@@ -42,6 +42,8 @@ _REQUIRED_PREPARED_SIMULATION_KEYS = frozenset(
         "use_sparse_jacobian",
         "wegscheider_cyclicity_enabled",
         "initial_prefix",
+        "intervention_schedule_declarative_fingerprint",
+        "intervention_schedule_executable_fingerprint",
     }
 )
 
@@ -321,7 +323,12 @@ def _normalize_prepared_simulation_block(prepared_simulation: Optional[object]) 
         "use_sparse_jacobian": bool(serialized["use_sparse_jacobian"]),
         "wegscheider_cyclicity_enabled": bool(serialized["wegscheider_cyclicity_enabled"]),
         "initial_prefix": str(serialized.get("initial_prefix") or ""),
-        "intervention_schedule_fingerprint": str(serialized.get("intervention_schedule_fingerprint") or ""),
+        "intervention_schedule_declarative_fingerprint": str(
+            serialized.get("intervention_schedule_declarative_fingerprint") or ""
+        ),
+        "intervention_schedule_executable_fingerprint": str(
+            serialized.get("intervention_schedule_executable_fingerprint") or ""
+        ),
     }
     symbolic_jacobian_identity = serialized.get("symbolic_jacobian_identity")
     if isinstance(symbolic_jacobian_identity, Mapping):

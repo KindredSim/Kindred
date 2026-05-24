@@ -32,6 +32,7 @@ from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 
 from kindred.core.temperature import TemperatureScheduleDictProtocol, TemperatureScheduleProtocol
 from kindred.core.intervention_schedule import (
+    compile_intervention_schedule,
     coerce_intervention_schedule,
 )
 from kindred.core.exceptions import (
@@ -239,8 +240,24 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
     schedule = coerce_intervention_schedule(req.intervention_schedule)
     prov["has_intervention_schedule"] = schedule is not None
     if schedule is not None:
-        prov["intervention_schedule"] = schedule.to_payload()
-        prov["intervention_schedule_fingerprint"] = schedule.fingerprint
+        compiled_schedule = compile_intervention_schedule(schedule)
+        prov["intervention_schedule_declarative"] = compiled_schedule.normalized_declarative_payload
+        prov["intervention_schedule_declarative_fingerprint"] = compiled_schedule.declarative_fingerprint
+        prov["intervention_schedule_executable"] = compiled_schedule.executable_payload
+        prov["intervention_schedule_executable_fingerprint"] = compiled_schedule.executable_fingerprint
+        if compiled_schedule.lineage:
+            prov["intervention_schedule_lineage"] = [dict(item) for item in compiled_schedule.lineage]
+        metadata = compiled_schedule.provenance.get("metadata")
+        if isinstance(metadata, Mapping):
+            prov["intervention_schedule_metadata"] = dict(metadata)
+        primitive_metadata = compiled_schedule.provenance.get("primitive_metadata")
+        if isinstance(primitive_metadata, Sequence) and not isinstance(primitive_metadata, (str, bytes)):
+            entries = [dict(item) for item in primitive_metadata if isinstance(item, Mapping)]
+            if entries:
+                prov["intervention_schedule_primitive_metadata"] = entries
+        prov["intervention_schedule_metadata_uses_internal_numeric_values"] = bool(
+            compiled_schedule.provenance.get("metadata_uses_internal_numeric_values")
+        )
 
     if req.temperature_schedule is not None:
         if isinstance(req.temperature_schedule, TemperatureScheduleDictProtocol):
@@ -576,21 +593,23 @@ def solve_ode(req: SimulationRequest | Mapping[str, Any], *, allow_unknown_keys:
     _scrub_unused_jacobian_provenance(prov, method=method, req=req)
     schedule = coerce_intervention_schedule(req.intervention_schedule)
     if schedule is not None:
-        return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
-            ScheduleExecutionRequest(
-                request=req,
-                rhs=rhs,
-                rhs_for_jac=rhs_for_jac,
-                t0=t0,
-                t1=t1,
-                y0=y0,
-                t_eval=t_eval,
-                provenance=prov,
-                method=method,
-                note=note,
-                schedule=schedule,
+        compiled_schedule = compile_intervention_schedule(schedule)
+        if not compiled_schedule.executable_schedule.is_empty():
+            return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
+                ScheduleExecutionRequest(
+                    request=req,
+                    rhs=rhs,
+                    rhs_for_jac=rhs_for_jac,
+                    t0=t0,
+                    t1=t1,
+                    y0=y0,
+                    t_eval=t_eval,
+                    provenance=prov,
+                    method=method,
+                    note=note,
+                    schedule=compiled_schedule.executable_schedule,
+                )
             )
-        )
     return _execute_scipy(
         req,
         rhs=rhs,

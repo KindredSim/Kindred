@@ -116,6 +116,81 @@ def test_fingerprint_simulation_request_is_deterministic_for_equivalent_plain_ca
     assert fp_a != fp_c
 
 
+def test_fingerprint_simulation_request_includes_declarative_and_executable_intervention_schedule_identity():
+    def rhs(_t, y):
+        return -y
+
+    y0 = np.array([1.0], dtype=float)
+    base_schedule = {
+        "protocols": [
+            {
+                "kind": "repeat",
+                "name": "feed",
+                "start": 0.0,
+                "every": 1.0,
+                "duration": 0.5,
+                "count": 1,
+                "during": [{"kind": "source", "species": "A", "rate": 1.0}],
+            }
+        ]
+    }
+    labelled_schedule = {
+        "metadata": {"label": "display only"},
+        "protocols": list(base_schedule["protocols"]),
+    }
+    executable_changed_schedule = {
+        "protocols": [
+            {
+                "kind": "repeat",
+                "name": "feed",
+                "start": 0.0,
+                "every": 1.0,
+                "duration": 0.5,
+                "count": 1,
+                "during": [{"kind": "source", "species": "A", "rate": 2.0}],
+            }
+        ]
+    }
+
+    req_base = SimulationRequest(
+        rhs=rhs,
+        t_span=(0.0, 1.0),
+        y0=y0,
+        solver="BDF",
+        grid={"N": 10},
+        species_names=("A",),
+        intervention_schedule=base_schedule,
+    )
+    req_labelled = SimulationRequest(
+        rhs=rhs,
+        t_span=(0.0, 1.0),
+        y0=y0,
+        solver="BDF",
+        grid={"N": 10},
+        species_names=("A",),
+        intervention_schedule=labelled_schedule,
+    )
+    req_executable_changed = SimulationRequest(
+        rhs=rhs,
+        t_span=(0.0, 1.0),
+        y0=y0,
+        solver="BDF",
+        grid={"N": 10},
+        species_names=("A",),
+        intervention_schedule=executable_changed_schedule,
+    )
+
+    fp_base = fingerprint_simulation_request(req_base)
+    fp_labelled = fingerprint_simulation_request(req_labelled)
+    fp_executable_changed = fingerprint_simulation_request(req_executable_changed)
+
+    assert fp_base is not None
+    assert fp_labelled is not None
+    assert fp_executable_changed is not None
+    assert fp_base != fp_labelled
+    assert fp_base != fp_executable_changed
+
+
 def test_temp_response_fingerprint_is_deterministic_for_equivalent_schedules():
     schedule_a = TemperatureSchedule.response([0.0, 5.0, 10.0], [300.0, 600.0], tau=2.0)
     schedule_b = TemperatureSchedule.response([0.0, 5.0, 10.0], [300.0, 600.0], tau=2.0)

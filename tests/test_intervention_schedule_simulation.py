@@ -224,6 +224,150 @@ def test_repeated_pulses_and_source_sink_intervals_execute_through_shared_solver
     assert result.provenance["has_intervention_schedule"] is True
 
 
+def test_repeated_source_intervals_match_manual_interval_expansion() -> None:
+    from kindred.core.intervention_schedule import InterventionSchedule
+
+    base_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=0.0",
+            "initial: B=0.0",
+        ]
+    )
+    repeated_schedule = InterventionSchedule.from_payload(
+        {
+            "repeated_intervals": [
+                {
+                    "kind": "source",
+                    "species": "A",
+                    "start": 1.0,
+                    "every": 2.0,
+                    "duration": 0.5,
+                    "count": 2,
+                    "rate": 2.0,
+                }
+            ]
+        }
+    )
+    manual_schedule = InterventionSchedule.from_payload(
+        {
+            "intervals": [
+                {"kind": "source", "species": "A", "start": 1.0, "end": 1.5, "rate": 2.0},
+                {"kind": "source", "species": "A", "start": 3.0, "end": 3.5, "rate": 2.0},
+            ]
+        }
+    )
+    base_request, species_names = _request_from_dsl(base_text, n=9, t_span=(0.0, 4.0))
+
+    repeated = solve_ode(replace(base_request, intervention_schedule=repeated_schedule))
+    manual = solve_ode(replace(base_request, intervention_schedule=manual_schedule))
+
+    np.testing.assert_allclose(repeated.Y, manual.Y, atol=1e-8)
+    assert float(repeated.Y[species_names.index("A"), -1]) == pytest.approx(2.0, abs=1e-7)
+
+
+def test_repeated_reservoir_intervals_hold_and_release_like_manual_expansion() -> None:
+    from kindred.core.intervention_schedule import InterventionSchedule
+
+    base_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.5",
+            "initial: A=0.0",
+            "initial: B=0.0",
+        ]
+    )
+    repeated_schedule = InterventionSchedule.from_payload(
+        {
+            "repeated_intervals": [
+                {
+                    "kind": "reservoir",
+                    "species": "A",
+                    "start": 1.0,
+                    "every": 2.0,
+                    "duration": 0.75,
+                    "count": 2,
+                    "value": 2.0,
+                }
+            ]
+        }
+    )
+    manual_schedule = InterventionSchedule.from_payload(
+        {
+            "intervals": [
+                {"kind": "reservoir", "species": "A", "start": 1.0, "end": 1.75, "value": 2.0},
+                {"kind": "reservoir", "species": "A", "start": 3.0, "end": 3.75, "value": 2.0},
+            ]
+        }
+    )
+    base_request, species_names = _request_from_dsl(base_text, n=17, t_span=(0.0, 4.0))
+
+    repeated = solve_ode(replace(base_request, intervention_schedule=repeated_schedule))
+    manual = solve_ode(replace(base_request, intervention_schedule=manual_schedule))
+
+    np.testing.assert_allclose(repeated.Y, manual.Y, atol=1e-8)
+    a = repeated.Y[species_names.index("A")]
+    active = ((repeated.t >= 1.0) & (repeated.t < 1.75)) | ((repeated.t >= 3.0) & (repeated.t < 3.75))
+    np.testing.assert_allclose(a[active], 2.0, atol=1e-7)
+
+
+def test_protocol_repeat_window_on_off_example_matches_manual_expansion() -> None:
+    protocol_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=0.0",
+            "initial: B=0.0",
+            "intervention: op=protocol; kind=repeat; name=user_light_cycle; start=0.0; every=2.0; duration=1.0; count=2; during=reservoir:A:value=1.0; after=clear:A",
+        ]
+    )
+    manual_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=0.0",
+            "initial: B=0.0",
+            "intervention: op=reservoir; species=A; start=0.0; end=1.0; value=1.0",
+            "intervention: op=clear; species=A; time=1.0",
+            "intervention: op=reservoir; species=A; start=2.0; end=3.0; value=1.0",
+            "intervention: op=clear; species=A; time=3.0",
+        ]
+    )
+    protocol_request, _species_names = _request_from_dsl(protocol_text, n=9, t_span=(0.0, 4.0))
+    manual_request, _species_names = _request_from_dsl(manual_text, n=9, t_span=(0.0, 4.0))
+
+    protocol = solve_ode(protocol_request)
+    manual = solve_ode(manual_request)
+
+    np.testing.assert_allclose(protocol.Y, manual.Y, atol=1e-8)
+    assert protocol.provenance["intervention_schedule_lineage"][0]["protocol"] == "user_light_cycle"
+
+
+def test_intervention_metadata_does_not_change_numeric_solver_result() -> None:
+    from kindred.core.intervention_schedule import InterventionSchedule
+
+    base_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=0.0",
+            "initial: B=0.0",
+        ]
+    )
+    plain_schedule = InterventionSchedule.from_payload(
+        {"intervals": [{"kind": "source", "species": "A", "start": 0.0, "end": 2.0, "rate": 1.0}]}
+    )
+    labelled_schedule = InterventionSchedule.from_payload(
+        {
+            "metadata": {"label": "blue light", "intent": "illumination", "quantity_kind": "intensity"},
+            "intervals": [{"kind": "source", "species": "A", "start": 0.0, "end": 2.0, "rate": 1.0}],
+        }
+    )
+    base_request, _species_names = _request_from_dsl(base_text, n=5, t_span=(0.0, 2.0))
+
+    plain = solve_ode(replace(base_request, intervention_schedule=plain_schedule))
+    labelled = solve_ode(replace(base_request, intervention_schedule=labelled_schedule))
+
+    np.testing.assert_allclose(labelled.Y, plain.Y, atol=1e-9)
+    assert labelled.provenance["intervention_schedule_metadata"]["label"] == "blue light"
+
+
 def test_parameterized_pulse_amount_executes_through_execution_request_overrides() -> None:
     from kindred.core.simulation_preparation import prepare_simulation_worker_run
 

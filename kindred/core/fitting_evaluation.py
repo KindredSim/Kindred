@@ -27,7 +27,6 @@ from kindred.core.runtime_defaults import (
 )
 from kindred.core.intervention_schedule import (
     coerce_intervention_schedule,
-    normalized_intervention_schedule_fingerprint,
 )
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
@@ -35,6 +34,7 @@ from kindred.core.simulation_preparation import (
     _bind_symbolic_jacobian_for_current_mechanism,
     _build_solver_config,
     _fit_simulation_error_from_preparation_error,
+    _normalized_intervention_schedule_identity_fingerprints,
     _prepare_preparation_failure,
     _raise_unowned_request_parameter_values,
     _mechanism_supports_dynamic_symbolic_snapshot,
@@ -560,7 +560,10 @@ def prepare_fitting_execution_context(
     intervention_schedule = coerce_intervention_schedule(prepared_payload.get("intervention_schedule"))
     from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
-    intervention_schedule_fingerprint = normalized_intervention_schedule_fingerprint(
+    (
+        intervention_schedule_declarative_fingerprint,
+        intervention_schedule_executable_fingerprint,
+    ) = _normalized_intervention_schedule_identity_fingerprints(
         intervention_schedule,
         mechanism_namespace=build_namespace_from_mechanism(bound.mechanism),
     )
@@ -585,7 +588,8 @@ def prepare_fitting_execution_context(
         use_sparse_jacobian=bool(prepared_solver_config.use_sparse_jacobian),
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         initial_prefix=str(initial_prefix),
-        intervention_schedule_fingerprint=str(intervention_schedule_fingerprint),
+        intervention_schedule_declarative_fingerprint=str(intervention_schedule_declarative_fingerprint),
+        intervention_schedule_executable_fingerprint=str(intervention_schedule_executable_fingerprint),
     )
 
     execution_request = SimulationExecutionRequest(
@@ -707,9 +711,10 @@ class SerialFittingEvaluator:
             raise TypeError("Process payload simulation_plan must be a mapping.")
         plan = SimulationPlan.from_payload(simulation_plan)
         plan_payload = plan.to_payload()
-        prepared_metadata = PreparedSimulationMetadata.from_mapping(
-            dict(payload["prepared_metadata"])
-        )
+        prepared_metadata_payload = payload["prepared_metadata"]
+        if not isinstance(prepared_metadata_payload, Mapping):
+            raise TypeError("Process payload prepared_metadata must be a mapping.")
+        prepared_metadata = PreparedSimulationMetadata.from_mapping(dict(prepared_metadata_payload))
         requested_param_names = sorted(
             {str(name) for name in list(payload["requested_param_names"] or []) if str(name).strip()}
         )
@@ -733,7 +738,12 @@ class SerialFittingEvaluator:
         try:
             assert_simulation_execution_request_schedule_identity(
                 request,
-                expected_fingerprint=str(prepared_metadata.intervention_schedule_fingerprint or ""),
+                expected_declarative_fingerprint=str(
+                    prepared_metadata.intervention_schedule_declarative_fingerprint or ""
+                ),
+                expected_executable_fingerprint=str(
+                    prepared_metadata.intervention_schedule_executable_fingerprint or ""
+                ),
             )
         except SimulationPreparationError as exc:
             raise ValueError(

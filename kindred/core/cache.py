@@ -45,7 +45,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple, TypeVar, Param
 
 import numpy as np
 
-from kindred.core.intervention_schedule import coerce_intervention_schedule
+from kindred.core.intervention_schedule import intervention_schedule_identity_fingerprints
 from kindred.core.lru_cache import LRUCache
 from kindred.core.equilibrium_rate_authority import normalize_existing_equilibrium_rate_authority
 from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
@@ -864,16 +864,19 @@ def fingerprint_simulation_request(req: "SimulationRequest") -> Optional[str]:
     schedule_fp: Optional[str] = None
     if schedule_val is not None:
         schedule_fp = _fingerprint_temperature_schedule_value(schedule_val)
-    intervention_schedule_fp: Optional[str] = None
+    intervention_schedule_declarative_fp: Optional[str] = None
+    intervention_schedule_executable_fp: Optional[str] = None
     intervention_species_names: Tuple[str, ...] = tuple()
     intervention_schedule_val = getattr(req, "intervention_schedule", None)
     if intervention_schedule_val is not None:
         try:
-            intervention_schedule = coerce_intervention_schedule(intervention_schedule_val)
+            (
+                intervention_schedule_declarative_fp,
+                intervention_schedule_executable_fp,
+            ) = intervention_schedule_identity_fingerprints(intervention_schedule_val)
         except Exception:
             return None
-        if intervention_schedule is not None:
-            intervention_schedule_fp = str(intervention_schedule.fingerprint)
+        if intervention_schedule_declarative_fp or intervention_schedule_executable_fp:
             intervention_species_names = tuple(str(name) for name in (getattr(req, "species_names", None) or ()))
 
     symbolic_jacobian_identity = symbolic_jacobian_identity_payload(getattr(req, "jacobian_func", None))
@@ -902,7 +905,8 @@ def fingerprint_simulation_request(req: "SimulationRequest") -> Optional[str]:
         ),
         jac_tag,
         schedule_fp,
-        intervention_schedule_fp,
+        intervention_schedule_declarative_fp,
+        intervention_schedule_executable_fp,
         intervention_species_names,
         bool(getattr(req, "progress_callback", None)),
         getattr(req, "positivity", None),

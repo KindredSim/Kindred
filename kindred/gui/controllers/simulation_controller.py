@@ -3553,7 +3553,8 @@ class SimulationController(QtCore.QObject):
         t_end: float,
         canonical_initials_fingerprint: str = "",
         preview_batch_cache_token: str = "",
-        intervention_schedule_fingerprint: str = "",
+        intervention_schedule_declarative_fingerprint: str = "",
+        intervention_schedule_executable_fingerprint: str = "",
         fast_mode: bool,
     ) -> SimulationIdentity:
         param_fingerprint = ""
@@ -3567,7 +3568,12 @@ class SimulationController(QtCore.QObject):
             canonical_initials_fingerprint=str(canonical_initials_fingerprint or ""),
             solver_config=solver_config,
             t_end=float(t_end),
-            intervention_schedule_fingerprint=str(intervention_schedule_fingerprint or ""),
+            intervention_schedule_declarative_fingerprint=str(
+                intervention_schedule_declarative_fingerprint or ""
+            ),
+            intervention_schedule_executable_fingerprint=str(
+                intervention_schedule_executable_fingerprint or ""
+            ),
             preview_batch_cache_token=preview_token,
             execution_flags=self._execution_identity_flags(fast_mode=bool(fast_mode)),
             symbolic_jacobian_identity=self._symbolic_jacobian_identity_for_set(

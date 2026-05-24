@@ -31,7 +31,7 @@ from kindred.core.intervention_schedule import (
     InterventionScheduleError,
     coerce_intervention_schedule,
     intervention_schedule_parameter_names,
-    normalized_intervention_schedule_fingerprint,
+    normalized_intervention_schedule_identity_fingerprints,
     normalized_intervention_schedule_payload,
     parse_intervention_schedule_from_dsl,
 )
@@ -532,7 +532,8 @@ class PreparedSimulationMetadata:
     use_sparse_jacobian: bool
     wegscheider_cyclicity_enabled: bool
     initial_prefix: str
-    intervention_schedule_fingerprint: str = ""
+    intervention_schedule_declarative_fingerprint: str = ""
+    intervention_schedule_executable_fingerprint: str = ""
     symbolic_jacobian_identity: Optional[Dict[str, Any]] = None
     symbolic_jacobian_status: Optional[Dict[str, Any]] = None
     symbolic_wegscheider_identity: Optional[Dict[str, Any]] = None
@@ -574,7 +575,12 @@ class PreparedSimulationMetadata:
                 self.wegscheider_cyclicity_enabled
             ),
             "initial_prefix": str(self.initial_prefix),
-            "intervention_schedule_fingerprint": str(self.intervention_schedule_fingerprint or ""),
+            "intervention_schedule_declarative_fingerprint": str(
+                self.intervention_schedule_declarative_fingerprint or ""
+            ),
+            "intervention_schedule_executable_fingerprint": str(
+                self.intervention_schedule_executable_fingerprint or ""
+            ),
         }
         if self.symbolic_jacobian_identity:
             payload["symbolic_jacobian_identity"] = dict(self.symbolic_jacobian_identity)
@@ -586,6 +592,14 @@ class PreparedSimulationMetadata:
 
     @classmethod
     def from_mapping(cls, meta: Mapping[str, Any]) -> "PreparedSimulationMetadata":
+        if "intervention_schedule_fingerprint" in meta:
+            raise KeyError("stale intervention_schedule_fingerprint")
+        for key in (
+            "intervention_schedule_declarative_fingerprint",
+            "intervention_schedule_executable_fingerprint",
+        ):
+            if key not in meta:
+                raise KeyError(key)
         param_names_raw = meta.get("param_names") or []
         if not isinstance(param_names_raw, (list, tuple)):
             param_names_raw = []
@@ -624,7 +638,12 @@ class PreparedSimulationMetadata:
                 )
             ),
             initial_prefix=str(meta.get("initial_prefix") or ""),
-            intervention_schedule_fingerprint=str(meta.get("intervention_schedule_fingerprint") or ""),
+            intervention_schedule_declarative_fingerprint=str(
+                meta.get("intervention_schedule_declarative_fingerprint") or ""
+            ),
+            intervention_schedule_executable_fingerprint=str(
+                meta.get("intervention_schedule_executable_fingerprint") or ""
+            ),
             symbolic_jacobian_identity=meta.get("symbolic_jacobian_identity"),
             symbolic_jacobian_status=(
                 dict(meta.get("symbolic_jacobian_status") or {})
@@ -882,22 +901,23 @@ def _normalized_schedule_payload_for_mechanism(
     )
 
 
-def _normalized_schedule_fingerprint_for_mechanism(
+def _normalized_intervention_schedule_identity_fingerprints(
     schedule: object,
     *,
-    mechanism: object,
-) -> str:
-    return normalized_intervention_schedule_fingerprint(
+    mechanism_namespace: object,
+) -> tuple[str, str]:
+    return normalized_intervention_schedule_identity_fingerprints(
         coerce_intervention_schedule(schedule),
-        mechanism_namespace=build_namespace_from_mechanism(mechanism),
+        mechanism_namespace=mechanism_namespace,
     )
 
 
 def assert_simulation_execution_request_schedule_identity(
     request: SimulationExecutionRequest,
     *,
-    expected_fingerprint: str,
-) -> str:
+    expected_declarative_fingerprint: str,
+    expected_executable_fingerprint: str = "",
+) -> tuple[str, str]:
     mechanism = _execution_request_schedule_identity_mechanism(request)
     request_payload = request.to_payload()
     request_schedule = _execution_request_schedule_payload_for_identity(request_payload)
@@ -905,18 +925,27 @@ def assert_simulation_execution_request_schedule_identity(
         request_schedule,
         mechanism=mechanism,
     )
-    request_fingerprint = _normalized_schedule_fingerprint_for_mechanism(
+    (
+        request_declarative_fingerprint,
+        request_executable_fingerprint,
+    ) = _normalized_intervention_schedule_identity_fingerprints(
         request_schedule,
-        mechanism=mechanism,
+        mechanism_namespace=build_namespace_from_mechanism(mechanism),
     )
-    if str(expected_fingerprint or "") != request_fingerprint:
+    expected_declarative = str(expected_declarative_fingerprint or "")
+    if expected_declarative != request_declarative_fingerprint:
         raise SimulationPreparationError(
             "intervention_schedule",
-            "prepared_metadata.intervention_schedule_fingerprint conflicts with execution request.",
+            "prepared_metadata.intervention_schedule_declarative_fingerprint conflicts with execution request.",
+        )
+    if str(expected_executable_fingerprint or "") != request_executable_fingerprint:
+        raise SimulationPreparationError(
+            "intervention_schedule",
+            "prepared_metadata.intervention_schedule_executable_fingerprint conflicts with execution request.",
         )
     prepared_payload = request_payload.get("prepared_payload")
     if not isinstance(prepared_payload, Mapping):
-        return request_fingerprint
+        return request_declarative_fingerprint, request_executable_fingerprint
     for field_name in ("intervention_schedule", "unresolved_intervention_schedule"):
         if field_name not in prepared_payload:
             continue
@@ -932,7 +961,7 @@ def assert_simulation_execution_request_schedule_identity(
                     "intervention schedule."
                 ),
             )
-    return request_fingerprint
+    return request_declarative_fingerprint, request_executable_fingerprint
 
 
 def _execution_request_intervention_schedule(
@@ -1094,10 +1123,7 @@ def coerce_prepared_simulation_metadata(
     if isinstance(prepared, PreparedSimulationMetadata):
         return prepared
     if isinstance(prepared, Mapping):
-        try:
-            return PreparedSimulationMetadata.from_mapping(prepared)
-        except Exception:
-            return None
+        return PreparedSimulationMetadata.from_mapping(prepared)
     return None
 
 
@@ -3455,7 +3481,10 @@ def build_prepared_simulation_func(
             metadata_requested_partition,
             param_names or [],
         )
-        intervention_schedule_fingerprint = normalized_intervention_schedule_fingerprint(
+        (
+            intervention_schedule_declarative_fingerprint,
+            intervention_schedule_executable_fingerprint,
+        ) = _normalized_intervention_schedule_identity_fingerprints(
             initial_bound.unresolved_intervention_schedule,
             mechanism_namespace=build_namespace_from_mechanism(initial_bound.mechanism),
         )
@@ -3464,7 +3493,8 @@ def build_prepared_simulation_func(
     except Exception as exc:
         initial_parse_error = exc
         canonical_metadata_param_names = sorted({str(x) for x in (param_names or []) if str(x).strip()})
-        intervention_schedule_fingerprint = ""
+        intervention_schedule_declarative_fingerprint = ""
+        intervention_schedule_executable_fingerprint = ""
 
     prepared_meta = PreparedSimulationMetadata(
         version=1,
@@ -3486,7 +3516,8 @@ def build_prepared_simulation_func(
         use_sparse_jacobian=bool(prepared_solver_config.use_sparse_jacobian),
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         initial_prefix=str(initial_prefix),
-        intervention_schedule_fingerprint=str(intervention_schedule_fingerprint),
+        intervention_schedule_declarative_fingerprint=str(intervention_schedule_declarative_fingerprint),
+        intervention_schedule_executable_fingerprint=str(intervention_schedule_executable_fingerprint),
     )
 
     bound: Optional[BoundMechanism] = None

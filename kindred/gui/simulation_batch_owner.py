@@ -768,10 +768,13 @@ class SimulationBatchOwner:
             set_id=str(set_id),
             mechanism_text=mechanism_text,
         )
-        from kindred.core.intervention_schedule import normalized_intervention_schedule_fingerprint_from_dsl_text
+        from kindred.core.intervention_schedule import normalized_intervention_schedule_identity_fingerprints_from_dsl_text
 
-        intervention_schedule_fingerprint = str(
-            normalized_intervention_schedule_fingerprint_from_dsl_text(str(mechanism_text or "")) or ""
+        (
+            intervention_schedule_declarative_fingerprint,
+            intervention_schedule_executable_fingerprint,
+        ) = normalized_intervention_schedule_identity_fingerprints_from_dsl_text(
+            str(mechanism_text or "")
         )
         initials_fingerprint = ""
         row = self._batch_row_for_set_id(str(set_id))
@@ -809,7 +812,8 @@ class SimulationBatchOwner:
             canonical_initials_fingerprint=initials_fingerprint,
             solver_config=expected_solver_config,
             t_end=expected_t_end,
-            intervention_schedule_fingerprint=intervention_schedule_fingerprint,
+            intervention_schedule_declarative_fingerprint=intervention_schedule_declarative_fingerprint,
+            intervention_schedule_executable_fingerprint=intervention_schedule_executable_fingerprint,
             preview_batch_cache_token=expected_overlay_token,
             execution_flags=("fast_mode",),
             symbolic_jacobian_identity=self._symbolic_jacobian_identity_for_preview(

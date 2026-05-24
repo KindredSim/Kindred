@@ -10,6 +10,7 @@ from kindred.core.batch_initial_conditions import (
     migrate_reaction_dsl_initial_concentration_sets,
     strip_reaction_dsl_initial_concentrations,
 )
+from kindred.core.intervention_schedule import intervention_schedule_identity_fingerprints
 from kindred.core.simulation_identity import (
     SimulationScopeIdentity,
     canonical_initials_fingerprint,
@@ -767,13 +768,20 @@ class SimulationRunDispatchPreparationOwner:
                     intervention_schedule = _submitted_intervention_schedule_from_text(
                         str(mechanism_context.owner_full_dsl or "")
                     )
+                    (
+                        intervention_schedule_declarative_fingerprint,
+                        intervention_schedule_executable_fingerprint,
+                    ) = intervention_schedule_identity_fingerprints(intervention_schedule)
                     identity = self._deps.simulation_identity_for_set(
                         set_id=set_id_s,
                         solver_config=solver_context.solver_config,
                         t_end=float(solver_context.t_end),
                         preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(set_id_s, ""),
-                        intervention_schedule_fingerprint=(
-                            "" if intervention_schedule is None else str(intervention_schedule.fingerprint or "")
+                        intervention_schedule_declarative_fingerprint=(
+                            intervention_schedule_declarative_fingerprint
+                        ),
+                        intervention_schedule_executable_fingerprint=(
+                            intervention_schedule_executable_fingerprint
                         ),
                         fast_mode=bool(fast_mode),
                     )
@@ -820,6 +828,10 @@ class SimulationRunDispatchPreparationOwner:
                 owned_species_by_set_id[set_id_s] = owned_species
             try:
                 intervention_schedule = _submitted_intervention_schedule_from_text(str(request_mechanism_text))
+                (
+                    intervention_schedule_declarative_fingerprint,
+                    intervention_schedule_executable_fingerprint,
+                ) = intervention_schedule_identity_fingerprints(intervention_schedule)
             except Exception as exc:
                 _abort_invalid_intervention_schedule(set_id_s, exc)
                 return None
@@ -863,8 +875,11 @@ class SimulationRunDispatchPreparationOwner:
                     t_end=float(solver_context.t_end),
                     canonical_initials_fingerprint=canonical_initials_fingerprint(initials_dict),
                     preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(set_id_s, ""),
-                    intervention_schedule_fingerprint=(
-                        "" if intervention_schedule is None else str(intervention_schedule.fingerprint or "")
+                    intervention_schedule_declarative_fingerprint=(
+                        intervention_schedule_declarative_fingerprint
+                    ),
+                    intervention_schedule_executable_fingerprint=(
+                        intervention_schedule_executable_fingerprint
                     ),
                     fast_mode=bool(fast_mode),
                 )

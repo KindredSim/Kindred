@@ -77,7 +77,7 @@ def _intervention_annotations_from_provenance(provenance: Mapping[str, object] |
     if not isinstance(provenance, Mapping):
         return []
     annotations: List[Dict[str, object]] = []
-    schedule = provenance.get("intervention_schedule")
+    schedule = provenance.get("intervention_schedule_executable")
     if isinstance(schedule, Mapping):
         for event in list(schedule.get("instant_events") or ()):
             if not isinstance(event, Mapping):

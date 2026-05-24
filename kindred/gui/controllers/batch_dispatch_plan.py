@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence
 
-from kindred.core.intervention_schedule import coerce_intervention_schedule
+from kindred.core.intervention_schedule import (
+    coerce_intervention_schedule,
+    intervention_schedule_identity_fingerprints,
+)
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_preparation import SimulationExecutionRequest
 
@@ -175,7 +178,16 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
         schedule = coerce_intervention_schedule(dispatch_input.intervention_schedule)
         if schedule is not None:
             intervention_schedule_payload = schedule.to_payload()
-            simulation_identity["intervention_schedule_fingerprint"] = str(schedule.fingerprint or "")
+            (
+                intervention_schedule_declarative_fingerprint,
+                intervention_schedule_executable_fingerprint,
+            ) = intervention_schedule_identity_fingerprints(schedule)
+            simulation_identity["intervention_schedule_declarative_fingerprint"] = (
+                intervention_schedule_declarative_fingerprint
+            )
+            simulation_identity["intervention_schedule_executable_fingerprint"] = (
+                intervention_schedule_executable_fingerprint
+            )
 
     if plan_payload is None:
         if isinstance(execution_request, dict):
@@ -232,12 +244,20 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
             plan = SimulationPlan.from_payload(plan_payload)
             plan_identity = plan.simulation_identity_payload()
             if plan_identity:
-                schedule_fingerprint = str(
-                    simulation_identity.get("intervention_schedule_fingerprint") or ""
+                schedule_declarative_fingerprint = str(
+                    simulation_identity.get("intervention_schedule_declarative_fingerprint") or ""
+                )
+                schedule_executable_fingerprint = str(
+                    simulation_identity.get("intervention_schedule_executable_fingerprint") or ""
                 )
                 simulation_identity = dict(plan_identity)
-                if schedule_fingerprint:
-                    simulation_identity["intervention_schedule_fingerprint"] = schedule_fingerprint
+                if schedule_declarative_fingerprint or schedule_executable_fingerprint:
+                    simulation_identity["intervention_schedule_declarative_fingerprint"] = (
+                        schedule_declarative_fingerprint
+                    )
+                    simulation_identity["intervention_schedule_executable_fingerprint"] = (
+                        schedule_executable_fingerprint
+                    )
             cache_identity_payload = _cache_identity_payload(
                 dispatch_input,
                 simulation_identity=simulation_identity,

@@ -238,3 +238,63 @@ def test_fit_global_final_replay_executes_parameterized_intervention_schedule(mo
     assert result.shared_params["dose"] == pytest.approx(3.0)
     replayed_a = np.asarray(result.model_series["ds1"]["A"], dtype=float)
     assert float(replayed_a[-1]) == pytest.approx(4.0, abs=1e-6)
+
+
+def test_fit_global_final_replay_executes_parameterized_intervention_protocol_schedule(monkeypatch):
+    import kindred.core.analysis.global_fitting as global_fitting
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=0.0",
+            "initial: B=0.0",
+            "intervention: op=protocol; kind=repeat; name=feed; start=0.0; every=1.0; duration=0.5; count=2; during=source:A:rate_param=feed_rate",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["feed_rate"],
+        t_end=2.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    def _fit_parameters(_objective, _initial_params, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters={"feed_rate": 2.0},
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(5, dtype=float),
+            nfev=1,
+            message="forced optimum",
+        )
+
+    monkeypatch.setattr(global_fitting, "fit_parameters", _fit_parameters)
+
+    result = global_fitting.fit_global(
+        evaluator,
+        [
+            {
+                "id": "ds1",
+                "t": np.asarray([0.0, 0.5, 1.0, 1.5, 2.0], dtype=float),
+                "species": "A",
+                "y": np.asarray([0.0, 1.0, 1.0, 2.0, 2.0], dtype=float),
+            }
+        ],
+        shared_params={"feed_rate": 1.0},
+        bounds={"feed_rate": (0.0, 10.0)},
+        method="trf",
+        max_nfev=1,
+        max_runtime_lanes=1,
+    )
+
+    assert result.completion.status == "ok"
+    assert result.shared_params["feed_rate"] == pytest.approx(2.0)
+    replayed_a = np.asarray(result.model_series["ds1"]["A"], dtype=float)
+    assert float(replayed_a[-1]) == pytest.approx(2.0, abs=1e-6)

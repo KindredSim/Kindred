@@ -6,7 +6,10 @@ from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 
-from kindred.core.intervention_schedule import coerce_intervention_schedule
+from kindred.core.intervention_schedule import (
+    coerce_intervention_schedule,
+    intervention_schedule_identity_fingerprints,
+)
 from kindred.core.simulation_preparation import SimulationExecutionRequest, SimulationPreparationError
 
 __all__ = [
@@ -232,20 +235,23 @@ class SimulationPlan:
         identity = self.simulation_identity_payload()
         if not identity:
             return
-        actual_fingerprint = str(identity.get("intervention_schedule_fingerprint") or "")
-        if actual_fingerprint and not self.execution_request.has_intervention_schedule_authority:
+        if "intervention_schedule_fingerprint" in identity:
+            raise ValueError("stale intervention_schedule_fingerprint")
+        actual_declarative = str(identity.get("intervention_schedule_declarative_fingerprint") or "")
+        actual_executable = str(identity.get("intervention_schedule_executable_fingerprint") or "")
+        if (actual_declarative or actual_executable) and not self.execution_request.has_intervention_schedule_authority:
             raise ValueError(
                 "SimulationPlan cache_identity_payload simulation_identity "
-                "intervention_schedule_fingerprint requires execution_request intervention_schedule authority."
+                "intervention schedule fingerprints require execution_request intervention_schedule authority."
             )
         if not self.execution_request.has_intervention_schedule_authority:
             return
         schedule = coerce_intervention_schedule(self.execution_request.intervention_schedule)
-        expected_fingerprint = "" if schedule is None else str(schedule.fingerprint or "")
-        if actual_fingerprint != expected_fingerprint:
+        expected_declarative, expected_executable = intervention_schedule_identity_fingerprints(schedule)
+        if actual_declarative != expected_declarative or actual_executable != expected_executable:
             raise ValueError(
                 "SimulationPlan cache_identity_payload simulation_identity "
-                "intervention_schedule_fingerprint conflicts with execution_request."
+                "intervention schedule fingerprints conflict with execution_request."
             )
 
 

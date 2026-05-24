@@ -400,6 +400,69 @@ def test_solve_ode_intervention_interval_symbolic_jacobian_uses_scheduled_rhs(mo
     assert out.provenance["intervention_symbolic_jacobian_disabled"] is True
 
 
+def test_solver_provenance_includes_declarative_and_executable_schedule_fingerprints(monkeypatch):
+    from kindred.core.intervention_schedule import InterventionSchedule, compile_intervention_schedule
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        y = np.vstack([np.ones_like(t_eval)])
+        return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    schedule = InterventionSchedule.from_payload(
+        {
+            "metadata": {"label": "feed pulses", "intent": "dose"},
+            "intervals": [
+                {
+                    "kind": "source",
+                    "species": "A",
+                    "start": 0.75,
+                    "end": 1.0,
+                    "rate": 0.5,
+                    "label": "tail feed",
+                    "display_unit": "uM/s",
+                }
+            ],
+            "repeated_intervals": [
+                {
+                    "kind": "source",
+                    "species": "A",
+                    "start": 0.0,
+                    "every": 0.5,
+                    "duration": 0.25,
+                    "count": 2,
+                    "rate": 1.0,
+                }
+            ],
+        }
+    )
+    compiled = compile_intervention_schedule(schedule)
+    out = solvers.solve_ode(
+        solvers.SimulationRequest(
+            rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+            t_span=(0.0, 1.0),
+            y0=np.array([1.0]),
+            solver="BDF",
+            grid={"N": 3},
+            species_names=("A",),
+            intervention_schedule=schedule,
+        )
+    )
+
+    assert "intervention_schedule" not in out.provenance
+    assert "intervention_schedule_fingerprint" not in out.provenance
+    assert out.provenance["intervention_schedule_declarative_fingerprint"] == compiled.declarative_fingerprint
+    assert out.provenance["intervention_schedule_executable_fingerprint"] == compiled.executable_fingerprint
+    assert out.provenance["intervention_schedule_executable"] == compiled.executable_payload
+    assert out.provenance["intervention_schedule_metadata"]["label"] == "feed pulses"
+    assert out.provenance["intervention_schedule_primitive_metadata"][0]["metadata"] == {
+        "display_unit": "uM/s",
+        "label": "tail feed",
+    }
+    assert out.provenance["intervention_schedule_metadata_uses_internal_numeric_values"] is True
+
+
 def test_solve_ode_empty_intervention_schedule_object_is_noop_without_species_names():
     from kindred.core.intervention_schedule import InterventionSchedule
 
@@ -514,7 +577,6 @@ def test_solve_ode_state_trigger_resumes_from_event_state_between_requested_samp
         intervention_schedule={
             "trigger_events": [
                 {
-                    "op": "trigger",
                     "trigger_species": "A",
                     "threshold": 0.5,
                     "direction": "rising",
@@ -561,7 +623,6 @@ def test_solve_ode_state_trigger_rearms_inside_same_segment(min_interval, first_
         intervention_schedule={
             "trigger_events": [
                 {
-                    "op": "trigger",
                     "trigger_species": "A",
                     "threshold": 0.5,
                     "direction": "rising",
@@ -606,7 +667,6 @@ def test_solve_ode_state_trigger_at_requested_sample_keeps_t_eval_grid_stable():
         intervention_schedule={
             "trigger_events": [
                 {
-                    "op": "trigger",
                     "trigger_species": "A",
                     "threshold": 0.5,
                     "direction": "rising",
@@ -639,7 +699,6 @@ def test_solve_ode_state_trigger_ignores_surplus_user_event_terminal_flags():
         intervention_schedule={
             "trigger_events": [
                 {
-                    "op": "trigger",
                     "trigger_species": "A",
                     "threshold": 0.5,
                     "direction": "rising",
@@ -685,7 +744,6 @@ def test_solve_ode_state_trigger_applies_clamp_interval_state_at_event_sample(
             ],
             "trigger_events": [
                 {
-                    "op": "trigger",
                     "trigger_species": "B",
                     "threshold": 0.5,
                     "direction": "rising",
@@ -731,7 +789,6 @@ def test_solve_ode_state_trigger_requires_event_state_when_event_between_samples
         intervention_schedule={
             "trigger_events": [
                 {
-                    "op": "trigger",
                     "trigger_species": "A",
                     "threshold": 0.5,
                     "direction": "rising",
