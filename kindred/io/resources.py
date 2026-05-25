@@ -22,14 +22,19 @@ import os
 import re
 import tempfile
 from pathlib import Path
+
+from kindred.core.mechanism_source import MechanismAuthoringSource
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "get_resource_text",
     "get_resource_path",
     "list_resources",
-    "get_preset_mechanism",
+    "get_preset_mechanism_source",
+    "get_intervention_example_source",
     "get_all_example_specs",
+    "get_all_intervention_example_specs",
 ]
 
 
@@ -230,9 +235,42 @@ def list_resources(subdirectory: str = "") -> list[str]:
 
 # Convenience functions for common resources
 
-def get_preset_mechanism(preset_id: str) -> str:
+
+def _natural_key(name: str) -> list[object]:
+    """Split into numeric and text chunks for deterministic ordering."""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
+
+
+def _list_text_resource_files(subdir: str) -> list[str]:
+    names: list[str] = []
+    from importlib.resources import files
+
+    try:
+        base = files("kindred").joinpath("data", subdir)
+        for item in base.iterdir():
+            if item.is_file() and item.suffix == ".txt":
+                names.append(item.name)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not list resources in %s: %s", subdir, exc)
+    return sorted(names, key=_natural_key)
+
+
+def _title_from_resource_text(text: str, *, fallback: str) -> str:
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        prefix = "# title:"
+        if stripped.lower().startswith(prefix):
+            title = stripped[len(prefix):].strip()
+            return title or fallback
+        return fallback
+    return fallback
+
+
+def get_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
     """
-    Load preset mechanism by ID.
+    Load a preset mechanism by ID as a complete authoring source.
 
     Parameters
     ----------
@@ -241,10 +279,27 @@ def get_preset_mechanism(preset_id: str) -> str:
 
     Returns
     -------
-    str
-        Mechanism DSL text
+    MechanismAuthoringSource
+        Complete mechanism source.
     """
-    return get_resource_text(f"presets/{preset_id}.txt")
+    return MechanismAuthoringSource.from_full_dsl_text(get_resource_text(f"presets/{preset_id}.txt"))
+
+
+def get_intervention_example_source(example_id: str) -> MechanismAuthoringSource:
+    """
+    Load a bundled intervention example by ID as a complete authoring source.
+
+    Parameters
+    ----------
+    example_id : str
+        Intervention example ID (e.g., "I1", "I2", ...)
+
+    Returns
+    -------
+    MechanismAuthoringSource
+        Complete mechanism source.
+    """
+    return MechanismAuthoringSource.from_full_dsl_text(get_resource_text(f"interventions/{example_id}.txt"))
 
 
 def get_all_example_specs() -> list[dict]:
@@ -271,30 +326,42 @@ def get_all_example_specs() -> list[dict]:
     >>> specs[0]
     {'id': 'M1', 'type': 'preset', 'path': 'presets/M1.txt'}
     """
-    def _natural_key(name: str) -> list[object]:
-        """Split into numeric and text chunks for deterministic ordering (M1, M2, M9)."""
-        return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
-
-    def _list_files(subdir: str) -> list[str]:
-        names: list[str] = []
-        from importlib.resources import files
-        try:
-            base = files("kindred").joinpath("data", subdir)
-            for item in base.iterdir():
-                if item.is_file() and item.suffix == ".txt":
-                    names.append(item.name)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Could not list resources in %s: %s", subdir, exc)
-        return sorted(names, key=_natural_key)
-
     examples: list[dict] = []
 
-    for name in _list_files("presets"):
+    for name in _list_text_resource_files("presets"):
         base = name[:-4] if name.endswith(".txt") else name
         examples.append({
             "id": base,
             "type": "preset",
             "path": f"presets/{name}",
+        })
+
+    return examples
+
+
+def get_all_intervention_example_specs() -> list[dict]:
+    """
+    Get metadata for all bundled intervention examples.
+
+    Returns
+    -------
+    list of dict
+        Each dict contains:
+        - id: str - Example identifier (e.g., "I1")
+        - type: str - "intervention"
+        - path: str - Resource path relative to kindred/data
+    """
+    examples: list[dict] = []
+
+    for name in _list_text_resource_files("interventions"):
+        base = name[:-4] if name.endswith(".txt") else name
+        path = f"interventions/{name}"
+        title = _title_from_resource_text(get_resource_text(path), fallback=base)
+        examples.append({
+            "id": base,
+            "type": "intervention",
+            "path": path,
+            "title": title,
         })
 
     return examples

@@ -154,7 +154,6 @@ def _prepared_entry(
         param_names=[],
         temperature_K=float(temperature_K),
         initials={},
-        use_advanced_dsl=True,
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
     entry = {

@@ -211,8 +211,9 @@ class MainWindowVariableRuntime:
             )
             from kindred.core.units import UnitsModel
 
-            mechanism_text = mw.mechanism_reactions_text_raw()
-            if not mechanism_text.strip():
+            source = mw.canonical_mechanism_source()
+            mechanism_text = source.reactions_text
+            if not source.full_dsl.strip():
                 return
 
             sanitized_text, baseline_variables, baseline_metadata = self.sanitize_mechanism_parameter_conflicts(
@@ -251,8 +252,9 @@ class MainWindowVariableRuntime:
             temperature_k = mw.temperature_spinbox_value()
             units = UnitsModel(temperature_K=temperature_k)
 
-            state_network_dsl = mw.mechanism_state_network_dsl_raw()
-            parse_mechanism_text = strip_named_reaction_dsl_initial_concentration_sets(mechanism_text)
+            parse_source = source.with_reactions_text(
+                strip_named_reaction_dsl_initial_concentration_sets(mechanism_text)
+            )
             try:
                 solver_owner = getattr(mw, "_simulation_solver_owner", None)
                 if solver_owner is not None and callable(getattr(solver_owner, "wegscheider_cyclicity_enabled", None)):
@@ -279,8 +281,7 @@ class MainWindowVariableRuntime:
                 )
                 if callable(authoritative_structure_snapshot):
                     structure_snapshot = authoritative_structure_snapshot(
-                        reactions_text=parse_mechanism_text,
-                        state_network_text=state_network_dsl,
+                        source=parse_source,
                         units_identity=(
                             "temperature_K",
                             f"{float(temperature_k):.17g}",
@@ -291,10 +292,7 @@ class MainWindowVariableRuntime:
                     )
                     mechanism = structure_snapshot.mechanism
                 else:
-                    full_dsl = str(parse_mechanism_text or "")
-                    if str(state_network_dsl or "").strip():
-                        full_dsl += "\n\n# State Network\n" + str(state_network_dsl).strip("\n")
-                    mechanism = _build_structure_snapshot(full_dsl)
+                    mechanism = _build_structure_snapshot(parse_source.full_dsl)
             except Exception as exc:
                 logger.warning("Could not parse mechanism for variable extraction: %s", exc)
                 return
@@ -471,15 +469,7 @@ class MainWindowVariableRuntime:
             if requested_params == current_params:
                 return self._slider_runtime
 
-        reactions_text = str(mw.mechanism_reactions_text_raw() or "")
-        state_network_dsl = str(mw.mechanism_state_network_dsl_raw() or "")
-        mechanism_text = reactions_text
-        if state_network_dsl.strip():
-            mechanism_text = (
-                f"{mechanism_text}\n\n# State Network\n{state_network_dsl}"
-                if mechanism_text.strip()
-                else f"# State Network\n{state_network_dsl}"
-            )
+        mechanism_text = mw.canonical_mechanism_source().full_dsl
         temperature_K = mw._temperature_spinbox.value()
 
         try:
@@ -488,7 +478,6 @@ class MainWindowVariableRuntime:
                 param_names=list(param_names),
                 temperature_K=temperature_K,
                 initials={},
-                use_advanced_dsl=True,
                 wegscheider_cyclicity_enabled=bool(mw._wegscheider_cyclicity_enabled),
             )
         except Exception as exc:
@@ -759,7 +748,7 @@ class MainWindowVariableRuntime:
             GENERATED_BLOCK_START = ""
             GENERATED_BLOCK_END = ""
 
-        reactions_text = mw.mechanism_reactions_text_raw()
+        reactions_text = mw.canonical_mechanism_source().reactions_text
 
         generated_body = None
         try:

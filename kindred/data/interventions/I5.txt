@@ -1,0 +1,6 @@
+# title: Washout interval
+# Removes an impurity during a cleanup phase.
+reaction: Impurity -> Byproduct; k=0.05
+initial: Impurity=1.0
+initial: Byproduct=0.0
+intervention: op=sink; species=Impurity; start=2.0; end=5.0; rate=0.15

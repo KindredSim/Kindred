@@ -5,6 +5,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Set, Tuple
 
+from kindred.core.mechanism_source import MechanismAuthoringSource
+
 
 class DisplayRefreshSource(Enum):
     INCIDENTAL_REFRESH = "incidental_refresh"
@@ -757,7 +759,16 @@ class SimulationMechanismPort(Protocol):
 
     def mechanism_reactions_text_raw(self) -> str: ...
 
-    def mechanism_state_network_dsl_raw(self) -> str: ...
+    def mechanism_source_for_run(self, *, fast_mode: bool) -> MechanismAuthoringSource: ...
+
+    def mechanism_source_for_run_set(
+        self,
+        source: MechanismAuthoringSource,
+        *,
+        set_id: Optional[str] = None,
+        apply_parameter_overrides: bool = True,
+        strip_initial_concentrations: bool = False,
+    ) -> MechanismAuthoringSource: ...
 
     def mechanism_slider_points_value(self) -> Optional[int]: ...
 
@@ -778,19 +789,15 @@ class SimulationMechanismPort(Protocol):
 
     def has_slider_overrides(self) -> bool: ...
 
-    def simulation_schema_id(self) -> str: ...
+    def simulation_schema_id(self, *, fast_mode: bool = False) -> str: ...
 
-    def simulation_param_fingerprint(self, set_id: Optional[str] = None) -> str: ...
+    def simulation_param_fingerprint(self, set_id: Optional[str] = None, *, fast_mode: bool = False) -> str: ...
 
     def slider_overrides(self, set_id: Optional[str] = None) -> Dict[str, float]: ...
 
-    def apply_overrides_to_text(self, base_text: str, *, set_id: Optional[str] = None) -> str: ...
-
-    def apply_overrides_to_state_network_dsl(self, base_text: str, *, set_id: Optional[str] = None) -> str: ...
-
     def get_mechanism_text(self) -> str: ...
 
-    def apply_wegscheider_resolution_source_rewrite(self, reactions_text: str) -> None: ...
+    def apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> None: ...
 
 
 class SimulationSolverPort(Protocol):
@@ -978,8 +985,7 @@ class SimulationMechanismHelpersPort(Protocol):
     def authoritative_structure_snapshot(
         self,
         *,
-        reactions_text: str,
-        state_network_text: str = "",
+        source: MechanismAuthoringSource,
         units_identity: Sequence[object] = (),
         builder: Callable[[str], object],
     ) -> object: ...

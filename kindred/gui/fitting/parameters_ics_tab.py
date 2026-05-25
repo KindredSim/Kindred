@@ -14,7 +14,15 @@ from kindred.core.simulator.parameter_namespace import build_namespace_from_mech
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
-from kindred.gui.fitting.constants import DEFAULT_PARALLEL_STARTS, FITTING_DEFAULT_SOLVER, INITIAL_PREFIX
+from kindred.gui.fitting.constants import (
+    DEFAULT_PARALLEL_STARTS,
+    FITTING_DEFAULT_SOLVER,
+    FITTING_MAX_NFEV_RANGE,
+    FITTING_METHODS,
+    FITTING_SEED_RANGE,
+    FITTING_SOLVERS,
+    INITIAL_PREFIX,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +333,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         dataset_entries_getter: Callable[[], List[Dict[str, Any]]],
         worker_running_getter: Callable[[], bool],
         dataset_manager_getter: Callable[[], Any],
-        reactions_text_getter: Callable[[], str],
+        mechanism_text_getter: Callable[[], str],
         integration_defaults: Tuple[str, float, float],
         config_defaults: Dict[str, Any],
         initial_parameter_defaults_getter: Optional[Callable[[str, str], tuple[bool, dict[str, float]]]] = None,
@@ -353,7 +361,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._dataset_entries_getter = dataset_entries_getter
         self._worker_running_getter = worker_running_getter
         self._dataset_manager_getter = dataset_manager_getter
-        self._reactions_text_getter = reactions_text_getter
+        self._mechanism_text_getter = mechanism_text_getter
         self._initial_parameter_defaults_getter = initial_parameter_defaults_getter
         # Build UI
         self._build_ui(integration_defaults)
@@ -429,10 +437,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
         algo_form = QtWidgets.QFormLayout()
         self._method_combo = QtWidgets.QComboBox()
-        self._method_combo.addItems(["lm", "trf", "dogbox", "differential_evolution"])
+        self._method_combo.addItems(list(FITTING_METHODS))
         self._method_combo.setCurrentText("trf")
         self._max_eval_spin = QtWidgets.QSpinBox()
-        self._max_eval_spin.setRange(10, 10000)
+        self._max_eval_spin.setRange(*FITTING_MAX_NFEV_RANGE)
         self._max_eval_spin.setValue(1000)
         algo_form.addRow("Method:", self._method_combo)
         algo_form.addRow("Max evaluations:", self._max_eval_spin)
@@ -448,7 +456,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._seed_check = QtWidgets.QCheckBox("Use fixed random seed")
         self._seed_check.setChecked(True)
         self._seed_spin = QtWidgets.QSpinBox()
-        self._seed_spin.setRange(0, 999_999)
+        self._seed_spin.setRange(*FITTING_SEED_RANGE)
         self._seed_spin.setValue(42)
         self._seed_spin.setEnabled(self._seed_check.isChecked())
         self._seed_check.toggled.connect(self._seed_spin.setEnabled)
@@ -481,7 +489,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
         self._integration_solver_combo = QtWidgets.QComboBox(params_group)
         self._integration_solver_combo.setObjectName("global_fit_integration_solver")
-        self._integration_solver_combo.addItems(["Radau", "BDF"])
+        self._integration_solver_combo.addItems(list(FITTING_SOLVERS))
         solver_name, _warning = normalize_solver_name(default_solver)
         self._integration_solver_combo.setCurrentText(solver_name)
 
@@ -533,7 +541,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return f"{base}e{sign}{digits}"
 
         method = str(defaults.get("method", "")).strip().lower()
-        if method in {"lm", "trf", "dogbox", "differential_evolution"}:
+        if method in FITTING_METHODS:
             self._method_combo.setCurrentText(method)
 
         if "max_nfev" in defaults:
@@ -796,14 +804,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self.window(), "No Datasets", "Select at least one dataset to include before adding parameters.")
             return
         available_observables: Dict[str, str] = {}
-        if callable(getattr(self, "_reactions_text_getter", None)):
+        if callable(getattr(self, "_mechanism_text_getter", None)):
             try:
                 from kindred.core.algebra.observable_introspection import extract_observables_from_algebra_text
                 from kindred.core.simulator.algebra_section import extract_algebra_section_text
 
-                reactions_text = str(self._reactions_text_getter() or "")
-                algebra_text = extract_algebra_section_text(reactions_text)
-                mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(reactions_text, initials={}))
+                mechanism_text = str(self._mechanism_text_getter() or "")
+                algebra_text = extract_algebra_section_text(mechanism_text)
+                mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(mechanism_text, initials={}))
                 available_observables = extract_observables_from_algebra_text(
                     algebra_text,
                     mechanism_namespace=mechanism_namespace,
@@ -873,12 +881,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         dialog.show()
 
     def _mechanism_steps_reference_text(self) -> str:
-        reaction_text = str(self._reactions_text_getter() or "")
+        mechanism_text = str(self._mechanism_text_getter() or "")
         try:
-            mechanism = parse_dsl_to_mechanism(reaction_text, initials={})
+            mechanism = parse_dsl_to_mechanism(mechanism_text, initials={})
             step_map = get_step_index_map(mechanism)
         except Exception as exc:
-            return f"Mechanism steps are unavailable until the Reactions text parses.\n\n{exc}"
+            return f"Mechanism steps are unavailable until the mechanism source parses.\n\n{exc}"
 
         lines: list[str] = ["Mechanism Steps", ""]
         if not step_map:
@@ -1655,10 +1663,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
     ) -> Optional[Tuple[str, float, float]]:
         from kindred.core.simulator.solvers import normalize_solver_name
 
-        allowed = ("Radau", "BDF")
         combo = getattr(self, "_integration_solver_combo", None)
         solver_label = str(combo.currentText()).strip() if combo is not None else FITTING_DEFAULT_SOLVER
-        if solver_label not in allowed:
+        if solver_label not in FITTING_SOLVERS:
             solver_label = FITTING_DEFAULT_SOLVER
         solver_method, solver_warning = normalize_solver_name(solver_label)
         if solver_warning and show_messages:

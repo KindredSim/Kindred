@@ -10,7 +10,7 @@ from kindred.core.simulator.wegscheider_symbolic import (
     WegscheiderCyclicityReport,
     WegscheiderResolutionUpdate,
     analyze_wegscheider_cyclicity,
-    apply_wegscheider_resolution_to_source,
+    apply_wegscheider_resolution_to_reactions_text,
     build_wegscheider_resolution_updates,
 )
 
@@ -74,10 +74,10 @@ def _format_resolution_message(
     return (
         "This mechanism has unresolved Wegscheider cyclicity. "
         "Choose the dependent symbolic Keq parameter for each cycle; Kindred will "
-        "add durable parameter algebra to the mechanism source.\n\n"
+        "add durable parameter algebra to the Reactions text.\n\n"
         "Unresolved cycles:\n"
         + "\n".join(cycle_lines)
-        + "\n\nAvailable source updates:\n"
+        + "\n\nAvailable Reactions updates:\n"
         + "\n".join(update_lines)
     )
 
@@ -154,7 +154,7 @@ def resolve_wegscheider_cyclicity_for_gui(
     else:
         raise WegscheiderResolutionUnavailable("No Wegscheider resolution chooser is available.")
     updates = build_wegscheider_resolution_updates(report, choices)
-    rewritten = apply_wegscheider_resolution_to_source(str(reactions_text or ""), updates)
+    rewritten = apply_wegscheider_resolution_to_reactions_text(str(reactions_text or ""), updates)
 
     reparsed = parse_dsl_to_mechanism(rewritten, initials={})
     if isinstance(getattr(reparsed, "metadata", None), dict):

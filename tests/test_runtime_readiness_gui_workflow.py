@@ -51,6 +51,44 @@ def _assert_aoh_same_side_step(mechanism: object) -> None:
     assert aoh_step.net_stoich == {"Ycross": -1.0, "W": 1.0, "PO": 1.0}
 
 
+_STALE_STATE_NETWORK_DSL = "\n".join(
+    [
+        "state: S_old, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+        "state: TS_old, kind=TS, energy=10, energy_unit=kJ/mol, degeneracy=1",
+        "state: P_old, kind=GS, energy=-1, energy_unit=kJ/mol, degeneracy=1",
+        "edge: S_old,TS_old",
+        "edge: TS_old,P_old",
+    ]
+)
+
+
+def _seed_authoritative_mechanism_source(
+    main_window,
+    *,
+    reactions_text: str = "reaction: OldA -> OldB; k=1",
+    state_network_dsl: str = _STALE_STATE_NETWORK_DSL,
+) -> None:
+    main_window._mechanism_editor.set_reactions_text(reactions_text, block_signals=True)
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(state_network_dsl)
+    main_window._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+
+
+def _top_level_menu(main_window, title: str) -> QtWidgets.QMenu:
+    normalized = title.replace("&", "")
+    for action in main_window.menuBar().actions():
+        if action.text().replace("&", "") == normalized and action.menu() is not None:
+            return action.menu()
+    raise AssertionError(f"Menu not found: {title}")
+
+
+def _submenu(menu: QtWidgets.QMenu, title: str) -> QtWidgets.QMenu:
+    normalized = title.replace("&", "")
+    for action in menu.actions():
+        if action.text().replace("&", "") == normalized and action.menu() is not None:
+            return action.menu()
+    raise AssertionError(f"Submenu not found: {title}")
+
+
 class _ReadyBatchPool:
     def __init__(self, max_lanes: int, warm_calls: list[dict[str, object]]) -> None:
         self.ready_lane_count = 0
@@ -66,6 +104,168 @@ class _ReadyBatchPool:
 
     def close(self, *, kill: bool = False) -> None:
         return None
+
+
+def test_intervention_example_menu_load_replaces_complete_source(main_window, qt_app):
+    from kindred.io.resources import get_intervention_example_source
+
+    _seed_authoritative_mechanism_source(main_window)
+
+    examples_menu = _top_level_menu(main_window, "Examples")
+    intervention_menu = _submenu(examples_menu, "Intervention Examples")
+    action = next(
+        (candidate for candidate in intervention_menu.actions() if str(candidate.data() or "").strip()),
+        None,
+    )
+    assert action is not None
+    example_id = str(action.data())
+
+    action.trigger()
+    qt_app.processEvents()
+
+    expected_text = get_intervention_example_source(example_id).reactions_text
+    loaded_text = main_window._mechanism_editor._reactions_text.toPlainText()
+    for line in expected_text.splitlines():
+        if line.startswith("initial:"):
+            continue
+        assert line in loaded_text
+    for line in expected_text.splitlines():
+        if line.startswith("initial:"):
+            assert line not in loaded_text
+    assert main_window._status_label.text() == f"Loaded intervention example: {example_id}"
+    assert main_window.mechanism_state_network_dsl_raw() == ""
+    assert "# State Network" not in main_window.get_mechanism_text()
+    assert _STALE_STATE_NETWORK_DSL not in main_window.get_mechanism_text()
+
+
+def test_template_manager_load_replaces_complete_source(main_window, qt_app):
+    from kindred.core.mechanism_source import MechanismAuthoringSource
+
+    _seed_authoritative_mechanism_source(main_window)
+    replacement_text = "reaction: TemplateA -> TemplateB; k=0.25"
+    source = MechanismAuthoringSource.from_parts(
+        reactions_text=replacement_text,
+        state_network_dsl="",
+    )
+    main_window._load_template_from_manager(source)
+    qt_app.processEvents()
+
+    assert main_window.mechanism_reactions_text_raw() == replacement_text
+    assert main_window.mechanism_state_network_dsl_raw() == ""
+    assert "# State Network" not in main_window.get_mechanism_text()
+    assert _STALE_STATE_NETWORK_DSL not in main_window.get_mechanism_text()
+
+
+def test_complete_mechanism_replacement_undo_redo_publishes_only_complete_sources(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    from kindred.core.mechanism_source import MechanismAuthoringSource
+
+    old_reactions = "reaction: OldA -> OldB; k=1"
+    old_state_network = _STALE_STATE_NETWORK_DSL
+    new_reactions = "reaction: NewA -> NewB; k=2"
+    new_state_network = "\n".join(
+        [
+            "state: S_new, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "state: TS_new, kind=TS, energy=8, energy_unit=kJ/mol, degeneracy=1",
+            "state: P_new, kind=GS, energy=-2, energy_unit=kJ/mol, degeneracy=1",
+            "edge: S_new,TS_new",
+            "edge: TS_new,P_new",
+        ]
+    )
+
+    _seed_authoritative_mechanism_source(
+        main_window,
+        reactions_text=old_reactions,
+        state_network_dsl=old_state_network,
+    )
+    main_window._load_template_from_manager(
+        MechanismAuthoringSource.from_parts(
+            reactions_text=new_reactions,
+            state_network_dsl=new_state_network,
+        )
+    )
+    qt_app.processEvents()
+
+    observed_sources: list[tuple[str, str]] = []
+    original_transition = main_window._apply_authoritative_mechanism_transition
+
+    def _record_transition(*args, **kwargs):
+        source = main_window.canonical_mechanism_source()
+        observed_sources.append((source.reactions_text, source.state_network_dsl))
+        return original_transition(*args, **kwargs)
+
+    monkeypatch.setattr(main_window, "_apply_authoritative_mechanism_transition", _record_transition)
+
+    main_window._undo_stack.undo()
+    qt_app.processEvents()
+
+    assert observed_sources
+    assert observed_sources == [(old_reactions, old_state_network)]
+
+    observed_sources.clear()
+    main_window._undo_stack.redo()
+    qt_app.processEvents()
+
+    assert observed_sources
+    assert observed_sources == [(new_reactions, new_state_network)]
+
+
+def test_locked_editor_blocks_complete_source_undo_redo(main_window, qt_app):
+    from kindred.core.mechanism_source import MechanismAuthoringSource
+
+    old_reactions = "reaction: LockedOldA -> LockedOldB; k=1"
+    old_state_network = _STALE_STATE_NETWORK_DSL
+    new_reactions = "reaction: LockedNewA -> LockedNewB; k=2"
+
+    _seed_authoritative_mechanism_source(
+        main_window,
+        reactions_text=old_reactions,
+        state_network_dsl=old_state_network,
+    )
+    main_window._load_template_from_manager(
+        MechanismAuthoringSource.from_parts(
+            reactions_text=new_reactions,
+            state_network_dsl="",
+        )
+    )
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked()
+    assert main_window.canonical_mechanism_source() == MechanismAuthoringSource.from_parts(
+        reactions_text=new_reactions,
+        state_network_dsl="",
+    )
+
+    main_window._undo()
+    qt_app.processEvents()
+
+    assert main_window.canonical_mechanism_source() == MechanismAuthoringSource.from_parts(
+        reactions_text=new_reactions,
+        state_network_dsl="",
+    )
+    assert main_window._status_label.text() == "Allow Editing to undo mechanism changes"
+
+    assert main_window._set_mechanism_edit_locked(False)
+    main_window._undo()
+    qt_app.processEvents()
+
+    assert main_window.canonical_mechanism_source() == MechanismAuthoringSource.from_parts(
+        reactions_text=old_reactions,
+        state_network_dsl=old_state_network,
+    )
+
+    assert main_window._force_lock_editor()
+    main_window._redo()
+    qt_app.processEvents()
+
+    assert main_window.canonical_mechanism_source() == MechanismAuthoringSource.from_parts(
+        reactions_text=old_reactions,
+        state_network_dsl=old_state_network,
+    )
+    assert main_window._status_label.text() == "Allow Editing to redo mechanism changes"
 
 
 def test_pasted_mechanism_runs_through_real_gui_containment(main_window, qtbot, monkeypatch):

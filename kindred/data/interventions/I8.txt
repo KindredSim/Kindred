@@ -1,0 +1,9 @@
+# title: Triggered scavenger addition
+# Adds scavenger when an intermediate accumulates past a threshold.
+reaction: Precursor -> Intermediate; k=0.8
+reaction: Intermediate + Scavenger -> Product; k=1.0
+initial: Precursor=1.0
+initial: Intermediate=0.0
+initial: Scavenger=0.0
+initial: Product=0.0
+intervention: op=trigger; trigger_species=Intermediate; threshold=0.25; direction=rising; action=add; species=Scavenger; amount=0.5; max_count=1; min_interval=0.0

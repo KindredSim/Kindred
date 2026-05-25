@@ -13,13 +13,70 @@ import os
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Mapping
 
 from PySide6.QtCore import QStandardPaths
+
+from kindred.core.mechanism_source import MechanismAuthoringSource
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["Template", "TemplateManager"]
+
+
+_TEMPLATE_FIELDS = frozenset(
+    {
+        "id",
+        "name",
+        "description",
+        "category",
+        "tags",
+        "reactions_text",
+        "state_network_dsl",
+        "created_at",
+        "modified_at",
+        "author",
+    }
+)
+_TEMPLATE_STRING_FIELDS = frozenset(
+    {
+        "id",
+        "name",
+        "description",
+        "category",
+        "reactions_text",
+        "state_network_dsl",
+        "created_at",
+        "modified_at",
+    }
+)
+
+
+def _validate_template_payload(data: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(data, Mapping):
+        raise TypeError("template payload must be a mapping.")
+    missing_fields = sorted(_TEMPLATE_FIELDS - set(data.keys()))
+    if missing_fields:
+        raise ValueError(
+            "template payload is missing required field(s): "
+            + ", ".join(missing_fields)
+        )
+    unknown_fields = sorted(set(data.keys()) - _TEMPLATE_FIELDS)
+    if unknown_fields:
+        raise ValueError(
+            "template payload has unknown field(s): "
+            + ", ".join(unknown_fields)
+        )
+    for field in sorted(_TEMPLATE_STRING_FIELDS):
+        if not isinstance(data[field], str):
+            raise TypeError(f"template payload field {field!r} must be a str.")
+    tags = data["tags"]
+    if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+        raise TypeError("template payload field 'tags' must be a list of str.")
+    author = data["author"]
+    if author is not None and not isinstance(author, str):
+        raise TypeError("template payload field 'author' must be a str or None.")
+    return dict(data)
 
 
 @dataclass
@@ -39,8 +96,10 @@ class Template:
         Template category (e.g., "Kinetics", "Atmospheric", "Polymer")
     tags : list of str
         Searchable tags
-    mechanism_text : str
-        DSL mechanism text
+    reactions_text : str
+        Reaction-layer DSL text
+    state_network_dsl : str
+        State Network DSL text
     created_at : str
         ISO 8601 timestamp
     modified_at : str
@@ -53,7 +112,8 @@ class Template:
     description: str
     category: str
     tags: List[str]
-    mechanism_text: str
+    reactions_text: str
+    state_network_dsl: str
     created_at: str
     modified_at: str
     author: Optional[str] = None
@@ -65,7 +125,15 @@ class Template:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> Template:
         """Create template from dictionary."""
-        return cls(**data)
+        return cls(**_validate_template_payload(data))
+
+    @property
+    def source(self) -> MechanismAuthoringSource:
+        """Return the template as a complete authoring source."""
+        return MechanismAuthoringSource.from_parts(
+            reactions_text=self.reactions_text,
+            state_network_dsl=self.state_network_dsl,
+        )
 
     @staticmethod
     def generate_id(name: str) -> str:
@@ -265,7 +333,7 @@ class TemplateManager:
     def create_template(
         self,
         name: str,
-        mechanism_text: str,
+        source: MechanismAuthoringSource,
         description: str = "",
         category: str = "General",
         tags: Optional[List[str]] = None,
@@ -278,8 +346,8 @@ class TemplateManager:
         ----------
         name : str
             Template name
-        mechanism_text : str
-            DSL mechanism text
+        source : MechanismAuthoringSource
+            Complete mechanism source
         description : str, optional
             Template description
         category : str, optional
@@ -296,6 +364,8 @@ class TemplateManager:
         """
         template_id = Template.generate_id(name)
         now = datetime.now().isoformat()
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be a MechanismAuthoringSource.")
 
         template = Template(
             id=template_id,
@@ -303,7 +373,8 @@ class TemplateManager:
             description=description,
             category=category,
             tags=tags or [],
-            mechanism_text=mechanism_text,
+            reactions_text=source.reactions_text,
+            state_network_dsl=source.state_network_dsl,
             created_at=now,
             modified_at=now,
             author=author,
@@ -316,7 +387,7 @@ class TemplateManager:
         self,
         template_id: str,
         name: Optional[str] = None,
-        mechanism_text: Optional[str] = None,
+        source: Optional[MechanismAuthoringSource] = None,
         description: Optional[str] = None,
         category: Optional[str] = None,
         tags: Optional[List[str]] = None,
@@ -331,8 +402,8 @@ class TemplateManager:
             Template ID to update
         name : str, optional
             New name
-        mechanism_text : str, optional
-            New mechanism text
+        source : MechanismAuthoringSource, optional
+            New complete mechanism source
         description : str, optional
             New description
         category : str, optional
@@ -361,8 +432,11 @@ class TemplateManager:
                 self.delete_template(template_id)
                 template.id = new_id
 
-        if mechanism_text is not None:
-            template.mechanism_text = mechanism_text
+        if source is not None:
+            if not isinstance(source, MechanismAuthoringSource):
+                raise TypeError("source must be a MechanismAuthoringSource.")
+            template.reactions_text = source.reactions_text
+            template.state_network_dsl = source.state_network_dsl
         if description is not None:
             template.description = description
         if category is not None:

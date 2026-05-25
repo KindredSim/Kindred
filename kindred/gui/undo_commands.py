@@ -7,31 +7,28 @@ Each command encapsulates a reversible operation on the mechanism editor.
 
 from __future__ import annotations
 
+from typing import Callable
+
 from PySide6 import QtWidgets, QtGui
 
 __all__ = [
-    "SetMechanismTextCommand",
-    "SetMechanismEditorTextsCommand",
+    "SetPlainTextCommand",
+    "SetMechanismSourceCommand",
     "InsertTextCommand",
     "DeleteTextCommand",
     "ReplaceTextCommand",
 ]
 
 
-class SetMechanismTextCommand(QtGui.QUndoCommand):
-    """
-    Command for setting the entire mechanism text.
-
-    Used for operations like loading a preset, importing a file, or
-    clearing the mechanism.
-    """
+class SetPlainTextCommand(QtGui.QUndoCommand):
+    """Command for setting one plain-text widget."""
 
     def __init__(
         self,
         text_widget: QtWidgets.QPlainTextEdit,
         new_text: str,
         old_text: str,
-        description: str = "Set mechanism text",
+        description: str = "Set text",
     ):
         """
         Initialize command.
@@ -39,13 +36,13 @@ class SetMechanismTextCommand(QtGui.QUndoCommand):
         Parameters
         ----------
         text_widget : QPlainTextEdit
-            The text editor widget
+            The text editor widget.
         new_text : str
             New text to set
         old_text : str
             Previous text (for undo)
         description : str
-            Human-readable description for the undo stack
+            Human-readable description for the undo stack.
         """
         super().__init__(description)
         self._text_widget = text_widget
@@ -59,7 +56,7 @@ class SetMechanismTextCommand(QtGui.QUndoCommand):
             self._text_widget.setPlainText(self._new_text)
         finally:
             self._text_widget.blockSignals(False)
-        # Manually trigger text changed after setting
+        self._text_widget.textChanged.emit()
         self._text_widget.document().contentsChanged.emit()
 
     def undo(self) -> None:
@@ -69,68 +66,42 @@ class SetMechanismTextCommand(QtGui.QUndoCommand):
             self._text_widget.setPlainText(self._old_text)
         finally:
             self._text_widget.blockSignals(False)
-        # Manually trigger text changed after setting
+        self._text_widget.textChanged.emit()
         self._text_widget.document().contentsChanged.emit()
 
 
-class SetMechanismEditorTextsCommand(QtGui.QUndoCommand):
-    """Command for updating authoritative reactions and state-network editors together."""
+class SetMechanismSourceCommand(QtGui.QUndoCommand):
+    """Command for applying complete mechanism authoring sources atomically."""
 
     def __init__(
         self,
-        reactions_widget: QtWidgets.QPlainTextEdit,
-        state_network_editor,
         *,
-        new_reactions_text: str,
-        old_reactions_text: str,
-        new_state_network_dsl: str,
-        old_state_network_dsl: str,
-        description: str = "Set mechanism editor texts",
+        new_source,
+        old_source,
+        apply_source: Callable[[object], None],
+        description: str = "Set mechanism source",
     ):
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         super().__init__(description)
-        self._reactions_widget = reactions_widget
-        self._state_network_editor = state_network_editor
-        self._new_reactions_text = str(new_reactions_text)
-        self._old_reactions_text = str(old_reactions_text)
-        self._new_state_network_dsl = str(new_state_network_dsl)
-        self._old_state_network_dsl = str(old_state_network_dsl)
-
-    def _set_reactions_text(self, text: str) -> None:
-        widget = self._reactions_widget
-        if widget is None:
-            return
-        current_text = widget.toPlainText()
-        if current_text == text:
-            return
-        widget.blockSignals(True)
-        try:
-            widget.setPlainText(text)
-        finally:
-            widget.blockSignals(False)
-        widget.document().contentsChanged.emit()
-
-    def _set_state_network_dsl(self, dsl_text: str) -> None:
-        editor = self._state_network_editor
-        if (
-            editor is None
-            or not hasattr(editor, "get_state_network_dsl")
-            or not hasattr(editor, "set_state_network_dsl")
-        ):
-            return
-        current_text = str(editor.get_state_network_dsl() or "")
-        if current_text == dsl_text:
-            return
-        editor.set_state_network_dsl(dsl_text)
-
-    def _apply(self, reactions_text: str, state_network_dsl: str) -> None:
-        self._set_reactions_text(str(reactions_text))
-        self._set_state_network_dsl(str(state_network_dsl))
+        if not isinstance(new_source, MechanismAuthoringSource):
+            raise TypeError("new_source must be a MechanismAuthoringSource.")
+        if not isinstance(old_source, MechanismAuthoringSource):
+            raise TypeError("old_source must be a MechanismAuthoringSource.")
+        if not callable(apply_source):
+            raise TypeError("apply_source must be callable.")
+        self._new_source = new_source
+        self._old_source = old_source
+        self._apply_source = apply_source
 
     def redo(self) -> None:
-        self._apply(self._new_reactions_text, self._new_state_network_dsl)
+        self._apply_source(self._new_source)
 
     def undo(self) -> None:
-        self._apply(self._old_reactions_text, self._old_state_network_dsl)
+        self._apply_source(self._old_source)
+
+    def targets_complete_mechanism_source_change(self) -> bool:
+        return self._old_source != self._new_source
 
 
 class InsertTextCommand(QtGui.QUndoCommand):

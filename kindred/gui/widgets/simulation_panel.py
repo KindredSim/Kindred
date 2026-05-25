@@ -8,6 +8,10 @@ from typing import Callable, Optional
 from PySide6 import QtWidgets
 
 from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.gui.project_schema import (
+    SIMULATION_NUM_POINTS_RANGE,
+    SIMULATION_TEMPERATURE_K_RANGE,
+)
 
 # Direct imports required to avoid circular dependency with widgets/__init__.py
 from kindred.gui.widgets.batch_initial_conditions_table import (
@@ -79,7 +83,7 @@ class SimulationPanel(QtWidgets.QWidget):
         self.sim_time_spinbox.textChanged.connect(lambda _v: on_solver_summary_refresh())
 
         self.num_points_spinbox = QtWidgets.QSpinBox(controls_row_widget)
-        self.num_points_spinbox.setRange(10, 100000)  # 10 to 100k points
+        self.num_points_spinbox.setRange(*SIMULATION_NUM_POINTS_RANGE)
         self.num_points_spinbox.setValue(100)
         self.num_points_spinbox.setToolTip("Number of points in the simulation output")
         self.num_points_spinbox.setMaximumWidth(140)
@@ -104,7 +108,7 @@ class SimulationPanel(QtWidgets.QWidget):
         self.temperature_label = QtWidgets.QLabel("T:", controls_row_widget)
         self.temperature_label.setVisible(False)
         self.temperature_spinbox = QtWidgets.QDoubleSpinBox(controls_row_widget)
-        self.temperature_spinbox.setRange(0.1, 10000.0)
+        self.temperature_spinbox.setRange(*SIMULATION_TEMPERATURE_K_RANGE)
         self.temperature_spinbox.setValue(298.15)
         self.temperature_spinbox.setDecimals(2)
         self.temperature_spinbox.setSuffix(" K")

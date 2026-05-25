@@ -250,16 +250,16 @@ def test_prepared_bound_mechanism_recomputes_dependent_keq_without_reparse():
     assert values["kr3"] == pytest.approx(12.0)
 
 
-def test_source_resolution_writes_durable_param_line_and_reparse_resolves():
+def test_reactions_text_resolution_writes_durable_param_line_and_reparse_resolves():
     from kindred.core.simulator.wegscheider_symbolic import (
         analyze_wegscheider_cyclicity,
-        apply_wegscheider_resolution_to_source,
+        apply_wegscheider_resolution_to_reactions_text,
         build_wegscheider_resolution_updates,
     )
 
     report = analyze_wegscheider_cyclicity(_enabled_mechanism(PBM_STOICHIOMETRIC_CYCLE))
     updates = build_wegscheider_resolution_updates(report, {"cycle_1": "Keq3"})
-    updated = apply_wegscheider_resolution_to_source(PBM_STOICHIOMETRIC_CYCLE, updates)
+    updated = apply_wegscheider_resolution_to_reactions_text(PBM_STOICHIOMETRIC_CYCLE, updates)
 
     assert "param Keq3 = 1 / (Keq1 * Keq2)" in updated
     reparsed_report = analyze_wegscheider_cyclicity(_enabled_mechanism(updated))
@@ -267,12 +267,12 @@ def test_source_resolution_writes_durable_param_line_and_reparse_resolves():
     assert reparsed_report.cycles[0].resolved_by == "Keq3"
 
 
-def test_source_resolution_replaces_existing_bad_param_line_instead_of_duplicating():
+def test_reactions_text_resolution_replaces_existing_bad_param_line_instead_of_duplicating():
     from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
     from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
     from kindred.core.simulator.wegscheider_symbolic import (
         analyze_wegscheider_cyclicity,
-        apply_wegscheider_resolution_to_source,
+        apply_wegscheider_resolution_to_reactions_text,
         build_wegscheider_resolution_updates,
     )
 
@@ -283,7 +283,7 @@ def test_source_resolution_replaces_existing_bad_param_line_instead_of_duplicati
     report = analyze_wegscheider_cyclicity(_enabled_mechanism(PBM_STOICHIOMETRIC_CYCLE))
     updates = build_wegscheider_resolution_updates(report, {"cycle_1": "Keq3"})
 
-    updated = apply_wegscheider_resolution_to_source(bad_source, updates)
+    updated = apply_wegscheider_resolution_to_reactions_text(bad_source, updates)
 
     assert updated.count("param Keq3 =") == 1
     assert "param Keq3 = 1 / (Keq1 * Keq2)" in updated

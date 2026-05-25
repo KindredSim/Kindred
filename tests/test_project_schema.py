@@ -1,13 +1,18 @@
 """Tests for kindred.gui.project_schema — single source of truth for project defaults."""
+import math
 import os
+import sys
 
 import pytest
 
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+from kindred.gui.fitting.constants import FITTING_MAX_NFEV_RANGE, FITTING_SEED_RANGE
+from kindred.gui.project_schema import SIMULATION_NUM_POINTS_RANGE
+
 
 EXPECTED_KEYS = {
-    "mechanism",
+    "mechanism_source",
     "notes",
-    "state_network",
     "batch_initial_conditions",
     "solver",
     "rtol",
@@ -32,6 +37,16 @@ EXPECTED_KEYS = {
 }
 
 
+def _complete_current_project_payload() -> dict[str, object]:
+    from kindred.gui.project_schema import get_default_project_payload
+
+    payload = get_default_project_payload()
+    payload["version"] = "test"
+    payload["solver_method"] = str(payload["solver"])
+    payload["solver_warning"] = None
+    return payload
+
+
 @pytest.mark.unit
 class TestProjectDefaults:
     def test_schema_completeness(self):
@@ -45,20 +60,25 @@ class TestProjectDefaults:
 
         first = get_default_project_payload()
         first["batch_initial_conditions"]["A"] = 1.0
-        first["mechanism"] = "mutated"
+        first["mechanism_source"]["reactions_text"] = "mutated"
 
         second = get_default_project_payload()
         assert second["batch_initial_conditions"] == {}
-        assert second["mechanism"] == ""
+        assert second["mechanism_source"] == {
+            "reactions_text": "",
+            "state_network_dsl": "",
+        }
 
     def test_default_payload_types_and_authoritative_values(self):
         from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
         from kindred.gui.project_schema import PROJECT_DEFAULTS, get_default_project_payload
 
         p = get_default_project_payload()
-        assert isinstance(p["mechanism"], str)
+        assert "project_schema_version" not in p
+        assert isinstance(p["mechanism_source"], dict)
+        assert isinstance(p["mechanism_source"]["reactions_text"], str)
+        assert isinstance(p["mechanism_source"]["state_network_dsl"], str)
         assert isinstance(p["notes"], str)
-        assert isinstance(p["state_network"], str)
         assert isinstance(p["batch_initial_conditions"], dict)
         assert isinstance(p["solver"], str)
         assert isinstance(p["rtol"], float)
@@ -83,10 +103,132 @@ class TestProjectDefaults:
             == PROJECT_DEFAULTS["max_parallel_batch_workers"]
         )
 
-    def test_schema_version_matches(self):
-        from kindred.gui.project_schema import PROJECT_SCHEMA_VERSION
+    def test_project_payload_contract_has_no_schema_version_surface(self):
+        import kindred.gui.project_schema as project_schema
 
-        assert PROJECT_SCHEMA_VERSION == 4
+        payload = project_schema.get_default_project_payload()
+
+        assert "PROJECT_SCHEMA_VERSION" not in project_schema.__all__
+        assert not hasattr(project_schema, "PROJECT_SCHEMA_VERSION")
+        assert "project_schema_version" not in project_schema.PROJECT_DEFAULTS
+        assert "project_schema_version" not in payload
+
+    @pytest.mark.parametrize("legacy_key", ["project_schema_version", "mechanism", "state_network", "use_advanced_dsl"])
+    def test_current_project_payload_rejects_unknown_top_level_fields(self, legacy_key):
+        from kindred.gui.project_schema import validate_project_payload
+
+        payload = _complete_current_project_payload()
+        payload[legacy_key] = "legacy"
+
+        with pytest.raises(ValueError, match=legacy_key):
+            validate_project_payload(payload)
+
+    @pytest.mark.parametrize(
+        "missing_key",
+        ["version", "notes", "batch_initial_conditions", "temperature_K", "num_points", "fitting_solver"],
+    )
+    def test_current_project_payload_rejects_missing_required_fields(self, missing_key):
+        from kindred.gui.project_schema import validate_project_payload
+
+        payload = _complete_current_project_payload()
+        del payload[missing_key]
+
+        with pytest.raises(ValueError, match=missing_key):
+            validate_project_payload(payload)
+
+    def test_current_project_payload_rejects_inconsistent_solver_metadata(self):
+        from kindred.gui.project_schema import validate_project_payload
+
+        payload = _complete_current_project_payload()
+        payload["solver"] = "BDF"
+        payload["solver_method"] = "Radau"
+        payload["solver_warning"] = None
+
+        with pytest.raises(ValueError, match="solver_method"):
+            validate_project_payload(payload)
+
+    @pytest.mark.parametrize(
+        "field",
+        ["rtol", "atol", "temperature_K", "fitting_ftol", "fitting_xtol", "fitting_rtol", "fitting_atol"],
+    )
+    @pytest.mark.parametrize(
+        "bad_value",
+        [math.nan, math.inf, -math.inf, 0.0, -1.0, sys.float_info.max],
+    )
+    def test_current_project_payload_rejects_invalid_positive_numeric_fields(self, field, bad_value):
+        from kindred.gui.project_schema import validate_project_payload
+
+        payload = _complete_current_project_payload()
+        payload[field] = bad_value
+
+        with pytest.raises(ValueError, match=field):
+            validate_project_payload(payload)
+
+    def test_current_project_payload_accepts_ui_supported_large_fitting_tolerances(self):
+        from kindred.gui.project_schema import validate_project_payload
+
+        payload = _complete_current_project_payload()
+        payload["fitting_ftol"] = 10.0
+        payload["fitting_xtol"] = 10.0
+        payload["fitting_rtol"] = 10.0
+        payload["fitting_atol"] = 10.0
+
+        validate_project_payload(payload)
+
+    @pytest.mark.parametrize(
+        ("field", "bad_value"),
+        [
+            ("num_points", SIMULATION_NUM_POINTS_RANGE[0] - 1),
+            ("num_points", SIMULATION_NUM_POINTS_RANGE[1] + 1),
+            ("max_parallel_batch_workers", 0),
+            ("max_parallel_batch_workers", int(MAX_PARALLEL_WORKERS_CEILING) + 1),
+            ("batch_runtime_lane_budget", 0),
+            ("batch_runtime_lane_budget", int(MAX_PARALLEL_WORKERS_CEILING) + 1),
+            ("fitting_max_nfev", FITTING_MAX_NFEV_RANGE[0] - 1),
+            ("fitting_max_nfev", FITTING_MAX_NFEV_RANGE[1] + 1),
+            ("fitting_seed", FITTING_SEED_RANGE[0] - 1),
+            ("fitting_seed", FITTING_SEED_RANGE[1] + 1),
+        ],
+    )
+    def test_current_project_payload_rejects_integer_fields_outside_current_ui_ranges(
+        self,
+        field,
+        bad_value,
+    ):
+        from kindred.gui.project_schema import validate_project_payload
+
+        payload = _complete_current_project_payload()
+        payload[field] = bad_value
+
+        with pytest.raises(ValueError, match=field):
+            validate_project_payload(payload)
+
+    @pytest.mark.parametrize(
+        ("field", "bad_value"),
+        [
+            ("simulation_time", ""),
+            ("simulation_time", "not-a-number"),
+            ("simulation_time", "nan"),
+            ("simulation_time", "inf"),
+            ("simulation_time", "0"),
+            ("simulation_time", "-1"),
+            ("simulation_time", str(sys.float_info.max)),
+            ("fitting_method", "bogus"),
+            ("fitting_solver", "bogus"),
+        ],
+    )
+    def test_current_project_payload_rejects_semantically_invalid_string_fields(
+        self,
+        field,
+        bad_value,
+    ):
+        from kindred.gui.project_schema import validate_project_payload
+
+        payload = _complete_current_project_payload()
+        payload[field] = bad_value
+
+        with pytest.raises(ValueError, match=field):
+            validate_project_payload(payload)
 
     def test_runtime_default_batch_workers_caps_high_cpu_count(self):
         from kindred.core import runtime_defaults

@@ -3038,7 +3038,6 @@ def prepare_bound_mechanism(
     *,
     temperature_K: float = 298.15,
     initials: Optional[Dict[str, float]] = None,
-    use_advanced_dsl: bool = True,
     wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 ) -> BoundMechanism:
     """
@@ -3054,8 +3053,6 @@ def prepare_bound_mechanism(
     initials = initials or {}
     units = UnitsModel(temperature_K=temperature_K)
 
-    if not use_advanced_dsl:
-        logger.debug("Legacy basic DSL mode requested; using advanced parser instead.")
     try:
         mechanism = parse_dsl_to_mechanism(mechanism_text, initials=initials, units=units)
     except Exception as exc:
@@ -3280,7 +3277,6 @@ def prepare_fitting_objective_context(
             param_names=param_names,
             temperature_K=temperature_K,
             initials=initials,
-            use_advanced_dsl=True,
             wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         )
         requested_parameter_partition = partition_simulation_parameter_values(
@@ -3446,7 +3442,6 @@ def build_prepared_simulation_func(
             param_names=list(param_names or []),
             temperature_K=float(temperature_K),
             initials={},
-            use_advanced_dsl=True,
             wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         )
         metadata_requested_partition = partition_simulation_parameter_values(

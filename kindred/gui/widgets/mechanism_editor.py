@@ -35,6 +35,7 @@ class _PersistentToggleMenu(QtWidgets.QMenu):
 class MechanismEditorTabbed(QtWidgets.QWidget):
     speciesModeChanged = Signal(bool)
     speciesResetRequested = Signal()
+    mechanismInspectRequested = Signal()
 
     """
     Mechanism editor with Reactions and Notes tabs.
@@ -83,6 +84,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_edit_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
         self._reactions_edit_btn.hide()
         reactions_header_row.addWidget(self._reactions_edit_btn)
+        self.inspect_mechanism_btn = QtWidgets.QPushButton("Inspect...", self)
+        self.inspect_mechanism_btn.setObjectName("mechanismInspectorOpenButton")
+        self.inspect_mechanism_btn.setToolTip("Open a read-only Mechanism Inspector")
+        self.inspect_mechanism_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
+        self.inspect_mechanism_btn.clicked.connect(lambda _checked=False: self.mechanismInspectRequested.emit())
+        reactions_header_row.addWidget(self.inspect_mechanism_btn)
         reactions_header_row.addStretch()
         self._run_btn = QtWidgets.QPushButton("\u25b6 Run")
         run_font = self._run_btn.font()
@@ -312,9 +319,16 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "intervention: op=clear; species=A; time=4.0\n"
             "intervention: op=pulse; species=A; start=1.0; every=0.5; count=4; amount=0.2\n"
             "intervention: op=source; species=B; start=0.0; end=5.0; rate=0.1\n"
+            "intervention: op=sink; species=B; start=0.0; end=5.0; rate=0.1\n"
             "intervention: op=reservoir; species=O2; start=0.0; end=10.0; value=1.0\n"
+            "intervention: op=clamp; species=light; start=0.0; end=10.0; value=1.0\n"
+            "intervention: op=repeated_interval; kind=source; species=A; start=0.0; every=2.0; duration=0.5; count=3; rate=0.25\n"
+            "intervention: op=protocol; kind=repeat; name=light_cycle; start=0.0; every=2.0; duration=1.0; count=3; during=reservoir:light:value=1.0; after=clear:light\n"
             "intervention: op=trigger; trigger_species=A; threshold=0.8; direction=falling; action=add; species=B; amount=0.1; max_count=1; min_interval=0.0\n"
-            "Fittable fields: instant time_param/value_param/amount_param; pulse start_param/every_param/amount_param; interval start_param/end_param/value_param/rate_param; trigger threshold_param/value_param/amount_param.\n"
+            "Fittable fields: instant time_param/value_param/amount_param; pulse start_param/every_param/amount_param; interval start_param/end_param/value_param/rate_param; repeated interval start_param/every_param/duration_param/value_param/rate_param; protocol start_param/every_param/duration_param and phase value_param/rate_param/amount_param; trigger threshold_param/value_param/amount_param.\n"
+            "Protected indexed names such as K1, k1, kf1, kr1, and Keq1 resolve through the mechanism parameter namespace; use a longer ordinary name such as K1_test for an independent schedule parameter.\n"
+            "Use Examples &gt; Intervention Examples for runnable current examples, including repeated intervals and repeat protocol cycles built from primitive operations.\n"
+            "Use Inspect... to open the Mechanism Inspector for read-only step numbers, symbolic RHS equations, and compiled intervention schedule payloads from core authorities.\n"
             "Solved schedule events and intervals can be shown as optional main-plot annotations from solver provenance; they are off by default and controlled from the plot context menu.\n"
             "\n"
             "<b>Algebra Declarations and Observables</b>\n"
@@ -527,9 +541,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     def _validate_dsl(self):
         """Validate DSL text and update validation indicator."""
         text = self._reactions_text.toPlainText()
+        state_network_dsl = self._state_network_editor.get_state_network_dsl()
 
         # Skip validation if text is empty
-        if not text.strip():
+        if not text.strip() and not str(state_network_dsl or "").strip():
             self._set_validation_state("idle")
             return
 
@@ -543,13 +558,20 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
                 apply_parameter_algebra_to_mechanism,
                 parameter_algebra_spec_from_mechanism,
             )
+            from kindred.core.mechanism_source import MechanismAuthoringSource
 
             parse_text = strip_named_reaction_dsl_initial_concentration_sets(text)
+            if str(state_network_dsl or "").strip() and not self._state_network_editor.is_valid():
+                raise ValueError("Invalid State Network")
+            validation_text = MechanismAuthoringSource.from_parts(
+                reactions_text=parse_text,
+                state_network_dsl=state_network_dsl,
+            ).full_dsl
 
             # Parse with empty initials (will be populated from DSL)
-            mechanism = parse_dsl_to_mechanism(parse_text, initials={})
+            mechanism = parse_dsl_to_mechanism(validation_text, initials={})
             _ = apply_parameter_algebra_to_mechanism(
-                parse_text,
+                validation_text,
                 mechanism=mechanism,
                 require_mutable=False,
             )

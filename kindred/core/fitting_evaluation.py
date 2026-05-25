@@ -529,7 +529,6 @@ def prepare_fitting_execution_context(
         param_names=list(param_names or []),
         temperature_K=float(temperature_K),
         initials={},
-        use_advanced_dsl=True,
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
     requested_partition = partition_simulation_parameter_values(

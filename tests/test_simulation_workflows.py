@@ -61,7 +61,7 @@ def test_main_window_override_materialization_preserves_dg_authority_without_kr(
     main_window._mechanism_editor._reactions_text.setPlainText(source)
     main_window._extract_and_populate_variables()
 
-    updated = main_window._apply_overrides_to_text(source, overrides={"kf1": 7.0})
+    updated = main_window._apply_reactions_overrides_to_text(source, overrides={"kf1": 7.0})
 
     assert "kf=7" in updated
     assert "dG_eq=-1.0" in updated
@@ -74,7 +74,7 @@ def test_main_window_kf_edit_refreshes_derived_kr_readout_for_dg_authority(main_
     main_window._mechanism_editor._reactions_text.setPlainText(source)
     main_window._extract_and_populate_variables()
 
-    main_window._update_variable_in_mechanism("kf1", 12.0, commit=True)
+    main_window._commit_slider_value("kf1", 12.0)
 
     variables = main_window._mechanism_editor._variable_sliders.get_variables()
     assert variables["kf1"] == pytest.approx(12.0)
@@ -93,7 +93,7 @@ def test_main_window_kf_edit_refreshes_derived_kr_readout_with_cm_std_ratio(main
     main_window._mechanism_editor._reactions_text.setPlainText(source)
     main_window._extract_and_populate_variables()
 
-    main_window._update_variable_in_mechanism("kf1", 20.0, commit=True)
+    main_window._commit_slider_value("kf1", 20.0)
 
     variables = main_window._mechanism_editor._variable_sliders.get_variables()
     assert variables["kf1"] == pytest.approx(20.0)

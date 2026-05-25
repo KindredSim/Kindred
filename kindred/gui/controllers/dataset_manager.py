@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -13,18 +12,6 @@ from kindred.core.simulator.dsl import extract_parameters_from_dsl
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class FitJob:
-    """Snapshot of a dataset fit request."""
-
-    dataset_name: str
-    dataset: Dict[str, Any]
-    param_names: List[str]
-    objective: Callable[[np.ndarray], np.ndarray]
-    t_exp: np.ndarray
-    target_species: str
 
 
 @dataclass
@@ -364,178 +351,8 @@ class DatasetManager:
         return hashlib.md5(payload.encode("utf-8"), usedforsecurity=False).hexdigest()
 
     # ------------------------------------------------------------------
-    # Fitting orchestration
-    # ------------------------------------------------------------------
-    def prepare_fit_job(
-        self,
-        config: Dict[str, Any],
-        mechanism_text: str,
-        state_network_text: str,
-        temperature_K: float,
-        preferred_target_species: Optional[str] = None,
-    ) -> FitJob:
-        """
-        Prepare a fit job without executing it.
-
-        Parameters
-        ----------
-        config : dict
-            Fitting configuration including dataset name, parameters, bounds, method, etc.
-        mechanism_text : str
-            DSL mechanism text
-        state_network_text : str
-            State network DSL text (optional)
-        temperature_K : float
-            Temperature in Kelvin
-        preferred_target_species : str, optional
-            Species name to use for fitting. If None, will attempt to infer from
-            visible series in the plot or fall back to first species with a warning.
-
-        Returns
-        -------
-        FitJob
-            Prepared fit job containing objective function and metadata.
-        """
-        dataset_name = config["dataset"]
-        dataset = self._dataset_resolver(dataset_name)
-        if not dataset:
-            raise DatasetManagerError(f"Dataset '{dataset_name}' not found.")
-
-        settings = self.get_fit_settings(dataset_name)
-        species = dataset.get("species") or {}
-        if not species:
-            raise DatasetManagerError("Dataset has no species data.")
-
-        # Determine target species with explicit fallback logic
-        target_species = None
-
-        # First priority: use preferred_target_species if provided
-        if preferred_target_species:
-            if preferred_target_species in species:
-                target_species = preferred_target_species
-                logger.info(f"Using user-specified target species: {target_species}")
-            else:
-                logger.warning(
-                    f"Preferred target species '{preferred_target_species}' not found in dataset. "
-                    f"Available species: {list(species.keys())}"
-                )
-
-        # Fallback: use first species key with a warning
-        if target_species is None:
-            target_species = list(species.keys())[0]
-            logger.warning(
-                f"No target species specified or selection unavailable. "
-                f"Defaulting to first species: '{target_species}'. "
-                f"Consider explicitly selecting a target species for fitting."
-            )
-
-        logger.info(f"Fitting target species: {target_species}")
-
-        t_exp = np.asarray(dataset["t"])
-        y_exp = species[target_species]
-
-        from kindred.core.fitting_objective import build_fitting_objective
-
-        param_names = list(config["parameters"].keys())
-        mechanism_payload = mechanism_text
-
-        def _has_state_network_header(text: str) -> bool:
-            return bool(re.search(r"(?im)^\s*#\s*state\s+network\b", text or ""))
-
-        state_network_clean = str(state_network_text or "").strip()
-        if state_network_clean and not _has_state_network_header(mechanism_payload):
-            mechanism_payload += "\n\n# State Network\n" + state_network_clean
-
-        solver_settings: Dict[str, Any] = {}
-        if callable(getattr(self, "_solver_settings_getter", None)):
-            try:
-                solver_settings = dict(self._solver_settings_getter() or {})
-            except Exception:
-                solver_settings = {}
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
-
-        solver_label = str(solver_settings.get("solver") or DEFAULT_SOLVER_NAME).strip() or DEFAULT_SOLVER_NAME
-        solver_name, solver_warning = normalize_solver_name(solver_label)
-        if solver_warning:
-            logger.warning("Solver normalization: %s (requested=%r)", solver_warning, solver_label)
-        rtol = float(solver_settings.get("rtol") or 1e-6)
-        atol = float(solver_settings.get("atol") or 1e-12)
-        wegscheider_enabled = bool(
-            solver_settings.get(
-                "wegscheider_cyclicity_enabled",
-                PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
-            )
-        )
-        solver_settings.setdefault("solver_label", str(solver_label))
-        solver_settings["solver"] = str(solver_name)
-        solver_settings["solver_warning"] = str(solver_warning) if solver_warning else None
-        solver_settings["rtol"] = float(rtol)
-        solver_settings["atol"] = float(atol)
-        solver_settings["wegscheider_cyclicity_enabled"] = bool(wegscheider_enabled)
-
-        objective = build_fitting_objective(
-            mechanism_text=mechanism_payload,
-            param_names=param_names,
-            t_exp=t_exp,
-            y_exp=y_exp,
-            target_species=target_species,
-            temperature_K=temperature_K,
-            initials=dict(settings.initial_conditions),
-            solver=solver_name,
-            rtol=rtol,
-            atol=atol,
-            wegscheider_cyclicity_enabled=wegscheider_enabled,
-        )
-
-        return FitJob(
-            dataset_name=dataset_name,
-            dataset=dataset,
-            param_names=param_names,
-            objective=objective,
-            t_exp=t_exp,
-            target_species=target_species,
-        )
-
-    def finalize_fit_job(self, job: FitJob, result: Any) -> None:
-        """Update dataset visuals using the finished fit result."""
-        model_y = self._rebuild_fit_series(job.objective, job.param_names, result)
-
-        entry = self._dataset_views.get(job.dataset_name)
-        if entry is None:
-            entry = self._prepare_dataset_entry(job.dataset_name, job.dataset)
-            self._dataset_views[job.dataset_name] = entry
-
-        if job.target_species in entry.get("species", {}):
-            entry["series_name"] = job.target_species
-            entry["data_y"] = entry["species"][job.target_species]
-
-        entry["model_x"] = job.t_exp
-        entry["model_y"] = model_y
-        entry["model_series"] = {job.target_species: model_y} if model_y is not None else None
-        entry["chi_squared"] = self._result_value(result, "chi_squared")
-        entry["r_squared"] = self._result_value(result, "r_squared")
-
-        self._update_dataset_plot(job.dataset_name)
-        self._refresh_dataset_grid()
-
-    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _rebuild_fit_series(self, objective, param_names: Sequence[str], result) -> Optional[np.ndarray]:
-        """Regenerate fitted model series for visualization."""
-        try:
-            parameters = self._result_value(result, "parameters") or {}
-            opt_vector = np.array([parameters[name] for name in param_names])
-            residuals_opt = objective(opt_vector)
-            model_y = getattr(objective, "last_model", None)
-            if model_y is None and hasattr(objective, "y_exp"):
-                model_y = objective.y_exp + residuals_opt
-            if model_y is not None:
-                return np.asarray(model_y)
-        except Exception as exc:  # pragma: no cover - visualization best effort
-            logger.warning("Failed to rebuild fitted series: %s", exc)
-        return None
-
     def _prepare_dataset_entry(self, name: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize dataset payload for visualization."""
         species = data.get("species", {})

@@ -1,0 +1,7 @@
+# title: Bolus reagent addition
+# Adds a limiting reagent once so product formation starts after the dose.
+reaction: A + B -> Product; k=0.8
+initial: A=1.0
+initial: B=0.0
+initial: Product=0.0
+intervention: op=add; species=B; time=1.0; amount=0.5

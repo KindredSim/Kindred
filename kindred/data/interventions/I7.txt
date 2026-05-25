@@ -1,0 +1,7 @@
+# title: Light-dark photocatalysis cycle
+# Builds an on/off illumination cycle from repeat protocol phases.
+reaction: Substrate + Light -> Product + Light; k=0.6
+initial: Substrate=1.0
+initial: Light=0.0
+initial: Product=0.0
+intervention: op=protocol; kind=repeat; name=user_light_cycle; start=0.0; every=2.0; duration=1.0; count=3; during=reservoir:Light:value=1.0; after=clear:Light

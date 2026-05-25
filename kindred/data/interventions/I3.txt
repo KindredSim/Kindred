@@ -1,0 +1,6 @@
+# title: Continuous nutrient feed
+# Adds nutrient at a steady rate during a single feed phase.
+reaction: Nutrient -> Product; k=0.4
+initial: Nutrient=0.0
+initial: Product=0.0
+intervention: op=source; species=Nutrient; start=0.0; end=4.0; rate=0.2

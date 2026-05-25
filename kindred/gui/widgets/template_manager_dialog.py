@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.config.templates import Template, TemplateManager
+from kindred.core.mechanism_source import MechanismAuthoringSource
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         self,
         parent: Optional[QtWidgets.QWidget] = None,
         template: Optional[Template] = None,
-        mechanism_text: str = "",
+        mechanism_source: Optional[MechanismAuthoringSource] = None,
     ):
         """
         Initialize template editor dialog.
@@ -38,8 +39,8 @@ class TemplateEditorDialog(QtWidgets.QDialog):
             Parent widget
         template : Template, optional
             Existing template to edit (None for new template)
-        mechanism_text : str, optional
-            Mechanism text (for new templates)
+        mechanism_source : MechanismAuthoringSource, optional
+            Complete mechanism source for new templates.
         """
         super().__init__(parent)
         self._template = template
@@ -110,9 +111,10 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         self._mechanism_edit = QtWidgets.QPlainTextEdit()
         self._mechanism_edit.setFont(QtGui.QFont("Courier New", 10))
         if template:
-            self._mechanism_edit.setPlainText(template.mechanism_text)
+            self._mechanism_edit.setPlainText(template.source.full_dsl)
         else:
-            self._mechanism_edit.setPlainText(mechanism_text)
+            source = mechanism_source or MechanismAuthoringSource()
+            self._mechanism_edit.setPlainText(source.full_dsl)
         layout.addWidget(self._mechanism_edit, stretch=1)
 
         # Button box
@@ -158,13 +160,14 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         tags_text = self._tags_edit.text().strip()
         tags = [t.strip() for t in tags_text.split(',') if t.strip()]
 
+        source = MechanismAuthoringSource.from_full_dsl_text(self._mechanism_edit.toPlainText().strip())
         return {
             'name': self._name_edit.text().strip(),
             'category': self._category_combo.currentText().strip(),
             'tags': tags,
             'author': self._author_edit.text().strip() or None,
             'description': self._description_edit.toPlainText().strip(),
-            'mechanism_text': self._mechanism_edit.toPlainText().strip(),
+            'source': source,
         }
 
 
@@ -176,13 +179,13 @@ class TemplateManagerDialog(QtWidgets.QDialog):
     """
 
     # Signal emitted when user wants to load a template
-    templateLoadRequested = QtCore.Signal(str)  # mechanism_text
+    templateLoadRequested = QtCore.Signal(MechanismAuthoringSource)
 
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget] = None,
         template_manager: Optional[TemplateManager] = None,
-        current_mechanism_text: str = "",
+        current_mechanism_source: Optional[MechanismAuthoringSource] = None,
     ):
         """
         Initialize template manager dialog.
@@ -193,12 +196,12 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             Parent widget
         template_manager : TemplateManager, optional
             Template manager instance (creates new if None)
-        current_mechanism_text : str, optional
-            Current mechanism text (for creating templates)
+        current_mechanism_source : MechanismAuthoringSource, optional
+            Current complete mechanism source for creating templates.
         """
         super().__init__(parent)
         self._template_manager = template_manager or TemplateManager()
-        self._current_mechanism_text = current_mechanism_text
+        self._current_mechanism_source = current_mechanism_source or MechanismAuthoringSource()
         self._current_template: Optional[Template] = None
 
         self.setWindowTitle("Template Manager")
@@ -422,7 +425,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
         self._modified_label.setText(modified_str)
         self._description_text.setPlainText(template.description)
-        self._preview_text.setPlainText(template.mechanism_text)
+        self._preview_text.setPlainText(template.source.full_dsl)
 
     def _clear_preview(self):
         """Clear template preview."""
@@ -438,7 +441,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         """Handle New button clicked."""
         dialog = TemplateEditorDialog(
             parent=self,
-            mechanism_text=self._current_mechanism_text
+            mechanism_source=self._current_mechanism_source,
         )
 
         if dialog.exec() == QtWidgets.QDialog.Accepted:
@@ -543,6 +546,5 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         if not self._current_template:
             return
 
-        # Emit signal with mechanism text
-        self.templateLoadRequested.emit(self._current_template.mechanism_text)
+        self.templateLoadRequested.emit(self._current_template.source)
         self.accept()

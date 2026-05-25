@@ -26,7 +26,7 @@ __all__ = [
     "WegscheiderCyclicityReport",
     "WegscheiderResolutionUpdate",
     "analyze_wegscheider_cyclicity",
-    "apply_wegscheider_resolution_to_source",
+    "apply_wegscheider_resolution_to_reactions_text",
     "build_wegscheider_resolution_updates",
     "validate_wegscheider_cyclicity_resolved",
 ]
@@ -311,7 +311,7 @@ def build_wegscheider_resolution_updates(
     return tuple(updates)
 
 
-def apply_wegscheider_resolution_to_source(
+def apply_wegscheider_resolution_to_reactions_text(
     dsl_text: str,
     updates: Sequence[WegscheiderResolutionUpdate],
 ) -> str:

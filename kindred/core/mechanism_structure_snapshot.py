@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
+from kindred.core.mechanism_source import MechanismAuthoringSource
+
 
 def _normalize_text_for_identity(text: str) -> str:
     return "\n".join(" ".join(str(line).split()) for line in str(text or "").splitlines()).strip()
@@ -33,16 +35,15 @@ class MechanismStructureSnapshotOwner:
     def snapshot_for(
         self,
         *,
-        reactions_text: str,
-        state_network_text: str = "",
+        source: MechanismAuthoringSource,
         units_identity: Sequence[object] | None = None,
         builder: Callable[[str], object],
     ) -> MechanismStructureSnapshot:
-        reactions_s = str(reactions_text or "")
-        state_network_s = str(state_network_text or "")
-        full_dsl = reactions_s
-        if state_network_s.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_s.strip("\n")
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be a MechanismAuthoringSource.")
+        reactions_s = str(source.reactions_text or "")
+        state_network_s = str(source.state_network_dsl or "")
+        full_dsl = source.full_dsl
         identity = (
             _normalize_text_for_identity(reactions_s),
             _normalize_text_for_identity(state_network_s),

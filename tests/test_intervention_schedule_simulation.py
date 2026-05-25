@@ -224,6 +224,28 @@ def test_repeated_pulses_and_source_sink_intervals_execute_through_shared_solver
     assert result.provenance["has_intervention_schedule"] is True
 
 
+def test_bundled_intervention_examples_run_through_solver() -> None:
+    from kindred.io.resources import get_all_intervention_example_specs, get_intervention_example_source
+
+    specs = get_all_intervention_example_specs()
+    assert specs
+    ids = [str(spec["id"]) for spec in specs]
+    assert len(ids) == len(set(ids))
+
+    for spec in specs:
+        request, species_names = _request_from_dsl(
+            get_intervention_example_source(str(spec["id"])).full_dsl,
+            n=13,
+            t_span=(0.0, 6.0),
+        )
+
+        result = solve_ode(request)
+
+        assert result.provenance["has_intervention_schedule"] is True
+        assert result.Y.shape[0] == len(species_names)
+        assert len(result.t) > 0
+
+
 def test_parameterized_pulse_amount_executes_through_execution_request_overrides() -> None:
     from kindred.core.simulation_preparation import prepare_simulation_worker_run
 

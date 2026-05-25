@@ -101,7 +101,6 @@ from kindred.gui.controllers.simulation_run_state import (
 from kindred.gui.controllers.slider_plot_coalescer import SliderPlotCoalescer
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
-from kindred.core.batch_initial_conditions import strip_reaction_dsl_initial_concentrations
 from kindred.gui.ports import (
     DisplayRefreshSource,
     DisplayTransitionCause,
@@ -239,7 +238,6 @@ class SimulationController(QtCore.QObject):
                 sync_batch_species_columns_for_run=self._sync_batch_species_columns_for_run,
                 slider_runtime_parameter_names=self._slider_runtime_parameter_names,
                 simulation_identity_for_set=self._simulation_identity_for_set,
-                request_mechanism_text_for_set=self._request_mechanism_text_for_set,
                 resolved_initials_for_batch_row=self._resolved_initials_for_batch_row,
                 slider_execution_parameter_values=self._slider_execution_parameter_values,
                 preview_contained_owner_identity=self._preview_contained_owner_identity,
@@ -3472,11 +3470,13 @@ class SimulationController(QtCore.QObject):
         if not bool(dict(solver_config or {}).get("use_sparse_jacobian", False)):
             return {}
         try:
-            mechanism_text = self._request_mechanism_text_for_set(
+            mechanism_source = self.ui.mechanism.mechanism_source_for_run_set(
+                self.ui.mechanism.mechanism_source_for_run(fast_mode=bool(fast_mode)),
                 set_id=str(set_id),
-                has_slider_overrides=bool(fast_mode) and self.ui.mechanism.has_slider_overrides(),
                 apply_parameter_overrides=False,
+                strip_initial_concentrations=True,
             )
+            mechanism_text = mechanism_source.full_dsl
             parameter_overrides = (
                 self.ui.mechanism.slider_overrides(set_id=str(set_id))
                 if bool(fast_mode) and self.ui.mechanism.has_slider_overrides()
@@ -3514,10 +3514,13 @@ class SimulationController(QtCore.QObject):
         if not bool(dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)):
             return {}
         try:
-            mechanism_text = self._request_mechanism_text_for_set(
+            mechanism_source = self.ui.mechanism.mechanism_source_for_run_set(
+                self.ui.mechanism.mechanism_source_for_run(fast_mode=bool(fast_mode)),
                 set_id=str(set_id),
-                has_slider_overrides=bool(fast_mode) and self.ui.mechanism.has_slider_overrides(),
+                apply_parameter_overrides=bool(fast_mode) and self.ui.mechanism.has_slider_overrides(),
+                strip_initial_concentrations=True,
             )
+            mechanism_text = mechanism_source.full_dsl
             solver_identity = repr(
                 {
                     "temperature_K": dict(solver_config or {}).get("temperature_K"),
@@ -3560,10 +3563,13 @@ class SimulationController(QtCore.QObject):
         param_fingerprint = ""
         preview_token = ""
         if bool(fast_mode):
-            param_fingerprint = self.ui.mechanism.simulation_param_fingerprint(set_id=str(set_id))
+            param_fingerprint = self.ui.mechanism.simulation_param_fingerprint(
+                set_id=str(set_id),
+                fast_mode=True,
+            )
             preview_token = str(preview_batch_cache_token or "")
         return SimulationIdentity.build(
-            schema_id=self.ui.mechanism.simulation_schema_id(),
+            schema_id=self.ui.mechanism.simulation_schema_id(fast_mode=bool(fast_mode)),
             param_fingerprint=param_fingerprint,
             canonical_initials_fingerprint=str(canonical_initials_fingerprint or ""),
             solver_config=solver_config,
@@ -3637,33 +3643,6 @@ class SimulationController(QtCore.QObject):
         if directive is not None:
             self._apply_completion_policy_state_patch(PolicyStatePatch(pending_replay=directive))
 
-    def _request_mechanism_text_for_set(
-        self,
-        *,
-        set_id: str,
-        has_slider_overrides: bool,
-        apply_parameter_overrides: bool = True,
-    ) -> str:
-        set_reactions_text = self.ui.mechanism.mechanism_reactions_text_raw()
-        if has_slider_overrides and bool(apply_parameter_overrides):
-            set_reactions_text = self.ui.mechanism.apply_overrides_to_text(
-                set_reactions_text,
-                set_id=str(set_id),
-            )
-        set_reactions_text = strip_reaction_dsl_initial_concentrations(set_reactions_text)
-
-        set_state_network_dsl = self.ui.mechanism.mechanism_state_network_dsl_raw()
-        if has_slider_overrides and bool(apply_parameter_overrides):
-            set_state_network_dsl = self.ui.mechanism.apply_overrides_to_state_network_dsl(
-                set_state_network_dsl,
-                set_id=str(set_id),
-            )
-
-        request_mechanism_text = set_reactions_text
-        if set_state_network_dsl.strip():
-            request_mechanism_text += "\n\n# State Network\n" + set_state_network_dsl
-        return str(request_mechanism_text)
-
     def _slider_runtime_parameter_names(self, *, set_id: Optional[str]) -> list[str]:
         names: set[str] = set()
         try:
@@ -3704,19 +3683,16 @@ class SimulationController(QtCore.QObject):
 
     def _slider_parameter_names_from_current_mechanism(self) -> list[str]:
         try:
-            from kindred.core.batch_initial_conditions import strip_named_reaction_dsl_initial_concentration_sets
             from kindred.core.simulator.dsl import parse_dsl_to_mechanism
             from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
             from kindred.core.units import UnitsModel
             from kindred.gui.parameter_enumeration import enumerate_step_parameters_for_gui
 
-            reactions_text = strip_named_reaction_dsl_initial_concentration_sets(
-                self.ui.mechanism.mechanism_reactions_text_raw()
+            source = (
+                self.ui.mechanism.mechanism_source_for_run(fast_mode=True)
+                .without_reaction_initial_concentrations()
             )
-            state_network_dsl = self.ui.mechanism.mechanism_state_network_dsl_raw()
-            full_dsl = str(reactions_text or "")
-            if str(state_network_dsl or "").strip():
-                full_dsl += "\n\n# State Network\n" + str(state_network_dsl).strip("\n")
+            full_dsl = source.full_dsl
             if not full_dsl.strip():
                 return []
             try:
@@ -3744,8 +3720,7 @@ class SimulationController(QtCore.QObject):
             )
             if callable(authoritative_structure_snapshot):
                 structure_snapshot = authoritative_structure_snapshot(
-                    reactions_text=str(reactions_text or ""),
-                    state_network_text=state_network_dsl,
+                    source=source,
                     units_identity=(
                         "temperature_K",
                         f"{float(temperature_K):.17g}",
@@ -3974,7 +3949,7 @@ class SimulationController(QtCore.QObject):
                 return False
             return True
 
-        self.ui.mechanism.apply_wegscheider_resolution_source_rewrite(
+        self.ui.mechanism.apply_wegscheider_resolution_reactions_rewrite(
             resolution.rewritten_reactions_text
         )
         self.ui.run_ui.set_status_text("Applied Wegscheider cyclicity resolution.")

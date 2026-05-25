@@ -222,11 +222,6 @@ class ConfigController(QtCore.QObject):
             atol=atol_value,
         )
 
-        legacy_use_advanced = settings.value("simulation/use_advanced_dsl", None)
-        if legacy_use_advanced is not None:
-            logger.info("Ignoring legacy setting simulation/use_advanced_dsl (advanced DSL always enabled)")
-            settings.remove("simulation/use_advanced_dsl")
-
         self._ui.set_use_sparse_jacobian(
             settings.value(
                 "simulation/use_sparse_jacobian",

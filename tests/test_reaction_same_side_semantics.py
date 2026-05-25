@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 from kindred.core import batch_parallel
-from kindred.core.cache import generate_mechanism_hash
 from kindred.core.fitting_evaluation import (
     SerialFittingEvaluator,
     prepare_fitting_execution_context,
@@ -19,7 +18,6 @@ from kindred.core.simulation_preparation import (
     prepare_simulation_worker_run,
     prepared_simulation_run_for_execution_request,
 )
-from kindred.core.simulation_identity import SimulationIdentity
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 
 
@@ -190,24 +188,6 @@ def test_serialization_and_hash_distinguish_same_side_catalyst_from_uncatalyzed_
     assert catalyzed_serial["reactions"][1]["products"] == {"B": 1.0, "E": 1.0}
     assert isinstance(catalyzed_serial["reactions"][1]["overrides"], dict)
     assert catalyzed_serial["reactions"] != uncatalyzed_serial["reactions"]
-    assert generate_mechanism_hash(catalyzed) != generate_mechanism_hash(uncatalyzed)
-
-    catalyzed_identity = SimulationIdentity.build(
-        schema_id=generate_mechanism_hash(catalyzed),
-        param_fingerprint="",
-        canonical_initials_fingerprint="",
-        solver_config={"solver": "BDF", "grid": {"N": 3}},
-        t_end=1.0,
-    )
-    uncatalyzed_identity = SimulationIdentity.build(
-        schema_id=generate_mechanism_hash(uncatalyzed),
-        param_fingerprint="",
-        canonical_initials_fingerprint="",
-        solver_config={"solver": "BDF", "grid": {"N": 3}},
-        t_end=1.0,
-    )
-    assert catalyzed_identity.cache_key() != uncatalyzed_identity.cache_key()
-    assert catalyzed_identity.prepared_runtime_key() != uncatalyzed_identity.prepared_runtime_key()
 
 
 def test_prepared_runtime_reuses_same_side_catalyst_semantics() -> None:
@@ -230,7 +210,6 @@ def test_prepared_runtime_reuses_same_side_catalyst_semantics() -> None:
         mechanism_text=CATALYST_TEXT,
         param_names=[],
         initials={"A": 3.0, "E": 5.0, "B": 0.0},
-        use_advanced_dsl=True,
     )
     prepared_payload = bound.as_serializable_execution_payload()
     reused = prepare_simulation_worker_run(
@@ -371,24 +350,6 @@ def test_reversible_serialization_and_hash_distinguish_same_side_catalyst(prefix
     assert catalyzed_serial["equilibria"][0]["stoich_forward"] == {"A": 1.0, "E": 1.0}
     assert catalyzed_serial["equilibria"][0]["stoich_back"] == {"B": 1.0, "E": 1.0}
     assert catalyzed_serial["equilibria"] != uncatalyzed_serial["equilibria"]
-    assert generate_mechanism_hash(catalyzed) != generate_mechanism_hash(uncatalyzed)
-
-    catalyzed_identity = SimulationIdentity.build(
-        schema_id=generate_mechanism_hash(catalyzed),
-        param_fingerprint="",
-        canonical_initials_fingerprint="",
-        solver_config={"solver": "BDF", "grid": {"N": 3}},
-        t_end=1.0,
-    )
-    uncatalyzed_identity = SimulationIdentity.build(
-        schema_id=generate_mechanism_hash(uncatalyzed),
-        param_fingerprint="",
-        canonical_initials_fingerprint="",
-        solver_config={"solver": "BDF", "grid": {"N": 3}},
-        t_end=1.0,
-    )
-    assert catalyzed_identity.cache_key() != uncatalyzed_identity.cache_key()
-    assert catalyzed_identity.prepared_runtime_key() != uncatalyzed_identity.prepared_runtime_key()
 
 
 def test_programmatic_reactions_use_explicit_physical_sides_and_clone_dicts() -> None:

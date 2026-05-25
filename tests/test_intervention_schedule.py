@@ -284,7 +284,6 @@ def test_schedule_scalar_shared_parameter_is_additive_not_schedule_only() -> Non
         param_names=["scale"],
         temperature_K=298.15,
         initials={},
-        use_advanced_dsl=True,
         wegscheider_cyclicity_enabled=False,
     )
     schedule = bound.mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE]
@@ -687,7 +686,6 @@ def test_unscheduled_execution_request_does_not_inherit_prepared_payload_schedul
         [],
         temperature_K=298.15,
         initials={"A": 1.0, "B": 0.0},
-        use_advanced_dsl=True,
         wegscheider_cyclicity_enabled=False,
     )
     request_payload = {
@@ -761,7 +759,6 @@ def test_prepared_payload_schedule_does_not_override_request_local_removal() -> 
         [],
         temperature_K=298.15,
         initials={"A": 1.0, "B": 0.0},
-        use_advanced_dsl=True,
         wegscheider_cyclicity_enabled=False,
     )
     request = SimulationExecutionRequest(

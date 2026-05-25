@@ -1,0 +1,6 @@
+# title: Repeated substrate dosing
+# Models fed-batch bolus additions without writing each dose by hand.
+reaction: Substrate -> Product; k=0.35
+initial: Substrate=0.0
+initial: Product=0.0
+intervention: op=pulse; species=Substrate; start=0.5; every=1.5; count=4; amount=0.25

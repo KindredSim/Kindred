@@ -1,0 +1,7 @@
+# title: Buffered catalyst reservoir
+# Holds a catalyst concentration constant during the active reaction phase.
+reaction: Substrate + Catalyst -> Product + Catalyst; k=0.5
+initial: Substrate=1.0
+initial: Catalyst=0.0
+initial: Product=0.0
+intervention: op=reservoir; species=Catalyst; start=0.0; end=4.0; value=1.0

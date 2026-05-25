@@ -888,16 +888,16 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _modeled_series_names_for_x_axis(self) -> set[str]:
         modeled = {str(x) for x in (self._params_ics_tab.get_mechanism_species() or []) if str(x).strip()}
-        if callable(getattr(self, "_reactions_text_getter", None)):
+        if callable(getattr(self, "_mechanism_text_getter", None)):
             try:
                 from kindred.core.algebra.observable_introspection import extract_observables_from_algebra_text
                 from kindred.core.simulator.algebra_section import extract_algebra_section_text
                 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
                 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
-                reactions_text = str(self._reactions_text_getter() or "")
-                algebra_text = extract_algebra_section_text(reactions_text)
-                mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(reactions_text, initials={}))
+                mechanism_text = str(self._mechanism_text_getter() or "")
+                algebra_text = extract_algebra_section_text(mechanism_text)
+                mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(mechanism_text, initials={}))
                 observables = extract_observables_from_algebra_text(
                     algebra_text,
                     mechanism_namespace=mechanism_namespace,
@@ -1153,7 +1153,7 @@ class FittingWindow(QtWidgets.QDialog):
             dataset_entries_getter=lambda: list(_w()._dataset_entries) if _w() is not None else [],
             worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
             dataset_manager_getter=lambda: _w()._dataset_manager if _w() is not None else None,
-            reactions_text_getter=lambda: str(_w()._reactions_text_getter() or "") if _w() is not None and callable(getattr(_w(), "_reactions_text_getter", None)) else "",
+            mechanism_text_getter=lambda: str(_w()._mechanism_text_getter() or "") if _w() is not None and callable(getattr(_w(), "_mechanism_text_getter", None)) else "",
             integration_defaults=self._active_integration_defaults_for_ui(),
             config_defaults=self._config_defaults,
             initial_parameter_defaults_getter=self._species_table.initial_parameter_defaults_for_species,
@@ -1918,11 +1918,12 @@ class FittingWindow(QtWidgets.QDialog):
             return
 
         reactions_text = str(self._reactions_text_getter() or "")
+        mechanism_text = str(self._mechanism_text_getter() or "")
         algebra_text = extract_algebra_section_text(reactions_text)
         try:
-            mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(reactions_text, initials={}))
+            mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(mechanism_text, initials={}))
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Mechanism Reactions text is invalid:\n\n{exc}")
+            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Mechanism source is invalid:\n\n{exc}")
             return
         existing_obs_map = extract_observables_from_algebra_text(
             algebra_text,

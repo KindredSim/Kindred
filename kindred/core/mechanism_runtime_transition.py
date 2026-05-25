@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
+from kindred.core.mechanism_source import MechanismAuthoringSource
+
 
 def _normalize_text_for_identity(text: str) -> str:
     return "\n".join(" ".join(str(line).split()) for line in str(text or "").splitlines()).strip()
@@ -54,14 +56,11 @@ class AuthoritativeMechanismSnapshot:
     normalized_state_network_text: str
 
     @classmethod
-    def from_texts(
-        cls,
-        *,
-        reactions_text: str,
-        state_network_text: str = "",
-    ) -> "AuthoritativeMechanismSnapshot":
-        reactions = str(reactions_text or "")
-        state_network = str(state_network_text or "")
+    def from_source(cls, source: MechanismAuthoringSource) -> "AuthoritativeMechanismSnapshot":
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be a MechanismAuthoringSource.")
+        reactions = str(source.reactions_text or "")
+        state_network = str(source.state_network_dsl or "")
         return cls(
             reactions_text=reactions,
             state_network_text=state_network,
@@ -155,9 +154,8 @@ class MechanismRuntimeTransitionService:
         initial_canonical_batch_initials_by_set_id: Mapping[str, object] | None = None,
     ) -> None:
         self._epoch = 0
-        self._current_snapshot = initial_snapshot or AuthoritativeMechanismSnapshot.from_texts(
-            reactions_text="",
-            state_network_text="",
+        self._current_snapshot = initial_snapshot or AuthoritativeMechanismSnapshot.from_source(
+            MechanismAuthoringSource()
         )
         self._current_canonical_batch_initials_identity: tuple[tuple[str, str], ...] | None = (
             _normalize_mapping_identity(initial_canonical_batch_initials_by_set_id)
@@ -185,11 +183,8 @@ class MechanismRuntimeTransitionService:
         self._pending_init_snapshot = None
         self._pending_readiness_epoch = None
 
-    def arm_pending_init_result_guard(self, *, rewrite: str, state_network_text: str = "") -> None:
-        self._pending_init_snapshot = AuthoritativeMechanismSnapshot.from_texts(
-            reactions_text=str(rewrite or ""),
-            state_network_text=str(state_network_text or ""),
-        )
+    def arm_pending_init_result_guard(self, *, source: MechanismAuthoringSource) -> None:
+        self._pending_init_snapshot = AuthoritativeMechanismSnapshot.from_source(source)
 
     def consume_pending_init_result_guard(self) -> Optional[AuthoritativeMechanismSnapshot]:
         snapshot = self._pending_init_snapshot

@@ -1,0 +1,6 @@
+# title: Repeated feed windows
+# Uses repeated intervals for recurring feed phases with fixed duration.
+reaction: Precursor -> Product; k=0.25
+initial: Precursor=0.0
+initial: Product=0.0
+intervention: op=repeated_interval; kind=source; species=Precursor; start=0.0; every=2.0; duration=0.5; count=3; rate=0.4

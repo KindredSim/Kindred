@@ -8,9 +8,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from kindred.core.batch_parallel import batch_mechanism_signature
 from kindred.core.batch_initial_conditions import (
     migrate_reaction_dsl_initial_concentration_sets,
-    strip_reaction_dsl_initial_concentrations,
 )
 from kindred.core.intervention_schedule import intervention_schedule_identity_fingerprints
+from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.simulation_identity import (
     SimulationScopeIdentity,
     canonical_initials_fingerprint,
@@ -43,6 +43,7 @@ class RunMechanismContext:
     has_slider_overrides: bool
     primary: object | None
     primary_set_id: str | None
+    base_source: MechanismAuthoringSource
     owner_full_dsl: str
     full_dsl: str
     pending_init_seed: Dict[str, Dict[str, float]]
@@ -107,7 +108,6 @@ class SimulationRunPreparationDependencies:
     sync_batch_species_columns_for_run: Callable[..., None]
     slider_runtime_parameter_names: Callable[..., Sequence[str]]
     simulation_identity_for_set: Callable[..., Any]
-    request_mechanism_text_for_set: Callable[..., str]
     resolved_initials_for_batch_row: Callable[..., Dict[str, Any]]
     slider_execution_parameter_values: Callable[..., Dict[str, Any]]
     preview_contained_owner_identity: Callable[..., Dict[str, Any]]
@@ -432,14 +432,25 @@ class SimulationRunMechanismPreparationOwner:
         primary = self._ports.batch.batch_preferred_primary_set_id(batch_rows)
         primary_set_id = str(primary) if primary is not None else None
 
-        owner_reactions_text_raw = self._ports.mechanism.mechanism_reactions_text_raw()
-        owner_state_network_dsl_raw = self._ports.mechanism.mechanism_state_network_dsl_raw()
-        reactions_text_raw = owner_reactions_text_raw
-        if has_slider_overrides:
-            reactions_text_raw = self._ports.mechanism.apply_overrides_to_text(
-                reactions_text_raw,
-                set_id=primary_set_id,
-            )
+        try:
+            selected_source = self._ports.mechanism.mechanism_source_for_run(fast_mode=bool(fast_mode))
+        except RuntimeError as exc:
+            if bool(runtime_readiness_only):
+                return None
+            status = "Preview mechanism has errors." if bool(fast_mode) else "Cannot run: mechanism has errors."
+            self._ports.run_ui.set_status_text(status)
+            if bool(fast_mode):
+                self._deps.clear_failed_fast_preview_ownership()
+            self._deps.set_simulation_running(False)
+            self._ports.run_ui.set_run_button_enabled(True)
+            self._ports.run_ui.set_stop_button_enabled(False)
+            self._deps.set_slider_simulation_active(False)
+            self._deps.clear_slider_triggered_preflight_state(fast_mode=bool(fast_mode))
+            if not bool(fast_mode):
+                self._deps.requeue_preserved_pending_slider_replay_after_preflight_abort()
+            self._deps.record_nonfatal_exception("Mechanism source was not ready for run preparation", exc)
+            return None
+        reactions_text_raw = selected_source.reactions_text
 
         pending_init_seed: Dict[str, Dict[str, float]] = {}
         pending_init_rewrite: Optional[str] = None
@@ -506,22 +517,17 @@ class SimulationRunMechanismPreparationOwner:
         elif (not bool(fast_mode)) and (not bool(runtime_readiness_only)):
             self._deps.clear_preview_ownership()
 
-        reactions_text = strip_reaction_dsl_initial_concentrations(
-            reactions_text_raw if pending_init_applied else migrated
+        base_source = selected_source.with_reactions_text(
+            reactions_text_raw if pending_init_applied else selected_source.reactions_text
         )
-        state_network_dsl = owner_state_network_dsl_raw
-        if has_slider_overrides:
-            state_network_dsl = self._ports.mechanism.apply_overrides_to_state_network_dsl(
-                state_network_dsl,
-                set_id=primary_set_id,
-            )
-        full_dsl = reactions_text
-        if state_network_dsl.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_dsl
-        owner_reactions_text = strip_reaction_dsl_initial_concentrations(owner_reactions_text_raw)
-        owner_full_dsl = owner_reactions_text
-        if owner_state_network_dsl_raw.strip():
-            owner_full_dsl += "\n\n# State Network\n" + owner_state_network_dsl_raw
+        full_source = self._ports.mechanism.mechanism_source_for_run_set(
+            base_source.with_reactions_text(reactions_text_raw if pending_init_applied else migrated),
+            set_id=primary_set_id,
+            apply_parameter_overrides=bool(has_slider_overrides),
+            strip_initial_concentrations=True,
+        )
+        full_dsl = full_source.full_dsl
+        owner_full_dsl = base_source.without_reaction_initial_concentrations().full_dsl
 
         if not full_dsl.strip():
             if bool(runtime_readiness_only):
@@ -551,6 +557,7 @@ class SimulationRunMechanismPreparationOwner:
             has_slider_overrides=bool(has_slider_overrides),
             primary=primary,
             primary_set_id=primary_set_id,
+            base_source=base_source,
             owner_full_dsl=owner_full_dsl,
             full_dsl=full_dsl,
             pending_init_seed=pending_init_seed,
@@ -810,10 +817,13 @@ class SimulationRunDispatchPreparationOwner:
                 if index < len(mechanism_context.queue_names)
                 else str(set_id)
             )
-            request_mechanism_text = self._deps.request_mechanism_text_for_set(
+            request_source = self._ports.mechanism.mechanism_source_for_run_set(
+                mechanism_context.base_source,
                 set_id=set_id_s,
-                has_slider_overrides=mechanism_context.has_slider_overrides,
+                apply_parameter_overrides=bool(mechanism_context.has_slider_overrides),
+                strip_initial_concentrations=True,
             )
+            request_mechanism_text = request_source.full_dsl
             mechanism_text_by_set_id[set_id_s] = str(request_mechanism_text)
             prepared_execution_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id_s)
             prepared_payload = solver_context.prepared_payload_by_set_id.get(set_id_s)

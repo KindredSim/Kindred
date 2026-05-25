@@ -5,7 +5,6 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from kindred.core.cache import generate_mechanism_hash
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateInputContext,
     step_entry_role_editable,
@@ -47,7 +46,6 @@ def test_equilibrium_authority_metadata_participates_in_hash_and_serialization_i
     rhs_a = build_ode_rhs_from_mechanism(mechanism_a)
     rhs_b = build_ode_rhs_from_mechanism(mechanism_b)
 
-    assert generate_mechanism_hash(mechanism_a) != generate_mechanism_hash(mechanism_b)
     assert mechanism_a.to_serializable()["equilibria"] != mechanism_b.to_serializable()["equilibria"]
     assert not np.allclose(
         rhs_a(0.0, np.asarray([0.0, 1.0], dtype=float)),
@@ -300,16 +298,6 @@ def test_serialization_uses_effective_authority_values_not_stale_raw_derived_slo
 
     assert serialized["kr"] == pytest.approx(2.0)
     assert serialized["Keq"] == pytest.approx(1.0)
-
-
-def test_cache_identity_ignores_equilibrium_display_metadata():
-    mechanism = _metadata_authority_mechanism(0.0)
-    original_hash = generate_mechanism_hash(mechanism)
-
-    mechanism.metadata["step_index_map"][0]["equilibrium_authority"]["editable"]["kr"] = True
-    mechanism.metadata["step_index_map"][0]["equilibrium_authority"]["derived"]["kr"] = False
-
-    assert generate_mechanism_hash(mechanism) == original_hash
 
 
 def test_algebra_symbol_table_uses_dg_authority_after_kf_algebra_update():

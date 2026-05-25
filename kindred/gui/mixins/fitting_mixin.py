@@ -27,6 +27,12 @@ from kindred.core.simulator.dsl_text_update import (
     authoritative_parameter_values_match,
 )
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
+from kindred.gui.fitting.constants import (
+    FITTING_MAX_NFEV_RANGE,
+    FITTING_METHODS,
+    FITTING_SEED_RANGE,
+    FITTING_SOLVERS,
+)
 from kindred.gui.mixins.ports import FittingMixinPorts
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
@@ -244,14 +250,13 @@ class FittingMixin:
             return _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT
 
         set_with_undo = getattr(self, "set_mechanism_reactions_text_with_optional_undo", None)
-        if callable(set_with_undo):
-            set_with_undo(
-                updated_text,
-                "Global Fit: update Reactions",
-                record_undo=True,
-            )
-        else:
-            mechanism_editor.set_reactions_text(updated_text)
+        if not callable(set_with_undo):
+            raise RuntimeError("Authoritative mechanism Reactions setter is unavailable.")
+        set_with_undo(
+            updated_text,
+            "Global Fit: update Reactions",
+            record_undo=True,
+        )
 
         if str(mechanism_editor.reactions_text()) == before_text:
             logger.warning("Fitted parameter project apply did not rewrite mechanism text")
@@ -528,14 +533,14 @@ class FittingMixin:
         algo_layout = QtWidgets.QFormLayout(algo_group)
 
         method_combo = QtWidgets.QComboBox()
-        method_combo.addItems(["lm", "trf", "dogbox", "differential_evolution"])
+        method_combo.addItems(list(FITTING_METHODS))
         method_default = defaults.get("method", "trf")
-        if method_default in {"lm", "trf", "dogbox", "differential_evolution"}:
+        if method_default in FITTING_METHODS:
             method_combo.setCurrentText(method_default)
         algo_layout.addRow("Method:", method_combo)
 
         max_nfev_spin = QtWidgets.QSpinBox()
-        max_nfev_spin.setRange(10, 10000)
+        max_nfev_spin.setRange(*FITTING_MAX_NFEV_RANGE)
         max_nfev_spin.setValue(int(defaults.get("max_nfev", 1000)))
         algo_layout.addRow("Max evaluations:", max_nfev_spin)
 
@@ -550,7 +555,7 @@ class FittingMixin:
         use_seed_check = QtWidgets.QCheckBox("Use fixed random seed")
         use_seed_check.setChecked(bool(defaults.get("use_seed", True)))
         seed_spin = QtWidgets.QSpinBox()
-        seed_spin.setRange(0, 999_999)
+        seed_spin.setRange(*FITTING_SEED_RANGE)
         seed_spin.setValue(int(defaults.get("seed", 42)))
         seed_spin.setEnabled(use_seed_check.isChecked())
         use_seed_check.toggled.connect(seed_spin.setEnabled)
@@ -562,7 +567,7 @@ class FittingMixin:
         integration_layout = QtWidgets.QFormLayout(integration_group)
 
         solver_combo = QtWidgets.QComboBox()
-        solver_combo.addItems(["Radau", "BDF"])
+        solver_combo.addItems(list(FITTING_SOLVERS))
         solver_name, _warning = normalize_solver_name(defaults.get("solver", "BDF"))
         solver_combo.setCurrentText(solver_name)
         integration_layout.addRow("Solver:", solver_combo)
@@ -690,15 +695,14 @@ class FittingMixin:
         def _set_reactions_text(new_text: str) -> None:
             if reactions_widget is None:
                 raise RuntimeError("Reactions editor unavailable.")
-            if callable(getattr(self, "_set_text_with_optional_undo", None)):
-                self._set_text_with_optional_undo(
-                    reactions_widget,
-                    str(new_text or ""),
-                    "Global Fit: update Reactions",
-                    True,
-                )
-                return
-            reactions_widget.setPlainText(str(new_text or ""))
+            set_reactions = getattr(self, "set_mechanism_reactions_text_with_optional_undo", None)
+            if not callable(set_reactions):
+                raise RuntimeError("Authoritative mechanism Reactions setter is unavailable.")
+            set_reactions(
+                str(new_text or ""),
+                "Global Fit: update Reactions",
+                record_undo=True,
+            )
 
         def _runtime_lane_budget(dataset_count: int) -> int:
             raw_budget = int(self.simulation_controller.batch_runtime_lane_budget)

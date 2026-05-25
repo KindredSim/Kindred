@@ -7,6 +7,7 @@ from kindred.core.mechanism_structure_snapshot import (
     MechanismStructureSnapshot,
     MechanismStructureSnapshotOwner,
 )
+from kindred.core.mechanism_source import MechanismAuthoringSource
 
 if TYPE_CHECKING:
     from kindred.gui.main_window import MainWindow
@@ -54,14 +55,12 @@ class MainWindowMechanismHelpers:
     def authoritative_structure_snapshot(
         self,
         *,
-        reactions_text: str,
-        state_network_text: str = "",
+        source: MechanismAuthoringSource,
         units_identity: tuple[object, ...] = (),
         builder: Callable[[str], object],
     ) -> MechanismStructureSnapshot:
         return self._structure_owner.snapshot_for(
-            reactions_text=str(reactions_text or ""),
-            state_network_text=str(state_network_text or ""),
+            source=source,
             units_identity=units_identity,
             builder=builder,
         )
