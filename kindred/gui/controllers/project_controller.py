@@ -11,9 +11,9 @@ import numpy as np
 from PySide6 import QtCore, QtWidgets
 
 from kindred.gui.project_schema import (
-    FITTING_DEFAULTS_KEYS,
     QSETTINGS_KEY_MAP,
     get_default_project_payload,
+    validate_project_payload,
 )
 from kindred.gui.utils import BusyCursor
 from kindred.gui.widgets.export_dialog import ExportDialog
@@ -120,6 +120,7 @@ class ProjectController(QtCore.QObject):
         try:
             with BusyCursor():
                 data = self._serialize_project_state()
+                validate_project_payload(data)
                 with open(filepath, "w") as handle:
                     json.dump(data, handle, indent=2)
         except Exception as exc:
@@ -167,14 +168,19 @@ class ProjectController(QtCore.QObject):
             if not self.save_project():
                 return
 
-        payload = get_default_project_payload()
-        for key in FITTING_DEFAULTS_KEYS:
-            payload.pop(key, None)
+        payload = self._serialize_project_state()
+        defaults = get_default_project_payload()
+        payload["mechanism_source"] = defaults["mechanism_source"]
+        payload["notes"] = defaults["notes"]
+        payload["batch_initial_conditions"] = defaults["batch_initial_conditions"]
         get_user_preference = self.mw.config_controller.get_user_preference
         for key in QSETTINGS_KEY_MAP:
-            if key in FITTING_DEFAULTS_KEYS:
-                continue
             payload[key] = get_user_preference(key)
+        from kindred.core.simulator.solvers import normalize_solver_name
+
+        solver_method, solver_warning = normalize_solver_name(payload["solver"])
+        payload["solver_method"] = str(solver_method)
+        payload["solver_warning"] = str(solver_warning) if solver_warning else None
         applied = self._apply_project_payload(payload, record_undo=False)
         if not applied:
             return

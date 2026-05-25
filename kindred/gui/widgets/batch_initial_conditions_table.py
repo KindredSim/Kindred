@@ -321,6 +321,21 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             self.dataChanged.emit(top_left, bottom_right, [QtCore.Qt.BackgroundRole])
         return set(invalid_for_rows)
 
+    def notify_rows_changed(self, rows: Sequence[int]) -> None:
+        rows_int = [int(row) for row in (rows or [])]
+        rows_int = sorted({row for row in rows_int if 0 <= row < int(self.rowCount())})
+        if not rows_int:
+            return
+        if self._base_column_count() > 1:
+            self.validate_rows(rows_int)
+        top_left = self.index(min(rows_int), 0)
+        bottom_right = self.index(max(rows_int), max(0, int(self.columnCount()) - 1))
+        self.dataChanged.emit(
+            top_left,
+            bottom_right,
+            [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
+        )
+
 
 class BatchInitialConditionsTableView(QtWidgets.QTableView):
     pasteError = QtCore.Signal(str)

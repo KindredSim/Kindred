@@ -11,6 +11,7 @@ from kindred.core.batch_initial_conditions import (
     strip_reaction_dsl_initial_concentrations,
 )
 from kindred.core.batch_simulation_cache import BatchSimulationCache
+from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.simulation_identity import (
     SimulationIdentity,
     canonical_initials_fingerprint,
@@ -57,8 +58,8 @@ class SimulationBatchOwner:
         batch_preferred_primary_set_id: Callable[[Sequence[int]], Optional[str]],
         batch_cache_key: Callable[..., str],
         batch_cache_getter: Callable[[], BatchSimulationCache],
-        batch_store: object,
-        batch_model: object,
+        batch_store_getter: Callable[[], object],
+        batch_model_getter: Callable[[], object],
         batch_initials_for_row: Callable[[int], Dict[str, float]],
         preview_session: object,
         preview_launch_pending: Callable[[], bool],
@@ -80,8 +81,8 @@ class SimulationBatchOwner:
         self._batch_preferred_primary_set_id = batch_preferred_primary_set_id
         self._batch_cache_key = batch_cache_key
         self._batch_cache_getter = batch_cache_getter
-        self._batch_store = batch_store
-        self._batch_model = batch_model
+        self._batch_store_getter = batch_store_getter
+        self._batch_model_getter = batch_model_getter
         self._batch_initials_for_row = batch_initials_for_row
         self._preview_session = preview_session
         self._preview_launch_pending = preview_launch_pending
@@ -91,6 +92,20 @@ class SimulationBatchOwner:
         self._sync_batch_species_columns = sync_batch_species_columns
         self._sync_mechanism_controls_to_focused_batch_set = sync_mechanism_controls_to_focused_batch_set
         self._symbolic_wegscheider_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+
+    @property
+    def _batch_store(self) -> object:
+        store = self._batch_store_getter()
+        if store is None:
+            raise RuntimeError("Batch initial conditions store is unavailable.")
+        return store
+
+    @property
+    def _batch_model(self) -> object:
+        model = self._batch_model_getter()
+        if model is None:
+            raise RuntimeError("Batch initial conditions model is unavailable.")
+        return model
 
     def batch_rows_for_scope(self, scope: str) -> List[int]:
         return [int(row) for row in (self._batch_rows_for_scope(str(scope)) or [])]
@@ -579,7 +594,6 @@ class SimulationBatchOwner:
         set_id: str,
         preview_cache_key: Optional[str] = None,
     ) -> BatchCacheEntryReadResult:
-        expected_mechanism_text = self._mechanism_text_for_workspace_selection(set_id=str(set_id))
         batch_cache = self._batch_cache()
         resolved_preview_cache_key = str(
             preview_cache_key
@@ -588,6 +602,8 @@ class SimulationBatchOwner:
         ).strip()
 
         try:
+            expected_source = self._mechanism_source_for_workspace_selection(set_id=str(set_id))
+            expected_mechanism_text = expected_source.full_dsl
             expected_identity = self.current_workspace_preview_identity(set_id=str(set_id))
             expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
                 set_id=str(set_id),
@@ -759,11 +775,13 @@ class SimulationBatchOwner:
             return {}
 
     def current_workspace_preview_identity(self, *, set_id: str) -> SimulationIdentity:
-        mechanism_text = self._mechanism_text_for_workspace_selection(set_id=str(set_id))
-        symbolic_mechanism_text = self._mechanism_text_for_workspace_selection(
+        mechanism_source = self._mechanism_source_for_workspace_selection(set_id=str(set_id))
+        mechanism_text = mechanism_source.full_dsl
+        symbolic_mechanism_source = self._mechanism_source_for_workspace_selection(
             set_id=str(set_id),
             apply_parameter_overrides=False,
         )
+        symbolic_mechanism_text = symbolic_mechanism_source.full_dsl
         expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
             set_id=str(set_id),
             mechanism_text=mechanism_text,
@@ -781,12 +799,12 @@ class SimulationBatchOwner:
         if row is not None:
             try:
                 baseline_initials = self.batch_initials_for_row(int(row))
-                reactions_text_raw = self._mechanism_owner.mechanism_reactions_text_raw()
-                if self._mechanism_owner.has_slider_overrides():
-                    reactions_text_raw = self._mechanism_owner.apply_overrides_to_text(
-                        reactions_text_raw,
-                        set_id=str(set_id),
-                    )
+                source = self._mechanism_owner.mechanism_source_for_run_set(
+                    self._mechanism_owner.mechanism_source_for_run(fast_mode=True),
+                    set_id=str(set_id),
+                    apply_parameter_overrides=True,
+                )
+                reactions_text_raw = source.reactions_text
                 try:
                     pending_init_seed, _migrated = migrate_reaction_dsl_initial_concentration_sets(
                         reactions_text_raw,
@@ -807,8 +825,11 @@ class SimulationBatchOwner:
             except Exception:
                 initials_fingerprint = ""
         return SimulationIdentity.build(
-            schema_id=self._mechanism_owner.simulation_schema_id(),
-            param_fingerprint=self._mechanism_owner.simulation_param_fingerprint(set_id=str(set_id)),
+            schema_id=self._mechanism_owner.simulation_schema_id(fast_mode=True),
+            param_fingerprint=self._mechanism_owner.simulation_param_fingerprint(
+                set_id=str(set_id),
+                fast_mode=True,
+            ),
             canonical_initials_fingerprint=initials_fingerprint,
             solver_config=expected_solver_config,
             t_end=expected_t_end,
@@ -912,28 +933,18 @@ class SimulationBatchOwner:
                 return False
         return True
 
-    def _mechanism_text_for_workspace_selection(
+    def _mechanism_source_for_workspace_selection(
         self,
         *,
         set_id: str,
         apply_parameter_overrides: bool = True,
-    ) -> str:
-        reactions_text = self._mechanism_owner.mechanism_reactions_text_raw()
-        if self._mechanism_owner.has_slider_overrides() and bool(apply_parameter_overrides):
-            reactions_text = self._mechanism_owner.apply_overrides_to_text(reactions_text, set_id=str(set_id))
-        reactions_text = strip_reaction_dsl_initial_concentrations(reactions_text)
-
-        state_network_dsl = self._mechanism_owner.mechanism_state_network_dsl_raw()
-        if self._mechanism_owner.has_slider_overrides() and bool(apply_parameter_overrides):
-            state_network_dsl = self._mechanism_owner.apply_overrides_to_state_network_dsl(
-                state_network_dsl,
-                set_id=str(set_id),
-            )
-
-        full_dsl = reactions_text
-        if state_network_dsl.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_dsl
-        return str(full_dsl)
+    ) -> MechanismAuthoringSource:
+        return self._mechanism_owner.mechanism_source_for_run_set(
+            self._mechanism_owner.mechanism_source_for_run(fast_mode=True),
+            set_id=str(set_id),
+            apply_parameter_overrides=bool(apply_parameter_overrides),
+            strip_initial_concentrations=True,
+        )
 
     def _current_workspace_preview_context(
         self,

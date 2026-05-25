@@ -39,7 +39,7 @@ from kindred.core.validation import try_parse_finite_float
 from kindred.gui.project_schema import (
     FITTING_DEFAULTS_KEYS,
     PROJECT_DEFAULTS,
-    PROJECT_SCHEMA_VERSION,
+    validate_project_payload,
 )
 
 if TYPE_CHECKING:
@@ -236,10 +236,10 @@ class MainWindow(
             variable_runtime=self._variable_runtime,
             mechanism_locked_getter=self.mechanism_editing_locked,
             try_lock_mechanism_editor=self._try_lock_mechanism_editor,
-            apply_overrides_to_text=self._apply_overrides_to_text,
-            apply_overrides_to_state_network_dsl=self._apply_overrides_to_state_network_dsl,
-            apply_wegscheider_resolution_source_rewrite=(
-                self._apply_wegscheider_resolution_source_rewrite
+            apply_reactions_overrides_to_text=self._apply_reactions_overrides_to_text,
+            apply_state_network_overrides_to_dsl=self._apply_state_network_overrides_to_dsl,
+            apply_wegscheider_resolution_reactions_rewrite=(
+                self._apply_wegscheider_resolution_reactions_rewrite
             ),
         )
         self._simulation_solver_owner = SimulationSolverOwner(
@@ -279,7 +279,6 @@ class MainWindow(
         self._temperature_dsl_override_active = False
         self._fitting_defaults: Dict[str, object] = {}
         self._last_batch_results: List[Dict[str, Any]] = []
-        self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
         self._simulation_runtime_preview_ready = True
 
         # Registry of actions that support customizable shortcuts.
@@ -309,8 +308,8 @@ class MainWindow(
             batch_preferred_primary_set_id=self._batch_preferred_primary_set_id,
             batch_cache_key=self._batch_cache_key,
             batch_cache_getter=lambda: self._sim_controller.batch_cache,
-            batch_store=self._batch_store,
-            batch_model=self._batch_model,
+            batch_store_getter=lambda: self._batch_store,
+            batch_model_getter=lambda: self._batch_model,
             batch_initials_for_row=self._batch_initials_for_row,
             preview_session=self._preview_session,
             preview_launch_pending=lambda: bool(
@@ -455,6 +454,7 @@ class MainWindow(
         self._mechanism_editor.speciesResetRequested.connect(self._on_species_reset_requested)
         self._mechanism_editor.run_btn.clicked.connect(self._sim_controller.run_simulation)
         self._mechanism_editor.symbolic_calculator_btn.clicked.connect(self._open_symbolic_calculator_panel)
+        self._mechanism_editor.mechanismInspectRequested.connect(self._open_mechanism_inspector)
         self._refresh_slider_transaction_button_state()
 
     def _set_slider_override_mode_buttons_enabled(self, enabled: bool) -> None:
@@ -508,12 +508,19 @@ class MainWindow(
         return bool(state_editor.is_valid())
 
     def _sync_mechanism_session_owner_from_widgets(self, *, authoritative: bool) -> None:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
         reactions_text, state_network_dsl = self._mechanism_session_texts_from_widgets()
         if authoritative:
-            owner.apply_authoritative_update(reactions_text, state_network_dsl)
+            owner.apply_authoritative_source(
+                MechanismAuthoringSource.from_parts(
+                    reactions_text=reactions_text,
+                    state_network_dsl=state_network_dsl,
+                )
+            )
             return
         if not owner.edit_session_active:
             raise RuntimeError("Mechanism edit session is not active.")
@@ -531,10 +538,7 @@ class MainWindow(
         self._refresh_overlay_swatches_for_current_mechanism()
 
     def _authoritative_mechanism_transition_snapshot(self) -> AuthoritativeMechanismSnapshot:
-        return AuthoritativeMechanismSnapshot.from_texts(
-            reactions_text=self.mechanism_reactions_text_raw(),
-            state_network_text=self.mechanism_state_network_dsl_raw(),
-        )
+        return AuthoritativeMechanismSnapshot.from_source(self.canonical_mechanism_source())
 
     def _authoritative_mechanism_runtime_refresh_deferred(self) -> bool:
         return int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) > 0
@@ -918,7 +922,7 @@ class MainWindow(
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             return False
-        return bool(owner.validate_canonical().valid)
+        return bool(owner.is_ready_for_preview())
 
     def _reactions_text_widget(self) -> Optional[QtWidgets.QPlainTextEdit]:
         editor = getattr(self, "_mechanism_editor", None)
@@ -934,6 +938,9 @@ class MainWindow(
     def _undo_command_targets_locked_mechanism_change(self, command: object) -> bool:
         if command is None:
             return False
+        complete_source_target = getattr(command, "targets_complete_mechanism_source_change", None)
+        if callable(complete_source_target):
+            return bool(complete_source_target())
         reactions_widget = self._reactions_text_widget()
         state_editor = getattr(getattr(self, "_mechanism_editor", None), "_state_network_editor", None)
 
@@ -1631,6 +1638,7 @@ class MainWindow(
         from kindred.core.batch_initial_conditions import (
             strip_named_reaction_dsl_initial_concentration_sets,
         )
+        from kindred.core.mechanism_source import MechanismAuthoringSource
 
         reactions_text = str(self.mechanism_reactions_text_raw() or "")
         state_network_text = str(self.mechanism_state_network_dsl_raw() or "")
@@ -1641,9 +1649,11 @@ class MainWindow(
         except Exception:
             logger.debug("Failed to parse current mechanism species roster for color sync", exc_info=True)
             return None
-        mechanism_text = str(reactions_text or "")
-        if state_network_text.strip():
-            mechanism_text += "\n\n# State Network\n" + state_network_text.strip("\n")
+        source = MechanismAuthoringSource.from_parts(
+            reactions_text=reactions_text,
+            state_network_dsl=state_network_text,
+        )
+        mechanism_text = source.full_dsl
 
         def _clean(names: Any) -> tuple[str, ...]:
             return tuple(str(name).strip() for name in (names or ()) if str(name).strip())
@@ -1677,8 +1687,7 @@ class MainWindow(
                 return mechanism_obj
 
             mechanism = self._mechanism_helpers.authoritative_structure_snapshot(
-                reactions_text=reactions_text,
-                state_network_text=state_network_text,
+                source=source,
                 units_identity=(
                     "temperature_K",
                     f"{temperature_k:.17g}",
@@ -1772,6 +1781,7 @@ class MainWindow(
         """Create the menu bar and shortcut customization registry."""
         self._shortcut_actions = {}
         menubar = self.menuBar()
+        self._menu_bar = menubar
 
         def add_items(menu: QtWidgets.QMenu, items: Sequence[Any]) -> None:
             for item in items:
@@ -1916,10 +1926,27 @@ class MainWindow(
         # menubar.addMenu(self._profiles_menu)
         # self._update_profiles_menu()
 
-        examples_menu = menubar.addMenu("E&xamples")
-        presets_submenu = examples_menu.addMenu("Preset Mechanisms")
+        examples_menu = QtWidgets.QMenu("E&xamples", self)
+        menubar.addMenu(examples_menu)
+        self._examples_menu = examples_menu
+        presets_submenu = QtWidgets.QMenu("Preset Mechanisms", examples_menu)
+        examples_menu.addMenu(presets_submenu)
+        self._preset_examples_menu = presets_submenu
         for preset_id in self._available_preset_ids():
             presets_submenu.addAction(preset_id, lambda pid=preset_id: self._load_preset_mechanism(pid))
+        intervention_examples_submenu = QtWidgets.QMenu("Intervention Examples", examples_menu)
+        examples_menu.addMenu(intervention_examples_submenu)
+        self._intervention_examples_menu = intervention_examples_submenu
+        for spec in self._available_intervention_example_specs():
+            example_id = str(spec["id"])
+            title = str(spec.get("title", "")).strip()
+            action_text = f"{example_id}: {title}" if title and title != example_id else example_id
+            action = intervention_examples_submenu.addAction(
+                action_text,
+                lambda _checked=False, eid=example_id: self._load_intervention_example(eid),
+            )
+            action.setData(example_id)
+            action.setObjectName(f"loadInterventionExample{example_id}Action")
         examples_menu.addSeparator()
         add_items(
             examples_menu,
@@ -2766,43 +2793,30 @@ class MainWindow(
     def _load_preset_mechanism(self, preset_id: str):
         """Load a bundled preset mechanism into the mechanism editor."""
         try:
-            from kindred.io.resources import get_preset_mechanism
-            from kindred.gui.undo_commands import SetMechanismTextCommand
+            from kindred.io.resources import get_preset_mechanism_source
 
-            mechanism_text = get_preset_mechanism(preset_id)
+            source = get_preset_mechanism_source(preset_id)
             if not self._guard_slider_transaction_invalidation(action_text=f"Loading preset {preset_id}"):
                 self._status_label.setText("Canceled preset load")
                 return
-            previous_authoritative_suppress = bool(
-                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+            source = source.with_reactions_text(
+                self._migrate_inline_initials_to_batch_store(source.reactions_text)
             )
             previous_text_signal_suppress = bool(
                 getattr(self, "_suppress_programmatic_text_change_signals", False)
             )
-            self._suppress_authoritative_mechanism_input_change = True
             self._suppress_programmatic_text_change_signals = True
             try:
                 self._mechanism_editor._set_validation_state("validating")
             except Exception:
                 logger.debug("Failed to mark preset mechanism validation as pending", exc_info=True)
-            reactions_widget = self._mechanism_editor._reactions_text
-            old_text = reactions_widget.toPlainText()
-            command = SetMechanismTextCommand(
-                reactions_widget,
-                mechanism_text,
-                old_text,
-                f"Load preset {preset_id}"
-            )
-            reactions_document = reactions_widget.document()
-            previous_widget_block = reactions_widget.blockSignals(True)
-            previous_document_block = reactions_document.blockSignals(True)
             try:
-                self._undo_stack.push(command)
-            finally:
-                reactions_document.blockSignals(previous_document_block)
-                reactions_widget.blockSignals(previous_widget_block)
-                self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-            try:
+                self._set_authoritative_mechanism_editor_source(
+                    source,
+                    description=f"Load preset {preset_id}",
+                    apply_transition=False,
+                    transition_source="preset_load",
+                )
                 self._on_programmatic_mechanism_load()
                 if getattr(self._mechanism_editor, "_current_validation_state", "") == "validating":
                     self._mechanism_editor._validate_dsl()
@@ -2819,16 +2833,57 @@ class MainWindow(
                 f"Failed to load preset mechanism {preset_id}:\n\n{e}"
             )
 
+    def _load_intervention_example(self, example_id: str):
+        """Load a bundled intervention example into the mechanism editor."""
+        try:
+            from kindred.io.resources import get_intervention_example_source
+
+            source = get_intervention_example_source(example_id)
+            if not self._guard_slider_transaction_invalidation(action_text=f"Loading intervention example {example_id}"):
+                self._status_label.setText("Canceled intervention example load")
+                return
+            source = source.with_reactions_text(
+                self._migrate_inline_initials_to_batch_store(source.reactions_text)
+            )
+            previous_text_signal_suppress = bool(
+                getattr(self, "_suppress_programmatic_text_change_signals", False)
+            )
+            self._suppress_programmatic_text_change_signals = True
+            try:
+                self._mechanism_editor._set_validation_state("validating")
+            except Exception:
+                logger.debug("Failed to mark intervention example validation as pending", exc_info=True)
+            try:
+                self._set_authoritative_mechanism_editor_source(
+                    source,
+                    description=f"Load intervention example {example_id}",
+                    apply_transition=False,
+                    transition_source="intervention_example_load",
+                )
+                self._on_programmatic_mechanism_load()
+                if getattr(self._mechanism_editor, "_current_validation_state", "") == "validating":
+                    self._mechanism_editor._validate_dsl()
+            finally:
+                self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
+            self._status_label.setText(f"Loaded intervention example: {example_id}")
+            logger.info("Loaded intervention example: %s", example_id)
+
+        except Exception as e:
+            logger.error("Failed to load intervention example %s: %s", example_id, e, exc_info=True)
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Load Error",
+                f"Failed to load intervention example {example_id}:\n\n{e}",
+            )
+
     def _open_template_manager(self):
         """Open template manager dialog."""
         from kindred.gui.widgets.template_manager_dialog import TemplateManagerDialog
 
-        current_text = self._mechanism_editor._reactions_text.toPlainText()
-
         dialog = TemplateManagerDialog(
             parent=self,
             template_manager=self._template_manager,
-            current_mechanism_text=current_text
+            current_mechanism_source=self._current_visible_mechanism_source(),
         )
 
         # Connect signal to load template
@@ -2836,35 +2891,102 @@ class MainWindow(
 
         dialog.exec()
 
-    def _load_template_from_manager(self, mechanism_text: str):
+    def _open_mechanism_inspector(self) -> None:
+        """Open a read-only inspector for the current mechanism text."""
+        from kindred.gui.widgets.mechanism_inspector import MechanismInspectorDialog
+
+        text = self._current_mechanism_inspector_source()
+        dialog = MechanismInspectorDialog(text, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._mechanism_inspector_dialog = dialog
+        dialog.show()
+
+    def _current_mechanism_inspector_source(self) -> str:
+        return str(self._current_visible_mechanism_source().full_dsl)
+
+    def _current_visible_mechanism_source(self):
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        if bool(owner.edit_session_active):
+            self._sync_mechanism_session_owner_from_widgets(authoritative=False)
+            return owner.draft_source
+        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        return owner.canonical_source
+
+    def _load_template_from_manager(self, source):
         """Load template from template manager."""
-        from kindred.gui.undo_commands import SetMechanismTextCommand
+        from kindred.core.mechanism_source import MechanismAuthoringSource
 
         if not self._guard_slider_transaction_invalidation(action_text="Loading this template"):
             self._status_label.setText("Canceled template load")
             return
 
-        old_text = self._mechanism_editor._reactions_text.toPlainText()
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("Template load requires a complete mechanism source.")
 
-        # Create undo command
-        command = SetMechanismTextCommand(
-            self._mechanism_editor._reactions_text,
-            mechanism_text,
-            old_text,
-            "Load template"
+        previous_text_signal_suppress = bool(
+            getattr(self, "_suppress_programmatic_text_change_signals", False)
         )
-        previous_authoritative_suppress = bool(
-            getattr(self, "_suppress_authoritative_mechanism_input_change", False)
-        )
-        self._suppress_authoritative_mechanism_input_change = True
+        self._suppress_programmatic_text_change_signals = True
         try:
-            self._undo_stack.push(command)
+            source = source.with_reactions_text(
+                self._migrate_inline_initials_to_batch_store(source.reactions_text)
+            )
+            self._set_authoritative_mechanism_editor_source(
+                source,
+                description="Load template",
+                apply_transition=False,
+                transition_source="template_load",
+            )
+            self._on_programmatic_mechanism_load()
         finally:
-            self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-        self._on_programmatic_mechanism_load()
+            self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
 
         self._status_label.setText("Loaded template from Template Manager")
         logger.info("Loaded template from Template Manager")
+
+    def _migrate_inline_initials_to_batch_store(self, reactions_text: str) -> str:
+        """Import inline initial concentrations into the batch store and return rewritten Reactions text."""
+        try:
+            seed_sets, migrated = migrate_reaction_dsl_initial_concentration_sets(
+                str(reactions_text or ""),
+                default_set_name="set1",
+            )
+        except Exception:
+            logger.debug("Failed to migrate inline initial concentrations into batch store", exc_info=True)
+            return str(reactions_text or "")
+        if not seed_sets or not migrated:
+            return str(reactions_text or "")
+
+        previous_suppress = bool(getattr(self, "_suppress_canonical_batch_initials_transition", False))
+        self._suppress_canonical_batch_initials_transition = True
+        try:
+            migrated_rows = self._materialize_migrated_initial_concentration_sets(seed_sets=dict(seed_sets))
+            self._notify_batch_initial_rows_changed(migrated_rows)
+        finally:
+            self._suppress_canonical_batch_initials_transition = previous_suppress
+        return str(migrated)
+
+    def _notify_batch_initial_rows_changed(self, rows: Sequence[int]) -> None:
+        batch_model = getattr(self, "_batch_model", None)
+        batch_store = getattr(self, "_batch_store", None)
+        if batch_model is None or batch_store is None:
+            return
+        store = getattr(batch_model, "store", None)
+        if callable(store):
+            try:
+                if store() is not batch_store:
+                    return
+            except Exception:
+                return
+        notify_rows_changed = getattr(batch_model, "notify_rows_changed", None)
+        if not callable(notify_rows_changed):
+            return
+        try:
+            notify_rows_changed([int(row) for row in rows])
+        except Exception:
+            logger.debug("Failed to notify batch model after migrated initial concentration rows changed", exc_info=True)
 
     def _load_custom_shortcuts(self, shortcuts_dict: dict):
         """
@@ -3531,13 +3653,10 @@ class MainWindow(
 
     def _get_mechanism_text(self) -> str:
         """Get the canonical mechanism DSL text."""
-        reactions_text = self.mechanism_reactions_text_raw()
-        state_network_dsl = self.mechanism_state_network_dsl_raw()
-        full_dsl = reactions_text
-        if state_network_dsl.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_dsl
-
-        return full_dsl
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        return str(owner.canonical_full_dsl)
 
     def _remember_last_mechanism(
         self,
@@ -3677,16 +3796,29 @@ class MainWindow(
         }
 
     def _serialize_project_state(self) -> Dict[str, Any]:
-        """Create a versioned snapshot of the current project."""
+        """Create a snapshot of the current project."""
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         solver_contract = load_solver_contract()
         solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
         solver_method, solver_warning = solver_contract.normalize_solver_name(solver_label)
+        mechanism_source = MechanismAuthoringSource.from_parts(
+            reactions_text=self.mechanism_reactions_text_raw(),
+            state_network_dsl=self.mechanism_state_network_dsl_raw(),
+        )
+        _pref = self.config_controller.get_user_preference
+        fitting_defaults = {
+            key: (
+                self._fitting_defaults[key]
+                if key in self._fitting_defaults
+                else _pref(key)
+            )
+            for key in FITTING_DEFAULTS_KEYS
+        }
         return {
-            'project_schema_version': PROJECT_SCHEMA_VERSION,
             'version': KINDRED_VERSION,
-            'mechanism': self.mechanism_reactions_text_raw(),
+            'mechanism_source': mechanism_source.to_payload(),
             'notes': self._mechanism_editor._notes_text.toPlainText(),
-            'state_network': self.mechanism_state_network_dsl_raw(),
             "solver": str(solver_label),
             "solver_method": str(solver_method),
             "solver_warning": str(solver_warning) if solver_warning else None,
@@ -3705,15 +3837,14 @@ class MainWindow(
             'simulation_time': str(self._sim_time_spinbox.text()).strip(),
             'num_points': int(self._num_points_spinbox.value()),
             'batch_initial_conditions': self._batch_store.as_serializable(),
-            **{key: self._fitting_defaults[key] for key in self._fitting_defaults
-               if key in FITTING_DEFAULTS_KEYS},
+            **fitting_defaults,
         }
 
     def serialize_project_state(self) -> Dict[str, Any]:
         """Public project snapshot API for controllers (avoid reaching into `_` helpers)."""
         return self._serialize_project_state()
 
-    def _set_text_with_optional_undo(
+    def _set_plain_text_widget_with_optional_undo(
         self,
         widget: QtWidgets.QPlainTextEdit,
         new_text: str,
@@ -3721,7 +3852,7 @@ class MainWindow(
         record_undo: bool,
     ) -> None:
         """Set text on a QPlainTextEdit, optionally recording the change on the undo stack."""
-        from kindred.gui.undo_commands import SetMechanismTextCommand
+        from kindred.gui.undo_commands import SetPlainTextCommand
 
         current_text = widget.toPlainText()
         if new_text is None:
@@ -3731,7 +3862,7 @@ class MainWindow(
             return
 
         if record_undo:
-            command = SetMechanismTextCommand(widget, new_text, current_text, description)
+            command = SetPlainTextCommand(widget, new_text, current_text, description)
             if bool(
                 getattr(self, "_suppress_authoritative_mechanism_input_change", False)
                 and getattr(self, "_suppress_programmatic_text_change_signals", False)
@@ -3789,7 +3920,6 @@ class MainWindow(
     ) -> tuple[bool, bool]:
         from kindred.core.batch_initial_conditions import (
             BatchInitialConditionsStore,
-            migrate_reaction_dsl_initial_concentration_sets,
         )
         from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableModel
 
@@ -3797,62 +3927,36 @@ class MainWindow(
         previous_batch_runtime_pool_settings = (
             self._simulation_batch_runtime_pool_settings_snapshot()
         )
-        project_version = int(data.get('project_schema_version', 1))
-        if project_version > PROJECT_SCHEMA_VERSION:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Unsupported Project Version",
-                "This project was saved with a newer version of Kindred. "
-                "Some settings may not load correctly."
+        source = validate_project_payload(data)
+        batch_payload = data.get("batch_initial_conditions")
+        try:
+            batch_store = (
+                BatchInitialConditionsStore.from_serializable(dict(batch_payload))
+                if batch_payload is not None
+                else BatchInitialConditionsStore()
             )
-            logger.warning(
-                "Loading newer project schema version (%s > %s)",
-                project_version,
-                PROJECT_SCHEMA_VERSION
-            )
+        except Exception as exc:
+            raise ValueError("project payload field 'batch_initial_conditions' is invalid.") from exc
+
+        notes_text = data.get('notes', "")
 
         self._reset_project_apply_dirty_session_state()
         self._clear_last_mechanism()
 
-        mechanism_text = data.get('mechanism', "")
-        batch_payload = data.get("batch_initial_conditions")
-        seed_sets: Dict[str, Dict[str, float]]
-        rewritten = mechanism_text
-        if isinstance(batch_payload, dict):
-            seed_sets = {}
-        else:
-            try:
-                seed_sets, rewritten = migrate_reaction_dsl_initial_concentration_sets(
-                    mechanism_text,
-                    default_set_name="set1",
-                )
-            except Exception:
-                seed_sets, rewritten = ({}, mechanism_text)
-        notes_text = data.get('notes', "")
-        self._set_text_with_optional_undo(
-            self._mechanism_editor._reactions_text,
-            mechanism_text,
-            "Load project (reactions)",
-            record_undo,
-        )
-
         # Batch initial conditions (schema v3+). For older projects, migrate any
         # inline initial concentrations into set1 and rewrite the block stub.
-        if isinstance(batch_payload, dict):
-            try:
-                self._batch_store = BatchInitialConditionsStore.from_serializable(batch_payload)
-            except Exception:
-                self._batch_store = BatchInitialConditionsStore()
-        else:
-            self._batch_store = BatchInitialConditionsStore()
-            if seed_sets:
-                self._materialize_migrated_initial_concentration_sets(seed_sets=seed_sets)
-                self._set_text_with_optional_undo(
-                    self._mechanism_editor._reactions_text,
-                    rewritten,
-                    "Migrate initial concentrations to set table",
-                    record_undo,
-                )
+        self._batch_store = batch_store
+        source = source.with_reactions_text(
+            self._migrate_inline_initials_to_batch_store(source.reactions_text)
+        )
+
+        self._set_authoritative_mechanism_editor_source(
+            source,
+            description="Load project mechanism source",
+            apply_transition=False,
+            transition_source="project_load",
+            record_undo=record_undo,
+        )
 
         self._batch_model = BatchInitialConditionsTableModel(self._batch_store, parent=self)
         if self._batch_table is not None:
@@ -3862,22 +3966,13 @@ class MainWindow(
         self._update_batch_row_controls_state()
         self._on_batch_current_changed()
 
-        self._set_text_with_optional_undo(
+        self._set_plain_text_widget_with_optional_undo(
             self._mechanism_editor._notes_text,
             notes_text,
             "Load project (notes)",
             record_undo,
         )
 
-        state_network_text = data.get('state_network') or ""
-        state_editor = self._mechanism_editor._state_network_editor
-        current_state_network = state_editor.get_state_network_dsl()
-        if state_network_text.strip():
-            if state_network_text.strip() != current_state_network.strip():
-                state_editor.set_state_network_dsl(state_network_text)
-        else:
-            if current_state_network.strip():
-                state_editor.clear()
         self._on_programmatic_mechanism_load(schedule_runtime_refresh=False)
 
         _pref = self.config_controller.get_user_preference
@@ -3908,11 +4003,6 @@ class MainWindow(
         self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
             data.get('limit_blas_threads_per_worker', _pref('limit_blas_threads_per_worker'))
         )
-        if 'use_advanced_dsl' in data:
-            logger.info(
-                "Loaded legacy project flag use_advanced_dsl=%s (ignored; advanced DSL always enabled)",
-                data['use_advanced_dsl'],
-            )
         self._temperature_spinbox.setValue(
             data.get('temperature_K', _pref('temperature_K'))
         )
@@ -3935,11 +4025,11 @@ class MainWindow(
             atol=atol_value,
         )
 
-        # Document-override-only dict -- non-overridden keys read live from tier 2
+        # Loaded project files carry a complete fitting-default snapshot.
         self._fitting_defaults = {
             key: data[key]
             for key in FITTING_DEFAULTS_KEYS
-            if key in data and data[key] is not None
+            if data[key] is not None
         }
         runtime_settings_changed = self._simulation_runtime_settings_snapshot() != previous_runtime_settings
         batch_runtime_pool_settings_changed = (
@@ -3950,6 +4040,7 @@ class MainWindow(
 
     def apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> bool:
         """Public project apply API for controllers (avoid reaching into `_` helpers)."""
+        validate_project_payload(data)
         if not self._guard_slider_transaction_invalidation(action_text="Loading this project"):
             return False
         self._apply_project_payload(data, record_undo=record_undo)
@@ -4012,6 +4103,12 @@ class MainWindow(
     def mechanism_state_network_dsl_raw(self) -> str:
         return self._simulation_mechanism_owner.mechanism_state_network_dsl_raw()
 
+    def canonical_mechanism_source(self):
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        return owner.canonical_source
+
     def set_variable_sliders(
         self,
         variables: Dict[str, float],
@@ -4046,17 +4143,25 @@ class MainWindow(
         *,
         record_undo: bool,
     ) -> None:
-        self._set_text_with_optional_undo(
-            self._mechanism_editor._reactions_text,
-            str(new_text),
-            str(description),
-            bool(record_undo),
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        self._set_authoritative_mechanism_editor_source(
+            MechanismAuthoringSource.from_parts(
+                reactions_text=str(new_text),
+                state_network_dsl=str(self.mechanism_state_network_dsl_raw() or ""),
+            ),
+            description=str(description),
+            record_undo=bool(record_undo),
         )
 
-    def _apply_wegscheider_resolution_source_rewrite(self, reactions_text: str) -> None:
-        self._set_authoritative_mechanism_editor_texts(
-            reactions_text=str(reactions_text),
-            state_network_dsl=str(self.mechanism_state_network_dsl_raw() or ""),
+    def _apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> None:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        self._set_authoritative_mechanism_editor_source(
+            MechanismAuthoringSource.from_parts(
+                reactions_text=str(reactions_text),
+                state_network_dsl=str(self.mechanism_state_network_dsl_raw() or ""),
+            ),
             description="Resolve Wegscheider cyclicity",
             apply_transition=True,
             transition_source="wegscheider_resolution",
@@ -4175,11 +4280,14 @@ class MainWindow(
     def _simulation_schema_text(self) -> str:
         return self._simulation_mechanism_owner.get_mechanism_text()
 
-    def simulation_schema_id(self) -> str:
-        return self._simulation_mechanism_owner.simulation_schema_id()
+    def simulation_schema_id(self, *, fast_mode: bool = False) -> str:
+        return self._simulation_mechanism_owner.simulation_schema_id(fast_mode=bool(fast_mode))
 
-    def simulation_param_fingerprint(self, set_id: Optional[str] = None) -> str:
-        return self._simulation_mechanism_owner.simulation_param_fingerprint(set_id=set_id)
+    def simulation_param_fingerprint(self, set_id: Optional[str] = None, *, fast_mode: bool = False) -> str:
+        return self._simulation_mechanism_owner.simulation_param_fingerprint(
+            set_id=set_id,
+            fast_mode=bool(fast_mode),
+        )
 
     def _batch_store_is_pristine_default_placeholder(self) -> bool:
         if int(self._batch_store.row_count()) != 1:
@@ -4254,15 +4362,6 @@ class MainWindow(
     def slider_overrides(self, set_id: Optional[str] = None) -> Dict[str, float]:
         return self._simulation_mechanism_owner.slider_overrides(set_id=set_id)
 
-    def apply_overrides_to_text(self, base_text: str, *, set_id: Optional[str] = None) -> str:
-        return self._simulation_mechanism_owner.apply_overrides_to_text(str(base_text), set_id=set_id)
-
-    def apply_overrides_to_state_network_dsl(self, base_text: str, *, set_id: Optional[str] = None) -> str:
-        return self._simulation_mechanism_owner.apply_overrides_to_state_network_dsl(
-            str(base_text),
-            set_id=set_id,
-        )
-
     def get_mechanism_text(self) -> str:
         return self._simulation_mechanism_owner.get_mechanism_text()
 
@@ -4327,25 +4426,7 @@ class MainWindow(
             self._suppress_canonical_batch_initials_transition = True
             try:
                 migrated_rows = self._materialize_migrated_initial_concentration_sets(seed_sets=seed_sets)
-                for row_idx in migrated_rows:
-                    try:
-                        top_left = self._batch_model.index(int(row_idx), 0)
-                        bottom_right = self._batch_model.index(
-                            int(row_idx),
-                            max(0, int(self._batch_model.columnCount()) - 1),
-                        )
-                        self._batch_model.dataChanged.emit(
-                            top_left,
-                            bottom_right,
-                            [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
-                        )
-                    except Exception as exc:
-                        logger.debug(
-                            "Failed to emit batch model dataChanged after migrating pending init seed row %s: %s",
-                            int(row_idx),
-                            exc,
-                            exc_info=True,
-                        )
+                self._notify_batch_initial_rows_changed(migrated_rows)
             finally:
                 self._suppress_canonical_batch_initials_transition = previous_batch_initials_suppress
             previous_suppress = self._variable_runtime.suppress_slider_runtime_invalidation()
@@ -4362,9 +4443,13 @@ class MainWindow(
                     record_undo=True,
                 )
                 self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+                from kindred.core.mechanism_source import MechanismAuthoringSource
+
                 self._mechanism_runtime_transition.arm_pending_init_result_guard(
-                    rewrite=str(rewrite),
-                    state_network_text=self.mechanism_state_network_dsl_raw(),
+                    source=MechanismAuthoringSource.from_parts(
+                        reactions_text=str(rewrite),
+                        state_network_dsl=self.mechanism_state_network_dsl_raw(),
+                    ),
                 )
                 self._set_mechanism_edit_locked(True)
                 self._apply_authoritative_mechanism_transition(
@@ -4387,10 +4472,14 @@ class MainWindow(
             return False
 
     def arm_pending_init_result_invalidation_guard(self, *, rewrite: str | None = None) -> None:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         rewrite_text = str(self.mechanism_reactions_text_raw() or "") if rewrite is None else str(rewrite or "")
         self._mechanism_runtime_transition.arm_pending_init_result_guard(
-            rewrite=rewrite_text,
-            state_network_text=self.mechanism_state_network_dsl_raw(),
+            source=MechanismAuthoringSource.from_parts(
+                reactions_text=rewrite_text,
+                state_network_dsl=self.mechanism_state_network_dsl_raw(),
+            ),
         )
 
     def invalidate_pending_init_preserved_results_after_failed_run(self) -> None:
@@ -5324,14 +5413,14 @@ class MainWindow(
             normalized[str(key)] = float(parsed)
         return normalized
 
-    def _apply_overrides_to_text(
+    def _apply_reactions_overrides_to_text(
         self,
         base_text: str,
         *,
         set_id: Optional[str] = None,
         overrides: Optional[Dict[str, float]] = None,
     ) -> str:
-        """Return mechanism DSL with slider overrides applied."""
+        """Return Reactions-layer DSL with slider overrides applied."""
         drag_baseline_text = self._preview_session.drag_baseline_text()
         if self._preview_session.slider_drag_active() and drag_baseline_text is not None:
             text = drag_baseline_text
@@ -5363,7 +5452,6 @@ class MainWindow(
                 var_name,
                 var_value,
                 source_text=text,
-                commit=False,
                 metadata=metadata,
                 step_analysis_context=step_analysis_context,
             )
@@ -5879,7 +5967,7 @@ class MainWindow(
                 return
         tokens.append([str(key), str(value)])
 
-    def _apply_overrides_to_state_network_dsl(
+    def _apply_state_network_overrides_to_dsl(
         self,
         base_dsl: str,
         *,
@@ -6033,15 +6121,11 @@ class MainWindow(
             float(value),
         )
 
-        if callable(getattr(self, "_set_text_with_optional_undo", None)):
-            self._set_text_with_optional_undo(
-                reactions_widget,
-                new_text,
-                f"Update param {name} in Reactions DSL",
-                True,
-            )
-        else:
-            reactions_widget.setPlainText(new_text)
+        self.set_mechanism_reactions_text_with_optional_undo(
+            new_text,
+            f"Update param {name} in Reactions DSL",
+            record_undo=True,
+        )
 
     def _parameter_algebra_spec_for_ui(self):
         from kindred.core.simulator.algebra_section import extract_algebra_section_text
@@ -6126,12 +6210,14 @@ class MainWindow(
         return "kJ/mol"
 
     def _energy_mode_full_dsl_from_editor(self) -> str:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         reactions_text = self._mechanism_editor._reactions_text.toPlainText()
         state_network_dsl = self._mechanism_editor._state_network_editor.get_state_network_dsl()
-        full_dsl = reactions_text
-        if str(state_network_dsl or "").strip():
-            full_dsl += "\n\n# State Network\n" + str(state_network_dsl)
-        return str(full_dsl)
+        return MechanismAuthoringSource.from_parts(
+            reactions_text=reactions_text,
+            state_network_dsl=state_network_dsl,
+        ).full_dsl
 
     def _energy_mode_temperature_K(self, full_dsl: str) -> float | None:
         T_override = self._dsl_global_temperature_K(full_dsl)
@@ -6462,16 +6548,18 @@ class MainWindow(
             self._suppress_canonical_batch_initials_transition = previous_suppress
         return ()
 
-    def _materialized_mechanism_editor_texts_for_effective_slider_values(
+    def _materialized_mechanism_editor_source_for_effective_slider_values(
         self,
         values: Dict[str, float],
-    ) -> tuple[str, str]:
+    ):
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         non_scalar_values, scalar_values, state_network_values = (
             self._partition_effective_slider_commit_values(values)
         )
         reactions_text = self.mechanism_reactions_text_raw()
         if non_scalar_values:
-            reactions_text = self._apply_overrides_to_text(
+            reactions_text = self._apply_reactions_overrides_to_text(
                 reactions_text,
                 overrides=non_scalar_values,
             )
@@ -6483,11 +6571,14 @@ class MainWindow(
 
         state_network_dsl = self.mechanism_state_network_dsl_raw()
         if state_network_dsl.strip() and state_network_values:
-            state_network_dsl = self._apply_overrides_to_state_network_dsl(
+            state_network_dsl = self._apply_state_network_overrides_to_dsl(
                 state_network_dsl,
                 overrides=state_network_values,
             )
-        return str(reactions_text), str(state_network_dsl)
+        return MechanismAuthoringSource.from_parts(
+            reactions_text=reactions_text,
+            state_network_dsl=state_network_dsl,
+        )
 
     def _partition_effective_slider_commit_values(
         self,
@@ -6512,17 +6603,20 @@ class MainWindow(
                 state_network_values[name_s] = value_f
         return non_scalar_values, scalar_values, state_network_values
 
-    def _set_authoritative_mechanism_editor_texts(
+    def _set_authoritative_mechanism_editor_source(
         self,
+        source,
         *,
-        reactions_text: str,
-        state_network_dsl: str,
         description: str,
         apply_transition: bool = True,
         transition_source: str = "authoritative_editor_rewrite",
+        record_undo: bool = True,
     ) -> None:
-        from kindred.gui.undo_commands import SetMechanismEditorTextsCommand
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+        from kindred.gui.undo_commands import SetMechanismSourceCommand
 
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be a MechanismAuthoringSource.")
         transition_required = False
         previous_suppress = self._variable_runtime.suppress_slider_runtime_invalidation()
         previous_authoritative_suppress = bool(
@@ -6531,7 +6625,8 @@ class MainWindow(
         self._variable_runtime.set_suppress_slider_runtime_invalidation(True)
         self._suppress_authoritative_mechanism_input_change = True
         try:
-            current_reactions = str(self.mechanism_reactions_text_raw() or "")
+            reactions_widget = self._mechanism_editor._reactions_text
+            current_reactions = str(reactions_widget.toPlainText() or "")
             state_editor = getattr(getattr(self, "_mechanism_editor", None), "_state_network_editor", None)
             state_editor_available = (
                 state_editor is not None
@@ -6543,23 +6638,26 @@ class MainWindow(
                 if state_editor_available
                 else ""
             )
-            reactions_text_s = str(reactions_text)
-            state_network_dsl_s = str(state_network_dsl)
+            reactions_text_s = str(source.reactions_text)
+            state_network_dsl_s = str(source.state_network_dsl)
             reactions_changed = reactions_text_s != current_reactions
             state_changed = state_editor_available and state_network_dsl_s != current_state
             if not reactions_changed and not state_changed:
                 return
-            command = SetMechanismEditorTextsCommand(
-                self._mechanism_editor._reactions_text,
-                state_editor if state_editor_available else None,
-                new_reactions_text=reactions_text_s,
-                old_reactions_text=current_reactions,
-                new_state_network_dsl=state_network_dsl_s,
-                old_state_network_dsl=current_state,
-                description=str(description),
+            old_source = MechanismAuthoringSource.from_parts(
+                reactions_text=current_reactions,
+                state_network_dsl=current_state,
             )
-            self._undo_stack.push(command)
-            self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+            if bool(record_undo):
+                command = SetMechanismSourceCommand(
+                    new_source=source,
+                    old_source=old_source,
+                    apply_source=self._apply_mechanism_source_undo_stack_replacement,
+                    description=str(description),
+                )
+                self._undo_stack.push(command)
+            else:
+                self._write_complete_authoritative_mechanism_source_to_editor(source)
             transition_required = True
         finally:
             self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
@@ -6568,6 +6666,66 @@ class MainWindow(
             self._apply_authoritative_mechanism_transition(
                 transition_source=str(transition_source or "authoritative_editor_rewrite")
             )
+
+    def _write_complete_authoritative_mechanism_source_to_editor(self, source) -> bool:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be a MechanismAuthoringSource.")
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is None:
+            raise RuntimeError("Mechanism editor is unavailable.")
+        reactions_widget = getattr(editor, "_reactions_text", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if reactions_widget is None:
+            raise RuntimeError("Mechanism Reactions editor is unavailable.")
+        state_editor_available = (
+            state_editor is not None
+            and hasattr(state_editor, "get_state_network_dsl")
+            and hasattr(state_editor, "set_state_network_dsl")
+        )
+        current_reactions = str(reactions_widget.toPlainText() or "")
+        current_state = (
+            str(state_editor.get_state_network_dsl() or "")
+            if state_editor_available
+            else ""
+        )
+        reactions_text = str(source.reactions_text)
+        state_network_dsl = str(source.state_network_dsl)
+        reactions_changed = reactions_text != current_reactions
+        state_changed = state_editor_available and state_network_dsl != current_state
+        if not reactions_changed and not state_changed:
+            return False
+
+        previous_reactions_block = reactions_widget.blockSignals(True)
+        previous_state_block = None
+        if state_editor_available:
+            previous_state_block = state_editor.blockSignals(True)
+        try:
+            if reactions_changed:
+                reactions_widget.setPlainText(reactions_text)
+            if state_changed:
+                state_editor.set_state_network_dsl(state_network_dsl)
+        finally:
+            if state_editor_available:
+                state_editor.blockSignals(bool(previous_state_block))
+            reactions_widget.blockSignals(bool(previous_reactions_block))
+
+        self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+        validate = getattr(editor, "_validate_dsl", None)
+        if callable(validate):
+            validate()
+        return True
+
+    def _apply_mechanism_source_undo_stack_replacement(self, source) -> None:
+        changed = self._write_complete_authoritative_mechanism_source_to_editor(source)
+        if not bool(changed):
+            return
+        if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
+            return
+        self._apply_authoritative_mechanism_transition(
+            transition_source="mechanism_source_undo_redo",
+        )
 
     def _materialize_direct_slider_commit_to_authoritative_editors(self, name: str, value: float) -> None:
         focused_set_id = str(self._preview_session.focused_mechanism_workspace_set_id() or "")
@@ -6594,12 +6752,9 @@ class MainWindow(
         *,
         description: str = "Apply slider overrides",
     ) -> None:
-        reactions_text, state_network_dsl = self._materialized_mechanism_editor_texts_for_effective_slider_values(
-            values
-        )
-        self._set_authoritative_mechanism_editor_texts(
-            reactions_text=reactions_text,
-            state_network_dsl=state_network_dsl,
+        source = self._materialized_mechanism_editor_source_for_effective_slider_values(values)
+        self._set_authoritative_mechanism_editor_source(
+            source,
             description=str(description),
             apply_transition=False,
         )
@@ -6949,7 +7104,6 @@ class MainWindow(
         value: float,
         *,
         source_text: Optional[str] = None,
-        commit: bool = True,
         strict: bool = False,
         metadata: Optional[Dict[str, Dict[str, object]]] = None,
         step_analysis_context: object | None = None,
@@ -6965,8 +7119,6 @@ class MainWindow(
             New value
         source_text : str | None
             Optional mechanism DSL to apply the change to. If None, use editor text.
-        commit : bool, default True
-            When True, apply updates to the editor and slider widgets.
 
         Returns
         -------
@@ -6980,8 +7132,6 @@ class MainWindow(
 
         if metadata is None:
             metadata = dict(self.variable_metadata())
-        slider_updates: list[tuple[str, float, Dict[str, object]]] = []
-        sliders = getattr(self._mechanism_editor, "_variable_sliders", None) if commit else None
         step_constraint_context = {
             "temperature_K": float(self._temperature_spinbox.value()),
             "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
@@ -7018,9 +7168,6 @@ class MainWindow(
         new_text = str(outcome.updated_text)
 
         if family == "Keq":
-            K_val = float(resolved_values[f"Keq{step_index}"])
-            kf_val = float(resolved_values[f"kf{step_index}"])
-            kr_val = float(resolved_values[f"kr{step_index}"])
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             K_meta = dict(metadata.get(f"Keq{step_index}") or {})
             K_meta.update(
@@ -7055,17 +7202,7 @@ class MainWindow(
                 }
             )
             metadata[f"kr{step_index}"] = kr_meta
-            if commit:
-                slider_updates.append((f"Keq{step_index}", float(f"{K_val:.6g}"), metadata[f"Keq{step_index}"]))
-                slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
-                slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
         elif family == "kf":
-            kf_val = float(resolved_values[f"kf{step_index}"])
-            kr_val = (
-                float(resolved_values[f"kr{step_index}"])
-                if f"kr{step_index}" in resolved_values
-                else None
-            )
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             kf_meta = dict(metadata.get(f"kf{step_index}") or {})
             kf_meta.update(
@@ -7078,7 +7215,7 @@ class MainWindow(
                 }
             )
             metadata[f"kf{step_index}"] = kf_meta
-            if kr_val is not None:
+            if f"kr{step_index}" in resolved_values:
                 kr_meta = dict(metadata.get(f"kr{step_index}") or {})
                 kr_meta.update(
                     {
@@ -7091,7 +7228,6 @@ class MainWindow(
                 )
                 metadata[f"kr{step_index}"] = kr_meta
             if f"Keq{step_index}" in resolved_values:
-                K_val = float(resolved_values[f"Keq{step_index}"])
                 K_meta = dict(metadata.get(f"Keq{step_index}") or {})
                 K_meta.update(
                     {
@@ -7103,15 +7239,7 @@ class MainWindow(
                     }
                 )
                 metadata[f"Keq{step_index}"] = K_meta
-            if commit:
-                slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
-                if kr_val is not None:
-                    slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
-                if f"Keq{step_index}" in resolved_values:
-                    slider_updates.append((f"Keq{step_index}", float(f"{resolved_values[f'Keq{step_index}']:.6g}"), metadata[f"Keq{step_index}"]))
         elif family == "kr":
-            kr_val = float(resolved_values[f"kr{step_index}"])
-            kf_val = float(resolved_values[f"kf{step_index}"])
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             kr_meta = dict(metadata.get(f"kr{step_index}") or {})
             kr_meta.update(
@@ -7136,7 +7264,6 @@ class MainWindow(
             )
             metadata[f"kf{step_index}"] = kf_meta
             if f"Keq{step_index}" in resolved_values:
-                K_val = float(resolved_values[f"Keq{step_index}"])
                 K_meta = dict(metadata.get(f"Keq{step_index}") or {})
                 K_meta.update(
                     {
@@ -7148,11 +7275,6 @@ class MainWindow(
                     }
                 )
                 metadata[f"Keq{step_index}"] = K_meta
-            if commit:
-                slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
-                slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
-                if f"Keq{step_index}" in resolved_values:
-                    slider_updates.append((f"Keq{step_index}", float(f"{resolved_values[f'Keq{step_index}']:.6g}"), metadata[f"Keq{step_index}"]))
         elif family == "k":
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             metadata[name] = {
@@ -7162,57 +7284,6 @@ class MainWindow(
                 "line": line_index,
                 "role": "k",
             }
-            if commit:
-                slider_updates.append((name, float(f"{resolved_values[name]:.6g}"), metadata[name]))
-
-        if commit and family in {"kf", "kr"} and f"Keq{step_index}" not in resolved_values:
-            try:
-                kf_current = float(resolved_values[f"kf{step_index}"])
-                kr_current = float(resolved_values[f"kr{step_index}"])
-            except Exception:
-                kf_current = float("nan")
-                kr_current = float("nan")
-            if math.isfinite(kf_current) and math.isfinite(kr_current) and abs(kr_current) > 1e-30:
-                K_name = f"Keq{step_index}"
-                K_meta = dict(metadata.get(K_name) or {})
-                if K_meta or (sliders is not None and sliders.has_variable(K_name)):
-                    label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
-                    K_meta.update(
-                        {
-                            "type": "equilibrium",
-                            "index": step_index,
-                            "label": K_meta.get("label") or label_text,
-                            "line": line_index,
-                            "role": "Keq",
-                            "editable": False,
-                            "derived": True,
-                        }
-                    )
-                    metadata[K_name] = K_meta
-                    slider_updates.append((K_name, float(f"{(kf_current / kr_current):.6g}"), K_meta))
-
-        if not commit:
-            return new_text
-
-        self.set_variable_metadata(metadata)
-
-        self._mechanism_editor.set_reactions_text(new_text, block_signals=True)
-
-        for slider_name, slider_value, meta in slider_updates:
-            if sliders is not None and sliders.has_variable(slider_name):
-                sliders.update_variable(slider_name, slider_value)
-                sliders.update_metadata(slider_name, meta)
-                # Only persist user-editable slider values as overrides; derived/read-only
-                # sliders (e.g., kf/kr implied by explicit Keq, or param-algebra constraints)
-                # must never be rewritten back into the DSL.
-                if not (isinstance(meta, dict) and meta.get("editable") is False):
-                    self._preview_session.stage_slider_value(slider_name, slider_value)
-
-        self._refresh_derived_parameters_display()
-
-        timer = getattr(self._mechanism_editor, "_network_update_timer", None)
-        if timer is not None:
-            timer.start()
 
         return new_text
 
@@ -7347,6 +7418,29 @@ class MainWindow(
 
         MainWindow._CACHED_PRESET_IDS = [path.stem for path in preset_files]
         return MainWindow._CACHED_PRESET_IDS
+
+    def _available_intervention_example_specs(self) -> List[Dict[str, str]]:
+        """Return bundled intervention examples discovered under kindred/data/interventions."""
+        try:
+            from kindred.io.resources import get_all_intervention_example_specs
+        except Exception as exc:  # pragma: no cover - defensive import
+            logger.warning("Intervention example resources unavailable: %s", exc)
+            return []
+
+        specs = []
+        for spec in get_all_intervention_example_specs():
+            example_id = str(spec.get("id", "")).strip()
+            if not example_id:
+                continue
+            specs.append(
+                {
+                    "id": example_id,
+                    "type": str(spec.get("type", "intervention")),
+                    "path": str(spec.get("path", "")),
+                    "title": str(spec.get("title", "")),
+                }
+            )
+        return specs
 
     @staticmethod
     def _preset_sort_key(path: Path) -> Tuple[int, str]:
