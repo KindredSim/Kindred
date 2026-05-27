@@ -30,6 +30,30 @@ class DisplaySetRole(Enum):
     REFERENCE_OVERLAY = "reference_overlay"
 
 
+@dataclass(frozen=True, slots=True)
+class CopyAllDisplayBlock:
+    set_id: str
+    label: str
+    t: Any
+    series: Dict[str, Any]
+    layer_id: str = ""
+    owned_species: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CopyAllMissingItem:
+    set_id: str
+    label: str
+    popup_label: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CopyAllExportPlan:
+    display_blocks: List[CopyAllDisplayBlock]
+    missing_items: List[CopyAllMissingItem]
+
+
 class DisplayEventKind(Enum):
     CACHE_DISPLAY_SCOPE_READY = "cache_display_scope_ready"
     RESOLVED_DISPLAY_REQUEST_READY = "resolved_display_request_ready"

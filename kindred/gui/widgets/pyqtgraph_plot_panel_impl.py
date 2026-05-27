@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import partial
 import logging
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, NamedTuple
@@ -13,6 +12,7 @@ from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt
 
 from kindred.gui.color_manager import ColorManager
+from kindred.gui.ports import CopyAllDisplayBlock, CopyAllExportPlan, CopyAllMissingItem
 
 # Direct imports required to avoid circular dependency with widgets/__init__.py
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
@@ -24,36 +24,9 @@ from ..ui_helpers import make_pyqtgraph_fallback_widget
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "CopyAllExportPlan",
-    "CopyAllMissingItem",
-    "CopyAllDisplayBlock",
     "PyQtGraphPlotPanel",
     "PYQTGRAPH_AVAILABLE",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class CopyAllDisplayBlock:
-    set_id: str
-    label: str
-    t: np.ndarray
-    series: Dict[str, np.ndarray]
-    layer_id: str = ""
-    owned_species: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class CopyAllMissingItem:
-    set_id: str
-    label: str
-    popup_label: str
-    reason: str
-
-
-@dataclass(frozen=True, slots=True)
-class CopyAllExportPlan:
-    display_blocks: List[CopyAllDisplayBlock]
-    missing_items: List[CopyAllMissingItem]
 
 
 def _try_float(value: object) -> Optional[float]:
@@ -306,6 +279,14 @@ if PYQTGRAPH_AVAILABLE:
             self._export_all_overlay_cache_dirty: bool = True
             self._dark_mode = False
             self._scalar_values: Dict[str, float] = {}
+            self._y_selection_user_touched: bool = False
+            self._auto_range_enabled: bool = True
+            self._manual_range_values: tuple[
+                Optional[float],
+                Optional[float],
+                Optional[float],
+                Optional[float],
+            ] = (None, None, None, None)
 
             # Batch simulation overlays (multiple initial-condition sets overlaid as lines)
             self._simulation_set_label: Optional[str] = None
@@ -373,6 +354,7 @@ if PYQTGRAPH_AVAILABLE:
             self._plot_item.setMenuEnabled(False)
             vb = self._plot_item.getViewBox()
             vb.setMenuEnabled(False)
+            vb.sigRangeChangedManually.connect(self._on_view_range_changed_manually)
             self._apply_axis_inversion_state()
 
             self._toolbar = AxisToolbar(self, orientation="horizontal")
@@ -560,10 +542,25 @@ if PYQTGRAPH_AVAILABLE:
             -----
             No downsampling needed! PyQtGraph handles large datasets efficiently.
             """
+            preserve_y_selection = bool(self._y_selection_user_touched)
+            previous_y_selection = (
+                {name for name, visible in self._visible.items() if visible}
+                if preserve_y_selection
+                else set()
+            )
+            previous_series_names = set(self._series.keys())
             self._t = np.asarray(t, dtype=float).reshape(-1)
             self._series = {str(k): np.asarray(v, dtype=float).reshape(-1)
                            for k, v in series.items()}
-            self._visible = {k: True for k in self._series.keys()}
+            new_series_names = set(self._series.keys())
+            same_roster = previous_series_names == new_series_names
+            preserved_overlap = previous_y_selection & new_series_names
+            if preserve_y_selection and (same_roster or preserved_overlap):
+                self._visible = {k: k in preserved_overlap for k in self._series.keys()}
+            else:
+                self._visible = {k: True for k in self._series.keys()}
+                if preserve_y_selection:
+                    self._y_selection_user_touched = False
             color_manager = ColorManager.instance()
             provided_owned = {str(name).strip() for name in (owned_species or []) if str(name).strip()}
             series_keys = {str(name).strip() for name in self._series.keys() if str(name).strip()}
@@ -886,7 +883,7 @@ if PYQTGRAPH_AVAILABLE:
 
         def selected_series(self) -> List[str]:
             """Return the currently selected Y-series names."""
-            return list(self._toolbar.selected_y())
+            return [name for name in self._series.keys() if self._visible.get(name, False)]
 
         def get_export_scope_preference(self) -> str:
             """Return the preferred export scope for CSV dialogs."""
@@ -894,8 +891,6 @@ if PYQTGRAPH_AVAILABLE:
 
         def transaction_export_axis_state(self, scope: str) -> Dict[str, object]:
             """Return export presentation state without exposing simulation data authority."""
-            if self._toolbar is None:
-                raise ValueError("Axis toolbar unavailable for export.")
             normalized_scope = str(scope or "axis")
             if normalized_scope == "axis":
                 y_names = self._axis_scope_series_names()
@@ -903,7 +898,7 @@ if PYQTGRAPH_AVAILABLE:
                     raise ValueError("Select at least one Y-series before exporting.")
             else:
                 y_names = list(self._series.keys())
-            x_name = self._toolbar.current_x() or "t"
+            x_name = self._x_axis_name or "t"
             _x_data, derived_label = self._get_x_data()
             return {
                 "x_name": str(x_name),
@@ -929,7 +924,7 @@ if PYQTGRAPH_AVAILABLE:
                     "Cannot export overlay datasets until issues are resolved:\n" + warning_msg
                 )
 
-            x_name = self._toolbar.current_x() or "t"
+            x_name = self._x_axis_name or "t"
             _x_data, derived_label = self._get_x_data()
             x_header = str(derived_label or x_name)
             columns: List[Tuple[str, np.ndarray]] = []
@@ -943,6 +938,41 @@ if PYQTGRAPH_AVAILABLE:
                     )
                 )
             return columns
+
+        def append_dataset_overlay_export_columns(
+            self,
+            header: Sequence[str],
+            rows: Sequence[Sequence[object]],
+            scope: str,
+        ) -> Tuple[List[str], List[List[object]]]:
+            """Append local dataset-overlay projection columns to existing CSV rows."""
+            overlay_columns: List[Tuple[str, np.ndarray]] = []
+            for raw_name, raw_values in self.dataset_overlay_export_columns(scope):
+                name = str(raw_name or "").strip()
+                if not name:
+                    continue
+                values = np.asarray(raw_values, dtype=float).reshape(-1)
+                if values.size <= 0:
+                    continue
+                overlay_columns.append((name, values))
+            if not overlay_columns:
+                return list(header), [list(row) for row in rows]
+
+            base_header = list(header)
+            output_rows = [list(row) for row in rows]
+            base_width = len(base_header)
+            max_len = max([len(output_rows)] + [int(values.shape[0]) for _, values in overlay_columns])
+            while len(output_rows) < max_len:
+                output_rows.append([""] * base_width)
+            for row in output_rows:
+                if len(row) < base_width:
+                    row.extend([""] * (base_width - len(row)))
+
+            output_header = base_header + [name for name, _values in overlay_columns]
+            for _name, values in overlay_columns:
+                for idx, row in enumerate(output_rows):
+                    row.append(values[idx] if idx < values.shape[0] else "")
+            return output_header, output_rows
 
         def _get_clipboard(self):
             """Clipboard accessor seam (monkeypatchable in tests)."""
@@ -1007,9 +1037,13 @@ if PYQTGRAPH_AVAILABLE:
 
         def set_selected_series(self, names: Sequence[str]) -> None:
             """Apply a specific selection of Y-series."""
-            valid = [n for n in names if n in self._series]
-            self._toolbar.select_y(valid)
-            self._on_y_selection_changed(valid)
+            valid = [str(n) for n in names if str(n) in self._series]
+            target = set(valid)
+            self._y_selection_user_touched = True
+            for series_name in self._series.keys():
+                self._visible[series_name] = series_name in target
+            self._project_y_selection_to_toolbar()
+            self._update_plot()
 
         def _series_names_compatible_with_x(
             self,
@@ -1069,22 +1103,10 @@ if PYQTGRAPH_AVAILABLE:
             return []
 
         def _visible_selected_series_names(self) -> List[str]:
-            toolbar = getattr(self, "_toolbar", None)
-            if toolbar is None:
-                return []
-            names: List[str] = []
-            seen: Set[str] = set()
-            for raw_name in toolbar.selected_y():
-                name = str(raw_name)
-                if name in seen:
-                    continue
-                seen.add(name)
-                if name not in self._series:
-                    continue
-                if not self._visible.get(name, True):
-                    continue
-                names.append(name)
-            return names
+            return [name for name in self._series.keys() if self._visible.get(name, False)]
+
+        def _project_y_selection_to_toolbar(self) -> None:
+            self._toolbar.select_y(self._visible_selected_series_names())
 
         def _current_primary_renderable_series_names(
             self,
@@ -1391,17 +1413,9 @@ if PYQTGRAPH_AVAILABLE:
 
             blocks: List[List[Tuple[str, np.ndarray]]] = []
             missing_items: List[CopyAllMissingItem] = list(plan.missing_items or [])
-            # Provider-owned display set IDs are the only source for displayed simulations.
-            display_set_ids: Set[str] = {
-                str(item.set_id or "").strip()
-                for item in list(plan.missing_items or [])
-                if str(item.set_id or "").strip()
-            }
 
             for display_block in list(plan.display_blocks or []):
                 set_id = str(display_block.set_id or "").strip()
-                if set_id:
-                    display_set_ids.add(set_id)
                 block_columns, missing_reason = self._build_displayed_simulation_copy_block(
                     display_block,
                     x_name=x_name,
@@ -1420,7 +1434,7 @@ if PYQTGRAPH_AVAILABLE:
                     )
                 )
 
-            if not blocks:
+            if not blocks and not missing_items:
                 raise ValueError("No visible simulation series are available to copy.")
             return blocks, missing_items
 
@@ -1460,6 +1474,21 @@ if PYQTGRAPH_AVAILABLE:
             box.setEscapeButton(no_button)
             box.exec()
             return box.clickedButton() is yes_button
+
+        def _show_copy_all_missing_items(self, missing_items: Sequence[CopyAllMissingItem]) -> None:
+            entries = [item for item in missing_items if isinstance(item, CopyAllMissingItem)]
+            if not entries:
+                return
+            lines = [
+                f"{str(item.popup_label or item.label or item.set_id or 'Requested Show simulation')}: "
+                f"{self._copy_all_reason_text(item.reason)}"
+                for item in entries
+            ]
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Copy All",
+                "No displayed simulation data can be copied.\n\n" + "\n".join(lines),
+            )
 
         def _build_visible_copy_blocks(self) -> List[List[Tuple[str, np.ndarray]]]:
             if self._t is None or not self._series:
@@ -1585,6 +1614,9 @@ if PYQTGRAPH_AVAILABLE:
                         return
                     raise ValueError("Copy All is unavailable.")
                 blocks, missing_items = self._build_copy_all_blocks(plan)
+                if not blocks:
+                    self._show_copy_all_missing_items(missing_items)
+                    return
                 if missing_items and not self._confirm_copy_all_missing_items(missing_items):
                     return
                 columns = self._flatten_copy_blocks(blocks)
@@ -2440,8 +2472,7 @@ if PYQTGRAPH_AVAILABLE:
 
         def _refresh_view_after_plot_update(self) -> None:
             """Keep auto-range truthful across live result updates without overriding manual ranges."""
-            toolbar = getattr(self, "_toolbar", None)
-            if toolbar is None or not bool(toolbar.is_auto_range()):
+            if not bool(self._auto_range_enabled):
                 return
             try:
                 self._plot_item.enableAutoRange(x=True, y=True)
@@ -2621,15 +2652,12 @@ if PYQTGRAPH_AVAILABLE:
             Parameters
             ----------
             scope : str
-                "axis" to use current toolbar selections, "all" for all series.
+                "axis" to use current plot-axis selections, "all" for all series.
             """
             if self._copy_all_export_plan_provider is not None:
                 raise ValueError(
                     "Main simulation plot export must be requested through the active simulation display transaction."
                 )
-            toolbar = self._toolbar
-            if toolbar is None:
-                raise ValueError("Axis toolbar unavailable for export.")
 
             series = self._series
             if not series:
@@ -2647,7 +2675,7 @@ if PYQTGRAPH_AVAILABLE:
                 overlay_series = list(self._export_all_overlay_series)
                 warnings = list(self._export_all_overlay_warnings)
 
-            x_name = toolbar.current_x() or "t"
+            x_name = self._x_axis_name or "t"
             x_data, derived_label = self._get_x_data()
             if x_data is None:
                 raise ValueError(f"The selected X-axis '{x_name}' has no data to export.")
@@ -2752,7 +2780,9 @@ if PYQTGRAPH_AVAILABLE:
 
             # X-axis candidates: time + all species
             x_candidates = ["t"] + list(self._series.keys())
-            self._toolbar.set_x_candidates(x_candidates)
+            if self._x_axis_name not in x_candidates:
+                self._x_axis_name = "t"
+            self._toolbar.set_x_candidates(x_candidates, default=self._x_axis_name)
 
             # Y-axis candidates: all species (checked by default if visible)
             y_candidates = [(name, self._visible.get(name, True)) for name in self._series.keys()]
@@ -2762,7 +2792,10 @@ if PYQTGRAPH_AVAILABLE:
             ]
             for name in scalar_names:
                 y_candidates.append((name, False))
-            self._toolbar.set_y_candidates(y_candidates, disabled=scalar_names)
+            self._toolbar.set_y_candidates(
+                y_candidates,
+                disabled=scalar_names,
+            )
 
         def visible_series(self):
             """Get list of visible series names."""
@@ -2784,6 +2817,7 @@ if PYQTGRAPH_AVAILABLE:
             prev = self._visible.get(name, True)
             self._visible[name] = bool(visible)
             if prev != self._visible[name]:
+                self._project_y_selection_to_toolbar()
                 self.seriesVisibilityChanged.emit(name, self._visible[name])
                 self._update_plot()
 
@@ -2828,10 +2862,38 @@ if PYQTGRAPH_AVAILABLE:
 
         def _on_y_selection_changed(self, selected: List[str]) -> None:
             """Handle Y-axis selection change from toolbar."""
+            self._y_selection_user_touched = True
             # Update visibility based on toolbar selection
             for series_name in self._series.keys():
                 self._visible[series_name] = series_name in selected
             self._update_plot()
+
+        def _on_view_range_changed_manually(self, *_args) -> None:
+            """Switch to manual range mode after PyQtGraph reports user range interaction."""
+            toolbar = getattr(self, "_toolbar", None)
+            if toolbar is None:
+                return
+            self._sync_toolbar_manual_ranges_to_view()
+            if not bool(self._auto_range_enabled):
+                return
+            self._auto_range_enabled = False
+            self._project_toolbar_auto_range(False)
+
+        def _project_toolbar_auto_range(self, enabled: bool) -> None:
+            """Project the plot-owned range mode into the toolbar."""
+            self._toolbar.set_auto_range(bool(enabled))
+
+        def _sync_toolbar_manual_ranges_to_view(self) -> None:
+            """Copy the current plot view limits into toolbar manual range fields."""
+            x_range, y_range = self._plot_item.viewRange()
+            ranges = (
+                float(x_range[0]),
+                float(x_range[1]),
+                float(y_range[0]),
+                float(y_range[1]),
+            )
+            self._manual_range_values = ranges
+            self._toolbar.set_manual_ranges(*ranges)
 
         def _on_parametric_toggled(self, enabled: bool) -> None:
             """Handle parametric mode toggle from toolbar."""
@@ -2932,18 +2994,24 @@ if PYQTGRAPH_AVAILABLE:
 
         def _on_axis_range_changed(self) -> None:
             """Handle axis range change from toolbar (auto/manual toggle or manual values changed)."""
-            logger.debug(f"Axis range changed: auto={self._toolbar.is_auto_range()}, ranges={self._toolbar.get_manual_ranges()}")
-            self._apply_axis_ranges()
+            auto_enabled = bool(self._toolbar.is_auto_range())
+            if auto_enabled:
+                ranges = self._manual_range_values
+            else:
+                ranges = self._toolbar.get_manual_ranges()
+                self._manual_range_values = ranges
+            self._auto_range_enabled = auto_enabled
+            logger.debug("Axis range changed: auto=%s, ranges=%s", auto_enabled, ranges)
+            self._apply_toolbar_axis_range_command()
 
-        def _apply_axis_ranges(self) -> None:
-            """Apply manual axis ranges from toolbar, or use auto range."""
-            if self._toolbar.is_auto_range():
+        def _apply_toolbar_axis_range_command(self) -> None:
+            """Apply the current toolbar range command to the plot-owned ViewBox."""
+            if self._auto_range_enabled:
                 # Auto range mode: let PyQtGraph auto-scale
                 self._plot_item.enableAutoRange()
                 logger.debug("Applied auto range")
             else:
-                # Manual range mode: use values from toolbar
-                x_min, x_max, y_min, y_max = self._toolbar.get_manual_ranges()
+                x_min, x_max, y_min, y_max = self._manual_range_values
 
                 # Apply X range if both values are provided
                 if x_min is not None and x_max is not None:
@@ -2980,6 +3048,9 @@ if PYQTGRAPH_AVAILABLE:
             self._intervention_annotation_items = []
             self._guide_items = []
             self._scalar_values = {}
+            self._y_selection_user_touched = False
+            self._auto_range_enabled = True
+            self._manual_range_values = (None, None, None, None)
             self._simulation_set_label = None
             self._simulation_set_id = None
             self._simulation_layer_id = None
@@ -2987,6 +3058,9 @@ if PYQTGRAPH_AVAILABLE:
             self._simulation_overlays = []
             self._owned_species_keys = set()
             self._owned_species_roster_explicit = False
+            self._toolbar.set_y_candidates([])
+            self._toolbar.set_manual_ranges(None, None, None, None)
+            self._project_toolbar_auto_range(True)
 
         # ==================== Plot Enhancements (v0.2.0) ====================
 
@@ -3151,23 +3225,23 @@ if PYQTGRAPH_AVAILABLE:
 
             # X-axis range
             x_min_spin = QtWidgets.QDoubleSpinBox()
-            x_min_spin.setDecimals(6)
+            x_min_spin.setDecimals(15)
             x_min_spin.setRange(-1e10, 1e10)
             x_min_spin.setValue(x_range[0])
 
             x_max_spin = QtWidgets.QDoubleSpinBox()
-            x_max_spin.setDecimals(6)
+            x_max_spin.setDecimals(15)
             x_max_spin.setRange(-1e10, 1e10)
             x_max_spin.setValue(x_range[1])
 
             # Y-axis range
             y_min_spin = QtWidgets.QDoubleSpinBox()
-            y_min_spin.setDecimals(6)
+            y_min_spin.setDecimals(15)
             y_min_spin.setRange(-1e10, 1e10)
             y_min_spin.setValue(y_range[0])
 
             y_max_spin = QtWidgets.QDoubleSpinBox()
-            y_max_spin.setDecimals(6)
+            y_max_spin.setDecimals(15)
             y_max_spin.setRange(-1e10, 1e10)
             y_max_spin.setValue(y_range[1])
 
@@ -3185,11 +3259,22 @@ if PYQTGRAPH_AVAILABLE:
             layout.addRow(button_box)
 
             if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                ranges = (
+                    float(x_min_spin.value()),
+                    float(x_max_spin.value()),
+                    float(y_min_spin.value()),
+                    float(y_max_spin.value()),
+                )
+                self._auto_range_enabled = False
+                self._manual_range_values = ranges
+                self._project_toolbar_auto_range(False)
                 # Apply ranges
                 self._plot_item.setRange(
-                    xRange=(x_min_spin.value(), x_max_spin.value()),
-                    yRange=(y_min_spin.value(), y_max_spin.value())
+                    xRange=(ranges[0], ranges[1]),
+                    yRange=(ranges[2], ranges[3]),
+                    padding=0,
                 )
+                self._toolbar.set_manual_ranges(*ranges)
                 logger.info(
                     f"Custom axis ranges applied: X=[{x_min_spin.value()}, {x_max_spin.value()}], "
                     f"Y=[{y_min_spin.value()}, {y_max_spin.value()}]"
@@ -3244,7 +3329,11 @@ if PYQTGRAPH_AVAILABLE:
 
         def _reset_view(self):
             """Reset plot view to auto range."""
+            self._auto_range_enabled = True
+            self._project_toolbar_auto_range(True)
+            self._plot_item.enableAutoRange(x=True, y=True)
             self._plot_item.autoRange()
+            self._sync_toolbar_manual_ranges_to_view()
             self._apply_axis_inversion_state()
             logger.info("Reset plot view to auto range")
 

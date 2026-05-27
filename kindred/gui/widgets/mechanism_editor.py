@@ -23,9 +23,35 @@ __all__ = ["MechanismEditorTabbed"]
 class _PersistentToggleMenu(QtWidgets.QMenu):
     """Keep checkable actions open so users can toggle multiple sliders in one pass."""
 
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._pressed_checkable_action: Optional[QtGui.QAction] = None
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        action = self.actionAt(event.position().toPoint())
+        if (
+            event.button() == QtCore.Qt.MouseButton.LeftButton
+            and action is not None
+            and action.isEnabled()
+            and action.isCheckable()
+        ):
+            self._pressed_checkable_action = action
+            event.accept()
+            return
+        self._pressed_checkable_action = None
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         action = self.actionAt(event.position().toPoint())
-        if action is not None and action.isEnabled() and action.isCheckable():
+        pressed_action = self._pressed_checkable_action
+        self._pressed_checkable_action = None
+        if (
+            event.button() == QtCore.Qt.MouseButton.LeftButton
+            and pressed_action is not None
+            and action is pressed_action
+            and action.isEnabled()
+            and action.isCheckable()
+        ):
             action.trigger()
             event.accept()
             return

@@ -581,6 +581,8 @@ class VariableSliders(QtWidgets.QWidget):
 
     def set_variable_visible(self, name: str, visible: bool) -> None:
         name_s = str(name)
+        if name_s not in self._containers:
+            return
         if visible:
             self._hidden_names.discard(name_s)
         else:

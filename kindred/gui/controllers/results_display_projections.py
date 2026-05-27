@@ -8,6 +8,9 @@ import numpy as np
 from kindred.gui.ports import (
     ActiveDisplayKind,
     ActiveDisplayTransaction,
+    CopyAllDisplayBlock,
+    CopyAllExportPlan,
+    CopyAllMissingItem,
     DisplayEventKind,
     DisplaySetMetadata,
     DisplaySetRole,
@@ -368,9 +371,34 @@ def display_transaction_provenance_payload(
     }
 
 
-def _copy_all_display_block_from_metadata(metadata: DisplaySetMetadata) -> object | None:
-    from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllDisplayBlock
+def _copy_all_export_set_id(metadata: DisplaySetMetadata) -> str:
+    if metadata.role is DisplaySetRole.REFERENCE_OVERLAY and metadata.set_id:
+        return f"{metadata.set_id}:canonical_reference"
+    return str(metadata.set_id)
 
+
+def _copy_all_export_label(metadata: DisplaySetMetadata) -> str:
+    return str(metadata.label or metadata.set_id or "Results")
+
+
+def _csv_export_label(metadata: DisplaySetMetadata) -> str:
+    return str(metadata.label or metadata.set_id or metadata.layer_id or "Results")
+
+
+def _copy_all_missing_reason_from_metadata(metadata: DisplaySetMetadata) -> str:
+    t = np.asarray(metadata.t if metadata.t is not None else [], dtype=float).reshape(-1)
+    series_raw = metadata.series or {}
+    if t.size <= 0 or not isinstance(series_raw, Mapping):
+        return "no_simulation_data"
+    owned_species = tuple(str(name) for name in (metadata.owned_species or ()) if str(name))
+    if not owned_species:
+        return "semantic_unavailable"
+    if not any(species_name in series_raw for species_name in owned_species):
+        return "no_visible_series"
+    return "unavailable"
+
+
+def _copy_all_display_block_from_metadata(metadata: DisplaySetMetadata) -> object | None:
     t = np.asarray(metadata.t if metadata.t is not None else [], dtype=float).reshape(-1)
     series_raw = metadata.series or {}
     if t.size <= 0 or not isinstance(series_raw, Mapping):
@@ -386,12 +414,8 @@ def _copy_all_display_block_from_metadata(metadata: DisplaySetMetadata) -> objec
     if not series:
         return None
     return CopyAllDisplayBlock(
-        set_id=(
-            f"{metadata.set_id}:canonical_reference"
-            if metadata.role is DisplaySetRole.REFERENCE_OVERLAY and metadata.set_id
-            else str(metadata.set_id)
-        ),
-        label=str(metadata.label or metadata.set_id or "Results"),
+        set_id=_copy_all_export_set_id(metadata),
+        label=_copy_all_export_label(metadata),
         t=t,
         series=series,
         layer_id=str(metadata.layer_id or ""),
@@ -400,18 +424,27 @@ def _copy_all_display_block_from_metadata(metadata: DisplaySetMetadata) -> objec
 
 
 def build_copy_all_export_plan(active_transaction: ActiveDisplayTransaction | None) -> object | None:
-    from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllExportPlan
-
     if active_transaction is None:
         return None
     display_blocks: list[object] = []
+    missing_items: list[object] = []
     for metadata in ordered_display_transaction_metadata(active_transaction):
         if not bool(metadata.visible):
             continue
         block = _copy_all_display_block_from_metadata(metadata)
         if block is not None:
             display_blocks.append(block)
-    return CopyAllExportPlan(display_blocks=display_blocks, missing_items=[])
+            continue
+        label = _copy_all_export_label(metadata)
+        missing_items.append(
+            CopyAllMissingItem(
+                set_id=_copy_all_export_set_id(metadata),
+                label=label,
+                popup_label=label,
+                reason=_copy_all_missing_reason_from_metadata(metadata),
+            )
+        )
+    return CopyAllExportPlan(display_blocks=display_blocks, missing_items=missing_items)
 
 
 def build_main_plot_csv_export(
@@ -419,27 +452,35 @@ def build_main_plot_csv_export(
     active_transaction: ActiveDisplayTransaction,
     scope: str,
     axis_state: Mapping[str, object],
-    dataset_columns: Sequence[tuple[str, object]],
 ) -> tuple[list[str], list[list[object]]]:
     normalized_scope = str(scope or "axis")
-    _ = dataset_columns
     x_name = str(axis_state.get("x_name") or "t")
     x_header = str(axis_state.get("x_header") or x_name)
     requested_y_names = tuple(str(name) for name in (axis_state.get("y_names") or ()) if str(name))
     columns: list[tuple[str, np.ndarray]] = []
+    missing_display_sets: list[str] = []
     for metadata in ordered_display_transaction_metadata(active_transaction):
         if not bool(metadata.visible):
             continue
+        label = _csv_export_label(metadata)
         t_array = np.asarray(metadata.t if metadata.t is not None else [], dtype=float).reshape(-1)
         if t_array.size <= 0:
+            missing_display_sets.append(f"{label} (no time axis)")
+            continue
+        if not isinstance(metadata.series, Mapping):
+            missing_display_sets.append(f"{label} (no series data)")
             continue
         series_map = dict(metadata.series or {})
+        if not series_map:
+            missing_display_sets.append(f"{label} (no series data)")
+            continue
         fallback_names = (
             requested_y_names
             if normalized_scope == "axis"
             else tuple(metadata.display_species or tuple(series_map))
         )
         if not metadata.owned_species:
+            missing_display_sets.append(f"{label} (semantic metadata unavailable)")
             continue
         owned_set = {str(name) for name in metadata.owned_species if str(name)}
         species_names = [
@@ -448,23 +489,45 @@ def build_main_plot_csv_export(
             if str(name) and str(name) in series_map and str(name) in owned_set
         ]
         if fallback_names and not species_names:
+            missing_display_sets.append(f"{label} (no selected display series)")
             continue
         if not species_names:
+            missing_display_sets.append(f"{label} (no display series)")
             continue
         if x_name == "t":
             x_array = t_array
         else:
             x_array = np.asarray(series_map.get(x_name) if x_name in series_map else [], dtype=float).reshape(-1)
         if x_array.size <= 0:
+            missing_display_sets.append(f"{label} (missing X axis '{x_name}')")
             continue
-        label = str(metadata.label or metadata.set_id or "Results")
         prefix = "" if metadata.role is DisplaySetRole.PRIMARY_RESULT else f"{label}::"
-        columns.append((f"{prefix}{x_header}", x_array))
+        metadata_columns: list[tuple[str, np.ndarray]] = [(f"{prefix}{x_header}", x_array)]
+        invalid_series: list[str] = []
+        valid_series = False
+        expected_len = x_array.shape[0]
         for species_name in species_names:
             values = np.asarray(series_map[species_name], dtype=float).reshape(-1)
-            if values.shape[0] != x_array.shape[0]:
+            if values.shape[0] != expected_len:
+                invalid_series.append(species_name)
                 continue
-            columns.append((f"{prefix}[{species_name}]", values))
+            metadata_columns.append((f"{prefix}[{species_name}]", values))
+            valid_series = True
+        if invalid_series:
+            missing_display_sets.append(
+                f"{label} (series length mismatch: {', '.join(invalid_series)})"
+            )
+            continue
+        if not valid_series:
+            missing_display_sets.append(f"{label} (no exportable display series)")
+            continue
+        columns.extend(metadata_columns)
+    if missing_display_sets:
+        detail = "; ".join(missing_display_sets)
+        raise ValueError(
+            "Cannot export active simulation display CSV because visible display sets are incomplete: "
+            + detail
+        )
     if not columns:
         raise ValueError("No active simulation display series are available to export.")
     max_len = max(values.shape[0] for _, values in columns)

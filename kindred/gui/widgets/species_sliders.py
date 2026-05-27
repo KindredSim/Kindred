@@ -142,24 +142,18 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._transaction_owner = owner
 
     def slider_picker_entries(self) -> list[tuple[str, str, bool]]:
-        return [(species, species, self.species_visible(species)) for species in self.slider_species_names()]
+        return [(species, species, self.species_visible(species)) for species in self._rows]
 
     def slider_species_names(self) -> list[str]:
-        if self._rows:
-            return [str(species) for species in self._rows]
-        model = self._model
-        if model is None:
-            return []
-        try:
-            return [str(species) for species in model.store().visible_species()]
-        except Exception:
-            return []
+        return [str(species) for species in self._rows]
 
     def species_visible(self, species: str) -> bool:
         return str(species) not in self._hidden_species
 
     def set_species_visible(self, species: str, visible: bool) -> None:
         species_s = str(species)
+        if species_s not in self._rows:
+            return
         if visible:
             self._hidden_species.discard(species_s)
         else:
@@ -374,7 +368,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             return
         store = model.store()
         species = list(store.visible_species())
-        if not species:
+        if not species or tuple(str(name) for name in species) != tuple(str(name) for name in self._rows):
+            self.rebuild_from_current_row()
             return
         row = int(self._current_row)
         self._selected_rows_signature = tuple(self._target_rows_for_write())
@@ -452,8 +447,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 self.rebuild_from_current_row()
             return
         if self._current_row is not None and int(self._current_row) == int(row):
-            current_species = {str(species) for species in self._rows}
-            expected_species = {str(species) for species in self.slider_species_names()}
+            current_species = tuple(str(species) for species in self._rows)
+            expected_species = tuple(self._model_visible_species_names())
             if (
                 current_species == expected_species
                 and bool(self._rows)
@@ -461,6 +456,19 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             ):
                 return
         self.rebuild_from_current_row()
+
+    def _model_visible_species_names(self) -> list[str]:
+        model = self._model
+        if model is None:
+            return []
+        store_getter = getattr(model, "store", None)
+        if not callable(store_getter):
+            return []
+        store = store_getter()
+        visible_species = getattr(store, "visible_species", None)
+        if not callable(visible_species):
+            return []
+        return [str(species) for species in visible_species()]
 
     def _target_rows_for_write(self) -> list[int]:
         model = self._model

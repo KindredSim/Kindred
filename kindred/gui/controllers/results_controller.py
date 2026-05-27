@@ -69,7 +69,12 @@ class ResultsDisplayPlotPort(Protocol):
     def set_simulation_popup_labels(self, *, primary_set_id: str, popup_labels_by_set_id: Mapping[str, str]) -> None: ...
     def clear_display_transaction_state(self) -> None: ...
     def transaction_export_axis_state(self, scope: str) -> Dict[str, object]: ...
-    def dataset_overlay_export_columns(self, scope: str) -> List[tuple[str, np.ndarray]]: ...
+    def append_dataset_overlay_export_columns(
+        self,
+        header: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        scope: str,
+    ) -> tuple[List[str], List[List[object]]]: ...
     def intervention_annotation_state(self) -> Dict[str, object]: ...
     def set_intervention_annotations_from_provenance(self, provenance: Mapping[str, object] | None) -> None: ...
     def reference_layers_visible(self) -> bool: ...
@@ -1844,12 +1849,12 @@ class ResultsController(QtCore.QObject):
         candidate = plot.transaction_export_axis_state(normalized_scope)
         if isinstance(candidate, Mapping):
             axis_state.update(dict(candidate))
-        return build_main_plot_csv_export(
+        header, rows = build_main_plot_csv_export(
             active_transaction=active_transaction,
             scope=normalized_scope,
             axis_state=axis_state,
-            dataset_columns=(),
         )
+        return plot.append_dataset_overlay_export_columns(header, rows, normalized_scope)
 
     def reset_stale_cache_warning_status(self) -> None:
         transition = self._last_display_transition_outcome

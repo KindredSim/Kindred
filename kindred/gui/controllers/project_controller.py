@@ -298,38 +298,38 @@ class ProjectController(QtCore.QObject):
     def _active_transaction_export_available(self, plot_widget) -> bool:
         if not self._is_results_main_plot(plot_widget):
             return False
-        try:
-            return self.mw.results_controller.active_display_transaction() is not None
-        except Exception as exc:
-            logger.debug("Active display transaction export precondition unavailable: %s", exc, exc_info=True)
+        results_controller = getattr(self.mw, "results_controller", None)
+        if results_controller is None:
             return False
+        return results_controller.active_display_transaction() is not None
 
     def _is_results_main_plot(self, plot_widget) -> bool:
         main_plot_getter = getattr(self.mw, "main_plot", None)
         if not callable(main_plot_getter):
             return False
-        try:
-            return plot_widget is main_plot_getter()
-        except Exception as exc:
-            logger.debug("Main plot export precondition unavailable: %s", exc, exc_info=True)
-            return False
+        return plot_widget is main_plot_getter()
 
     def _resolve_export_payload(self, plot_widget) -> Optional[Dict[str, object]]:
         if plot_widget is None:
             return None
 
-        try:
-            payload = plot_widget.export_payload()
-        except Exception:
-            payload = None
-        if isinstance(payload, dict) and payload:
-            normalized = self._normalize_export_payload(payload)
-            if normalized is not None:
-                return normalized
+        export_payload = getattr(plot_widget, "export_payload", None)
+        if callable(export_payload):
+            try:
+                payload = export_payload()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and payload:
+                normalized = self._normalize_export_payload(payload)
+                if normalized is not None:
+                    return normalized
 
+        get_dataset_data = getattr(plot_widget, "get_dataset_data", None)
+        if not callable(get_dataset_data):
+            return None
         try:
-            data = plot_widget.get_dataset_data()
-        except Exception:
+            data = get_dataset_data()
+        except ValueError:
             data = None
         if isinstance(data, dict) and data:
             t_raw = data.get("t")
@@ -393,11 +393,9 @@ class ProjectController(QtCore.QObject):
         if self._is_results_main_plot(plot):
             raise ValueError("No active simulation display transaction is available to export.")
 
-        try:
-            export = plot.build_visible_export(scope)
-        except AttributeError:
-            pass
-        else:
+        build_visible_export = getattr(plot, "build_visible_export", None)
+        if callable(build_visible_export):
+            export = build_visible_export(scope)
             if isinstance(export, tuple) and len(export) == 2:
                 return export
 
@@ -415,12 +413,7 @@ class ProjectController(QtCore.QObject):
         scope: str,
     ) -> Optional[Tuple[List[str], List[List[object]]]]:
         if self._is_results_main_plot(plot):
-            try:
-                return self.mw.results_controller.build_main_plot_csv_export(scope)
-            except ValueError:
-                raise
-            except Exception as exc:
-                logger.debug("Active display transaction export unavailable: %s", exc, exc_info=True)
+            return self.mw.results_controller.build_main_plot_csv_export(scope)
         return None
 
     @staticmethod
