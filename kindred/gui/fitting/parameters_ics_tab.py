@@ -332,7 +332,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         selected_dataset_ids_getter: Callable[[], List[str]],
         dataset_entries_getter: Callable[[], List[Dict[str, Any]]],
         worker_running_getter: Callable[[], bool],
-        dataset_manager_getter: Callable[[], Any],
+        dataset_fit_settings_store_getter: Callable[[], Any],
+        mechanism_parameter_scan_owner_getter: Callable[[], Any],
         mechanism_text_getter: Callable[[], str],
         integration_defaults: Tuple[str, float, float],
         config_defaults: Dict[str, Any],
@@ -360,7 +361,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._selected_dataset_ids_getter = selected_dataset_ids_getter
         self._dataset_entries_getter = dataset_entries_getter
         self._worker_running_getter = worker_running_getter
-        self._dataset_manager_getter = dataset_manager_getter
+        self._dataset_fit_settings_store_getter = dataset_fit_settings_store_getter
+        self._mechanism_parameter_scan_owner_getter = mechanism_parameter_scan_owner_getter
         self._mechanism_text_getter = mechanism_text_getter
         self._initial_parameter_defaults_getter = initial_parameter_defaults_getter
         # Build UI
@@ -1364,13 +1366,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
         ds_id = str(dataset_id or "").strip()
         if not ds_id:
             return
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is None or not hasattr(dataset_manager, "get_fit_settings"):
-            return
-        try:
-            settings = dataset_manager.get_fit_settings(ds_id)
-        except Exception:
-            return
+        settings_store = self._dataset_fit_settings_store_getter()
+        if settings_store is None:
+            raise RuntimeError("Dataset fit settings store unavailable; cannot seed fitting initial conditions.")
+        settings = settings_store.get_fit_settings(ds_id)
 
         fixed = self._global_dataset_params.setdefault(ds_id, {})
         var_specs = self._global_dataset_variable_params.get(ds_id) if isinstance(self._global_dataset_variable_params, dict) else None
@@ -1712,16 +1711,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
     # Mechanism rebuild
     # ------------------------------------------------------------------
 
-    def _scan_parameter_definitions_for_mechanism(self, mechanism_text: str, dataset_manager: Any = None) -> list[dict[str, Any]]:
-        if dataset_manager is None:
-            dataset_manager = self._dataset_manager_getter()
-        scan_params = getattr(dataset_manager, "scan_mechanism_parameters", None)
-        if not callable(scan_params):
-            return [
-                dict(definition)
-                for definition in (getattr(self, "_shared_param_definitions", {}) or {}).values()
-                if isinstance(definition, dict)
-            ]
+    def _scan_parameter_definitions_for_mechanism(self, mechanism_text: str) -> list[dict[str, Any]]:
+        scan_owner = self._mechanism_parameter_scan_owner_getter()
+        scan_params = scan_owner.scan_mechanism_parameters
         param_defs = scan_params(str(mechanism_text or ""))
         return [dict(definition) for definition in (param_defs or []) if isinstance(definition, dict)]
 
@@ -1995,12 +1987,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def set_fixed_shared_params(self, value: Dict[str, float]) -> None:
         self._fixed_shared_params = dict(value)
 
-    def get_last_fit_params(self) -> Dict[str, float]:
-        return dict(self._last_fit_params)
-
-    def set_last_fit_params(self, value: Dict[str, float]) -> None:
-        self._last_fit_params = dict(value)
-
     def get_staged_dataset_params(self) -> Dict[str, Dict[str, float]]:
         return {k: dict(v) for k, v in self._staged_dataset_params.items()}
 
@@ -2177,23 +2163,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._populate_parameter_table()
         if missing_scalars:
             self.runtimeInputsChanged.emit()
-
-    def mirror_staged_ic_values(self) -> int:
-        total_updates = 0
-        for dataset_id, param_map in self._staged_dataset_params.items():
-            if not isinstance(param_map, dict):
-                continue
-            for key, value in param_map.items():
-                key_str = str(key)
-                if not key_str.startswith(INITIAL_PREFIX):
-                    continue
-                self._global_dataset_params.setdefault(dataset_id, {})[key_str] = float(value)
-                if dataset_id in self._global_dataset_variable_params:
-                    spec = self._global_dataset_variable_params[dataset_id].get(key_str)
-                    if isinstance(spec, dict):
-                        spec["initial"] = float(value)
-                total_updates += 1
-        return total_updates
 
     def collect_integration_settings(self) -> Optional[Tuple[str, float, float]]:
         return self._collect_integration_settings_for_run()

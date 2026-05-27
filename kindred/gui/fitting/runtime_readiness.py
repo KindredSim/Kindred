@@ -44,6 +44,12 @@ class FittingRuntimeLaunchDecisionState(str, Enum):
     NOT_READY = "not_ready"
 
 
+class FittingRuntimePostPreparationAction(str, Enum):
+    NONE = "none"
+    CLOSE = "close"
+    RUN_PENDING = "run_pending"
+
+
 @dataclass(frozen=True)
 class FittingRuntimeIdentity:
     datasets: tuple[FitDatasetSpec, ...]
@@ -348,6 +354,8 @@ class FittingRuntimeReadinessController:
         self._owned_sessions_lock = threading.RLock()
         self._worker: Optional[FittingRuntimePreparationWorker] = None
         self._error: Optional[BaseException] = None
+        self._close_after_prepare_requested = False
+        self._pending_fit_run_request_hash = ""
 
     @property
     def worker(self) -> Optional[FittingRuntimePreparationWorker]:
@@ -372,6 +380,7 @@ class FittingRuntimeReadinessController:
     def set_blocked(self, error: Optional[BaseException] = None) -> None:
         self._desired_identity = None
         self._error = error
+        self.clear_pending_fit_run()
         self._ledger.blocked_transitions += 1
         self._cancel_active_preparation()
         self._close_ready_session(kill=False)
@@ -468,8 +477,38 @@ class FittingRuntimeReadinessController:
         )
         return FittingRuntimeLaunchDecision(decision_state, snapshot=snapshot)
 
+    def mark_pending_fit_run(self, identity: object) -> None:
+        self._pending_fit_run_request_hash = self._request_hash_for_identity(identity)
+
+    def clear_pending_fit_run(self) -> None:
+        self._pending_fit_run_request_hash = ""
+
+    def request_close_after_prepare(self) -> None:
+        self._close_after_prepare_requested = True
+
+    def consume_post_preparation_action(
+        self,
+        snapshot: FittingRuntimeReadinessSnapshot,
+    ) -> FittingRuntimePostPreparationAction:
+        if self._close_after_prepare_requested:
+            self._close_after_prepare_requested = False
+            self.clear_pending_fit_run()
+            return FittingRuntimePostPreparationAction.CLOSE
+        if snapshot.state is not FittingRuntimeReadinessState.READY:
+            self.clear_pending_fit_run()
+            return FittingRuntimePostPreparationAction.NONE
+        pending_hash = str(self._pending_fit_run_request_hash or "")
+        if not pending_hash:
+            return FittingRuntimePostPreparationAction.NONE
+        ready_hash = self._snapshot_ready_request_hash(snapshot)
+        self.clear_pending_fit_run()
+        if ready_hash and ready_hash == pending_hash:
+            return FittingRuntimePostPreparationAction.RUN_PENDING
+        return FittingRuntimePostPreparationAction.NONE
+
     def cancel(self, *, kill: bool = True) -> bool:
         self._desired_identity = None
+        self.clear_pending_fit_run()
         if self._worker is None:
             self._close_ready_session(kill=kill)
             self._close_owned_sessions(kill=kill)
@@ -489,6 +528,7 @@ class FittingRuntimeReadinessController:
     def close(self, *, kill: bool = True) -> bool:
         self._ledger.close_requests += 1
         self._desired_identity = None
+        self.clear_pending_fit_run()
         if self._worker is not None:
             self._state = FittingRuntimeReadinessState.CLOSING
             self._ledger.close_deferred += 1
@@ -584,6 +624,22 @@ class FittingRuntimeReadinessController:
         self._state = FittingRuntimeReadinessState.PREPARING
         self._ledger.preparation_starts += 1
         worker.start()
+
+    @staticmethod
+    def _request_hash_for_identity(identity: object) -> str:
+        return str(
+            getattr(identity, "launch_request_hash", "")
+            or getattr(identity, "stamp_hash", "")
+            or ""
+        )
+
+    def _snapshot_ready_request_hash(self, snapshot: FittingRuntimeReadinessSnapshot) -> str:
+        identity = snapshot.identity
+        if identity is not None:
+            request_hash = self._request_hash_for_identity(identity)
+            if request_hash:
+                return request_hash
+        return str(snapshot.ready_hash or "")
 
     def _cancel_active_preparation(self) -> None:
         worker = self._worker

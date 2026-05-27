@@ -752,7 +752,6 @@ def resolve_run_scope(
     selected_rows: Sequence[int],
     total_rows: int,
     mode: str,
-    fallback_row: int | None = None,
 ) -> List[int]:
     total_rows = int(total_rows)
     if total_rows <= 0:
@@ -762,10 +761,6 @@ def resolve_run_scope(
         return list(range(total_rows))
     # selected mode
     sel = [int(r) for r in (selected_rows or []) if 0 <= int(r) < total_rows]
-    if not sel:
-        if fallback_row is not None and 0 <= int(fallback_row) < total_rows:
-            return [int(fallback_row)]
-        return [0]
     return list(sel)
 
 

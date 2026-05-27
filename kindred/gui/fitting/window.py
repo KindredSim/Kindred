@@ -34,6 +34,10 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     coerce_fit_dataset_parameter_overrides,
     split_fit_dataset_parameter_overrides,
 )
+from kindred.core.analysis.global_fit_projection import (
+    FitRenderProjection,
+    projection_from_global_fit_result,
+)
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR,
     SerialFittingEvaluator,
@@ -52,6 +56,10 @@ from kindred.gui.fitting.launch import (
     FittingLaunchResult,
     FittingLaunchSnapshot,
     validate_de_bounds,
+)
+from kindred.gui.fitting.completed_apply_authority import (
+    CompletedFitApplyAuthority,
+    CompletedFitApplyAuthorityOwner,
 )
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
@@ -269,7 +277,9 @@ class FittingWindow(QtWidgets.QDialog):
         mode: str,
         parameter_defs: Sequence[Dict[str, Any]],
         dataset_entries: Sequence[Dict[str, Any]],
-        dataset_manager: Optional[Any] = None,
+        dataset_fit_settings_store: Any,
+        dataset_view_publisher: Any,
+        mechanism_parameter_scan_owner: Any,
         simulation_func: Optional[
             Callable[[Dict[str, float]], Dict[str, np.ndarray]] | _EvaluateSeriesEvaluatorLike
         ] = None,
@@ -286,9 +296,7 @@ class FittingWindow(QtWidgets.QDialog):
         dataset_payloads: Optional[Sequence[Dict[str, Any]]] = None,
         dataset_payload_results: Optional[Dict[str, object]] = None,
         dataset_weights: Optional[Dict[str, float]] = None,
-        apply_callback: Optional[Callable[[Dict[str, float]], None]] = None,
         project_apply_callback: Optional[Callable[[str, Dict[str, float], Dict[str, Dict[str, float]]], None]] = None,
-        dataset_settings_updater: Optional[Callable[[str, Dict[str, float]], None]] = None,
         config_defaults: Optional[Dict[str, Any]] = None,
         parent: Optional[QtWidgets.QWidget] = None,
     ):
@@ -299,7 +307,15 @@ class FittingWindow(QtWidgets.QDialog):
             raise ValueError(f"Unsupported fitting mode: {mode!r}")
 
         self._mode = normalized_mode
-        self._dataset_manager = dataset_manager
+        if not dataset_fit_settings_store:
+            raise ValueError("FittingWindow requires a committed dataset fit-settings store.")
+        if dataset_view_publisher is None:
+            raise ValueError("FittingWindow requires a committed dataset view publisher.")
+        if not mechanism_parameter_scan_owner:
+            raise ValueError("FittingWindow requires a mechanism parameter scan owner.")
+        self._dataset_fit_settings_store = dataset_fit_settings_store
+        self._dataset_view_publisher = dataset_view_publisher
+        self._mechanism_parameter_scan_owner = mechanism_parameter_scan_owner
         if fit_func is None:
             from kindred.core.analysis.global_fitting import fit_global as default_fit_global
 
@@ -324,9 +340,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._last_launch_result: Optional[FittingLaunchResult] = None
         self._runtime_settings_getter = runtime_settings_getter
         self._runtime_lane_budget = runtime_lane_budget
-        self._apply_callback = apply_callback
         self._project_apply_callback = project_apply_callback
-        self._dataset_settings_updater = dataset_settings_updater
         self._config_defaults = dict(config_defaults or {})
 
         self._global_dataset_params = dict(dataset_params or {})
@@ -456,11 +470,8 @@ class FittingWindow(QtWidgets.QDialog):
         self._best_cost = None
         self._pre_run_parameter_state: Optional[List[Dict[str, Any]]] = None
         self._pre_run_staged_dataset_params: Optional[Dict[str, Dict[str, float]]] = None
-        self._latest_model_series = {}
-        self._latest_dataset_stats = {}
-        self._latest_plot_model_series = {}
-        self._latest_plot_model_x = {}
         self._last_result = None
+        self._apply_authority_owner = CompletedFitApplyAuthorityOwner()
         self._fit_run_state_owner = FittingRunStateOwner()
         self._fit_runtime_prepare_notifier = _FitRuntimePreparationNotifier(self)
         self._fit_runtime_readiness = FittingRuntimeReadinessController(
@@ -474,12 +485,6 @@ class FittingWindow(QtWidgets.QDialog):
             QtCore.Qt.ConnectionType.QueuedConnection,
         )
         self._closing = False
-        self._pending_best_payload = None
-        self._pending_best_worker = None
-        self._pending_best_timer = QtCore.QTimer(self)
-        self._pending_best_timer.setSingleShot(True)
-        self._pending_best_timer.setInterval(150)
-        self._pending_best_timer.timeout.connect(self._apply_pending_best_update)
 
     @property
     def _is_fit_running(self) -> bool:
@@ -1120,7 +1125,7 @@ class FittingWindow(QtWidgets.QDialog):
             dataset_label_getter=lambda ds_id: _w()._dataset_label_for_id(ds_id) if _w() is not None else str(ds_id),
             dataset_weight_getter=lambda ds_id: _w()._dataset_weight_for_id(ds_id) if _w() is not None else 1.0,
             persist_dataset_weight_callback=lambda ds_id, w: _w()._persist_dataset_weight(ds_id, w) if _w() is not None else None,
-            dataset_manager_getter=lambda: _w()._dataset_manager if _w() is not None else None,
+            dataset_fit_settings_store_getter=lambda: _w()._dataset_fit_settings_store if _w() is not None else None,
             worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
             modeled_series_getter=lambda: _w()._modeled_series_names_for_x_axis() if _w() is not None else set(),
             parent=self,
@@ -1152,7 +1157,8 @@ class FittingWindow(QtWidgets.QDialog):
             selected_dataset_ids_getter=lambda: _w()._selected_dataset_ids() if _w() is not None else [],
             dataset_entries_getter=lambda: list(_w()._dataset_entries) if _w() is not None else [],
             worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
-            dataset_manager_getter=lambda: _w()._dataset_manager if _w() is not None else None,
+            dataset_fit_settings_store_getter=lambda: _w()._dataset_fit_settings_store if _w() is not None else None,
+            mechanism_parameter_scan_owner_getter=lambda: _w()._mechanism_parameter_scan_owner if _w() is not None else None,
             mechanism_text_getter=lambda: str(_w()._mechanism_text_getter() or "") if _w() is not None and callable(getattr(_w(), "_mechanism_text_getter", None)) else "",
             integration_defaults=self._active_integration_defaults_for_ui(),
             config_defaults=self._config_defaults,
@@ -1230,13 +1236,13 @@ class FittingWindow(QtWidgets.QDialog):
     def _on_fit_runtime_inputs_changed(self, *_args) -> None:
         if getattr(self, "_closing", False):
             return
+        self._invalidate_fit_result_authority()
         worker = getattr(self, "_worker", None)
         if worker is not None and self._worker_is_running(worker):
             self._supersede_active_fit_worker_for_runtime_input_change()
         else:
             if worker is not None:
                 self._fit_run_state_owner.mark_superseded()
-                self._clear_pending_best_update_state()
                 self._clear_worker_ref_if_stopped(worker)
                 self._discard_fit_runtime_session(kill=True)
                 self._set_running_state(False)
@@ -1246,11 +1252,76 @@ class FittingWindow(QtWidgets.QDialog):
                 self._fit_run_state_owner.clear_superseded()
             self._fit_runtime_readiness.set_desired_identity(None)
         self._fit_run_state_owner.clear_active_run_stamp_hash()
+        self._refresh_project_apply_controls(prefer_broadest=True)
         self._refresh_run_button_enabled_state()
         self._fit_runtime_preparation_owner.schedule_refresh()
 
     def handle_external_runtime_inputs_changed(self) -> None:
         self._on_fit_runtime_inputs_changed()
+
+    def handle_external_datasets_removed(self, dataset_ids: Sequence[str]) -> None:
+        remove_set = {
+            str(dataset_id).strip()
+            for dataset_id in (dataset_ids or [])
+            if str(dataset_id).strip()
+        }
+        if not remove_set:
+            self._on_fit_runtime_inputs_changed()
+            return
+        self._deauthorize_project_datasets(remove_set)
+
+    def _deauthorize_project_datasets(self, dataset_ids: Sequence[str]) -> None:
+        """Purge project-deleted datasets from this fit window's authorized pool."""
+        remove_set = {str(x).strip() for x in (dataset_ids or []) if str(x).strip()}
+        if not remove_set:
+            self._on_fit_runtime_inputs_changed()
+            return
+        invalidated_authority = self._apply_authority_owner.clear_if_depends_on_any(remove_set)
+        authority_invalidated = invalidated_authority is not None
+        if invalidated_authority is not None:
+            self._clear_fit_render_projection_authority(invalidated_authority.dataset_ids)
+
+        had_entry = any(str(entry.get("id") or "").strip() in remove_set for entry in (self._dataset_entries or []))
+        had_pool = any(ds_id in self._loaded_dataset_pool for ds_id in remove_set)
+        had_order = any(ds_id in remove_set for ds_id in (self._loaded_dataset_order or []))
+        had_state = any(
+            ds_id in mapping
+            for ds_id in remove_set
+            for mapping in (
+                self._loaded_dataset_series_parse_failures,
+                self._global_payload_results,
+                self._global_payload_lookup,
+                self._active_variable_specs,
+                self._sampling_applied,
+                self._global_weights,
+            )
+        )
+
+        self._dataset_entries = [
+            entry for entry in self._dataset_entries if str(entry.get("id") or "").strip() not in remove_set
+        ]
+        for ds_id in remove_set:
+            self._loaded_dataset_pool.pop(ds_id, None)
+            self._loaded_dataset_series_parse_failures.pop(ds_id, None)
+            self._sampling_applied.pop(ds_id, None)
+            self._global_payload_results.pop(ds_id, None)
+            self._global_payload_lookup.pop(ds_id, None)
+            self._active_variable_specs.pop(ds_id, None)
+            self._global_weights.pop(ds_id, None)
+        self._loaded_dataset_order = [
+            ds_id for ds_id in (self._loaded_dataset_order or []) if str(ds_id).strip() not in remove_set
+        ]
+
+        self._species_table.remove_dataset_state(remove_set)
+        self._params_ics_tab.remove_dataset_parameter_rows(remove_set)
+
+        if had_entry or had_pool or had_order or had_state:
+            self._sync_after_session_dataset_change()
+            self._status_label.setText("Project datasets removed")
+            return
+        if authority_invalidated:
+            self._refresh_project_apply_controls(prefer_broadest=True)
+            self._status_label.setText("Project datasets removed")
 
     def _on_algebraic_observable_requested(self, selection: dict) -> None:
         """Handle algebraic observable add request from ParametersIcsTab."""
@@ -1399,14 +1470,13 @@ class FittingWindow(QtWidgets.QDialog):
                 value = 1.0
             if np.isfinite(value):
                 return max(0.0, float(value))
-        if self._dataset_manager is not None and hasattr(self._dataset_manager, "get_fit_settings"):
-            try:
-                settings = self._dataset_manager.get_fit_settings(str(dataset_id))
-                persisted = float(getattr(settings, "weight", 1.0))
-            except Exception:
-                persisted = None
-            if persisted is not None and np.isfinite(persisted):
-                return max(0.0, float(persisted))
+        try:
+            settings = self._dataset_fit_settings_store.get_fit_settings(str(dataset_id))
+            persisted = float(getattr(settings, "weight", 1.0))
+        except Exception:
+            persisted = None
+        if persisted is not None and np.isfinite(persisted):
+            return max(0.0, float(persisted))
         try:
             fallback = float(self._global_weights.get(str(dataset_id), 1.0))
         except Exception:
@@ -1423,14 +1493,12 @@ class FittingWindow(QtWidgets.QDialog):
         if isinstance(entry, dict):
             entry["weight"] = float(normalized_weight)
         self._global_weights[ds_id] = float(normalized_weight)
-        if self._dataset_manager is not None and hasattr(self._dataset_manager, "get_fit_settings"):
-            try:
-                settings = self._dataset_manager.get_fit_settings(ds_id)
-                setattr(settings, "weight", float(normalized_weight))
-                if hasattr(self._dataset_manager, "update_fit_settings"):
-                    self._dataset_manager.update_fit_settings(ds_id, settings)
-            except Exception:
-                pass
+        try:
+            settings = self._dataset_fit_settings_store.get_fit_settings(ds_id)
+            setattr(settings, "weight", float(normalized_weight))
+            self._dataset_fit_settings_store.update_fit_settings(ds_id, settings)
+        except Exception:
+            pass
         if not math.isclose(float(previous_weight), float(normalized_weight), rel_tol=1e-12, abs_tol=1e-12):
             self._on_fit_runtime_inputs_changed()
 
@@ -1992,7 +2060,7 @@ class FittingWindow(QtWidgets.QDialog):
                 "Mechanism Reactions editor is unavailable in this window. Close and reopen Global Fit from the main window.",
             )
             return False
-        if not callable(self._mechanism_text_getter) or not callable(self._simulation_builder) or self._dataset_manager is None:
+        if not callable(self._mechanism_text_getter) or not callable(self._simulation_builder):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Add Observable",
@@ -2204,13 +2272,10 @@ class FittingWindow(QtWidgets.QDialog):
     # Fit lifecycle
     # ------------------------------------------------------------------
     def _reset_fit_run_cached_state(self) -> None:
+        self._invalidate_fit_result_authority()
         self._fit_run_state_owner.reset_for_new_run()
         self._pre_run_parameter_state = None
         self._pre_run_staged_dataset_params = None
-        self._latest_model_series = {}
-        self._latest_dataset_stats = {}
-        self._latest_plot_model_series = {}
-        self._latest_plot_model_x = {}
         self._best_cost = None
         self._best_effort_failures.clear()
         self._teardown_disable_failures.clear()
@@ -2245,7 +2310,7 @@ class FittingWindow(QtWidgets.QDialog):
             return True
         if getattr(self, "_fit_window_state_refreshing", False):
             return False
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
+        from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 
         self._fit_window_state_refreshing = True
         try:
@@ -2254,7 +2319,7 @@ class FittingWindow(QtWidgets.QDialog):
             self._species_table.refresh_dataset_entries(list(self._dataset_entries))
             self._capture_failed_fit_restore_baseline()
             self._mark_fit_window_state_mechanism_current(mechanism_text)
-        except DatasetManagerError as exc:
+        except DatasetOwnerError as exc:
             if show_errors:
                 self._clear_failed_run_visual_state()
                 QtWidgets.QMessageBox.warning(self, "Global Fit", str(exc))
@@ -2289,12 +2354,14 @@ class FittingWindow(QtWidgets.QDialog):
                 purpose=FittingLaunchPurpose.EXPLICIT_RUN,
             )
         except RuntimeError as exc:
+            self._fit_runtime_readiness.clear_pending_fit_run()
             self._fit_runtime_readiness.set_blocked(exc)
             self._set_fit_status(f"Fitting runtime not ready: {exc}")
             self._refresh_run_button_enabled_state()
             return
         identity = launch_result.identity
         if identity is None:
+            self._fit_runtime_readiness.clear_pending_fit_run()
             self._fit_runtime_readiness.set_blocked()
             self.render_launch_rejection(
                 launch_result,
@@ -2308,16 +2375,20 @@ class FittingWindow(QtWidgets.QDialog):
         if launch_decision.state is not FittingRuntimeLaunchDecisionState.ACCEPTED:
             snapshot = launch_decision.snapshot or self._fit_runtime_readiness.snapshot()
             if snapshot.state is FittingRuntimeReadinessState.PREPARING:
+                self._fit_runtime_readiness.mark_pending_fit_run(identity)
                 self._set_fit_status("Preparing fitting runtime...")
                 self._set_fit_stop_enabled(True)
             else:
+                self._fit_runtime_readiness.clear_pending_fit_run()
                 self._set_fit_status("Fitting runtime is not ready")
             self._refresh_run_button_enabled_state()
             return
         accepted_launch = launch_decision.accepted_launch
         if accepted_launch is None:
+            self._fit_runtime_readiness.clear_pending_fit_run()
             self._refresh_run_button_enabled_state()
             return
+        self._fit_runtime_readiness.clear_pending_fit_run()
         self._start_accepted_fit_runtime_launch(accepted_launch)
 
     def _start_accepted_fit_runtime_launch(self, accepted_launch: FittingRuntimeAcceptedLaunch) -> None:
@@ -2802,7 +2873,6 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _supersede_active_fit_worker_for_runtime_input_change(self) -> None:
         self._fit_run_state_owner.mark_superseded()
-        self._clear_pending_best_update_state()
         self._hard_teardown_worker(
             reason="Fitting runtime inputs changed; fit cancelled",
             disable_ui=False,
@@ -2873,8 +2943,13 @@ class FittingWindow(QtWidgets.QDialog):
             self._worker = None
 
     def _cancel_fit(self) -> None:
+        self._invalidate_fit_result_authority()
+        self._fit_run_state_owner.mark_superseded()
+        self._fit_run_state_owner.clear_active_dataset_ids()
+        self._refresh_project_apply_controls(prefer_broadest=True, running=True)
         readiness = self._fit_runtime_readiness.snapshot()
         if readiness.state is FittingRuntimeReadinessState.PREPARING:
+            self._fit_runtime_readiness.clear_pending_fit_run()
             self._fit_runtime_preparation_owner.cancel_preparation(kill=True)
             try:
                 self._stop_button.setEnabled(False)
@@ -2895,7 +2970,6 @@ class FittingWindow(QtWidgets.QDialog):
             running = False
         if not running:
             return
-        self._clear_pending_best_update_state()
         self._hard_teardown_worker(reason="Fit cancelled", disable_ui=False)
         self._discard_fit_runtime_session(kill=True)
         try:
@@ -2946,14 +3020,6 @@ class FittingWindow(QtWidgets.QDialog):
         if not running:
             self._worker = None
             self._progress_bar.setValue(0)
-            if hasattr(self, "_pending_best_timer"):
-                try:
-                    self._pending_best_timer.stop()
-                except Exception as exc:
-                    self._best_effort_failures.add("set_running_state.pending_best_timer_stop")
-                    logger.debug("Failed to stop pending-best timer: %s", exc, exc_info=True)
-            self._pending_best_payload = None
-            self._pending_best_worker = None
         self._species_table.refresh_validity_ui()
         self._refresh_sampling_validity_ui()
         if not running:
@@ -3020,16 +3086,6 @@ class FittingWindow(QtWidgets.QDialog):
                 wait_for_worker(2000)
             except Exception:
                 pass
-
-    def _clear_pending_best_update_state(self) -> None:
-        if hasattr(self, "_pending_best_timer"):
-            try:
-                self._pending_best_timer.stop()
-            except Exception as exc:
-                self._best_effort_failures.add("clear_pending_best_update_state.pending_best_timer_stop")
-                logger.debug("Failed to stop pending-best timer during worker completion cleanup: %s", exc, exc_info=True)
-        self._pending_best_payload = None
-        self._pending_best_worker = None
 
     @QtCore.Slot(int, str)
     def _dispatch_fit_worker_progress(self, percent: int, message: str) -> None:
@@ -3104,9 +3160,32 @@ class FittingWindow(QtWidgets.QDialog):
         if isinstance(payload, Mapping):
             payload_hash = str(payload.get("run_stamp_hash") or "")
         active_hash = self._fit_run_state_owner.active_run_stamp_hash
-        if payload_hash and active_hash and payload_hash != active_hash:
+        if not payload_hash or not active_hash:
             return False
-        return True
+        return payload_hash == active_hash
+
+    def _live_payload_matches_active_run(self, payload: object, *, worker: Optional[QtCore.QThread]) -> bool:
+        if not self._is_active_worker_callback(worker):
+            return False
+        if not isinstance(payload, Mapping):
+            return False
+        payload_hash = str(payload.get("run_stamp_hash") or "")
+        active_hash = str(self._fit_run_state_owner.active_run_stamp_hash or "")
+        return bool(payload_hash and active_hash and payload_hash == active_hash)
+
+    def _render_projection_matches_active_run(self, projection: object) -> bool:
+        if self._fit_run_state_owner.active_run_superseded:
+            return False
+        if not isinstance(projection, FitRenderProjection):
+            return False
+        active_hash = str(self._fit_run_state_owner.active_run_stamp_hash or "")
+        if not active_hash or projection.run_stamp_hash != active_hash:
+            return False
+        active_dataset_ids = set(self._fit_run_state_owner.active_dataset_ids)
+        projection_dataset_ids = set(projection.dataset_ids)
+        if not active_dataset_ids or not projection_dataset_ids:
+            return False
+        return projection_dataset_ids == active_dataset_ids
 
     def _on_worker_progress(self, percent: int, message: str, *, worker: Optional[QtCore.QThread] = None) -> None:
         if not self._is_active_worker_callback(worker):
@@ -3124,7 +3203,6 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> None:
         if not self._terminal_payload_matches_active_run(payload, worker=worker):
             return
-        self._clear_pending_best_update_state()
         if self._closing:
             return
         result: GlobalFitResult = payload.get("result")
@@ -3150,11 +3228,22 @@ class FittingWindow(QtWidgets.QDialog):
                 dict(result.shared_params),
                 {k: dict(v) for k, v in (result.dataset_params or {}).items()},
             )
+            result_dataset_ids = self._result_dataset_ids(result)
+            authority_hash = str(payload.get("run_stamp_hash") or "")
+            self._apply_authority_owner.set_from_result(
+                result,
+                dataset_ids=result_dataset_ids,
+                run_stamp_hash=authority_hash,
+            )
         if severity == "fail":
             pass
         else:
             self._run_results_tab.push_final_result(result, self._dataset_entries)
-            self._update_dataset_views_from_global(result)
+            self._publish_fit_render_projection(
+                projection_from_global_fit_result(result, run_stamp_hash=authority_hash),
+                dataset_ids=result_dataset_ids,
+                refresh_all=True,
+            )
         if severity == "fail":
             pass
         else:
@@ -3163,11 +3252,6 @@ class FittingWindow(QtWidgets.QDialog):
         if severity == "fail":
             pass
         else:
-            self._latest_model_series = {k: dict(v) for k, v in (result.model_series or {}).items()}
-            self._latest_dataset_stats = {
-                info.dataset_id: {"chi_squared": float(info.chi_squared), "r_squared": float(info.r_squared)}
-                for info in (result.dataset_info or [])
-            }
             self._fit_run_state_owner.clear_active_dataset_ids()
             self._pre_run_parameter_state = None
             self._pre_run_staged_dataset_params = None
@@ -3259,8 +3343,6 @@ class FittingWindow(QtWidgets.QDialog):
 
         for info in getattr(result, "dataset_info", None) or []:
             _add(getattr(info, "dataset_id", None))
-        for dataset_id in (getattr(result, "model_series", None) or {}).keys():
-            _add(dataset_id)
 
         completion = getattr(result, "completion", None)
         if completion is not None:
@@ -3279,30 +3361,52 @@ class FittingWindow(QtWidgets.QDialog):
             return list(active_dataset_ids)
         return self._result_dataset_ids(result)
 
-    def _clear_failed_dataset_manager_fit_state(self, dataset_ids: Sequence[str]) -> None:
-        if not self._dataset_manager:
-            return
+    def _invalidate_fit_result_authority(self, dataset_ids: Optional[Sequence[str]] = None) -> None:
+        if dataset_ids is None:
+            invalidated_ids = self._current_render_authority_dataset_ids()
+        else:
+            invalidated_ids = [str(dataset_id).strip() for dataset_id in dataset_ids if str(dataset_id).strip()]
+        self._apply_authority_owner.clear()
+        self._clear_fit_render_projection_authority(invalidated_ids)
+
+    def _current_render_authority_dataset_ids(self) -> List[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        def _add(dataset_id: object) -> None:
+            ds_id = str(dataset_id or "").strip()
+            if not ds_id or ds_id in seen:
+                return
+            seen.add(ds_id)
+            ordered.append(ds_id)
+
+        for dataset_id in self._fit_run_state_owner.active_dataset_ids:
+            _add(dataset_id)
+        authority = self._apply_authority_owner.peek()
+        if authority is not None:
+            for dataset_id in sorted(authority.dataset_ids):
+                _add(dataset_id)
+        return ordered
+
+    def _clear_fit_render_projection_authority(self, dataset_ids: Sequence[str]) -> None:
         normalized_ids = [str(dataset_id).strip() for dataset_id in dataset_ids if str(dataset_id).strip()]
         if not normalized_ids:
             return
-        self._dataset_manager.sync_fit_result_views({}, dataset_stats={}, dataset_ids=normalized_ids)
+        self._dataset_view_publisher.clear_fit_result_views(normalized_ids)
+        self._run_results_tab.clear_render_projection(normalized_ids, refresh_all=True)
 
     def _disable_results_summary_button(self) -> None:
         self._results_summary_button.setEnabled(False)
 
     def _clear_failed_run_visual_state(self, result: Optional[GlobalFitResult] = None) -> None:
+        self._invalidate_fit_result_authority(self._active_or_result_dataset_ids(result))
         self._clear_failed_fit_apply_state()
-        self._clear_failed_dataset_manager_fit_state(self._active_or_result_dataset_ids(result))
         self._run_results_tab._clear_failed_run_state(
             self._dataset_entries,
             self._results_fit_targets_by_dataset(),
         )
         self._disable_results_summary_button()
         self._refresh_project_apply_controls(prefer_broadest=True)
-        self._latest_model_series = {}
-        self._latest_dataset_stats = {}
-        self._latest_plot_model_series = {}
-        self._latest_plot_model_x = {}
         self._fit_run_state_owner.clear_active_dataset_ids()
         self._pre_run_parameter_state = None
         self._pre_run_staged_dataset_params = None
@@ -3416,7 +3520,7 @@ class FittingWindow(QtWidgets.QDialog):
         """Live best-so-far updates during global fitting."""
         if self._closing:
             return
-        if not self._is_active_worker_callback(worker):
+        if not self._live_payload_matches_active_run(payload, worker=worker):
             return
         try:
             cost = float(payload.get("cost"))
@@ -3437,97 +3541,30 @@ class FittingWindow(QtWidgets.QDialog):
                 ds_params,
             )
 
-        model_series = payload.get("model_series")
-        plot_model_series = payload.get("plot_model_series")
-        plot_model_x = payload.get("plot_model_x")
-        dataset_stats = payload.get("dataset_stats")
-        has_plot_data = any(
-            value is not None
-            for value in (
-                model_series,
-                plot_model_series,
-                plot_model_x,
-                dataset_stats,
-            )
-        )
+        render_projection = payload.get("render_projection")
+        if self._render_projection_matches_active_run(render_projection):
+            self._publish_fit_render_projection(render_projection, refresh_all=False)
+
         running = bool(self._worker and hasattr(self._worker, "isRunning") and self._worker.isRunning())
         self._refresh_project_apply_controls(prefer_broadest=True, running=running)
-        if not has_plot_data:
-            if not running:
-                self._params_ics_tab.repaint_parameter_table()
-            return
-
-        if isinstance(model_series, dict):
-            self._latest_model_series = {k: dict(v) for k, v in model_series.items() if isinstance(v, dict)}
-        else:
-            self._latest_model_series = {}
-        if isinstance(dataset_stats, dict):
-            self._latest_dataset_stats = {
-                str(ds_id): dict(stats) for ds_id, stats in dataset_stats.items() if isinstance(stats, dict)
-            }
-        else:
-            self._latest_dataset_stats = {}
-        if isinstance(plot_model_series, dict):
-            self._latest_plot_model_series = {k: dict(v) for k, v in plot_model_series.items() if isinstance(v, dict)}
-        else:
-            self._latest_plot_model_series = {}
-        if isinstance(plot_model_x, dict):
-            self._latest_plot_model_x = {str(k): np.asarray(v, dtype=float).reshape(-1) for k, v in plot_model_x.items()}
-        else:
-            self._latest_plot_model_x = {}
         if not running:
-            self._run_results_tab.push_live_update(payload, update_tracker=False)
             self._params_ics_tab.repaint_parameter_table()
-            return
-        self._pending_best_payload = dict(payload)
-        self._pending_best_worker = worker
-        if not self._pending_best_timer.isActive():
-            self._pending_best_timer.start()
-
-    def _apply_pending_best_update(self) -> None:
-        if self._closing:
-            self._pending_best_payload = None
-            self._pending_best_worker = None
-            return
-        payload = self._pending_best_payload
-        self._pending_best_payload = None
-        worker = self._pending_best_worker
-        self._pending_best_worker = None
-        if not isinstance(payload, dict):
-            return
-        if not self._is_active_worker_callback(worker):
-            return
-        self._run_results_tab.push_live_update(payload, update_tracker=False)
-
-    def _staged_initial_condition_parameters(self) -> Dict[str, Dict[str, float]]:
-        staged: Dict[str, Dict[str, float]] = {}
-        for dataset_id, param_map in (self._params_ics_tab.get_staged_dataset_params() or {}).items():
-            if not isinstance(param_map, dict):
-                continue
-            updates: Dict[str, float] = {}
-            for key, value in param_map.items():
-                key_str = str(key)
-                if not key_str.startswith(INITIAL_PREFIX):
-                    continue
-                try:
-                    updates[key_str] = float(value)
-                except (TypeError, ValueError):
-                    continue
-            if updates:
-                staged[str(dataset_id)] = updates
-        return staged
 
     def _available_project_apply_scopes(self) -> set[str]:
-        scopes: set[str] = set()
-        has_parameters = bool(self._params_ics_tab.get_last_fit_params())
-        has_initial_conditions = bool(self._staged_initial_condition_parameters())
-        if has_parameters:
-            scopes.add(_PROJECT_APPLY_SCOPE_PARAMETERS)
-        if has_initial_conditions:
-            scopes.add(_PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS)
-        if has_parameters and has_initial_conditions:
-            scopes.add(_PROJECT_APPLY_SCOPE_BOTH)
-        return scopes
+        authority = self._current_project_apply_authority()
+        if authority is None:
+            return set()
+        return authority.available_scopes()
+
+    def _current_project_apply_authority(self) -> Optional[CompletedFitApplyAuthority]:
+        authority_before = self._apply_authority_owner.peek()
+        authority = self._apply_authority_owner.current_for_run_stamp(
+            self._fit_run_state_owner.active_run_stamp_hash
+        )
+        if authority is None and authority_before is not None:
+            self._clear_fit_render_projection_authority(authority_before.dataset_ids)
+            return None
+        return authority
 
     @staticmethod
     def _preferred_project_apply_scope(scopes: set[str]) -> Optional[str]:
@@ -3579,60 +3616,55 @@ class FittingWindow(QtWidgets.QDialog):
                 combo_index = combo.findData(selected_scope)
                 if combo_index >= 0:
                     combo.setCurrentIndex(combo_index)
-        can_dispatch = bool(self._project_apply_callback or self._apply_callback or self._dataset_settings_updater)
+        can_dispatch = bool(self._project_apply_callback)
         combo.setEnabled(bool(scopes) and not bool(running))
         button.setEnabled(bool(scopes) and can_dispatch and not bool(running))
 
-    def _mirror_staged_initial_condition_values(self) -> int:
-        return self._params_ics_tab.mirror_staged_ic_values()
-
-    def _apply_dataset_initials_via_updater(self) -> int:
-        if not self._dataset_settings_updater:
-            return 0
-        self._mirror_staged_initial_condition_values()
+    def _mirror_authority_initial_condition_values(self, authority: CompletedFitApplyAuthority) -> int:
+        global_params = self._params_ics_tab.get_global_dataset_params()
+        global_variable_params = self._params_ics_tab.get_global_dataset_variable_params()
         total_updates = 0
-        for dataset_id, param_map in self._staged_initial_condition_parameters().items():
-            updates: Dict[str, float] = {}
+        for dataset_id, param_map in authority.initial_condition_params().items():
+            ds_id = str(dataset_id)
             for key, value in param_map.items():
-                species = str(key)[len(INITIAL_PREFIX):]
-                updates[species] = float(value)
-            if updates:
-                self._dataset_settings_updater(dataset_id, updates)
-                total_updates += len(updates)
+                key_str = str(key)
+                if not key_str.startswith(INITIAL_PREFIX):
+                    continue
+                global_params.setdefault(ds_id, {})[key_str] = float(value)
+                spec = global_variable_params.get(ds_id, {}).get(key_str)
+                if isinstance(spec, dict):
+                    spec["initial"] = float(value)
+                total_updates += 1
+        self._params_ics_tab.set_global_dataset_params(global_params)
+        self._params_ics_tab.set_global_dataset_variable_params(global_variable_params)
         return total_updates
 
     def _apply_to_project(self) -> None:
-        scope = self._selected_project_apply_scope()
-        if not scope or scope not in self._available_project_apply_scopes():
+        authority = self._current_project_apply_authority()
+        if authority is None:
+            self._refresh_project_apply_controls(prefer_broadest=True)
             return
-        shared_params = {str(name): float(value) for name, value in (self._params_ics_tab.get_last_fit_params() or {}).items()}
-        dataset_params = {
-            str(dataset_id): dict(param_map)
-            for dataset_id, param_map in (self._params_ics_tab.get_staged_dataset_params() or {}).items()
-            if isinstance(param_map, dict)
-        }
+        if not self._project_apply_callback:
+            self._refresh_project_apply_controls(prefer_broadest=True)
+            return
+        scope = self._selected_project_apply_scope()
+        scopes = authority.available_scopes()
+        if not scope or scope not in scopes:
+            return
+        shared_params = authority.shared_params()
+        dataset_params = authority.dataset_params()
         apply_warning_text = ""
         try:
-            if self._project_apply_callback:
-                callback_result = self._project_apply_callback(scope, shared_params, dataset_params)
-                if callback_result is False:
-                    return
-                if isinstance(callback_result, str):
-                    apply_warning_text = str(callback_result).strip()
-            else:
-                if scope in {_PROJECT_APPLY_SCOPE_PARAMETERS, _PROJECT_APPLY_SCOPE_BOTH}:
-                    if not (self._apply_callback and shared_params):
-                        raise RuntimeError("No fitted parameter values are available to apply.")
-                    self._apply_callback(shared_params)
-                if scope in {_PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS, _PROJECT_APPLY_SCOPE_BOTH}:
-                    if not self._dataset_settings_updater:
-                        raise RuntimeError("No dataset initial-condition updater is available.")
-                    self._apply_dataset_initials_via_updater()
+            callback_result = self._project_apply_callback(scope, shared_params, dataset_params)
+            if callback_result is False:
+                return
+            if isinstance(callback_result, str):
+                apply_warning_text = str(callback_result).strip()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Apply to Project", str(exc))
             return
         if scope in {_PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS, _PROJECT_APPLY_SCOPE_BOTH}:
-            self._mirror_staged_initial_condition_values()
+            self._mirror_authority_initial_condition_values(authority)
         if apply_warning_text:
             QtWidgets.QMessageBox.warning(self, "Apply to Project", apply_warning_text)
             return
@@ -3642,69 +3674,36 @@ class FittingWindow(QtWidgets.QDialog):
             f"{self._apply_scope_combo.currentText() or 'Selected scope'} applied to project.",
         )
 
-    def _update_global_plots_from_maps(
+    def _publish_fit_render_projection(
         self,
-        model_series: Dict[str, Dict[str, np.ndarray]],
-        dataset_stats: Dict[str, Dict[str, float]],
-        model_x_by_dataset: Optional[Dict[str, np.ndarray]] = None,
+        projection: FitRenderProjection,
+        *,
+        dataset_ids: Optional[Sequence[str]] = None,
+        refresh_all: bool = False,
     ) -> None:
-        self._run_results_tab.push_live_update(
-            {
-                "plot_model_series": model_series if model_x_by_dataset else {},
-                "model_series": model_series if not model_x_by_dataset else {},
-                "dataset_stats": dataset_stats,
-                "plot_model_x": model_x_by_dataset or {},
-            }
-        )
-
-    def _update_dataset_views_from_maps(
-        self,
-        model_series: Dict[str, Dict[str, np.ndarray]],
-        dataset_stats: Dict[str, Dict[str, float]],
-    ) -> None:
-        if not self._dataset_manager:
+        if not self._render_projection_matches_active_run(projection):
             return
-        self._dataset_manager.sync_fit_result_views(
-            model_series,
-            dataset_stats=dataset_stats,
-        )
-
-    def _update_dataset_views_from_global(self, result: GlobalFitResult) -> None:
-        """Update dataset tabs/grid using global-fit output."""
-        if not self._dataset_manager:
-            return
-
-        dataset_ids = self._result_dataset_ids(result)
-        if not dataset_ids:
-            return
-        dataset_stats: Dict[str, Dict[str, float]] = {}
-        info_map = {info.dataset_id: info for info in result.dataset_info}
-        for dataset_id in dataset_ids:
-            info = info_map.get(dataset_id)
-            if info is not None:
-                dataset_stats[dataset_id] = {
-                    "chi_squared": info.chi_squared,
-                    "r_squared": info.r_squared,
-                }
-
-        self._dataset_manager.sync_fit_result_views(
-            result.model_series,
-            dataset_stats=dataset_stats,
+        self._run_results_tab.push_render_projection(projection, refresh_all=refresh_all)
+        self._dataset_view_publisher.sync_fit_render_projection(
+            projection,
             dataset_ids=dataset_ids,
         )
 
     def _on_worker_error(self, error: object, *, worker: Optional[QtCore.QThread] = None) -> None:
         if not self._terminal_payload_matches_active_run(error, worker=worker):
             return
-        self._clear_pending_best_update_state()
         if self._closing:
             return
         if self._results_rebuild_pending:
             self._results_rebuild_pending = False
         payload = coerce_simulation_failure(error)
         if str(payload.get("kind") or "") == "cancelled":
+            self._invalidate_fit_result_authority()
+            self._fit_run_state_owner.mark_superseded()
+            self._fit_run_state_owner.clear_active_dataset_ids()
             self._set_running_state(False)
             self._status_label.setText("Fit cancelled")
+            self._refresh_project_apply_controls(prefer_broadest=True, running=False)
             return
         self._clear_failed_run_visual_state()
         stack_trace = simulation_failure_detail_text(payload)
@@ -3728,18 +3727,15 @@ class FittingWindow(QtWidgets.QDialog):
     # Plot + stats helpers
     # ------------------------------------------------------------------
     def _refresh_plot_baselines(self) -> None:
-        self._latest_model_series = {}
-        self._latest_dataset_stats = {}
-        self._latest_plot_model_series = {}
-        self._latest_plot_model_x = {}
         self._request_rebuild_subtabs()
-
-    def _update_global_plots(self, result: GlobalFitResult) -> None:
-        self._run_results_tab.push_final_result(result, self._dataset_entries)
 
     def _build_global_stats(self, result: GlobalFitResult) -> Dict[str, float]:
         total_points = sum(info.n_points for info in result.dataset_info)
-        series_count = sum(len(result.model_series.get(info.dataset_id, {})) for info in result.dataset_info)
+        fit_targets = self._results_fit_targets_by_dataset()
+        series_count = sum(
+            len(fit_targets.get(str(info.dataset_id), []))
+            for info in result.dataset_info
+        )
         shared = len(result.shared_params)
         dataset_vars = sum(len(specs) for specs in self._active_variable_specs.values())
         params = shared + dataset_vars
@@ -3764,16 +3760,9 @@ class FittingWindow(QtWidgets.QDialog):
     # ------------------------------------------------------------------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[name-defined]
         self._closing = True
-        if hasattr(self, "_pending_best_timer"):
-            try:
-                self._pending_best_timer.stop()
-            except Exception as exc:
-                self._best_effort_failures.add("closeEvent.pending_best_timer_stop")
-                logger.debug("Failed to stop pending-best timer during closeEvent: %s", exc, exc_info=True)
-        self._pending_best_payload = None
         self._hard_teardown_worker(reason="Cancelling...", disable_ui=True)
         if not self._fit_runtime_readiness.close(kill=True):
-            self._fit_runtime_preparation_owner.request_close_after_prepare()
+            self._fit_runtime_readiness.request_close_after_prepare()
             try:
                 self.setEnabled(False)
             except Exception:

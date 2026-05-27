@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal
 
+from kindred.core.analysis.global_fit_projection import FitRenderDatasetProjection
 from kindred.gui.plot_config import get_plot_panel_class
 
 logger = logging.getLogger(__name__)
@@ -153,8 +154,6 @@ class DatasetPlotPanel(QWidget):
         self,
         data_x: np.ndarray,
         data_y: np.ndarray,
-        model_x: Optional[np.ndarray] = None,
-        model_y: Optional[np.ndarray] = None,
         confidence_upper: Optional[np.ndarray] = None,
         confidence_lower: Optional[np.ndarray] = None,
         xlabel: str = "Time",
@@ -168,8 +167,6 @@ class DatasetPlotPanel(QWidget):
         ----------
         data_x, data_y : np.ndarray
             Experimental data points
-        model_x, model_y : np.ndarray, optional
-            Model prediction (from fitting)
         confidence_upper, confidence_lower : np.ndarray, optional
             Confidence interval bands
         xlabel, ylabel : str
@@ -192,9 +189,6 @@ class DatasetPlotPanel(QWidget):
 
         self._model_t = None
         self._model_series = {}
-        if model_x is not None and model_y is not None:
-            self._model_t = np.asarray(model_x, dtype=float)
-            self._model_series = {str(ylabel): np.asarray(model_y, dtype=float)}
 
         # Create species checkboxes
         self._create_species_checkboxes()
@@ -242,6 +236,19 @@ class DatasetPlotPanel(QWidget):
             for name, checkbox in (self._species_checkboxes or {}).items()
             if bool(getattr(checkbox, "isChecked", lambda: False)())
         ]
+
+    def apply_fit_render_projection(self, projection: FitRenderDatasetProjection) -> None:
+        """Apply a typed fitting render projection as the dataset-tab fit overlay."""
+        if not isinstance(projection, FitRenderDatasetProjection):
+            return
+        if projection.status != "ok":
+            return
+        self._model_t = np.asarray(projection.model_x, dtype=float)
+        self._model_series = {
+            str(name): np.asarray(values, dtype=float)
+            for name, values in projection.model_series.items()
+        }
+        self._render_dataset_layers()
 
     def _render_dataset_layers(self) -> None:
         """Delegate dataset-tab rendering to the backend public contract."""

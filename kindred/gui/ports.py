@@ -88,6 +88,27 @@ class DisplayStatus(Enum):
     NO_COMPLETE_DISPLAYABLE_REQUEST_SCOPE = "no_complete_displayable_request_scope"
 
 
+@dataclass(frozen=True, slots=True)
+class ConcentrationSetInteractionTransaction:
+    gesture: str
+    row: Optional[int]
+    set_id: str
+    focus_change: bool
+    selection_change: bool
+    requested_show_set_ids: tuple[str, ...]
+    explicit_slider_target_set_ids: tuple[str, ...]
+    effective_slider_edit_target_set_ids: tuple[str, ...]
+    effective_slider_edit_target_rows: tuple[int, ...]
+    run_selected_rows: tuple[int, ...]
+    empty_run_target_reason: str
+    display_refresh_needed: bool
+    display_refresh_reason: str
+    slider_rebuild_needed: bool
+    slider_rebuild_reason: str
+    runtime_readiness_refresh_needed: bool
+    runtime_readiness_refresh_reason: str
+
+
 def _normalized_str_tuple(values: Sequence[str] | object) -> tuple[str, ...]:
     if isinstance(values, str):
         values = (values,)
@@ -706,6 +727,17 @@ class SimulationBatchPort(Protocol):
     def requested_show_batch_set_ids(self) -> List[str]: ...
 
     def slider_edit_target_set_ids(self) -> List[str]: ...
+
+    def effective_slider_edit_target_set_ids(self, *, focused_row: Optional[int] = None) -> List[str]: ...
+
+    def concentration_set_interaction_transaction(
+        self,
+        *,
+        gesture: str,
+        row: Optional[int] = None,
+    ) -> ConcentrationSetInteractionTransaction: ...
+
+    def run_selected_empty_target_reason(self) -> str: ...
 
     def focused_batch_set_id(self) -> Optional[str]: ...
 

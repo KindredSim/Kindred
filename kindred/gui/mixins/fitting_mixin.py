@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional, Sequence, TYPE_CHECKING
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
@@ -128,25 +128,7 @@ class FittingMixin:
         ports = getattr(self, "_fitting_ports", None)
         if isinstance(ports, FittingMixinPorts):
             return ports
-
-        mechanism_editor = getattr(self, "_mechanism_editor", None)
-        dataset_manager = getattr(self, "_dataset_manager", None)
-        data_manager = getattr(getattr(self, "_right_panel", None), "_data_manager", None)
-        status_label = getattr(self, "_status_label", None)
-        temperature_spinbox = getattr(self, "_temperature_spinbox", None)
-        num_points_spinbox = getattr(self, "_num_points_spinbox", None)
-
-        if status_label is None:
-            raise RuntimeError("FittingMixin ports are not initialized.")
-
-        return FittingMixinPorts(
-            mechanism_editor=mechanism_editor,
-            dataset_manager=dataset_manager,
-            data_manager_getter=lambda: getattr(getattr(self, "_right_panel", None), "_data_manager", data_manager),
-            status_setter=lambda text: status_label.setText(str(text)),
-            temperature_getter=lambda: float(temperature_spinbox.value()) if temperature_spinbox is not None else 298.15,
-            num_points_getter=lambda: int(num_points_spinbox.value()) if num_points_spinbox is not None else 100,
-        )
+        raise RuntimeError("FittingMixin ports are not initialized.")
 
     def _set_fitting_status(self, text: str) -> None:
         self._require_fitting_ports().status_setter(str(text))
@@ -198,6 +180,22 @@ class FittingMixin:
                 self._record_fitting_best_effort_failure(
                     "active_fit_window_runtime_inputs_changed",
                     message="Failed to notify an active fitting window about runtime input changes",
+                    exc=exc,
+                )
+
+    def _notify_active_fit_windows_datasets_removed(self, dataset_ids: Sequence[str]) -> None:
+        removed_ids = tuple(str(dataset_id) for dataset_id in dataset_ids if str(dataset_id))
+        if not removed_ids:
+            self._notify_active_fit_windows_runtime_inputs_changed()
+            return
+        windows = list(getattr(self, "_active_fit_windows", []) or [])
+        for window in windows:
+            try:
+                window.handle_external_datasets_removed(removed_ids)
+            except Exception as exc:
+                self._record_fitting_best_effort_failure(
+                    "active_fit_window_datasets_removed",
+                    message="Failed to notify an active fitting window about removed datasets",
                     exc=exc,
                 )
 
@@ -634,19 +632,7 @@ class FittingMixin:
             predicted = observed + residuals
 
         if observed.size == 0:
-            dataset_info = fit_result.get("dataset", {})
-            dataset_name = dataset_info.get("name")
-            if dataset_name:
-                data_manager = self._require_fitting_ports().data_manager_getter()
-                dataset_payload = data_manager.get_dataset(dataset_name) if data_manager is not None else None
-                species_map = (dataset_payload or {}).get("species", {})
-                target = dataset_info.get("target_species")
-                if target and target in species_map:
-                    observed = _array(species_map[target])
-                elif species_map:
-                    observed = _array(next(iter(species_map.values())))
-                if observed.size and residuals.size == observed.size and predicted.size == 0:
-                    predicted = observed + residuals
+            logger.debug("Fitting diagnostics payload did not include observed data; registry reconstruction is not attempted.")
 
         result_dict = {
             'parameters': fit_result.get('parameters', {}),
@@ -713,8 +699,10 @@ class FittingMixin:
 
         return GlobalFitLaunchContext(
             parent=self,
-            dataset_manager=ports.dataset_manager,
-            data_manager_getter=ports.data_manager_getter,
+            dataset_registry=ports.dataset_registry,
+            dataset_fit_settings_store=ports.dataset_fit_settings_store,
+            dataset_view_publisher=ports.dataset_view_publisher,
+            mechanism_parameter_scan_owner=ports.mechanism_parameter_scan_owner,
             mechanism_text_getter=lambda: str(self._get_mechanism_text() or ""),
             reactions_text_getter=_get_reactions_text,
             reactions_text_setter=_set_reactions_text,
@@ -727,9 +715,7 @@ class FittingMixin:
             temperature_getter=ports.temperature_getter,
             num_points_getter=ports.num_points_getter,
             register_fit_window=self._register_fit_window,
-            write_fit_results_to_mechanism=self._write_fit_results_to_mechanism,
             apply_fit_results_to_project=self._apply_fit_results_to_project,
-            apply_dataset_initial_updates=self._apply_dataset_initial_updates,
             load_fitting_defaults=self._get_fitting_session_defaults,
             runtime_lane_budget=_runtime_lane_budget,
             batch_store=getattr(self, "_batch_store", None),
@@ -775,7 +761,7 @@ class FittingMixin:
         self,
         dataset_params: Dict[str, Dict[str, float]] | None,
     ) -> tuple[tuple[_FitDatasetInitialConditionApplyItem, ...], bool]:
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
+        from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 
         updates_by_dataset = self._extract_fit_initial_condition_updates(dataset_params)
         has_requested_updates = bool(updates_by_dataset)
@@ -786,15 +772,13 @@ class FittingMixin:
         if batch_store is None:
             raise RuntimeError("Initial conditions store is unavailable.")
 
-        dataset_manager = self._require_fitting_ports().dataset_manager
-        if dataset_manager is None:
-            raise RuntimeError("Dataset manager is unavailable.")
+        dataset_fit_settings_store = self._require_fitting_ports().dataset_fit_settings_store
 
         plan: list[_FitDatasetInitialConditionApplyItem] = []
         for dataset_id, species_updates in updates_by_dataset.items():
             try:
-                settings = dataset_manager.get_fit_settings(dataset_id)
-            except DatasetManagerError as exc:
+                settings = dataset_fit_settings_store.get_fit_settings(dataset_id)
+            except DatasetOwnerError as exc:
                 raise RuntimeError(f"Dataset '{dataset_id}' is no longer available.") from exc
 
             mapped_set_id = str(getattr(settings, "batch_set_id", "") or "").strip()
@@ -903,8 +887,8 @@ class FittingMixin:
     ) -> None:
         batch_store = getattr(self, "_batch_store", None)
         batch_model = getattr(self, "_batch_model", None)
-        dataset_manager = self._require_fitting_ports().dataset_manager
-        if batch_store is None or dataset_manager is None:
+        dataset_fit_settings_store = self._require_fitting_ports().dataset_fit_settings_store
+        if batch_store is None:
             raise RuntimeError("Batch initial conditions project apply is unavailable.")
 
         affected_rows: list[int] = []
@@ -915,12 +899,12 @@ class FittingMixin:
             if item.canonical_updates:
                 affected_rows.append(row)
             if item.settings_sync_updates or item.mapping_sync_needed:
-                settings = dataset_manager.get_fit_settings(item.dataset_id)
+                settings = dataset_fit_settings_store.get_fit_settings(item.dataset_id)
                 for species, value in item.settings_sync_updates.items():
                     settings.initial_conditions[str(species)] = float(value)
                 settings.batch_set_id = item.set_id
                 settings.batch_set = item.set_name
-                dataset_manager.update_fit_settings(item.dataset_id, settings)
+                dataset_fit_settings_store.update_fit_settings(item.dataset_id, settings)
 
         if batch_model is not None and affected_rows:
             for row in sorted(set(affected_rows)):
@@ -1011,11 +995,11 @@ class FittingMixin:
 
     def _apply_dataset_initial_updates(self, dataset_id: str, updates: Dict[str, float]) -> None:
         """Persist fitted initial concentrations back to dataset settings."""
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
+        from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 
         try:
-            settings = self._require_fitting_ports().dataset_manager.get_fit_settings(dataset_id)
-        except DatasetManagerError:
+            settings = self._require_fitting_ports().dataset_fit_settings_store.get_fit_settings(dataset_id)
+        except DatasetOwnerError:
             return
         changed = False
         for species, value in updates.items():
@@ -1023,4 +1007,4 @@ class FittingMixin:
                 settings.initial_conditions[species] = float(value)
                 changed = True
         if changed:
-            self._require_fitting_ports().dataset_manager.update_fit_settings(dataset_id, settings)
+            self._require_fitting_ports().dataset_fit_settings_store.update_fit_settings(dataset_id, settings)

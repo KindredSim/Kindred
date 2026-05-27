@@ -5,7 +5,10 @@ from typing import Protocol
 from PySide6 import QtCore
 
 from kindred.gui.fitting.launch import FittingLaunchPurpose
-from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+from kindred.gui.fitting.runtime_readiness import (
+    FittingRuntimePostPreparationAction,
+    FittingRuntimeReadinessState,
+)
 
 class FittingRuntimePreparationWindow(Protocol):
     @property
@@ -19,16 +22,16 @@ class FittingRuntimePreparationWindow(Protocol):
     def set_fit_status(self, text: str) -> None: ...
     def set_fit_stop_enabled(self, enabled: bool) -> None: ...
     def set_fit_controls_locked(self, locked: bool) -> None: ...
+    def run_fit(self) -> None: ...
     def close(self) -> None: ...
 
 
 class FittingRuntimePreparationOwner:
-    """Owns passive fitting runtime preparation scheduling and close-after lifecycle."""
+    """Owns passive fitting runtime preparation scheduling."""
 
     def __init__(self, window: FittingRuntimePreparationWindow) -> None:
         self._window = window
         self._refresh_pending = False
-        self._close_after_prepare = False
 
     @property
     def refresh_pending(self) -> bool:
@@ -37,14 +40,6 @@ class FittingRuntimePreparationOwner:
     @refresh_pending.setter
     def refresh_pending(self, value: bool) -> None:
         self._refresh_pending = bool(value)
-
-    @property
-    def close_after_prepare(self) -> bool:
-        return bool(self._close_after_prepare)
-
-    @close_after_prepare.setter
-    def close_after_prepare(self, value: bool) -> None:
-        self._close_after_prepare = bool(value)
 
     def schedule_refresh(self) -> None:
         window = self._window
@@ -115,16 +110,6 @@ class FittingRuntimePreparationOwner:
             return
         self.run_refresh()
 
-    def request_close_after_prepare(self) -> None:
-        self._close_after_prepare = True
-
-    def close_after_preparation_if_requested(self) -> bool:
-        if not self._close_after_prepare:
-            return False
-        self._close_after_prepare = False
-        QtCore.QTimer.singleShot(0, self._window.close)
-        return True
-
     @QtCore.Slot()
     def poll_preparation(self) -> None:
         window = self._window
@@ -142,8 +127,16 @@ class FittingRuntimePreparationOwner:
         window.set_fit_stop_enabled(False)
         window.set_fit_controls_locked(False)
         window.refresh_run_button_enabled_state()
+        action = window.fit_runtime_readiness.consume_post_preparation_action(snapshot)
+        if action is FittingRuntimePostPreparationAction.CLOSE:
+            QtCore.QTimer.singleShot(0, window.close)
+            return
+        if action is FittingRuntimePostPreparationAction.RUN_PENDING:
+            if window.is_closing or window.is_fit_running():
+                return
+            window.run_fit()
+            return
         if snapshot.state is FittingRuntimeReadinessState.FAILED:
             self._refresh_pending = False
             return
-        if not self.close_after_preparation_if_requested():
-            self.queue_pending_refresh()
+        self.queue_pending_refresh()

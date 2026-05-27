@@ -149,33 +149,10 @@ class MainWindowPreviewSession:
         mw._status_label.setText(str(message or "Preview unavailable. Adjust sliders or run again."))
 
     def _focused_mechanism_workspace_set_id(self) -> str:
-        mw = self._mw
-        try:
-            focused_set_id = mw.focused_batch_set_id()
-        except Exception:
-            focused_set_id = None
-        if focused_set_id:
-            return str(focused_set_id)
-        try:
-            row_count = int(mw.batch_store_row_count())
-        except Exception:
-            row_count = 0
-        if row_count > 0:
-            try:
-                set_id = mw.batch_set_id_for_row(0)
-            except Exception:
-                set_id = None
-            if set_id:
-                return str(set_id)
-        return ""
+        target_ids = self._main_window_effective_slider_target_set_ids()
+        return str(target_ids[0]) if target_ids else ""
 
-    def focused_mechanism_workspace_set_id(self) -> str:
-        return str(self._focused_mechanism_workspace_set_id() or "")
-
-    def _selected_mechanism_target_set_ids(self) -> list[str]:
-        return self.effective_slider_edit_target_set_ids()
-
-    def effective_slider_edit_target_set_ids(self) -> list[str]:
+    def _main_window_effective_slider_target_set_ids(self) -> list[str]:
         mw = self._mw
         try:
             helper = getattr(mw, "_effective_slider_edit_target_set_ids")
@@ -193,10 +170,16 @@ class MainWindowPreviewSession:
                 continue
             seen.add(set_id_s)
             normalized.append(set_id_s)
-        if normalized:
-            return normalized
-        focused_set_id = self._focused_mechanism_workspace_set_id()
-        return [focused_set_id] if focused_set_id else []
+        return normalized
+
+    def focused_mechanism_workspace_set_id(self) -> str:
+        return str(self._focused_mechanism_workspace_set_id() or "")
+
+    def _selected_mechanism_target_set_ids(self) -> list[str]:
+        return self.effective_slider_edit_target_set_ids()
+
+    def effective_slider_edit_target_set_ids(self) -> list[str]:
+        return self._main_window_effective_slider_target_set_ids()
 
     def _workspace_for_set_id(self, set_id: str) -> dict[str, float]:
         return self._param_store.local_overrides_for_set(str(set_id or ""))

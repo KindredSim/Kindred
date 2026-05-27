@@ -55,7 +55,7 @@ from kindred.gui.app_wiring import (
     build_batch_dock_panel,
     build_mechanism_dock,
     build_profile_and_template_managers,
-    build_right_dock_and_dataset_manager,
+    build_right_dock_and_dataset_owners,
     build_settings_and_controllers,
     build_sliders_dock,
     build_simulation_plumbing,
@@ -296,11 +296,10 @@ class MainWindow(
         self._batch_store = batch_components.store
         self._batch_model = batch_components.model
         self._simulation_batch_owner = SimulationBatchOwner(
-            batch_rows_for_scope=self._batch_rows_for_scope,
-            batch_set_ids_for_scope=self._batch_set_ids_for_scope,
+            batch_selected_rows=self._batch_selected_rows,
             requested_show_batch_set_ids=self._requested_show_batch_set_ids,
             slider_edit_target_set_ids=self._slider_edit_target_set_ids,
-            focused_batch_set_id=self._focused_batch_set_id_value,
+            focused_batch_set_id=self._cached_focused_batch_set_id_value,
             batch_current_row=self._batch_current_row,
             batch_set_id_for_row=self._batch_set_id_for_row,
             batch_set_name_for_id=self._batch_set_name_for_id,
@@ -328,10 +327,11 @@ class MainWindow(
         self._batch_table: Optional[BatchInitialConditionsTableView] = None
         self._focused_batch_set_id = ""
         self._last_effective_slider_edit_target_set_ids: tuple[str, ...] = ()
+        self._last_batch_runtime_readiness_refresh_key: tuple[tuple[int, ...], tuple[str, ...]] | None = None
         self._connected_batch_semantics_model = None
         self._connected_batch_selection_model = None
-        self._pending_import_batch_mapping_names: List[str] = []
         # (Batch run/caching/executor state lives in self._sim_controller.)
+        self._set_species_panel_transaction_owner()
 
     def _init_settings_and_controllers(self) -> None:
         # Theme state.
@@ -636,9 +636,7 @@ class MainWindow(
             bool(outcome.runtime_input_invalidation_required)
             or bool(outcome.runtime_invalidation_required)
         ):
-            notify_fit_windows = getattr(self, "_notify_active_fit_windows_runtime_inputs_changed", None)
-            if callable(notify_fit_windows):
-                notify_fit_windows()
+            self._notify_active_fit_windows_runtime_inputs_changed()
         return outcome
 
     def _apply_canonical_batch_initials_transition(
@@ -811,9 +809,7 @@ class MainWindow(
 
     def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
         self._update_temperature_mode_indicator()
-        notify_fit_windows = getattr(self, "_notify_active_fit_windows_runtime_inputs_changed", None)
-        if callable(notify_fit_windows):
-            notify_fit_windows()
+        self._notify_active_fit_windows_runtime_inputs_changed()
 
     @staticmethod
     def _state_network_dialog_info_text(*, locked: bool) -> str:
@@ -1105,7 +1101,7 @@ class MainWindow(
             try:
                 species_panel.attach(table=self._batch_table, model=self._batch_model)
                 if hasattr(species_panel, "activate"):
-                    self._ensure_batch_current_row_selected()
+                    self._select_initial_batch_row_if_needed()
                     species_panel.activate()
             except RuntimeError as exc:
                 logger.debug("Failed to attach species panel to batch table: %s", exc, exc_info=True)
@@ -1192,6 +1188,17 @@ class MainWindow(
         self._connected_batch_semantics_model = current_model
         self._connected_batch_selection_model = current_selection_model
 
+    def _species_panel_transaction_owner(self) -> object:
+        return getattr(self, "_simulation_batch_owner", None) or self._preview_session
+
+    def _set_species_panel_transaction_owner(self) -> None:
+        try:
+            species_panel = self._mechanism_editor.species_sliders_widget()
+        except (AttributeError, RuntimeError, TypeError):
+            return
+        if species_panel is not None and hasattr(species_panel, "set_transaction_owner"):
+            species_panel.set_transaction_owner(self._species_panel_transaction_owner())
+
     def _try_wire_species_panel(self):
         try:
             species_panel = self._mechanism_editor.species_sliders_widget()
@@ -1206,7 +1213,7 @@ class MainWindow(
 
         try:
             if hasattr(species_panel, "set_transaction_owner"):
-                species_panel.set_transaction_owner(self._preview_session)
+                species_panel.set_transaction_owner(self._species_panel_transaction_owner())
             species_panel.speciesEdited.connect(self._on_species_slider_edited)
             species_panel.speciesDragFinished.connect(self._on_species_slider_drag_finished)
         except RuntimeError as exc:
@@ -1217,7 +1224,7 @@ class MainWindow(
         return species_panel
 
     def _init_right_dock_and_datasets(self) -> None:
-        right_dock_components = build_right_dock_and_dataset_manager(
+        right_dock_components = build_right_dock_and_dataset_owners(
             self,
             plot_tabs=self._plot_tabs,
             mechanism_getter=self._get_mechanism_text,
@@ -1232,9 +1239,33 @@ class MainWindow(
         self._right_dock.setWidget(right_dock_components.container)
         self.addDockWidget(self._default_dock_area(self._right_dock), self._right_dock)
 
-        # Centralize dataset/fitting coordination outside the main window.
-        self._dataset_manager = right_dock_components.dataset_manager
-        self._bootstrap_existing_datasets()
+        self._dataset_registry = right_dock_components.dataset_registry
+        self._dataset_fit_settings_store = right_dock_components.dataset_fit_settings_store
+        self._dataset_view_publisher = right_dock_components.dataset_view_publisher
+        self._mechanism_parameter_scan_owner = right_dock_components.mechanism_parameter_scan_owner
+        self._dataset_import_panel = right_dock_components.import_panel
+
+        from kindred.gui.controllers.dataset_import_coordinator import DatasetImportCoordinator
+
+        self._dataset_import_coordinator = DatasetImportCoordinator(
+            registry=self._dataset_registry,
+            fit_settings_store=self._dataset_fit_settings_store,
+            view_publisher=self._dataset_view_publisher,
+            import_panel=self._dataset_import_panel,
+            status_setter=lambda text: self._status_label.setText(str(text)),
+            overlay_sync=self._sync_overlay_catalog,
+            color_sync=self._sync_color_manager_authoritative_roster,
+            batch_store_getter=lambda: getattr(self, "_batch_store", None),
+            batch_model_getter=lambda: getattr(self, "_batch_model", None),
+            batch_table_getter=lambda: getattr(self, "_batch_table", None),
+            mechanism_text_getter=self._get_mechanism_text,
+            extract_mechanism_initials=self._extract_mechanism_initials,
+            sync_batch_species_columns=self.sync_batch_species_columns,
+            record_failure=self._record_best_effort_failure,
+            runtime_inputs_changed=self._notify_active_fit_windows_runtime_inputs_changed,
+            datasets_removed=self._notify_active_fit_windows_datasets_removed,
+            message_parent=self,
+        )
 
         # Reference species statistics table within plot tabs.
         self._results_table = self._plot_tabs._main_plot.stats_table()
@@ -1380,10 +1411,16 @@ class MainWindow(
         *,
         wait: bool = False,
         force_when_hidden: bool = False,
+        selected_run_rows: Optional[Sequence[int]] = None,
+        slider_preview_rows: Optional[Sequence[int]] = None,
     ) -> None:
         if (not bool(force_when_hidden)) and not self.isVisible():
             return
-        self._make_simulation_runtime_available_after_startup(wait=bool(wait))
+        self._make_simulation_runtime_available_after_startup(
+            wait=bool(wait),
+            selected_run_rows=selected_run_rows,
+            slider_preview_rows=slider_preview_rows,
+        )
 
     def _simulation_runtime_settings_snapshot(self) -> Dict[str, object]:
         solver_contract = load_solver_contract()
@@ -1433,12 +1470,25 @@ class MainWindow(
                 force_when_hidden=bool(force_when_hidden),
             )
 
-    def _make_simulation_runtime_available_after_startup(self, *, wait: bool = False) -> None:
+    def _make_simulation_runtime_available_after_startup(
+        self,
+        *,
+        wait: bool = False,
+        selected_run_rows: Optional[Sequence[int]] = None,
+        slider_preview_rows: Optional[Sequence[int]] = None,
+    ) -> None:
         if bool(getattr(self, "_simulation_runtime_availability_shutdown_started", False)):
             return
         try:
-            self._sim_controller.ensure_current_interactive_simulation_runtimes_available(wait=bool(wait))
-            self._poll_interactive_runtime_readiness_after_refresh()
+            self._sim_controller.ensure_current_interactive_simulation_runtimes_available(
+                wait=bool(wait),
+                selected_run_rows=selected_run_rows,
+                slider_preview_rows=slider_preview_rows,
+            )
+            self._poll_interactive_runtime_readiness_after_refresh(
+                selected_run_rows=selected_run_rows,
+                slider_preview_rows=slider_preview_rows,
+            )
         except Exception as exc:
             record_gui_best_effort_failure(
                 self,
@@ -1495,21 +1545,48 @@ class MainWindow(
         except Exception:
             logger.debug("Failed to update slider readiness state", exc_info=True)
 
-    def _poll_interactive_runtime_readiness_after_refresh(self) -> None:
+    def _poll_interactive_runtime_readiness_after_refresh(
+        self,
+        *,
+        selected_run_rows: Optional[Sequence[int]] = None,
+        slider_preview_rows: Optional[Sequence[int]] = None,
+    ) -> None:
         if bool(getattr(self, "_simulation_runtime_availability_shutdown_started", False)):
             return
         try:
-            ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=False)
-            preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot()
-            run_snapshot = self._sim_controller.selected_run_runtime_snapshot()
+            explicit_run_rows = selected_run_rows is not None
+            explicit_preview_rows = slider_preview_rows is not None
+            run_rows = (
+                tuple(int(row) for row in selected_run_rows)
+                if explicit_run_rows
+                else None
+            )
+            preview_rows = (
+                tuple(int(row) for row in slider_preview_rows)
+                if explicit_preview_rows
+                else self._effective_slider_edit_target_rows()
+            )
+            ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(
+                fast_mode=False,
+                rows=run_rows,
+            )
+            preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot(preview_rows)
+            run_snapshot = self._sim_controller.selected_run_runtime_snapshot(run_rows)
             if any(
                 self._runtime_snapshot_should_poll(snapshot)
                 for snapshot in (ordinary_snapshot, preview_snapshot, run_snapshot)
             ):
-                self._sim_controller.ensure_current_interactive_simulation_runtimes_available(wait=False)
-                ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=False)
-                preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot()
-                run_snapshot = self._sim_controller.selected_run_runtime_snapshot()
+                self._sim_controller.ensure_current_interactive_simulation_runtimes_available(
+                    wait=False,
+                    selected_run_rows=run_rows,
+                    slider_preview_rows=preview_rows,
+                )
+                ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(
+                    fast_mode=False,
+                    rows=run_rows,
+                )
+                preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot(preview_rows)
+                run_snapshot = self._sim_controller.selected_run_runtime_snapshot(run_rows)
             self._set_runtime_backed_run_controls_ready(
                 self._runtime_snapshot_controls_ready(run_snapshot)
             )
@@ -1535,14 +1612,21 @@ class MainWindow(
                 log=logger,
             )
             return
-        QtCore.QTimer.singleShot(50, self._poll_interactive_runtime_readiness_after_refresh)
+        QtCore.QTimer.singleShot(
+            50,
+            lambda: self._poll_interactive_runtime_readiness_after_refresh(
+                selected_run_rows=run_rows if explicit_run_rows else None,
+                slider_preview_rows=preview_rows if explicit_preview_rows else None,
+            ),
+        )
 
     def _init_mixin_ports(self) -> None:
-        data_manager = getattr(getattr(self, "_right_panel", None), "_data_manager", None)
         self._fitting_ports = FittingMixinPorts(
             mechanism_editor=self._mechanism_editor,
-            dataset_manager=self._dataset_manager,
-            data_manager_getter=lambda: getattr(getattr(self, "_right_panel", None), "_data_manager", data_manager),
+            dataset_registry=self._dataset_registry,
+            dataset_fit_settings_store=self._dataset_fit_settings_store,
+            dataset_view_publisher=self._dataset_view_publisher,
+            mechanism_parameter_scan_owner=self._mechanism_parameter_scan_owner,
             status_setter=lambda text: self._status_label.setText(str(text)),
             temperature_getter=lambda: float(self._temperature_spinbox.value()),
             num_points_getter=lambda: int(self._num_points_spinbox.value()),
@@ -1614,24 +1698,6 @@ class MainWindow(
         except Exception:
             logger.debug("Failed to update parameter table after programmatic mechanism load", exc_info=True)
             QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
-
-    def _bootstrap_existing_datasets(self):
-        """Populate dataset visualizations for any datasets already loaded."""
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
-
-        self._sync_color_manager_authoritative_roster()
-        existing = self._right_panel._data_manager.get_datasets()
-        if not existing:
-            return
-
-        for name, payload in existing.items():
-            try:
-                self._dataset_manager.register_dataset(name, payload)
-            except DatasetManagerError as exc:
-                logger.warning("Skipping dataset '%s' during bootstrap: %s", name, exc)
-                continue
-
-        self._sync_overlay_catalog()
 
     def _current_mechanism_species_roster_for_colors(self) -> tuple[str, ...] | None:
         """Best-effort current mechanism species roster for color canonicalization."""
@@ -1728,22 +1794,22 @@ class MainWindow(
     def _sync_overlay_catalog(self):
         """Propagate loaded datasets into the simulation overlay controls."""
         plot = getattr(self._plot_tabs, "_main_plot", None)
-        data_manager = getattr(self._right_panel, "_data_manager", None)
-        if plot is None or data_manager is None:
+        dataset_registry = getattr(self, "_dataset_registry", None)
+        if plot is None or dataset_registry is None:
             return
         if not hasattr(plot, "set_overlay_catalog"):
             return
         self._sync_color_manager_authoritative_roster()
-        plot.set_overlay_catalog(data_manager.get_datasets())
+        plot.set_overlay_catalog(dataset_registry.presentation_payloads_by_display_name())
 
     def _snapshot_datasets(self) -> Dict[str, Dict[str, Any]]:
         """Capture lightweight metadata about loaded datasets."""
-        data_manager = getattr(self._right_panel, "_data_manager", None)
-        if data_manager is None:
+        dataset_registry = getattr(self, "_dataset_registry", None)
+        if dataset_registry is None:
             return {}
 
         snapshot: Dict[str, Dict[str, Any]] = {}
-        for name, dataset in data_manager.get_datasets().items():
+        for name, dataset in dataset_registry.presentation_payloads_by_display_name().items():
             t = dataset.get("t")
             species = dataset.get("species") or {}
             num_points = int(len(np.asarray(t).reshape(-1))) if t is not None else 0
@@ -2139,10 +2205,13 @@ class MainWindow(
 
     def _connect_signals(self):
         """Connect signals between components."""
-        # Data manager signals
-        self._right_panel._data_manager.datasetLoaded.connect(self._on_dataset_loaded)
-        self._right_panel._data_manager.datasetRemoved.connect(self._on_dataset_removed)
-        self._right_panel._data_manager.loadFinished.connect(self._on_dataset_load_finished)
+        # Dataset import panel signals
+        self._dataset_import_panel.importCompleted.connect(
+            self._dataset_import_coordinator.handle_completion
+        )
+        self._dataset_import_panel.datasetRemovalRequested.connect(
+            self._dataset_import_coordinator.remove_dataset_by_id
+        )
 
         # Temperature mode indicator and authoritative mechanism consumers.
         reactions_widget = getattr(self._mechanism_editor, "_reactions_text", None)
@@ -2500,222 +2569,7 @@ class MainWindow(
 
     def _load_data_via_action(self) -> None:
         """Invoke the Data panel's Load dialog from the File menu."""
-        data_manager = getattr(self._right_panel, "_data_manager", None)
-        if data_manager is None:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Data Panel Unavailable",
-                "The Data panel is not available in the current layout."
-            )
-            return
-        data_manager.trigger_load_dialog()
-
-    def _on_dataset_loaded(self, name: str, data: dict):
-        """Handle dataset loaded from data manager."""
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
-
-        logger.info(f"Dataset loaded: {name}")
-
-        self._sync_color_manager_authoritative_roster()
-        try:
-            self._dataset_manager.register_dataset(name, data)
-        except DatasetManagerError as exc:
-            logger.warning(f"Dataset '{name}' missing usable species: {exc}")
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Dataset Skipped",
-                f"Dataset '{name}' cannot be visualized:\n\n{exc}"
-            )
-            return
-
-        self._status_label.setText(f"Dataset '{name}' loaded ({len(data['t'])} points)")
-        self._sync_overlay_catalog()
-        self._pending_import_batch_mapping_names.append(str(name))
-
-    def _on_dataset_load_finished(self, canceled: bool) -> None:
-        """Resolve post-import batch mapping after a dataset load cycle completes."""
-        if not self._pending_import_batch_mapping_names:
-            return
-        batch_store = getattr(self, "_batch_store", None)
-        batch_model = getattr(self, "_batch_model", None)
-        batch_store_rows = int(batch_store.row_count()) if batch_store is not None else 0
-        batch_model_rows = int(batch_model.rowCount()) if batch_model is not None else 0
-        if not (batch_store_rows > 0 or batch_model_rows > 0):
-            self._pending_import_batch_mapping_names.clear()
-            return
-
-        mechanism_species: List[str] = []
-        try:
-            mechanism_species = list((self._extract_mechanism_initials(self._get_mechanism_text()) or {}).keys())
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "main_window.import_batch_mapping.extract_mechanism_initials",
-                message="Failed to extract mechanism initials while preparing import-time batch mapping",
-                exc=exc,
-            )
-        try:
-            self.sync_batch_species_columns(mechanism_species)
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "main_window.import_batch_mapping.sync_batch_species_columns",
-                message="Failed to sync batch species columns while preparing import-time batch mapping",
-                exc=exc,
-            )
-
-        data_panel = getattr(self._right_panel, "_data_manager", None)
-        pending_names = list(dict.fromkeys(self._pending_import_batch_mapping_names))
-        self._pending_import_batch_mapping_names.clear()
-        for dataset_name in pending_names:
-            if data_panel is None:
-                break
-            dataset_payload = data_panel.get_dataset(str(dataset_name))
-            if dataset_payload is None:
-                continue
-            self._maybe_prompt_for_import_batch_mapping(str(dataset_name), dataset_payload, mechanism_species)
-
-    def _maybe_prompt_for_import_batch_mapping(
-        self,
-        dataset_name: str,
-        dataset_payload: Dict[str, Any],
-        mechanism_species: Sequence[str],
-    ) -> None:
-        from kindred.gui.fitting.batch_mapping import (
-            T0_SEED_TOL_S,
-            apply_batch_mapping_to_settings,
-            create_and_seed_batch_set,
-            default_batch_set_name_for_dataset,
-            pick_existing_batch_set,
-            prompt_dataset_batch_mapping_choice,
-            resolve_saved_batch_mapping,
-            select_batch_set,
-            unique_batch_set_name,
-        )
-
-        batch_store = getattr(self, "_batch_store", None)
-        batch_model = getattr(self, "_batch_model", None)
-        if batch_store is None or batch_model is None:
-            return
-        try:
-            self.sync_batch_species_columns(list(mechanism_species))
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "main_window.import_batch_mapping.sync_batch_species_columns",
-                message="Failed to sync batch species columns while preparing import-time batch mapping",
-                exc=exc,
-            )
-
-        settings = self._dataset_manager.get_fit_settings(str(dataset_name))
-        resolved = resolve_saved_batch_mapping(settings, batch_store)
-        if resolved.status == "mapped":
-            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-            return
-
-        batch_set_names = list(batch_store.set_names() or [])
-        if not batch_set_names:
-            return
-
-        create_set_name = unique_batch_set_name(
-            batch_set_names,
-            default_batch_set_name_for_dataset(str(dataset_name)) or str(dataset_name),
-        )
-        running_under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
-        action = prompt_dataset_batch_mapping_choice(
-            self,
-            str(dataset_name),
-            create_set_name,
-            title="Import Set Mapping",
-            skip_label="Skip",
-            skip_description="Leave this dataset unmapped",
-            running_under_pytest=running_under_pytest,
-            pytest_default_action="skip",
-        )
-        if action == "skip":
-            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-            return
-        if action == "map":
-            target_set = pick_existing_batch_set(
-                self,
-                str(dataset_name),
-                batch_set_names,
-                title="Map Dataset to Set",
-                empty_message_title="Import Set Mapping",
-                empty_message_text="No sets exist to map to. Create a set first.",
-            )
-            if not target_set:
-                self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-                return
-            apply_batch_mapping_to_settings(settings, batch_store, target_set)
-            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-            return
-
-        _row_idx, created, seeded = create_and_seed_batch_set(
-            dataset_name=str(dataset_name),
-            dataset_payload=dataset_payload,
-            mechanism_species=mechanism_species,
-            batch_store=batch_store,
-            batch_model=batch_model,
-            set_name=create_set_name,
-            record_failure=self._record_best_effort_failure,
-            failure_key_prefix="main_window.import_batch_mapping",
-        )
-        if created and not seeded and not mechanism_species:
-            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-            return
-        if created and batch_store is not None and not seeded:
-            try:
-                t_arr = np.asarray((dataset_payload or {}).get("t", []), dtype=float).reshape(-1)
-                t0 = float(t_arr[0]) if t_arr.size else float("nan")
-            except Exception:
-                t0 = float("nan")
-            if not (abs(t0) <= T0_SEED_TOL_S):
-                if running_under_pytest:
-                    response = QtWidgets.QMessageBox.StandardButton.Cancel
-                else:
-                    response = QtWidgets.QMessageBox.warning(
-                        self,
-                        "Import Set Mapping",
-                        (
-                            f"Dataset '{dataset_name}' does not start at t\u22480 "
-                            f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
-                            "OK: Map this dataset to the new zeroed set\n"
-                            "Cancel: Leave this dataset unmapped and edit the new set manually"
-                        ),
-                        QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
-                        QtWidgets.QMessageBox.StandardButton.Cancel,
-                    )
-                if response == QtWidgets.QMessageBox.StandardButton.Cancel:
-                    select_batch_set(
-                        batch_store,
-                        batch_model,
-                        getattr(self, "_batch_table", None),
-                        create_set_name,
-                        record_failure=self._record_best_effort_failure,
-                        failure_key_prefix="main_window.import_batch_mapping",
-                    )
-                    if not running_under_pytest:
-                        QtWidgets.QMessageBox.information(
-                            self,
-                            "Import Set Mapping",
-                            (
-                                f"Set '{create_set_name}' was created.\n\n"
-                                "Edit its initial concentrations in the Initial Conditions table, "
-                                "then map the dataset when it is ready."
-                            ),
-                        )
-                    self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-                    return
-        apply_batch_mapping_to_settings(settings, batch_store, create_set_name)
-        self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-
-    def _on_dataset_removed(self, name: str):
-        """Handle dataset removal from the data manager."""
-        logger.info(f"Dataset removed: {name}")
-
-        removed_entry = self._dataset_manager.remove_dataset(name)
-
-        if removed_entry:
-            self._status_label.setText(f"Dataset '{name}' removed")
-        self._sync_overlay_catalog()
+        self._dataset_import_panel.trigger_load_dialog()
 
     def _scan_mechanism_parameters(self):
         """
@@ -2724,7 +2578,7 @@ class MainWindow(
         P2 ENHANCEMENT: Now uses caching to avoid re-scanning unchanged mechanisms.
         This improves performance, especially for large mechanisms.
         """
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
+        from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 
         mechanism_text = self._get_mechanism_text()
 
@@ -2737,8 +2591,8 @@ class MainWindow(
             return
 
         try:
-            self._dataset_manager.scan_mechanism_parameters(mechanism_text)
-        except DatasetManagerError as exc:
+            self._mechanism_parameter_scan_owner.scan_mechanism_parameters(mechanism_text)
+        except DatasetOwnerError as exc:
             QtWidgets.QMessageBox.information(
                 self,
                 "No Parameters Found",
@@ -3727,13 +3581,9 @@ class MainWindow(
         self._sim_controller.prepare_runtime_work_for_project_apply(epoch=int(runtime_epoch))
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
         self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
-        dataset_manager = getattr(self, "_dataset_manager", None)
-        if dataset_manager is not None and hasattr(dataset_manager, "clear_all_datasets"):
-            dataset_manager.clear_all_datasets()
-
-        data_manager = getattr(getattr(self, "_right_panel", None), "_data_manager", None)
-        if data_manager is not None and hasattr(data_manager, "clear_datasets"):
-            data_manager.clear_datasets()
+        dataset_import_coordinator = getattr(self, "_dataset_import_coordinator", None)
+        if dataset_import_coordinator is not None:
+            dataset_import_coordinator.clear_all_datasets()
 
         self._pre_dsl_temperature = None
         self._temperature_dsl_override_active = False
@@ -3762,7 +3612,7 @@ class MainWindow(
 
         try:
             if hasattr(panel, "set_transaction_owner"):
-                panel.set_transaction_owner(self._preview_session)
+                panel.set_transaction_owner(self._species_panel_transaction_owner())
             panel.attach(table=table, model=model)
         except RuntimeError as exc:
             logger.debug("Failed to reattach species panel after project apply: %s", exc, exc_info=True)
@@ -3770,7 +3620,7 @@ class MainWindow(
             return
 
         if hasattr(panel, "activate"):
-            self._ensure_batch_current_row_selected()
+            self._select_initial_batch_row_if_needed()
             try:
                 panel.activate()
             except RuntimeError as exc:
@@ -4179,10 +4029,10 @@ class MainWindow(
         self._temperature_mode_indicator.setText(str(text))
 
     def batch_rows_for_scope(self, scope: str) -> List[int]:
-        return [int(r) for r in (self._batch_rows_for_scope(str(scope)) or [])]
+        return self._simulation_batch_owner.batch_rows_for_scope(str(scope))
 
     def batch_set_ids_for_scope(self, scope: str) -> List[str]:
-        return [str(s) for s in (self._batch_set_ids_for_scope(str(scope)) or [])]
+        return self._simulation_batch_owner.batch_set_ids_for_scope(str(scope))
 
     def requested_show_batch_set_ids(self) -> List[str]:
         return [str(s) for s in (self._requested_show_batch_set_ids() or [])]
@@ -4198,7 +4048,7 @@ class MainWindow(
         return int(row) if row is not None else None
 
     def focused_batch_set_id(self) -> Optional[str]:
-        value = self._focused_batch_set_id_value()
+        value = self._cached_focused_batch_set_id_value()
         return str(value) if value else None
 
     def batch_set_id_for_row(self, row: int) -> Optional[str]:
@@ -4672,19 +4522,31 @@ class MainWindow(
         return bool(model.set_slider_edit_target_set_ids(set_ids))
 
     def _effective_slider_edit_target_set_ids(self) -> List[str]:
-        focused_set_id = self._focused_batch_set_id_value()
-        effective_ids: list[str] = []
-        seen: set[str] = set()
-        if focused_set_id:
-            effective_ids.append(focused_set_id)
-            seen.add(focused_set_id)
-        for set_id in self._slider_edit_target_set_ids():
-            set_id_s = str(set_id or "").strip()
-            if not set_id_s or set_id_s in seen:
+        owner = getattr(self, "_simulation_batch_owner", None)
+        if owner is not None and hasattr(owner, "effective_slider_edit_target_set_ids"):
+            try:
+                return [
+                    str(set_id)
+                    for set_id in owner.effective_slider_edit_target_set_ids()
+                    if str(set_id)
+                ]
+            except Exception as exc:
+                logger.debug("Failed to resolve slider edit targets from batch owner: %s", exc, exc_info=True)
+        return []
+
+    def _effective_slider_edit_target_rows(self) -> tuple[int, ...]:
+        rows: list[int] = []
+        seen: set[int] = set()
+        for set_id in self._effective_slider_edit_target_set_ids():
+            row = self._batch_row_for_set_id(str(set_id))
+            if row is None:
                 continue
-            effective_ids.append(set_id_s)
-            seen.add(set_id_s)
-        return effective_ids
+            row_i = int(row)
+            if row_i in seen:
+                continue
+            rows.append(row_i)
+            seen.add(row_i)
+        return tuple(rows)
 
     @staticmethod
     def _normalized_slider_target_set_ids(set_ids: Sequence[str]) -> tuple[str, ...]:
@@ -4732,19 +4594,10 @@ class MainWindow(
         except RuntimeError as exc:
             logger.debug("Failed to invalidate stale slider preview targets: %s", exc, exc_info=True)
 
-    def _focused_batch_set_id_value(self) -> str:
-        current_row = self._batch_current_row()
-        if current_row is not None:
-            current_set_id = str(self._batch_set_id_for_row(int(current_row)) or "").strip()
-            if current_set_id:
-                return current_set_id
+    def _cached_focused_batch_set_id_value(self) -> str:
         focused_set_id = str(getattr(self, "_focused_batch_set_id", "") or "").strip()
         if focused_set_id and self._batch_store.row_for_set_id(focused_set_id) is not None:
             return focused_set_id
-        if int(self._batch_store.row_count()) > 0:
-            fallback = str(self._batch_set_id_for_row(0) or "").strip()
-            if fallback:
-                return fallback
         return ""
 
     def _batch_row_for_set_id(self, set_id: str) -> Optional[int]:
@@ -4769,8 +4622,6 @@ class MainWindow(
             focused_set_id = str(getattr(self, "_focused_batch_set_id", "") or "").strip()
             if focused_set_id and self._batch_row_for_set_id(focused_set_id) is None:
                 focused_set_id = ""
-        if (not focused_set_id) and int(self._batch_store.row_count()) > 0:
-            focused_set_id = str(self._batch_set_id_for_row(0) or "").strip()
         return self._set_cached_focused_batch_set_id(focused_set_id)
 
     def _next_default_batch_set_name(self) -> str:
@@ -4866,12 +4717,6 @@ class MainWindow(
         except RuntimeError as exc:
             logger.debug("Failed to block batch selection signals: %s", exc, exc_info=True)
             signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
         try:
             sel.clearSelection()
             for r in new_rows:
@@ -4886,10 +4731,6 @@ class MainWindow(
                     sel.blockSignals(False)
                 except RuntimeError as exc:
                     logger.debug("Failed to unblock batch selection signals: %s", exc, exc_info=True)
-                    signals_blocked = False
-                    signals_blocked = False
-                    signals_blocked = False
-                    signals_blocked = False
                     signals_blocked = False
         self._update_batch_row_controls_state()
 
@@ -4907,12 +4748,12 @@ class MainWindow(
         return []
 
     def _datasets_mapped_to_batch_sets(self, *, set_ids: Sequence[str], set_names: Sequence[str]) -> List[str]:
-        manager = getattr(self, "_dataset_manager", None)
-        if manager is None:
-            return []
-        if hasattr(manager, "datasets_mapped_to_batch_sets"):
-            return list(manager.datasets_mapped_to_batch_sets(set_ids=set_ids, set_names=set_names))
-        return []
+        return list(
+            self._dataset_fit_settings_store.datasets_mapped_to_batch_sets(
+                set_ids=set_ids,
+                set_names=set_names,
+            )
+        )
 
     def _confirm_delete_batch_sets(
         self,
@@ -4962,12 +4803,15 @@ class MainWindow(
         return response == QtWidgets.QMessageBox.StandardButton.Yes
 
     def _unmap_datasets_for_deleted_batch_sets(self, *, set_ids: Sequence[str], set_names: Sequence[str]) -> List[str]:
-        manager = getattr(self, "_dataset_manager", None)
-        if manager is None:
-            return []
-        if hasattr(manager, "unmap_batch_sets"):
-            return list(manager.unmap_batch_sets(set_ids=set_ids, set_names=set_names))
-        return []
+        affected = list(
+            self._dataset_fit_settings_store.unmap_batch_sets(
+                set_ids=set_ids,
+                set_names=set_names,
+            )
+        )
+        if affected:
+            self._notify_active_fit_windows_runtime_inputs_changed()
+        return affected
 
     def _select_single_batch_row(self, row: int) -> None:
         table = getattr(self, "_batch_table", None)
@@ -4997,7 +4841,6 @@ class MainWindow(
                     sel.blockSignals(False)
                 except RuntimeError as exc:
                     logger.debug("Failed to unblock batch selection signals: %s", exc, exc_info=True)
-                    signals_blocked = False
                     signals_blocked = False
         self._update_batch_row_controls_state()
 
@@ -5055,32 +4898,6 @@ class MainWindow(
         self._update_batch_row_controls_state()
         self._refresh_batch_display_from_request_scope()
 
-    def _batch_set_names_for_scope(self, scope: str) -> List[str]:
-        from kindred.core.batch_initial_conditions import resolve_run_scope
-
-        names = list(self._batch_store.set_names())
-        if not names:
-            return []
-        scope = str(scope or "").strip().lower()
-        if scope == "all":
-            return names
-        rows = resolve_run_scope(
-            selected_rows=self._batch_selected_rows(),
-            total_rows=len(names),
-            mode="selected",
-            fallback_row=self._batch_current_row(),
-        )
-        return [names[r] for r in rows if 0 <= int(r) < len(names)]
-
-    def _batch_set_ids_for_scope(self, scope: str) -> List[str]:
-        names = self._batch_set_names_for_scope(scope)
-        ids: List[str] = []
-        for name in names:
-            sid = self._batch_set_id_for_name(name)
-            if sid:
-                ids.append(str(sid))
-        return ids
-
     def _requested_show_batch_rows(self) -> List[int]:
         rows: List[int] = []
         for set_id in self._requested_show_batch_set_ids():
@@ -5088,22 +4905,6 @@ class MainWindow(
             if row is not None:
                 rows.append(int(row))
         return rows
-
-    def _batch_rows_for_scope(self, scope: str) -> List[int]:
-        from kindred.core.batch_initial_conditions import resolve_run_scope
-
-        total = int(self._batch_store.row_count())
-        if total <= 0:
-            return []
-        scope = str(scope or "").strip().lower()
-        if scope == "all":
-            return list(range(total))
-        return resolve_run_scope(
-            selected_rows=self._batch_selected_rows(),
-            total_rows=total,
-            mode="selected",
-            fallback_row=self._batch_current_row(),
-        )
 
     def _update_batch_row_controls_state(self) -> None:
         selected_rows = self._batch_selected_rows()
@@ -5114,7 +4915,14 @@ class MainWindow(
             self._move_batch_down_btn.setEnabled(bool(allow_reorder))
         model = getattr(self, "_batch_model", None)
         if model is not None and hasattr(model, "set_focused_effective_edit_target_set_id"):
-            model.set_focused_effective_edit_target_set_id(self._focused_batch_set_id_value())
+            focused_target_set_id = ""
+            owner = getattr(self, "_simulation_batch_owner", None)
+            if owner is not None and hasattr(owner, "focused_effective_slider_target_set_id"):
+                try:
+                    focused_target_set_id = owner.focused_effective_slider_target_set_id()
+                except Exception as exc:
+                    logger.debug("Failed to resolve focused slider target from batch owner: %s", exc, exc_info=True)
+            model.set_focused_effective_edit_target_set_id(focused_target_set_id)
 
     def _batch_cache_key(
         self,
@@ -5158,7 +4966,7 @@ class MainWindow(
         total = int(self._batch_store.row_count())
         if total <= 0:
             return None
-        focused_set_id = self._focused_batch_set_id_value()
+        focused_set_id = self._cached_focused_batch_set_id_value()
         row_ids = {
             str(self._batch_set_id_for_row(int(row)) or "").strip()
             for row in rows or ()
@@ -5172,7 +4980,7 @@ class MainWindow(
                 sid = self._batch_set_id_for_row(int(rr))
                 if sid:
                     return sid
-        return self._batch_set_id_for_row(0)
+        return None
 
     def _sync_batch_species_columns(
         self,
@@ -5185,7 +4993,12 @@ class MainWindow(
         if new_species == list(self._batch_store.visible_species()):
             return
 
-        selected_sets = self._batch_set_names_for_scope("selected")
+        selected_sets = [
+            str(name)
+            for set_id in self._simulation_batch_owner.batch_set_ids_for_scope("selected")
+            for name in [self._batch_set_name_for_id(str(set_id))]
+            if name
+        ]
         current_row = self._batch_current_row()
         current_set = None
         if current_row is not None:
@@ -5262,9 +5075,36 @@ class MainWindow(
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
+        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
+            gesture="selection_change",
+        )
+        self._refresh_runtime_readiness_from_batch_interaction(
+            transaction,
+            context="batch selection change",
+        )
+
+    def _refresh_runtime_readiness_from_batch_interaction(
+        self,
+        transaction: object,
+        *,
+        context: str,
+    ) -> None:
+        if not bool(getattr(transaction, "runtime_readiness_refresh_needed", False)):
+            return
+        refresh_key = (
+            tuple(int(row) for row in (getattr(transaction, "run_selected_rows", ()) or ())),
+            tuple(str(set_id) for set_id in (getattr(transaction, "effective_slider_edit_target_set_ids", ()) or ())),
+        )
+        if refresh_key == getattr(self, "_last_batch_runtime_readiness_refresh_key", None):
+            return
         try:
-            run_snapshot = self._sim_controller.selected_run_runtime_snapshot()
-            preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot()
+            run_rows = tuple(int(row) for row in (getattr(transaction, "run_selected_rows", ()) or ()))
+            run_snapshot = self._sim_controller.selected_run_runtime_snapshot(run_rows)
+            preview_rows = tuple(
+                int(row)
+                for row in (getattr(transaction, "effective_slider_edit_target_rows", ()) or ())
+            )
+            preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot(preview_rows)
             self._set_runtime_backed_run_controls_ready(
                 self._runtime_snapshot_controls_ready(run_snapshot)
             )
@@ -5273,9 +5113,14 @@ class MainWindow(
             )
             self._apply_runtime_readiness_failure_status(run_snapshot, preview_snapshot)
             if self._runtime_snapshot_should_poll(run_snapshot) or self._runtime_snapshot_should_poll(preview_snapshot):
-                self._schedule_simulation_runtime_availability_refresh(wait=False)
+                self._schedule_simulation_runtime_availability_refresh(
+                    wait=False,
+                    selected_run_rows=run_rows,
+                    slider_preview_rows=preview_rows,
+                )
+            self._last_batch_runtime_readiness_refresh_key = refresh_key
         except Exception:
-            logger.debug("Failed to refresh selected-run runtime readiness after batch selection change", exc_info=True)
+            logger.debug("Failed to refresh selected-run runtime readiness after %s", context, exc_info=True)
 
     def _batch_current_change_display_source(self) -> DisplayRefreshSource:
         table = getattr(self, "_batch_table", None)
@@ -5333,31 +5178,58 @@ class MainWindow(
         )
 
     def _on_batch_current_changed(self, *_args) -> None:
-        focused_set_id = self._update_focused_batch_set_id()
+        current_row = self._batch_current_row()
+        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
+            gesture="row_body_click",
+            row=current_row,
+        )
+        focused_set_id = self._update_focused_batch_set_id(row=current_row)
         if not focused_set_id:
             return
-        self._refresh_slider_edit_targets_summary()
-        self._reconcile_slider_target_membership_change()
-        self._refresh_batch_display_from_request_scope(
-            display_source=self._batch_current_change_display_source(),
+        if transaction.slider_rebuild_needed:
+            self._refresh_slider_edit_targets_summary()
+            self._reconcile_slider_target_membership_change()
+        if transaction.display_refresh_needed:
+            self._refresh_batch_display_from_request_scope(
+                display_source=self._batch_current_change_display_source(),
+                rebuild_species_sliders=False,
+            )
+        self._refresh_runtime_readiness_from_batch_interaction(
+            transaction,
+            context="batch current change",
         )
 
     def _on_batch_show_membership_changed(self) -> None:
-        self._reconcile_slider_target_membership_change()
-        self._refresh_batch_display_from_request_scope(
-            display_source=DisplayRefreshSource.EXPLICIT_SHOW_REQUEST,
+        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
+            gesture="show_membership_change",
+            row=self._batch_current_row(),
         )
+        if transaction.slider_rebuild_needed:
+            self._reconcile_slider_target_membership_change()
+        if transaction.display_refresh_needed:
+            self._refresh_batch_display_from_request_scope(
+                display_source=DisplayRefreshSource.EXPLICIT_SHOW_REQUEST,
+            )
 
     def _on_slider_edit_targets_changed(self) -> None:
+        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
+            gesture="slider_target_change",
+            row=self._batch_current_row(),
+        )
         self._reconcile_slider_target_membership_change()
         self._refresh_slider_edit_targets_summary()
-        try:
-            panel = self._mechanism_editor.species_sliders_widget()
-            if panel is not None and hasattr(panel, "rebuild_from_current_row"):
-                panel.rebuild_from_current_row()
-        except RuntimeError as exc:
-            logger.debug("Failed to rebuild species panel after slider target change: %s", exc, exc_info=True)
-            self._species_panel_available = False
+        if transaction.slider_rebuild_needed:
+            try:
+                panel = self._mechanism_editor.species_sliders_widget()
+                if panel is not None and hasattr(panel, "rebuild_from_current_row"):
+                    panel.rebuild_from_current_row()
+            except RuntimeError as exc:
+                logger.debug("Failed to rebuild species panel after slider target change: %s", exc, exc_info=True)
+                self._species_panel_available = False
+        self._refresh_runtime_readiness_from_batch_interaction(
+            transaction,
+            context="slider target change",
+        )
 
     def _refresh_slider_edit_targets_summary(self) -> None:
         editor = getattr(self, "_mechanism_editor", None)
@@ -5389,13 +5261,15 @@ class MainWindow(
         self,
         *,
         display_source: object | None = None,
+        rebuild_species_sliders: bool = True,
     ) -> None:
         outcome = self.results_controller.refresh_display_from_request_scope(
             display_source=display_source,
         )
         if outcome.focused_controls_use_workspace is not None:
             self._sync_mechanism_controls_to_focused_batch_set(
-                use_workspace=bool(outcome.focused_controls_use_workspace)
+                use_workspace=bool(outcome.focused_controls_use_workspace),
+                rebuild_species_sliders=bool(rebuild_species_sliders),
             )
 
     def _normalized_slider_overrides(
@@ -6813,7 +6687,12 @@ class MainWindow(
             affected_canonical_initial_set_ids=affected_canonical_initial_set_ids,
         )
 
-    def _sync_mechanism_controls_to_focused_batch_set(self, *, use_workspace: bool = True) -> None:
+    def _sync_mechanism_controls_to_focused_batch_set(
+        self,
+        *,
+        use_workspace: bool = True,
+        rebuild_species_sliders: bool = True,
+    ) -> None:
         sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
         if sliders is not None and hasattr(sliders, "get_variables"):
             current_values = sliders.get_variables() or {}
@@ -6850,12 +6729,13 @@ class MainWindow(
                 else:
                     self._update_parameter_table_from_sliders()
 
-        try:
-            panel = self._mechanism_editor.species_sliders_widget()
-            if panel is not None and hasattr(panel, "rebuild_from_current_row"):
-                panel.rebuild_from_current_row()
-        except Exception:
-            logger.exception("Failed to rebuild species panel while syncing focused mechanism controls")
+        if bool(rebuild_species_sliders):
+            try:
+                panel = self._mechanism_editor.species_sliders_widget()
+                if panel is not None and hasattr(panel, "rebuild_from_current_row"):
+                    panel.rebuild_from_current_row()
+            except Exception:
+                logger.exception("Failed to rebuild species panel while syncing focused mechanism controls")
 
     def _on_commit_slider_overrides_clicked(self) -> None:
         """
@@ -6905,7 +6785,7 @@ class MainWindow(
                 QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
 
             try:
-                self._ensure_batch_current_row_selected()
+                self._sync_cached_focus_to_current_batch_row()
                 panel = self._mechanism_editor.species_sliders_widget()
                 if panel is not None and hasattr(panel, "rebuild_from_current_row"):
                     panel.rebuild_from_current_row()
@@ -6956,7 +6836,7 @@ class MainWindow(
             QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
 
         try:
-            self._ensure_batch_current_row_selected()
+            self._sync_cached_focus_to_current_batch_row()
             panel = self._mechanism_editor.species_sliders_widget()
             if panel is not None and hasattr(panel, "rebuild_from_current_row"):
                 panel.rebuild_from_current_row()
@@ -6970,7 +6850,7 @@ class MainWindow(
     # Species mode (Batch Initial Conditions sliders)
     # ------------------------------------------------------------------
 
-    def _ensure_batch_current_row_selected(self) -> None:
+    def _sync_cached_focus_to_current_batch_row(self) -> None:
         table = getattr(self, "_batch_table", None)
         model = getattr(self, "_batch_model", None)
         if table is None or model is None:
@@ -6978,18 +6858,30 @@ class MainWindow(
         if model.rowCount() <= 0:
             return
         current = table.currentIndex()
-        if current.isValid():
+        if not current.isValid():
             return
-        idx = model.index(0, 0)
-        if not idx.isValid():
+        row = int(current.row())
+        if not (0 <= row < int(model.rowCount())):
             return
-        table.setCurrentIndex(idx)
-        self._update_focused_batch_set_id(row=0)
-        sel = table.selectionModel()
-        if sel is None:
+        self._update_focused_batch_set_id(row=row)
+
+    def _select_initial_batch_row_if_needed(self) -> None:
+        table = getattr(self, "_batch_table", None)
+        model = getattr(self, "_batch_model", None)
+        if table is None or model is None:
             return
-        sel.clearSelection()
-        sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+        if int(model.rowCount()) <= 0:
+            return
+        if table.currentIndex().isValid() or self._batch_selected_rows():
+            self._sync_cached_focus_to_current_batch_row()
+            return
+        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
+            gesture="initial_default_selection",
+            row=0,
+        )
+        if not (transaction.focus_change or transaction.selection_change):
+            return
+        self._select_single_batch_row(0)
 
     def _on_species_mode_changed(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -7009,7 +6901,7 @@ class MainWindow(
             self._preview_session.deactivate_species_preview_timer()
             return
 
-        self._ensure_batch_current_row_selected()
+        self._sync_cached_focus_to_current_batch_row()
         if panel is not None:
             if hasattr(panel, "activate"):
                 try:
@@ -7758,9 +7650,7 @@ class MainWindow(
                 "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
             }
             if next_fit_runtime_settings != previous_fit_runtime_settings:
-                notify_fit_windows = getattr(self, "_notify_active_fit_windows_runtime_inputs_changed", None)
-                if callable(notify_fit_windows):
-                    notify_fit_windows()
+                self._notify_active_fit_windows_runtime_inputs_changed()
             slider_schema_refresh_needed = bool(
                 current_runtime_settings["wegscheider_cyclicity_enabled"]
                 != next_runtime_settings["wegscheider_cyclicity_enabled"]

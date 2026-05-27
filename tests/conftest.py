@@ -141,7 +141,7 @@ def _patch_main_window_test_environment(
         ready_owner = _ReadyTestRuntimeOwner()
         monkeypatch.setattr(
             "kindred.gui.controllers.simulation_controller.SimulationController.ensure_interactive_simulation_runtimes_available",
-            lambda self, *, wait=False: None,
+            lambda self, *, wait=False, selected_run_rows=None, slider_preview_rows=None: None,
         )
         monkeypatch.setattr(
             "kindred.gui.controllers.simulation_controller.SimulationController.interactive_simulation_runtime_ready",
@@ -165,7 +165,7 @@ def _patch_main_window_test_environment(
         )
         monkeypatch.setattr(
             "kindred.gui.controllers.simulation_controller.SimulationController._interactive_simulation_runtime_snapshot",
-            lambda self, *, fast_mode: RuntimeReadinessSnapshot(
+            lambda self, *, fast_mode, rows=None: RuntimeReadinessSnapshot(
                 mode="preview" if bool(fast_mode) else "ordinary",
                 status="ready",
                 ready=True,
@@ -177,7 +177,7 @@ def _patch_main_window_test_environment(
         )
         monkeypatch.setattr(
             "kindred.gui.controllers.simulation_controller.SimulationController._selected_run_runtime_snapshot",
-            lambda self: RuntimeReadinessSnapshot(
+            lambda self, rows=None: RuntimeReadinessSnapshot(
                 mode="ordinary",
                 status="ready",
                 ready=True,

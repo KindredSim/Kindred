@@ -603,7 +603,7 @@ class SimulationController(QtCore.QObject):
         material = {
             "rows": list(rows_tuple),
             "target_set_ids": list(self._run_target_set_ids_for_rows(rows_tuple)),
-            "parallel_batch_runtime": bool(self._selected_run_uses_parallel_batch_runtime()),
+            "parallel_batch_runtime": bool(self._selected_run_uses_parallel_batch_runtime(rows_tuple)),
             "payloads": payloads,
         }
         try:
@@ -614,14 +614,24 @@ class SimulationController(QtCore.QObject):
     def _clear_pending_run_after_runtime_ready(self) -> None:
         self._run_state.pending_run_after_runtime_ready = PendingRunAfterRuntimeReadyState()
 
-    def _ensure_selected_run_runtime_warming(self) -> None:
-        if self._selected_run_uses_parallel_batch_runtime():
+    def _ensure_selected_run_runtime_warming(
+        self,
+        rows: Optional[Sequence[int]] = None,
+    ) -> None:
+        runtime_rows = self._interactive_runtime_rows(rows)
+        if self._selected_run_uses_parallel_batch_runtime(runtime_rows):
             self._ensure_parallel_batch_runtime_ready(
                 wait=False,
-                required_lanes=self._current_parallel_batch_runtime_required_lanes(),
+                required_lanes=self._current_parallel_batch_runtime_required_lanes(
+                    selected_run_rows=runtime_rows,
+                ),
             )
         else:
-            self._ensure_interactive_simulation_runtime_available_for_mode(fast_mode=False, wait=False)
+            self._ensure_interactive_simulation_runtime_available_for_mode(
+                fast_mode=False,
+                wait=False,
+                rows=runtime_rows,
+            )
 
     def _queue_run_after_runtime_ready(
         self,
@@ -632,7 +642,7 @@ class SimulationController(QtCore.QObject):
         if not bool(runtime_snapshot.should_poll):
             self._clear_pending_run_after_runtime_ready()
             return
-        self._ensure_selected_run_runtime_warming()
+        self._ensure_selected_run_runtime_warming(rows_to_run)
         self._run_state.pending_run_after_runtime_ready = PendingRunAfterRuntimeReadyState(
             active=True,
             rows=tuple(int(row) for row in rows_to_run or ()),
@@ -676,9 +686,10 @@ class SimulationController(QtCore.QObject):
             self._restore_run_controls_after_pending_run_cancelled()
             return
 
-        runtime_snapshot = self._selected_run_runtime_snapshot()
+        pending_rows = tuple(int(row) for row in pending.rows)
+        runtime_snapshot = self._selected_run_runtime_snapshot(pending_rows)
         if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
-            self._ensure_selected_run_runtime_warming()
+            self._ensure_selected_run_runtime_warming(pending_rows)
             self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
             self.ui.run_ui.set_run_button_enabled(True)
             self.ui.run_ui.set_stop_button_enabled(False)
@@ -1378,12 +1389,19 @@ class SimulationController(QtCore.QObject):
     def stop_simulation(self) -> None:
         self._stop_simulation()
 
-    def ensure_interactive_simulation_runtimes_available(self, *, wait: bool = False) -> None:
+    def ensure_interactive_simulation_runtimes_available(
+        self,
+        *,
+        wait: bool = False,
+        selected_run_rows: Optional[Sequence[int]] = None,
+        slider_preview_rows: Optional[Sequence[int]] = None,
+    ) -> None:
         for fast_mode in (False, True):
             try:
                 self._ensure_interactive_simulation_runtime_available_for_mode(
                     fast_mode=bool(fast_mode),
                     wait=bool(wait),
+                    rows=slider_preview_rows if bool(fast_mode) else selected_run_rows,
                 )
             except Exception as exc:
                 mode_label = "preview" if bool(fast_mode) else "ordinary"
@@ -1392,9 +1410,22 @@ class SimulationController(QtCore.QObject):
                     exc,
                 )
 
-    def ensure_current_interactive_simulation_runtimes_available(self, *, wait: bool = False) -> None:
-        self.ensure_interactive_simulation_runtimes_available(wait=bool(wait))
-        required_lanes = self._current_parallel_batch_runtime_required_lanes()
+    def ensure_current_interactive_simulation_runtimes_available(
+        self,
+        *,
+        wait: bool = False,
+        selected_run_rows: Optional[Sequence[int]] = None,
+        slider_preview_rows: Optional[Sequence[int]] = None,
+    ) -> None:
+        self.ensure_interactive_simulation_runtimes_available(
+            wait=bool(wait),
+            selected_run_rows=selected_run_rows,
+            slider_preview_rows=slider_preview_rows,
+        )
+        required_lanes = self._current_parallel_batch_runtime_required_lanes(
+            selected_run_rows=selected_run_rows,
+            slider_preview_rows=slider_preview_rows,
+        )
         if int(required_lanes) > 1:
             self._ensure_parallel_batch_runtime_ready(
                 wait=bool(wait),
@@ -1410,14 +1441,27 @@ class SimulationController(QtCore.QObject):
             and self.interactive_simulation_runtime_ready(fast_mode=True)
         )
 
-    def interactive_simulation_runtime_snapshot(self, *, fast_mode: bool) -> RuntimeReadinessSnapshot:
-        return self._interactive_simulation_runtime_snapshot(fast_mode=bool(fast_mode))
+    def interactive_simulation_runtime_snapshot(
+        self,
+        *,
+        fast_mode: bool,
+        rows: Optional[Sequence[int]] = None,
+    ) -> RuntimeReadinessSnapshot:
+        return self._interactive_simulation_runtime_snapshot(fast_mode=bool(fast_mode), rows=rows)
 
-    def interactive_simulation_runtime_ready(self, *, fast_mode: bool) -> bool:
-        return bool(self._interactive_simulation_runtime_snapshot(fast_mode=bool(fast_mode)).ready)
+    def interactive_simulation_runtime_ready(
+        self,
+        *,
+        fast_mode: bool,
+        rows: Optional[Sequence[int]] = None,
+    ) -> bool:
+        return bool(self._interactive_simulation_runtime_snapshot(fast_mode=bool(fast_mode), rows=rows).ready)
 
-    def slider_preview_runtime_snapshot(self) -> RuntimeReadinessSnapshot:
-        return self._slider_preview_runtime_snapshot()
+    def slider_preview_runtime_snapshot(
+        self,
+        rows: Optional[Sequence[int]] = None,
+    ) -> RuntimeReadinessSnapshot:
+        return self._slider_preview_runtime_snapshot(rows)
 
     def invalidate_slider_preview_work(self) -> None:
         self._invalidate_slider_preview_work()
@@ -1495,14 +1539,23 @@ class SimulationController(QtCore.QObject):
     def parallel_batch_runtime_ready(self, *, required_lanes: int | None = None) -> bool:
         return self._parallel_batch_runtime_ready(required_lanes=required_lanes)
 
-    def selected_run_uses_parallel_batch_runtime(self) -> bool:
-        return bool(self._selected_run_uses_parallel_batch_runtime())
+    def selected_run_uses_parallel_batch_runtime(
+        self,
+        rows: Optional[Sequence[int]] = None,
+    ) -> bool:
+        return bool(self._selected_run_uses_parallel_batch_runtime(rows))
 
-    def selected_run_runtime_snapshot(self) -> RuntimeReadinessSnapshot:
-        return self._selected_run_runtime_snapshot()
+    def selected_run_runtime_snapshot(
+        self,
+        rows: Optional[Sequence[int]] = None,
+    ) -> RuntimeReadinessSnapshot:
+        return self._selected_run_runtime_snapshot(rows)
 
-    def selected_run_runtime_ready(self) -> bool:
-        return bool(self._selected_run_runtime_snapshot().ready)
+    def selected_run_runtime_ready(
+        self,
+        rows: Optional[Sequence[int]] = None,
+    ) -> bool:
+        return bool(self._selected_run_runtime_snapshot(rows).ready)
 
     def release_current_simulation_worker(self) -> None:
         self._release_current_simulation_worker()
@@ -2066,30 +2119,53 @@ class SimulationController(QtCore.QObject):
             wait=bool(wait),
         )
 
-    def _interactive_runtime_rows(self) -> list[int]:
-        try:
-            rows = list(self.ui.batch.batch_rows_for_scope("selected"))
-        except Exception:
-            rows = []
-        if not rows:
+    def _interactive_runtime_rows(self, rows: Optional[Sequence[int]] = None) -> list[int]:
+        if rows is not None:
+            normalized: list[int] = []
+            seen: set[int] = set()
             try:
                 row_count = int(self.ui.batch.batch_store_row_count())
             except Exception:
                 row_count = 0
-            if row_count > 0:
-                rows = [0]
+            for row in rows or ():
+                try:
+                    row_i = int(row)
+                except (TypeError, ValueError):
+                    continue
+                if not (0 <= row_i < row_count) or row_i in seen:
+                    continue
+                normalized.append(row_i)
+                seen.add(row_i)
+            return normalized
+        try:
+            rows = list(self.ui.batch.batch_rows_for_scope("selected"))
+        except Exception:
+            rows = []
         return [int(row) for row in rows]
 
-    def _interactive_runtime_plan_payloads_for_mode(self, *, fast_mode: bool) -> list[dict[str, Any]]:
+    def _interactive_runtime_plan_payloads_for_mode(
+        self,
+        *,
+        fast_mode: bool,
+        rows: Optional[Sequence[int]] = None,
+    ) -> list[dict[str, Any]]:
         return self._build_runtime_readiness_plan_payloads(
             fast_mode=bool(fast_mode),
-            batch_rows=self._interactive_runtime_rows(),
+            batch_rows=self._interactive_runtime_rows(rows),
         )
 
-    def _interactive_simulation_runtime_snapshot(self, *, fast_mode: bool) -> RuntimeReadinessSnapshot:
+    def _interactive_simulation_runtime_snapshot(
+        self,
+        *,
+        fast_mode: bool,
+        rows: Optional[Sequence[int]] = None,
+    ) -> RuntimeReadinessSnapshot:
         mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
         try:
-            payloads = self._interactive_runtime_plan_payloads_for_mode(fast_mode=bool(fast_mode))
+            payloads = self._interactive_runtime_plan_payloads_for_mode(
+                fast_mode=bool(fast_mode),
+                rows=rows,
+            )
         except Exception as exc:
             message = f"Failed to build {'preview' if bool(fast_mode) else 'simulation'} runtime payload."
             logger.warning("%s %s", message, exc, exc_info=True)
@@ -2208,8 +2284,12 @@ class SimulationController(QtCore.QObject):
         *,
         fast_mode: bool,
         wait: bool = False,
+        rows: Optional[Sequence[int]] = None,
     ) -> None:
-        payloads = self._interactive_runtime_plan_payloads_for_mode(fast_mode=bool(fast_mode))
+        payloads = self._interactive_runtime_plan_payloads_for_mode(
+            fast_mode=bool(fast_mode),
+            rows=rows,
+        )
         if not payloads:
             return
         mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
@@ -2325,16 +2405,23 @@ class SimulationController(QtCore.QObject):
             ),
         )
 
-    def _selected_run_uses_parallel_batch_runtime(self) -> bool:
-        rows = self._interactive_runtime_rows()
+    def _selected_run_uses_parallel_batch_runtime(
+        self,
+        rows: Optional[Sequence[int]] = None,
+    ) -> bool:
+        rows = self._interactive_runtime_rows(rows)
         if len(rows) <= 1:
             return False
         return bool(self._effective_batch_worker_count(len(rows)) > 1)
 
-    def _selected_run_runtime_snapshot(self) -> RuntimeReadinessSnapshot:
-        if self._selected_run_uses_parallel_batch_runtime():
-            return self._parallel_batch_runtime_snapshot()
-        return self._interactive_simulation_runtime_snapshot(fast_mode=False)
+    def _selected_run_runtime_snapshot(
+        self,
+        rows: Optional[Sequence[int]] = None,
+    ) -> RuntimeReadinessSnapshot:
+        runtime_rows = self._interactive_runtime_rows(rows)
+        if self._selected_run_uses_parallel_batch_runtime(runtime_rows):
+            return self._parallel_batch_runtime_snapshot(rows=runtime_rows)
+        return self._interactive_simulation_runtime_snapshot(fast_mode=False, rows=runtime_rows)
 
     def _slider_preview_uses_parallel_batch_runtime(self, rows: Optional[Sequence[int]] = None) -> bool:
         if rows is None:
@@ -2349,19 +2436,35 @@ class SimulationController(QtCore.QObject):
     def _slider_preview_runtime_snapshot(self, rows: Optional[Sequence[int]] = None) -> RuntimeReadinessSnapshot:
         if self._slider_preview_uses_parallel_batch_runtime(rows):
             return self._parallel_batch_runtime_snapshot(rows=rows)
-        return self._interactive_simulation_runtime_snapshot(fast_mode=True)
+        return self._interactive_simulation_runtime_snapshot(fast_mode=True, rows=rows)
 
-    def _current_parallel_batch_runtime_required_lanes(self) -> int:
-        rows = self._interactive_runtime_rows()
-        row_count = len(rows)
-        if row_count <= 1:
-            return 1
-        required_lanes = self._parallel_batch_required_lanes_for_rows(rows)
-        if required_lanes <= 1:
-            return 1
-        if self._selected_run_uses_parallel_batch_runtime() or self._slider_preview_uses_parallel_batch_runtime(rows):
-            return int(required_lanes)
-        return 1
+    def _current_parallel_batch_runtime_required_lanes(
+        self,
+        *,
+        selected_run_rows: Optional[Sequence[int]] = None,
+        slider_preview_rows: Optional[Sequence[int]] = None,
+    ) -> int:
+        selected_rows = (
+            self._interactive_runtime_rows(selected_run_rows)
+            if selected_run_rows is not None
+            else self._interactive_runtime_rows()
+        )
+        preview_rows = (
+            self._interactive_runtime_rows(slider_preview_rows)
+            if slider_preview_rows is not None
+            else list(selected_rows)
+        )
+        selected_required = (
+            self._parallel_batch_required_lanes_for_rows(selected_rows)
+            if self._selected_run_uses_parallel_batch_runtime(selected_rows)
+            else 1
+        )
+        preview_required = (
+            self._parallel_batch_required_lanes_for_rows(preview_rows)
+            if self._slider_preview_uses_parallel_batch_runtime(preview_rows)
+            else 1
+        )
+        return max(1, int(selected_required), int(preview_required))
 
     def _parallel_batch_runtime_snapshot(self, rows: Optional[Sequence[int]] = None) -> RuntimeReadinessSnapshot:
         if rows is None:
@@ -3858,7 +3961,8 @@ class SimulationController(QtCore.QObject):
 
         rows_to_run = self.ui.batch.batch_rows_for_scope("selected")
         if not rows_to_run:
-            self.ui.dialogs.message_box_warning("No Sets", "Add at least one set before running.")
+            reason = self.ui.batch.run_selected_empty_target_reason()
+            self.ui.dialogs.message_box_warning("No Sets", reason)
             return
 
         try:
@@ -3869,7 +3973,7 @@ class SimulationController(QtCore.QObject):
         if not self._resolve_wegscheider_cyclicity_for_run_or_abort():
             return
 
-        runtime_snapshot = self._selected_run_runtime_snapshot()
+        runtime_snapshot = self._selected_run_runtime_snapshot(rows_to_run)
         if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
             self._queue_run_after_runtime_ready(
                 rows_to_run=rows_to_run,
@@ -4580,11 +4684,10 @@ class SimulationController(QtCore.QObject):
         row_count = int(self.ui.batch.batch_store_row_count())
         rows = [int(r) for r in (batch_rows or []) if 0 <= int(r) < int(row_count)]
         if not rows:
-            if int(row_count) > 0:
-                return [0]
             if bool(runtime_readiness_only):
                 return None
-            self.ui.dialogs.message_box_warning("No Sets", "Add at least one set before running.")
+            reason = self.ui.batch.run_selected_empty_target_reason()
+            self.ui.dialogs.message_box_warning("No Sets", reason)
             if bool(fast_mode):
                 self._clear_failed_fast_preview_ownership()
             self._simulation_running = False

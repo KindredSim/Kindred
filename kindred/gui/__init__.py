@@ -18,7 +18,7 @@ Contracts
 Structure
 ---------
 main_window.py   : QMainWindow, menus, docks, signals and slots
-controllers/     : auxiliary controllers such as DatasetManager
+controllers/     : auxiliary controllers for dataset, simulation, project, and result ownership
 widgets/         : editors, dialogs, and PyQtGraph-backed plot widgets
 """
 

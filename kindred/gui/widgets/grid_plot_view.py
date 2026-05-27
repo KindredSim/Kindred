@@ -15,6 +15,7 @@ import math
 import numpy as np
 from PySide6 import QtCore, QtWidgets, QtGui
 
+from kindred.core.analysis.global_fit_projection import FitRenderDatasetProjection
 from kindred.gui.color_manager import ColorManager
 from kindred.gui.plot_config import try_import_pyqtgraph
 from kindred.gui.diagnostics import record_best_effort_failure
@@ -155,12 +156,11 @@ class GridPlotView(QtWidgets.QWidget):
 
         frozen = dict(dataset or {})
         frozen["name"] = str(frozen.get("name") or "")
-        for key in ("data_x", "data_y", "model_x", "model_y"):
+        frozen.pop("model_x", None)
+        frozen.pop("model_series", None)
+        for key in ("data_x", "data_y"):
             if key in frozen and frozen.get(key) is not None:
                 frozen[key] = _freeze_1d(frozen.get(key))
-        model_series = frozen.get("model_series")
-        if isinstance(model_series, dict):
-            frozen["model_series"] = {str(k): _freeze_1d(v) for k, v in model_series.items()}
         all_species = frozen.get("all_species")
         if isinstance(all_species, dict):
             frozen["all_species"] = {str(k): _freeze_1d(v) for k, v in all_species.items()}
@@ -447,10 +447,13 @@ class GridPlotView(QtWidgets.QWidget):
             chi_squared = dataset.get("chi_squared")
             r_squared = dataset.get("r_squared")
             all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
-            model_x = dataset.get("model_x")
-            model_y = dataset.get("model_y")
-            model_series = dataset.get("model_series") or {}
-            current_species = dataset.get("current_species")
+            fit_projection = dataset.get("fit_render_projection")
+            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
+                model_x = fit_projection.model_x
+                model_series = fit_projection.model_series
+            else:
+                model_x = None
+                model_series = {}
 
             try:
                 if x_units:
@@ -557,24 +560,23 @@ class GridPlotView(QtWidgets.QWidget):
                             )
                     active_keys.add(data_key)
 
-                    # Model overlay (multi-series preferred, fallback to single model_y).
+                    # Model overlay from the typed multi-series projection.
                     y_model = None
                     if isinstance(model_series, dict) and species_name in model_series:
                         y_model = model_series[species_name]
-                    elif model_y is not None and (current_species == species_name or len(self._selected_species_list) == 1):
-                        y_model = model_y
 
-                    if y_model is not None:
+                    if y_model is not None and model_x is not None:
                         try:
                             y_model_arr = np.asarray(y_model, dtype=float).reshape(-1)
                         except Exception:
                             y_model_arr = None
                         if y_model_arr is not None:
-                            x_model = model_x if model_x is not None else data_x
                             try:
-                                x_model_arr = np.asarray(x_model, dtype=float).reshape(-1)
+                                x_model_arr = np.asarray(model_x, dtype=float).reshape(-1)
                             except Exception:
-                                x_model_arr = data_x
+                                x_model_arr = None
+                            if x_model_arr is None:
+                                continue
                             model_item = self._ensure_curve_item(
                                 plot,
                                 idx,
@@ -702,9 +704,6 @@ class GridPlotView(QtWidgets.QWidget):
         name: str,
         data_x: np.ndarray,
         data_y: np.ndarray,
-        model_x: Optional[np.ndarray] = None,
-        model_y: Optional[np.ndarray] = None,
-        model_series: Optional[Dict[str, np.ndarray]] = None,
         chi_squared: Optional[float] = None,
         r_squared: Optional[float] = None,
         all_species: Optional[Dict[str, np.ndarray]] = None,
@@ -719,10 +718,6 @@ class GridPlotView(QtWidgets.QWidget):
             Dataset name
         data_x, data_y : np.ndarray
             Experimental data
-        model_x, model_y : np.ndarray, optional
-            Model fit
-        model_series : dict, optional
-            Multi-series model fit {species_name: y_model_aligned_to_model_x}
         chi_squared, r_squared : float, optional
             Fit quality metrics
         all_species : dict, optional
@@ -737,9 +732,6 @@ class GridPlotView(QtWidgets.QWidget):
             'name': name,
             'data_x': np.asarray(data_x),
             'data_y': np.asarray(data_y),
-            'model_x': np.asarray(model_x) if model_x is not None else None,
-            'model_y': np.asarray(model_y) if model_y is not None else None,
-            'model_series': {k: np.asarray(v) for k, v in (model_series or {}).items()} if model_series else None,
             'chi_squared': chi_squared,
             'r_squared': r_squared,
             'all_species': all_species if all_species else {current_species or 'Data': data_y},
@@ -975,89 +967,6 @@ class GridPlotView(QtWidgets.QWidget):
         if needs_rebuild:
             self._rebuild_structure()
         self._update_plot_data_in_place()
-
-    def _plot_dataset(self, plot: Any, dataset: Dict[str, Any], idx: int):
-        """Plot a single dataset on the given PlotItem."""
-        if self._pg is None:
-            return
-        # Extract data
-        name = dataset['name']
-        data_x = dataset['data_x']
-        chi_squared = dataset['chi_squared']
-        r_squared = dataset['r_squared']
-        all_species = dataset.get('all_species', {})
-        model_x = dataset.get('model_x')
-        model_y = dataset.get('model_y')
-        model_series = dataset.get('model_series') or {}
-        current_species = dataset.get('current_species')
-
-        color_manager = ColorManager.instance()
-        color_manager.seed_species(all_species.keys())
-
-        # Configure plot
-        plot.setLabel('bottom', 'Time', units='s')
-        plot.setLabel('left', 'Concentration', units='M')
-        plot.showGrid(x=True, y=True, alpha=0.3)
-
-        # Build title with fit quality
-        title = name
-        if chi_squared is not None:
-            title += f" (χ² = {chi_squared:.3e})"
-            color = self._get_color_for_chi_squared(chi_squared)
-        elif r_squared is not None:
-            title += f" (R² = {r_squared:.3f})"
-            color = self._get_color_for_r_squared(r_squared)
-        else:
-            color = (51, 51, 51)
-
-        # Set title with color
-        plot.setTitle(title, color=color, size='10pt')
-
-        # Plot each selected species
-        for species_name in self._selected_species_list:
-            if species_name not in all_species:
-                continue
-
-            species_data = all_species[species_name]
-            color = color_manager.get_species_rgb(species_name, known_species=tuple(all_species.keys()))
-
-            # Plot experimental data as scatter points
-            plot.plot(
-                data_x, species_data,
-                pen=None,
-                symbol='o',
-                symbolSize=5,
-                symbolBrush=self._pg.mkBrush(*color, 150),
-                symbolPen=self._pg.mkPen(color=color, width=1),
-                name=None,
-            )
-
-            # Plot model overlay (multi-series preferred, fallback to single model_y)
-            y_model = None
-            if isinstance(model_series, dict) and species_name in model_series:
-                y_model = model_series[species_name]
-            elif model_y is not None and (current_species == species_name or len(self._selected_species_list) == 1):
-                y_model = model_y
-
-            if y_model is not None:
-                x_model = model_x if model_x is not None else data_x
-                plot.plot(
-                    x_model,
-                    y_model,
-                    pen=self._pg.mkPen(color=color, width=2),
-                    name=species_name,
-                )
-
-        # Add legend if we have multiple species
-        if len(self._selected_species_list) > 1 and self._legend_visible:
-            plot.addLegend(offset=(5, 5))
-
-        # Reduce font sizes for compact display
-        font = QtGui.QFont()
-        font.setPointSize(7)
-        for axis in ['left', 'bottom']:
-            plot.getAxis(axis).setStyle(tickFont=font)
-            plot.getAxis(axis).setTickFont(font)
 
     def _toggle_legend(self, visible: bool) -> None:
         """Toggle legend visibility and redraw grid."""

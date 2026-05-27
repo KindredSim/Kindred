@@ -439,6 +439,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         return [int(row) for row in rows if 0 <= int(row) < row_count]
 
     def _primary_source_row(self) -> Optional[int]:
+        if self._transaction_owner is not None:
+            target_rows = self._target_rows_for_write()
+            return int(target_rows[0]) if target_rows else None
         return self._current_table_row()
 
     def _rebuild_if_primary_row_changed(self) -> None:
@@ -464,21 +467,21 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         current_row = self._current_table_row()
         if model is None:
             return [int(current_row)] if current_row is not None else []
-        target_set_ids: list[str] = []
         owner = self._transaction_owner
-        if owner is not None and hasattr(owner, "effective_slider_edit_target_set_ids"):
-            try:
-                target_set_ids = [
-                    str(set_id)
-                    for set_id in (owner.effective_slider_edit_target_set_ids() or [])
-                    if str(set_id)
-                ]
-            except Exception:
-                target_set_ids = []
+        if owner is None or not hasattr(owner, "effective_slider_edit_target_set_ids"):
+            return []
+        try:
+            target_set_ids = [
+                str(set_id)
+                for set_id in (owner.effective_slider_edit_target_set_ids() or [])
+                if str(set_id)
+            ]
+        except Exception:
+            logger.debug("Failed to resolve effective slider targets from transaction owner", exc_info=True)
+            return []
         rows: list[int] = []
         seen: set[int] = set()
-        source_set_ids = target_set_ids or model.slider_edit_target_set_ids()
-        for set_id in source_set_ids:
+        for set_id in target_set_ids:
             row = model.store().row_for_set_id(str(set_id))
             if row is None:
                 continue
@@ -487,8 +490,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 continue
             rows.append(row_i)
             seen.add(row_i)
-        if (not target_set_ids) and current_row is not None and int(current_row) not in seen:
-            rows.insert(0, int(current_row))
         return rows
 
     def _show_placeholder(self) -> None:

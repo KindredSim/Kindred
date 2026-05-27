@@ -16,7 +16,10 @@ if TYPE_CHECKING:
     from kindred.config.templates import TemplateManager
     from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
     from kindred.gui.controllers.config_controller import ConfigController
-    from kindred.gui.controllers.dataset_manager import DatasetManager
+    from kindred.gui.controllers.dataset_fit_settings_store import DatasetFitSettingsStore
+    from kindred.gui.controllers.dataset_registry import DatasetRegistry
+    from kindred.gui.controllers.dataset_view_publisher import DatasetViewPublisher
+    from kindred.gui.controllers.mechanism_parameter_scan_owner import MechanismParameterScanOwner
     from kindred.gui.main_window import MainWindow
     from kindred.gui.controllers.project_controller import ProjectController
     from kindred.gui.controllers.results_controller import ResultsController
@@ -24,6 +27,7 @@ if TYPE_CHECKING:
     from kindred.gui.ports import SimulationUiPorts
     from kindred.gui.theme_manager import ThemeManager
     from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableModel
+    from kindred.gui.widgets.data_manager import DataManagerPanel
     from kindred.gui.widgets.plot_tabs import PlotTabsWidget
     from kindred.gui.widgets.right_panel import RightPanelTabbed
 
@@ -72,7 +76,11 @@ class RightDockComponents:
     dock: QDockWidget
     container: QWidget
     panel: RightPanelTabbed
-    dataset_manager: DatasetManager
+    import_panel: DataManagerPanel
+    dataset_registry: DatasetRegistry
+    dataset_fit_settings_store: DatasetFitSettingsStore
+    dataset_view_publisher: DatasetViewPublisher
+    mechanism_parameter_scan_owner: MechanismParameterScanOwner
 
 
 @dataclass(frozen=True)
@@ -561,7 +569,7 @@ def build_batch_dock_panel(
     )
 
 
-def build_right_dock_and_dataset_manager(
+def build_right_dock_and_dataset_owners(
     main_window: MainWindow,
     *,
     plot_tabs: PlotTabsWidget,
@@ -569,13 +577,19 @@ def build_right_dock_and_dataset_manager(
     simulation_runner: Callable[..., Any],
     solver_settings_getter: Callable[[], dict[str, Any]],
 ) -> RightDockComponents:
-    from kindred.gui.controllers.dataset_manager import DatasetManager
+    from kindred.gui.controllers.dataset_fit_settings_store import DatasetFitSettingsStore
+    from kindred.gui.controllers.dataset_registry import DatasetRegistry
+    from kindred.gui.controllers.dataset_tab_simulation_owner import DatasetTabSimulationOwner
+    from kindred.gui.controllers.dataset_view_publisher import DatasetViewPublisher
+    from kindred.gui.controllers.mechanism_parameter_scan_owner import MechanismParameterScanOwner
+    from kindred.gui.widgets.data_manager import DataManagerPanel
     from kindred.gui.widgets.floating_dock_container import FloatingDockContainer
     from kindred.gui.widgets.right_panel import RightPanelTabbed
 
     dock = build_shell_dock(main_window, RIGHT_DOCK_SPEC)
 
-    panel = RightPanelTabbed()
+    import_panel = DataManagerPanel()
+    panel = RightPanelTabbed(data_panel=import_panel)
     container = FloatingDockContainer(
         content=panel,
         dock=dock,
@@ -583,14 +597,29 @@ def build_right_dock_and_dataset_manager(
         on_reset_layout=main_window._reset_layout,
         parent=main_window,
     )
-    dataset_manager = DatasetManager(
-        plot_tabs=plot_tabs,
-        dataset_resolver=panel.get_dataset,
+    dataset_registry = DatasetRegistry()
+    dataset_fit_settings_store = DatasetFitSettingsStore(dataset_registry)
+    dataset_tab_simulation_owner = DatasetTabSimulationOwner(
         mechanism_getter=mechanism_getter,
         simulation_runner=simulation_runner,
+    )
+    dataset_view_publisher = DatasetViewPublisher(
+        plot_tabs=plot_tabs,
+        dataset_tab_simulation_owner=dataset_tab_simulation_owner,
+    )
+    mechanism_parameter_scan_owner = MechanismParameterScanOwner(
         solver_settings_getter=solver_settings_getter,
     )
-    return RightDockComponents(dock=dock, container=container, panel=panel, dataset_manager=dataset_manager)
+    return RightDockComponents(
+        dock=dock,
+        container=container,
+        panel=panel,
+        import_panel=import_panel,
+        dataset_registry=dataset_registry,
+        dataset_fit_settings_store=dataset_fit_settings_store,
+        dataset_view_publisher=dataset_view_publisher,
+        mechanism_parameter_scan_owner=mechanism_parameter_scan_owner,
+    )
 
 
 def load_solver_contract() -> SolverContract:

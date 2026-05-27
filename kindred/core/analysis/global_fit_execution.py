@@ -84,6 +84,9 @@ class DatasetFitInfo:
     residuals: np.ndarray  # Residuals for this dataset
     n_points: int  # Number of data points
     weight: float  # Weight used in global objective
+    t_obs: Optional[np.ndarray] = None  # Observed time values used for fitting
+    x_name: str = "t"  # Observed X-axis name for render projection
+    x_obs: Optional[np.ndarray] = None  # Observed non-time X values when x_name != "t"
 
 
 @dataclass
@@ -125,6 +128,7 @@ class GlobalFitResult:
     objective_residuals: Optional[np.ndarray] = None
     model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     residual_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
+    plot_observed_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     plot_model_x: Dict[str, np.ndarray] = field(default_factory=dict)
     plot_model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     alignment_report: Dict[str, Dict[str, float]] = field(default_factory=dict)
@@ -232,7 +236,7 @@ def build_completion_detail_sections(
             )
 
     for ds_id, diagnostic in sorted(dataset_failures.items(), key=lambda kv: str(kv[0])):
-        if simulation_failure_detail_text(diagnostic.failure):
+        if simulation_failure_detail_text(diagnostic.failure) or _compact_failure_message(diagnostic.failure):
             sections.append(
                 FitDetailSection(
                     dataset_id=str(ds_id),
@@ -1365,6 +1369,7 @@ def assemble_global_fit_result(
     total_points = 0
     model_series_map: Dict[str, Dict[str, np.ndarray]] = {}
     residual_series_map: Dict[str, Dict[str, np.ndarray]] = {}
+    plot_observed_series_map: Dict[str, Dict[str, np.ndarray]] = {}
     plot_model_x_map: Dict[str, np.ndarray] = {}
     plot_model_series_map: Dict[str, Dict[str, np.ndarray]] = {}
     final_dataset_failures: Dict[str, FitDiagnostic] = {}
@@ -1487,6 +1492,7 @@ def assemble_global_fit_result(
         for idx, species_name in enumerate(species_list):
             y_exp = np.asarray(y_matrix[idx], dtype=float).reshape(-1)
             exp_blocks.append(y_exp)
+            plot_observed_series_map.setdefault(ds_id, {})[species_name] = y_exp.copy()
             penalty_block = np.full_like(y_exp, penalty_value, dtype=float)
 
             if not (isinstance(sim_species, dict) and species_name in sim_species):
@@ -1642,6 +1648,9 @@ def assemble_global_fit_result(
                 residuals=residuals,
                 n_points=int(residuals.size),
                 weight=weights.get(ds_id, 1.0),
+                t_obs=np.asarray(t_exp, dtype=float).reshape(-1),
+                x_name=x_name,
+                x_obs=None if x_obs is None else np.asarray(x_obs, dtype=float).reshape(-1),
             )
         )
 
@@ -1737,6 +1746,7 @@ def assemble_global_fit_result(
         objective_residuals=objective_residuals.copy() if objective_residuals is not None else None,
         model_series=model_series_map,
         residual_series=residual_series_map,
+        plot_observed_series=plot_observed_series_map,
         plot_model_x=plot_model_x_map,
         plot_model_series=plot_model_series_map,
         alignment_report=dict(alignment_report),

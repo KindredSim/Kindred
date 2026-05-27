@@ -76,14 +76,8 @@ class SimulationSliderPreviewLaunchOwner:
     ) -> None:
         target_set_ids = [str(set_id) for set_id in pending_target_set_ids if str(set_id)]
         if not target_set_ids:
-            try:
-                target_set_ids = [
-                    str(set_id)
-                    for set_id in (self._ui.batch.batch_set_ids_for_scope("selected") or ())
-                    if str(set_id)
-                ]
-            except Exception:
-                target_set_ids = []
+            self._deps.clear_pending_slider_preview_replay(clear_plot_updates=False)
+            return
         self._deps.queue_pending_slider_preview_replay(
             target_set_ids=target_set_ids,
             request_id=int(request_id),
@@ -244,6 +238,7 @@ class SimulationSliderPreviewLaunchOwner:
             self._deps.ensure_interactive_simulation_runtime_available_for_mode(
                 fast_mode=True,
                 wait=False,
+                rows=selected_rows,
             )
             self._ui.slider.set_slider_triggered_simulation(False)
             self._ui.run_ui.set_status_text(str(preview_snapshot.message or "Preparing preview runtime..."))

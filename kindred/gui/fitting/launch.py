@@ -16,7 +16,7 @@ from kindred.core.analysis.fit_dataset_payload import (
     read_fit_dataset_payload,
 )
 from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-from kindred.gui.controllers.dataset_manager import DatasetManagerError
+from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 from kindred.gui.fitting.batch_mapping import (
     T0_SEED_TOL_S,
     apply_batch_mapping_to_settings,
@@ -33,7 +33,7 @@ from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 if TYPE_CHECKING:
-    from kindred.gui.controllers.dataset_manager import DatasetFitSettings
+    from kindred.gui.controllers.dataset_fit_settings_store import DatasetFitSettings
 
 
 logger = logging.getLogger(__name__)
@@ -157,8 +157,10 @@ class FittingLaunchSnapshot:
 @dataclass(frozen=True)
 class GlobalFitLaunchContext:
     parent: QtWidgets.QWidget
-    dataset_manager: Any
-    data_manager_getter: Callable[[], Any]
+    dataset_registry: Any
+    dataset_fit_settings_store: Any
+    dataset_view_publisher: Any
+    mechanism_parameter_scan_owner: Any
     mechanism_text_getter: Callable[[], str]
     reactions_text_getter: Callable[[], str]
     reactions_text_setter: Callable[[str], None]
@@ -171,9 +173,7 @@ class GlobalFitLaunchContext:
     temperature_getter: Callable[[], float]
     num_points_getter: Callable[[], int]
     register_fit_window: Callable[[QtWidgets.QWidget], None]
-    write_fit_results_to_mechanism: Callable[[Dict[str, float]], None]
     apply_fit_results_to_project: Callable[[str, Dict[str, float], Dict[str, Dict[str, float]]], None]
-    apply_dataset_initial_updates: Callable[[str, Dict[str, float]], None]
     load_fitting_defaults: Callable[[], Dict[str, object]]
     runtime_lane_budget: Callable[[int], int]
     batch_store: Any = None
@@ -225,16 +225,23 @@ def _resolve_window_factory(context: GlobalFitLaunchContext) -> Callable[..., Qt
 
 def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWidgets.QWidget]:
     """Launch the global-fit window using the fitting package as the owner."""
-    data_panel = context.data_manager_getter()
-    if data_panel is None:
-        QtWidgets.QMessageBox.warning(context.parent, "Global Fit", "Data manager unavailable in the current layout.")
+    if context.dataset_registry is None:
+        QtWidgets.QMessageBox.warning(context.parent, "Global Fit", "Dataset source unavailable in the current layout.")
         return None
 
-    datasets_map_raw = data_panel.get_datasets()
-    datasets_map = {str(k): dict(v or {}) for k, v in (datasets_map_raw or {}).items()}
-    if not datasets_map:
+    records = tuple(context.dataset_registry.records())
+    if not records:
         QtWidgets.QMessageBox.warning(context.parent, "Global Fit", "Load at least one dataset first.")
         return None
+    selected_records = tuple(sorted(records, key=lambda record: str(record.display_name)))
+    datasets_map = {
+        str(record.dataset_id): dict(record.payload or {})
+        for record in selected_records
+    }
+    display_name_by_id = {
+        str(record.dataset_id): str(record.display_name)
+        for record in selected_records
+    }
 
     has_any_species = False
     for payload in (datasets_map or {}).values():
@@ -258,13 +265,13 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         )
         mechanism_initials = {}
     mechanism_species = list((mechanism_initials or {}).keys())
-    selected_names = sorted(map(str, datasets_map.keys()))
-    dataset_count = len(selected_names)
+    selected_dataset_ids = [str(record.dataset_id) for record in selected_records]
+    dataset_count = len(selected_dataset_ids)
     dataset_label = f"{dataset_count} dataset{'s' if dataset_count != 1 else ''}"
 
     try:
-        parameter_defs = context.dataset_manager.scan_mechanism_parameters(mechanism_text)
-    except DatasetManagerError as exc:
+        parameter_defs = context.mechanism_parameter_scan_owner.scan_mechanism_parameters(mechanism_text)
+    except DatasetOwnerError as exc:
         QtWidgets.QMessageBox.warning(context.parent, "Global Fit", str(exc))
         return None
 
@@ -313,9 +320,10 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
     batch_set_names = list(batch_store.set_names()) if batch_store is not None else []
     running_under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
-    for dataset_name in selected_names:
-        settings = context.dataset_manager.get_fit_settings(dataset_name)
-        base = default_batch_set_name_for_dataset(dataset_name) or str(dataset_name)
+    for dataset_id in selected_dataset_ids:
+        display_name = display_name_by_id.get(str(dataset_id), str(dataset_id))
+        settings = context.dataset_fit_settings_store.get_fit_settings(dataset_id)
+        base = default_batch_set_name_for_dataset(display_name) or str(display_name)
 
         resolved_mapping = resolve_saved_batch_mapping(settings, batch_store)
         target_set: Optional[str] = resolved_mapping.batch_set if resolved_mapping.status == "mapped" else None
@@ -323,7 +331,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
             create_set_name = unique_batch_set_name(batch_set_names, base)
             action = prompt_dataset_batch_mapping_choice(
                 context.parent,
-                dataset_name,
+                display_name,
                 create_set_name,
                 title="Global Fit – Set Mapping",
                 skip_label="Cancel",
@@ -337,7 +345,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
             if action == "map":
                 target_set = pick_existing_batch_set(
                     context.parent,
-                    dataset_name,
+                    display_name,
                     batch_set_names,
                     title="Map Dataset to Set",
                     empty_message_title="Global Fit",
@@ -348,9 +356,9 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                     return None
                 apply_batch_mapping_to_settings(settings, batch_store, target_set)
             else:
-                dataset_payload = datasets_map.get(dataset_name) or {}
+                dataset_payload = datasets_map.get(dataset_id) or {}
                 row_idx, created, seeded = create_and_seed_batch_set(
-                    dataset_name=dataset_name,
+                    dataset_name=display_name,
                     dataset_payload=dataset_payload,
                     mechanism_species=mechanism_species,
                     batch_store=batch_store,
@@ -379,7 +387,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                                 context.parent,
                                 "Global Fit – Initial Conditions",
                                 (
-                                    f"Dataset '{dataset_name}' does not start at t\u22480 "
+                                    f"Dataset '{display_name}' does not start at t\u22480 "
                                     f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
                                     "OK: Create set with zeros and continue\n"
                                     "Cancel: Create set and edit manually (then restart Global Fit)"
@@ -412,13 +420,14 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         if defaults is None:
             context.set_status("Global fit cancelled")
             return None
-        defaults_by_dataset[dataset_name] = defaults
+        defaults_by_dataset[dataset_id] = defaults
         batch_set_names = list(batch_store.set_names()) if batch_store is not None else batch_set_names
 
     settings_map: Dict[str, "DatasetFitSettings"] = {}
-    for dataset_name in selected_names:
-        settings = context.dataset_manager.get_fit_settings(dataset_name)
-        settings.ensure_species(mechanism_species, defaults_by_dataset.get(dataset_name, mechanism_initials))
+    for dataset_id in selected_dataset_ids:
+        display_name = display_name_by_id.get(str(dataset_id), str(dataset_id))
+        settings = context.dataset_fit_settings_store.get_fit_settings(dataset_id)
+        settings.ensure_species(mechanism_species, defaults_by_dataset.get(dataset_id, mechanism_initials))
         missing_initials = [
             species_name for species_name in (mechanism_species or [])
             if species_name not in (settings.initial_conditions or {})
@@ -427,21 +436,21 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
             QtWidgets.QMessageBox.warning(
                 context.parent,
                 "Global Fit",
-                f"Dataset '{dataset_name}' requires initial concentrations for: {', '.join(missing_initials)}.",
+                f"Dataset '{display_name}' requires initial concentrations for: {', '.join(missing_initials)}.",
             )
             context.set_status("Global fit cancelled")
             return None
-        context.dataset_manager.update_fit_settings(dataset_name, settings)
-        settings_map[dataset_name] = settings
+        context.dataset_fit_settings_store.update_fit_settings(dataset_id, settings)
+        settings_map[dataset_id] = settings
 
     dataset_params: Dict[str, Dict[str, float]] = {}
     dataset_variable_params: Dict[str, Dict[str, Dict[str, float]]] = {}
     weights: Dict[str, float] = {}
     initial_prefix = "init:"
-    for dataset_name in selected_names:
-        settings = settings_map[dataset_name]
-        weights[dataset_name] = settings.weight
-        dataset_params[dataset_name] = {}
+    for dataset_id in selected_dataset_ids:
+        settings = settings_map[dataset_id]
+        weights[dataset_id] = settings.weight
+        dataset_params[dataset_id] = {}
         var_specs: Dict[str, Dict[str, float]] = {}
         for species, init_value in settings.initial_conditions.items():
             key = f"{initial_prefix}{species}"
@@ -454,9 +463,9 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                     "log10": bool(settings.log10_flags.get(species, False)),
                 }
             else:
-                dataset_params[dataset_name][key] = init_value
+                dataset_params[dataset_id][key] = init_value
         if var_specs:
-            dataset_variable_params[dataset_name] = var_specs
+            dataset_variable_params[dataset_id] = var_specs
 
     t_axes: List[np.ndarray] = []
     dataset_entries: List[Dict[str, object]] = []
@@ -485,7 +494,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         dataset_entries.append(
             {
                 "id": str(dataset_id),
-                "label": str(dataset_id),
+                "label": display_name_by_id.get(str(dataset_id), str(dataset_id)),
                 "t": t_values,
                 "species_data": series_map,
                 "selected_species": [],
@@ -604,7 +613,9 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         mode="global",
         parameter_defs=parameter_defs,
         dataset_entries=dataset_entries,
-        dataset_manager=context.dataset_manager,
+        dataset_fit_settings_store=context.dataset_fit_settings_store,
+        dataset_view_publisher=context.dataset_view_publisher,
+        mechanism_parameter_scan_owner=context.mechanism_parameter_scan_owner,
         simulation_func=None,
         mechanism_species=mechanism_species,
         mechanism_text_getter=context.mechanism_text_getter,
@@ -618,10 +629,8 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         dataset_payload_results=dataset_payload_results,
         dataset_weights=weights,
         runtime_lane_budget=context.runtime_lane_budget,
-        apply_callback=context.write_fit_results_to_mechanism,
         project_apply_callback=context.apply_fit_results_to_project,
         config_defaults=context.load_fitting_defaults(),
-        dataset_settings_updater=context.apply_dataset_initial_updates,
         parent=context.parent,
     )
     window.setWindowTitle(f"Global Fit – {dataset_label}")

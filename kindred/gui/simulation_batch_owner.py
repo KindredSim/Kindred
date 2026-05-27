@@ -8,6 +8,7 @@ import numpy as np
 
 from kindred.core.batch_initial_conditions import (
     migrate_reaction_dsl_initial_concentration_sets,
+    resolve_run_scope,
     strip_reaction_dsl_initial_concentrations,
 )
 from kindred.core.batch_simulation_cache import BatchSimulationCache
@@ -25,6 +26,7 @@ from kindred.core.batch_cache_contracts import (
 from kindred.gui.ports import (
     BatchDisplayRequestCoverage,
     BatchDisplayRequestResolution,
+    ConcentrationSetInteractionTransaction,
     DisplayTransitionCause,
     ResolvedBatchDisplayRequestEntry,
 )
@@ -46,8 +48,7 @@ class SimulationBatchOwner:
     def __init__(
         self,
         *,
-        batch_rows_for_scope: Callable[[str], Sequence[int]],
-        batch_set_ids_for_scope: Callable[[str], Sequence[str]],
+        batch_selected_rows: Callable[[], Sequence[int]],
         requested_show_batch_set_ids: Callable[[], Sequence[str]],
         slider_edit_target_set_ids: Callable[[], Sequence[str]],
         focused_batch_set_id: Callable[[], Optional[str]],
@@ -69,8 +70,7 @@ class SimulationBatchOwner:
         sync_batch_species_columns: Callable[..., None],
         sync_mechanism_controls_to_focused_batch_set: Callable[..., None],
     ) -> None:
-        self._batch_rows_for_scope = batch_rows_for_scope
-        self._batch_set_ids_for_scope = batch_set_ids_for_scope
+        self._batch_selected_rows = batch_selected_rows
         self._requested_show_batch_set_ids = requested_show_batch_set_ids
         self._slider_edit_target_set_ids = slider_edit_target_set_ids
         self._focused_batch_set_id = focused_batch_set_id
@@ -108,10 +108,25 @@ class SimulationBatchOwner:
         return model
 
     def batch_rows_for_scope(self, scope: str) -> List[int]:
-        return [int(row) for row in (self._batch_rows_for_scope(str(scope)) or [])]
+        total = int(self._batch_store.row_count())
+        if total <= 0:
+            return []
+        scope_key = str(scope or "").strip().lower()
+        if scope_key == "all":
+            return list(range(total))
+        return resolve_run_scope(
+            selected_rows=self._batch_selected_rows(),
+            total_rows=total,
+            mode="selected",
+        )
 
     def batch_set_ids_for_scope(self, scope: str) -> List[str]:
-        return [str(set_id) for set_id in (self._batch_set_ids_for_scope(str(scope)) or [])]
+        set_ids: List[str] = []
+        for row in self.batch_rows_for_scope(scope):
+            set_id = self.batch_set_id_for_row(int(row))
+            if set_id:
+                set_ids.append(str(set_id))
+        return set_ids
 
     def requested_show_batch_set_ids(self) -> List[str]:
         return [str(set_id) for set_id in (self._requested_show_batch_set_ids() or [])]
@@ -119,9 +134,161 @@ class SimulationBatchOwner:
     def slider_edit_target_set_ids(self) -> List[str]:
         return [str(set_id) for set_id in (self._slider_edit_target_set_ids() or [])]
 
+    def _normalized_valid_set_ids(self, set_ids: Sequence[str]) -> List[str]:
+        valid_ids = {str(set_id) for set_id in self._batch_store.set_ids()}
+        normalized: List[str] = []
+        for raw_set_id in set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if not set_id or set_id not in valid_ids or set_id in normalized:
+                continue
+            normalized.append(set_id)
+        return normalized
+
+    def _set_id_for_current_row(self) -> Optional[str]:
+        row = self.batch_current_row()
+        if row is None:
+            return None
+        return self.batch_set_id_for_row(int(row))
+
+    def effective_slider_edit_target_set_ids(self, *, focused_row: Optional[int] = None) -> List[str]:
+        explicit_ids = self._normalized_valid_set_ids(self.slider_edit_target_set_ids())
+        if explicit_ids:
+            return list(explicit_ids)
+        if focused_row is not None:
+            set_id = self.batch_set_id_for_row(int(focused_row))
+        else:
+            set_id = self._set_id_for_current_row()
+        return [str(set_id)] if set_id else []
+
+    def focused_effective_slider_target_set_id(self) -> str:
+        explicit_ids = self._normalized_valid_set_ids(self.slider_edit_target_set_ids())
+        if explicit_ids:
+            return ""
+        target_ids = self.effective_slider_edit_target_set_ids()
+        return str(target_ids[0]) if target_ids else ""
+
+    def run_selected_empty_target_reason(self) -> str:
+        total = int(self._batch_store.row_count())
+        if total <= 0:
+            return "Add at least one set before running."
+        return "Select at least one set before running."
+
+    def selected_run_target_rows(self) -> List[int]:
+        return self.batch_rows_for_scope("selected")
+
+    def concentration_set_interaction_transaction(
+        self,
+        *,
+        gesture: str,
+        row: Optional[int] = None,
+    ) -> ConcentrationSetInteractionTransaction:
+        gesture_key = str(gesture or "").strip().lower()
+        row_i: Optional[int]
+        try:
+            row_i = int(row) if row is not None else self.batch_current_row()
+        except (TypeError, ValueError):
+            row_i = None
+        total = int(self._batch_store.row_count())
+        if row_i is not None and not (0 <= int(row_i) < total):
+            row_i = None
+        set_id = self.batch_set_id_for_row(int(row_i)) if row_i is not None else None
+        set_id_s = str(set_id or "")
+
+        focused_set_id = str(self._focused_batch_set_id() or "").strip()
+        selected_rows = tuple(int(row) for row in self.batch_rows_for_scope("selected"))
+        target_selection_rows = selected_rows
+        if gesture_key in {"row_body_click", "initial_default_selection"} and row_i is not None:
+            target_selection_rows = (int(row_i),)
+
+        requested_show_ids = tuple(self._normalized_valid_set_ids(self.requested_show_batch_set_ids()))
+        explicit_slider_ids = tuple(self._normalized_valid_set_ids(self.slider_edit_target_set_ids()))
+        effective_slider_ids = tuple(self.effective_slider_edit_target_set_ids(focused_row=row_i))
+        effective_slider_rows = tuple(
+            int(row)
+            for row in (
+                self._batch_row_for_set_id(str(set_id))
+                for set_id in effective_slider_ids
+            )
+            if row is not None
+        )
+
+        focus_change = bool(
+            gesture_key in {"row_body_click", "initial_default_selection"}
+            and set_id_s
+            and focused_set_id != set_id_s
+        )
+        selection_change = bool(
+            gesture_key == "selection_change"
+            or tuple(selected_rows) != tuple(target_selection_rows)
+        )
+
+        display_refresh_needed = gesture_key in {"row_body_click", "show_checkbox", "show_membership_change"}
+        slider_rebuild_needed = gesture_key in {
+            "row_body_click",
+            "slider_checkbox",
+            "slider_target_change",
+        }
+        runtime_readiness_refresh_needed = bool(
+            (
+                gesture_key in {"row_body_click", "selection_change"}
+                and bool(focus_change or selection_change)
+            )
+            or gesture_key in {"slider_checkbox", "slider_target_change"}
+        )
+
+        run_rows = tuple(int(row) for row in target_selection_rows)
+        empty_reason = "" if run_rows else self.run_selected_empty_target_reason()
+
+        return ConcentrationSetInteractionTransaction(
+            gesture=gesture_key,
+            row=row_i,
+            set_id=set_id_s,
+            focus_change=focus_change,
+            selection_change=selection_change,
+            requested_show_set_ids=requested_show_ids,
+            explicit_slider_target_set_ids=explicit_slider_ids,
+            effective_slider_edit_target_set_ids=effective_slider_ids,
+            effective_slider_edit_target_rows=effective_slider_rows,
+            run_selected_rows=run_rows,
+            empty_run_target_reason=empty_reason,
+            display_refresh_needed=display_refresh_needed,
+            display_refresh_reason=gesture_key if display_refresh_needed else "",
+            slider_rebuild_needed=slider_rebuild_needed,
+            slider_rebuild_reason=gesture_key if slider_rebuild_needed else "",
+            runtime_readiness_refresh_needed=runtime_readiness_refresh_needed,
+            runtime_readiness_refresh_reason=gesture_key if runtime_readiness_refresh_needed else "",
+        )
+
     def focused_batch_set_id(self) -> Optional[str]:
         value = self._focused_batch_set_id()
         return str(value) if value else None
+
+    def preview_initials_for_row(self, row: int, baseline: Dict[str, float]) -> Dict[str, float]:
+        preview = getattr(self._preview_session, "preview_initials_for_row", None)
+        if callable(preview):
+            try:
+                return dict(preview(int(row), dict(baseline or {})))
+            except Exception:
+                return dict(baseline or {})
+        return dict(baseline or {})
+
+    def stage_concentration_value_for_rows(self, rows: Sequence[int], *, species: str, value: float) -> bool:
+        stage = getattr(self._preview_session, "stage_concentration_value_for_rows", None)
+        if callable(stage):
+            try:
+                return bool(stage(rows, species=str(species), value=float(value)))
+            except Exception:
+                return False
+        return False
+
+    def discard_concentration_overlays_for_rows(self, rows: Sequence[int]) -> bool:
+        discard = getattr(self._preview_session, "discard_concentration_overlays_for_rows", None)
+        if callable(discard):
+            try:
+                return bool(discard(rows))
+            except Exception:
+                return False
+        return False
 
     def batch_current_row(self) -> Optional[int]:
         row = self._batch_current_row()
@@ -397,9 +564,8 @@ class SimulationBatchOwner:
         requested_show_set_ids: Sequence[str],
         prefer_set: Optional[str] = None,
     ) -> bool:
-        focused_set_id = str(
-            prefer_set or (requested_show_set_ids[0] if requested_show_set_ids else "") or ""
-        ).strip()
+        _ = requested_show_set_ids
+        focused_set_id = str(prefer_set or "").strip()
         if not focused_set_id:
             return False
         return self._preview_has_dirty_state_for_set(focused_set_id)
@@ -468,8 +634,6 @@ class SimulationBatchOwner:
             str(set_id) for set_id in (batch_cache.active_cache_invalidated_set_ids or ()) if str(set_id)
         }
         focused_set_id = str(self._focused_batch_set_id() or "").strip()
-        if (not focused_set_id) and requested_show_set_ids:
-            focused_set_id = str(requested_show_set_ids[0] or "").strip()
 
         resolved_entries: list[ResolvedBatchDisplayRequestEntry] = []
         has_workspace_display_request = False
