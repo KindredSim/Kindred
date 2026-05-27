@@ -849,8 +849,31 @@ def test_open_solver_settings_refreshes_runtime_after_final_settings_apply(main_
     ]
 
 
-def test_open_solver_settings_notifies_active_fit_windows_for_runtime_changes(main_window, monkeypatch):
+def _fit_runtime_publisher(main_window):
+    publisher = getattr(main_window, "fitting_runtime_input_publisher", None)
+    if publisher is None:
+        publisher = getattr(main_window, "_fitting_runtime_input_publisher", None)
+    assert publisher is not None
+    return publisher
+
+
+def _runtime_inputs_payload(runtime_inputs) -> dict[str, object]:
+    evaluator = runtime_inputs.evaluator
+    return {
+        "evaluator": {
+            "temperature_K": float(evaluator.temperature_K),
+            "use_sparse_jacobian": bool(evaluator.use_sparse_jacobian),
+            "wegscheider_cyclicity_enabled": bool(evaluator.wegscheider_cyclicity_enabled),
+        },
+        "batch_runtime_lane_budget": int(runtime_inputs.batch_runtime_lane_budget),
+        "lane_count_for_two_datasets": int(runtime_inputs.lane_count_for_dataset_count(2)),
+    }
+
+
+def test_open_solver_settings_publishes_typed_fit_runtime_inputs_for_runtime_changes(main_window, monkeypatch):
     class _FakeDialog:
+        update: dict[str, object] = {}
+
         def __init__(self, _parent, *, cache_port=None):
             self._settings = {}
             self._cache_port = cache_port
@@ -863,14 +886,14 @@ def test_open_solver_settings_notifies_active_fit_windows_for_runtime_changes(ma
 
         def get_settings(self):
             updated = dict(self._settings)
-            updated["use_sparse_jacobian"] = not bool(updated.get("use_sparse_jacobian", False))
+            updated.update(type(self).update)
             return updated
 
-    notifications: list[str] = []
+    notifications: list[dict[str, object]] = []
 
     class _FitWindow:
-        def handle_external_runtime_inputs_changed(self) -> None:
-            notifications.append("notified")
+        def apply_runtime_inputs(self, runtime_inputs, **_kwargs) -> None:
+            notifications.append(_runtime_inputs_payload(runtime_inputs))
 
         def close(self) -> bool:
             return True
@@ -879,15 +902,44 @@ def test_open_solver_settings_notifies_active_fit_windows_for_runtime_changes(ma
         "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
         _FakeDialog,
     )
-    main_window._active_fit_windows = [_FitWindow()]
+    _fit_runtime_publisher(main_window).register_window(_FitWindow())
 
+    original_sparse = bool(main_window._use_sparse_jacobian)
+    original_wegscheider = bool(main_window._wegscheider_cyclicity_enabled)
+    original_lane_budget = int(main_window.simulation_controller.batch_runtime_lane_budget)
+
+    _FakeDialog.update = {"use_sparse_jacobian": not original_sparse}
+    main_window._open_solver_settings()
+    _FakeDialog.update = {"wegscheider_cyclicity_enabled": not original_wegscheider}
+    main_window._open_solver_settings()
+    _FakeDialog.update = {"batch_runtime_lane_budget": original_lane_budget + 1}
     main_window._open_solver_settings()
 
-    assert notifications == ["notified"]
+    assert len(notifications) == 3
+    assert notifications[0]["evaluator"] == {
+        "temperature_K": float(main_window._temperature_spinbox.value()),
+        "use_sparse_jacobian": (not original_sparse),
+        "wegscheider_cyclicity_enabled": original_wegscheider,
+    }
+    assert notifications[1]["evaluator"] == {
+        "temperature_K": float(main_window._temperature_spinbox.value()),
+        "use_sparse_jacobian": (not original_sparse),
+        "wegscheider_cyclicity_enabled": (not original_wegscheider),
+    }
+    assert notifications[2]["evaluator"] == notifications[1]["evaluator"]
+    assert notifications[2]["batch_runtime_lane_budget"] == original_lane_budget + 1
+    assert set(notifications[2]["evaluator"]) == {
+        "temperature_K",
+        "use_sparse_jacobian",
+        "wegscheider_cyclicity_enabled",
+    }
+    assert notifications[2]["lane_count_for_two_datasets"] >= 1
 
 
 def test_open_solver_settings_does_not_notify_fit_windows_for_local_fit_integration_defaults(main_window, monkeypatch):
     class _FakeDialog:
+        update: dict[str, object] = {}
+
         def __init__(self, _parent, *, cache_port=None):
             self._settings = {}
             self._cache_port = cache_port
@@ -900,13 +952,14 @@ def test_open_solver_settings_does_not_notify_fit_windows_for_local_fit_integrat
 
         def get_settings(self):
             updated = dict(self._settings)
-            updated["rtol"] = 2e-6
+            updated.update(type(self).update)
             return updated
 
     notifications: list[str] = []
 
     class _FitWindow:
-        def handle_external_runtime_inputs_changed(self) -> None:
+        def apply_runtime_inputs(self, runtime_inputs, **_kwargs) -> None:
+            _ = runtime_inputs
             notifications.append("notified")
 
         def close(self) -> bool:
@@ -916,35 +969,65 @@ def test_open_solver_settings_does_not_notify_fit_windows_for_local_fit_integrat
         "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
         _FakeDialog,
     )
-    main_window._active_fit_windows = [_FitWindow()]
+    _fit_runtime_publisher(main_window).register_window(_FitWindow())
 
-    main_window._open_solver_settings()
+    unrelated_updates = [
+        {"solver": "Radau"},
+        {"rtol": 2e-6},
+        {"atol": 2e-12},
+        {"slider_preview_solver": "Radau"},
+        {"slider_preview_points": 375},
+        {"parameter_preview_debounce_ms": 250},
+        {"equilibrium_preview_debounce_ms": 250},
+        {"limit_blas_threads_per_worker": False},
+        {"result_cache_cap": 123},
+        {"preview_cache_cap": 45},
+        {
+            "max_parallel_batch_workers": int(
+                main_window.simulation_controller.parallel_batch.max_parallel_workers
+            )
+            + 1,
+        },
+    ]
+    for update in unrelated_updates:
+        _FakeDialog.update = update
+        main_window._open_solver_settings()
 
     assert notifications == []
 
 
 def test_active_fit_window_runtime_notification_continues_after_stale_window_error(main_window):
-    notifications: list[str] = []
+    notifications: list[dict[str, object]] = []
 
     class _BadFitWindow:
-        def handle_external_runtime_inputs_changed(self) -> None:
+        def apply_runtime_inputs(self, runtime_inputs, **_kwargs) -> None:
+            _ = runtime_inputs
             raise RuntimeError("deleted wrapper")
 
         def close(self) -> bool:
             return True
 
     class _GoodFitWindow:
-        def handle_external_runtime_inputs_changed(self) -> None:
-            notifications.append("notified")
+        def apply_runtime_inputs(self, runtime_inputs, **_kwargs) -> None:
+            notifications.append(_runtime_inputs_payload(runtime_inputs))
 
         def close(self) -> bool:
             return True
 
-    main_window._active_fit_windows = [_BadFitWindow(), _GoodFitWindow()]
+    publisher = _fit_runtime_publisher(main_window)
+    publisher.register_window(_BadFitWindow())
+    publisher.register_window(_GoodFitWindow())
 
-    main_window._notify_active_fit_windows_runtime_inputs_changed()
+    publisher.publish_current(reason="test forced active-window notification", force=True)
 
-    assert notifications == ["notified"]
+    assert len(notifications) == 1
+    assert set(notifications[0]["evaluator"]) == {
+        "temperature_K",
+        "use_sparse_jacobian",
+        "wegscheider_cyclicity_enabled",
+    }
+    recorded_failures = getattr(main_window, "_fitting_best_effort_failures", set())
+    assert any("runtime" in str(key) for key in recorded_failures)
 
 
 def test_open_solver_settings_persists_preview_debounce_controls(main_window, monkeypatch):

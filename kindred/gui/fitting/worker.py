@@ -175,7 +175,8 @@ class GlobalFitWorker(QtCore.QThread):
         self._best_params: Dict[str, float] = {}
         self._pending_best = False
         self._last_best_emit_ts = 0.0
-        self._last_render_projection_emit_ts = 0.0
+        self._last_render_projection_attempt_ts = 0.0
+        self._last_render_projection_success_ts = 0.0
 
     def cancel(self) -> None:
         """Request cancellation from the worker."""
@@ -297,7 +298,8 @@ class GlobalFitWorker(QtCore.QThread):
         self._best_params = {}
         self._pending_best = False
         self._last_best_emit_ts = 0.0
-        self._last_render_projection_emit_ts = 0.0
+        self._last_render_projection_attempt_ts = 0.0
+        self._last_render_projection_success_ts = 0.0
 
         self.progress.emit(5, f"Running global fit... [{self._solver}]")
         result = self._fit_func(
@@ -418,9 +420,10 @@ class GlobalFitWorker(QtCore.QThread):
             return None
         if self._fit_evaluator is None:
             return None
-        elapsed = float(now) - float(self._last_render_projection_emit_ts)
-        if self._last_render_projection_emit_ts > 0.0 and elapsed < self._render_projection_interval_s:
+        elapsed = float(now) - float(self._last_render_projection_attempt_ts)
+        if self._last_render_projection_attempt_ts > 0.0 and elapsed < self._render_projection_interval_s:
             return None
+        self._last_render_projection_attempt_ts = float(now)
         try:
             layout = build_parameter_layout(
                 payloads=list(self._dataset_specs),
@@ -457,7 +460,7 @@ class GlobalFitWorker(QtCore.QThread):
         except Exception as exc:
             logger.debug("Skipping live fit render projection: %s", exc)
             return None
-        self._last_render_projection_emit_ts = float(now)
+        self._last_render_projection_success_ts = float(now)
         return projection
 
     def _live_projection_evaluator(self) -> object:

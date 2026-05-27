@@ -1,6 +1,40 @@
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional
+
+from kindred.gui.fitting.constants import FITTING_SCIENTIFIC_VALUE_MAX
+
+
+def _valid_solver_tolerance(value: object) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric <= 0.0 or numeric > FITTING_SCIENTIFIC_VALUE_MAX:
+        return None
+    return float(numeric)
+
+
+def resolve_solver_tolerance(
+    value: object,
+    *,
+    field_name: str,
+    current_value: object,
+    default_value: object,
+) -> float:
+    parsed = _valid_solver_tolerance(value)
+    if parsed is not None:
+        return parsed
+    current = _valid_solver_tolerance(current_value)
+    if current is not None:
+        return current
+    default = _valid_solver_tolerance(default_value)
+    if default is None:
+        raise ValueError(f"default solver tolerance {field_name!r} is invalid")
+    return default
 
 
 class SimulationSolverOwner:

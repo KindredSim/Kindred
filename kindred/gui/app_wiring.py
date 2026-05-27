@@ -575,7 +575,7 @@ def build_right_dock_and_dataset_owners(
     plot_tabs: PlotTabsWidget,
     mechanism_getter: Callable[[], str],
     simulation_runner: Callable[..., Any],
-    solver_settings_getter: Callable[[], dict[str, Any]],
+    wegscheider_cyclicity_enabled_getter: Callable[[], bool],
 ) -> RightDockComponents:
     from kindred.gui.controllers.dataset_fit_settings_store import DatasetFitSettingsStore
     from kindred.gui.controllers.dataset_registry import DatasetRegistry
@@ -608,7 +608,7 @@ def build_right_dock_and_dataset_owners(
         dataset_tab_simulation_owner=dataset_tab_simulation_owner,
     )
     mechanism_parameter_scan_owner = MechanismParameterScanOwner(
-        solver_settings_getter=solver_settings_getter,
+        wegscheider_cyclicity_enabled_getter=wegscheider_cyclicity_enabled_getter,
     )
     return RightDockComponents(
         dock=dock,

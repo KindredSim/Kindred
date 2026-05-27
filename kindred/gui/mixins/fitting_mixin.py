@@ -6,7 +6,6 @@ Provides methods for:
 - Fitting configuration dialogs
 - Fitting diagnostics display
 - Parameter override/update in mechanism DSL
-- Modeless fitting window management
 """
 
 from __future__ import annotations
@@ -14,12 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
-from typing import Dict, List, Optional, Sequence, TYPE_CHECKING
+from typing import Dict, Optional, TYPE_CHECKING
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.batch_parallel import compute_effective_batch_workers
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulator.dsl_text_update import (
     StepParameterUpdateOutcome,
@@ -34,7 +32,6 @@ from kindred.gui.fitting.constants import (
     FITTING_SOLVERS,
 )
 from kindred.gui.mixins.ports import FittingMixinPorts
-from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 
 logger = logging.getLogger(__name__)
@@ -152,53 +149,6 @@ class FittingMixin:
             counts_attr="_fitting_best_effort_failure_counts",
         )
 
-    def _register_fit_window(self, window: QtWidgets.QWidget) -> None:
-        """Track modeless fitting windows to keep them alive."""
-        if not hasattr(self, "_active_fit_windows"):
-            self._active_fit_windows: List[QtWidgets.QWidget] = []
-
-        self._active_fit_windows.append(window)
-
-        def _cleanup(*_args):
-            windows = getattr(self, "_active_fit_windows", None)
-            if isinstance(windows, list) and window in windows:
-                windows.remove(window)
-
-        window.destroyed.connect(_cleanup)
-        window.show()
-        window.raise_()
-        window.activateWindow()
-
-    def _notify_active_fit_windows_runtime_inputs_changed(self) -> None:
-        windows = list(getattr(self, "_active_fit_windows", []) or [])
-        for window in windows:
-            try:
-                handler = getattr(window, "handle_external_runtime_inputs_changed", None)
-                if callable(handler):
-                    handler()
-            except Exception as exc:
-                self._record_fitting_best_effort_failure(
-                    "active_fit_window_runtime_inputs_changed",
-                    message="Failed to notify an active fitting window about runtime input changes",
-                    exc=exc,
-                )
-
-    def _notify_active_fit_windows_datasets_removed(self, dataset_ids: Sequence[str]) -> None:
-        removed_ids = tuple(str(dataset_id) for dataset_id in dataset_ids if str(dataset_id))
-        if not removed_ids:
-            self._notify_active_fit_windows_runtime_inputs_changed()
-            return
-        windows = list(getattr(self, "_active_fit_windows", []) or [])
-        for window in windows:
-            try:
-                window.handle_external_datasets_removed(removed_ids)
-            except Exception as exc:
-                self._record_fitting_best_effort_failure(
-                    "active_fit_window_datasets_removed",
-                    message="Failed to notify an active fitting window about removed datasets",
-                    exc=exc,
-                )
-
     def _write_fit_results_to_mechanism(
         self,
         parameters: dict,
@@ -299,16 +249,15 @@ class FittingMixin:
 
     def _current_fit_step_constraint_context(self) -> Dict[str, object]:
         ports = self._require_fitting_ports()
-        solver_settings_getter = getattr(self, "_get_solver_settings", None)
-        solver_settings = solver_settings_getter() if callable(solver_settings_getter) else {}
+        wegscheider_getter = getattr(self, "_get_wegscheider_cyclicity_enabled", None)
+        if not callable(wegscheider_getter):
+            raise RuntimeError("Fitting constraint context requires an explicit Wegscheider setting provider.")
+        wegscheider_enabled = wegscheider_getter()
+        if not isinstance(wegscheider_enabled, bool):
+            raise RuntimeError("Fitting constraint context requires an explicit Wegscheider setting.")
         return {
             "temperature_K": float(ports.temperature_getter()),
-            "wegscheider_cyclicity_enabled": bool(
-                dict(solver_settings or {}).get(
-                    "wegscheider_cyclicity_enabled",
-                    PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
-                )
-            ),
+            "wegscheider_cyclicity_enabled": wegscheider_enabled,
         }
 
     @staticmethod
@@ -690,13 +639,6 @@ class FittingMixin:
                 record_undo=True,
             )
 
-        def _runtime_lane_budget(dataset_count: int) -> int:
-            raw_budget = int(self.simulation_controller.batch_runtime_lane_budget)
-            return compute_effective_batch_workers(
-                num_sets=max(1, int(dataset_count)),
-                max_parallel_workers=max(1, int(raw_budget)),
-            )
-
         return GlobalFitLaunchContext(
             parent=self,
             dataset_registry=ports.dataset_registry,
@@ -711,13 +653,11 @@ class FittingMixin:
             set_status=self._set_fitting_status,
             sync_batch_species_columns=self._sync_batch_species_columns,
             batch_initials_for_row=self._batch_initials_for_row,
-            get_solver_settings=self._get_solver_settings,
-            temperature_getter=ports.temperature_getter,
+            fitting_settings_getter=self._get_global_fit_launch_settings,
             num_points_getter=ports.num_points_getter,
-            register_fit_window=self._register_fit_window,
+            register_fit_window=self._fitting_runtime_input_publisher.register_window,
             apply_fit_results_to_project=self._apply_fit_results_to_project,
             load_fitting_defaults=self._get_fitting_session_defaults,
-            runtime_lane_budget=_runtime_lane_budget,
             batch_store=getattr(self, "_batch_store", None),
             batch_model=getattr(self, "_batch_model", None),
             batch_table=getattr(self, "_batch_table", None),

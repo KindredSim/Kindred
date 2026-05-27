@@ -15,6 +15,108 @@ from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     coerce_prepared_simulation_metadata,
 )
+from kindred.gui.fitting.runtime_inputs import FittingEvaluatorRuntimeSettings
+from kindred.gui.project_schema import SIMULATION_TEMPERATURE_K_RANGE
+
+
+def _coerce_runtime_temperature(value: Any, *, source: str) -> float:
+    if isinstance(value, bool):
+        raise RuntimeError(f"{source} requires numeric temperature_K.")
+    try:
+        temperature = float(value)
+    except Exception as exc:
+        raise RuntimeError(f"{source} requires numeric temperature_K.") from exc
+    min_temperature, max_temperature = SIMULATION_TEMPERATURE_K_RANGE
+    if (
+        not math.isfinite(temperature)
+        or temperature < float(min_temperature)
+        or temperature > float(max_temperature)
+    ):
+        raise RuntimeError(f"{source} requires temperature_K within the simulation temperature range.")
+    return temperature
+
+
+def _coerce_runtime_bool(value: Any, *, key: str, source: str) -> bool:
+    if not isinstance(value, bool):
+        raise RuntimeError(f"{source} requires explicit {key}.")
+    return value
+
+def _mapping_has_explicit_prepared_runtime_fields(prepared: Mapping[str, Any]) -> bool:
+    try:
+        _coerce_runtime_temperature(
+            prepared["temperature_K"],
+            source="Prepared simulation metadata",
+        )
+        _coerce_runtime_bool(
+            prepared["use_sparse_jacobian"],
+            key="use_sparse_jacobian",
+            source="Prepared simulation metadata",
+        )
+        _coerce_runtime_bool(
+            prepared["wegscheider_cyclicity_enabled"],
+            key="wegscheider_cyclicity_enabled",
+            source="Prepared simulation metadata",
+        )
+    except Exception:
+        return False
+    return True
+
+
+def coerce_strict_fitting_prepared_metadata(prepared: object) -> Optional[PreparedSimulationMetadata]:
+    if isinstance(prepared, Mapping) and not _mapping_has_explicit_prepared_runtime_fields(prepared):
+        return None
+    meta = coerce_prepared_simulation_metadata(prepared)
+    if meta is None:
+        return None
+    try:
+        _coerce_runtime_temperature(
+            meta.temperature_K,
+            source="Prepared simulation metadata",
+        )
+        _coerce_runtime_bool(
+            meta.use_sparse_jacobian,
+            key="use_sparse_jacobian",
+            source="Prepared simulation metadata",
+        )
+        _coerce_runtime_bool(
+            meta.wegscheider_cyclicity_enabled,
+            key="wegscheider_cyclicity_enabled",
+            source="Prepared simulation metadata",
+        )
+    except Exception:
+        return None
+    return meta
+
+
+def prepared_simulation_matches_runtime_inputs(
+    prepared_simulation: Optional[PreparedSimulationMetadata],
+    runtime_inputs: FittingEvaluatorRuntimeSettings,
+) -> bool:
+    if prepared_simulation is None:
+        return False
+    try:
+        prepared_temperature = _coerce_runtime_temperature(
+            prepared_simulation.temperature_K,
+            source="Prepared simulation metadata",
+        )
+        requested_temperature = float(runtime_inputs.temperature_K)
+        prepared_sparse = _coerce_runtime_bool(
+            prepared_simulation.use_sparse_jacobian,
+            key="use_sparse_jacobian",
+            source="Prepared simulation metadata",
+        )
+        prepared_wegscheider = _coerce_runtime_bool(
+            prepared_simulation.wegscheider_cyclicity_enabled,
+            key="wegscheider_cyclicity_enabled",
+            source="Prepared simulation metadata",
+        )
+    except Exception:
+        return False
+    return (
+        math.isclose(prepared_temperature, requested_temperature, rel_tol=1e-9, abs_tol=1e-12)
+        and prepared_sparse is runtime_inputs.use_sparse_jacobian
+        and prepared_wegscheider is runtime_inputs.wegscheider_cyclicity_enabled
+    )
 
 
 @dataclass(frozen=True)
@@ -59,7 +161,7 @@ class FittingEvaluatorStateOwner:
         requested_solver: str,
         requested_rtol: float,
         requested_atol: float,
-        runtime_settings: Mapping[str, Any],
+        runtime_inputs: FittingEvaluatorRuntimeSettings,
         param_names_for_readiness: Callable[..., list[str]],
     ) -> Optional[FittingEvaluatorComponents]:
         base_evaluator = self._base_evaluator
@@ -70,7 +172,7 @@ class FittingEvaluatorStateOwner:
             prepared_matches_request = (
                 self._prepared_simulation_matches_mechanism(prepared_simulation, mechanism_text)
                 and self._prepared_solver_normalized(prepared_simulation) == str(requested_solver)
-                and self._prepared_simulation_matches_runtime_settings(prepared_simulation, runtime_settings)
+                and self._prepared_simulation_matches_runtime_inputs(prepared_simulation, runtime_inputs)
                 and self._prepared_tolerances_match(
                     prepared_simulation,
                     requested_rtol=float(requested_rtol),
@@ -96,7 +198,7 @@ class FittingEvaluatorStateOwner:
             prepared_simulation=prepared_simulation if prepared_matches_request else None,
             mechanism_text=mechanism_text,
         )
-        runtime_snapshot = dict(runtime_settings or {})
+        builder_kwargs = runtime_inputs.builder_kwargs()
 
         def _build_deferred_fit_evaluator():
             return self._simulation_builder(
@@ -105,9 +207,7 @@ class FittingEvaluatorStateOwner:
                 solver=str(requested_solver),
                 rtol=float(requested_rtol),
                 atol=float(requested_atol),
-                temperature_K=float(runtime_snapshot["temperature_K"]),
-                use_sparse_jacobian=bool(runtime_snapshot["use_sparse_jacobian"]),
-                wegscheider_cyclicity_enabled=bool(runtime_snapshot["wegscheider_cyclicity_enabled"]),
+                **builder_kwargs,
             )
 
         return FittingEvaluatorComponents(base_evaluator, _build_deferred_fit_evaluator, None, True)
@@ -120,19 +220,18 @@ class FittingEvaluatorStateOwner:
         requested_solver: str,
         requested_rtol: float,
         requested_atol: float,
-        runtime_settings: Mapping[str, Any],
+        runtime_inputs: FittingEvaluatorRuntimeSettings,
     ) -> tuple[Any, Optional[PreparedSimulationMetadata]]:
         if not callable(self._simulation_builder):
             raise RuntimeError("Simulation builder unavailable.")
+        builder_kwargs = runtime_inputs.builder_kwargs()
         base_evaluator = self._simulation_builder(
             str(mechanism_text or ""),
             list(param_names),
             solver=str(requested_solver),
             rtol=float(requested_rtol),
             atol=float(requested_atol),
-            temperature_K=float(runtime_settings["temperature_K"]),
-            use_sparse_jacobian=bool(runtime_settings["use_sparse_jacobian"]),
-            wegscheider_cyclicity_enabled=bool(runtime_settings["wegscheider_cyclicity_enabled"]),
+            **builder_kwargs,
         )
         self._base_evaluator = base_evaluator
         return base_evaluator, self.prepared_simulation_meta(base_evaluator)
@@ -145,14 +244,14 @@ class FittingEvaluatorStateOwner:
             prepared = getattr(evaluator, "prepared_metadata", None)
         except Exception:
             prepared = None
-        meta = coerce_prepared_simulation_metadata(prepared)
+        meta = coerce_strict_fitting_prepared_metadata(prepared)
         if meta is not None:
             return meta
         try:
             prepared = getattr(evaluator, "_kindred_prepared_simulation_meta", None)
         except Exception:
             return None
-        return coerce_prepared_simulation_metadata(prepared)
+        return coerce_strict_fitting_prepared_metadata(prepared)
 
     @staticmethod
     def _prepared_solver_normalized(prepared_simulation: Optional[PreparedSimulationMetadata]) -> str:
@@ -183,25 +282,11 @@ class FittingEvaluatorStateOwner:
         return expected_hash == cls._mechanism_text_sha256(text) and expected_len == len(text)
 
     @staticmethod
-    def _prepared_simulation_matches_runtime_settings(
+    def _prepared_simulation_matches_runtime_inputs(
         prepared_simulation: Optional[PreparedSimulationMetadata],
-        runtime_settings: Mapping[str, Any],
+        runtime_inputs: FittingEvaluatorRuntimeSettings,
     ) -> bool:
-        if prepared_simulation is None:
-            return False
-        try:
-            prepared_temperature = float(prepared_simulation.temperature_K)
-            requested_temperature = float(runtime_settings["temperature_K"])
-        except Exception:
-            return False
-        return (
-            np.isfinite(prepared_temperature)
-            and np.isfinite(requested_temperature)
-            and math.isclose(prepared_temperature, requested_temperature, rel_tol=1e-9, abs_tol=1e-12)
-            and bool(prepared_simulation.use_sparse_jacobian) == bool(runtime_settings["use_sparse_jacobian"])
-            and bool(prepared_simulation.wegscheider_cyclicity_enabled)
-            == bool(runtime_settings["wegscheider_cyclicity_enabled"])
-        )
+        return prepared_simulation_matches_runtime_inputs(prepared_simulation, runtime_inputs)
 
     @staticmethod
     def _prepared_tolerances_match(

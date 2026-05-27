@@ -6,14 +6,13 @@ from typing import Any, Callable, Dict, List
 
 from kindred.core.simulator.dsl import extract_parameters_from_dsl
 from kindred.gui.controllers.dataset_errors import DatasetOwnerError
-from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 
 class MechanismParameterScanOwner:
     """Scan mechanism text for fittable parameters with cache ownership."""
 
-    def __init__(self, *, solver_settings_getter: Callable[[], Dict[str, Any]]) -> None:
-        self._solver_settings_getter = solver_settings_getter
+    def __init__(self, *, wegscheider_cyclicity_enabled_getter: Callable[[], bool]) -> None:
+        self._wegscheider_cyclicity_enabled_getter = wegscheider_cyclicity_enabled_getter
         self._param_scan_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def scan_mechanism_parameters(self, mechanism_text: str) -> List[Dict[str, Any]]:
@@ -21,16 +20,18 @@ class MechanismParameterScanOwner:
         if not cleaned:
             raise DatasetOwnerError("Mechanism text is empty.")
 
-        cfg = self._solver_settings_getter()
+        wegscheider_cyclicity_enabled = self._read_wegscheider_cyclicity_enabled()
 
-        mechanism_hash = self._param_scan_cache_key(cleaned, cfg)
+        mechanism_hash = self._param_scan_cache_key(
+            cleaned,
+            wegscheider_cyclicity_enabled=wegscheider_cyclicity_enabled,
+        )
         if mechanism_hash in self._param_scan_cache:
             return self._param_scan_cache[mechanism_hash]
 
         constrained: set[str] = set()
         scalar_params: Dict[str, float] = {}
         scalar_info: Dict[str, Dict[str, object]] = {}
-        cfg_dict: Dict[str, Any] = cfg if isinstance(cfg, dict) else {}
         try:
             from kindred.core.simulator.dsl import parse_dsl_to_mechanism
             from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
@@ -38,12 +39,7 @@ class MechanismParameterScanOwner:
 
             mech = parse_dsl_to_mechanism(cleaned, initials={})
             if isinstance(getattr(mech, "metadata", None), dict):
-                mech.metadata["wegscheider_cyclicity_enabled"] = bool(
-                    cfg_dict.get(
-                        "wegscheider_cyclicity_enabled",
-                        PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
-                    )
-                )
+                mech.metadata["wegscheider_cyclicity_enabled"] = wegscheider_cyclicity_enabled
             apply_parameter_algebra_to_mechanism(cleaned, mechanism=mech, require_mutable=False)
             constrained_meta = (getattr(mech, "metadata", {}) or {}).get("constrained_params") or {}
             if isinstance(constrained_meta, dict):
@@ -109,18 +105,18 @@ class MechanismParameterScanOwner:
         return unique_params
 
     @staticmethod
-    def _param_scan_cache_key(cleaned_mechanism: str, solver_cfg: Dict[str, Any] | None) -> str:
+    def _param_scan_cache_key(
+        cleaned_mechanism: str,
+        *,
+        wegscheider_cyclicity_enabled: bool,
+    ) -> str:
         import hashlib
         import json
 
-        cfg = solver_cfg or {}
+        if not isinstance(wegscheider_cyclicity_enabled, bool):
+            raise RuntimeError("Mechanism parameter scan requires an explicit Wegscheider setting.")
         solver_key = {
-            "wegscheider_cyclicity_enabled": bool(
-                cfg.get(
-                    "wegscheider_cyclicity_enabled",
-                    PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
-                )
-            ),
+            "wegscheider_cyclicity_enabled": wegscheider_cyclicity_enabled,
         }
         payload = json.dumps(
             {"mechanism": str(cleaned_mechanism), "solver": solver_key},
@@ -129,6 +125,16 @@ class MechanismParameterScanOwner:
             ensure_ascii=True,
         )
         return hashlib.md5(payload.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+    def _read_wegscheider_cyclicity_enabled(self) -> bool:
+        getter = self._wegscheider_cyclicity_enabled_getter
+        try:
+            value = getter()
+        except Exception as exc:
+            raise RuntimeError("Failed to read Wegscheider setting for mechanism parameter scan.") from exc
+        if not isinstance(value, bool):
+            raise RuntimeError("Mechanism parameter scan requires an explicit Wegscheider setting.")
+        return value
 
     def _suggest_parameter_bounds(self, param_name: str, param_value: float) -> tuple:
         if param_name.startswith("k") and param_name[0].lower() == "k":

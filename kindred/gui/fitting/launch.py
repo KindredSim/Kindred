@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import logging
+import math
 import os
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
@@ -28,9 +29,8 @@ from kindred.gui.fitting.batch_mapping import (
     select_batch_set,
     unique_batch_set_name,
 )
-from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
+from kindred.gui.fitting.runtime_inputs import FittingEvaluatorRuntimeSettings, FittingRuntimeInputs
 from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity
-from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 if TYPE_CHECKING:
     from kindred.gui.controllers.dataset_fit_settings_store import DatasetFitSettings
@@ -44,6 +44,7 @@ __all__ = [
     "FittingLaunchRejection",
     "FittingLaunchResult",
     "FittingLaunchSnapshot",
+    "GlobalFitLaunchSettings",
     "GlobalFitLaunchContext",
     "launch_global_fit_session",
     "validate_de_bounds",
@@ -155,6 +156,14 @@ class FittingLaunchSnapshot:
 
 
 @dataclass(frozen=True)
+class GlobalFitLaunchSettings:
+    solver: str
+    rtol: float
+    atol: float
+    runtime_inputs: FittingRuntimeInputs
+
+
+@dataclass(frozen=True)
 class GlobalFitLaunchContext:
     parent: QtWidgets.QWidget
     dataset_registry: Any
@@ -169,17 +178,62 @@ class GlobalFitLaunchContext:
     set_status: Callable[[str], None]
     sync_batch_species_columns: Callable[[List[str]], None]
     batch_initials_for_row: Callable[[int], Dict[str, float]]
-    get_solver_settings: Callable[[], Dict[str, object]]
-    temperature_getter: Callable[[], float]
+    fitting_settings_getter: Callable[[], GlobalFitLaunchSettings]
     num_points_getter: Callable[[], int]
-    register_fit_window: Callable[[QtWidgets.QWidget], None]
+    register_fit_window: Callable[..., object]
     apply_fit_results_to_project: Callable[[str, Dict[str, float], Dict[str, Dict[str, float]]], None]
     load_fitting_defaults: Callable[[], Dict[str, object]]
-    runtime_lane_budget: Callable[[int], int]
     batch_store: Any = None
     batch_model: Any = None
     batch_table: Any = None
     window_factory: Optional[Callable[..., QtWidgets.QWidget]] = None
+
+
+def _coerce_global_fit_launch_settings(raw_settings: object) -> GlobalFitLaunchSettings:
+    if not isinstance(raw_settings, GlobalFitLaunchSettings):
+        raise RuntimeError("Global Fit launch settings provider must return GlobalFitLaunchSettings.")
+    return GlobalFitLaunchSettings(
+        solver=_require_global_fit_launch_solver(raw_settings.solver),
+        rtol=_require_global_fit_positive_finite_float(raw_settings.rtol, "rtol"),
+        atol=_require_global_fit_positive_finite_float(raw_settings.atol, "atol"),
+        runtime_inputs=_require_global_fit_runtime_inputs(raw_settings.runtime_inputs),
+    )
+
+
+def _require_global_fit_runtime_inputs(value: object) -> FittingRuntimeInputs:
+    if not isinstance(value, FittingRuntimeInputs):
+        raise RuntimeError("Global Fit launch settings require typed runtime inputs.")
+    return value
+
+
+def _require_global_fit_launch_solver(value: object) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("Global Fit launch settings require explicit solver.")
+    solver_label = value.strip()
+    if not solver_label:
+        raise RuntimeError("Global Fit launch settings require explicit solver.")
+    return solver_label
+
+
+def _require_global_fit_positive_finite_float(value: object, label: str) -> float:
+    if isinstance(value, bool):
+        raise RuntimeError(f"Global Fit launch settings require numeric {label}.")
+    try:
+        numeric = float(value)
+    except Exception as exc:
+        raise RuntimeError(f"Global Fit launch settings require numeric {label}.") from exc
+    if not math.isfinite(numeric) or numeric <= 0.0:
+        raise RuntimeError(f"Global Fit launch settings require positive finite {label}.")
+    return numeric
+
+
+def _read_global_fit_launch_settings(context: GlobalFitLaunchContext) -> GlobalFitLaunchSettings:
+    getter = context.fitting_settings_getter
+    try:
+        raw_settings = getter()
+    except Exception as exc:
+        raise RuntimeError("Failed to read Global Fit launch settings.") from exc
+    return _coerce_global_fit_launch_settings(raw_settings)
 
 
 def _record_failure(
@@ -522,7 +576,8 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         max_len = 2
 
     grid_points = max(2, int(context.num_points_getter()), int(max_len))
-    solver_settings = dict(context.get_solver_settings() or {})
+    launch_settings = _read_global_fit_launch_settings(context)
+
     def _build_simulation(
         mechanism_text_for_run: str,
         param_names_for_run: List[str],
@@ -534,79 +589,48 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         use_sparse_jacobian: Optional[bool] = None,
         wegscheider_cyclicity_enabled: Optional[bool] = None,
     ):
-        current_solver_settings = solver_settings
-        needs_live_solver_settings = (
-            solver is None
-            or rtol is None
-            or atol is None
-            or use_sparse_jacobian is None
-            or wegscheider_cyclicity_enabled is None
-        )
-        if needs_live_solver_settings:
-            try:
-                current_solver_settings = dict(context.get_solver_settings() or {})
-            except Exception:
-                current_solver_settings = solver_settings
-
-        current_solver_settings = dict(current_solver_settings or {})
         from kindred.core.simulator.solvers import normalize_solver_name
 
-        current_solver_settings.setdefault("solver", FITTING_DEFAULT_SOLVER)
-        current_solver_settings.setdefault("rtol", 1e-6)
-        current_solver_settings.setdefault("atol", 1e-12)
-        current_solver_settings.setdefault("use_sparse_jacobian", bool(PROJECT_DEFAULTS["use_sparse_jacobian"]))
-        current_solver_settings.setdefault(
-            "wegscheider_cyclicity_enabled",
-            bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]),
+        solver_label = _require_global_fit_launch_solver(
+            solver if solver is not None else launch_settings.solver
         )
-
-        solver_label = str(solver or current_solver_settings.get("solver") or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
         solver_value, _solver_warning = normalize_solver_name(solver_label)
-        rtol_value = float(rtol if rtol is not None else (current_solver_settings.get("rtol") or 1e-6))
-        atol_value = float(atol if atol is not None else (current_solver_settings.get("atol") or 1e-12))
-        temperature_value = float(temperature_K) if temperature_K is not None else float(context.temperature_getter())
-        sparse_value = (
-            bool(use_sparse_jacobian)
-            if use_sparse_jacobian is not None
-            else bool(current_solver_settings.get("use_sparse_jacobian"))
+        rtol_value = _require_global_fit_positive_finite_float(
+            rtol if rtol is not None else launch_settings.rtol,
+            "rtol",
         )
-        wegscheider_value = (
-            bool(wegscheider_cyclicity_enabled)
-            if wegscheider_cyclicity_enabled is not None
-            else bool(current_solver_settings.get("wegscheider_cyclicity_enabled"))
+        atol_value = _require_global_fit_positive_finite_float(
+            atol if atol is not None else launch_settings.atol,
+            "atol",
+        )
+        evaluator_inputs = launch_settings.runtime_inputs.evaluator
+        runtime_settings = FittingEvaluatorRuntimeSettings(
+            temperature_K=(
+                temperature_K if temperature_K is not None else evaluator_inputs.temperature_K
+            ),
+            use_sparse_jacobian=(
+                use_sparse_jacobian
+                if use_sparse_jacobian is not None
+                else evaluator_inputs.use_sparse_jacobian
+            ),
+            wegscheider_cyclicity_enabled=(
+                wegscheider_cyclicity_enabled
+                if wegscheider_cyclicity_enabled is not None
+                else evaluator_inputs.wegscheider_cyclicity_enabled
+            ),
         )
         fit_context = prepare_fitting_execution_context(
             mechanism_text=str(mechanism_text_for_run or ""),
             param_names=[str(x) for x in (param_names_for_run or []) if str(x)],
             t_end=max_time,
             num_points=grid_points,
-            temperature_K=temperature_value,
             solver=solver_value,
             rtol=rtol_value,
             atol=atol_value,
-            use_sparse_jacobian=sparse_value,
-            wegscheider_cyclicity_enabled=wegscheider_value,
+            **runtime_settings.builder_kwargs(),
             initial_prefix=initial_prefix,
         )
         return SerialFittingEvaluator(fit_context)
-
-    def _runtime_settings_for_fit_window() -> Dict[str, object]:
-        current_solver_settings = dict(context.get_solver_settings() or {})
-        return {
-            "temperature_K": float(context.temperature_getter()),
-            "use_sparse_jacobian": bool(
-                current_solver_settings.get(
-                    "use_sparse_jacobian",
-                    PROJECT_DEFAULTS["use_sparse_jacobian"],
-                )
-            ),
-            "wegscheider_cyclicity_enabled": bool(
-                current_solver_settings.get(
-                    "wegscheider_cyclicity_enabled",
-                    PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
-                )
-            ),
-        }
 
     window_factory = _resolve_window_factory(context)
     window = window_factory(
@@ -622,18 +646,17 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         reactions_text_getter=context.reactions_text_getter,
         reactions_text_setter=context.reactions_text_setter,
         simulation_builder=_build_simulation,
-        runtime_settings_getter=_runtime_settings_for_fit_window,
+        runtime_inputs=launch_settings.runtime_inputs,
         dataset_params=dataset_params,
         dataset_variable_params=dataset_variable_params,
         dataset_payloads=dataset_payloads,
         dataset_payload_results=dataset_payload_results,
         dataset_weights=weights,
-        runtime_lane_budget=context.runtime_lane_budget,
         project_apply_callback=context.apply_fit_results_to_project,
         config_defaults=context.load_fitting_defaults(),
         parent=context.parent,
     )
     window.setWindowTitle(f"Global Fit – {dataset_label}")
     context.set_status(f"Global fitting window open ({dataset_label})")
-    context.register_fit_window(window)
+    context.register_fit_window(window, runtime_inputs=launch_settings.runtime_inputs)
     return window

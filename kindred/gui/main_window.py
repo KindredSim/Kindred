@@ -39,6 +39,7 @@ from kindred.core.validation import try_parse_finite_float
 from kindred.gui.project_schema import (
     FITTING_DEFAULTS_KEYS,
     PROJECT_DEFAULTS,
+    SIMULATION_TEMPERATURE_K_RANGE,
     validate_project_payload,
 )
 
@@ -66,6 +67,11 @@ from kindred.gui.app_wiring import (
     load_solver_contract,
 )
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
+from kindred.gui.fitting.runtime_inputs import (
+    FittingEvaluatorRuntimeSettings,
+    FittingRuntimeInputPublisher,
+    FittingRuntimeInputs,
+)
 from kindred.gui.ports import DisplayRefreshSource
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.mechanism_session_owner import MechanismSessionOwner
@@ -76,7 +82,7 @@ from kindred.gui.simulation_mechanism_owner import SimulationMechanismOwner
 from kindred.gui.simulation_provenance_owner import SimulationProvenanceOwner
 from kindred.gui.simulation_run_ui_owner import SimulationRunUiOwner
 from kindred.gui.simulation_settings_owner import SimulationSettingsOwner
-from kindred.gui.simulation_solver_owner import SimulationSolverOwner
+from kindred.gui.simulation_solver_owner import SimulationSolverOwner, resolve_solver_tolerance
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 from kindred.gui.mixins.ports import FittingMixinPorts, ProfileMixinPorts
 from kindred.gui.mixins.fitting_mixin import FittingMixin
@@ -171,6 +177,7 @@ class MainWindow(
         self._init_mechanism_dock_and_panel()
         self._init_sliders_dock()
         self._init_batch_dock_and_panel()
+        self._init_fitting_runtime_input_publisher()
         self._init_right_dock_and_datasets()
         self._init_symbolic_calculator_dock()
         self._init_bottom_analysis_dock()
@@ -437,6 +444,32 @@ class MainWindow(
         self._batch_dock.setWidget(batch_dock_components.container)
         self.addDockWidget(self._default_dock_area(self._batch_dock), self._batch_dock)
 
+    def _init_fitting_runtime_input_publisher(self) -> None:
+        self._fitting_runtime_input_publisher = FittingRuntimeInputPublisher(
+            capture_inputs=self._capture_fitting_runtime_inputs,
+            record_failure=self._record_fitting_best_effort_failure,
+        )
+
+    @property
+    def fitting_runtime_input_publisher(self) -> FittingRuntimeInputPublisher:
+        return self._fitting_runtime_input_publisher
+
+    def _capture_fitting_runtime_inputs(self) -> FittingRuntimeInputs:
+        return FittingRuntimeInputs(
+            evaluator=FittingEvaluatorRuntimeSettings(
+                temperature_K=self._require_global_fit_temperature(self._temperature_spinbox.value()),
+                use_sparse_jacobian=self._require_global_fit_bool(
+                    "_use_sparse_jacobian",
+                    "use_sparse_jacobian",
+                ),
+                wegscheider_cyclicity_enabled=self._require_global_fit_bool(
+                    "_wegscheider_cyclicity_enabled",
+                    "wegscheider_cyclicity_enabled",
+                ),
+            ),
+            batch_runtime_lane_budget=int(self._sim_controller.batch_runtime_lane_budget),
+        )
+
     def _wire_mechanism_editor_signals(self) -> None:
         sliders = self._mechanism_editor._variable_sliders
         sliders.variableChanged.connect(self._on_variable_changed)
@@ -636,7 +669,10 @@ class MainWindow(
             bool(outcome.runtime_input_invalidation_required)
             or bool(outcome.runtime_invalidation_required)
         ):
-            self._notify_active_fit_windows_runtime_inputs_changed()
+            self._fitting_runtime_input_publisher.publish_current(
+                reason="authoritative mechanism transition",
+                force=True,
+            )
         return outcome
 
     def _apply_canonical_batch_initials_transition(
@@ -809,7 +845,7 @@ class MainWindow(
 
     def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
         self._update_temperature_mode_indicator()
-        self._notify_active_fit_windows_runtime_inputs_changed()
+        self._fitting_runtime_input_publisher.publish_if_changed(reason="temperature changed")
 
     @staticmethod
     def _state_network_dialog_info_text(*, locked: bool) -> str:
@@ -1229,7 +1265,7 @@ class MainWindow(
             plot_tabs=self._plot_tabs,
             mechanism_getter=self._get_mechanism_text,
             simulation_runner=self._run_dataset_simulation,
-            solver_settings_getter=self._get_solver_settings,
+            wegscheider_cyclicity_enabled_getter=self._get_wegscheider_cyclicity_enabled,
         )
         self._right_dock = right_dock_components.dock
         self._right_panel = right_dock_components.panel
@@ -1262,8 +1298,10 @@ class MainWindow(
             extract_mechanism_initials=self._extract_mechanism_initials,
             sync_batch_species_columns=self.sync_batch_species_columns,
             record_failure=self._record_best_effort_failure,
-            runtime_inputs_changed=self._notify_active_fit_windows_runtime_inputs_changed,
-            datasets_removed=self._notify_active_fit_windows_datasets_removed,
+            runtime_inputs_changed=lambda: self._fitting_runtime_input_publisher.publish_if_changed(
+                reason="dataset import runtime inputs changed"
+            ),
+            datasets_removed=self._fitting_runtime_input_publisher.publish_datasets_removed,
             message_parent=self,
         )
 
@@ -2280,34 +2318,31 @@ class MainWindow(
         *,
         field_name: str,
         current_value: Optional[float],
-    ) -> Optional[float]:
-        if value is None:
-            logger.warning(
-                "Invalid solver tolerance %s=%r; keeping current value %s",
-                field_name,
-                value,
-                current_value,
-            )
-            return current_value
+    ) -> float:
+        resolved = resolve_solver_tolerance(
+            value,
+            field_name=field_name,
+            current_value=current_value,
+            default_value=PROJECT_DEFAULTS[field_name],
+        )
         try:
             parsed = float(value)
         except (TypeError, ValueError):
+            parsed = float("nan")
+        if (
+            value is None
+            or isinstance(value, bool)
+            or not math.isfinite(parsed)
+            or parsed <= 0.0
+            or parsed != resolved
+        ):
             logger.warning(
-                "Invalid solver tolerance %s=%r; keeping current value %s",
+                "Invalid solver tolerance %s=%r; using resolved value %s",
                 field_name,
                 value,
-                current_value,
+                resolved,
             )
-            return current_value
-        if not math.isfinite(parsed) or parsed <= 0.0:
-            logger.warning(
-                "Invalid solver tolerance %s=%r; keeping current value %s",
-                field_name,
-                value,
-                current_value,
-            )
-            return current_value
-        return float(parsed)
+        return resolved
 
     def _apply_solver_runtime_state(
         self,
@@ -3645,6 +3680,65 @@ class MainWindow(
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
         }
 
+    def _get_wegscheider_cyclicity_enabled(self) -> bool:
+        value = getattr(self, "_wegscheider_cyclicity_enabled", None)
+        if not isinstance(value, bool):
+            raise RuntimeError("Wegscheider setting is not available.")
+        return value
+
+    def _get_global_fit_launch_settings(self) -> object:
+        from kindred.gui.fitting.launch import GlobalFitLaunchSettings
+
+        solver_contract = load_solver_contract()
+        solver_label = str(self._initial_solver or "").strip()
+        if not solver_label:
+            raise RuntimeError("Global Fit launch settings require explicit solver.")
+        solver_method, _solver_warning = solver_contract.normalize_solver_name(solver_label)
+        rtol = self._require_global_fit_tolerance("_initial_rtol", "rtol")
+        atol = self._require_global_fit_tolerance("_initial_atol", "atol")
+        return GlobalFitLaunchSettings(
+            solver=str(solver_method),
+            rtol=float(rtol),
+            atol=float(atol),
+            runtime_inputs=self._fitting_runtime_input_publisher.current_inputs(),
+        )
+
+    def _require_global_fit_tolerance(self, attr_name: str, label: str) -> float:
+        value = getattr(self, attr_name, None)
+        if value is None:
+            raise RuntimeError(f"Global Fit launch settings require explicit {label}.")
+        try:
+            numeric = float(value)
+        except Exception as exc:
+            raise RuntimeError(f"Global Fit launch settings require numeric {label}.") from exc
+        if not math.isfinite(numeric) or numeric <= 0.0:
+            raise RuntimeError(f"Global Fit launch settings require positive finite {label}.")
+        return numeric
+
+    def _require_global_fit_bool(self, attr_name: str, label: str) -> bool:
+        value = getattr(self, attr_name, None)
+        if not isinstance(value, bool):
+            raise RuntimeError(f"Global Fit launch settings require explicit {label}.")
+        return value
+
+    def _require_global_fit_temperature(self, value: object) -> float:
+        if isinstance(value, bool):
+            raise RuntimeError("Global Fit launch settings require numeric temperature_K.")
+        try:
+            numeric = float(value)
+        except Exception as exc:
+            raise RuntimeError("Global Fit launch settings require numeric temperature_K.") from exc
+        min_temperature, max_temperature = SIMULATION_TEMPERATURE_K_RANGE
+        if (
+            not math.isfinite(numeric)
+            or numeric < float(min_temperature)
+            or numeric > float(max_temperature)
+        ):
+            raise RuntimeError(
+                "Global Fit launch settings require temperature_K within the simulation temperature range."
+            )
+        return numeric
+
     def _serialize_project_state(self) -> Dict[str, Any]:
         """Create a snapshot of the current project."""
         from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -3744,10 +3838,11 @@ class MainWindow(
             int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) + 1
         )
         try:
-            (
-                simulation_runtime_settings_changed,
-                batch_runtime_pool_settings_changed,
-            ) = self._apply_project_payload_inner(data, record_undo=record_undo)
+            with self._fitting_runtime_input_publisher.transaction(reason="project apply"):
+                (
+                    simulation_runtime_settings_changed,
+                    batch_runtime_pool_settings_changed,
+                ) = self._apply_project_payload_inner(data, record_undo=record_undo)
         finally:
             self._authoritative_mechanism_runtime_refresh_defer_depth = max(
                 0,
@@ -4810,7 +4905,10 @@ class MainWindow(
             )
         )
         if affected:
-            self._notify_active_fit_windows_runtime_inputs_changed()
+            self._fitting_runtime_input_publisher.publish_current(
+                reason="batch set dataset mapping changed",
+                force=True,
+            )
         return affected
 
     def _select_single_batch_row(self, row: int) -> None:
@@ -7496,11 +7594,6 @@ class MainWindow(
             current_atol = float(self._initial_atol or 1e-12)
             current_sparse = bool(self._use_sparse_jacobian)
             current_wegscheider = bool(self._wegscheider_cyclicity_enabled)
-            previous_fit_runtime_settings = {
-                "use_sparse_jacobian": bool(current_sparse),
-                "wegscheider_cyclicity_enabled": bool(current_wegscheider),
-                "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
-            }
             current_runtime_settings = {
                 "solver": str(current_solver),
                 "rtol": float(current_rtol),
@@ -7644,13 +7737,7 @@ class MainWindow(
                 "limit_blas_threads_per_worker",
                 self._sim_controller.parallel_batch.limit_blas_threads_per_worker,
             )
-            next_fit_runtime_settings = {
-                "use_sparse_jacobian": bool(self._use_sparse_jacobian),
-                "wegscheider_cyclicity_enabled": bool(self._wegscheider_cyclicity_enabled),
-                "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
-            }
-            if next_fit_runtime_settings != previous_fit_runtime_settings:
-                self._notify_active_fit_windows_runtime_inputs_changed()
+            self._fitting_runtime_input_publisher.publish_if_changed(reason="solver settings applied")
             slider_schema_refresh_needed = bool(
                 current_runtime_settings["wegscheider_cyclicity_enabled"]
                 != next_runtime_settings["wegscheider_cyclicity_enabled"]
@@ -7774,7 +7861,7 @@ class MainWindow(
         self._poll_interactive_runtime_readiness_after_refresh()
 
     def _prepare_fit_window_shutdown_for_close(self) -> bool:
-        tracked_windows = list(getattr(self, "_active_fit_windows", []) or [])
+        tracked_windows = list(self._fitting_runtime_input_publisher.active_windows())
         all_closed = True
 
         for window in tracked_windows:
@@ -7794,7 +7881,8 @@ class MainWindow(
                 continue
 
             try:
-                if bool(window.isVisible()):
+                is_visible = getattr(window, "isVisible", None)
+                if callable(is_visible) and bool(is_visible()):
                     all_closed = False
             except RuntimeError:
                 continue

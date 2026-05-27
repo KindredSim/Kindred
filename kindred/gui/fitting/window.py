@@ -45,7 +45,6 @@ from kindred.core.fitting_evaluation import (
     evaluate_fitting_series,
 )
 from kindred.core.fitting_runtime_session import FittingRuntimeLedger, FittingRuntimeSession
-from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulation_preparation import PreparedSimulationMetadata
 from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
@@ -80,7 +79,12 @@ from kindred.gui.fitting.runtime_readiness import (
 )
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
-from kindred.gui.fitting.evaluator_state import FittingEvaluatorStateOwner
+from kindred.gui.fitting.evaluator_state import (
+    FittingEvaluatorStateOwner,
+    coerce_strict_fitting_prepared_metadata,
+    prepared_simulation_matches_runtime_inputs,
+)
+from kindred.gui.fitting.runtime_inputs import FittingRuntimeInputs
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.run_state import FittingRunStateOwner
@@ -289,8 +293,7 @@ class FittingWindow(QtWidgets.QDialog):
         reactions_text_getter: Optional[Callable[[], str]] = None,
         reactions_text_setter: Optional[Callable[[str], None]] = None,
         simulation_builder: Optional[SimulationBuilder] = None,
-        runtime_settings_getter: Optional[Callable[[], Mapping[str, Any]]] = None,
-        runtime_lane_budget: Optional[Callable[[int], int]] = None,
+        runtime_inputs: Optional[FittingRuntimeInputs] = None,
         dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
         dataset_variable_params: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
         dataset_payloads: Optional[Sequence[Dict[str, Any]]] = None,
@@ -330,16 +333,15 @@ class FittingWindow(QtWidgets.QDialog):
             if callable(simulation_builder)
             else None
         )
-        if runtime_lane_budget is None:
-            raise ValueError("FittingWindow requires an explicit runtime_lane_budget provider.")
+        if not isinstance(runtime_inputs, FittingRuntimeInputs):
+            raise ValueError("FittingWindow requires explicit typed runtime inputs.")
 
         self._fit_evaluator_state = FittingEvaluatorStateOwner(
             base_evaluator=simulation_func,
             simulation_builder=self._simulation_builder,
         )
         self._last_launch_result: Optional[FittingLaunchResult] = None
-        self._runtime_settings_getter = runtime_settings_getter
-        self._runtime_lane_budget = runtime_lane_budget
+        self._runtime_inputs = runtime_inputs
         self._project_apply_callback = project_apply_callback
         self._config_defaults = dict(config_defaults or {})
 
@@ -509,10 +511,8 @@ class FittingWindow(QtWidgets.QDialog):
     def fit_runtime_readiness(self) -> FittingRuntimeReadinessController:
         return self._fit_runtime_readiness
 
-    def _runtime_lane_budget_for_dataset_count(self, dataset_count: int) -> int:
-        provider = self._runtime_lane_budget
-        value = int(provider(max(1, int(dataset_count))))
-        return max(1, int(value))
+    def _runtime_lane_count_for_dataset_count(self, dataset_count: int) -> int:
+        return int(self._runtime_inputs.lane_count_for_dataset_count(max(1, int(dataset_count))))
 
     def collect_dataset_selection(self) -> FittingLaunchDatasetSelection:
         rows = []
@@ -773,7 +773,8 @@ class FittingWindow(QtWidgets.QDialog):
             dataset_overrides=list(dataset_overrides),
         )
         if prepared_simulation is None:
-            stamp["runtime_request"] = {
+            stamp["runtime_inputs"] = self._runtime_inputs.to_stamp_payload()
+            stamp["runtime_identity_request"] = {
                 "solver": str(requested_solver),
                 "rtol": f"{float(rtol):.12g}",
                 "atol": f"{float(atol):.12g}",
@@ -783,7 +784,6 @@ class FittingWindow(QtWidgets.QDialog):
                     mechanism_text=mechanism_text,
                 ),
             }
-            stamp["runtime_request"].update(self._runtime_settings_for_identity())
         stamp_hash = hash_global_fit_run_stamp(stamp)
         stamp_short = str(stamp_hash)[:12]
         fixed_params = self._fixed_params_for_run(config)
@@ -799,7 +799,7 @@ class FittingWindow(QtWidgets.QDialog):
                     fit_evaluator=self._simulation_with_fixed_params(base_evaluator, fixed_snapshot),
                 )
 
-        lane_budget = self._runtime_lane_budget_for_dataset_count(len(dataset_specs))
+        lane_budget = self._runtime_lane_count_for_dataset_count(len(dataset_specs))
         return FittingRuntimeIdentity(
             datasets=tuple(dataset_specs),
             config=config,
@@ -1256,7 +1256,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_run_button_enabled_state()
         self._fit_runtime_preparation_owner.schedule_refresh()
 
-    def handle_external_runtime_inputs_changed(self) -> None:
+    def apply_runtime_inputs(self, runtime_inputs: FittingRuntimeInputs) -> None:
+        if not isinstance(runtime_inputs, FittingRuntimeInputs):
+            raise RuntimeError("FittingWindow requires typed runtime inputs.")
+        self._runtime_inputs = runtime_inputs
         self._on_fit_runtime_inputs_changed()
 
     def handle_external_datasets_removed(self, dataset_ids: Sequence[str]) -> None:
@@ -1266,7 +1269,6 @@ class FittingWindow(QtWidgets.QDialog):
             if str(dataset_id).strip()
         }
         if not remove_set:
-            self._on_fit_runtime_inputs_changed()
             return
         self._deauthorize_project_datasets(remove_set)
 
@@ -1274,7 +1276,6 @@ class FittingWindow(QtWidgets.QDialog):
         """Purge project-deleted datasets from this fit window's authorized pool."""
         remove_set = {str(x).strip() for x in (dataset_ids or []) if str(x).strip()}
         if not remove_set:
-            self._on_fit_runtime_inputs_changed()
             return
         invalidated_authority = self._apply_authority_owner.clear_if_depends_on_any(remove_set)
         authority_invalidated = invalidated_authority is not None
@@ -1590,34 +1591,30 @@ class FittingWindow(QtWidgets.QDialog):
         if not math.isclose(float(atol), float(identity.requested_atol), rel_tol=1e-9, abs_tol=1e-12):
             return False
         try:
-            current_lane_count = self._runtime_lane_budget_for_dataset_count(len(identity.datasets))
+            current_lane_count = self._runtime_lane_count_for_dataset_count(len(identity.datasets))
         except Exception:
             return False
         if int(current_lane_count) != int(identity.lane_count):
             return False
-        return self._fit_runtime_identity_matches_runtime_settings(identity)
+        return self._fit_runtime_identity_matches_runtime_inputs(identity)
 
-    def _fit_runtime_identity_matches_runtime_settings(self, identity: FittingRuntimeIdentity) -> bool:
+    def _fit_runtime_identity_matches_runtime_inputs(self, identity: FittingRuntimeIdentity) -> bool:
         if not callable(getattr(self, "_simulation_builder", None)):
             return True
-        current = self._runtime_settings_for_identity()
         stamp = dict(identity.stamp or {})
         prepared = stamp.get("prepared_simulation")
         if isinstance(prepared, Mapping):
-            return (
-                str(prepared.get("temperature_K") or "") == str(current.get("temperature_K") or "")
-                and bool(prepared.get("use_sparse_jacobian")) == bool(current.get("use_sparse_jacobian"))
-                and bool(prepared.get("wegscheider_cyclicity_enabled"))
-                == bool(current.get("wegscheider_cyclicity_enabled"))
+            return prepared_simulation_matches_runtime_inputs(
+                coerce_strict_fitting_prepared_metadata(prepared),
+                self._runtime_inputs.evaluator,
             )
-        runtime_request = stamp.get("runtime_request")
-        if isinstance(runtime_request, Mapping):
-            for key, value in current.items():
-                if key not in runtime_request:
-                    return False
-                if str(runtime_request.get(key)) != str(value):
-                    return False
-        return True
+        stamped_inputs = stamp.get("runtime_inputs")
+        if isinstance(stamped_inputs, Mapping):
+            try:
+                return FittingRuntimeInputs.from_stamp_payload(stamped_inputs).identity_key() == self._runtime_inputs.identity_key()
+            except RuntimeError:
+                return False
+        return False
 
     def _fitting_evaluator_components_for_runtime_identity(
         self,
@@ -1634,68 +1631,21 @@ class FittingWindow(QtWidgets.QDialog):
             requested_solver=requested_solver,
             requested_rtol=requested_rtol,
             requested_atol=requested_atol,
-            runtime_settings=self._runtime_settings_for_identity(),
+            runtime_inputs=self._runtime_inputs.evaluator,
             param_names_for_readiness=self._param_names_for_readiness_identity,
         )
 
-    def _runtime_settings_for_identity(self) -> dict[str, object]:
-        settings: Mapping[str, Any] = {}
-        getter = getattr(self, "_runtime_settings_getter", None)
-        if callable(getter):
-            try:
-                raw_settings = getter()
-                if isinstance(raw_settings, Mapping):
-                    settings = raw_settings
-            except Exception as exc:
-                raise RuntimeError("Failed to read fitting runtime settings.") from exc
-        try:
-            temperature = float(settings.get("temperature_K", PROJECT_DEFAULTS["temperature_K"]))
-        except Exception:
-            temperature = float(PROJECT_DEFAULTS["temperature_K"])
-        return {
-            "temperature_K": f"{temperature:.12g}",
-            "use_sparse_jacobian": bool(
-                settings.get(
-                    "use_sparse_jacobian",
-                    PROJECT_DEFAULTS["use_sparse_jacobian"],
-                )
-            ),
-            "wegscheider_cyclicity_enabled": bool(
-                settings.get(
-                    "wegscheider_cyclicity_enabled",
-                    PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
-                )
-            ),
-        }
-
-    def _prepared_simulation_matches_runtime_settings(
+    def _prepared_simulation_matches_runtime_inputs(
         self,
         prepared_simulation: Optional[PreparedSimulationMetadata],
     ) -> bool:
-        if prepared_simulation is None:
-            return False
-        runtime_settings = self._runtime_settings_for_identity()
-        try:
-            prepared_temperature = float(prepared_simulation.temperature_K)
-            requested_temperature = float(runtime_settings["temperature_K"])
-        except Exception:
-            return False
-        return (
-            np.isfinite(prepared_temperature)
-            and np.isfinite(requested_temperature)
-            and math.isclose(prepared_temperature, requested_temperature, rel_tol=1e-9, abs_tol=1e-12)
-            and bool(prepared_simulation.use_sparse_jacobian) == bool(runtime_settings["use_sparse_jacobian"])
-            and bool(prepared_simulation.wegscheider_cyclicity_enabled)
-            == bool(runtime_settings["wegscheider_cyclicity_enabled"])
+        return prepared_simulation_matches_runtime_inputs(
+            prepared_simulation,
+            self._runtime_inputs.evaluator,
         )
 
-    def _runtime_settings_for_builder_kwargs(self) -> dict[str, object]:
-        runtime_settings = self._runtime_settings_for_identity()
-        return {
-            "temperature_K": float(runtime_settings["temperature_K"]),
-            "use_sparse_jacobian": bool(runtime_settings["use_sparse_jacobian"]),
-            "wegscheider_cyclicity_enabled": bool(runtime_settings["wegscheider_cyclicity_enabled"]),
-        }
+    def _runtime_inputs_for_builder_kwargs(self) -> dict[str, object]:
+        return self._runtime_inputs.evaluator.builder_kwargs()
 
     def _param_names_for_readiness_identity(
         self,
@@ -2261,7 +2211,7 @@ class FittingWindow(QtWidgets.QDialog):
                 requested_solver=str(solver),
                 requested_rtol=float(rtol),
                 requested_atol=float(atol),
-                runtime_settings=self._runtime_settings_for_identity(),
+                runtime_inputs=self._runtime_inputs.evaluator,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Add Observable", f"Failed to refresh simulation:\n\n{exc}")
@@ -2739,7 +2689,7 @@ class FittingWindow(QtWidgets.QDialog):
                     mechanism_matches
                     and
                     current_solver == requested_solver
-                    and self._prepared_simulation_matches_runtime_settings(prepared_simulation)
+                    and self._prepared_simulation_matches_runtime_inputs(prepared_simulation)
                     and np.isfinite(current_rtol)
                     and np.isfinite(current_atol)
                     and math.isclose(float(current_rtol), float(requested_rtol), rel_tol=1e-9, abs_tol=1e-12)
@@ -2756,14 +2706,13 @@ class FittingWindow(QtWidgets.QDialog):
                 current_param_names = self._refresh_parameter_definitions_for_mechanism(mechanism_text)
             if not current_param_names:
                 current_param_names = list(param_names)
-            runtime_settings = self._runtime_settings_for_identity()
             _base_simulation, prepared_simulation = self._fit_evaluator_state.build_and_set(
                 mechanism_text=mechanism_text,
                 param_names=list(current_param_names),
                 requested_solver=str(requested_solver),
                 requested_rtol=float(requested_rtol),
                 requested_atol=float(requested_atol),
-                runtime_settings=runtime_settings,
+                runtime_inputs=self._runtime_inputs.evaluator,
             )
         except SimulationBuilderContractError as exc:
             logger.error("Simulation builder contract mismatch: %s", exc)
@@ -3760,6 +3709,9 @@ class FittingWindow(QtWidgets.QDialog):
     # ------------------------------------------------------------------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[name-defined]
         self._closing = True
+        self._fit_run_state_owner.mark_superseded()
+        self._invalidate_fit_result_authority()
+        self._fit_run_state_owner.clear_active_dataset_ids()
         self._hard_teardown_worker(reason="Cancelling...", disable_ui=True)
         if not self._fit_runtime_readiness.close(kill=True):
             self._fit_runtime_readiness.request_close_after_prepare()

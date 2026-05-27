@@ -130,6 +130,68 @@ def test_project_payload_without_state_network_clears_existing_state_network(mai
     assert stale_state_network_text not in main_window.get_mechanism_text()
 
 
+def test_project_apply_publishes_final_fit_runtime_inputs_once_after_project_settings(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    publisher = getattr(main_window, "fitting_runtime_input_publisher", None)
+    if publisher is None:
+        publisher = getattr(main_window, "_fitting_runtime_input_publisher", None)
+    assert publisher is not None
+
+    notifications: list[dict[str, object]] = []
+
+    class _FitWindow:
+        def apply_runtime_inputs(self, runtime_inputs, **_kwargs) -> None:
+            evaluator = runtime_inputs.evaluator
+            notifications.append(
+                {
+                    "temperature_K": float(evaluator.temperature_K),
+                    "use_sparse_jacobian": bool(evaluator.use_sparse_jacobian),
+                    "wegscheider_cyclicity_enabled": bool(evaluator.wegscheider_cyclicity_enabled),
+                    "batch_runtime_lane_budget": int(runtime_inputs.batch_runtime_lane_budget),
+                }
+            )
+
+        def close(self) -> bool:
+            return True
+
+    publisher.register_window(_FitWindow())
+
+    original_programmatic_load = main_window._on_programmatic_mechanism_load
+
+    def _programmatic_load_probe(*args, **kwargs):
+        publisher.publish_current(reason="programmatic mechanism load probe", force=True)
+        assert notifications == []
+        return original_programmatic_load(*args, **kwargs)
+
+    monkeypatch.setattr(main_window, "_on_programmatic_mechanism_load", _programmatic_load_probe)
+
+    original_temperature = float(main_window._temperature_spinbox.value())
+    original_sparse = bool(main_window._use_sparse_jacobian)
+    original_wegscheider = bool(main_window._wegscheider_cyclicity_enabled)
+    original_lane_budget = int(main_window.simulation_controller.batch_runtime_lane_budget)
+
+    payload = dict(main_window._serialize_project_state())
+    payload["use_sparse_jacobian"] = not original_sparse
+    payload["wegscheider_cyclicity_enabled"] = not original_wegscheider
+    payload["batch_runtime_lane_budget"] = original_lane_budget + 1
+    payload["temperature_K"] = original_temperature
+
+    main_window._apply_project_payload(payload, record_undo=False)
+    qt_app.processEvents()
+
+    assert notifications == [
+        {
+            "temperature_K": original_temperature,
+            "use_sparse_jacobian": not original_sparse,
+            "wegscheider_cyclicity_enabled": not original_wegscheider,
+            "batch_runtime_lane_budget": original_lane_budget + 1,
+        }
+    ]
+
+
 def test_invalid_project_mechanism_source_is_rejected_before_session_reset(main_window, monkeypatch):
     payload = dict(main_window._serialize_project_state())
     payload["mechanism_source"] = {

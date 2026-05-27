@@ -440,7 +440,9 @@ def finalize_global_fit_run_stamp_prepared_simulation(
     if prepared_block is None:
         return finalized
     finalized["prepared_simulation"] = prepared_block
-    finalized.pop("runtime_request", None)
+    for key in tuple(finalized):
+        if str(key).startswith("runtime_"):
+            finalized.pop(key, None)
     return finalized
 
 
