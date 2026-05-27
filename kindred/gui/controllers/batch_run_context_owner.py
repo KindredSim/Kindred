@@ -1216,6 +1216,7 @@ class BatchRunContextOwner:
             warnings=tuple(deepcopy(dict(warning)) for warning in entry.warnings if isinstance(warning, Mapping)),
             completion_provenance=deepcopy(dict(entry.completion_provenance or {})),
             owned_species=owned_species,
+            display_species=tuple(str(name) for name in entry.display_species if str(name)),
         )
         raw[self._COMPLETION_DISPLAY_ENTRIES_KEY] = entries
         unavailable = [
@@ -1524,6 +1525,7 @@ class BatchRunContextOwner:
                 warnings=tuple(deepcopy(dict(warning)) for warning in value.warnings if isinstance(warning, Mapping)),
                 completion_provenance=deepcopy(dict(value.completion_provenance or {})),
                 owned_species=tuple(str(name) for name in value.owned_species if str(name)),
+                display_species=tuple(str(name) for name in value.display_species if str(name)),
             )
         return None
 

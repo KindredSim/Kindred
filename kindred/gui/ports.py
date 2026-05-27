@@ -38,6 +38,7 @@ class CopyAllDisplayBlock:
     series: Dict[str, Any]
     layer_id: str = ""
     owned_species: tuple[str, ...] = ()
+    display_species: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +485,7 @@ class CompletionDisplayEntry:
     warnings: tuple[Mapping[str, Any], ...]
     completion_provenance: Mapping[str, Any] | None
     owned_species: tuple[str, ...]
+    display_species: tuple[str, ...] = ()
 
     def to_display_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -499,6 +501,8 @@ class CompletionDisplayEntry:
             payload["completion_provenance"] = dict(self.completion_provenance)
         if self.owned_species:
             payload["owned_species"] = tuple(str(name) for name in self.owned_species if str(name))
+        if self.display_species:
+            payload["display_species"] = tuple(str(name) for name in self.display_species if str(name))
         return payload
 
 
@@ -537,6 +541,7 @@ class FreshPreviewDisplayEntry:
     solver_provenance: Mapping[str, Any] | None
     completion_provenance: Mapping[str, Any] | None
     owned_species: tuple[str, ...] = ()
+    display_species: tuple[str, ...] = ()
     workspace_preview_provenance: Mapping[str, Any] | None = None
 
     def to_display_payload(self) -> Dict[str, Any]:
@@ -550,6 +555,8 @@ class FreshPreviewDisplayEntry:
             payload["completion_provenance"] = dict(self.completion_provenance)
         if self.owned_species:
             payload["owned_species"] = tuple(str(name) for name in self.owned_species if str(name))
+        if self.display_species:
+            payload["display_species"] = tuple(str(name) for name in self.display_species if str(name))
         return payload
 
 
@@ -931,6 +938,8 @@ class SimulationResultsPort(Protocol):
         batch_set_id: Optional[str],
         algebra_scalars: Optional[Mapping[str, object]],
         direct_completion_provenance: Mapping[str, Any],
+        owned_species: Sequence[str],
+        display_species: Sequence[str],
         solver_provenance: Optional[Mapping[str, Any]] = None,
     ) -> SimulationCompletionDisplayOutcome: ...
 

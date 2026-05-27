@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Dict, Mapping, Sequence
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedDisplayResult:
+    series: Dict[str, np.ndarray]
+    display_species: tuple[str, ...]
+    owned_species: tuple[str, ...]
+    algebra_scalars: Dict[str, object]
 
 
 class SimulationResultMaterializationOwner:
@@ -15,6 +26,40 @@ class SimulationResultMaterializationOwner:
     ) -> None:
         self._ui = ui
         self._record_nonfatal_exception = record_nonfatal_exception
+
+    def materialize_completion_display_result(
+        self,
+        *,
+        series: Mapping[str, Any] | None,
+        finalized_species_names: Sequence[str] | None,
+        owned_species: Sequence[str] | None,
+        algebra_scalars: Mapping[str, object] | None = None,
+    ) -> MaterializedDisplayResult | None:
+        owned = tuple(str(name).strip() for name in (owned_species or ()) if str(name).strip())
+        display_roster = tuple(
+            str(name).strip() for name in (finalized_species_names or ()) if str(name).strip()
+        )
+        if not owned or not display_roster or not isinstance(series, Mapping):
+            return None
+        raw_series = dict(series or {})
+        display_series: Dict[str, np.ndarray] = {}
+        seen: set[str] = set()
+        for name in display_roster:
+            if name in seen or name not in raw_series:
+                return None
+            try:
+                display_series[name] = np.asarray(raw_series[name], dtype=float).reshape(-1).copy()
+            except Exception:
+                return None
+            seen.add(name)
+        if any(name not in display_series for name in owned):
+            return None
+        return MaterializedDisplayResult(
+            series=display_series,
+            display_species=display_roster,
+            owned_species=owned,
+            algebra_scalars=dict(algebra_scalars or {}),
+        )
 
     def resolve_completion_mechanism(
         self,

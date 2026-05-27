@@ -5,6 +5,7 @@ from typing import Any, Dict, Sequence
 
 import numpy as np
 
+from kindred.gui.controllers.results_display_builders import display_species_for_metadata
 from kindred.gui.ports import (
     ActiveDisplayKind,
     ActiveDisplayTransaction,
@@ -338,17 +339,9 @@ def display_transaction_provenance_payload(
                 "visible": bool(metadata.visible),
                 "owned_species": list(metadata.owned_species or ()),
                 "display_species": list(metadata.display_species or ()),
-                "completion_provenance": display_mapping_payload(
-                    metadata.completion_provenance
-                ),
                 "workspace_preview_provenance": display_mapping_payload(
                     metadata.workspace_preview_provenance
                 ),
-                "series_names": [
-                    str(name)
-                    for name in dict(metadata.series or {})
-                    if str(name)
-                ],
                 "num_points": int(
                     np.asarray(
                         metadata.t if metadata.t is not None else [],
@@ -390,10 +383,11 @@ def _copy_all_missing_reason_from_metadata(metadata: DisplaySetMetadata) -> str:
     series_raw = metadata.series or {}
     if t.size <= 0 or not isinstance(series_raw, Mapping):
         return "no_simulation_data"
-    owned_species = tuple(str(name) for name in (metadata.owned_species or ()) if str(name))
-    if not owned_species:
-        return "semantic_unavailable"
-    if not any(species_name in series_raw for species_name in owned_species):
+    display_species = display_species_for_metadata(
+        series=series_raw,
+        display_species=metadata.display_species,
+    )
+    if not display_species:
         return "no_visible_series"
     return "unavailable"
 
@@ -403,11 +397,12 @@ def _copy_all_display_block_from_metadata(metadata: DisplaySetMetadata) -> objec
     series_raw = metadata.series or {}
     if t.size <= 0 or not isinstance(series_raw, Mapping):
         return None
-    owned_species = tuple(str(name) for name in (metadata.owned_species or ()) if str(name))
-    if not owned_species:
-        return None
+    display_species = display_species_for_metadata(
+        series=series_raw,
+        display_species=metadata.display_species,
+    )
     series = {}
-    for species_name in owned_species:
+    for species_name in display_species:
         if species_name not in series_raw:
             continue
         series[species_name] = np.asarray(series_raw[species_name], dtype=float).reshape(-1)
@@ -419,7 +414,8 @@ def _copy_all_display_block_from_metadata(metadata: DisplaySetMetadata) -> objec
         t=t,
         series=series,
         layer_id=str(metadata.layer_id or ""),
-        owned_species=tuple(series.keys()),
+        owned_species=tuple(str(name) for name in (metadata.owned_species or ()) if str(name)),
+        display_species=display_species,
     )
 
 
@@ -477,17 +473,15 @@ def build_main_plot_csv_export(
         fallback_names = (
             requested_y_names
             if normalized_scope == "axis"
-            else tuple(metadata.display_species or tuple(series_map))
+            else tuple(metadata.display_species)
         )
-        if not metadata.owned_species:
-            missing_display_sets.append(f"{label} (semantic metadata unavailable)")
-            continue
-        owned_set = {str(name) for name in metadata.owned_species if str(name)}
-        species_names = [
-            str(name)
-            for name in fallback_names
-            if str(name) and str(name) in series_map and str(name) in owned_set
-        ]
+        species_names = list(
+            display_species_for_metadata(
+                series=series_map,
+                display_species=metadata.display_species,
+                fallback_names=fallback_names,
+            )
+        )
         if fallback_names and not species_names:
             missing_display_sets.append(f"{label} (no selected display series)")
             continue

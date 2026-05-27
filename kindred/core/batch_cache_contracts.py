@@ -24,6 +24,7 @@ class BatchCacheEntryV1(TypedDict):
     warnings: list[dict[str, Any]]
     completion_provenance: NotRequired[Dict[str, Any]]
     owned_species: NotRequired[tuple[str, ...]]
+    display_species: NotRequired[tuple[str, ...]]
 
 
 class PlotOverlayEntryV1(TypedDict):
@@ -114,6 +115,7 @@ def build_batch_cache_entry(
     warnings: Optional[Sequence[Mapping[str, Any]]] = None,
     completion_provenance: Optional[Mapping[str, Any]] = None,
     owned_species: Optional[Sequence[str]] = None,
+    display_species: Optional[Sequence[str]] = None,
 ) -> BatchCacheEntryV1:
     scalars: Dict[str, float] = {}
     if isinstance(algebra_scalars, Mapping):
@@ -149,6 +151,16 @@ def build_batch_cache_entry(
     )
     if owned_species_t:
         entry["owned_species"] = owned_species_t
+    display_species_t = tuple(
+        str(name).strip()
+        for name in (display_species or ())
+        if str(name).strip()
+    )
+    if display_species_t:
+        available = set(entry["series"])
+        if any(name not in available for name in display_species_t):
+            raise TypeError("display_species must reference available series")
+        entry["display_species"] = display_species_t
     return entry
 
 
@@ -184,6 +196,7 @@ def read_batch_cache_entry(
             warnings=cast(Optional[Sequence[Mapping[str, Any]]], payload.get("warnings")),
             completion_provenance=cast(Optional[Mapping[str, Any]], completion_provenance),
             owned_species=cast(Optional[Sequence[str]], payload.get("owned_species")),
+            display_species=cast(Optional[Sequence[str]], payload.get("display_species")),
         )
     except Exception:
         return BatchCacheEntryReadResult("invalid")

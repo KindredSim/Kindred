@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, Dict, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict
 
 import numpy as np
 
@@ -21,6 +21,7 @@ __all__ = [
     "display_species_for_metadata",
     "metadata_for_display_commit",
     "owned_species_for_display_entry",
+    "series_for_display_species",
     "transaction_overlay_is_reference",
 ]
 
@@ -40,10 +41,18 @@ def deduped_set_ids(values: Sequence[str]) -> tuple[str, ...]:
 def display_species_for_metadata(
     *,
     series: Mapping[str, Any],
-    owned_species: Sequence[str],
+    display_species: Sequence[str],
+    fallback_names: Sequence[str] = (),
 ) -> tuple[str, ...]:
-    available = {str(name) for name in dict(series or {}) if str(name)}
-    return tuple(str(name) for name in (owned_species or ()) if str(name) in available)
+    raw_series = {str(name): values for name, values in dict(series or {}).items() if str(name)}
+    if not raw_series:
+        return ()
+    allowed = deduped_set_ids(tuple(str(name) for name in (display_species or ()) if str(name)))
+    if not allowed:
+        return ()
+    requested = deduped_set_ids(tuple(str(name) for name in (fallback_names or ()) if str(name))) or allowed
+    allowed_set = set(allowed)
+    return tuple(name for name in requested if name in raw_series and name in allowed_set)
 
 
 def _display_series_for_metadata(
@@ -53,9 +62,29 @@ def _display_series_for_metadata(
 ) -> Dict[str, Any]:
     raw_series = {str(name): values for name, values in dict(series or {}).items() if str(name)}
     display_names = tuple(str(name) for name in (display_species or ()) if str(name))
-    if not display_names:
-        return raw_series
     return {name: raw_series[name] for name in display_names if name in raw_series}
+
+
+def series_for_display_species(
+    *,
+    series: Mapping[str, Any] | None,
+    display_species: Sequence[str] | None,
+) -> Dict[str, np.ndarray] | None:
+    if not isinstance(series, Mapping):
+        return None
+    names = deduped_set_ids(tuple(str(name) for name in (display_species or ()) if str(name)))
+    if not names:
+        return None
+    raw_series = dict(series or {})
+    display_series: Dict[str, np.ndarray] = {}
+    for name in names:
+        if name not in raw_series:
+            return None
+        try:
+            display_series[name] = np.asarray(raw_series[name], dtype=float).reshape(-1).copy()
+        except Exception:
+            return None
+    return display_series or None
 
 
 def transaction_overlay_is_reference(entry: Mapping[str, Any]) -> bool:
@@ -86,13 +115,23 @@ def display_overlay_entry(
             layer_id=layer_id,
         )
     )
+    raw_display_species = entry.get("display_species")
+    if isinstance(raw_display_species, Sequence) and not isinstance(raw_display_species, (str, bytes)):
+        overlay["display_species"] = deduped_set_ids(tuple(str(name) for name in raw_display_species if str(name)))
     owned = deduped_set_ids(
         tuple(str(name) for name in (owned_species or ()) if str(name))
     ) or owned_species_for_display_entry(entry)
     display_species = display_species_for_metadata(
         series=overlay.get("series") if isinstance(overlay.get("series"), Mapping) else {},
-        owned_species=owned,
+        display_species=(
+            overlay.get("display_species")
+            if isinstance(overlay.get("display_species"), Sequence)
+            and not isinstance(overlay.get("display_species"), (str, bytes))
+            else None
+        ),
     )
+    if display_species:
+        overlay["display_species"] = display_species
     overlay["series"] = _display_series_for_metadata(
         series=overlay.get("series") if isinstance(overlay.get("series"), Mapping) else {},
         display_species=display_species,
@@ -115,14 +154,12 @@ def metadata_for_display_commit(
     primary_set_id: str,
     primary_label: str,
     owned_species: Sequence[str] | None,
+    display_species: Sequence[str],
     completion_provenance: Mapping[str, Any] | None,
     workspace_preview_provenance_by_set_id: Mapping[str, Mapping[str, Any]] | None,
 ) -> Mapping[str, DisplaySetMetadata]:
     primary_owned = deduped_set_ids(tuple(str(name) for name in (owned_species or ()) if str(name)))
-    primary_display_species = display_species_for_metadata(
-        series=series,
-        owned_species=primary_owned,
-    )
+    primary_display_species = display_species_for_metadata(series=series, display_species=display_species)
     primary_series = _display_series_for_metadata(
         series=series,
         display_species=primary_display_species,
@@ -164,7 +201,12 @@ def metadata_for_display_commit(
         )
         overlay_display_species = display_species_for_metadata(
             series=overlay_series,
-            owned_species=overlay_owned,
+            display_species=(
+                overlay.get("display_species")
+                if isinstance(overlay.get("display_species"), Sequence)
+                and not isinstance(overlay.get("display_species"), (str, bytes))
+                else None
+            ),
         )
         overlay_series = _display_series_for_metadata(
             series=overlay_series,
@@ -209,6 +251,7 @@ def active_transaction_for_display_commit(
     primary_label: str,
     display_set_ids: Sequence[str],
     owned_species: Sequence[str] | None,
+    display_species: Sequence[str],
     completion_provenance: Mapping[str, Any] | None,
     workspace_preview_provenance_by_set_id: Mapping[str, Mapping[str, Any]] | None,
     active_kind: ActiveDisplayKind,
@@ -242,6 +285,7 @@ def active_transaction_for_display_commit(
             primary_set_id=primary_set_id,
             primary_label=primary_label,
             owned_species=owned_species,
+            display_species=display_species,
             completion_provenance=completion_provenance,
             workspace_preview_provenance_by_set_id=workspace_preview_provenance_by_set_id,
         ),

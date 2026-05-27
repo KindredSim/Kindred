@@ -623,6 +623,13 @@ if PYQTGRAPH_AVAILABLE:
                 )
                 if entry_owned_species:
                     normalized_entry["owned_species"] = entry_owned_species
+                entry_display_species = tuple(
+                    str(name).strip()
+                    for name in (entry.get("display_species") or ())
+                    if str(name).strip()
+                )
+                if entry_display_species:
+                    normalized_entry["display_species"] = entry_display_species
                 completion_provenance = entry.get("completion_provenance")
                 if isinstance(completion_provenance, Mapping):
                     normalized_entry["completion_provenance"] = dict(completion_provenance)
@@ -1091,14 +1098,16 @@ if PYQTGRAPH_AVAILABLE:
                     continue
                 seen.add(name)
                 fallback.append(name)
-            owned_species = PyQtGraphPlotPanel._simulation_overlay_owned_species(entry)
-            if not owned_species:
-                return fallback
-            owned_set = set(owned_species)
-            visible_owned = [name for name in fallback if name in owned_set]
-            if visible_owned:
-                return visible_owned
-            if fallback:
+            display_species = tuple(
+                str(name).strip()
+                for name in (entry.get("display_species") or ())
+                if str(name).strip()
+            )
+            if display_species:
+                display_set = set(display_species)
+                visible_display = [name for name in fallback if name in display_set]
+                if visible_display:
+                    return visible_display
                 return []
             return []
 
@@ -1125,11 +1134,6 @@ if PYQTGRAPH_AVAILABLE:
                     continue
                 seen.add(name)
                 candidate_names.append(name)
-            if bool(getattr(self, "_owned_species_roster_explicit", False)):
-                owned_set = {str(name) for name in (self._owned_species_keys or set()) if str(name)}
-                if owned_set:
-                    selected_owned = [name for name in candidate_names if name in owned_set]
-                    candidate_names = selected_owned
             return self._series_names_compatible_with_x(
                 candidate_names,
                 self._series,
@@ -1380,12 +1384,8 @@ if PYQTGRAPH_AVAILABLE:
                     values=x_values,
                 )
 
-            y_names = self._simulation_overlay_candidate_series_names(
-                {"owned_species": display_block.owned_species},
-                visible_y_names,
-            )
             y_names = self._series_names_compatible_with_x(
-                y_names,
+                visible_y_names,
                 display_block.series,
                 x_values,
                 require_visible=False,
@@ -1420,7 +1420,7 @@ if PYQTGRAPH_AVAILABLE:
                     display_block,
                     x_name=x_name,
                     x_label=x_label,
-                    visible_y_names=list(display_block.owned_species or tuple(display_block.series)),
+                    visible_y_names=list(display_block.display_species),
                 )
                 if block_columns is not None:
                     blocks.append(block_columns)

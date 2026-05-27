@@ -44,6 +44,7 @@ class SimulationCacheAdmin:
         warnings: Sequence[Mapping[str, Any]] | None = None,
         completion_provenance: Mapping[str, Any] | None = None,
         owned_species: Sequence[str] | None = None,
+        display_species: Sequence[str] | None = None,
         preview_scope_set_ids: Sequence[str] | None = None,
     ) -> SimulationCachePublicationResult:
         normalized_key = str(cache_key or "").strip() or None
@@ -74,6 +75,7 @@ class SimulationCacheAdmin:
                 warnings=warnings,
                 completion_provenance=completion_provenance,
                 owned_species=owned_species,
+                display_species=display_species,
             )
         return SimulationCachePublicationResult(
             cache_key=normalized_key,

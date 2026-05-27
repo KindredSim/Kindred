@@ -99,6 +99,7 @@ def prepared_window(main_window, monkeypatch):
             mechanism_text=dsl,
         ),
         owned_species=owned_species,
+        display_species=tuple(str(name) for name in species_names),
     )
     outcome = main_window.results_controller.publish_completed_run_display_transaction(
         CompletedRunDisplayTransaction(

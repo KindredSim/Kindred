@@ -5,10 +5,10 @@ import logging
 from time import perf_counter
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
-import numpy as np
 from PySide6 import QtCore
 
 from kindred.gui.controllers.simulation_completion_policy import CacheAuthorityState, CompletionPolicyContext
+from kindred.gui.controllers.simulation_result_materialization import MaterializedDisplayResult
 from kindred.gui.ports import (
     CompletedRunDisplayCoverage,
     CompletedRunDisplayIntent,
@@ -339,6 +339,10 @@ class SimulationCompletionPublicationOwner:
                 state.ctx,
                 set_id=state.batch_set_id,
             )
+        materialized = self._materialize_completion_display(
+            completion,
+            required_owned_species=owned_species,
+        )
         self._cache_admin.publish_completion_cache(
             cache_key=cache_token,
             cache_token=cache_token,
@@ -362,6 +366,11 @@ class SimulationCompletionPublicationOwner:
             ],
             completion_provenance=self.direct_completion_provenance_payload(completion),
             owned_species=owned_species,
+            display_species=(
+                materialized.display_species
+                if isinstance(materialized, MaterializedDisplayResult)
+                else ()
+            ),
         )
 
     def apply_pending_init(
@@ -418,11 +427,11 @@ class SimulationCompletionPublicationOwner:
                 cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
             )
             return
-        semantic_series = self._semantic_display_series_from_owned_rows(
+        materialized = self._materialize_completion_display(
             completion,
-            owned_species=owned_species,
+            required_owned_species=owned_species,
         )
-        if semantic_series is None:
+        if materialized is None:
             state.ctx = self._batch_context_owner.record_completion_display_unavailable(
                 state.ctx,
                 set_id=state.batch_set_id,
@@ -433,8 +442,8 @@ class SimulationCompletionPublicationOwner:
             set_id=str(state.batch_set_id or ""),
             label=str(state.batch_set or state.batch_set_id or ""),
             t=completion.t,
-            series=semantic_series,
-            algebra_scalars=dict(completion.algebra_scalars),
+            series=materialized.series,
+            algebra_scalars=materialized.algebra_scalars,
             solver_provenance=completion.solver_provenance,
             mechanism_text=str(completion.mechanism_text or ""),
             solver_config=dict(completion.solver_config),
@@ -444,7 +453,8 @@ class SimulationCompletionPublicationOwner:
                 if isinstance(warning, Mapping)
             ),
             completion_provenance=self.direct_completion_provenance_payload(completion),
-            owned_species=owned_species,
+            owned_species=materialized.owned_species,
+            display_species=materialized.display_species,
         )
         state.ctx = self._batch_context_owner.record_completion_display_entry(
             state.ctx,
@@ -453,27 +463,18 @@ class SimulationCompletionPublicationOwner:
             entry=entry,
         )
 
-    @staticmethod
-    def _semantic_display_series_from_owned_rows(
+    def _materialize_completion_display(
+        self,
         completion: CompletionResultState,
         *,
-        owned_species: Sequence[str],
-    ) -> Optional[Dict[str, Any]]:
-        owned = tuple(str(name) for name in owned_species if str(name))
-        if not owned:
-            return None
-        raw_series = completion.series if isinstance(completion.series, Mapping) else {}
-        if not raw_series:
-            return None
-        semantic_series: Dict[str, Any] = {}
-        for species_name in owned:
-            if species_name not in raw_series:
-                return None
-            try:
-                semantic_series[species_name] = np.asarray(raw_series[species_name], dtype=float).copy()
-            except Exception:
-                return None
-        return semantic_series or None
+        required_owned_species: Sequence[str],
+    ) -> Optional[MaterializedDisplayResult]:
+        return self._result_materialization_owner.materialize_completion_display_result(
+            series=completion.series,
+            finalized_species_names=completion.species_names,
+            owned_species=required_owned_species,
+            algebra_scalars=completion.algebra_scalars,
+        )
 
     def _fresh_preview_display_entry(
         self,
@@ -492,21 +493,23 @@ class SimulationCompletionPublicationOwner:
             candidate = None
         if isinstance(candidate, Mapping):
             workspace_provenance = dict(candidate)
-        available_series = {str(name) for name in dict(completion.series or {}) if str(name)}
-        owned_species = tuple(
-            str(name)
-            for name in (completion.species_names or ())
-            if str(name) and (not available_series or str(name) in available_series)
+        owned_species = self._base_owned_species_from_completion(completion)
+        materialized = self._materialize_completion_display(
+            completion,
+            required_owned_species=owned_species,
         )
+        if materialized is None:
+            return None
         return FreshPreviewDisplayEntry(
             set_id=set_id,
             label=str(state.batch_set or set_id),
             t=completion.t,
-            series=dict(completion.series or {}),
-            algebra_scalars=dict(completion.algebra_scalars or {}),
+            series=materialized.series,
+            algebra_scalars=materialized.algebra_scalars,
             solver_provenance=completion.solver_provenance,
             completion_provenance=self.direct_completion_provenance_payload(completion),
-            owned_species=owned_species,
+            owned_species=materialized.owned_species,
+            display_species=materialized.display_species,
             workspace_preview_provenance=workspace_provenance,
         )
 
@@ -641,14 +644,33 @@ class SimulationCompletionPublicationOwner:
         if requires_completed_run_transaction:
             return self._completed_run_unavailable_outcome(completed_run_coverage)
 
+        owned_species = self._base_owned_species_from_completion(completion)
+        materialized = self._materialize_completion_display(
+            completion,
+            required_owned_species=owned_species,
+        )
+        if materialized is None:
+            return self._ui.results.publish_direct_completion_result(
+                t=completion.t,
+                series={},
+                batch_set=state.batch_set,
+                batch_set_id=state.batch_set_id,
+                algebra_scalars=completion.algebra_scalars,
+                solver_provenance=completion.solver_provenance,
+                direct_completion_provenance=self.direct_completion_provenance_payload(completion),
+                owned_species=owned_species,
+                display_species=(),
+            )
         outcome = self._ui.results.publish_direct_completion_result(
             t=completion.t,
-            series=completion.series,
+            series=materialized.series,
             batch_set=state.batch_set,
             batch_set_id=state.batch_set_id,
-            algebra_scalars=completion.algebra_scalars,
+            algebra_scalars=materialized.algebra_scalars,
             solver_provenance=completion.solver_provenance,
             direct_completion_provenance=self.direct_completion_provenance_payload(completion),
+            owned_species=materialized.owned_species,
+            display_species=materialized.display_species,
         )
         if isinstance(outcome, SimulationCompletionDisplayOutcome):
             return outcome
@@ -850,6 +872,22 @@ class SimulationCompletionPublicationOwner:
             "solver_provenance": completion.solver_provenance,
             "warnings": completion.warnings,
         }
+
+    @staticmethod
+    def _base_owned_species_from_completion(
+        completion: CompletionResultState,
+    ) -> tuple[str, ...]:
+        available_series = {str(name) for name in dict(completion.series or {}) if str(name)}
+        base_species_count = completion.base_species_count
+        if isinstance(base_species_count, int) and base_species_count >= 0:
+            owned_source = tuple(completion.species_names or ())[:base_species_count]
+        else:
+            owned_source = ()
+        return tuple(
+            str(name)
+            for name in owned_source
+            if str(name) and (not available_series or str(name) in available_series)
+        )
 
     @staticmethod
     def _mechanism_resolution_solver_config(

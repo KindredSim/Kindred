@@ -415,6 +415,7 @@ class BatchSimulationCache:
         warnings: Optional[Sequence[Mapping[str, Any]]] = None,
         completion_provenance: Optional[Mapping[str, Any]] = None,
         owned_species: Optional[Sequence[str]] = None,
+        display_species: Optional[Sequence[str]] = None,
     ) -> Optional[str]:
         entry = build_batch_cache_entry(
             t=t,
@@ -431,6 +432,7 @@ class BatchSimulationCache:
             warnings=warnings,
             completion_provenance=completion_provenance,
             owned_species=owned_species,
+            display_species=display_species,
         )
         return self.put_batch_cache_entry(
             cache_key=cache_key,
