@@ -53,6 +53,7 @@ def _completion_display_entry(
             mechanism_text=str(mechanism_text),
         ),
         owned_species=("A",),
+        display_species=("A",),
     )
 
 

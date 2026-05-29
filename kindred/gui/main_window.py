@@ -383,9 +383,9 @@ class MainWindow(
         set_copy_status_text = getattr(main_plot, "set_copy_status_text_callback", None)
         if callable(set_copy_status_text):
             set_copy_status_text(self.set_status_text)
-        set_reference_visibility_observer = getattr(main_plot, "set_reference_layer_visibility_observer", None)
-        if callable(set_reference_visibility_observer):
-            set_reference_visibility_observer(self.results_controller.update_reference_overlay_visibility)
+        main_plot.referenceLayerVisibilityRequested.connect(
+            self.results_controller.set_reference_overlays_visible
+        )
 
     def _init_mechanism_dock_and_panel(self) -> None:
         mechanism_dock_components = build_mechanism_dock(self)
@@ -1103,7 +1103,7 @@ class MainWindow(
                 return False
             return True
 
-        self._discard_slider_transaction_for_invalidation()
+        self._discard_pending_slider_edits_for_invalidation()
         if bool(preview.has_dirty_transaction()):
             self._simulation_dialogs.message_box_warning(
                 "Pending Slider Changes",
@@ -1251,6 +1251,7 @@ class MainWindow(
             if hasattr(species_panel, "set_transaction_owner"):
                 species_panel.set_transaction_owner(self._species_panel_transaction_owner())
             species_panel.speciesEdited.connect(self._on_species_slider_edited)
+            species_panel.speciesDragStarted.connect(self._on_species_slider_drag_started)
             species_panel.speciesDragFinished.connect(self._on_species_slider_drag_finished)
         except RuntimeError as exc:
             logger.debug("Failed to wire species sliders signals: %s", exc, exc_info=True)
@@ -4659,31 +4660,19 @@ class MainWindow(
         current_target_ids = self._normalized_slider_target_set_ids(
             self._effective_slider_edit_target_set_ids()
         )
-        previous_target_ids = self._normalized_slider_target_set_ids(
-            getattr(self, "_last_effective_slider_edit_target_set_ids", ())
-        )
         self._last_effective_slider_edit_target_set_ids = current_target_ids
-        current_target_set = set(current_target_ids)
-        removed_target_ids: list[str] = []
-        for set_id in previous_target_ids:
-            if set_id not in current_target_set and set_id not in removed_target_ids:
-                removed_target_ids.append(set_id)
         try:
             preview_removed = self._preview_session.reconcile_slider_target_membership(current_target_ids)
         except RuntimeError as exc:
             logger.debug("Failed to prune slider preview state after target membership change: %s", exc, exc_info=True)
             preview_removed = ()
-        for set_id in preview_removed:
-            set_id_s = str(set_id or "").strip()
-            if set_id_s and set_id_s not in removed_target_ids:
-                removed_target_ids.append(set_id_s)
-        if not removed_target_ids:
+        if not preview_removed:
             return
         try:
             intersects = True
             inspector = getattr(self._sim_controller, "slider_preview_work_intersects_target_scope", None)
             if callable(inspector):
-                intersects = bool(inspector(tuple(removed_target_ids)))
+                intersects = bool(inspector(tuple(preview_removed)))
             if intersects:
                 self._sim_controller.invalidate_slider_preview_work()
         except RuntimeError as exc:
@@ -5310,6 +5299,19 @@ class MainWindow(
             )
 
     def _on_slider_edit_targets_changed(self) -> None:
+        try:
+            panel = self._mechanism_editor.species_sliders_widget()
+            if (
+                panel is not None
+                and hasattr(panel, "live_drag_active")
+                and bool(panel.live_drag_active())
+            ):
+                self._slider_edit_targets_changed_deferred_during_species_drag = True
+                self._refresh_slider_edit_targets_summary()
+                return
+        except RuntimeError as exc:
+            logger.debug("Failed to inspect species panel during slider target change: %s", exc, exc_info=True)
+            self._species_panel_available = False
         transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
             gesture="slider_target_change",
             row=self._batch_current_row(),
@@ -6830,6 +6832,12 @@ class MainWindow(
         if bool(rebuild_species_sliders):
             try:
                 panel = self._mechanism_editor.species_sliders_widget()
+                if (
+                    panel is not None
+                    and hasattr(panel, "live_drag_active")
+                    and bool(panel.live_drag_active())
+                ):
+                    return
                 if panel is not None and hasattr(panel, "rebuild_from_current_row"):
                     panel.rebuild_from_current_row()
             except Exception:
@@ -6855,15 +6863,16 @@ class MainWindow(
         target_set_ids = self._effective_slider_edit_target_set_ids()
         if bool(self._preview_session.has_staged_concentration_overlays()):
             replay_intent = self._preview_session.capture_reset_slider_replay_intent()
-            cleared_display = self._discard_slider_transaction_for_invalidation(
+            self._discard_pending_slider_edits_for_invalidation(
                 target_set_ids=target_set_ids,
             )
         else:
             self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
             self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
             self._preview_session.reset_mechanism_workspaces(target_set_ids)
-            cleared_display = self.results_controller.clear_display_if_workspace_previews_were_displayed(
+            self.results_controller.clear_display_if_workspace_previews_were_displayed(
                 target_set_ids,
+                clear_plot=False,
             )
             self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
@@ -6891,27 +6900,30 @@ class MainWindow(
                 logger.exception("Failed to reset species row")
                 self._species_panel_available = False
             self._refresh_slider_transaction_button_state()
-            if not cleared_display:
-                self._refresh_batch_display_from_request_scope()
+            self._refresh_batch_display_from_request_scope()
             return
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
         if replay_intent is not None:
             self._preview_session.submit_slider_replay_intent(replay_intent)
             self._sim_controller.launch_pending_slider_preview_replay()
-        elif not cleared_display:
+        else:
             self._refresh_batch_display_from_request_scope()
 
-    def _discard_slider_transaction_for_invalidation(
+    def _discard_pending_slider_edits_for_invalidation(
         self,
         *,
         target_set_ids: Sequence[str] | None = None,
     ) -> bool:
-        """Clear the staged transaction without scheduling a preview rerun."""
-        clear_active_cache_identity = self._simulation_batch_owner.active_preview_cache_identity_matches_current_workspace()
+        """Discard staged slider edits and leave the visible display recoverable."""
+        targets = target_set_ids or self._effective_slider_edit_target_set_ids()
+        clear_active_cache_identity = (
+            self._simulation_batch_owner.active_preview_cache_identity_matches_current_workspace()
+        )
         self._sim_controller.invalidate_slider_preview_work()
         self._preview_session.clear_working_transaction(invalidate_preview_work=False)
         cleared_display = self.results_controller.clear_display_if_workspace_previews_were_displayed(
-            target_set_ids or self._effective_slider_edit_target_set_ids(),
+            targets,
+            clear_plot=False,
         )
         if clear_active_cache_identity:
             self._simulation_batch_owner.clear_active_cache_identity_state()
@@ -7034,17 +7046,25 @@ class MainWindow(
         if changed:
             self.results_controller.clear_display_if_workspace_previews_were_displayed(
                 target_set_ids,
+                clear_plot=False,
             )
             self._refresh_slider_transaction_button_state()
             self._queue_species_slider_simulation(label="init:reset", delay_ms=0)
 
     def _on_species_slider_edited(self, species: str, value: float) -> None:
-        _ = float(value)  # ensure numeric for callers; no side effects
+        changed = self._preview_session.on_species_slider_value_changed(species, float(value))
         self._refresh_slider_transaction_button_state()
-        self._preview_session.queue_species_slider_simulation(label=f"init:{species}", delay_ms=80)
+        if changed:
+            self._preview_session.queue_species_slider_simulation(label=f"init:{species}", delay_ms=80)
+
+    def _on_species_slider_drag_started(self, species: str) -> None:
+        self._preview_session.on_species_slider_drag_started(species)
 
     def _on_species_slider_drag_finished(self, species: str) -> None:
-        self._preview_session.queue_species_slider_simulation(label=f"init:{species}", delay_ms=0)
+        self._preview_session.on_species_slider_drag_finished(species)
+        if bool(getattr(self, "_slider_edit_targets_changed_deferred_during_species_drag", False)):
+            self._slider_edit_targets_changed_deferred_during_species_drag = False
+            self._on_slider_edit_targets_changed()
 
     def _queue_species_slider_simulation(self, *, label: str, delay_ms: int) -> None:
         self._preview_session.queue_species_slider_simulation(label=label, delay_ms=delay_ms)

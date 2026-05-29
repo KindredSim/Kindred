@@ -19,6 +19,9 @@ from kindred.gui.ports import (
     DisplayTransitionCause,
     DisplayTransitionOutcome,
     DisplayTransitionOutcomeKind,
+    PlotDisplayLayer,
+    PlotDisplayLayersPayload,
+    PlotLayerKind,
 )
 
 __all__ = [
@@ -26,12 +29,14 @@ __all__ = [
     "build_main_plot_csv_export",
     "cache_resolution_cause_for_transition",
     "display_mapping_payload",
-    "display_status_for_unpublished_request",
     "display_status_is_displayed",
+    "display_set_presentation_label",
     "display_transaction_provenance_payload",
     "display_transition_status_text",
     "ordered_display_transaction_metadata",
+    "plot_display_layers_payload",
     "published_display_status_text",
+    "stats_results_map_from_display_transaction",
 ]
 
 _COMPLETED_RUN_DENIED_NO_CACHE_STATUS = (
@@ -55,6 +60,126 @@ def ordered_display_transaction_metadata(
             str(item.layer_id or ""),
         ),
     )
+
+
+def _plot_kind_for_display_role(role: DisplaySetRole) -> PlotLayerKind:
+    if role is DisplaySetRole.PRIMARY_RESULT:
+        return PlotLayerKind.PRIMARY_SERIES
+    if role is DisplaySetRole.REFERENCE_OVERLAY:
+        return PlotLayerKind.REFERENCE_SERIES
+    return PlotLayerKind.RESULT_SERIES
+
+
+def _metadata_layer_id(metadata: DisplaySetMetadata, *, kind: PlotLayerKind) -> str:
+    layer_id = str(metadata.layer_id or "").strip()
+    if layer_id:
+        return layer_id
+    source_id = str(metadata.set_id or "").strip()
+    return f"{kind.value}:{source_id}" if source_id else kind.value
+
+
+def display_set_presentation_label(
+    metadata: DisplaySetMetadata,
+    *,
+    presentation_label: str | None = None,
+) -> str:
+    base = str(presentation_label or metadata.label or metadata.set_id or metadata.layer_id or "Results").strip()
+    if metadata.role is DisplaySetRole.REFERENCE_OVERLAY and not base.endswith(" [ref]"):
+        return f"{base} [ref]"
+    return base
+
+
+def plot_display_layers_payload(
+    transaction: ActiveDisplayTransaction,
+    *,
+    presentation_labels_by_set_id: Mapping[str, str] | None = None,
+) -> PlotDisplayLayersPayload:
+    layers: list[PlotDisplayLayer] = []
+    primary_layer_id = ""
+    presentation_labels = {
+        str(set_id): str(label)
+        for set_id, label in dict(presentation_labels_by_set_id or {}).items()
+        if str(set_id)
+    }
+    for metadata in ordered_display_transaction_metadata(transaction):
+        kind = _plot_kind_for_display_role(metadata.role)
+        layer_id = _metadata_layer_id(metadata, kind=kind)
+        if kind is PlotLayerKind.PRIMARY_SERIES and not primary_layer_id:
+            primary_layer_id = layer_id
+        source_id = str(metadata.set_id or "")
+        owned_species = tuple(metadata.owned_species or ())
+        style_metadata: Dict[str, object] = {}
+        if owned_species:
+            style_metadata["color_domain"] = owned_species
+        source_metadata: Dict[str, object] = {
+            "display_role": metadata.role.value,
+        }
+        layers.append(
+            PlotDisplayLayer(
+                layer_id=layer_id,
+                source_id=source_id,
+                label=display_set_presentation_label(
+                    metadata,
+                    presentation_label=presentation_labels.get(source_id),
+                ),
+                kind=kind,
+                x=metadata.t,
+                y=dict(metadata.series or {}),
+                y_series=tuple(metadata.display_species or ()),
+                visible=bool(metadata.visible),
+                style_metadata=style_metadata,
+                source_metadata=source_metadata,
+            )
+        )
+    if not primary_layer_id:
+        primary_set_id = str(transaction.primary_display_set_id or "").strip()
+        primary_layer_id = f"{PlotLayerKind.PRIMARY_SERIES.value}:{primary_set_id}" if primary_set_id else ""
+    return PlotDisplayLayersPayload(
+        transaction_id=str(transaction.transaction_id or ""),
+        primary_layer_id=primary_layer_id,
+        layers=tuple(layers),
+        intervention_annotations=tuple(transaction.intervention_annotations or ()),
+        show_intervention_annotations=bool(transaction.show_intervention_annotations),
+    )
+
+
+def stats_results_map_from_display_transaction(
+    transaction: ActiveDisplayTransaction,
+    *,
+    include_reference_overlays: bool,
+    presentation_labels_by_set_id: Mapping[str, str] | None = None,
+) -> Dict[str, Dict[str, object]]:
+    presentation_labels = {
+        str(set_id): str(label)
+        for set_id, label in dict(presentation_labels_by_set_id or {}).items()
+        if str(set_id)
+    }
+    results_map: Dict[str, Dict[str, object]] = {}
+    for metadata in ordered_display_transaction_metadata(transaction):
+        if not bool(metadata.visible):
+            continue
+        if metadata.role is DisplaySetRole.REFERENCE_OVERLAY and not bool(include_reference_overlays):
+            continue
+        layer_id = str(metadata.layer_id or "").strip()
+        if not layer_id:
+            layer_prefix = "reference" if metadata.role is DisplaySetRole.REFERENCE_OVERLAY else "result"
+            layer_id = f"{layer_prefix}:{metadata.set_id}"
+        results_map[layer_id] = {
+            "t": metadata.t,
+            "series": dict(metadata.series or {}),
+            "label": display_set_presentation_label(
+                metadata,
+                presentation_label=presentation_labels.get(str(metadata.set_id or "")),
+            ),
+            "layer_id": layer_id,
+            "kind": (
+                PlotLayerKind.REFERENCE_SERIES
+                if metadata.role is DisplaySetRole.REFERENCE_OVERLAY
+                else PlotLayerKind.RESULT_SERIES
+            ),
+            "set_id": str(metadata.set_id),
+        }
+    return results_map
 
 
 def published_display_status_text(display_status: DisplayStatus) -> str:
@@ -82,15 +207,6 @@ def display_status_is_displayed(display_status: DisplayStatus) -> bool:
         DisplayStatus.DISPLAYED_FRESH_PREVIEW,
         DisplayStatus.DISPLAYED_DIRECT_RESULT,
     }
-
-
-def display_status_for_unpublished_request(
-    *,
-    requested_status: DisplayStatus,
-    active_transaction: ActiveDisplayTransaction | None,
-) -> DisplayStatus:
-    _ = active_transaction
-    return requested_status
 
 
 def display_transition_status_text(
@@ -125,6 +241,8 @@ def display_transition_status_text(
         return _with_request_outcome_status_suffix("Display failed.", transition_outcome)
     if cause is DisplayTransitionCause.QUEUED_DISPLAY:
         return _with_request_outcome_status_suffix("Display queued.", transition_outcome)
+    if cause is DisplayTransitionCause.MANUAL_CLEAR:
+        return _with_request_outcome_status_suffix("Display cleared.", transition_outcome)
     if cause is DisplayTransitionCause.DISPLAY_MUTATION_DENIED:
         if has_active_display:
             return _with_request_outcome_status_suffix(
@@ -333,7 +451,7 @@ def display_transaction_provenance_payload(
         display_sets.append(
             {
                 "set_id": str(metadata.set_id or ""),
-                "label": str(metadata.label or metadata.set_id or ""),
+                "label": display_set_presentation_label(metadata),
                 "role": metadata.role.value if isinstance(metadata.role, DisplaySetRole) else str(metadata.role),
                 "layer_id": str(metadata.layer_id or ""),
                 "visible": bool(metadata.visible),
@@ -371,11 +489,11 @@ def _copy_all_export_set_id(metadata: DisplaySetMetadata) -> str:
 
 
 def _copy_all_export_label(metadata: DisplaySetMetadata) -> str:
-    return str(metadata.label or metadata.set_id or "Results")
+    return display_set_presentation_label(metadata)
 
 
 def _csv_export_label(metadata: DisplaySetMetadata) -> str:
-    return str(metadata.label or metadata.set_id or metadata.layer_id or "Results")
+    return display_set_presentation_label(metadata)
 
 
 def _copy_all_missing_reason_from_metadata(metadata: DisplaySetMetadata) -> str:
@@ -419,7 +537,9 @@ def _copy_all_display_block_from_metadata(metadata: DisplaySetMetadata) -> objec
     )
 
 
-def build_copy_all_export_plan(active_transaction: ActiveDisplayTransaction | None) -> object | None:
+def build_copy_all_export_plan(
+    active_transaction: ActiveDisplayTransaction | None,
+) -> object | None:
     if active_transaction is None:
         return None
     display_blocks: list[object] = []

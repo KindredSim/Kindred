@@ -5,7 +5,6 @@ from typing import Any, Dict
 
 import numpy as np
 
-from kindred.core.batch_cache_contracts import build_overlay_entry
 from kindred.gui.ports import (
     ActiveDisplayKind,
     ActiveDisplayTransaction,
@@ -17,12 +16,11 @@ from kindred.gui.ports import (
 __all__ = [
     "active_transaction_for_display_commit",
     "deduped_set_ids",
-    "display_overlay_entry",
+    "display_metadata_for_entry",
     "display_species_for_metadata",
     "metadata_for_display_commit",
     "owned_species_for_display_entry",
     "series_for_display_species",
-    "transaction_overlay_is_reference",
 ]
 
 
@@ -87,76 +85,82 @@ def series_for_display_species(
     return display_series or None
 
 
-def transaction_overlay_is_reference(entry: Mapping[str, Any]) -> bool:
-    return str(entry.get("layer_kind") or "").strip() == "reference"
-
-
 def owned_species_for_display_entry(entry: Mapping[str, Any]) -> tuple[str, ...]:
     raw_owned = entry.get("owned_species")
     return deduped_set_ids(tuple(str(name) for name in (raw_owned or ()) if str(name)))
 
 
-def display_overlay_entry(
+def _display_species_from_entry(entry: Mapping[str, Any]) -> tuple[str, ...]:
+    raw_display_species = entry.get("display_species")
+    if not isinstance(raw_display_species, Sequence) or isinstance(raw_display_species, (str, bytes)):
+        return ()
+    return deduped_set_ids(tuple(str(name) for name in raw_display_species if str(name)))
+
+
+def display_metadata_for_entry(
     *,
     label: str,
     entry: Mapping[str, Any],
     set_id: str,
-    layer_kind: str,
+    role: DisplaySetRole,
     layer_id: str,
     owned_species: Sequence[str] | None = None,
-    visible: bool | None = None,
-) -> Dict[str, object]:
-    overlay = dict(
-        build_overlay_entry(
-            label=label,
-            entry=entry,
-            set_id=set_id,
-            layer_kind=layer_kind,
-            layer_id=layer_id,
-        )
-    )
-    raw_display_species = entry.get("display_species")
-    if isinstance(raw_display_species, Sequence) and not isinstance(raw_display_species, (str, bytes)):
-        overlay["display_species"] = deduped_set_ids(tuple(str(name) for name in raw_display_species if str(name)))
-    owned = deduped_set_ids(
-        tuple(str(name) for name in (owned_species or ()) if str(name))
-    ) or owned_species_for_display_entry(entry)
-    display_species = display_species_for_metadata(
-        series=overlay.get("series") if isinstance(overlay.get("series"), Mapping) else {},
-        display_species=(
-            overlay.get("display_species")
-            if isinstance(overlay.get("display_species"), Sequence)
-            and not isinstance(overlay.get("display_species"), (str, bytes))
-            else None
-        ),
-    )
-    if display_species:
-        overlay["display_species"] = display_species
-    overlay["series"] = _display_series_for_metadata(
-        series=overlay.get("series") if isinstance(overlay.get("series"), Mapping) else {},
+    visible: bool = True,
+    workspace_preview_provenance: Mapping[str, Any] | None = None,
+) -> DisplaySetMetadata | None:
+    if not isinstance(entry, Mapping):
+        return None
+    entry_t = entry.get("t")
+    if entry_t is None:
+        return None
+    display_species = _display_species_from_entry(entry)
+    display_series = series_for_display_species(
+        series=entry.get("series"),
         display_species=display_species,
     )
-    if owned:
-        overlay["owned_species"] = owned
-    if visible is not None:
-        overlay["visible"] = bool(visible)
+    if display_series is None:
+        return None
+    resolved_owned = deduped_set_ids(tuple(str(name) for name in (owned_species or ()) if str(name)))
+    if not resolved_owned:
+        resolved_owned = owned_species_for_display_entry(entry)
     completion_provenance = entry.get("completion_provenance")
-    if isinstance(completion_provenance, Mapping):
-        overlay["completion_provenance"] = dict(completion_provenance)
-    return overlay
+    return DisplaySetMetadata(
+        set_id=str(set_id or "").strip(),
+        label=str(label or set_id or "Results"),
+        role=role,
+        t=entry_t,
+        series=display_series,
+        owned_species=resolved_owned,
+        display_species=display_species_for_metadata(
+            series=display_series,
+            display_species=display_species,
+        ),
+        layer_id=str(layer_id or "").strip(),
+        completion_provenance=(
+            dict(completion_provenance)
+            if isinstance(completion_provenance, Mapping)
+            else None
+        ),
+        workspace_preview_provenance=(
+            dict(workspace_preview_provenance)
+            if isinstance(workspace_preview_provenance, Mapping)
+            else None
+        ),
+        visible=bool(visible),
+    )
 
 
 def metadata_for_display_commit(
     *,
     t: np.ndarray,
     series: Mapping[str, Any],
-    overlays: Sequence[Mapping[str, Any]],
     primary_set_id: str,
     primary_label: str,
     owned_species: Sequence[str] | None,
     display_species: Sequence[str],
     completion_provenance: Mapping[str, Any] | None,
     workspace_preview_provenance_by_set_id: Mapping[str, Mapping[str, Any]] | None,
+    additional_metadata: Sequence[DisplaySetMetadata] = (),
 ) -> Mapping[str, DisplaySetMetadata]:
     primary_owned = deduped_set_ids(tuple(str(name) for name in (owned_species or ()) if str(name)))
     primary_display_species = display_species_for_metadata(series=series, display_species=display_species)
@@ -188,57 +192,13 @@ def metadata_for_display_commit(
             ),
         )
     }
-    for raw_overlay in overlays or ():
-        if not isinstance(raw_overlay, Mapping):
+    for metadata in additional_metadata or ():
+        if not isinstance(metadata, DisplaySetMetadata):
             continue
-        overlay = dict(raw_overlay)
-        set_id = str(overlay.get("set_id") or "").strip()
-        if not set_id:
+        layer_id = str(metadata.layer_id or "").strip()
+        if not layer_id or layer_id == primary_layer_id:
             continue
-        overlay_series = dict(overlay.get("series") or {})
-        overlay_owned = deduped_set_ids(
-            tuple(str(name) for name in (overlay.get("owned_species") or ()) if str(name))
-        )
-        overlay_display_species = display_species_for_metadata(
-            series=overlay_series,
-            display_species=(
-                overlay.get("display_species")
-                if isinstance(overlay.get("display_species"), Sequence)
-                and not isinstance(overlay.get("display_species"), (str, bytes))
-                else None
-            ),
-        )
-        overlay_series = _display_series_for_metadata(
-            series=overlay_series,
-            display_species=overlay_display_species,
-        )
-        role = (
-            DisplaySetRole.REFERENCE_OVERLAY
-            if transaction_overlay_is_reference(overlay)
-            else DisplaySetRole.RESULT_OVERLAY
-        )
-        layer_id = str(overlay.get("layer_id") or f"result:{set_id}")
-        metadata_by_layer_id[layer_id] = DisplaySetMetadata(
-            set_id=set_id,
-            label=str(overlay.get("popup_label") or overlay.get("label") or set_id),
-            role=role,
-            t=overlay.get("t"),
-            series=overlay_series,
-            owned_species=overlay_owned,
-            display_species=overlay_display_species,
-            layer_id=layer_id,
-            completion_provenance=(
-                dict(overlay.get("completion_provenance"))
-                if isinstance(overlay.get("completion_provenance"), Mapping)
-                else None
-            ),
-            workspace_preview_provenance=(
-                dict((workspace_preview_provenance_by_set_id or {}).get(set_id) or {})
-                if isinstance((workspace_preview_provenance_by_set_id or {}).get(set_id), Mapping)
-                else None
-            ),
-            visible=bool(overlay.get("visible", True)),
-        )
+        metadata_by_layer_id[layer_id] = metadata
     return metadata_by_layer_id
 
 
@@ -246,7 +206,6 @@ def active_transaction_for_display_commit(
     *,
     t: np.ndarray,
     series: Mapping[str, Any],
-    overlays: Sequence[Mapping[str, Any]],
     primary_set_id: str,
     primary_label: str,
     display_set_ids: Sequence[str],
@@ -256,6 +215,7 @@ def active_transaction_for_display_commit(
     workspace_preview_provenance_by_set_id: Mapping[str, Mapping[str, Any]] | None,
     active_kind: ActiveDisplayKind,
     status: DisplayStatus,
+    additional_metadata: Sequence[DisplaySetMetadata] = (),
     request_id: int | None = None,
     run_id: int | None = None,
     intervention_annotations: Sequence[Mapping[str, Any]] = (),
@@ -281,13 +241,13 @@ def active_transaction_for_display_commit(
         sets=metadata_for_display_commit(
             t=t,
             series=series,
-            overlays=overlays,
             primary_set_id=primary_set_id,
             primary_label=primary_label,
             owned_species=owned_species,
             display_species=display_species,
             completion_provenance=completion_provenance,
             workspace_preview_provenance_by_set_id=workspace_preview_provenance_by_set_id,
+            additional_metadata=additional_metadata,
         ),
         status=status,
         intervention_annotations=tuple(

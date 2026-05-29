@@ -15,6 +15,11 @@ class DisplayRefreshSource(Enum):
     SLIDER_REPLAY = "slider_replay"
 
 
+class SliderReplayScopeKind(Enum):
+    FUTURE_TARGET_MEMBERSHIP = "future_target_membership"
+    CAPTURED_TRANSACTION = "captured_transaction"
+
+
 class ActiveDisplayKind(Enum):
     COMPLETED_RUN = "completed_run"
     CACHED_RESULT = "cached_result"
@@ -28,6 +33,68 @@ class DisplaySetRole(Enum):
     PRIMARY_RESULT = "primary_result"
     RESULT_OVERLAY = "result_overlay"
     REFERENCE_OVERLAY = "reference_overlay"
+
+
+class PlotLayerKind(Enum):
+    PRIMARY_SERIES = "primary_series"
+    RESULT_SERIES = "result_series"
+    REFERENCE_SERIES = "reference_series"
+
+
+@dataclass(frozen=True, slots=True)
+class PlotDisplayLayer:
+    layer_id: str
+    source_id: str
+    label: str
+    kind: PlotLayerKind
+    x: Any
+    y: Mapping[str, Any]
+    y_series: tuple[str, ...]
+    visible: bool = True
+    style_metadata: Mapping[str, Any] = field(default_factory=dict)
+    source_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "layer_id", str(self.layer_id or "").strip())
+        object.__setattr__(self, "source_id", str(self.source_id or "").strip())
+        object.__setattr__(self, "label", str(self.label or "").strip())
+        object.__setattr__(self, "kind", _normalized_plot_kind(self.kind))
+        object.__setattr__(self, "x", _readonly_display_value(self.x))
+        object.__setattr__(self, "y", _immutable_display_mapping(self.y))
+        object.__setattr__(self, "y_series", _normalized_str_tuple(self.y_series))
+        object.__setattr__(self, "visible", bool(self.visible))
+        object.__setattr__(self, "style_metadata", _immutable_display_mapping(self.style_metadata))
+        object.__setattr__(self, "source_metadata", _immutable_display_mapping(self.source_metadata))
+
+
+@dataclass(frozen=True, slots=True)
+class PlotDisplayLayersPayload:
+    transaction_id: str
+    primary_layer_id: str
+    layers: tuple[PlotDisplayLayer, ...]
+    intervention_annotations: tuple[Mapping[str, Any], ...] = ()
+    show_intervention_annotations: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "transaction_id", str(self.transaction_id or "").strip())
+        object.__setattr__(self, "primary_layer_id", str(self.primary_layer_id or "").strip())
+        object.__setattr__(
+            self,
+            "layers",
+            tuple(layer for layer in (self.layers or ()) if isinstance(layer, PlotDisplayLayer)),
+        )
+        object.__setattr__(
+            self,
+            "intervention_annotations",
+            _immutable_display_mapping_tuple(self.intervention_annotations),
+        )
+        object.__setattr__(self, "show_intervention_annotations", bool(self.show_intervention_annotations))
+
+
+@dataclass(frozen=True, slots=True)
+class PlotCsvExportColumn:
+    header: str
+    values: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +213,16 @@ def _normalized_str_tuple(values: Sequence[str] | object) -> tuple[str, ...]:
         seen.add(item)
         normalized.append(item)
     return tuple(normalized)
+
+
+def _normalized_plot_kind(value: PlotLayerKind | str | object) -> PlotLayerKind:
+    if isinstance(value, PlotLayerKind):
+        return value
+    raw = str(value or "").strip()
+    for candidate in PlotLayerKind:
+        if raw == candidate.value or raw == candidate.name:
+            return candidate
+    raise ValueError(f"Unknown plot layer kind: {value!r}")
 
 
 def _readonly_display_value(value: Any) -> Any:
@@ -485,7 +562,7 @@ class CompletionDisplayEntry:
     warnings: tuple[Mapping[str, Any], ...]
     completion_provenance: Mapping[str, Any] | None
     owned_species: tuple[str, ...]
-    display_species: tuple[str, ...] = ()
+    display_species: tuple[str, ...]
 
     def to_display_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -540,8 +617,8 @@ class FreshPreviewDisplayEntry:
     algebra_scalars: Mapping[str, object]
     solver_provenance: Mapping[str, Any] | None
     completion_provenance: Mapping[str, Any] | None
-    owned_species: tuple[str, ...] = ()
-    display_species: tuple[str, ...] = ()
+    owned_species: tuple[str, ...]
+    display_species: tuple[str, ...]
     workspace_preview_provenance: Mapping[str, Any] | None = None
 
     def to_display_payload(self) -> Dict[str, Any]:
@@ -604,10 +681,21 @@ def _normalize_slider_replay_target_set_ids(values: Sequence[str] | object) -> t
     return tuple(normalized)
 
 
+def _normalize_slider_replay_scope_kind(value: SliderReplayScopeKind | str | object) -> SliderReplayScopeKind:
+    if isinstance(value, SliderReplayScopeKind):
+        return value
+    raw = str(value or "").strip()
+    for candidate in SliderReplayScopeKind:
+        if raw == candidate.value or raw == candidate.name:
+            return candidate
+    return SliderReplayScopeKind.FUTURE_TARGET_MEMBERSHIP
+
+
 @dataclass(frozen=True, slots=True)
 class SliderReplayIntent:
     target_set_ids: tuple[str, ...] = ()
     source: str = ""
+    scope_kind: SliderReplayScopeKind = SliderReplayScopeKind.FUTURE_TARGET_MEMBERSHIP
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -616,6 +704,11 @@ class SliderReplayIntent:
             _normalize_slider_replay_target_set_ids(self.target_set_ids),
         )
         object.__setattr__(self, "source", str(self.source or "").strip())
+        object.__setattr__(
+            self,
+            "scope_kind",
+            _normalize_slider_replay_scope_kind(self.scope_kind),
+        )
 
 
 class SliderPreviewLifecyclePort(Protocol):

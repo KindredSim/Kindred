@@ -68,6 +68,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     """
 
     speciesEdited = Signal(str, float)     # species, value
+    speciesDragStarted = Signal(str)       # species
     speciesDragFinished = Signal(str)      # species
     contentStateChanged = Signal(bool)
 
@@ -88,6 +89,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._hidden_species: set[str] = set()
         self._visible_species_signature: tuple[str, ...] = ()
         self._selected_rows_signature: tuple[int, ...] = ()
+        self._slider_target_rebuild_deferred: bool = False
         self._placeholder: QtWidgets.QLabel | None = None
         self._hidden_placeholder: QtWidgets.QLabel | None = None
 
@@ -243,8 +245,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._current_row = None
         self._selected_rows_signature = ()
 
-    def rebase_snapshots_for_rows(self, rows: list[int]) -> None:
-        _ = rows
+    def live_drag_active(self) -> bool:
+        return any(bool(entry.dragging) for entry in self._rows.values())
 
     # ---------------- internal ----------------
 
@@ -266,6 +268,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
 
     def _on_slider_edit_targets_changed(self) -> None:
         if not self._active:
+            return
+        if self.live_drag_active():
+            self._slider_target_rebuild_deferred = True
             return
         self._rebuild_if_primary_row_changed()
 
@@ -599,6 +604,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         layout.addLayout(top)
 
         slider = QtWidgets.QSlider(QtCore.Qt.Horizontal, container)
+        slider.setMinimumHeight(28)
+        slider.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         slider.setMinimum(0)
         slider.setMaximum(_SLIDER_STEPS)
         slider.setSingleStep(10)
@@ -650,6 +657,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         if entry is None:
             return
         entry.dragging = True
+        entry.slider.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+        self.speciesDragStarted.emit(str(species))
 
     def _on_slider_released(self, species: str) -> None:
         entry = self._rows.get(str(species))
@@ -657,6 +666,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             return
         entry.dragging = False
         self.speciesDragFinished.emit(str(species))
+        if self._slider_target_rebuild_deferred:
+            self._slider_target_rebuild_deferred = False
+            self._rebuild_if_primary_row_changed()
 
     def _on_slider_value_changed(self, species: str, pos: int) -> None:
         if not self._active or self._table is None or self._model is None:
@@ -668,16 +680,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         value = max(0.0, float(value))
         entry.mixed = False
         entry.value_label.setText(_format_concentration(value))
-
-        target_rows = self._target_rows_for_write()
-        if not target_rows:
-            return
-        try:
-            owner = self._transaction_owner
-            if owner is not None and hasattr(owner, "stage_concentration_value_for_rows"):
-                owner.stage_concentration_value_for_rows(target_rows, species=str(species), value=float(value))
-        except Exception:
-            logger.debug("Failed to stage concentration overlay for %s", species, exc_info=True)
 
         self.speciesEdited.emit(str(species), float(value))
 

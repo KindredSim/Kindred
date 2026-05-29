@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Dict, Optional, Sequence
 from PySide6 import QtCore
 
 from kindred.core.document_parameter_store import DocumentParameterStore
-from kindred.gui.ports import SliderPreviewLifecyclePort, SliderReplayIntent
+from kindred.gui.ports import (
+    SliderPreviewLifecyclePort,
+    SliderReplayIntent,
+    SliderReplayScopeKind,
+)
 
 if TYPE_CHECKING:
     from kindred.gui.main_window import MainWindow
@@ -51,6 +55,7 @@ class MainWindowPreviewSession:
         self._suppress_slider_refresh = False
         self._slider_release_in_progress = False
         self._slider_release_primary_name = ""
+        self._species_slider_drag_changed = False
         self._variable_update_timer = None
         self._species_slider_update_timer = None
         self._slider_release_commit_timer = None
@@ -118,10 +123,6 @@ class MainWindowPreviewSession:
                 clear_preview = getattr(batch_cache, "clear_active_preview_cache_identity_state", None)
                 if callable(clear_preview):
                     clear_preview()
-                else:
-                    batch_cache.active_preview_cache_key = None
-                    if hasattr(batch_cache, "active_preview_scope_set_ids"):
-                        batch_cache.active_preview_scope_set_ids = None
         except Exception:
             logger.debug("Failed to clear active preview cache state", exc_info=True)
 
@@ -420,6 +421,8 @@ class MainWindowPreviewSession:
     ) -> tuple[Optional[SliderReplayIntent], tuple[str, ...]]:
         if not isinstance(intent, SliderReplayIntent):
             return None, ()
+        if intent.scope_kind is SliderReplayScopeKind.CAPTURED_TRANSACTION:
+            return intent, ()
         current_target_ids = self._normalized_target_set_id_tuple(intent.target_set_ids)
         if not current_target_ids:
             return None, ()
@@ -429,6 +432,7 @@ class MainWindowPreviewSession:
             self.build_slider_replay_intent(
                 set_ids=surviving_target_ids,
                 source=intent.source,
+                scope_kind=intent.scope_kind,
             ),
             removed_target_ids,
         )
@@ -480,8 +484,13 @@ class MainWindowPreviewSession:
         *,
         set_ids: Sequence[str] | str,
         source: str,
+        scope_kind: SliderReplayScopeKind = SliderReplayScopeKind.FUTURE_TARGET_MEMBERSHIP,
     ) -> Optional[SliderReplayIntent]:
-        intent = SliderReplayIntent(target_set_ids=set_ids, source=str(source or ""))
+        intent = SliderReplayIntent(
+            target_set_ids=set_ids,
+            source=str(source or ""),
+            scope_kind=scope_kind,
+        )
         if not intent.target_set_ids or not intent.source:
             return None
         return intent
@@ -491,8 +500,13 @@ class MainWindowPreviewSession:
         *,
         set_ids: Sequence[str],
         source: str,
+        scope_kind: SliderReplayScopeKind = SliderReplayScopeKind.FUTURE_TARGET_MEMBERSHIP,
     ) -> Optional[SliderReplayIntent]:
-        intent = self.build_slider_replay_intent(set_ids=set_ids, source=source)
+        intent = self.build_slider_replay_intent(
+            set_ids=set_ids,
+            source=source,
+            scope_kind=scope_kind,
+        )
         self._current_slider_replay_intent = intent
         return intent
 
@@ -507,6 +521,12 @@ class MainWindowPreviewSession:
         if current is not None and current.source != "species_slider":
             return
         if current is None and submitted_species_intent is None:
+            return
+        if (
+            submitted_species_intent is not None
+            and submitted_species_intent.scope_kind is SliderReplayScopeKind.CAPTURED_TRANSACTION
+        ):
+            self._current_slider_replay_intent = submitted_species_intent
             return
         next_intent = self.build_slider_replay_intent(
             set_ids=self._staged_concentration_overlay_target_set_ids(),
@@ -734,6 +754,52 @@ class MainWindowPreviewSession:
             )
             self._reconcile_species_slider_replay_intent()
             self._refresh_transaction_button_state()
+        return bool(changed)
+
+    def _rows_for_slider_target_set_ids(self, target_set_ids: Sequence[str]) -> list[int]:
+        mw = self._mw
+        rows: list[int] = []
+        seen: set[int] = set()
+        for set_id in target_set_ids or ():
+            try:
+                row = mw._batch_row_for_set_id(str(set_id))
+            except Exception:
+                row = None
+            if row is None:
+                continue
+            row_i = int(row)
+            if row_i in seen:
+                continue
+            seen.add(row_i)
+            rows.append(row_i)
+        if rows:
+            return rows
+        try:
+            current_row = mw._batch_current_row()
+        except Exception:
+            current_row = None
+        return [int(current_row)] if current_row is not None else []
+
+    def on_species_slider_value_changed(self, species: str, value: float) -> bool:
+        """Stage species slider edits through the preview-session gesture owner."""
+        if (
+            (self._slider_drag_active or self._slider_release_in_progress)
+            and self._slider_gesture_target_set_ids_snapshot
+        ):
+            target_set_ids = self.slider_gesture_target_set_ids_snapshot()
+        else:
+            target_set_ids = self._selected_mechanism_target_set_ids()
+        target_rows = self._rows_for_slider_target_set_ids(target_set_ids)
+        if not target_rows:
+            return False
+        changed = self.stage_concentration_value_for_rows(
+            target_rows,
+            species=str(species),
+            value=float(value),
+        )
+        if changed and self._slider_drag_active:
+            self._species_slider_drag_changed = True
+            return False
         return bool(changed)
 
     def clear_staged_concentration_overlays(self) -> None:
@@ -1065,6 +1131,33 @@ class MainWindowPreviewSession:
         timer.stop()
         timer.start()
 
+    def on_species_slider_drag_started(self, species: str) -> None:
+        """Capture species slider gesture scope before live preview churn can retarget it."""
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
+        self._slider_drag_active = True
+        self._species_slider_drag_changed = False
+        self._capture_slider_gesture_target_snapshot()
+        self._suppress_slider_refresh = True
+        self._last_slider_change_name = f"init:{species}"
+
+    def on_species_slider_drag_finished(self, species: str) -> None:
+        """Run the species preview using the scope captured at drag start."""
+        if not self.is_mechanism_valid_for_preview():
+            self._slider_drag_active = False
+            self._suppress_slider_refresh = False
+            self._clear_slider_gesture_target_snapshot()
+            self._show_invalid_preview_state()
+            return
+        self._slider_drag_active = False
+        changed = bool(self._species_slider_drag_changed)
+        self._species_slider_drag_changed = False
+        if changed:
+            self.queue_species_slider_simulation(label=f"init:{species}", delay_ms=0)
+        self._suppress_slider_refresh = False
+        self._clear_slider_gesture_target_snapshot()
+
     def queue_species_slider_simulation(self, *, label: str, delay_ms: int) -> None:
         """Queue a fast preview run for species-mode slider edits."""
         if not self.is_mechanism_valid_for_preview():
@@ -1077,9 +1170,19 @@ class MainWindowPreviewSession:
         delay_ms_i = max(0, min(500, delay_ms_i))
 
         self._last_slider_change_name = str(label or "init")
+        target_set_ids = (
+            self.slider_gesture_target_set_ids_snapshot()
+            or self._selected_mechanism_target_set_ids()
+        )
+        scope_kind = (
+            SliderReplayScopeKind.CAPTURED_TRANSACTION
+            if self.slider_gesture_target_set_ids_snapshot()
+            else SliderReplayScopeKind.FUTURE_TARGET_MEMBERSHIP
+        )
         intent = self.stage_slider_replay_intent(
-            set_ids=self._selected_mechanism_target_set_ids(),
+            set_ids=target_set_ids,
             source="species_slider",
+            scope_kind=scope_kind,
         )
         self.submit_slider_replay_intent(
             intent,
@@ -1116,6 +1219,7 @@ class MainWindowPreviewSession:
         intent = self.stage_slider_replay_intent(
             set_ids=target_set_ids,
             source="drag_release",
+            scope_kind=SliderReplayScopeKind.CAPTURED_TRANSACTION,
         )
         self.submit_slider_replay_intent(
             intent,
@@ -1186,6 +1290,8 @@ class MainWindowPreviewSession:
         mw = self._mw
         try:
             raw = mw._batch_store.get_value(int(row), str(species))
+            if str(raw).strip() == "":
+                return 0.0
             value = float(raw)
         except Exception:
             return None

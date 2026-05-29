@@ -381,6 +381,7 @@ def _completion_entry(*, set_id: str, label: str, values: tuple[float, float]) -
             mechanism_text="reaction: A -> B ; k=0.1",
         ),
         owned_species=("A",),
+        display_species=("A",),
     )
 
 def test_fast_parallel_preview_accepts_lane_epoch_distinct_from_preview_epoch():

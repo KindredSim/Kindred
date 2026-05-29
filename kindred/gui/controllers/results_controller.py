@@ -17,21 +17,19 @@ from kindred.core.batch_cache_contracts import (
 from kindred.gui.controllers.results_display_builders import (
     active_transaction_for_display_commit,
     deduped_set_ids,
-    display_overlay_entry,
+    display_metadata_for_entry,
     owned_species_for_display_entry,
     series_for_display_species,
-    transaction_overlay_is_reference,
 )
 from kindred.gui.controllers.results_display_projections import (
     build_copy_all_export_plan,
     build_main_plot_csv_export,
     cache_resolution_cause_for_transition,
-    display_status_for_unpublished_request,
-    display_status_is_displayed,
     display_transaction_provenance_payload,
     display_transition_status_text,
     ordered_display_transaction_metadata,
-    published_display_status_text,
+    plot_display_layers_payload,
+    stats_results_map_from_display_transaction,
 )
 from kindred.gui.ports import (
     ActiveDisplayKind,
@@ -51,8 +49,10 @@ from kindred.gui.ports import (
     DisplayTransitionCause,
     DisplayTransitionOutcome,
     DisplayTransitionOutcomeKind,
-    FreshPreviewDisplayEntry,
     FreshPreviewDisplayTransaction,
+    PlotCsvExportColumn,
+    PlotDisplayLayersPayload,
+    PlotLayerKind,
     ResolvedBatchDisplayRequestEntry,
     SimulationCompletionDisplayOutcome,
 )
@@ -64,21 +64,15 @@ __all__ = ["ResultsController"]
 
 class ResultsDisplayPlotPort(Protocol):
     def set_scalar_values(self, scalars: Dict[str, object]) -> None: ...
+    def set_display_layers(self, payload: PlotDisplayLayersPayload) -> None: ...
     def set_statistics_results(self, results: Dict[str, object], *, prefer: str) -> None: ...
     def stats_table(self) -> object: ...
     def overlay_snapshot(self) -> Dict[str, object]: ...
-    def set_simulation_popup_labels(self, *, primary_set_id: str, popup_labels_by_set_id: Mapping[str, str]) -> None: ...
     def clear_display_transaction_state(self) -> None: ...
     def transaction_export_axis_state(self, scope: str) -> Dict[str, object]: ...
-    def append_dataset_overlay_export_columns(
-        self,
-        header: Sequence[str],
-        rows: Sequence[Sequence[object]],
-        scope: str,
-    ) -> tuple[List[str], List[List[object]]]: ...
+    def dataset_overlay_export_columns(self, scope: str) -> Sequence[PlotCsvExportColumn]: ...
     def intervention_annotation_state(self) -> Dict[str, object]: ...
     def set_intervention_annotations_from_provenance(self, provenance: Mapping[str, object] | None) -> None: ...
-    def reference_layers_visible(self) -> bool: ...
 
 
 def _coerce_display_refresh_source(source: object | None) -> DisplayRefreshSource:
@@ -117,7 +111,6 @@ class ResultsControllerPort:
     update_main_plot_statistics: Callable[..., None]
     main_plot_stats_table: Callable[[], object]
     publish_main_plot_results_table: Callable[[object], None]
-    set_main_plot_data: Callable[..., None]
     show_simulation_tab: Callable[[], None]
     refresh_simulation_plot_views: Callable[[], None]
     schedule_main_plot_refresh: Callable[[Sequence[int]], None]
@@ -271,10 +264,71 @@ class ResultsController(QtCore.QObject):
         super().__init__(ui.parent)
         self._ui = ui
         self._active_display_transaction: ActiveDisplayTransaction | None = None
+        self._reference_overlays_visible: bool = True
         self._last_display_transition_outcome: DisplayTransitionOutcome | None = None
 
     def active_display_transaction(self) -> ActiveDisplayTransaction | None:
         return self._active_display_transaction
+
+    def set_reference_overlays_visible(self, visible: bool) -> None:
+        show = bool(visible)
+        self._reference_overlays_visible = show
+        previous_transaction = self._active_display_transaction
+        if not isinstance(previous_transaction, ActiveDisplayTransaction):
+            return
+
+        updated_sets: Dict[str, DisplaySetMetadata] = {}
+        has_reference_metadata = False
+        changed = False
+        for raw_layer_id, metadata in dict(previous_transaction.sets or {}).items():
+            layer_id = str(raw_layer_id or "").strip()
+            if metadata.role is DisplaySetRole.REFERENCE_OVERLAY:
+                has_reference_metadata = True
+                if bool(metadata.visible) != show:
+                    metadata = replace(metadata, visible=show)
+                    changed = True
+            if layer_id:
+                updated_sets[layer_id] = metadata
+        if not has_reference_metadata or not changed:
+            return
+
+        updated_transaction = replace(previous_transaction, sets=updated_sets)
+        self._active_display_transaction = updated_transaction
+        plot = self._main_plot()
+        self._set_plot_display_layers(
+            plot=plot,
+            active_display_transaction=updated_transaction,
+        )
+        stats_results_map = stats_results_map_from_display_transaction(
+            updated_transaction,
+            include_reference_overlays=True,
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(updated_transaction.display_set_ids),
+        )
+        prefer = f"result:{updated_transaction.primary_display_set_id}"
+        for metadata in dict(updated_transaction.sets or {}).values():
+            if (
+                metadata.role is DisplaySetRole.PRIMARY_RESULT
+                and str(metadata.set_id) == str(updated_transaction.primary_display_set_id)
+            ):
+                prefer = str(metadata.layer_id or prefer)
+                break
+        try:
+            plot.set_statistics_results(stats_results_map, prefer=prefer)
+            self._publish_main_plot_results_table(plot=plot)
+        except Exception as exc:
+            logger.exception("Failed to refresh reference visibility statistics projection: %s", exc)
+        self.refresh_active_display_transaction_provenance_projection()
+        self._record_display_transition_outcome(
+            outcome_kind=DisplayTransitionOutcomeKind.PUBLISHED,
+            active_transaction=updated_transaction,
+            previous_transaction=previous_transaction,
+            display_status=updated_transaction.status,
+            display_set_ids=updated_transaction.display_set_ids,
+            attempted_display_set_ids=updated_transaction.display_set_ids,
+            affected_set_ids=updated_transaction.display_set_ids,
+            event_kind=DisplayEventKind.SHOW_SCOPE_CHANGED,
+            cause=self._display_cause_for_active_kind(updated_transaction.kind),
+        )
 
     def publish_deferred_display_request(
         self,
@@ -301,39 +355,6 @@ class ResultsController(QtCore.QObject):
                 display_status=DisplayStatus.DISPLAY_DEFERRED,
             )
         )
-
-    def update_reference_overlay_visibility(self, visible: bool) -> None:
-        transaction = self._active_display_transaction
-        if transaction is None:
-            return
-        updated_sets: Dict[str, DisplaySetMetadata] = {}
-        changed = False
-        for layer_id, metadata in dict(transaction.sets or {}).items():
-            if metadata.role is DisplaySetRole.REFERENCE_OVERLAY:
-                updated = replace(metadata, visible=bool(visible))
-                changed = changed or metadata.visible != bool(visible)
-                updated_sets[str(layer_id)] = updated
-                continue
-            updated_sets[str(layer_id)] = metadata
-        if changed:
-            updated_transaction = replace(transaction, sets=updated_sets)
-            self._active_display_transaction = updated_transaction
-            self._record_display_transition_outcome(
-                outcome_kind=DisplayTransitionOutcomeKind.PUBLISHED,
-                active_transaction=updated_transaction,
-                previous_transaction=transaction,
-                display_status=updated_transaction.status,
-                display_set_ids=updated_transaction.display_set_ids,
-                affected_set_ids=updated_transaction.display_set_ids,
-                event_kind=DisplayEventKind.SHOW_SCOPE_CHANGED,
-                cause=self._display_cause_for_active_kind(updated_transaction.kind),
-            )
-            provenance_payload = self._display_transaction_provenance_payload(updated_transaction)
-            self._ui.update_display_transaction_provenance(**provenance_payload)
-
-    @staticmethod
-    def _deduped_set_ids(values: Sequence[str]) -> tuple[str, ...]:
-        return deduped_set_ids(values)
 
     def _current_display_request_scope(
         self,
@@ -366,7 +387,7 @@ class ResultsController(QtCore.QObject):
                 logger.debug("Failed to snapshot requested Show set ids: %s", exc, exc_info=True)
                 requested_show_ids = ()
         else:
-            requested_show_ids = tuple(self._deduped_set_ids(requested_show_set_ids))
+            requested_show_ids = tuple(deduped_set_ids(requested_show_set_ids))
         if requested_labels_by_set_id is None:
             requested_labels = self._popup_labels_by_set_id(requested_show_ids)
         else:
@@ -410,7 +431,7 @@ class ResultsController(QtCore.QObject):
             row_selection_set_ids=row_selection_set_ids,
             explicit_slider_target_set_ids=explicit_slider_targets,
             effective_slider_target_set_ids=effective_slider_targets,
-            run_target_set_ids=self._deduped_set_ids(run_target_set_ids),
+            run_target_set_ids=deduped_set_ids(run_target_set_ids),
             cache_key=str(cache_key or "").strip(),
             run_id=run_id,
             request_id=request_id,
@@ -491,50 +512,6 @@ class ResultsController(QtCore.QObject):
             and transition_outcome.cause is DisplayTransitionCause.DISPLAY_MUTATION_DENIED
             and isinstance(transition_outcome.active_transaction, ActiveDisplayTransaction)
             and transition_outcome.active_transaction.kind is ActiveDisplayKind.COMPLETED_RUN
-        )
-
-    @staticmethod
-    def _display_transition_status_text(
-        transition_outcome: DisplayTransitionOutcome | None,
-    ) -> str:
-        return display_transition_status_text(transition_outcome)
-
-    def _set_status_from_display_transition(
-        self,
-        transition_outcome: DisplayTransitionOutcome | None,
-    ) -> None:
-        self._ui.set_status_text(self._display_transition_status_text(transition_outcome))
-
-    @staticmethod
-    def _published_display_status_text(display_status: DisplayStatus) -> str:
-        return published_display_status_text(display_status)
-
-    @staticmethod
-    def _display_status_is_displayed(display_status: DisplayStatus) -> bool:
-        return display_status_is_displayed(display_status)
-
-    @classmethod
-    def _display_status_for_unpublished_request(
-        cls,
-        *,
-        requested_status: DisplayStatus,
-        active_transaction: ActiveDisplayTransaction | None,
-    ) -> DisplayStatus:
-        _ = cls
-        return display_status_for_unpublished_request(
-            requested_status=requested_status,
-            active_transaction=active_transaction,
-        )
-
-    @staticmethod
-    def _cache_resolution_cause_for_transition(
-        transition_outcome: DisplayTransitionOutcome | None,
-        *,
-        default: DisplayTransitionCause = DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE,
-    ) -> DisplayTransitionCause:
-        return cache_resolution_cause_for_transition(
-            transition_outcome,
-            default=default,
         )
 
     def _main_plot(self) -> ResultsDisplayPlotPort:
@@ -695,9 +672,9 @@ class ResultsController(QtCore.QObject):
         transaction = self._active_display_transaction
         if transaction is None:
             return {}
-        requested_ids = set(self._deduped_set_ids(requested_show_set_ids))
-        excluded_ids = set(self._deduped_set_ids(excluded_set_ids))
-        active_display_ids = set(self._deduped_set_ids(transaction.display_set_ids))
+        requested_ids = set(deduped_set_ids(requested_show_set_ids))
+        excluded_ids = set(deduped_set_ids(excluded_set_ids))
+        active_display_ids = set(deduped_set_ids(transaction.display_set_ids))
         entries: dict[str, Mapping[str, Any]] = {}
         for metadata in dict(transaction.sets or {}).values():
             if not isinstance(metadata, DisplaySetMetadata):
@@ -726,10 +703,6 @@ class ResultsController(QtCore.QObject):
         return entries
 
     @staticmethod
-    def _owned_species_for_display_entry(entry: Mapping[str, Any]) -> tuple[str, ...]:
-        return owned_species_for_display_entry(entry)
-
-    @staticmethod
     def _explicit_display_species_for_entry(entry: Mapping[str, Any]) -> tuple[str, ...]:
         raw_display_species = entry.get("display_species")
         if not isinstance(raw_display_species, Sequence) or isinstance(raw_display_species, (str, bytes)):
@@ -745,81 +718,9 @@ class ResultsController(QtCore.QObject):
             display_species=ResultsController._explicit_display_species_for_entry(entry),
         )
 
-    @staticmethod
-    def _display_overlay_entry(
-        *,
-        label: str,
-        entry: Mapping[str, Any],
-        set_id: str,
-        layer_kind: str,
-        layer_id: str,
-        owned_species: Sequence[str] | None = None,
-        visible: bool | None = None,
-    ) -> Dict[str, object]:
-        return display_overlay_entry(
-            label=label,
-            entry=entry,
-            set_id=set_id,
-            layer_kind=layer_kind,
-            layer_id=layer_id,
-            owned_species=owned_species,
-            visible=visible,
-        )
-
-    def _cached_batch_overlays(
-        self,
-        *,
-        transaction_entries_by_set_id: Mapping[str, Mapping[str, Any]],
-        primary: str,
-    ) -> List[Dict[str, object]]:
-        overlays: List[Dict[str, object]] = []
-        for sid, entry in transaction_entries_by_set_id.items():
-            if str(sid) == str(primary):
-                continue
-            overlay_label = self._ui.batch_name_for_id(str(sid)) or str(sid)
-            overlay_entry = {
-                **dict(entry),
-                "display_species": self._explicit_display_species_for_entry(entry),
-            }
-            overlays.append(
-                self._display_overlay_entry(
-                    label=overlay_label,
-                    entry=overlay_entry,
-                    set_id=str(sid),
-                    layer_id=f"result:{sid}",
-                    layer_kind="result",
-                )
-            )
-        return overlays
-
     def _publish_main_plot_results_table(self, *, plot: ResultsDisplayPlotPort | None = None) -> None:
         table = plot.stats_table() if plot is not None else self._ui.main_plot_stats_table()
         self._ui.publish_main_plot_results_table(table)
-
-    @staticmethod
-    def _stats_results_map_from_display_transaction(
-        active_display_transaction: ActiveDisplayTransaction,
-        *,
-        include_reference_overlays: bool,
-    ) -> Dict[str, Dict[str, object]]:
-        stats_results_map: Dict[str, Dict[str, object]] = {}
-        for metadata in ordered_display_transaction_metadata(active_display_transaction):
-            if metadata.role is DisplaySetRole.REFERENCE_OVERLAY and not bool(include_reference_overlays):
-                continue
-            layer_id = str(metadata.layer_id or "").strip()
-            if not layer_id:
-                layer_prefix = "reference" if metadata.role is DisplaySetRole.REFERENCE_OVERLAY else "result"
-                layer_id = f"{layer_prefix}:{metadata.set_id}"
-            layer_kind = "reference" if metadata.role is DisplaySetRole.REFERENCE_OVERLAY else "result"
-            stats_results_map[layer_id] = {
-                "t": metadata.t,
-                "series": dict(metadata.series or {}),
-                "label": str(metadata.label or metadata.set_id),
-                "layer_id": layer_id,
-                "layer_kind": layer_kind,
-                "set_id": str(metadata.set_id),
-            }
-        return stats_results_map
 
     def _apply_cached_batch_plot_metadata(
         self,
@@ -843,9 +744,10 @@ class ResultsController(QtCore.QObject):
             )
             return "metadata_scalar_failed"
 
-        stats_results_map = self._stats_results_map_from_display_transaction(
+        stats_results_map = stats_results_map_from_display_transaction(
             active_display_transaction,
             include_reference_overlays=False,
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(active_display_transaction.display_set_ids),
         )
         try:
             self._ui.update_main_plot_statistics(
@@ -886,9 +788,10 @@ class ResultsController(QtCore.QObject):
             )
             return "metadata_scalar_failed"
 
-        stats_results_map = self._stats_results_map_from_display_transaction(
+        stats_results_map = stats_results_map_from_display_transaction(
             active_display_transaction,
             include_reference_overlays=True,
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(active_display_transaction.display_set_ids),
         )
         try:
             self._ui.update_main_plot_statistics(
@@ -936,20 +839,11 @@ class ResultsController(QtCore.QObject):
 
         _ = completion_entries
         _ = display_series_by_set_id
-        stats_results_map: Dict[str, Dict[str, object]] = {}
-        metadata_values = self._ordered_display_transaction_metadata(active_display_transaction)
-        for metadata in metadata_values:
-            if metadata.role is DisplaySetRole.REFERENCE_OVERLAY:
-                continue
-            layer_id = str(metadata.layer_id or f"result:{metadata.set_id}")
-            stats_results_map[layer_id] = {
-                "t": metadata.t,
-                "series": dict(metadata.series or {}),
-                "label": str(metadata.label or metadata.set_id),
-                "layer_id": layer_id,
-                "layer_kind": "result",
-                "set_id": str(metadata.set_id),
-            }
+        stats_results_map = stats_results_map_from_display_transaction(
+            active_display_transaction,
+            include_reference_overlays=True,
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(active_display_transaction.display_set_ids),
+        )
         try:
             self._ui.update_main_plot_statistics(
                 stats_results_map=stats_results_map,
@@ -971,6 +865,46 @@ class ResultsController(QtCore.QObject):
             self._publish_main_plot_results_table()
         except Exception as exc:
             logger.exception("Failed to fetch stats table after completed run display: %s", exc)
+            return "metadata_table_failed"
+        return None
+
+    def _apply_active_transaction_plot_metadata(
+        self,
+        *,
+        plot: object,
+        active_display_transaction: ActiveDisplayTransaction,
+        primary_t: np.ndarray,
+        primary_series: Mapping[str, Any],
+        algebra_scalars: Mapping[str, object] | None,
+        prefer_layer_id: str,
+        context_label: str,
+    ) -> Optional[str]:
+        try:
+            self._ui.set_main_plot_scalar_values(dict(algebra_scalars or {}))
+        except Exception as exc:
+            logger.exception("Failed to set plot scalar values for %s: %s", context_label, exc)
+            return "metadata_scalar_failed"
+
+        normalized_series = {str(k): np.asarray(v, dtype=float) for k, v in dict(primary_series or {}).items()}
+        stats_results_map = stats_results_map_from_display_transaction(
+            active_display_transaction,
+            include_reference_overlays=True,
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(active_display_transaction.display_set_ids),
+        )
+        try:
+            self._ui.update_main_plot_statistics(
+                stats_results_map=stats_results_map,
+                prefer=str(prefer_layer_id or ""),
+                t=np.asarray(primary_t, dtype=float),
+                series=normalized_series,
+            )
+        except Exception as exc:
+            logger.exception("Failed to update plot statistics for %s: %s", context_label, exc)
+            return "metadata_statistics_failed"
+        try:
+            self._publish_main_plot_results_table(plot=plot)
+        except Exception as exc:
+            logger.exception("Failed to update results table for %s: %s", context_label, exc)
             return "metadata_table_failed"
         return None
 
@@ -1002,7 +936,7 @@ class ResultsController(QtCore.QObject):
                         "series": normalized_series,
                         "label": str(display_label),
                         "layer_id": layer_id_s,
-                        "layer_kind": "result",
+                        "kind": PlotLayerKind.RESULT_SERIES,
                         "set_id": set_id_s,
                     }
                 },
@@ -1031,7 +965,9 @@ class ResultsController(QtCore.QObject):
         direct_completion_provenance: Mapping[str, Any] | None,
         active_display_transaction: ActiveDisplayTransaction | None = None,
     ) -> Optional[str]:
-        transaction_payload = self._display_transaction_provenance_payload(active_display_transaction)
+        transaction_payload = display_transaction_provenance_payload(
+            active_display_transaction,
+        )
         if not isinstance(direct_completion_provenance, Mapping):
             if not transaction_payload:
                 self._clear_direct_completion_provenance()
@@ -1080,11 +1016,20 @@ class ResultsController(QtCore.QObject):
             return "direct_provenance_failed"
         return None
 
-    @staticmethod
-    def _display_transaction_provenance_payload(
-        transaction: ActiveDisplayTransaction | None,
-    ) -> Dict[str, object]:
-        return display_transaction_provenance_payload(transaction)
+    def refresh_active_display_transaction_provenance_projection(self, *_args: object) -> None:
+        active_transaction = self._active_display_transaction
+        if not isinstance(active_transaction, ActiveDisplayTransaction):
+            return
+        payload = display_transaction_provenance_payload(
+            active_transaction,
+        )
+        try:
+            self._ui.update_display_transaction_provenance(
+                display_transaction=payload.get("display_transaction"),
+                display_sets=payload.get("display_sets"),
+            )
+        except Exception as exc:
+            logger.exception("Failed to refresh display transaction provenance projection: %s", exc)
 
     def _clear_direct_completion_provenance(self) -> None:
         self._ui.set_last_simulation_provenance({})
@@ -1115,30 +1060,19 @@ class ResultsController(QtCore.QObject):
             popup_labels[set_id] = popup_label
         return popup_labels
 
-    def _sync_main_plot_copy_labels(self, *, primary_set_id: str, display_set_ids: Sequence[str]) -> None:
-        primary_set_id_s = str(primary_set_id or "").strip()
-        display_ids: list[str] = []
-        for raw_set_id in display_set_ids or ():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id or set_id in display_ids:
-                continue
-            display_ids.append(set_id)
-        if primary_set_id_s and primary_set_id_s not in display_ids:
-            display_ids.insert(0, primary_set_id_s)
-        plot = self._main_plot()
-        plot.set_simulation_popup_labels(
-            primary_set_id=primary_set_id_s,
-            popup_labels_by_set_id=self._popup_labels_by_set_id(display_ids),
-        )
-
-    def _deauthorize_active_display_transaction_outputs(self) -> ActiveDisplayTransaction | None:
+    def _deauthorize_active_display_transaction_outputs(
+        self,
+        *,
+        clear_plot: bool = True,
+    ) -> ActiveDisplayTransaction | None:
         previous_transaction = self._active_display_transaction
         self._active_display_transaction = None
-        try:
-            plot = self._main_plot()
-            plot.clear_display_transaction_state()
-        except Exception as exc:
-            logger.debug("Failed to clear display transaction plot state: %s", exc, exc_info=True)
+        if bool(clear_plot):
+            try:
+                plot = self._main_plot()
+                plot.clear_display_transaction_state()
+            except Exception as exc:
+                logger.debug("Failed to clear display transaction plot state: %s", exc, exc_info=True)
         try:
             self._clear_direct_completion_provenance()
         except Exception as exc:
@@ -1168,8 +1102,9 @@ class ResultsController(QtCore.QObject):
         missing_intent_set_ids: Sequence[str] = (),
         failed_intent_set_ids: Sequence[str] = (),
         semantic_unavailable_set_ids: Sequence[str] = (),
+        clear_plot: bool = True,
     ) -> DisplayTransitionOutcome:
-        previous_transaction = self._deauthorize_active_display_transaction_outputs()
+        previous_transaction = self._deauthorize_active_display_transaction_outputs(clear_plot=clear_plot)
         transition = self._record_display_transition_outcome(
             outcome_kind=outcome_kind,
             active_transaction=None,
@@ -1191,18 +1126,26 @@ class ResultsController(QtCore.QObject):
             event_kind=event_kind,
             cause=cause,
         )
-        self._set_status_from_display_transition(transition)
+        self._ui.set_status_text(display_transition_status_text(transition))
         return transition
 
     def clear_display_if_workspace_previews_were_displayed(
         self,
         set_ids: Sequence[str],
+        *,
+        clear_plot: bool = True,
     ) -> bool:
         displayed_set_ids = self._displayed_workspace_preview_set_ids(set_ids)
         if not displayed_set_ids:
             return False
         self._ui.clear_active_preview_cache_identity_state()
-        self.clear_active_display_transaction()
+        self.clear_active_display_transaction(
+            display_status=DisplayStatus.NO_COMPLETE_DISPLAYABLE_REQUEST_SCOPE,
+            cause=DisplayTransitionCause.AFFECTED_SCOPE_INTERSECTS_ACTIVE_DISPLAY,
+            affected_set_ids=displayed_set_ids,
+            unresolved_intent_set_ids=displayed_set_ids,
+            clear_plot=bool(clear_plot),
+        )
         return True
 
     def _displayed_workspace_preview_set_ids(
@@ -1333,21 +1276,6 @@ class ResultsController(QtCore.QObject):
             return AuthoritativeResultDisplayTransitionOutcome(refresh_requested=False)
         self.clear_active_display_transaction()
         return AuthoritativeResultDisplayTransitionOutcome(refresh_requested=False)
-
-    @staticmethod
-    def _transaction_overlay_is_reference(entry: Mapping[str, Any]) -> bool:
-        return transaction_overlay_is_reference(entry)
-
-    def _reference_overlay_visible_for_publication(self) -> bool:
-        try:
-            return bool(self._main_plot().reference_layers_visible())
-        except Exception as exc:
-            logger.debug(
-                "Reference overlay visibility unavailable during display publication: %s",
-                exc,
-                exc_info=True,
-            )
-            return True
 
     def current_workspace_preview_identity_payload(self, *, set_id: str) -> Optional[Dict[str, Any]]:
         sid = str(set_id or "").strip()
@@ -1512,10 +1440,10 @@ class ResultsController(QtCore.QObject):
         semantic_unavailable_set_ids: Sequence[str] = (),
     ) -> DisplayTransitionOutcome:
         affected_scope = self._normalized_set_id_set(affected_set_ids)
-        unresolved_scope = tuple(self._deduped_set_ids(unresolved_intent_set_ids or tuple(affected_scope)))
-        failed_scope = tuple(self._deduped_set_ids(failed_intent_set_ids))
+        unresolved_scope = tuple(deduped_set_ids(unresolved_intent_set_ids or tuple(affected_scope)))
+        failed_scope = tuple(deduped_set_ids(failed_intent_set_ids))
         semantic_scope = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 semantic_unavailable_set_ids
                 or tuple(set_id for set_id in affected_scope if set_id not in set(failed_scope))
             )
@@ -1575,9 +1503,9 @@ class ResultsController(QtCore.QObject):
         if not isinstance(cause, DisplayTransitionCause):
             raise TypeError("Completed-run display unavailable requires DisplayTransitionCause")
         affected_scope = self._normalized_set_id_set(affected_set_ids)
-        unresolved_scope = tuple(self._deduped_set_ids(unresolved_intent_set_ids or tuple(affected_scope)))
+        unresolved_scope = tuple(deduped_set_ids(unresolved_intent_set_ids or tuple(affected_scope)))
         failed_scope = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 failed_intent_set_ids
                 or (
                     tuple(affected_scope)
@@ -1696,7 +1624,7 @@ class ResultsController(QtCore.QObject):
         )
         if cause is None:
             return None
-        requested_ids = tuple(self._deduped_set_ids(requested_show_set_ids))
+        requested_ids = tuple(deduped_set_ids(requested_show_set_ids))
         available_ids = {
             *self._completed_run_display_set_ids(),
             *(
@@ -1721,7 +1649,7 @@ class ResultsController(QtCore.QObject):
             outcome_kind=DisplayTransitionOutcomeKind.DENIED,
             display_status=DisplayStatus.DISPLAY_DENIED,
         )
-        self._set_status_from_display_transition(outcome)
+        self._ui.set_status_text(display_transition_status_text(outcome))
         return outcome
 
     def deauthorize_completed_run_display_for_runtime_input_preview(
@@ -1823,13 +1751,9 @@ class ResultsController(QtCore.QObject):
         return display_series
 
     def build_main_plot_copy_all_export_plan(self) -> object | None:
-        return build_copy_all_export_plan(self._active_display_transaction)
-
-    @staticmethod
-    def _ordered_display_transaction_metadata(
-        transaction: ActiveDisplayTransaction,
-    ) -> list[DisplaySetMetadata]:
-        return ordered_display_transaction_metadata(transaction)
+        return build_copy_all_export_plan(
+            self._active_display_transaction,
+        )
 
     def build_main_plot_csv_export(self, scope: str) -> tuple[list[str], list[list[object]]]:
         active_transaction = self._active_display_transaction
@@ -1850,7 +1774,46 @@ class ResultsController(QtCore.QObject):
             scope=normalized_scope,
             axis_state=axis_state,
         )
-        return plot.append_dataset_overlay_export_columns(header, rows, normalized_scope)
+        header, rows = self._append_plot_owned_csv_export_columns(
+            header,
+            rows,
+            plot.dataset_overlay_export_columns(normalized_scope),
+        )
+        return header, rows
+
+    @staticmethod
+    def _append_plot_owned_csv_export_columns(
+        header: Sequence[str],
+        rows: Sequence[Sequence[object]],
+        columns: Sequence[PlotCsvExportColumn],
+    ) -> tuple[list[str], list[list[object]]]:
+        extra_columns: list[tuple[str, np.ndarray]] = []
+        for column in columns or ():
+            if not isinstance(column, PlotCsvExportColumn):
+                continue
+            header_text = str(column.header or "").strip()
+            if not header_text:
+                continue
+            values = np.asarray(column.values).reshape(-1)
+            if values.size <= 0:
+                continue
+            extra_columns.append((header_text, values))
+        base_header = list(header)
+        base_rows = [list(row) for row in rows]
+        if not extra_columns:
+            return base_header, base_rows
+        combined_header = base_header + [name for name, _values in extra_columns]
+        max_len = max(len(base_rows), *(values.shape[0] for _name, values in extra_columns))
+        combined_rows: list[list[object]] = []
+        for idx in range(max_len):
+            if idx < len(base_rows):
+                row = list(base_rows[idx])
+            else:
+                row = [""] * len(base_header)
+            for _name, values in extra_columns:
+                row.append(values[idx] if idx < values.shape[0] else "")
+            combined_rows.append(row)
+        return combined_header, combined_rows
 
     def reset_stale_cache_warning_status(self) -> None:
         transition = self._last_display_transition_outcome
@@ -1887,7 +1850,6 @@ class ResultsController(QtCore.QObject):
         *,
         t: np.ndarray,
         series: Mapping[str, Any],
-        overlays: Sequence[Mapping[str, Any]],
         primary_set_id: str,
         primary_label: str,
         display_set_ids: Sequence[str],
@@ -1896,6 +1858,7 @@ class ResultsController(QtCore.QObject):
         completion_provenance: Mapping[str, Any] | None,
         workspace_preview_provenance_by_set_id: Mapping[str, Mapping[str, Any]] | None,
         display_transition: DisplayPublicationTransition,
+        additional_metadata: Sequence[DisplaySetMetadata] = (),
         run_id: int | None = None,
         request_id: int | None = None,
         intervention_annotations: Sequence[Mapping[str, Any]] = (),
@@ -1906,7 +1869,6 @@ class ResultsController(QtCore.QObject):
         return active_transaction_for_display_commit(
             t=t,
             series=series,
-            overlays=overlays,
             primary_set_id=primary_set_id,
             primary_label=primary_label,
             display_set_ids=display_set_ids,
@@ -1914,6 +1876,7 @@ class ResultsController(QtCore.QObject):
             display_species=display_species,
             completion_provenance=completion_provenance,
             workspace_preview_provenance_by_set_id=workspace_preview_provenance_by_set_id,
+            additional_metadata=additional_metadata,
             active_kind=kind,
             status=status,
             request_id=request_id,
@@ -1921,6 +1884,36 @@ class ResultsController(QtCore.QObject):
             intervention_annotations=intervention_annotations,
             show_intervention_annotations=show_intervention_annotations,
         )
+
+    def _authorized_reference_metadata_for_refresh(
+        self,
+        *,
+        previous_transaction: ActiveDisplayTransaction | None,
+        display_set_ids: Sequence[str],
+    ) -> Dict[str, DisplaySetMetadata]:
+        if not isinstance(previous_transaction, ActiveDisplayTransaction):
+            return {}
+        display_ids = set(deduped_set_ids(display_set_ids))
+        if not display_ids:
+            return {}
+        reference_metadata: Dict[str, DisplaySetMetadata] = {}
+        for raw_layer_id, metadata in dict(previous_transaction.sets or {}).items():
+            if not isinstance(metadata, DisplaySetMetadata):
+                continue
+            if metadata.role is not DisplaySetRole.REFERENCE_OVERLAY:
+                continue
+            if str(metadata.set_id or "").strip() not in display_ids:
+                continue
+            layer_id = str(metadata.layer_id or raw_layer_id or "").strip()
+            if not layer_id:
+                continue
+            if bool(metadata.visible) != bool(self._reference_overlays_visible):
+                metadata = replace(
+                    metadata,
+                    visible=bool(self._reference_overlays_visible),
+                )
+            reference_metadata[layer_id] = metadata
+        return reference_metadata
 
     def _record_display_transition_outcome(
         self,
@@ -1948,7 +1941,7 @@ class ResultsController(QtCore.QObject):
             else None
         )
         outcome_requested_ids = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 requested_show_set_ids
                 if requested_show_set_ids is not None
                 else (
@@ -1977,7 +1970,7 @@ class ResultsController(QtCore.QObject):
                 requested_labels_by_set_id=outcome_labels,
             )
         outcome_display_ids = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 display_set_ids
                 if display_set_ids is not None
                 else (
@@ -1988,7 +1981,7 @@ class ResultsController(QtCore.QObject):
             )
         )
         outcome_attempted_ids = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 attempted_display_set_ids
                 if attempted_display_set_ids is not None
                 else outcome_display_ids
@@ -2032,15 +2025,11 @@ class ResultsController(QtCore.QObject):
         cause: DisplayTransitionCause = DisplayTransitionCause.DISPLAY_MUTATION_DENIED,
     ) -> DisplayTransitionOutcome:
         active_transaction = self._active_display_transaction
-        resolved_status = self._display_status_for_unpublished_request(
-            requested_status=display_status,
-            active_transaction=active_transaction,
-        )
         outcome = self._record_display_transition_outcome(
             outcome_kind=outcome_kind,
             active_transaction=active_transaction,
             previous_transaction=active_transaction,
-            display_status=resolved_status,
+            display_status=display_status,
             requested_show_set_ids=(
                 requested_show_set_ids
                 if requested_show_set_ids is not None
@@ -2057,7 +2046,7 @@ class ResultsController(QtCore.QObject):
             event_kind=event_kind,
             cause=cause,
         )
-        self._set_status_from_display_transition(outcome)
+        self._ui.set_status_text(display_transition_status_text(outcome))
         return outcome
 
     def _simulation_no_display_outcome(
@@ -2075,8 +2064,8 @@ class ResultsController(QtCore.QObject):
         outcome_kind: DisplayTransitionOutcomeKind = DisplayTransitionOutcomeKind.DENIED,
         display_status: DisplayStatus = DisplayStatus.DISPLAY_DENIED,
     ) -> SimulationCompletionDisplayOutcome:
-        affected_ids = tuple(self._deduped_set_ids(affected_set_ids))
-        unresolved_ids = tuple(self._deduped_set_ids(unresolved_intent_set_ids or affected_ids))
+        affected_ids = tuple(deduped_set_ids(affected_set_ids))
+        unresolved_ids = tuple(deduped_set_ids(unresolved_intent_set_ids or affected_ids))
         if (
             self._active_display_transaction is not None
             and affected_ids
@@ -2134,8 +2123,8 @@ class ResultsController(QtCore.QObject):
         failed_intent_set_ids: Sequence[str] = (),
         semantic_unavailable_set_ids: Sequence[str] = (),
     ) -> DisplayTransitionOutcome:
-        affected_ids = tuple(self._deduped_set_ids(affected_set_ids))
-        unresolved_ids = tuple(self._deduped_set_ids(unresolved_intent_set_ids or affected_ids))
+        affected_ids = tuple(deduped_set_ids(affected_set_ids))
+        unresolved_ids = tuple(deduped_set_ids(unresolved_intent_set_ids or affected_ids))
         self._deauthorize_active_display_transaction_outputs()
         transition = self._record_display_transition_outcome(
             outcome_kind=DisplayTransitionOutcomeKind.FAILED,
@@ -2175,7 +2164,7 @@ class ResultsController(QtCore.QObject):
             event_kind=DisplayEventKind.DISPLAY_FAILURE,
             cause=DisplayTransitionCause.DISPLAY_MUTATION_FAILED,
         )
-        self._set_status_from_display_transition(transition)
+        self._ui.set_status_text(display_transition_status_text(transition))
         return transition
 
     @staticmethod
@@ -2202,7 +2191,6 @@ class ResultsController(QtCore.QObject):
         t: np.ndarray,
         series: Mapping[str, Any],
         label: str,
-        overlays: Sequence[Dict[str, object]],
         metadata_applier: Callable[[ResultsDisplayPlotPort, ActiveDisplayTransaction], Optional[str]],
         annotation_entry: Mapping[str, Any],
         primary_set_id: str,
@@ -2213,6 +2201,7 @@ class ResultsController(QtCore.QObject):
         owned_species: Sequence[str] | None = None,
         display_species: Sequence[str],
         display_transition: DisplayPublicationTransition,
+        additional_metadata: Sequence[DisplaySetMetadata] = (),
         requested_show_set_ids: Sequence[str] | None = None,
         requested_labels_by_set_id: Mapping[str, str] | None = None,
         run_target_set_ids: Sequence[str] = (),
@@ -2224,7 +2213,7 @@ class ResultsController(QtCore.QObject):
         run_id: int | None = None,
         request_id: int | None = None,
     ) -> CachedBatchDisplayScopeOutcome:
-        attempted_display_ids = tuple(self._deduped_set_ids(display_set_ids))
+        attempted_display_ids = tuple(deduped_set_ids(display_set_ids))
         request_scope = self._current_display_request_scope(
             requested_show_set_ids=requested_show_set_ids,
             requested_labels_by_set_id=requested_labels_by_set_id,
@@ -2237,7 +2226,7 @@ class ResultsController(QtCore.QObject):
             transition=display_transition,
         )
         if display_denied:
-            denied_ids = tuple(self._deduped_set_ids(requested_show_set_ids or attempted_display_ids))
+            denied_ids = tuple(deduped_set_ids(requested_show_set_ids or attempted_display_ids))
             transition_outcome = self._record_unpublished_display_request_outcome(
                 affected_set_ids=denied_ids,
                 requested_show_set_ids=requested_show_set_ids,
@@ -2249,12 +2238,10 @@ class ResultsController(QtCore.QObject):
             return CachedBatchDisplayScopeOutcome(
                 transition_outcome=transition_outcome,
             )
-        primary_set_id_s = str(primary_set_id or "").strip()
         previous_transaction = self._active_display_transaction
         active_transaction = self._active_transaction_for_display_commit(
             t=np.asarray(t, dtype=float),
             series=series,
-            overlays=overlays,
             primary_set_id=str(primary_set_id),
             primary_label=str(primary_label),
             display_set_ids=attempted_display_ids,
@@ -2262,6 +2249,7 @@ class ResultsController(QtCore.QObject):
             display_species=display_species,
             completion_provenance=completion_provenance,
             workspace_preview_provenance_by_set_id=workspace_preview_provenance_by_set_id,
+            additional_metadata=additional_metadata,
             display_transition=display_transition,
             run_id=run_id,
             request_id=request_id,
@@ -2284,31 +2272,6 @@ class ResultsController(QtCore.QObject):
             return CachedBatchDisplayScopeOutcome(
                 transition_outcome=transition_outcome,
             )
-        if not self._set_plot_data(
-            np.asarray(t, dtype=float),
-            {str(k): np.asarray(v, dtype=float) for k, v in series.items()},
-            label=str(label),
-            primary_set_id=primary_set_id_s,
-            layer_id=f"result:{primary_set_id_s}" if primary_set_id_s else None,
-            overlays=overlays,
-            owned_species=owned_species,
-        ):
-            transition_outcome = self._record_failed_display_transaction_attempt(
-                previous_transaction=previous_transaction,
-                affected_set_ids=attempted_display_ids,
-                attempted_transaction=active_transaction,
-                request_scope=request_scope,
-                requested_show_set_ids=requested_show_set_ids,
-                requested_labels_by_set_id=requested_labels_by_set_id,
-                unresolved_intent_set_ids=unresolved_intent_set_ids,
-                missing_intent_set_ids=missing_intent_set_ids,
-                failed_intent_set_ids=failed_intent_set_ids,
-                semantic_unavailable_set_ids=semantic_unavailable_set_ids,
-            )
-            return CachedBatchDisplayScopeOutcome(
-                transition_outcome=transition_outcome,
-            )
-
         self._active_display_transaction = active_transaction
         try:
             self._apply_intervention_annotations(plot=plot, entry=annotation_entry)
@@ -2338,11 +2301,7 @@ class ResultsController(QtCore.QObject):
                 show_intervention_annotations=show_intervention_annotations,
             )
             self._active_display_transaction = active_transaction
-        copy_metadata_failure = self._sync_plot_copy_metadata_from_transaction(
-            primary_set_id=str(primary_set_id),
-            display_set_ids=attempted_display_ids,
-        )
-        if copy_metadata_failure:
+        if not self._set_plot_display_layers(plot=plot, active_display_transaction=active_transaction):
             transition_outcome = self._record_failed_display_transaction_attempt(
                 previous_transaction=previous_transaction,
                 affected_set_ids=attempted_display_ids,
@@ -2460,7 +2419,7 @@ class ResultsController(QtCore.QObject):
                 request=request,
             )
         transition_outcome = self._transition_outcome(outcome)
-        self._set_status_from_display_transition(transition_outcome)
+        self._ui.set_status_text(display_transition_status_text(transition_outcome))
         return self._refresh_failed(
             focused_controls_use_workspace=False,
             transition_outcome=transition_outcome,
@@ -2505,7 +2464,7 @@ class ResultsController(QtCore.QObject):
             isinstance(transition_outcome, DisplayTransitionOutcome)
             and transition_outcome.cause is DisplayTransitionCause.DISPLAY_MUTATION_FAILED
         ):
-            self._set_status_from_display_transition(transition_outcome)
+            self._ui.set_status_text(display_transition_status_text(transition_outcome))
             return (
                 self._refresh_failed(
                     focused_controls_use_workspace=bool(resolution.focused_uses_workspace_controls),
@@ -2517,7 +2476,7 @@ class ResultsController(QtCore.QObject):
             None,
             BatchDisplayRequestResolution(
                 resolved_entries=resolution.resolved_entries,
-                unavailable_cause=self._cache_resolution_cause_for_transition(
+                unavailable_cause=cache_resolution_cause_for_transition(
                     transition_outcome,
                     default=resolution.unavailable_cause or DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE,
                 ),
@@ -2595,7 +2554,7 @@ class ResultsController(QtCore.QObject):
             isinstance(transition_outcome, DisplayTransitionOutcome)
             and transition_outcome.cause is DisplayTransitionCause.DISPLAY_MUTATION_FAILED
         ):
-            self._set_status_from_display_transition(transition_outcome)
+            self._ui.set_status_text(display_transition_status_text(transition_outcome))
             return (
                 self._refresh_failed(
                     focused_controls_use_workspace=bool(resolution.focused_uses_workspace_controls),
@@ -2608,7 +2567,7 @@ class ResultsController(QtCore.QObject):
                 cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
                 display_status=DisplayStatus.DISPLAY_DENIED,
             )
-            self._set_status_from_display_transition(transition_outcome)
+            self._ui.set_status_text(display_transition_status_text(transition_outcome))
             return (
                 self._refresh_failed(
                     focused_controls_use_workspace=request.focused_dirty,
@@ -2620,7 +2579,7 @@ class ResultsController(QtCore.QObject):
             None,
             BatchDisplayRequestResolution(
                 resolved_entries=resolution.resolved_entries,
-                unavailable_cause=self._cache_resolution_cause_for_transition(
+                unavailable_cause=cache_resolution_cause_for_transition(
                     transition_outcome,
                     default=resolution.unavailable_cause or DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE,
                 ),
@@ -2660,7 +2619,7 @@ class ResultsController(QtCore.QObject):
                 ),
                 resolution,
             )
-        if self._cache_resolution_cause_for_transition(
+        if cache_resolution_cause_for_transition(
             self._transition_outcome(outcome),
             default=DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE,
         ) is not DisplayTransitionCause.INVALID_CACHE_ENTRY:
@@ -2685,7 +2644,7 @@ class ResultsController(QtCore.QObject):
         resolution: BatchDisplayRequestResolution,
         requested_show_set_ids: Sequence[str],
     ) -> BatchDisplayRefreshOutcome:
-        requested_ids = tuple(self._deduped_set_ids(requested_show_set_ids))
+        requested_ids = tuple(deduped_set_ids(requested_show_set_ids))
         scope_deauthorization = self._deauthorize_active_display_after_display_scope_refresh(
             request=request,
             requested_show_set_ids=requested_show_set_ids,
@@ -2735,7 +2694,7 @@ class ResultsController(QtCore.QObject):
                 cause=DisplayTransitionCause.INVALID_CACHE_ENTRY,
                 display_status=DisplayStatus.DISPLAY_DENIED,
             )
-            self._set_status_from_display_transition(transition_outcome)
+            self._ui.set_status_text(display_transition_status_text(transition_outcome))
             return self._refresh_failed(
                 focused_controls_use_workspace=request.focused_dirty,
                 transition_outcome=transition_outcome,
@@ -2747,7 +2706,7 @@ class ResultsController(QtCore.QObject):
                 cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
                 display_status=DisplayStatus.DISPLAY_DENIED,
             )
-            self._set_status_from_display_transition(transition_outcome)
+            self._ui.set_status_text(display_transition_status_text(transition_outcome))
             return self._refresh_failed(
                 focused_controls_use_workspace=request.focused_dirty,
                 transition_outcome=transition_outcome,
@@ -2760,7 +2719,7 @@ class ResultsController(QtCore.QObject):
             cause=DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE,
             display_status=DisplayStatus.DISPLAY_DENIED,
         )
-        self._set_status_from_display_transition(transition_outcome)
+        self._ui.set_status_text(display_transition_status_text(transition_outcome))
         return self._refresh_failed(
             focused_controls_use_workspace=bool(request.focused_dirty),
             transition_outcome=transition_outcome,
@@ -2851,25 +2810,6 @@ class ResultsController(QtCore.QObject):
         self._ui.update_batch_row_controls_state()
         return outcome
 
-    def _sync_plot_copy_metadata_from_transaction(
-        self,
-        *,
-        primary_set_id: str,
-        display_set_ids: Sequence[str],
-    ) -> Optional[str]:
-        try:
-            if str(primary_set_id or "").strip():
-                self._sync_main_plot_copy_labels(
-                    primary_set_id=str(primary_set_id),
-                    display_set_ids=list(display_set_ids),
-                )
-            else:
-                self._sync_main_plot_copy_labels(primary_set_id="", display_set_ids=[])
-        except Exception as exc:
-            logger.exception("Failed to sync display transaction copy metadata: %s", exc)
-            return "display_transaction_copy_metadata_failed"
-        return None
-
     def _cached_batch_display_scope_availability(
         self,
         *,
@@ -2934,7 +2874,7 @@ class ResultsController(QtCore.QObject):
         display_source: object | None = None,
     ) -> CachedBatchDisplayScopeOutcome:
         cache_key = str(cache_key or "")
-        requested_ids = tuple(self._deduped_set_ids(requested_show_set_ids))
+        requested_ids = tuple(deduped_set_ids(requested_show_set_ids))
         if not cache_key:
             transition_outcome = self._record_unpublished_display_request_outcome(
                 affected_set_ids=requested_ids,
@@ -3016,7 +2956,7 @@ class ResultsController(QtCore.QObject):
             )
         if active_entries_by_set_id:
             merged_available_ids = tuple(
-                self._deduped_set_ids(
+                deduped_set_ids(
                     (
                         *coverage.available_ids,
                         *(
@@ -3123,7 +3063,7 @@ class ResultsController(QtCore.QObject):
                         attempted_display_set_ids=tuple(coverage.available_ids),
                         affected_set_ids=requested_ids,
                         unresolved_intent_set_ids=tuple(
-                            self._deduped_set_ids((*semantic_unavailable_ids, *invalidated_requested_ids))
+                            deduped_set_ids((*semantic_unavailable_ids, *invalidated_requested_ids))
                         ),
                         missing_intent_set_ids=invalidated_requested_ids,
                         semantic_unavailable_set_ids=semantic_unavailable_ids,
@@ -3137,7 +3077,7 @@ class ResultsController(QtCore.QObject):
                         requested_show_set_ids=requested_ids,
                         attempted_display_set_ids=tuple(coverage.available_ids),
                         unresolved_intent_set_ids=tuple(
-                            self._deduped_set_ids((*semantic_unavailable_ids, *requested_ids))
+                            deduped_set_ids((*semantic_unavailable_ids, *requested_ids))
                         ),
                         semantic_unavailable_set_ids=semantic_unavailable_ids,
                     )
@@ -3154,13 +3094,25 @@ class ResultsController(QtCore.QObject):
                 entry = transaction_entries_by_set_id[str(primary)]
                 t = entry["t"]
                 primary_label = self._ui.batch_name_for_id(primary) or str(primary)
-        overlays = self._cached_batch_overlays(
-            transaction_entries_by_set_id=transaction_entries_by_set_id,
-            primary=primary,
-        )
         transaction_display_set_ids = tuple(str(set_id) for set_id in coverage.available_ids if str(set_id) in transaction_entries_by_set_id)
+        additional_metadata: List[DisplaySetMetadata] = []
+        for sid, metadata_entry in transaction_entries_by_set_id.items():
+            if str(sid) == str(primary):
+                continue
+            display_metadata = display_metadata_for_entry(
+                label=str(self._ui.batch_name_for_id(str(sid)) or sid),
+                entry={
+                    **dict(metadata_entry),
+                    "display_species": self._explicit_display_species_for_entry(metadata_entry),
+                },
+                set_id=str(sid),
+                role=DisplaySetRole.RESULT_OVERLAY,
+                layer_id=f"result:{sid}",
+            )
+            if display_metadata is not None:
+                additional_metadata.append(display_metadata)
         unavailable_intent_set_ids = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 (
                     *(
                         set_id
@@ -3216,7 +3168,6 @@ class ResultsController(QtCore.QObject):
             t=np.asarray(t, dtype=float),
             series=primary_display_series,
             label=str(primary_label),
-            overlays=overlays,
             metadata_applier=lambda plot, active_transaction: self._apply_cached_batch_plot_metadata(
                 plot=plot,
                 active_display_transaction=active_transaction,
@@ -3232,8 +3183,9 @@ class ResultsController(QtCore.QObject):
             display_set_ids=list(transaction_display_set_ids),
             display_species=self._explicit_display_species_for_entry(entry),
             completion_provenance=entry.get("completion_provenance") if isinstance(entry, Mapping) else None,
-            owned_species=self._owned_species_for_display_entry(entry),
+            owned_species=owned_species_for_display_entry(entry),
             display_transition=display_transition,
+            additional_metadata=tuple(additional_metadata),
             requested_show_set_ids=requested_ids,
             requested_labels_by_set_id={
                 str(set_id): str(self._ui.batch_name_for_id(str(set_id)) or set_id)
@@ -3257,7 +3209,7 @@ class ResultsController(QtCore.QObject):
         missing_intent_set_ids: Sequence[str] = (),
     ) -> CachedBatchDisplayScopeOutcome:
         requested_ids_for_outcome = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 requested_show_set_ids
                 if requested_show_set_ids is not None
                 else tuple(str(resolved.set_id) for resolved in resolved_entries if str(resolved.set_id))
@@ -3282,12 +3234,12 @@ class ResultsController(QtCore.QObject):
             affected_set_ids: Sequence[str] = (),
             semantic_unavailable_set_ids: Sequence[str] = (),
         ) -> CachedBatchDisplayScopeOutcome:
-            semantic_ids = tuple(self._deduped_set_ids(semantic_unavailable_set_ids))
+            semantic_ids = tuple(deduped_set_ids(semantic_unavailable_set_ids))
             affected_ids = tuple(
-                self._deduped_set_ids(requested_ids_for_outcome or affected_set_ids)
+                deduped_set_ids(requested_ids_for_outcome or affected_set_ids)
             )
             unresolved_ids = tuple(
-                self._deduped_set_ids(
+                deduped_set_ids(
                     (
                         *unresolved_intent_set_ids,
                         *missing_intent_set_ids,
@@ -3334,12 +3286,12 @@ class ResultsController(QtCore.QObject):
                     cause=DisplayTransitionCause.INVALID_CACHE_ENTRY,
                     affected_set_ids=(resolved_id,),
                 )
-            if not self._owned_species_for_display_entry(resolved.entry):
-                semantic_unavailable_ids = tuple(self._deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
+            if not owned_species_for_display_entry(resolved.entry):
+                semantic_unavailable_ids = tuple(deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
                 displayable_entries_by_id.pop(resolved_id, None)
                 continue
             if self._semantic_unavailable_display_set_ids({resolved_id: resolved.entry}):
-                semantic_unavailable_ids = tuple(self._deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
+                semantic_unavailable_ids = tuple(deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
                 displayable_entries_by_id.pop(resolved_id, None)
                 continue
             if resolved.canonical_entry is not None and not isinstance(
@@ -3350,16 +3302,16 @@ class ResultsController(QtCore.QObject):
                     cause=DisplayTransitionCause.INVALID_CACHE_ENTRY,
                     affected_set_ids=(resolved_id,),
                 )
-            if resolved.canonical_entry is not None and not self._owned_species_for_display_entry(
+            if resolved.canonical_entry is not None and not owned_species_for_display_entry(
                 resolved.canonical_entry,
             ):
-                semantic_unavailable_ids = tuple(self._deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
+                semantic_unavailable_ids = tuple(deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
                 displayable_entries_by_id.pop(resolved_id, None)
                 continue
             if resolved.canonical_entry is not None and self._semantic_unavailable_display_set_ids(
                 {resolved_id: resolved.canonical_entry}
             ):
-                semantic_unavailable_ids = tuple(self._deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
+                semantic_unavailable_ids = tuple(deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
                 displayable_entries_by_id.pop(resolved_id, None)
                 continue
 
@@ -3372,7 +3324,7 @@ class ResultsController(QtCore.QObject):
             )
         resolved_entries = tuple(entries_by_id.values())
         unresolved_outcome_ids = tuple(
-            self._deduped_set_ids((*unresolved_intent_set_ids, *semantic_unavailable_ids))
+            deduped_set_ids((*unresolved_intent_set_ids, *semantic_unavailable_ids))
         )
 
         primary = None
@@ -3385,37 +3337,39 @@ class ResultsController(QtCore.QObject):
         if primary is None:
             primary = next(iter(entries_by_id.values()))
 
-        overlays = [
-            self._display_overlay_entry(
-                label=resolved.label,
+        additional_metadata: List[DisplaySetMetadata] = []
+        for resolved in resolved_entries:
+            if str(resolved.set_id) == str(primary.set_id):
+                continue
+            display_metadata = display_metadata_for_entry(
+                label=str(resolved.label),
                 entry={
                     **dict(resolved.entry),
                     "display_species": self._explicit_display_species_for_entry(resolved.entry),
                 },
-                set_id=resolved.set_id,
-                layer_kind="result",
+                set_id=str(resolved.set_id),
+                role=DisplaySetRole.RESULT_OVERLAY,
                 layer_id=f"result:{resolved.set_id}",
+                workspace_preview_provenance=resolved.workspace_preview_provenance,
             )
-            for resolved in resolved_entries
-            if str(resolved.set_id) != str(primary.set_id)
-        ]
-        reference_overlay_visible = self._reference_overlay_visible_for_publication()
+            if display_metadata is not None:
+                additional_metadata.append(display_metadata)
         for resolved in resolved_entries:
             if resolved.canonical_entry is None:
                 continue
-            overlays.append(
-                self._display_overlay_entry(
-                    label=f"{resolved.label} [ref]",
-                    entry={
-                        **dict(resolved.canonical_entry),
-                        "display_species": self._explicit_display_species_for_entry(resolved.canonical_entry),
-                    },
-                    set_id=resolved.set_id,
-                    layer_kind="reference",
-                    layer_id=f"reference:{resolved.set_id}",
-                    visible=reference_overlay_visible,
-                )
+            display_metadata = display_metadata_for_entry(
+                label=str(resolved.label),
+                entry={
+                    **dict(resolved.canonical_entry),
+                    "display_species": self._explicit_display_species_for_entry(resolved.canonical_entry),
+                },
+                set_id=str(resolved.set_id),
+                role=DisplaySetRole.REFERENCE_OVERLAY,
+                layer_id=f"reference:{resolved.set_id}",
+                visible=self._reference_overlays_visible,
             )
+            if display_metadata is not None:
+                additional_metadata.append(display_metadata)
         transaction_display_set_ids = tuple(str(resolved.set_id) for resolved in resolved_entries if str(resolved.set_id))
         workspace_provenance_by_set_id = {
             str(resolved.set_id): dict(resolved.workspace_preview_provenance)
@@ -3465,7 +3419,6 @@ class ResultsController(QtCore.QObject):
             t=np.asarray(primary.entry["t"], dtype=float),
             series=primary_display_series,
             label=str(primary.label),
-            overlays=overlays,
             metadata_applier=lambda plot, active_transaction: self._apply_resolved_batch_plot_metadata(
                 plot=plot,
                 active_display_transaction=active_transaction,
@@ -3482,10 +3435,11 @@ class ResultsController(QtCore.QObject):
                 if isinstance(primary.entry.get("completion_provenance"), Mapping)
                 else None
             ),
-            owned_species=self._owned_species_for_display_entry(primary.entry),
+            owned_species=owned_species_for_display_entry(primary.entry),
             display_transition=display_transition,
+            additional_metadata=tuple(additional_metadata),
             requested_show_set_ids=(
-                tuple(self._deduped_set_ids(requested_show_set_ids))
+                tuple(deduped_set_ids(requested_show_set_ids))
                 if requested_show_set_ids is not None
                 else transaction_display_set_ids
             ),
@@ -3511,7 +3465,7 @@ class ResultsController(QtCore.QObject):
         transaction: CompletedRunDisplayTransaction,
     ) -> SimulationCompletionDisplayOutcome:
         intent_ids = tuple(str(set_id) for set_id in transaction.intent.requested_show_set_ids if str(set_id))
-        initial_affected_ids = tuple(self._deduped_set_ids(transaction.display_set_ids or intent_ids))
+        initial_affected_ids = tuple(deduped_set_ids(transaction.display_set_ids or intent_ids))
         completion_entries = tuple(transaction.completion_entries or ())
         if not completion_entries:
             return self._simulation_no_display_outcome(
@@ -3529,7 +3483,7 @@ class ResultsController(QtCore.QObject):
         completed_ids = tuple(str(entry.set_id) for entry in completion_entries if str(entry.set_id))
         failed_ids = tuple(str(set_id) for set_id in transaction.failed_set_ids if str(set_id))
         unresolved_intent_ids = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 (
                     *tuple(str(set_id) for set_id in transaction.unresolved_intent_set_ids if str(set_id)),
                     *failed_ids,
@@ -3537,12 +3491,12 @@ class ResultsController(QtCore.QObject):
             )
         )
         missing_intent_ids = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 tuple(str(set_id) for set_id in transaction.missing_intent_set_ids if str(set_id))
             )
         )
         failed_intent_ids = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 (
                     *tuple(str(set_id) for set_id in transaction.failed_intent_set_ids if str(set_id)),
                     *failed_ids,
@@ -3550,7 +3504,7 @@ class ResultsController(QtCore.QObject):
             )
         )
         semantic_unavailable_ids = tuple(
-            self._deduped_set_ids(
+            deduped_set_ids(
                 tuple(str(set_id) for set_id in transaction.semantic_unavailable_set_ids if str(set_id))
             )
         )
@@ -3624,19 +3578,19 @@ class ResultsController(QtCore.QObject):
         def semantic_unavailable(
             semantic_ids: Sequence[str],
         ) -> SimulationCompletionDisplayOutcome:
-            semantic_ids = tuple(self._deduped_set_ids(tuple(str(set_id) for set_id in semantic_ids if str(set_id))))
-            unresolved = tuple(self._deduped_set_ids((*unresolved_intent_ids, *failed_ids, *semantic_ids)))
-            missing_ids = tuple(self._deduped_set_ids(missing_intent_ids))
+            semantic_ids = tuple(deduped_set_ids(tuple(str(set_id) for set_id in semantic_ids if str(set_id))))
+            unresolved = tuple(deduped_set_ids((*unresolved_intent_ids, *failed_ids, *semantic_ids)))
+            missing_ids = tuple(deduped_set_ids(missing_intent_ids))
             return self.publish_completed_run_display_unavailable(
                 cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
-                affected_set_ids=tuple(self._deduped_set_ids((*unresolved, *missing_ids))) or semantic_ids,
+                affected_set_ids=tuple(deduped_set_ids((*unresolved, *missing_ids))) or semantic_ids,
                 requested_show_set_ids=intent_ids,
                 requested_labels_by_set_id=transaction.intent.labels_by_set_id,
                 attempted_display_set_ids=completed_ids,
                 unresolved_intent_set_ids=unresolved,
                 missing_intent_set_ids=missing_ids,
                 failed_intent_set_ids=failed_intent_ids,
-                semantic_unavailable_set_ids=tuple(self._deduped_set_ids((*semantic_unavailable_ids, *semantic_ids))),
+                semantic_unavailable_set_ids=tuple(deduped_set_ids((*semantic_unavailable_ids, *semantic_ids))),
             )
 
         displayable_entries: list[CompletionDisplayEntry] = []
@@ -3645,7 +3599,7 @@ class ResultsController(QtCore.QObject):
                 return self._simulation_no_display_outcome(
                     DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS,
                     affected_set_ids=tuple(
-                        self._deduped_set_ids(
+                        deduped_set_ids(
                             (
                                 str(completion_entry.set_id),
                                 *missing_intent_ids,
@@ -3658,7 +3612,7 @@ class ResultsController(QtCore.QObject):
                     requested_labels_by_set_id=transaction.intent.labels_by_set_id,
                     attempted_display_set_ids=completed_ids,
                     unresolved_intent_set_ids=tuple(
-                        self._deduped_set_ids(
+                        deduped_set_ids(
                             (str(completion_entry.set_id), *missing_intent_ids, *failed_intent_ids)
                         )
                     ),
@@ -3672,7 +3626,7 @@ class ResultsController(QtCore.QObject):
                 return self._simulation_no_display_outcome(
                     DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS,
                     affected_set_ids=tuple(
-                        self._deduped_set_ids(
+                        deduped_set_ids(
                             (
                                 str(completion_entry.set_id),
                                 *missing_intent_ids,
@@ -3685,7 +3639,7 @@ class ResultsController(QtCore.QObject):
                     requested_labels_by_set_id=transaction.intent.labels_by_set_id,
                     attempted_display_set_ids=completed_ids,
                     unresolved_intent_set_ids=tuple(
-                        self._deduped_set_ids(
+                        deduped_set_ids(
                             (str(completion_entry.set_id), *missing_intent_ids, *failed_intent_ids)
                         )
                     ),
@@ -3697,12 +3651,12 @@ class ResultsController(QtCore.QObject):
                 )
             if not tuple(str(name) for name in completion_entry.owned_species if str(name)):
                 semantic_unavailable_ids = tuple(
-                    self._deduped_set_ids((*semantic_unavailable_ids, str(completion_entry.set_id)))
+                    deduped_set_ids((*semantic_unavailable_ids, str(completion_entry.set_id)))
                 )
                 continue
             if not self._completion_entry_matches_intent_owned_species(transaction, completion_entry):
                 semantic_unavailable_ids = tuple(
-                    self._deduped_set_ids((*semantic_unavailable_ids, str(completion_entry.set_id)))
+                    deduped_set_ids((*semantic_unavailable_ids, str(completion_entry.set_id)))
                 )
                 continue
             displayable_entries.append(completion_entry)
@@ -3711,7 +3665,7 @@ class ResultsController(QtCore.QObject):
             display_series = self._completion_entry_display_series(completion_entry)
             if display_series is None:
                 semantic_unavailable_ids = tuple(
-                    self._deduped_set_ids((*semantic_unavailable_ids, str(completion_entry.set_id)))
+                    deduped_set_ids((*semantic_unavailable_ids, str(completion_entry.set_id)))
                 )
                 continue
             display_series_by_set_id[str(completion_entry.set_id)] = display_series
@@ -3724,23 +3678,24 @@ class ResultsController(QtCore.QObject):
             return semantic_unavailable(semantic_unavailable_ids or expected_ids)
         if str(primary.set_id) not in {str(entry.set_id) for entry in displayable_entries}:
             primary = displayable_entries[0]
-        overlays = [
-            self._display_overlay_entry(
-                label=completion_entry.label,
+        additional_metadata: List[DisplaySetMetadata] = []
+        for completion_entry in displayable_entries:
+            if str(completion_entry.set_id) == str(primary.set_id):
+                continue
+            display_metadata = display_metadata_for_entry(
+                label=str(completion_entry.label),
                 entry={
                     **completion_entry.to_display_payload(),
                     "series": display_series_by_set_id[str(completion_entry.set_id)],
                     "display_species": tuple(completion_entry.display_species),
                 },
-                set_id=completion_entry.set_id,
-                layer_kind="result",
+                set_id=str(completion_entry.set_id),
+                role=DisplaySetRole.RESULT_OVERLAY,
                 layer_id=f"result:{completion_entry.set_id}",
                 owned_species=tuple(str(name) for name in completion_entry.owned_species if str(name)),
             )
-            for completion_entry in completion_entries
-            if str(completion_entry.set_id) != str(primary.set_id)
-            and str(completion_entry.set_id) in display_series_by_set_id
-        ]
+            if display_metadata is not None:
+                additional_metadata.append(display_metadata)
         primary_owned_species = tuple(str(name) for name in primary.owned_species if str(name))
         if not primary_owned_species:
             return semantic_unavailable((str(primary.set_id),))
@@ -3752,7 +3707,6 @@ class ResultsController(QtCore.QObject):
             t=np.asarray(primary.t, dtype=float),
             series=primary_series,
             label=str(primary.label),
-            overlays=overlays,
             metadata_applier=lambda plot, active_transaction: self._apply_completed_run_plot_metadata(
                 plot=plot,
                 active_display_transaction=active_transaction,
@@ -3768,11 +3722,12 @@ class ResultsController(QtCore.QObject):
             completion_provenance=primary.completion_provenance,
             owned_species=primary_owned_species,
             display_transition=_DISPLAY_TRANSITION_COMPLETED_RUN_FINAL,
+            additional_metadata=tuple(additional_metadata),
             requested_show_set_ids=transaction.intent.requested_show_set_ids,
             requested_labels_by_set_id=transaction.intent.labels_by_set_id,
             run_target_set_ids=transaction.intent.run_target_set_ids,
             unresolved_intent_set_ids=tuple(
-                self._deduped_set_ids((*unresolved_intent_ids, *semantic_unavailable_ids))
+                deduped_set_ids((*unresolved_intent_ids, *semantic_unavailable_ids))
             ),
             missing_intent_set_ids=missing_intent_ids,
             failed_intent_set_ids=failed_intent_ids,
@@ -3783,15 +3738,6 @@ class ResultsController(QtCore.QObject):
         )
         return SimulationCompletionDisplayOutcome(
             transition_outcome=outcome.transition_outcome,
-        )
-
-    @staticmethod
-    def _fresh_preview_entry_display_series(
-        entry: FreshPreviewDisplayEntry,
-    ) -> Optional[Dict[str, object]]:
-        return series_for_display_species(
-            series=entry.series,
-            display_species=entry.display_species,
         )
 
     def publish_fresh_preview_display(
@@ -3845,7 +3791,10 @@ class ResultsController(QtCore.QObject):
                     outcome_kind=DisplayTransitionOutcomeKind.FAILED,
                     display_status=DisplayStatus.NO_COMPLETE_DISPLAYABLE_REQUEST_SCOPE,
                 )
-            display_series = self._fresh_preview_entry_display_series(entry)
+            display_series = series_for_display_species(
+                series=entry.series,
+                display_species=entry.display_species,
+            )
             if display_series is None:
                 return self._simulation_no_display_outcome(
                     DisplayTransitionCause.NO_DISPLAYABLE_PREVIEW_RESULTS,
@@ -3862,22 +3811,25 @@ class ResultsController(QtCore.QObject):
                 )
             series_by_set_id[str(entry.set_id)] = display_series
 
-        overlays = [
-            self._display_overlay_entry(
-                label=entry.label,
+        additional_metadata: List[DisplaySetMetadata] = []
+        for entry in entries:
+            if str(entry.set_id) == str(primary.set_id):
+                continue
+            display_metadata = display_metadata_for_entry(
+                label=str(entry.label),
                 entry={
                     **entry.to_display_payload(),
                     "series": series_by_set_id[str(entry.set_id)],
                     "display_species": tuple(entry.display_species),
                 },
-                set_id=entry.set_id,
-                layer_kind="result",
+                set_id=str(entry.set_id),
+                role=DisplaySetRole.RESULT_OVERLAY,
                 layer_id=f"result:{entry.set_id}",
                 owned_species=tuple(str(name) for name in entry.owned_species if str(name)),
+                workspace_preview_provenance=entry.workspace_preview_provenance,
             )
-            for entry in entries
-            if str(entry.set_id) != str(primary.set_id)
-        ]
+            if display_metadata is not None:
+                additional_metadata.append(display_metadata)
         workspace_provenance_by_set_id = {
             str(entry.set_id): dict(entry.workspace_preview_provenance)
             for entry in entries
@@ -3888,20 +3840,26 @@ class ResultsController(QtCore.QObject):
                 DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
                 affected_set_ids=expected_ids,
             )
+        prior_reference_metadata = self._authorized_reference_metadata_for_refresh(
+            previous_transaction=self._active_display_transaction,
+            display_set_ids=expected_ids,
+        )
+        for layer_id, metadata in prior_reference_metadata.items():
+            if layer_id not in {str(item.layer_id or "") for item in additional_metadata}:
+                additional_metadata.append(metadata)
         primary_series = series_by_set_id[str(primary.set_id)]
         outcome = self._apply_batch_display_transaction(
             t=np.asarray(primary.t, dtype=float),
             series=primary_series,
             label=str(primary.label),
-            overlays=overlays,
-            metadata_applier=lambda plot, _active_transaction: self._apply_direct_completion_plot_metadata(
+            metadata_applier=lambda plot, active_transaction: self._apply_active_transaction_plot_metadata(
                 plot=plot,
-                t=np.asarray(primary.t, dtype=float),
-                series=primary_series,
-                display_label=str(primary.label or primary.set_id or "Preview"),
+                active_display_transaction=active_transaction,
+                primary_t=np.asarray(primary.t, dtype=float),
+                primary_series=primary_series,
                 algebra_scalars=primary.algebra_scalars,
-                layer_id=f"result:{primary.set_id}" if primary.set_id else "result:preview",
-                set_id=str(primary.set_id or ""),
+                prefer_layer_id=f"result:{primary.set_id}" if primary.set_id else "result:preview",
+                context_label=f"fresh preview display (primary={primary.label or primary.set_id or 'Preview'})",
             ),
             annotation_entry={"solver_provenance": primary.solver_provenance},
             primary_set_id=str(primary.set_id),
@@ -3917,6 +3875,7 @@ class ResultsController(QtCore.QObject):
                 in {DisplayRefreshSource.EXPLICIT_SHOW_REQUEST, DisplayRefreshSource.SLIDER_REPLAY}
                 else _DISPLAY_TRANSITION_FRESH_PREVIEW
             ),
+            additional_metadata=tuple(additional_metadata),
             requested_show_set_ids=transaction.requested_show_set_ids or transaction.display_set_ids,
             requested_labels_by_set_id=transaction.requested_labels_by_set_id,
             run_target_set_ids=transaction.target_set_ids,
@@ -3972,7 +3931,6 @@ class ResultsController(QtCore.QObject):
             t=np.asarray(t, dtype=float),
             series=display_series,
             label=(set_name or display_label),
-            overlays=[],
             metadata_applier=lambda plot, _active_transaction: self._apply_direct_completion_plot_metadata(
                 plot=plot,
                 t=np.asarray(t, dtype=float),
@@ -3996,32 +3954,25 @@ class ResultsController(QtCore.QObject):
             transition_outcome=outcome.transition_outcome,
         )
 
-    def _set_plot_data(
+    def _set_plot_display_layers(
         self,
-        t: np.ndarray,
-        series: Dict[str, np.ndarray],
         *,
-        label: Optional[str] = None,
-        primary_set_id: Optional[str] = None,
-        layer_id: Optional[str] = None,
-        overlays: Optional[Sequence[Dict[str, object]]] = None,
-        owned_species: Optional[Sequence[str]] = None,
+        plot: ResultsDisplayPlotPort,
+        active_display_transaction: ActiveDisplayTransaction,
     ) -> bool:
-        """Set simulation data to plot."""
         try:
-            self._ui.set_main_plot_data(
-                t,
-                series,
-                label=label,
-                primary_set_id=primary_set_id,
-                layer_id=layer_id,
-                overlays=overlays,
-                owned_species=owned_species,
+            plot.set_display_layers(
+                plot_display_layers_payload(
+                    active_display_transaction,
+                    presentation_labels_by_set_id=self._popup_labels_by_set_id(
+                        active_display_transaction.display_set_ids,
+                    ),
+                )
             )
             return True
         except Exception as exc:
-            logger.warning("Failed to set data: %s", exc, exc_info=True)
-            QtWidgets.QMessageBox.warning(self._ui.parent, "Error", f"Failed to set data: {exc}")
+            logger.warning("Failed to render display layers: %s", exc, exc_info=True)
+            QtWidgets.QMessageBox.warning(self._ui.parent, "Error", f"Failed to render display layers: {exc}")
             return False
 
     def _commit_successful_plot_display(
@@ -4035,7 +3986,7 @@ class ResultsController(QtCore.QObject):
             self._ui.show_simulation_tab()
             self._ui.refresh_simulation_plot_views()
             self._ui.schedule_main_plot_refresh((50, 100))
-            self._set_status_from_display_transition(transition_outcome)
+            self._ui.set_status_text(display_transition_status_text(transition_outcome))
             logger.info("Data set: %s species, %s points", int(len(series)), int(len(t)))
         except Exception as exc:
             logger.exception("Failed to apply post-commit plot display UI refresh: %s", exc)

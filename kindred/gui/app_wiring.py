@@ -380,9 +380,6 @@ def build_window_shell(main_window: MainWindow) -> WindowShellComponents:
     def publish_main_plot_results_table(table) -> None:
         main_window._results_table = table
 
-    def set_main_plot_data(t, series, **kwargs) -> None:
-        main_plot().set_data(t, series, **kwargs)
-
     def show_simulation_tab() -> None:
         plot_tabs._tabs.setCurrentIndex(0)
 
@@ -431,7 +428,6 @@ def build_window_shell(main_window: MainWindow) -> WindowShellComponents:
         update_main_plot_statistics=update_main_plot_statistics,
         main_plot_stats_table=main_plot_stats_table,
         publish_main_plot_results_table=publish_main_plot_results_table,
-        set_main_plot_data=set_main_plot_data,
         show_simulation_tab=show_simulation_tab,
         refresh_simulation_plot_views=refresh_simulation_plot_views,
         schedule_main_plot_refresh=schedule_main_plot_refresh,
