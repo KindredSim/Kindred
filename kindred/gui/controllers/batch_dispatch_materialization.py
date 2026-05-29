@@ -11,10 +11,12 @@ class BatchDispatchMaterializationOwner:
         self,
         *,
         row: int,
-        set_name: str,
         fast_mode: bool,
+        pending_initials: dict[str, float] | None = None,
     ) -> dict[str, float]:
         initials = dict(self._batch.batch_initials_for_row(int(row)))
+        for species, value in dict(pending_initials or {}).items():
+            initials[str(species)] = float(value)
         if bool(fast_mode):
             initials = dict(self._slider.preview_initials_for_row(int(row), initials))
         return {str(species): float(value) for species, value in initials.items()}

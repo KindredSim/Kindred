@@ -950,8 +950,22 @@ class BatchInitialConditionsStore:
                 )
         store = cls(sets=sets)
         visible = payload.get("visible_species") if isinstance(payload, dict) else None
-        if isinstance(visible, list):
-            store.set_species([str(s) for s in visible])
+        visible_species = [str(s) for s in visible if str(s)] if isinstance(visible, list) else []
+        if not visible_species and isinstance(sets_in, list):
+            seen_species: set[str] = set()
+            for entry in sets_in:
+                if not isinstance(entry, dict):
+                    continue
+                values = entry.get("values")
+                if not isinstance(values, dict):
+                    continue
+                for key in values.keys():
+                    species = str(key)
+                    if species and species not in seen_species:
+                        visible_species.append(species)
+                        seen_species.add(species)
+        if visible_species:
+            store.set_species(visible_species)
         explicit_visible_species = isinstance(visible, list) and any(str(s) for s in visible)
         explicit_values = False
         if isinstance(sets_in, list):

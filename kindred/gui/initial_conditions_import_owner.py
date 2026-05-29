@@ -166,6 +166,34 @@ class InitialConditionsImportOwner:
             species_changed=bool(species_changed),
         )
 
+    def pending_initials_for_source_set(
+        self,
+        source: MechanismAuthoringSource,
+        *,
+        set_name: str,
+    ) -> dict[str, float]:
+        target_name = str(set_name or "").strip() or "set1"
+        try:
+            extraction = extract_reaction_dsl_initial_condition_imports(
+                str(source.reactions_text or ""),
+                default_set_name=target_name,
+            )
+        except Exception:
+            logger.debug("Failed to parse pending draft Initial Conditions", exc_info=True)
+            return {}
+        for event in extraction.imports:
+            if not bool(event.value_bearing):
+                continue
+            if str(event.source_name or "") != target_name:
+                continue
+            initials: dict[str, float] = {}
+            for species, value in dict(event.values or {}).items():
+                parsed, ok = try_parse_finite_float(value)
+                if ok:
+                    initials[str(species)] = float(parsed)
+            return initials
+        return {}
+
     def _apply_visible_species(self, species_names: Sequence[str]) -> bool:
         names = [str(name) for name in species_names if str(name)]
         store = self._batch_store_getter()

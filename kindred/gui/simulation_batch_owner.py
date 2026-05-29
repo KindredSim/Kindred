@@ -961,11 +961,12 @@ class SimulationBatchOwner:
         if row is not None:
             try:
                 baseline_initials = self.batch_initials_for_row(int(row))
-                self._mechanism_owner.mechanism_source_for_run_set(
+                set_name = self._batch_set_name_for_id(str(set_id))
+                pending_initials = self._mechanism_owner.pending_initials_for_run_source_set(
                     self._mechanism_owner.mechanism_source_for_run(fast_mode=True),
-                    set_id=str(set_id),
-                    apply_parameter_overrides=True,
+                    set_name=str(set_name or set_id),
                 )
+                baseline_initials = {**baseline_initials, **dict(pending_initials or {})}
                 preview_initials = self._preview_session.preview_initials_for_row(int(row), baseline_initials)
                 initials_fingerprint = canonical_initials_fingerprint(preview_initials)
             except Exception:

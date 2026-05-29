@@ -233,6 +233,7 @@ class SimulationController(QtCore.QObject):
                 set_simulation_running=self._set_simulation_running,
                 set_slider_simulation_active=self._set_slider_simulation_active,
                 slider_runtime_parameter_names=self._slider_runtime_parameter_names,
+                pending_initials_for_run_source_set=self.ui.mechanism.pending_initials_for_run_source_set,
                 simulation_identity_for_set=self._simulation_identity_for_set,
                 resolved_initials_for_batch_row=self._resolved_initials_for_batch_row,
                 slider_execution_parameter_values=self._slider_execution_parameter_values,
@@ -3688,13 +3689,13 @@ class SimulationController(QtCore.QObject):
         self,
         *,
         row: int,
-        set_name: str,
         include_preview_initials: bool,
+        pending_initials: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, float]:
         return self._batch_dispatch_materialization_owner.materialize_initials(
             row=int(row),
-            set_name=str(set_name),
             fast_mode=bool(include_preview_initials),
+            pending_initials=dict(pending_initials or {}),
         )
 
     def _requeue_preserved_pending_slider_replay_after_preflight_abort(self) -> None:
@@ -3896,7 +3897,8 @@ class SimulationController(QtCore.QObject):
         )
 
     def _run_simulation(self):
-        if not self.ui.mechanism.auto_lock_for_run():
+        auto_lock_result = self.ui.mechanism.auto_lock_for_run()
+        if not auto_lock_result:
             self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
             return
         if not self.ui.mechanism.is_mechanism_ready_for_run():
@@ -3918,7 +3920,9 @@ class SimulationController(QtCore.QObject):
             self.ui.run_ui.set_status_text("Cancelling previous simulation...")
             return
 
-        rows_to_run = self.ui.batch.batch_rows_for_scope("selected")
+        rows_to_run = list(getattr(auto_lock_result, "affected_rows", ()) or ())
+        if not rows_to_run:
+            rows_to_run = self.ui.batch.batch_rows_for_scope("selected")
         if not rows_to_run:
             reason = self.ui.batch.run_selected_empty_target_reason()
             self.ui.dialogs.message_box_warning("No Sets", reason)
@@ -4213,7 +4217,6 @@ class SimulationController(QtCore.QObject):
             try:
                 initials_dict = self._batch_dispatch_materialization_owner.materialize_initials(
                     row=row,
-                    set_name=str(set_name),
                     fast_mode=bool(payload.fast_mode),
                 )
             except Exception as exc:
@@ -4509,7 +4512,6 @@ class SimulationController(QtCore.QObject):
         try:
             initials_dict = self._batch_dispatch_materialization_owner.materialize_initials(
                 row=row,
-                set_name=str(set_name),
                 fast_mode=bool(payload.fast_mode),
             )
         except Exception as exc:

@@ -75,7 +75,7 @@ from kindred.gui.initial_conditions_import_owner import (
     InitialConditionsImportOwner,
 )
 from kindred.gui.initial_conditions_source_acceptance_owner import InitialConditionsSourceAcceptanceOwner
-from kindred.gui.ports import DisplayRefreshSource
+from kindred.gui.ports import DisplayRefreshSource, RunAutoLockResult
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.mechanism_session_owner import MechanismSessionOwner
 from kindred.gui.main_window_preview_session import MainWindowPreviewSession
@@ -246,6 +246,7 @@ class MainWindow(
             variable_runtime=self._variable_runtime,
             mechanism_locked_getter=self.mechanism_editing_locked,
             try_lock_mechanism_editor=self._try_lock_mechanism_editor,
+            pending_initials_for_source_set=self._pending_initials_for_source_set,
             apply_reactions_overrides_to_text=self._apply_reactions_overrides_to_text,
             apply_state_network_overrides_to_dsl=self._apply_state_network_overrides_to_dsl,
             apply_wegscheider_resolution_reactions_rewrite=(
@@ -929,10 +930,21 @@ class MainWindow(
         self._refresh_symbolic_calculator_state()
         return True
 
-    def _try_lock_mechanism_editor(self) -> bool:
+    def _pending_initials_for_source_set(self, source, *, set_name: str) -> dict[str, float]:
+        return self._initial_conditions_import_owner.pending_initials_for_source_set(
+            source,
+            set_name=str(set_name or ""),
+        )
+
+    def _try_lock_mechanism_editor(self, *, return_acceptance: bool = False) -> bool | RunAutoLockResult:
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
+
+        def _result(success: bool, affected_rows: tuple[int, ...] = ()) -> bool | RunAutoLockResult:
+            if bool(return_acceptance):
+                return RunAutoLockResult(bool(success), tuple(int(row) for row in affected_rows))
+            return bool(success)
 
         def _set_reactions_widget_text(text: str) -> None:
             widget = self._reactions_text_widget()
@@ -956,7 +968,7 @@ class MainWindow(
             )
             if reconciliation_plan is None:
                 self._refresh_symbolic_calculator_state()
-                return False
+                return _result(False)
             reconciled_source = reconciliation_plan.source
             if str(reconciled_source.reactions_text) != str(owner.draft_reactions_text):
                 owner.update_draft_reactions(str(reconciled_source.reactions_text))
@@ -969,8 +981,10 @@ class MainWindow(
                 if callable(validate):
                     validate()
                 self._refresh_symbolic_calculator_state()
-                return False
-            self._initial_conditions_source_acceptance_owner.apply_prepared_plan(reconciliation_plan)
+                return _result(False)
+            reconciliation_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
+                reconciliation_plan
+            )
         else:
             original_canonical_source = owner.canonical_source
             reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_lock(
@@ -978,7 +992,7 @@ class MainWindow(
                 prompt_overwrite=True,
             )
             if reconciliation_plan is None:
-                return False
+                return _result(False)
             reconciled_source = reconciliation_plan.source
             if str(reconciled_source.reactions_text) != str(owner.canonical_reactions_text):
                 owner.apply_authoritative_source(reconciled_source)
@@ -987,14 +1001,16 @@ class MainWindow(
                 if owner.canonical_source != original_canonical_source:
                     owner.apply_authoritative_source(original_canonical_source)
                     self._restore_mechanism_widgets_from_owner_canonical()
-                return False
-            self._initial_conditions_source_acceptance_owner.apply_prepared_plan(reconciliation_plan)
+                return _result(False)
+            reconciliation_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
+                reconciliation_plan
+            )
         self._apply_authoritative_mechanism_transition()
         self._refresh_mechanism_edit_lock_ui()
         validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
         if callable(validate):
             validate()
-        return True
+        return _result(True, tuple(getattr(reconciliation_result, "affected_rows", ()) or ()))
 
     def _set_mechanism_edit_locked(self, locked: bool) -> bool:
         if not bool(locked):

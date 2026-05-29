@@ -8,6 +8,15 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Seque
 from kindred.core.mechanism_source import MechanismAuthoringSource
 
 
+@dataclass(frozen=True, slots=True)
+class RunAutoLockResult:
+    success: bool
+    affected_rows: tuple[int, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.success)
+
+
 class DisplayRefreshSource(Enum):
     INCIDENTAL_REFRESH = "incidental_refresh"
     EXPLICIT_SHOW_REQUEST = "explicit_show_request"
@@ -909,7 +918,7 @@ class SimulationBatchPort(Protocol):
 
 
 class SimulationMechanismPort(Protocol):
-    def auto_lock_for_run(self) -> bool: ...
+    def auto_lock_for_run(self) -> RunAutoLockResult: ...
 
     def is_mechanism_ready_for_run(self) -> bool: ...
 

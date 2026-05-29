@@ -99,6 +99,7 @@ class SimulationRunPreparationDependencies:
     set_simulation_running: Callable[[bool], None]
     set_slider_simulation_active: Callable[[bool], None]
     slider_runtime_parameter_names: Callable[..., Sequence[str]]
+    pending_initials_for_run_source_set: Callable[..., Dict[str, Any]]
     simulation_identity_for_set: Callable[..., Any]
     resolved_initials_for_batch_row: Callable[..., Dict[str, Any]]
     slider_execution_parameter_values: Callable[..., Dict[str, Any]]
@@ -763,10 +764,18 @@ class SimulationRunDispatchPreparationOwner:
             if intervention_schedule is not None:
                 intervention_schedule_by_set_id[set_id_s] = intervention_schedule.to_payload()
             try:
+                pending_initials = {}
+                if bool(fast_mode):
+                    pending_initials = dict(
+                        self._deps.pending_initials_for_run_source_set(
+                            mechanism_context.base_source,
+                            set_name=set_name,
+                        )
+                    )
                 initials_dict = self._deps.resolved_initials_for_batch_row(
                     row=row,
-                    set_name=set_name,
                     include_preview_initials=bool(fast_mode),
+                    pending_initials=pending_initials,
                 )
             except Exception as exc:
                 if bool(runtime_readiness_only):

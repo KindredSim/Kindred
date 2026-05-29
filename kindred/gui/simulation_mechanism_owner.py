@@ -4,6 +4,7 @@ from typing import Callable, Dict, Optional
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.validation import try_parse_finite_float
+from kindred.gui.ports import RunAutoLockResult
 
 
 class SimulationMechanismOwner:
@@ -17,9 +18,10 @@ class SimulationMechanismOwner:
         preview_session: object,
         variable_runtime: object,
         mechanism_locked_getter: Callable[[], bool],
-        try_lock_mechanism_editor: Callable[[], bool],
+        try_lock_mechanism_editor: Callable[..., object],
         apply_reactions_overrides_to_text: Callable[..., str],
         apply_state_network_overrides_to_dsl: Callable[..., str],
+        pending_initials_for_source_set: Callable[..., dict[str, float]] | None = None,
         apply_wegscheider_resolution_reactions_rewrite: Callable[[str], None] | None = None,
     ) -> None:
         self._mechanism_session_owner_getter = mechanism_session_owner_getter
@@ -28,14 +30,18 @@ class SimulationMechanismOwner:
         self._variable_runtime = variable_runtime
         self._mechanism_locked_getter = mechanism_locked_getter
         self._try_lock_mechanism_editor = try_lock_mechanism_editor
+        self._pending_initials_for_source_set = pending_initials_for_source_set
         self._apply_reactions_overrides_to_text = apply_reactions_overrides_to_text
         self._apply_state_network_overrides_to_dsl = apply_state_network_overrides_to_dsl
         self._apply_wegscheider_resolution_reactions_rewrite = apply_wegscheider_resolution_reactions_rewrite
 
-    def auto_lock_for_run(self) -> bool:
+    def auto_lock_for_run(self) -> RunAutoLockResult:
         if not bool(self._mechanism_locked_getter()):
-            return bool(self._try_lock_mechanism_editor())
-        return True
+            result = self._try_lock_mechanism_editor(return_acceptance=True)
+            if isinstance(result, RunAutoLockResult):
+                return result
+            return RunAutoLockResult(bool(result))
+        return RunAutoLockResult(True)
 
     def is_mechanism_ready_for_run(self) -> bool:
         owner = self._mechanism_session_owner()
@@ -78,6 +84,19 @@ class SimulationMechanismOwner:
         if bool(strip_initial_concentrations):
             materialized = materialized.without_reaction_initial_concentrations()
         return materialized
+
+    def pending_initials_for_run_source_set(
+        self,
+        source: MechanismAuthoringSource,
+        *,
+        set_name: str,
+    ) -> dict[str, float]:
+        if self._pending_initials_for_source_set is None:
+            return {}
+        return self._pending_initials_for_source_set(
+            source,
+            set_name=str(set_name or ""),
+        )
 
     def mechanism_slider_points_value(self) -> Optional[int]:
         try:
@@ -127,7 +146,11 @@ class SimulationMechanismOwner:
 
     def simulation_schema_id(self, *, fast_mode: bool = False) -> str:
         param_store = self._preview_session.param_store
-        schema_text = self.mechanism_source_for_run(fast_mode=bool(fast_mode)).full_dsl
+        schema_text = (
+            self.mechanism_source_for_run(fast_mode=bool(fast_mode))
+            .without_reaction_initial_concentrations()
+            .full_dsl
+        )
         if str(param_store.schema_text or "") != schema_text:
             param_store.set_schema(schema_text)
         return str(param_store.schema_id or "")
