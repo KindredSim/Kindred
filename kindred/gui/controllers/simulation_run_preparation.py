@@ -6,9 +6,6 @@ import math
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from kindred.core.batch_parallel import batch_mechanism_signature
-from kindred.core.batch_initial_conditions import (
-    migrate_reaction_dsl_initial_concentration_sets,
-)
 from kindred.core.intervention_schedule import intervention_schedule_identity_fingerprints
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.simulation_identity import (
@@ -46,9 +43,6 @@ class RunMechanismContext:
     base_source: MechanismAuthoringSource
     owner_full_dsl: str
     full_dsl: str
-    pending_init_seed: Dict[str, Dict[str, float]]
-    pending_init_rewrite: Optional[str]
-    pending_init_applied: bool
     preview_owner_epoch: int | None
 
 
@@ -98,14 +92,12 @@ class SimulationRunPreparationPorts:
 class SimulationRunPreparationDependencies:
     claim_preview_ownership: Callable[..., Any]
     clear_preview_ownership: Callable[[], None]
-    invalidate_preserved_pending_init_results_after_failed_run: Callable[..., None]
     clear_failed_fast_preview_ownership: Callable[[], None]
     clear_slider_triggered_preflight_state: Callable[..., None]
     requeue_preserved_pending_slider_replay_after_preflight_abort: Callable[[], None]
     record_nonfatal_exception: Callable[[str, BaseException], None]
     set_simulation_running: Callable[[bool], None]
     set_slider_simulation_active: Callable[[bool], None]
-    sync_batch_species_columns_for_run: Callable[..., None]
     slider_runtime_parameter_names: Callable[..., Sequence[str]]
     simulation_identity_for_set: Callable[..., Any]
     resolved_initials_for_batch_row: Callable[..., Dict[str, Any]]
@@ -249,9 +241,6 @@ def build_run_start_context(
         pending_workspace_reset_set_ids=list(dirty_reset_tracking.pending_workspace_reset_set_ids),
         pending_dirty_reset_generation_by_set_id=dict(dirty_reset_tracking.pending_dirty_reset_generation_by_set_id),
         primary_set_id=mechanism_context.primary,
-        pending_init_seed=mechanism_context.pending_init_seed,
-        pending_init_rewrite=mechanism_context.pending_init_rewrite,
-        pending_init_applied=bool(mechanism_context.pending_init_applied),
         explicit_cache_preview_token=None,
         explicit_cache_preview_scope_set_ids=run_start_cache_decision.explicit_preview_scope_set_ids,
         explicit_cache_valid_set_ids=run_start_cache_decision.explicit_cache_valid_set_ids,
@@ -450,56 +439,7 @@ class SimulationRunMechanismPreparationOwner:
                 self._deps.requeue_preserved_pending_slider_replay_after_preflight_abort()
             self._deps.record_nonfatal_exception("Mechanism source was not ready for run preparation", exc)
             return None
-        reactions_text_raw = selected_source.reactions_text
-
-        pending_init_seed: Dict[str, Dict[str, float]] = {}
-        pending_init_rewrite: Optional[str] = None
-        pending_init_applied = False
-        migrated = reactions_text_raw
-        try:
-            pending_init_seed, migrated = migrate_reaction_dsl_initial_concentration_sets(
-                reactions_text_raw,
-                default_set_name="set1",
-            )
-            if pending_init_seed:
-                pending_init_rewrite = migrated
-        except Exception:
-            pending_init_seed = {}
-            pending_init_rewrite = None
-            migrated = reactions_text_raw
-
         rows = list(batch_rows)
-        if (
-            (not bool(fast_mode))
-            and pending_init_seed
-            and pending_init_rewrite
-            and not bool(runtime_readiness_only)
-        ):
-            try:
-                pending_init_applied = bool(
-                    self._ports.mechanism_helpers.apply_pending_init_migration(
-                        seed_sets=dict(pending_init_seed),
-                        rewrite=str(pending_init_rewrite),
-                    )
-                )
-            except Exception:
-                pending_init_applied = False
-            if pending_init_applied:
-                reactions_text_raw = str(pending_init_rewrite)
-                imported_names = [str(name) for name in pending_init_seed.keys() if str(name)]
-                materialized_names = list(self._ports.batch.batch_store_set_names())
-                materialized_rows: List[int] = []
-                for imported_name in imported_names:
-                    try:
-                        row_idx = materialized_names.index(str(imported_name))
-                    except ValueError:
-                        continue
-                    materialized_rows.append(int(row_idx))
-                if materialized_rows:
-                    rows = materialized_rows
-                    primary = self._ports.batch.batch_preferred_primary_set_id(rows)
-                    primary_set_id = str(primary) if primary is not None else None
-
         names = list(self._ports.batch.batch_store_set_names())
         queue_names = [str(names[r]) for r in rows if 0 <= int(r) < len(names)]
         queue_ids = [
@@ -517,11 +457,9 @@ class SimulationRunMechanismPreparationOwner:
         elif (not bool(fast_mode)) and (not bool(runtime_readiness_only)):
             self._deps.clear_preview_ownership()
 
-        base_source = selected_source.with_reactions_text(
-            reactions_text_raw if pending_init_applied else selected_source.reactions_text
-        )
+        base_source = selected_source
         full_source = self._ports.mechanism.mechanism_source_for_run_set(
-            base_source.with_reactions_text(reactions_text_raw if pending_init_applied else migrated),
+            base_source,
             set_id=primary_set_id,
             apply_parameter_overrides=bool(has_slider_overrides),
             strip_initial_concentrations=True,
@@ -532,9 +470,6 @@ class SimulationRunMechanismPreparationOwner:
         if not full_dsl.strip():
             if bool(runtime_readiness_only):
                 return None
-            self._deps.invalidate_preserved_pending_init_results_after_failed_run(
-                pending_init_applied=bool(pending_init_applied)
-            )
             self._ports.dialogs.message_box_warning(
                 "No Mechanism",
                 "Please define reactions or state network in the Mechanism editor first.",
@@ -560,9 +495,6 @@ class SimulationRunMechanismPreparationOwner:
             base_source=base_source,
             owner_full_dsl=owner_full_dsl,
             full_dsl=full_dsl,
-            pending_init_seed=pending_init_seed,
-            pending_init_rewrite=pending_init_rewrite,
-            pending_init_applied=bool(pending_init_applied),
             preview_owner_epoch=preview_owner_epoch,
         )
 
@@ -613,7 +545,6 @@ class SimulationRunSolverPreparationOwner:
         prepared_payload_by_set_id: Dict[str, Dict[str, Any]] = {}
         execution_prepared_payload_by_set_id: Dict[str, Dict[str, Any]] = {}
         owner_parameter_names_by_set_id: Dict[str, List[str]] = {}
-        slider_runtime = None
         if bool(fast_mode):
             target_runtime_set_ids = list(mechanism_context.queue_ids)
             if (not target_runtime_set_ids) and mechanism_context.primary_set_id:
@@ -625,16 +556,6 @@ class SimulationRunSolverPreparationOwner:
                 prepared_payload = prepared_payload_by_set_id.get(str(mechanism_context.primary_set_id))
             if prepared_payload is None and prepared_payload_by_set_id:
                 prepared_payload = dict(next(iter(prepared_payload_by_set_id.values())))
-
-        if (not bool(runtime_readiness_only)) and (
-            (not bool(fast_mode)) or (not list(self._ports.batch.batch_store_visible_species()))
-        ):
-            self._deps.sync_batch_species_columns_for_run(
-                fast_mode=bool(fast_mode),
-                slider_runtime=slider_runtime,
-                full_dsl=mechanism_context.full_dsl,
-                temperature_K=float(temperature_K),
-            )
 
         n_points = int((solver_grid_context.get("grid") or {}).get("N") or 0)
         if fast_mode:
@@ -656,9 +577,6 @@ class SimulationRunSolverPreparationOwner:
         except ValueError as exc:
             if bool(runtime_readiness_only):
                 return None
-            self._deps.invalidate_preserved_pending_init_results_after_failed_run(
-                pending_init_applied=bool(mechanism_context.pending_init_applied)
-            )
             self._ports.dialogs.message_box_warning("Invalid t_end", f"Fix t_end before running:\n\n{exc}")
             if bool(fast_mode):
                 self._deps.clear_failed_fast_preview_ownership()
@@ -729,9 +647,6 @@ class SimulationRunDispatchPreparationOwner:
         def _abort_invalid_intervention_schedule(set_id_s: str, exc: BaseException) -> None:
             if bool(runtime_readiness_only):
                 raise ValueError(f"Invalid intervention schedule for set {set_id_s!r}: {exc}") from exc
-            self._deps.invalidate_preserved_pending_init_results_after_failed_run(
-                pending_init_applied=bool(mechanism_context.pending_init_applied)
-            )
             self._deps.record_nonfatal_exception("Failed to parse intervention schedule for run plan", exc)
             self._ports.dialogs.message_box_warning(
                 "Invalid Intervention Schedule",
@@ -851,17 +766,11 @@ class SimulationRunDispatchPreparationOwner:
                 initials_dict = self._deps.resolved_initials_for_batch_row(
                     row=row,
                     set_name=set_name,
-                    pending_init_seed=mechanism_context.pending_init_seed,
-                    pending_init_applied=False,
                     include_preview_initials=bool(fast_mode),
                 )
             except Exception as exc:
                 if bool(runtime_readiness_only):
                     return None
-                if not bool(fast_mode):
-                    self._deps.invalidate_preserved_pending_init_results_after_failed_run(
-                        pending_init_applied=bool(mechanism_context.pending_init_applied)
-                    )
                 self._ports.dialogs.message_box_warning(
                     "Invalid Initial Conditions",
                     f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",

@@ -64,9 +64,6 @@ class BatchContextSeed:
     stale_runtime_input_set_ids: Sequence[str] | None = None
     failed_set_ids: Sequence[str] | None = None
     failed_set_errors: Mapping[str, Any] | None = None
-    pending_init_seed: Mapping[str, Mapping[str, Any]] | None = None
-    pending_init_rewrite: str | None = None
-    pending_init_applied: bool | None = None
     explicit_cache_preview_token: str | None = None
     explicit_cache_preview_scope_set_ids: Sequence[str] | None = None
     explicit_cache_valid_set_ids: Sequence[str] | None = None
@@ -116,9 +113,6 @@ class BatchCallbackContext(MappingABC[str, Any]):
     runtime_input_set_epoch_by_set_id: Mapping[str, int] | None = None
     pending_workspace_reset_set_ids: tuple[str, ...] = ()
     pending_dirty_reset_generation_by_set_id: Mapping[str, int] | None = None
-    pending_init_seed: Mapping[str, Mapping[str, float]] | None = None
-    pending_init_rewrite: str | None = None
-    pending_init_applied: bool = False
     explicit_cache_preview_token: str | None = None
     explicit_cache_preview_scope_set_ids: tuple[str, ...] | None = None
     explicit_cache_valid_set_ids: tuple[str, ...] | None = None
@@ -148,13 +142,6 @@ class BatchCallbackContext(MappingABC[str, Any]):
             "stale_runtime_input_set_ids": list(self.stale_runtime_input_set_ids),
             "pending_workspace_reset_set_ids": list(self.pending_workspace_reset_set_ids),
             "pending_dirty_reset_generation_by_set_id": dict(self.pending_dirty_reset_generation_by_set_id or {}),
-            "pending_init_seed": {
-                str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
-                for set_name, seed in dict(self.pending_init_seed or {}).items()
-                if str(set_name) and isinstance(seed, Mapping)
-            },
-            "pending_init_rewrite": self.pending_init_rewrite,
-            "pending_init_applied": bool(self.pending_init_applied),
             "explicit_cache_preview_token": self.explicit_cache_preview_token,
             "explicit_cache_preview_scope_set_ids": self.explicit_cache_preview_scope_set_ids,
             "explicit_cache_valid_set_ids": self.explicit_cache_valid_set_ids,
@@ -220,9 +207,6 @@ class BatchRunStartRequest:
     pending_workspace_reset_set_ids: Sequence[str]
     pending_dirty_reset_generation_by_set_id: Mapping[str, Any]
     primary_set_id: str | None
-    pending_init_seed: Mapping[str, Mapping[str, Any]]
-    pending_init_rewrite: str | None
-    pending_init_applied: bool
     explicit_cache_preview_token: str | None
     explicit_cache_preview_scope_set_ids: Sequence[str] | None
     explicit_cache_valid_set_ids: Sequence[str] | None
@@ -313,15 +297,6 @@ class BatchRunStartRequest:
                 str(set_id): value
                 for set_id, value in dict(self.pending_dirty_reset_generation_by_set_id or {}).items()
                 if str(set_id)
-            },
-        )
-        object.__setattr__(
-            self,
-            "pending_init_seed",
-            {
-                str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
-                for set_name, seed in dict(self.pending_init_seed or {}).items()
-                if str(set_name) and isinstance(seed, Mapping)
             },
         )
         for name in (
@@ -455,8 +430,6 @@ class BatchParallelStartPayload:
     simulation_identity_by_set_id: Dict[str, Dict[str, Any]]
     scope_identity: Dict[str, Any]
     preview_batch_cache_token_by_set_id: Dict[str, str]
-    pending_init_seed: Any
-    pending_init_applied: bool
 
 
 @dataclass(frozen=True)
@@ -483,8 +456,6 @@ class BatchSerialNextPayload:
     prepared_by_set_id: Dict[str, Dict[str, Any]]
     scope_identity: Dict[str, Any]
     preview_batch_cache_token_by_set_id: Dict[str, str]
-    pending_init_seed: Any
-    pending_init_applied: bool
 
 
 @dataclass(frozen=True)
@@ -554,15 +525,6 @@ class BatchRunContextOwner:
                 for set_id, value in dict(ctx.get("pending_dirty_reset_generation_by_set_id") or {}).items()
                 if str(set_id)
             },
-            pending_init_seed={
-                str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
-                for set_name, seed in dict(ctx.get("pending_init_seed") or {}).items()
-                if str(set_name) and isinstance(seed, Mapping)
-            },
-            pending_init_rewrite=(
-                str(ctx.get("pending_init_rewrite")) if ctx.get("pending_init_rewrite") is not None else None
-            ),
-            pending_init_applied=self._coerce_bool(ctx.get("pending_init_applied")),
             explicit_cache_preview_token=(
                 str(ctx.get("explicit_cache_preview_token")) if ctx.get("explicit_cache_preview_token") is not None else None
             ),
@@ -754,8 +716,6 @@ class BatchRunContextOwner:
                 for set_id, token in dict(ctx.get("preview_batch_cache_token_by_set_id") or {}).items()
                 if str(set_id)
             },
-            pending_init_seed=deepcopy(ctx.get("pending_init_seed")),
-            pending_init_applied=self._coerce_bool(ctx.get("pending_init_applied")),
         )
 
     def serial_next_payload(
@@ -828,8 +788,6 @@ class BatchRunContextOwner:
                 for set_id, token in dict(ctx.get("preview_batch_cache_token_by_set_id") or {}).items()
                 if str(set_id)
             },
-            pending_init_seed=deepcopy(ctx.get("pending_init_seed")),
-            pending_init_applied=self._coerce_bool(ctx.get("pending_init_applied")),
         )
 
     def completion_state(
@@ -1134,13 +1092,6 @@ class BatchRunContextOwner:
             "primary_set_id": request.primary_set_id,
             "total": len(request.queue_ids),
             "completed_set_ids": [],
-            "pending_init_seed": {
-                str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
-                for set_name, seed in dict(request.pending_init_seed or {}).items()
-                if str(set_name) and isinstance(seed, Mapping)
-            },
-            "pending_init_rewrite": request.pending_init_rewrite,
-            "pending_init_applied": bool(request.pending_init_applied),
             "explicit_cache_preview_token": request.explicit_cache_preview_token,
             "explicit_cache_preview_scope_set_ids": request.explicit_cache_preview_scope_set_ids,
             "explicit_cache_valid_set_ids": request.explicit_cache_valid_set_ids,
@@ -1586,9 +1537,6 @@ class BatchRunContextOwner:
             completed_set_ids=ctx.get("completed_set_ids"),
             pending_workspace_reset_set_ids=ctx.get("pending_workspace_reset_set_ids"),
             pending_dirty_reset_generation_by_set_id=ctx.get("pending_dirty_reset_generation_by_set_id"),
-            pending_init_seed=ctx.get("pending_init_seed"),
-            pending_init_rewrite=ctx.get("pending_init_rewrite"),
-            pending_init_applied=ctx.get("pending_init_applied", False),
             explicit_cache_preview_token=ctx.get("explicit_cache_preview_token"),
             explicit_cache_preview_scope_set_ids=ctx.get("explicit_cache_preview_scope_set_ids"),
             explicit_cache_valid_set_ids=ctx.get("explicit_cache_valid_set_ids"),
@@ -1673,12 +1621,6 @@ class BatchRunContextOwner:
         raw["completed_set_ids"] = list(context.completed_set_ids)
         raw["pending_workspace_reset_set_ids"] = list(context.pending_workspace_reset_set_ids)
         raw["pending_dirty_reset_generation_by_set_id"] = dict(context.pending_dirty_reset_generation_by_set_id)
-        raw["pending_init_seed"] = {
-            str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
-            for set_name, seed in context.pending_init_seed.items()
-        }
-        raw["pending_init_rewrite"] = context.pending_init_rewrite
-        raw["pending_init_applied"] = bool(context.pending_init_applied)
         raw["explicit_cache_preview_token"] = context.explicit_cache_preview_token
         raw["explicit_cache_preview_scope_set_ids"] = context.explicit_cache_preview_scope_set_ids
         raw["explicit_cache_valid_set_ids"] = context.explicit_cache_valid_set_ids

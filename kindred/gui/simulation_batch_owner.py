@@ -7,7 +7,6 @@ from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional,
 import numpy as np
 
 from kindred.core.batch_initial_conditions import (
-    migrate_reaction_dsl_initial_concentration_sets,
     resolve_run_scope,
     strip_reaction_dsl_initial_concentrations,
 )
@@ -30,7 +29,6 @@ from kindred.gui.ports import (
     DisplayTransitionCause,
     ResolvedBatchDisplayRequestEntry,
 )
-from kindred.gui.controllers.simulation_completion_policy import pending_initial_seed_for_set
 
 
 @dataclass(frozen=True, slots=True)
@@ -963,27 +961,11 @@ class SimulationBatchOwner:
         if row is not None:
             try:
                 baseline_initials = self.batch_initials_for_row(int(row))
-                source = self._mechanism_owner.mechanism_source_for_run_set(
+                self._mechanism_owner.mechanism_source_for_run_set(
                     self._mechanism_owner.mechanism_source_for_run(fast_mode=True),
                     set_id=str(set_id),
                     apply_parameter_overrides=True,
                 )
-                reactions_text_raw = source.reactions_text
-                try:
-                    pending_init_seed, _migrated = migrate_reaction_dsl_initial_concentration_sets(
-                        reactions_text_raw,
-                        default_set_name="set1",
-                    )
-                except Exception:
-                    pending_init_seed = {}
-                set_name = str(self.batch_set_name_for_id(str(set_id)) or "")
-                for species, value in pending_initial_seed_for_set(
-                    pending_init_seed,
-                    set_name=set_name,
-                ).items():
-                    parsed, ok = try_parse_finite_float(value)
-                    if ok:
-                        baseline_initials[str(species)] = float(parsed)
                 preview_initials = self._preview_session.preview_initials_for_row(int(row), baseline_initials)
                 initials_fingerprint = canonical_initials_fingerprint(preview_initials)
             except Exception:

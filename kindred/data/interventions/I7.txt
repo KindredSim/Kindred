@@ -1,7 +1,10 @@
-# title: Light-dark photocatalysis cycle
-# Builds an on/off illumination cycle from repeat protocol phases.
-reaction: Substrate + Light -> Product + Light; k=0.6
-initial: Substrate=1.0
-initial: Light=0.0
-initial: Product=0.0
-intervention: op=protocol; kind=repeat; name=user_light_cycle; start=0.0; every=2.0; duration=1.0; count=3; during=reservoir:Light:value=1.0; after=clear:Light
+# title: Isotope entrainment chase
+# Adds an unlabeled substrate chase after a labeled catalyst-bound adduct has accumulated.
+reaction: LabeledSubstrate + Catalyst -> LabeledAdduct; k=1.0
+reaction: LabeledAdduct -> LabeledProduct + Catalyst; k=0.35
+reaction: UnlabeledSubstrate + Catalyst -> UnlabeledAdduct; k=1.0
+reaction: UnlabeledAdduct -> UnlabeledProduct + Catalyst; k=0.35
+intervention_set1 = {
+  initial: LabeledSubstrate=1.0, UnlabeledSubstrate=0.0, Catalyst=0.2, LabeledAdduct=0.0, UnlabeledAdduct=0.0, LabeledProduct=0.0, UnlabeledProduct=0.0
+}
+intervention: op=trigger; trigger_species=LabeledAdduct; threshold=0.05; direction=rising; action=add; species=UnlabeledSubstrate; amount=1.0; max_count=1; min_interval=0.0

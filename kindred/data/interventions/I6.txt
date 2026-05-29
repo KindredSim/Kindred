@@ -1,7 +1,8 @@
-# title: Buffered catalyst reservoir
-# Holds a catalyst concentration constant during the active reaction phase.
-reaction: Substrate + Catalyst -> Product + Catalyst; k=0.5
-initial: Substrate=1.0
-initial: Catalyst=0.0
-initial: Product=0.0
-intervention: op=reservoir; species=Catalyst; start=0.0; end=4.0; value=1.0
+# title: Triggered intermediate trapping
+# Adds a trapping reagent when an intermediate accumulates past a threshold.
+reaction: Precursor -> Intermediate; k=0.8
+reaction: Intermediate + Scavenger -> Product; k=1.0
+intervention_set1 = {
+  initial: Precursor=1.0, Intermediate=0.0, Scavenger=0.0, Product=0.0
+}
+intervention: op=trigger; trigger_species=Intermediate; threshold=0.25; direction=rising; action=add; species=Scavenger; amount=0.5; max_count=1; min_interval=0.0

@@ -42,7 +42,6 @@ class SimulationLifecycleEffects:
     schedule_deferred_preview_replay: bool = False
     deferred_replay_stop_timers: bool = True
     apply_explicit_failure_pending_replay: bool = False
-    invalidate_failed_pending_init_results: bool = False
     show_preview_unavailable_status: str | None = None
     modal_error: SimulationModalError | None = None
 
@@ -268,7 +267,6 @@ class SimulationLifecycleEffectOwner:
             reset_slider_triggered=True,
             schedule_deferred_preview_replay=bool(cancelled and has_deferred_preview_replay),
             apply_explicit_failure_pending_replay=not bool(cancelled),
-            invalidate_failed_pending_init_results=True,
             modal_error=(
                 None
                 if bool(cancelled)

@@ -1,6 +1,7 @@
-# title: Repeated feed windows
-# Uses repeated intervals for recurring feed phases with fixed duration.
-reaction: Precursor -> Product; k=0.25
-initial: Precursor=0.0
-initial: Product=0.0
-intervention: op=repeated_interval; kind=source; species=Precursor; start=0.0; every=2.0; duration=0.5; count=3; rate=0.4
+# title: Pseudo-first-order reagent reservoir
+# Holds an excess reagent constant so substrate decay reports pseudo-first-order kinetics.
+reaction: Substrate + Reagent -> Product; k=0.8
+intervention_set1 = {
+  initial: Substrate=1.0, Reagent=0.0, Product=0.0
+}
+intervention: op=reservoir; species=Reagent; start=0.0; end=4.0; value=10.0

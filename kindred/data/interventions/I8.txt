@@ -1,9 +1,12 @@
-# title: Triggered scavenger addition
-# Adds scavenger when an intermediate accumulates past a threshold.
-reaction: Precursor -> Intermediate; k=0.8
-reaction: Intermediate + Scavenger -> Product; k=1.0
-initial: Precursor=1.0
-initial: Intermediate=0.0
-initial: Scavenger=0.0
-initial: Product=0.0
-intervention: op=trigger; trigger_species=Intermediate; threshold=0.25; direction=rising; action=add; species=Scavenger; amount=0.5; max_count=1; min_interval=0.0
+# title: Ligand and inhibitor perturbation sequence
+# Interleaves ligand activation, inhibitor challenge, and ligand removal in one catalytic run.
+reaction: Substrate + Catalyst -> Product + Catalyst; k=0.15
+reaction: Substrate + LigatedCatalyst -> Product + LigatedCatalyst; k=0.9
+reaction: Catalyst + Ligand -> LigatedCatalyst; k=1.0
+reaction: Catalyst + Inhibitor -> InhibitedCatalyst; k=1.2
+intervention_set1 = {
+  initial: Substrate=1.0, Catalyst=0.2, Ligand=0.0, LigatedCatalyst=0.0, Inhibitor=0.0, InhibitedCatalyst=0.0, Product=0.0
+}
+intervention: op=add; species=Ligand; time=1.0; amount=0.4
+intervention: op=add; species=Inhibitor; time=3.0; amount=0.25
+intervention: op=remove; species=Ligand; time=4.5; amount=0.2

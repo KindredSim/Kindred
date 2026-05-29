@@ -225,7 +225,7 @@ def test_repeated_pulses_and_source_sink_intervals_execute_through_shared_solver
 
 
 def test_bundled_intervention_examples_run_through_solver() -> None:
-    from kindred.io.resources import get_all_intervention_example_specs, get_intervention_example_source
+    from kindred.io.resources import get_all_intervention_example_specs, get_parseable_intervention_example_source
 
     specs = get_all_intervention_example_specs()
     assert specs
@@ -234,7 +234,7 @@ def test_bundled_intervention_examples_run_through_solver() -> None:
 
     for spec in specs:
         request, species_names = _request_from_dsl(
-            get_intervention_example_source(str(spec["id"])).full_dsl,
+            get_parseable_intervention_example_source(str(spec["id"])).full_dsl,
             n=13,
             t_span=(0.0, 6.0),
         )

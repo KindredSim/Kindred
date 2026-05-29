@@ -23,6 +23,7 @@ import re
 import tempfile
 from pathlib import Path
 
+from kindred.core.batch_initial_conditions import reaction_dsl_with_parseable_initial_concentrations
 from kindred.core.mechanism_source import MechanismAuthoringSource
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,9 @@ __all__ = [
     "get_resource_path",
     "list_resources",
     "get_preset_mechanism_source",
+    "get_parseable_preset_mechanism_source",
     "get_intervention_example_source",
+    "get_parseable_intervention_example_source",
     "get_all_example_specs",
     "get_all_intervention_example_specs",
 ]
@@ -285,6 +288,20 @@ def get_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
     return MechanismAuthoringSource.from_full_dsl_text(get_resource_text(f"presets/{preset_id}.txt"))
 
 
+def get_parseable_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
+    """
+    Load a bundled preset mechanism as parser/solver-safe simulation DSL.
+
+    Raw bundled presets may include GUI-import authoring Initial Conditions
+    blocks. This API converts them to ordinary `initial:` DSL so direct parser
+    and solver consumers receive initial values in parser-safe text.
+    """
+    source = get_preset_mechanism_source(preset_id)
+    return source.with_reactions_text(
+        reaction_dsl_with_parseable_initial_concentrations(source.reactions_text)
+    )
+
+
 def get_intervention_example_source(example_id: str) -> MechanismAuthoringSource:
     """
     Load a bundled intervention example by ID as a complete authoring source.
@@ -300,6 +317,20 @@ def get_intervention_example_source(example_id: str) -> MechanismAuthoringSource
         Complete mechanism source.
     """
     return MechanismAuthoringSource.from_full_dsl_text(get_resource_text(f"interventions/{example_id}.txt"))
+
+
+def get_parseable_intervention_example_source(example_id: str) -> MechanismAuthoringSource:
+    """
+    Load a bundled intervention example as parser/solver-safe simulation DSL.
+
+    Raw bundled interventions may include GUI-import authoring Initial
+    Conditions blocks. This API converts them to ordinary `initial:` DSL for
+    direct core parser and solver consumers.
+    """
+    source = get_intervention_example_source(example_id)
+    return source.with_reactions_text(
+        reaction_dsl_with_parseable_initial_concentrations(source.reactions_text)
+    )
 
 
 def get_all_example_specs() -> list[dict]:

@@ -224,9 +224,6 @@ class SimulationController(QtCore.QObject):
             dependencies=SimulationRunPreparationDependencies(
                 claim_preview_ownership=self._claim_preview_ownership,
                 clear_preview_ownership=self._clear_preview_ownership,
-                invalidate_preserved_pending_init_results_after_failed_run=(
-                    self._invalidate_preserved_pending_init_results_after_failed_run
-                ),
                 clear_failed_fast_preview_ownership=self._clear_failed_fast_preview_ownership,
                 clear_slider_triggered_preflight_state=self._clear_slider_triggered_preflight_state,
                 requeue_preserved_pending_slider_replay_after_preflight_abort=(
@@ -235,7 +232,6 @@ class SimulationController(QtCore.QObject):
                 record_nonfatal_exception=self._record_nonfatal_exception,
                 set_simulation_running=self._set_simulation_running,
                 set_slider_simulation_active=self._set_slider_simulation_active,
-                sync_batch_species_columns_for_run=self._sync_batch_species_columns_for_run,
                 slider_runtime_parameter_names=self._slider_runtime_parameter_names,
                 simulation_identity_for_set=self._simulation_identity_for_set,
                 resolved_initials_for_batch_row=self._resolved_initials_for_batch_row,
@@ -279,8 +275,6 @@ class SimulationController(QtCore.QObject):
         )
 
         self._debug_batch_parallel: bool = bool(os.environ.get("KINDRED_DEBUG_BATCH_PAR"))
-        self._pending_reaction_init_stub: Optional[str] = None
-        self._pending_reaction_init_stub_request_id: Optional[int] = None
         self._nonfatal_exception_count: int = 0
         self._last_nonfatal_exception: Optional[str] = None
         self._retained_simulation_workers: List[object] = []
@@ -364,9 +358,6 @@ class SimulationController(QtCore.QObject):
             dependencies=ParallelBatchOutcomeDependencies(
                 freshness=self._callback_freshness_owner,
                 record_nonfatal_exception=self._record_nonfatal_exception,
-                invalidate_preserved_pending_init_results_after_failed_run=(
-                    self._invalidate_preserved_pending_init_results_after_failed_run
-                ),
                 finalize_scoped_batch_success_subset=self._finalize_scoped_batch_success_subset,
                 cleanup_parallel_batch_lane_pool_after_run=self._cleanup_parallel_batch_lane_pool_after_run,
                 show_scoped_batch_failure_summary=self._show_scoped_batch_failure_summary,
@@ -869,10 +860,6 @@ class SimulationController(QtCore.QObject):
         if bool(effects.schedule_deferred_preview_replay):
             self._schedule_deferred_preview_replay_handoff_once(
                 stop_timers=bool(effects.deferred_replay_stop_timers),
-            )
-        if bool(effects.invalidate_failed_pending_init_results):
-            self._invalidate_preserved_pending_init_results_after_failed_run(
-                ctx=failed_run_context if isinstance(failed_run_context, Mapping) else None,
             )
         if effects.modal_error is not None:
             self.ui.dialogs.message_box_critical(
@@ -3702,40 +3689,12 @@ class SimulationController(QtCore.QObject):
         *,
         row: int,
         set_name: str,
-        pending_init_seed: Optional[Mapping[str, object]],
-        pending_init_applied: bool,
         include_preview_initials: bool,
     ) -> Dict[str, float]:
         return self._batch_dispatch_materialization_owner.materialize_initials(
             row=int(row),
             set_name=str(set_name),
             fast_mode=bool(include_preview_initials),
-            pending_init_seed=pending_init_seed,
-            pending_init_applied=bool(pending_init_applied),
-        )
-
-    def _invalidate_preserved_pending_init_results_after_failed_run(
-        self,
-        *,
-        pending_init_applied: bool = False,
-        ctx: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        policy_context = self._batch_context_owner.completion_policy_context(ctx)
-        if bool(pending_init_applied) and policy_context is not None and (not policy_context.pending_init_applied):
-            policy_context = policy_context.evolve(pending_init_applied=True)
-        decision = self._completion_policy.resolve_pending_init_failure(policy_context)
-        if not decision.should_invalidate_preserved_results:
-            return
-        try:
-            self.ui.mechanism_helpers.invalidate_pending_init_preserved_results_after_failed_run()
-        except Exception as exc:
-            self._record_nonfatal_exception(
-                "Failed to invalidate preserved pending-init results after explicit run failure",
-                exc,
-            )
-        self._apply_completion_policy_state_patch(
-            decision.state_patch,
-            base_context=(ctx if isinstance(ctx, Mapping) else None),
         )
 
     def _requeue_preserved_pending_slider_replay_after_preflight_abort(self) -> None:
@@ -4244,8 +4203,6 @@ class SimulationController(QtCore.QObject):
         rows = list(payload.rows)
         queue_ids = list(payload.queue_ids)
         queue_names = list(payload.queue_names)
-        pending_seed = payload.pending_init_seed
-        pending_init_applied = bool(payload.pending_init_applied)
         callback_context = self._batch_context_owner.callback_context_snapshot(context)
 
         for idx, set_id in enumerate(queue_ids):
@@ -4258,8 +4215,6 @@ class SimulationController(QtCore.QObject):
                     row=row,
                     set_name=str(set_name),
                     fast_mode=bool(payload.fast_mode),
-                    pending_init_seed=pending_seed,
-                    pending_init_applied=bool(pending_init_applied),
                 )
             except Exception as exc:
                 self.ui.dialogs.message_box_warning(
@@ -4268,13 +4223,12 @@ class SimulationController(QtCore.QObject):
                 )
                 if payload.fast_mode:
                     self._clear_failed_fast_preview_ownership()
-                ctx = self._batch_context_owner.deactivate()
+                self._batch_context_owner.deactivate()
                 self._shutdown_batch_lane_pool(force_terminate=True)
                 self._simulation_running = False
                 self.ui.run_ui.set_run_button_enabled(True)
                 self.ui.run_ui.set_stop_button_enabled(False)
                 self._slider_simulation_active = False
-                self._invalidate_preserved_pending_init_results_after_failed_run(ctx=ctx)
                 return False
 
             task_plan = build_parallel_batch_task_plan(
@@ -4324,14 +4278,13 @@ class SimulationController(QtCore.QObject):
                 ):
                     callback_context = self._batch_context_owner.callback_context_snapshot()
                     continue
-                ctx = self._batch_context_owner.deactivate()
+                self._batch_context_owner.deactivate()
                 self._shutdown_batch_lane_pool(force_terminate=True)
                 self._simulation_running = False
                 self._slider_simulation_active = False
                 self.ui.run_ui.set_run_button_enabled(True)
                 self.ui.run_ui.set_stop_button_enabled(False)
                 self.ui.run_ui.set_status_text("Batch simulation failed")
-                self._invalidate_preserved_pending_init_results_after_failed_run(ctx=ctx)
                 return False
             try:
                 self._batch_parallel.submit_task(
@@ -4407,12 +4360,11 @@ class SimulationController(QtCore.QObject):
         )
         if bool(fast_mode):
             self._clear_failed_fast_preview_ownership()
-        ctx = self._batch_context_owner.deactivate()
+        self._batch_context_owner.deactivate()
         self._simulation_running = False
         self.ui.run_ui.set_run_button_enabled(True)
         self.ui.run_ui.set_stop_button_enabled(False)
         self._slider_simulation_active = False
-        self._invalidate_preserved_pending_init_results_after_failed_run(ctx=ctx or context)
 
     def _start_contained_serial_batch_worker(
         self,
@@ -4559,8 +4511,6 @@ class SimulationController(QtCore.QObject):
                 row=row,
                 set_name=str(set_name),
                 fast_mode=bool(payload.fast_mode),
-                pending_init_seed=payload.pending_init_seed,
-                pending_init_applied=bool(payload.pending_init_applied),
             )
         except Exception as exc:
             self._abort_serial_batch_for_invalid_initials(
@@ -4704,7 +4654,6 @@ class SimulationController(QtCore.QObject):
             examples = sorted(invalid)[:8]
             details = "\n".join(f"  • row {r+1}: {sp}" for r, sp in examples)
             more = "" if len(invalid) <= len(examples) else f"\n  • ... and {len(invalid) - len(examples)} more"
-            self._invalidate_preserved_pending_init_results_after_failed_run(ctx=None)
             self.ui.dialogs.message_box_warning(
                 "Invalid Initial Conditions",
                 "Fix invalid numeric cells in the Initial Conditions table before running:\n\n" + details + more,
@@ -4747,44 +4696,6 @@ class SimulationController(QtCore.QObject):
             runtime_readiness_only=bool(runtime_readiness_only),
             mechanism_context=mechanism_context,
         )
-
-    def _sync_batch_species_columns_for_run(
-        self,
-        *,
-        fast_mode: bool,
-        slider_runtime: object | None,
-        full_dsl: str,
-        temperature_K: float,
-    ) -> None:
-        species_for_sync: List[str] = []
-        if fast_mode and slider_runtime is not None:
-            species_for_sync = list(getattr(slider_runtime, "species_names", []) or [])
-        else:
-            try:
-                last_mech = self.ui.mechanism_helpers.last_mechanism()
-                last_ctx = self.ui.mechanism_helpers.last_mechanism_context()
-                if last_mech is not None and str(last_ctx.get("dsl_text") or "") == str(full_dsl):
-                    species_for_sync = list(last_mech.species_names())
-                else:
-                    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-                    from kindred.core.units import UnitsModel
-
-                    mech_tmp = parse_dsl_to_mechanism(
-                        full_dsl,
-                        initials={},
-                        units=UnitsModel(temperature_K=float(temperature_K), energy_unit="kJ/mol"),
-                    )
-                    species_for_sync = list(mech_tmp.species_names())
-            except Exception:
-                species_for_sync = []
-        if species_for_sync:
-            try:
-                self.ui.batch.sync_batch_species_columns(species_for_sync)
-            except Exception as exc:
-                self._record_nonfatal_exception(
-                    "Failed to sync batch species columns from mechanism species list",
-                    exc,
-                )
 
     def _build_run_dispatch_context_or_abort(
         self,

@@ -183,14 +183,48 @@ class DatasetImportCoordinator:
                 exc=exc,
             )
 
-        for record in records:
-            self._maybe_prompt_for_import_batch_mapping(record, mechanism_species)
+        force_create_remaining = False
+        for index, record in enumerate(records):
+            batch_store = self._batch_store_getter()
+            remaining_records = records[index + 1 :]
+            allow_create_all = (
+                not force_create_remaining
+                and batch_store is not None
+                and any(self._record_needs_import_batch_mapping(later, batch_store) for later in remaining_records)
+            )
+            result = self._maybe_prompt_for_import_batch_mapping(
+                record,
+                mechanism_species,
+                allow_create_all=allow_create_all,
+                force_create=force_create_remaining,
+            )
+            if result == "create_all":
+                force_create_remaining = True
+
+    def _record_needs_import_batch_mapping(self, record: DatasetRecord, batch_store: Any) -> bool:
+        from kindred.gui.fitting.batch_mapping import inspect_saved_batch_mapping
+
+        if batch_store is None:
+            return False
+        try:
+            settings = self._fit_settings_store.get_fit_settings(str(record.dataset_id))
+        except Exception as exc:
+            self._record_failure(
+                "dataset_import.batch_mapping.inspect_fit_settings",
+                message="Failed to inspect dataset fit settings while preparing import-time bulk mapping",
+                exc=exc,
+            )
+            return False
+        return inspect_saved_batch_mapping(settings, batch_store).status == "unmapped"
 
     def _maybe_prompt_for_import_batch_mapping(
         self,
         record: DatasetRecord,
         mechanism_species: Sequence[str],
-    ) -> None:
+        *,
+        allow_create_all: bool = False,
+        force_create: bool = False,
+    ) -> str:
         from kindred.gui.fitting.batch_mapping import (
             T0_SEED_TOL_S,
             apply_batch_mapping_to_settings,
@@ -206,7 +240,7 @@ class DatasetImportCoordinator:
         batch_store = self._batch_store_getter()
         batch_model = self._batch_model_getter()
         if batch_store is None or batch_model is None:
-            return
+            return "skip"
         try:
             self._sync_batch_species_columns(list(mechanism_species))
         except Exception as exc:
@@ -221,30 +255,34 @@ class DatasetImportCoordinator:
         resolved = resolve_saved_batch_mapping(settings, batch_store)
         if resolved.status == "mapped":
             self._fit_settings_store.update_fit_settings(str(record.dataset_id), settings)
-            return
+            return "mapped"
 
         batch_set_names = list(batch_store.set_names() or [])
         if not batch_set_names:
-            return
+            return "skip"
 
         create_set_name = unique_batch_set_name(
             batch_set_names,
             default_batch_set_name_for_dataset(dataset_name) or dataset_name,
         )
         running_under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
-        action = prompt_dataset_batch_mapping_choice(
-            self._message_parent,
-            dataset_name,
-            create_set_name,
-            title="Import Set Mapping",
-            skip_label="Skip",
-            skip_description="Leave this dataset unmapped",
-            running_under_pytest=running_under_pytest,
-            pytest_default_action="skip",
-        )
+        if force_create:
+            action = "create"
+        else:
+            action = prompt_dataset_batch_mapping_choice(
+                self._message_parent,
+                dataset_name,
+                create_set_name,
+                title="Import Set Mapping",
+                skip_label="Skip",
+                skip_description="Leave this dataset unmapped",
+                running_under_pytest=running_under_pytest,
+                pytest_default_action="skip",
+                include_create_all=allow_create_all,
+            )
         if action == "skip":
             self._fit_settings_store.update_fit_settings(str(record.dataset_id), settings)
-            return
+            return "skip"
         if action == "map":
             target_set = pick_existing_batch_set(
                 self._message_parent,
@@ -256,10 +294,10 @@ class DatasetImportCoordinator:
             )
             if not target_set:
                 self._fit_settings_store.update_fit_settings(str(record.dataset_id), settings)
-                return
+                return "skip"
             apply_batch_mapping_to_settings(settings, batch_store, target_set)
             self._fit_settings_store.update_fit_settings(str(record.dataset_id), settings)
-            return
+            return "map"
 
         _row_idx, created, seeded = create_and_seed_batch_set(
             dataset_name=dataset_name,
@@ -273,7 +311,7 @@ class DatasetImportCoordinator:
         )
         if created and not seeded and not mechanism_species:
             self._fit_settings_store.update_fit_settings(str(record.dataset_id), settings)
-            return
+            return str(action)
         if created and batch_store is not None and not seeded:
             try:
                 t_arr = np.asarray((record.payload or {}).get("t", []), dtype=float).reshape(-1)
@@ -316,6 +354,7 @@ class DatasetImportCoordinator:
                             ),
                         )
                     self._fit_settings_store.update_fit_settings(str(record.dataset_id), settings)
-                    return
+                    return str(action)
         apply_batch_mapping_to_settings(settings, batch_store, create_set_name)
         self._fit_settings_store.update_fit_settings(str(record.dataset_id), settings)
+        return str(action)

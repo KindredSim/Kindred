@@ -23,13 +23,6 @@ class MainWindowMechanismHelpers:
         self._sync_mechanism_controls_to_focused_batch_set: Callable[..., None] = (
             main_window._sync_mechanism_controls_to_focused_batch_set
         )
-        self._apply_pending_init_migration: Callable[..., bool] = main_window.apply_pending_init_migration
-        self._arm_pending_init_result_invalidation_guard: Callable[..., None] = (
-            main_window.arm_pending_init_result_invalidation_guard
-        )
-        self._invalidate_pending_init_preserved_results_after_failed_run: Callable[[], None] = (
-            main_window.invalidate_pending_init_preserved_results_after_failed_run
-        )
         self._last_mechanism: object | None = None
         self._last_mechanism_context: dict[str, Any] = {}
         self._structure_owner = MechanismStructureSnapshotOwner()
@@ -76,24 +69,6 @@ class MainWindowMechanismHelpers:
 
     def sync_mechanism_controls_to_focused_batch_set(self, *, use_workspace: bool = True) -> None:
         self._sync_mechanism_controls_to_focused_batch_set(use_workspace=bool(use_workspace))
-
-    def apply_pending_init_migration(
-        self,
-        *,
-        seed_sets: dict[str, dict[str, float]] | None = None,
-        rewrite: str,
-    ) -> bool:
-        normalized = {
-            str(set_name): {str(species): float(value) for species, value in dict(values).items()}
-            for set_name, values in dict(seed_sets or {}).items()
-        }
-        return bool(self._apply_pending_init_migration(seed_sets=normalized, rewrite=str(rewrite)))
-
-    def arm_pending_init_result_invalidation_guard(self, *, rewrite: str | None = None) -> None:
-        self._arm_pending_init_result_invalidation_guard(rewrite=rewrite)
-
-    def invalidate_pending_init_preserved_results_after_failed_run(self) -> None:
-        self._invalidate_pending_init_preserved_results_after_failed_run()
 
     def clear_last_mechanism(self) -> None:
         self._last_mechanism = None

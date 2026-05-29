@@ -1,7 +1,7 @@
-# title: Bolus reagent addition
-# Adds a limiting reagent once so product formation starts after the dose.
-reaction: A + B -> Product; k=0.8
-initial: A=1.0
-initial: B=0.0
-initial: Product=0.0
-intervention: op=add; species=B; time=1.0; amount=0.5
+# title: Reagent-jump initiation
+# Starts a bimolecular reaction by adding the missing reagent after baseline observation.
+reaction: Substrate + Reagent -> Product; k=0.8
+intervention_set1 = {
+  initial: Substrate=1.0, Reagent=0.0, Product=0.0
+}
+intervention: op=add; species=Reagent; time=1.0; amount=0.5

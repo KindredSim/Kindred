@@ -29,7 +29,6 @@ class ParallelBatchOutcomeResolution:
 class ParallelBatchOutcomeDependencies:
     freshness: SimulationCallbackFreshnessOwner
     record_nonfatal_exception: Callable[..., None]
-    invalidate_preserved_pending_init_results_after_failed_run: Callable[..., None]
     finalize_scoped_batch_success_subset: Callable[..., DisplayTransitionOutcome | None]
     cleanup_parallel_batch_lane_pool_after_run: Callable[..., None]
     show_scoped_batch_failure_summary: Callable[..., None]
@@ -182,8 +181,6 @@ class ParallelBatchOutcomeOwner:
             explicit_cache_valid_set_ids=cache_state.explicit_cache_valid_set_ids,
             explicit_cache_invalidated_set_ids=cache_state.explicit_cache_invalidated_set_ids,
         )
-        self._deps.invalidate_preserved_pending_init_results_after_failed_run(ctx=ctx)
-
         completed_count = int(transition.completed_count)
         if completed_count < total:
             if total > 1:

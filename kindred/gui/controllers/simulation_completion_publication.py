@@ -128,14 +128,12 @@ class SimulationCompletionPublicationOwner:
             self.publish_cache_truth(state)
             self.publish_cache_entry(completion, state)
             self.record_in_flight_completion_display_entry(completion, state)
-            self.apply_pending_init(completion, state)
             display_outcome = self.publish_display(completion, state)
             if self._non_displayed_outcome_is_terminal(display_outcome, state):
                 if isinstance(state.ctx, Mapping):
                     state.ctx = self._batch_context_owner.deactivate_if_active(state.ctx)
                 state.batch_queue_done = True
                 return
-            self.apply_pending_init_guard(completion, state)
             self._result_materialization_owner.refresh_primary_result_controls(
                 mechanism=completion.mechanism,
                 energy_mode=bool(completion.energy_mode),
@@ -371,42 +369,6 @@ class SimulationCompletionPublicationOwner:
                 if isinstance(materialized, MaterializedDisplayResult)
                 else ()
             ),
-        )
-
-    def apply_pending_init(
-        self,
-        completion: CompletionResultState,
-        state: CompletionCallbackState,
-    ) -> None:
-        if state.policy_context is None:
-            return
-        pending_init_completion = self._completion_policy.resolve_pending_init_completion(
-            context=state.policy_context,
-            batch_set=state.batch_set,
-            is_preview=bool(state.is_preview),
-            is_primary=bool(completion.is_primary),
-        )
-        if not pending_init_completion.should_attempt_apply:
-            return
-        applied = False
-        try:
-            applied = bool(
-                self._ui.mechanism_helpers.apply_pending_init_migration(
-                    seed_sets={str(state.batch_set): dict(pending_init_completion.seed_for_ui)},
-                    rewrite=str(pending_init_completion.rewrite or ""),
-                )
-            )
-        except Exception:
-            applied = False
-        if not applied:
-            return
-        state.policy_context = self._completion_policy.note_pending_init_apply_result(
-            context=state.policy_context,
-            applied=True,
-        )
-        state.ctx = self._batch_context_owner.serialize_completion_policy_context(
-            state.policy_context,
-            base_context=state.ctx if isinstance(state.ctx, Mapping) else None,
         )
 
     def record_in_flight_completion_display_entry(
@@ -907,23 +869,6 @@ class SimulationCompletionPublicationOwner:
             return solver_config
         solver_config["temperature_K"] = launch_provenance["temperature_K"]
         return solver_config
-
-    def apply_pending_init_guard(
-        self,
-        completion: CompletionResultState,
-        state: CompletionCallbackState,
-    ) -> None:
-        if state.policy_context is None:
-            return
-        pending_init_guard_rewrite = self._completion_policy.should_arm_pending_init_guard(
-            context=state.policy_context,
-            is_preview=bool(state.is_preview),
-            is_primary=bool(completion.is_primary),
-        )
-        if pending_init_guard_rewrite:
-            self._ui.mechanism_helpers.arm_pending_init_result_invalidation_guard(
-                rewrite=str(pending_init_guard_rewrite)
-            )
 
     def advance_batch_success(
         self,

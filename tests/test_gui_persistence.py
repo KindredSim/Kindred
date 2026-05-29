@@ -4,6 +4,8 @@ import math
 import pytest
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.batch_initial_conditions import BatchInitialConditionsStore, BatchSet
+from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.gui.main_window import MainWindow
 from kindred.gui.tutorial_manager import launch_tutorial
 from kindred.gui.widgets.tutorial_overlay import TutorialOverlay
@@ -81,7 +83,7 @@ def test_project_round_trip_includes_all_dsl(tmp_path, monkeypatch, qt_app):
         expected_reactions_text = "\n".join(
             [
                 "reaction: A -> B; k=0.2",
-                "# Initial concentrations moved to Batch Initial Conditions table (set1). Edit there.",
+                "# Initial Conditions moved to Batch Initial Conditions table (set1): A=1, B=0. Table values are authoritative.",
                 "# Algebra",
                 "let rate_ratio = [B] / max([A], 1e-6)",
             ]
@@ -128,6 +130,31 @@ def test_project_payload_without_state_network_clears_existing_state_network(mai
     assert main_window.mechanism_state_network_dsl_raw() == ""
     assert "# State Network" not in main_window.get_mechanism_text()
     assert stale_state_network_text not in main_window.get_mechanism_text()
+
+
+def test_project_load_with_saved_batch_initials_strips_mechanism_text_initials(main_window, qt_app):
+    saved_store = BatchInitialConditionsStore([BatchSet("set1", {"A": "5.0", "B": "7.0"})])
+    saved_store.set_species(["A", "B"])
+    payload = dict(main_window._serialize_project_state())
+    payload["mechanism_source"] = MechanismAuthoringSource.from_parts(
+        reactions_text="\n".join(
+            [
+                "reaction: A -> B; k=1",
+                "set1 = {",
+                "  [A] = 1.0",
+                "  [B] = 0.0",
+                "}",
+            ]
+        ),
+        state_network_dsl="",
+    ).to_payload()
+    payload["batch_initial_conditions"] = saved_store.as_serializable()
+
+    main_window._apply_project_payload(payload, record_undo=False)
+    qt_app.processEvents()
+
+    assert main_window.mechanism_reactions_text_raw() == "reaction: A -> B; k=1"
+    assert main_window._batch_store.values_for_set("set1") == {"A": "5.0", "B": "7.0"}
 
 
 def test_project_apply_publishes_final_fit_runtime_inputs_once_after_project_settings(

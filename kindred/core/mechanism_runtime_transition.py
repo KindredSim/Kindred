@@ -88,7 +88,6 @@ class MechanismTransitionOutcome:
     display_cache_invalidation_allowed: bool
     readiness_schedule_required: bool
     readiness_schedule_deferred: bool
-    pending_init_preservation: bool
     affected_set_ids: tuple[str, ...] = ()
 
     @property
@@ -162,7 +161,6 @@ class MechanismRuntimeTransitionService:
             if initial_canonical_batch_initials_by_set_id is not None
             else None
         )
-        self._pending_init_snapshot: Optional[AuthoritativeMechanismSnapshot] = None
         self._pending_readiness_epoch: Optional[int] = None
 
     @property
@@ -180,16 +178,7 @@ class MechanismRuntimeTransitionService:
             self._current_canonical_batch_initials_identity = _normalize_mapping_identity(
                 canonical_batch_initials_by_set_id
             )
-        self._pending_init_snapshot = None
         self._pending_readiness_epoch = None
-
-    def arm_pending_init_result_guard(self, *, source: MechanismAuthoringSource) -> None:
-        self._pending_init_snapshot = AuthoritativeMechanismSnapshot.from_source(source)
-
-    def consume_pending_init_result_guard(self) -> Optional[AuthoritativeMechanismSnapshot]:
-        snapshot = self._pending_init_snapshot
-        self._pending_init_snapshot = None
-        return snapshot
 
     def consume_pending_readiness_epoch(self) -> Optional[int]:
         epoch = self._pending_readiness_epoch
@@ -210,7 +199,6 @@ class MechanismRuntimeTransitionService:
         affected_set_ids: Sequence[str] = (),
     ) -> MechanismTransitionOutcome:
         source_s = str(source or "authoritative_change")
-        pending_init_preservation = False
         runtime_invalidation_required = False
         canonical_identity_supplied = canonical_batch_initials_by_set_id is not None
         canonical_identity = (
@@ -239,36 +227,8 @@ class MechanismRuntimeTransitionService:
         )
 
         if bool(force_runtime_invalidation):
-            self._pending_init_snapshot = None
             runtime_invalidation_required = True
         else:
-            pending_snapshot = self._pending_init_snapshot
-            if pending_snapshot is not None:
-                pending_init_source = source_s in {
-                    "pending_init_migration",
-                    "authoritative_change",
-                    "authoritative_editor_rewrite",
-                }
-                if snapshot.matches(pending_snapshot) and (
-                    pending_init_source or not runtime_input_invalidation_required
-                ):
-                    pending_init_preservation = True
-                    self._current_snapshot = snapshot
-                    if canonical_identity_supplied:
-                        self._current_canonical_batch_initials_identity = canonical_identity or ()
-                    return MechanismTransitionOutcome(
-                        epoch=int(self._epoch),
-                        source=source_s,
-                        runtime_invalidation_required=False,
-                        runtime_input_invalidation_required=False,
-                        active_work_supersede_required=False,
-                        display_cache_invalidation_allowed=False,
-                        readiness_schedule_required=False,
-                        readiness_schedule_deferred=False,
-                        pending_init_preservation=True,
-                        affected_set_ids=(),
-                    )
-                self._pending_init_snapshot = None
             runtime_invalidation_required = not snapshot.matches(self._current_snapshot)
             edit_session_blocks_transition = bool(edit_session_active) and (
                 runtime_invalidation_required or not runtime_input_invalidation_required
@@ -287,7 +247,6 @@ class MechanismRuntimeTransitionService:
                     display_cache_invalidation_allowed=False,
                     readiness_schedule_required=False,
                     readiness_schedule_deferred=False,
-                    pending_init_preservation=False,
                     affected_set_ids=(),
                 )
 
@@ -314,7 +273,6 @@ class MechanismRuntimeTransitionService:
                 display_cache_invalidation_allowed=True,
                 readiness_schedule_required=readiness_schedule_required,
                 readiness_schedule_deferred=readiness_schedule_deferred,
-                pending_init_preservation=pending_init_preservation,
                 affected_set_ids=(),
             )
 
@@ -333,7 +291,6 @@ class MechanismRuntimeTransitionService:
                 display_cache_invalidation_allowed=True,
                 readiness_schedule_required=False,
                 readiness_schedule_deferred=False,
-                pending_init_preservation=pending_init_preservation,
                 affected_set_ids=affected_set_ids_t,
             )
 
@@ -349,6 +306,5 @@ class MechanismRuntimeTransitionService:
             display_cache_invalidation_allowed=False,
             readiness_schedule_required=False,
             readiness_schedule_deferred=False,
-            pending_init_preservation=pending_init_preservation,
             affected_set_ids=(),
         )

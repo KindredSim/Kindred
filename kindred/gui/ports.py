@@ -1150,13 +1150,6 @@ class SimulationMechanismHelpersPort(Protocol):
 
     def sync_mechanism_controls_to_focused_batch_set(self, *, use_workspace: bool = True) -> None: ...
 
-    def apply_pending_init_migration(self, *, seed_sets: Dict[str, Dict[str, float]], rewrite: str) -> bool: ...
-
-    def arm_pending_init_result_invalidation_guard(self, *, rewrite: str | None = None) -> None: ...
-
-    def invalidate_pending_init_preserved_results_after_failed_run(self) -> None: ...
-
-
 @dataclass(frozen=True, slots=True)
 class SimulationUiPorts:
     dialogs: SimulationDialogsPort

@@ -2,10 +2,11 @@
 # Mechanism
 A + B -> C ; kf = 0.2
 
-# Initials
-[A] = 1.0
-[B] = 1.0
-[C] = 0.0
+preset_set1 = {
+  [A] = 1.0
+  [B] = 1.0
+  [C] = 0.0
+}
 
 # Algebra
 let extent = [C]

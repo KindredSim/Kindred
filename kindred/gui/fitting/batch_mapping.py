@@ -23,6 +23,7 @@ __all__ = [
     "default_batch_set_name_for_dataset",
     "emit_batch_row_data_changed",
     "ensure_batch_set_row",
+    "inspect_saved_batch_mapping",
     "pick_existing_batch_set",
     "prompt_dataset_batch_mapping_choice",
     "resolve_saved_batch_mapping",
@@ -180,15 +181,13 @@ def emit_batch_row_data_changed(
         )
 
 
-def resolve_saved_batch_mapping(settings: Any, batch_store: Any) -> BatchMappingResolution:
+def inspect_saved_batch_mapping(settings: Any, batch_store: Any) -> BatchMappingResolution:
     mapped_name = str(getattr(settings, "batch_set", "") or "").strip() or None
     mapped_id = str(getattr(settings, "batch_set_id", "") or "").strip() or None
     if batch_store is not None and mapped_id:
         mapped_row = batch_store.row_for_set_id(mapped_id)
         if mapped_row is not None:
             resolved_name = str(batch_store.set_name_for_row(int(mapped_row)))
-            settings.batch_set = resolved_name
-            settings.batch_set_id = mapped_id
             return BatchMappingResolution(
                 status="mapped",
                 batch_set=resolved_name,
@@ -198,13 +197,20 @@ def resolve_saved_batch_mapping(settings: Any, batch_store: Any) -> BatchMapping
         mapped_row = batch_store.row_for_set(mapped_name)
         if mapped_row is not None:
             resolved_id = str(batch_store.set_id_for_row(int(mapped_row)))
-            settings.batch_set = mapped_name
-            settings.batch_set_id = resolved_id
             return BatchMappingResolution(
                 status="mapped",
                 batch_set=mapped_name,
                 batch_set_id=resolved_id,
             )
+    return BatchMappingResolution(status="unmapped")
+
+
+def resolve_saved_batch_mapping(settings: Any, batch_store: Any) -> BatchMappingResolution:
+    inspected = inspect_saved_batch_mapping(settings, batch_store)
+    if inspected.status == "mapped":
+        settings.batch_set = inspected.batch_set
+        settings.batch_set_id = inspected.batch_set_id
+        return inspected
     settings.batch_set = None
     settings.batch_set_id = None
     return BatchMappingResolution(status="unmapped")
@@ -220,6 +226,7 @@ def prompt_dataset_batch_mapping_choice(
     skip_description: str,
     running_under_pytest: bool = False,
     pytest_default_action: str = "create",
+    include_create_all: bool = False,
 ) -> str:
     if running_under_pytest:
         return str(pytest_default_action)
@@ -232,17 +239,27 @@ def prompt_dataset_batch_mapping_choice(
         "\n".join(
             [
                 f"Create new: Create set '{create_set_name}'",
+                *(
+                    ["Create new all: Create new sets for remaining unmapped imported datasets"]
+                    if include_create_all
+                    else []
+                ),
                 "Map existing: Choose an existing set",
                 f"{skip_label}: {skip_description}",
             ]
         )
     )
     create_button = box.addButton("Create new", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+    create_all_button = None
+    if include_create_all:
+        create_all_button = box.addButton("Create new all", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
     map_button = box.addButton("Map existing", QtWidgets.QMessageBox.ButtonRole.ActionRole)
     skip_button = box.addButton(str(skip_label), QtWidgets.QMessageBox.ButtonRole.RejectRole)
     box.setDefaultButton(create_button)
     box.exec()
     clicked = box.clickedButton()
+    if create_all_button is not None and clicked is create_all_button:
+        return "create_all"
     if clicked is map_button:
         return "map"
     if clicked is create_button:

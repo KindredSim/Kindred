@@ -96,20 +96,6 @@ def next_cache_truth_generation(value: object) -> int:
     return cache_truth_generation_value(value) + 1
 
 
-def pending_initial_seed_for_set(
-    pending_init_seed: object,
-    *,
-    set_name: str,
-) -> dict[str, object]:
-    if not isinstance(pending_init_seed, Mapping) or not pending_init_seed:
-        return {}
-
-    nested_seed = pending_init_seed.get(str(set_name))
-    if isinstance(nested_seed, Mapping):
-        return {str(species): value for species, value in nested_seed.items()}
-    return {}
-
-
 @dataclass(frozen=True, slots=True)
 class CompletionPolicyContext:
     active: bool
@@ -126,9 +112,6 @@ class CompletionPolicyContext:
     completed_set_ids: tuple[str, ...] = ()
     pending_workspace_reset_set_ids: tuple[str, ...] = ()
     pending_dirty_reset_generation_by_set_id: dict[str, int] = field(default_factory=dict)
-    pending_init_seed: dict[str, dict[str, float]] = field(default_factory=dict)
-    pending_init_rewrite: Optional[str] = None
-    pending_init_applied: bool = False
     explicit_cache_preview_token: Optional[str] = None
     explicit_cache_preview_scope_set_ids: Optional[tuple[str, ...]] = None
     explicit_cache_valid_set_ids: Optional[tuple[str, ...]] = None
@@ -164,21 +147,6 @@ class CompletionPolicyContext:
                 if str(set_id) and (normalized_generation := _normalize_optional_int(generation)) is not None
             },
         )
-        object.__setattr__(
-            self,
-            "pending_init_seed",
-            {
-                str(set_name): {
-                    str(species): float(value)
-                    for species, value in dict(seed).items()
-                    if str(species) and _try_float(value) is not None
-                }
-                for set_name, seed in dict(self.pending_init_seed or {}).items()
-                if str(set_name) and isinstance(seed, Mapping)
-            },
-        )
-        object.__setattr__(self, "pending_init_rewrite", _normalize_optional_str(self.pending_init_rewrite))
-        object.__setattr__(self, "pending_init_applied", _normalize_bool(self.pending_init_applied))
         object.__setattr__(self, "explicit_cache_preview_token", _normalize_optional_str(self.explicit_cache_preview_token))
         object.__setattr__(
             self,
@@ -345,32 +313,6 @@ class CacheReconciliationDecision:
     active_cache_invalidated_set_ids: Optional[tuple[str, ...]]
     redraw_valid_set_ids: Optional[tuple[str, ...]]
     has_redraw_subset: bool
-
-
-@dataclass(frozen=True, slots=True)
-class PendingInitCompletionDecision:
-    should_attempt_apply: bool
-    seed_for_ui: dict[str, float] = field(default_factory=dict)
-    rewrite: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "should_attempt_apply", bool(self.should_attempt_apply))
-        object.__setattr__(
-            self,
-            "seed_for_ui",
-            {
-                str(species): float(value)
-                for species, value in dict(self.seed_for_ui or {}).items()
-                if str(species) and _try_float(value) is not None
-            },
-        )
-        object.__setattr__(self, "rewrite", _normalize_optional_str(self.rewrite))
-
-
-@dataclass(frozen=True, slots=True)
-class PendingInitFailureDecision:
-    should_invalidate_preserved_results: bool
-    state_patch: PolicyStatePatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -706,63 +648,6 @@ class SimulationCompletionPolicy:
             explicit_cache_valid_set_ids=(),
             explicit_cache_invalidated_set_ids=(),
             explicit_cache_truth_generation=next_generation,
-        )
-
-    def resolve_pending_init_completion(
-        self,
-        *,
-        context: CompletionPolicyContext,
-        batch_set: Optional[str],
-        is_preview: bool,
-        is_primary: bool,
-    ) -> PendingInitCompletionDecision:
-        if bool(is_preview) or (not bool(is_primary)):
-            return PendingInitCompletionDecision(False)
-        if context.pending_init_applied:
-            return PendingInitCompletionDecision(False)
-        rewrite = context.pending_init_rewrite
-        if not rewrite:
-            return PendingInitCompletionDecision(False)
-        seed_for_ui: dict[str, float] = {}
-        for species, value in pending_initial_seed_for_set(context.pending_init_seed, set_name=str(batch_set or "")).items():
-            float_value = _try_float(value)
-            if float_value is None:
-                continue
-            seed_for_ui[str(species)] = float_value
-        if not seed_for_ui:
-            return PendingInitCompletionDecision(False)
-        return PendingInitCompletionDecision(True, seed_for_ui=seed_for_ui, rewrite=rewrite)
-
-    def note_pending_init_apply_result(
-        self,
-        *,
-        context: CompletionPolicyContext,
-        applied: bool,
-    ) -> CompletionPolicyContext:
-        if not applied:
-            return context
-        return context.evolve(pending_init_applied=True)
-
-    def should_arm_pending_init_guard(
-        self,
-        *,
-        context: CompletionPolicyContext,
-        is_preview: bool,
-        is_primary: bool,
-    ) -> Optional[str]:
-        if bool(is_preview) or (not bool(is_primary)) or (not bool(context.pending_init_applied)):
-            return None
-        return context.pending_init_rewrite
-
-    def resolve_pending_init_failure(
-        self,
-        context: Optional[CompletionPolicyContext],
-    ) -> PendingInitFailureDecision:
-        if context is None or (not bool(context.pending_init_applied)):
-            return PendingInitFailureDecision(False, PolicyStatePatch())
-        return PendingInitFailureDecision(
-            True,
-            PolicyStatePatch(context=context.evolve(pending_init_applied=False)),
         )
 
     def resolve_preflight_abort_pending_replay(

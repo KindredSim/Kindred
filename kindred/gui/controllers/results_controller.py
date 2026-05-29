@@ -27,7 +27,6 @@ from kindred.gui.controllers.results_display_projections import (
     cache_resolution_cause_for_transition,
     display_transaction_provenance_payload,
     display_transition_status_text,
-    ordered_display_transaction_metadata,
     plot_display_layers_payload,
     stats_results_map_from_display_transaction,
 )

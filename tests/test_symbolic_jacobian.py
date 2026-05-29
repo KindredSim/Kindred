@@ -19,7 +19,7 @@ from kindred.core.simulation_preparation import (
 )
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.solvers import solve_ode
-from kindred.io.resources import get_preset_mechanism_source
+from kindred.io.resources import get_parseable_preset_mechanism_source
 
 
 pytestmark = pytest.mark.unit
@@ -795,7 +795,7 @@ def test_dynamic_rate_binding_sparse_preparation_generates_symbolic_after_concre
 def test_m1_sparse_dynamic_preview_uses_symbolic_jacobian_after_concrete_override():
     m1_without_algebra = "\n".join(
         line
-        for line in get_preset_mechanism_source("M1").full_dsl.splitlines()
+        for line in get_parseable_preset_mechanism_source("M1").full_dsl.splitlines()
         if not line.strip().startswith("let ") and "Algebra" not in line
     )
     prepared = prepare_simulation_worker_run(
@@ -831,7 +831,7 @@ def test_m9_sparse_dynamic_preview_uses_symbolic_jacobian_after_concrete_overrid
     prepared = prepare_simulation_worker_run(
         execution_request=SimulationExecutionRequest(
             prepared_payload=None,
-            mechanism_text=get_preset_mechanism_source("M9").full_dsl,
+            mechanism_text=get_parseable_preset_mechanism_source("M9").full_dsl,
             initials={},
             t_span=(0.0, 1.0),
             solver_config={

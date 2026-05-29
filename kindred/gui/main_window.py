@@ -21,7 +21,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from kindred import __version__ as KINDRED_VERSION
-from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 from kindred.core.mechanism_runtime_transition import (
     AuthoritativeMechanismSnapshot,
     MechanismTransitionOutcome,
@@ -72,6 +71,10 @@ from kindred.gui.fitting.runtime_inputs import (
     FittingRuntimeInputPublisher,
     FittingRuntimeInputs,
 )
+from kindred.gui.initial_conditions_import_owner import (
+    InitialConditionsImportOwner,
+)
+from kindred.gui.initial_conditions_source_acceptance_owner import InitialConditionsSourceAcceptanceOwner
 from kindred.gui.ports import DisplayRefreshSource
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.mechanism_session_owner import MechanismSessionOwner
@@ -302,6 +305,18 @@ class MainWindow(
         batch_components = build_batch_initial_conditions(self)
         self._batch_store = batch_components.store
         self._batch_model = batch_components.model
+        self._initial_conditions_import_owner = InitialConditionsImportOwner(
+            batch_store_getter=lambda: self._batch_store,
+            batch_model_getter=lambda: self._batch_model,
+            confirm_overwrite=self._confirm_initial_condition_import_overwrite,
+            notify_rows_changed=self._notify_batch_initial_rows_changed,
+            sync_species_columns=self._sync_batch_species_columns,
+            temperature_getter=lambda: float(self._temperature_spinbox.value()),
+        )
+        self._initial_conditions_source_acceptance_owner = InitialConditionsSourceAcceptanceOwner(
+            import_owner=self._initial_conditions_import_owner,
+            show_reconciliation_error=self._show_initial_conditions_reconciliation_error,
+        )
         self._simulation_batch_owner = SimulationBatchOwner(
             batch_selected_rows=self._batch_selected_rows,
             requested_show_batch_set_ids=self._requested_show_batch_set_ids,
@@ -918,16 +933,62 @@ class MainWindow(
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
+
+        def _set_reactions_widget_text(text: str) -> None:
+            widget = self._reactions_text_widget()
+            if widget is None or str(widget.toPlainText()) == str(text):
+                return
+            previous_text_signal_suppress = bool(
+                getattr(self, "_suppress_programmatic_text_change_signals", False)
+            )
+            self._suppress_programmatic_text_change_signals = True
+            try:
+                widget.setPlainText(str(text))
+            finally:
+                self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
+
         if owner.edit_session_active:
             self._sync_mechanism_session_owner_from_widgets(authoritative=False)
+            original_draft_reactions = str(owner.draft_reactions_text)
+            reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_lock(
+                owner.draft_source,
+                prompt_overwrite=True,
+            )
+            if reconciliation_plan is None:
+                self._refresh_symbolic_calculator_state()
+                return False
+            reconciled_source = reconciliation_plan.source
+            if str(reconciled_source.reactions_text) != str(owner.draft_reactions_text):
+                owner.update_draft_reactions(str(reconciled_source.reactions_text))
+                _set_reactions_widget_text(str(reconciled_source.reactions_text))
             if not owner.commit_edit_session():
+                if owner.edit_session_active and str(owner.draft_reactions_text) != original_draft_reactions:
+                    owner.update_draft_reactions(original_draft_reactions)
+                    _set_reactions_widget_text(original_draft_reactions)
                 validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
                 if callable(validate):
                     validate()
                 self._refresh_symbolic_calculator_state()
                 return False
-        elif not self._simulation_mechanism_owner.is_mechanism_ready_for_run():
-            return False
+            self._initial_conditions_source_acceptance_owner.apply_prepared_plan(reconciliation_plan)
+        else:
+            original_canonical_source = owner.canonical_source
+            reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_lock(
+                owner.canonical_source,
+                prompt_overwrite=True,
+            )
+            if reconciliation_plan is None:
+                return False
+            reconciled_source = reconciliation_plan.source
+            if str(reconciled_source.reactions_text) != str(owner.canonical_reactions_text):
+                owner.apply_authoritative_source(reconciled_source)
+                self._restore_mechanism_widgets_from_owner_canonical()
+            if not self._simulation_mechanism_owner.is_mechanism_ready_for_run():
+                if owner.canonical_source != original_canonical_source:
+                    owner.apply_authoritative_source(original_canonical_source)
+                    self._restore_mechanism_widgets_from_owner_canonical()
+                return False
+            self._initial_conditions_source_acceptance_owner.apply_prepared_plan(reconciliation_plan)
         self._apply_authoritative_mechanism_transition()
         self._refresh_mechanism_edit_lock_ui()
         validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
@@ -1710,19 +1771,6 @@ class MainWindow(
             logger.debug("Failed to clear variable sliders after programmatic mechanism load", exc_info=True)
             self._preview_session.clear_pending_slider_values()
             self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
-
-        try:
-            seed_sets, migrated = migrate_reaction_dsl_initial_concentration_sets(
-                self.mechanism_reactions_text_raw(),
-                default_set_name="set1",
-            )
-            if seed_sets and migrated:
-                self.apply_pending_init_migration(
-                    seed_sets=dict(seed_sets),
-                    rewrite=str(migrated),
-                )
-        except Exception:
-            logger.debug("Failed to migrate inline initial concentrations during programmatic load", exc_info=True)
 
         self._apply_authoritative_mechanism_transition(
             schedule_runtime_refresh=bool(schedule_runtime_refresh),
@@ -2689,9 +2737,14 @@ class MainWindow(
             if not self._guard_slider_transaction_invalidation(action_text=f"Loading preset {preset_id}"):
                 self._status_label.setText("Canceled preset load")
                 return
-            source = source.with_reactions_text(
-                self._migrate_inline_initials_to_batch_store(source.reactions_text)
+            reconciled = self._initial_conditions_source_acceptance_owner.accept_importable_source(
+                source,
+                prompt_overwrite=True,
             )
+            if reconciled is None:
+                self._status_label.setText("Canceled preset load")
+                return
+            source = reconciled
             previous_text_signal_suppress = bool(
                 getattr(self, "_suppress_programmatic_text_change_signals", False)
             )
@@ -2732,9 +2785,14 @@ class MainWindow(
             if not self._guard_slider_transaction_invalidation(action_text=f"Loading intervention example {example_id}"):
                 self._status_label.setText("Canceled intervention example load")
                 return
-            source = source.with_reactions_text(
-                self._migrate_inline_initials_to_batch_store(source.reactions_text)
+            reconciled = self._initial_conditions_source_acceptance_owner.accept_importable_source(
+                source,
+                prompt_overwrite=True,
             )
+            if reconciled is None:
+                self._status_label.setText("Canceled intervention example load")
+                return
+            source = reconciled
             previous_text_signal_suppress = bool(
                 getattr(self, "_suppress_programmatic_text_change_signals", False)
             )
@@ -2820,9 +2878,14 @@ class MainWindow(
         )
         self._suppress_programmatic_text_change_signals = True
         try:
-            source = source.with_reactions_text(
-                self._migrate_inline_initials_to_batch_store(source.reactions_text)
+            reconciled = self._initial_conditions_source_acceptance_owner.accept_importable_source(
+                source,
+                prompt_overwrite=True,
             )
+            if reconciled is None:
+                self._status_label.setText("Canceled template load")
+                return
+            source = reconciled
             self._set_authoritative_mechanism_editor_source(
                 source,
                 description="Load template",
@@ -2836,27 +2899,27 @@ class MainWindow(
         self._status_label.setText("Loaded template from Template Manager")
         logger.info("Loaded template from Template Manager")
 
-    def _migrate_inline_initials_to_batch_store(self, reactions_text: str) -> str:
-        """Import inline initial concentrations into the batch store and return rewritten Reactions text."""
-        try:
-            seed_sets, migrated = migrate_reaction_dsl_initial_concentration_sets(
-                str(reactions_text or ""),
-                default_set_name="set1",
-            )
-        except Exception:
-            logger.debug("Failed to migrate inline initial concentrations into batch store", exc_info=True)
-            return str(reactions_text or "")
-        if not seed_sets or not migrated:
-            return str(reactions_text or "")
+    def _confirm_initial_condition_import_overwrite(self, set_names: Sequence[str]) -> bool:
+        names = ", ".join(str(name) for name in set_names if str(name))
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("Overwrite Initial Conditions?")
+        box.setText(f"Apply mechanism-text Initial Conditions to: {names}")
+        box.setInformativeText(
+            "Existing values in those set(s) will be overwritten. Other Initial Conditions sets are preserved."
+        )
+        cancel_button = box.addButton(QtWidgets.QMessageBox.Cancel)
+        apply_button = box.addButton("Apply", QtWidgets.QMessageBox.AcceptRole)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is apply_button
 
-        previous_suppress = bool(getattr(self, "_suppress_canonical_batch_initials_transition", False))
-        self._suppress_canonical_batch_initials_transition = True
-        try:
-            migrated_rows = self._materialize_migrated_initial_concentration_sets(seed_sets=dict(seed_sets))
-            self._notify_batch_initial_rows_changed(migrated_rows)
-        finally:
-            self._suppress_canonical_batch_initials_transition = previous_suppress
-        return str(migrated)
+    def _show_initial_conditions_reconciliation_error(self, message: str) -> None:
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Initial Conditions Import Error",
+            str(message or "Initial Conditions could not be reconciled."),
+        )
 
     def _notify_batch_initial_rows_changed(self, rows: Sequence[int]) -> None:
         batch_model = getattr(self, "_batch_model", None)
@@ -3889,12 +3952,18 @@ class MainWindow(
         self._reset_project_apply_dirty_session_state()
         self._clear_last_mechanism()
 
-        # Batch initial conditions (schema v3+). For older projects, migrate any
-        # inline initial concentrations into set1 and rewrite the block stub.
         self._batch_store = batch_store
-        source = source.with_reactions_text(
-            self._migrate_inline_initials_to_batch_store(source.reactions_text)
+        self._batch_model = BatchInitialConditionsTableModel(self._batch_store, parent=self)
+        if self._batch_table is not None:
+            self._batch_table.setModel(self._batch_model)
+            self._rebind_batch_semantics_signal_bindings()
+        reconciled = self._initial_conditions_source_acceptance_owner.accept_project_source_after_batch_load(
+            source,
+            batch_store=self._batch_store,
+            batch_payload_present=batch_payload is not None,
         )
+        if reconciled is not None:
+            source = reconciled
 
         self._set_authoritative_mechanism_editor_source(
             source,
@@ -3904,10 +3973,6 @@ class MainWindow(
             record_undo=record_undo,
         )
 
-        self._batch_model = BatchInitialConditionsTableModel(self._batch_store, parent=self)
-        if self._batch_table is not None:
-            self._batch_table.setModel(self._batch_model)
-            self._rebind_batch_semantics_signal_bindings()
         self._rebind_species_panel_after_batch_model_replacement()
         self._update_batch_row_controls_state()
         self._on_batch_current_changed()
@@ -4235,76 +4300,6 @@ class MainWindow(
             fast_mode=bool(fast_mode),
         )
 
-    def _batch_store_is_pristine_default_placeholder(self) -> bool:
-        if int(self._batch_store.row_count()) != 1:
-            return False
-        names = list(self._batch_store.set_names() or [])
-        if names != ["set1"]:
-            return False
-        values = dict(self._batch_store.values_for_set("set1") or {})
-        for raw in values.values():
-            text = str(raw).strip()
-            if not text:
-                continue
-            parsed, ok = try_parse_finite_float(text)
-            if not ok or abs(float(parsed)) > 1e-12:
-                return False
-        return True
-
-    def _materialize_migrated_initial_concentration_sets(
-        self,
-        *,
-        seed_sets: Mapping[str, Mapping[str, object]],
-    ) -> List[int]:
-        rows: List[int] = []
-        ordered_names = [str(name) for name in seed_sets.keys() if str(name).strip()]
-        if not ordered_names:
-            return rows
-
-        reuse_default_row = bool(
-            self._batch_store_is_pristine_default_placeholder()
-            and str(ordered_names[0]) != "set1"
-        )
-        batch_model = getattr(self, "_batch_model", None)
-        batch_model_attached = bool(
-            batch_model is not None
-            and hasattr(batch_model, "store")
-            and callable(getattr(batch_model, "store"))
-            and batch_model.store() is self._batch_store
-        )
-        row_by_name: Dict[str, int] = {}
-        if reuse_default_row:
-            self._batch_store.set_set_name(0, str(ordered_names[0]))
-            row_by_name[str(ordered_names[0])] = 0
-
-        seen_rows: set[int] = set()
-        for set_name in ordered_names:
-            seed = seed_sets.get(str(set_name)) or {}
-            row_idx = row_by_name.get(str(set_name))
-            if row_idx is None:
-                existing_row = self._batch_store.row_for_set(str(set_name))
-                if existing_row is None:
-                    insert_at = int(self._batch_store.row_count())
-                    if batch_model_attached:
-                        batch_model.beginInsertRows(QtCore.QModelIndex(), insert_at, insert_at)
-                    try:
-                        row_idx = int(self._batch_store.ensure_set(str(set_name)))
-                    finally:
-                        if batch_model_attached:
-                            batch_model.endInsertRows()
-                else:
-                    row_idx = int(existing_row)
-                row_by_name[str(set_name)] = int(row_idx)
-            for species, value in dict(seed).items():
-                parsed, ok = try_parse_finite_float(value)
-                if not ok:
-                    continue
-                self._batch_store.set_value(int(row_idx), str(species), f"{float(parsed):.6g}")
-            if int(row_idx) not in seen_rows:
-                rows.append(int(row_idx))
-                seen_rows.add(int(row_idx))
-        return rows
-
     def slider_overrides(self, set_id: Optional[str] = None) -> Dict[str, float]:
         return self._simulation_mechanism_owner.slider_overrides(set_id=set_id)
 
@@ -4356,89 +4351,6 @@ class MainWindow(
             refresh_sliders=bool(refresh_sliders),
             preserve_visibility=bool(preserve_visibility),
         )
-
-    def apply_pending_init_migration(
-        self,
-        *,
-        seed_sets: Mapping[str, Mapping[str, object]] | None = None,
-        rewrite: str,
-    ) -> bool:
-        if not seed_sets or not rewrite:
-            return False
-        try:
-            previous_batch_initials_suppress = bool(
-                getattr(self, "_suppress_canonical_batch_initials_transition", False)
-            )
-            self._suppress_canonical_batch_initials_transition = True
-            try:
-                migrated_rows = self._materialize_migrated_initial_concentration_sets(seed_sets=seed_sets)
-                self._notify_batch_initial_rows_changed(migrated_rows)
-            finally:
-                self._suppress_canonical_batch_initials_transition = previous_batch_initials_suppress
-            previous_suppress = self._variable_runtime.suppress_slider_runtime_invalidation()
-            previous_authoritative_suppress = bool(
-                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
-            )
-            self._variable_runtime.set_suppress_slider_runtime_invalidation(True)
-            self._suppress_authoritative_mechanism_input_change = True
-            restore_deferred = False
-            try:
-                self.set_mechanism_reactions_text_with_optional_undo(
-                    str(rewrite),
-                    "Migrate initial concentrations to set table",
-                    record_undo=True,
-                )
-                self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
-                from kindred.core.mechanism_source import MechanismAuthoringSource
-
-                self._mechanism_runtime_transition.arm_pending_init_result_guard(
-                    source=MechanismAuthoringSource.from_parts(
-                        reactions_text=str(rewrite),
-                        state_network_dsl=self.mechanism_state_network_dsl_raw(),
-                    ),
-                )
-                self._set_mechanism_edit_locked(True)
-                self._apply_authoritative_mechanism_transition(
-                    transition_source="pending_init_migration",
-                    canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
-                )
-                restore_deferred = True
-                def _restore_pending_init_rewrite_suppression() -> None:
-                    self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
-                    self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-
-                QtCore.QTimer.singleShot(0, _restore_pending_init_rewrite_suppression)
-            finally:
-                if not restore_deferred:
-                    self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
-                    self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-            return True
-        except Exception:
-            logger.debug("Failed to apply initial concentration migration to editor/store", exc_info=True)
-            return False
-
-    def arm_pending_init_result_invalidation_guard(self, *, rewrite: str | None = None) -> None:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        rewrite_text = str(self.mechanism_reactions_text_raw() or "") if rewrite is None else str(rewrite or "")
-        self._mechanism_runtime_transition.arm_pending_init_result_guard(
-            source=MechanismAuthoringSource.from_parts(
-                reactions_text=rewrite_text,
-                state_network_dsl=self.mechanism_state_network_dsl_raw(),
-            ),
-        )
-
-    def invalidate_pending_init_preserved_results_after_failed_run(self) -> None:
-        pending_snapshot = self._mechanism_runtime_transition.consume_pending_init_result_guard()
-        if pending_snapshot is None:
-            return
-        self._invalidate_slider_runtime()
-        if not self.results_controller.authoritative_result_transition_required(
-            cache_stale_scope_is_global=False,
-            cache_stale_set_ids=(),
-        ):
-            return
-        self._invalidate_active_results_for_global_authoritative_change()
 
     def _simulate_mechanism(
         self,

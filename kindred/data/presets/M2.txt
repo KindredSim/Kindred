@@ -2,9 +2,10 @@
 # Mechanism
 A <-> B ; kf = 2.0 ; kr = 0.5
 
-# Initials
-[A] = 1.0
-[B] = 0.0
+preset_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+}
 
 # Algebra
 let ratio = [B] / max([A], 1e-30)
