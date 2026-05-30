@@ -935,6 +935,13 @@ class SimulationMechanismPort(Protocol):
         strip_initial_concentrations: bool = False,
     ) -> MechanismAuthoringSource: ...
 
+    def pending_initials_for_run_source_set(
+        self,
+        source: MechanismAuthoringSource,
+        *,
+        set_name: str,
+    ) -> Dict[str, float]: ...
+
     def mechanism_slider_points_value(self) -> Optional[int]: ...
 
     def mechanism_slider_solver_value(self) -> Optional[str]: ...

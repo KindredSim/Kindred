@@ -176,15 +176,18 @@ class InitialConditionsImportOwner:
         try:
             extraction = extract_reaction_dsl_initial_condition_imports(
                 str(source.reactions_text or ""),
-                default_set_name=target_name,
+                default_set_name="set1",
             )
         except Exception:
             logger.debug("Failed to parse pending draft Initial Conditions", exc_info=True)
             return {}
-        for event in extraction.imports:
+        value_imports = tuple(event for event in extraction.imports if event.value_bearing)
+        destination_names = self._destination_names_for_imports(value_imports)
+        for event in value_imports:
             if not bool(event.value_bearing):
                 continue
-            if str(event.source_name or "") != target_name:
+            destination = str(destination_names.get(event.import_id, event.source_name) or event.source_name)
+            if destination != target_name:
                 continue
             initials: dict[str, float] = {}
             for species, value in dict(event.values or {}).items():

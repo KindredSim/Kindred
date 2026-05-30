@@ -5008,19 +5008,7 @@ class MainWindow(
         if new_species == list(self._batch_store.visible_species()):
             return
 
-        selected_sets = [
-            str(name)
-            for set_id in self._simulation_batch_owner.batch_set_ids_for_scope("selected")
-            for name in [self._batch_set_name_for_id(str(set_id))]
-            if name
-        ]
-        current_row = self._batch_current_row()
-        current_set = None
-        if current_row is not None:
-            names = list(self._batch_store.set_names())
-            if 0 <= int(current_row) < len(names):
-                current_set = str(names[int(current_row)])
-
+        selection_snapshot = self._simulation_batch_owner.batch_selection_state_snapshot()
         species_sync_snapshot = self._simulation_batch_owner.batch_species_column_sync_snapshot()
 
         self._batch_model.set_species(new_species)
@@ -5043,42 +5031,10 @@ class MainWindow(
             species_sync_snapshot,
             retain_active_cache_identity=bool(retain_active_cache_identity),
         )
-
-        table = getattr(self, "_batch_table", None)
-        if table is None:
-            return
-        sel = table.selectionModel()
-        if sel is None:
-            return
-        signals_blocked = False
-        try:
-            sel.blockSignals(True)
-            signals_blocked = True
-        except RuntimeError as exc:
-            logger.debug("Failed to block batch selection signals: %s", exc, exc_info=True)
-            signals_blocked = False
-        restored_focus_row: Optional[int] = None
-        try:
-            sel.clearSelection()
-            for name in selected_sets:
-                row = self._batch_store.row_for_set(name)
-                if row is None:
-                    continue
-                idx = self._batch_model.index(int(row), 0)
-                sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-            if current_set:
-                row = self._batch_store.row_for_set(current_set)
-                if row is not None:
-                    table.setCurrentIndex(self._batch_model.index(int(row), 0))
-                    restored_focus_row = int(row)
-        finally:
-            if signals_blocked:
-                try:
-                    sel.blockSignals(False)
-                except RuntimeError as exc:
-                    logger.debug("Failed to unblock batch selection signals: %s", exc, exc_info=True)
-                    signals_blocked = False
-        self._update_focused_batch_set_id(row=restored_focus_row)
+        selection_resolution = self._simulation_batch_owner.resolve_batch_selection_state_snapshot(
+            selection_snapshot
+        )
+        self._apply_batch_selection_state_resolution(selection_resolution)
 
         try:
             panel = self._mechanism_editor.species_sliders_widget()
@@ -5087,6 +5043,44 @@ class MainWindow(
         except RuntimeError as exc:
             logger.debug("Failed to rebuild species panel after batch species sync: %s", exc, exc_info=True)
             self._species_panel_available = False
+
+    def _apply_batch_selection_state_resolution(self, resolution: object) -> None:
+        table = getattr(self, "_batch_table", None)
+        if table is None:
+            return
+        sel = table.selectionModel()
+        if sel is None:
+            return
+        rows = tuple(int(row) for row in (getattr(resolution, "selected_rows", ()) or ()))
+        focused_row_raw = getattr(resolution, "focused_row", None)
+        focused_row = int(focused_row_raw) if focused_row_raw is not None else None
+        focused_set_id = str(getattr(resolution, "focused_set_id", "") or "").strip()
+        signals_blocked = False
+        try:
+            sel.blockSignals(True)
+            signals_blocked = True
+        except RuntimeError as exc:
+            logger.debug("Failed to block batch selection signals: %s", exc, exc_info=True)
+            signals_blocked = False
+        try:
+            sel.clearSelection()
+            for row in rows:
+                idx = self._batch_model.index(int(row), 0)
+                sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+            if focused_row is not None:
+                table.setCurrentIndex(self._batch_model.index(int(focused_row), 0))
+        finally:
+            if signals_blocked:
+                try:
+                    sel.blockSignals(False)
+                except RuntimeError as exc:
+                    logger.debug("Failed to unblock batch selection signals: %s", exc, exc_info=True)
+        if focused_set_id:
+            self._set_cached_focused_batch_set_id(focused_set_id)
+        elif focused_row is not None:
+            self._update_focused_batch_set_id(row=focused_row)
+        else:
+            self._set_cached_focused_batch_set_id("")
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()

@@ -583,6 +583,49 @@ class SimulationController(QtCore.QObject):
             target_set_ids.append(set_id_s)
         return tuple(target_set_ids)
 
+    def _run_rows_for_target_set_ids(
+        self,
+        target_set_ids: Sequence[str],
+        *,
+        fallback_rows: Sequence[int] = (),
+    ) -> list[int]:
+        target_ids = [str(set_id).strip() for set_id in target_set_ids or () if str(set_id).strip()]
+        if target_ids:
+            rows_by_set_id: Dict[str, int] = {}
+            try:
+                row_count = int(self.ui.batch.batch_store_row_count())
+            except Exception:
+                row_count = 0
+            for row in range(max(0, int(row_count))):
+                try:
+                    set_id = self.ui.batch.batch_set_id_for_row(int(row))
+                except Exception:
+                    set_id = None
+                set_id_s = str(set_id or "").strip()
+                if set_id_s and set_id_s not in rows_by_set_id:
+                    rows_by_set_id[set_id_s] = int(row)
+            if any(set_id not in rows_by_set_id for set_id in target_ids):
+                return []
+            return [int(rows_by_set_id[set_id]) for set_id in target_ids if set_id in rows_by_set_id]
+        try:
+            row_count = int(self.ui.batch.batch_store_row_count())
+        except Exception:
+            row_count = None
+        rows: list[int] = []
+        seen_rows: set[int] = set()
+        for row in fallback_rows or ():
+            try:
+                row_i = int(row)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if row_i in seen_rows:
+                continue
+            if row_count is not None and not (0 <= row_i < int(row_count)):
+                continue
+            seen_rows.add(row_i)
+            rows.append(row_i)
+        return rows
+
     def _run_intent_signature_for_rows(self, rows: Sequence[int]) -> str:
         rows_tuple = tuple(int(row) for row in rows or ())
         try:
@@ -661,6 +704,37 @@ class SimulationController(QtCore.QObject):
         self.ui.run_ui.set_stop_button_enabled(False)
         self.ui.run_ui.set_status_text("Ready.")
 
+    def _launch_run_selected_rows(self, rows_to_run: Sequence[int]) -> None:
+        rows = [int(row) for row in rows_to_run or ()]
+        reset_set_ids: list[str] = []
+        for row in rows:
+            try:
+                set_id = self.ui.batch.batch_set_id_for_row(int(row))
+            except Exception:
+                set_id = None
+            set_id_s = str(set_id or "").strip()
+            if set_id_s:
+                reset_set_ids.append(set_id_s)
+
+        self._flush_pending_slider_updates_for_run(reset_set_ids=reset_set_ids)
+        self._clear_preview_ownership()
+        request_id = self._next_sim_request_id()
+
+        self.ui.run_ui.set_run_button_enabled(False)
+        self.ui.run_ui.set_stop_button_enabled(True)
+        self._simulation_running = True
+
+        logger.info("Starting simulation")
+        self.ui.run_ui.set_status_text("Running simulation...")
+        self.ui.run_ui.set_sim_progress_value(0)
+
+        self.run_simulation_internal(
+            fast_mode=False,
+            request_id=int(request_id),
+            batch_rows=rows,
+            reuse_parallel_lane_pool=bool(len(rows) > 1),
+        )
+
     def _retry_pending_run_after_runtime_ready(self) -> None:
         pending = self._pending_run_after_runtime_ready
         if not pending.active:
@@ -668,17 +742,21 @@ class SimulationController(QtCore.QObject):
         if bool(getattr(self, "_simulation_running", False)) or self._has_running_owned_simulation_workers():
             QtCore.QTimer.singleShot(50, self._retry_pending_run_after_runtime_ready)
             return
-        current_rows = tuple(self.ui.batch.batch_rows_for_scope("selected") or ())
-        if current_rows != tuple(pending.rows) or self._run_target_set_ids_for_rows(current_rows) != tuple(
-            pending.target_set_ids
-        ) or self._run_intent_signature_for_rows(current_rows) != str(
-            pending.intent_signature or ""
-        ):
+        pending_rows = tuple(
+            self._run_rows_for_target_set_ids(
+                pending.target_set_ids,
+                fallback_rows=pending.rows,
+            )
+        )
+        if not pending_rows:
+            self._clear_pending_run_after_runtime_ready()
+            self._restore_run_controls_after_pending_run_cancelled()
+            return
+        if self._run_intent_signature_for_rows(pending_rows) != str(pending.intent_signature or ""):
             self._clear_pending_run_after_runtime_ready()
             self._restore_run_controls_after_pending_run_cancelled()
             return
 
-        pending_rows = tuple(int(row) for row in pending.rows)
         runtime_snapshot = self._selected_run_runtime_snapshot(pending_rows)
         if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
             self._ensure_selected_run_runtime_warming(pending_rows)
@@ -696,7 +774,7 @@ class SimulationController(QtCore.QObject):
 
         self._clear_pending_run_after_runtime_ready()
         self.ui.run_ui.set_runtime_backed_run_controls_ready(True)
-        self._run_simulation()
+        self._launch_run_selected_rows(pending_rows)
 
     def _has_deferred_preview_replay_intent(
         self,
@@ -3897,6 +3975,8 @@ class SimulationController(QtCore.QObject):
         )
 
     def _run_simulation(self):
+        selected_rows = list(self.ui.batch.batch_rows_for_scope("selected"))
+        selected_target_set_ids = self._run_target_set_ids_for_rows(selected_rows)
         auto_lock_result = self.ui.mechanism.auto_lock_for_run()
         if not auto_lock_result:
             self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
@@ -3920,9 +4000,10 @@ class SimulationController(QtCore.QObject):
             self.ui.run_ui.set_status_text("Cancelling previous simulation...")
             return
 
-        rows_to_run = list(getattr(auto_lock_result, "affected_rows", ()) or ())
-        if not rows_to_run:
-            rows_to_run = self.ui.batch.batch_rows_for_scope("selected")
+        rows_to_run = self._run_rows_for_target_set_ids(
+            selected_target_set_ids,
+            fallback_rows=selected_rows,
+        )
         if not rows_to_run:
             reason = self.ui.batch.run_selected_empty_target_reason()
             self.ui.dialogs.message_box_warning("No Sets", reason)
@@ -3951,34 +4032,7 @@ class SimulationController(QtCore.QObject):
             return
 
         self._clear_pending_run_after_runtime_ready()
-        reset_set_ids: list[str] = []
-        for row in rows_to_run:
-            try:
-                set_id = self.ui.batch.batch_set_id_for_row(int(row))
-            except Exception:
-                set_id = None
-            set_id_s = str(set_id or "").strip()
-            if set_id_s:
-                reset_set_ids.append(set_id_s)
-
-        self._flush_pending_slider_updates_for_run(reset_set_ids=reset_set_ids)
-        self._clear_preview_ownership()
-        request_id = self._next_sim_request_id()
-
-        self.ui.run_ui.set_run_button_enabled(False)
-        self.ui.run_ui.set_stop_button_enabled(True)
-        self._simulation_running = True
-
-        logger.info("Starting simulation")
-        self.ui.run_ui.set_status_text("Running simulation...")
-        self.ui.run_ui.set_sim_progress_value(0)
-
-        self.run_simulation_internal(
-            fast_mode=False,
-            request_id=int(request_id),
-            batch_rows=rows_to_run,
-            reuse_parallel_lane_pool=bool(len(rows_to_run) > 1),
-        )
+        self._launch_run_selected_rows(rows_to_run)
 
     def _resolve_wegscheider_cyclicity_for_run_or_abort(self) -> bool:
         if not bool(self.ui.solver.wegscheider_cyclicity_enabled()):

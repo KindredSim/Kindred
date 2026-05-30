@@ -40,6 +40,19 @@ class BatchSpeciesColumnSyncSnapshot:
     scope_tokens_before: Mapping[str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class BatchSelectionStateSnapshot:
+    selected_set_ids: tuple[str, ...]
+    focused_set_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class BatchSelectionStateResolution:
+    selected_rows: tuple[int, ...]
+    focused_row: Optional[int] = None
+    focused_set_id: str = ""
+
+
 class SimulationBatchOwner:
     """Thin Qt adapter for batch table/store, cache identity, and display-request resolution."""
 
@@ -125,6 +138,38 @@ class SimulationBatchOwner:
             if set_id:
                 set_ids.append(str(set_id))
         return set_ids
+
+    def batch_selection_state_snapshot(self) -> BatchSelectionStateSnapshot:
+        return BatchSelectionStateSnapshot(
+            selected_set_ids=tuple(self.batch_set_ids_for_scope("selected")),
+            focused_set_id=str(self.focused_batch_set_id() or "").strip(),
+        )
+
+    def resolve_batch_selection_state_snapshot(
+        self,
+        snapshot: BatchSelectionStateSnapshot,
+    ) -> BatchSelectionStateResolution:
+        selected_rows: list[int] = []
+        seen_rows: set[int] = set()
+        for set_id in tuple(getattr(snapshot, "selected_set_ids", ()) or ()):
+            row = self._batch_row_for_set_id(str(set_id))
+            if row is None:
+                continue
+            row_i = int(row)
+            if row_i in seen_rows:
+                continue
+            seen_rows.add(row_i)
+            selected_rows.append(row_i)
+        focused_set_id = str(getattr(snapshot, "focused_set_id", "") or "").strip()
+        focused_row = self._batch_row_for_set_id(focused_set_id) if focused_set_id else None
+        if focused_row is None and selected_rows:
+            focused_row = int(selected_rows[0])
+            focused_set_id = str(self.batch_set_id_for_row(int(focused_row)) or "").strip()
+        return BatchSelectionStateResolution(
+            selected_rows=tuple(selected_rows),
+            focused_row=int(focused_row) if focused_row is not None else None,
+            focused_set_id=focused_set_id,
+        )
 
     def requested_show_batch_set_ids(self) -> List[str]:
         return [str(set_id) for set_id in (self._requested_show_batch_set_ids() or [])]
