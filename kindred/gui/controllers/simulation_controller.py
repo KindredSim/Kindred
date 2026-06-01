@@ -203,8 +203,7 @@ class SimulationController(QtCore.QObject):
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
         self._runtime_lane_allocator = RuntimeLaneAllocator(
-            lane_warmer=self._warm_runtime_lane_pool,
-            backend_lane_is_live=self._runtime_lane_is_live,
+            backend_lease_provider=self._batch_parallel,
         )
         self._batch_dispatch_materialization_owner = BatchDispatchMaterializationOwner(
             batch=self.ui.batch,
@@ -643,9 +642,9 @@ class SimulationController(QtCore.QObject):
                 stale_fast_handoff_after_display=bool(effects.stale_fast_handoff_after_display),
             )
         if bool(effects.close_contained_owner):
-            self._close_contained_simulation_owner(
+            self._runtime_readiness_lifecycle.release_launch_contexts_for_run_kind(
                 fast_mode=bool(effects.close_contained_fast_mode),
-                kill=bool(effects.close_contained_kill),
+                failed=bool(effects.close_contained_kill),
             )
         if bool(effects.clear_shutdown_request):
             self._clear_shutdown_request_after_close_cleanup()
@@ -1215,6 +1214,9 @@ class SimulationController(QtCore.QObject):
             return
         request_id = self._next_sim_request_id()
         target_set_ids = self._run_target_set_ids_for_rows(rows_to_run)
+        self._prepare_ordinary_runtime_launch_context(
+            target_set_ids=target_set_ids,
+        )
         requested_show_set_ids = self._runtime_requested_show_set_ids(target_set_ids)
         intent = RuntimeLaunchIntent(
             intent_kind="ordinary",
@@ -1236,6 +1238,16 @@ class SimulationController(QtCore.QObject):
             preferred_lane_capacity=self._lane_capacity_for_rows(rows_to_run),
         )
         self._accept_and_dispatch_prepared_runtime_request(prepared)
+
+    def _prepare_ordinary_runtime_launch_context(
+        self,
+        *,
+        target_set_ids: Sequence[str],
+    ) -> None:
+        self._flush_pending_slider_updates_for_run(reset_set_ids=target_set_ids)
+        self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+        self._clear_preview_ownership()
+        self._runtime_readiness_lifecycle.release_preview_launch_contexts(failed=True)
 
     def launch_pending_slider_preview_replay(self) -> None:
         pending = self._pending_slider_preview_launch
@@ -1293,9 +1305,6 @@ class SimulationController(QtCore.QObject):
         if dispatch_plan is not None:
             self._dispatch_runtime_plan(dispatch_plan)
         return dispatch_plan
-
-    def invalidate_interactive_simulation_runtimes(self, *, kill: bool = False) -> None:
-        self._runtime_readiness_lifecycle.release_all(failed=bool(kill))
 
     def _runtime_requested_show_set_ids(self, fallback_set_ids: Sequence[str]) -> tuple[str, ...]:
         requested: Sequence[str] = ()
@@ -1921,7 +1930,7 @@ class SimulationController(QtCore.QObject):
         seen_ids: set[int] = set()
         owned_workers = []
         current_worker = getattr(self, "_simulation_worker", None)
-        self._close_contained_simulation_owner(kill=True)
+        self._runtime_readiness_lifecycle.release_all_launch_contexts(failed=True)
         if current_worker is not None:
             owned_workers.append(current_worker)
             seen_ids.add(id(current_worker))
@@ -2036,37 +2045,6 @@ class SimulationController(QtCore.QObject):
         blas_limited = bool(self._contained_child_blas_threads_limited())
         return f"contained-child-blas:{'limited' if blas_limited else 'unlimited'}"
 
-    def _warm_runtime_lane_pool(self, capacity: int, *, wait: bool = False) -> tuple[tuple[str, int, str], ...]:
-        requested = max(1, int(capacity or 1))
-        self._batch_parallel.ensure_warm_lane_pool(max_lanes=requested, wait=bool(wait))
-        if not self._batch_parallel.has_ready_lane_pool(max_lanes=requested):
-            return ()
-        snapshot = self._batch_parallel.runtime_snapshot()
-        token = self._batch_parallel.lane_pool_token()
-        token_s = str(token if token is not None else id(self._batch_parallel))
-        generation = int(getattr(snapshot, "current_generation", 0) or 0)
-        return tuple((f"runtime-lane-{token_s}-{index + 1}", generation, token_s) for index in range(requested))
-
-    def _runtime_lane_is_live(self, lane) -> bool:
-        token = self._batch_parallel.lane_pool_token()
-        if token is None:
-            return False
-        token_s = str(token)
-        lane_token = str(getattr(lane, "backend_pool_token", "") or "")
-        if lane_token and lane_token != token_s:
-            return False
-        try:
-            snapshot = self._batch_parallel.runtime_snapshot()
-        except Exception:
-            return False
-        if bool(getattr(snapshot, "pool_stale", False)):
-            return False
-        lane_generation = int(getattr(lane, "generation", 0) or 0)
-        current_generation = int(getattr(snapshot, "current_generation", 0) or 0)
-        if lane_generation and current_generation and lane_generation != current_generation:
-            return False
-        return bool(self._batch_parallel.has_ready_lane_pool(max_lanes=1))
-
     def _release_active_runtime_dispatch_plan(self, *, failed: bool = False) -> None:
         dispatch_plan = getattr(self, "_active_runtime_dispatch_plan", None)
         if isinstance(dispatch_plan, RuntimeDispatchPlan):
@@ -2075,6 +2053,41 @@ class SimulationController(QtCore.QObject):
                 failed=bool(failed),
             )
         self._active_runtime_dispatch_plan = None
+
+    def _parallel_batch_active_request_count_or_none(self) -> int | None:
+        try:
+            return int(self._batch_parallel.active_request_count())
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to read active parallel batch request count",
+                exc,
+            )
+            return None
+
+    def _release_pending_runtime_dispatch_plan_if_backend_idle(self) -> None:
+        release_pending = getattr(
+            self._runtime_readiness_lifecycle,
+            "release_pending_dispatch_plan_if_backend_idle",
+            None,
+        )
+        if not callable(release_pending):
+            return
+        active_request_count = self._parallel_batch_active_request_count_or_none()
+        if active_request_count is None:
+            return
+        released_plan = release_pending(
+            active_request_count=active_request_count,
+            failed=False,
+        )
+        if not isinstance(released_plan, RuntimeDispatchPlan):
+            return
+        active_plan = getattr(self, "_active_runtime_dispatch_plan", None)
+        if (
+            isinstance(active_plan, RuntimeDispatchPlan)
+            and str(active_plan.launch_allocation.allocation_id)
+            == str(released_plan.launch_allocation.allocation_id)
+        ):
+            self._active_runtime_dispatch_plan = None
 
     def _new_contained_simulation_owner(
         self,
@@ -2100,14 +2113,6 @@ class SimulationController(QtCore.QObject):
             kwargs["active_timeout_s"] = float(timeout_s)
         kwargs["handler_env"] = self._contained_child_handler_env()
         return WarmSimulationOwner(owner_plan_payload, **kwargs)
-
-    def _close_contained_simulation_owner(
-        self,
-        *,
-        fast_mode: Optional[bool] = None,
-        kill: bool = False,
-    ) -> None:
-        self._runtime_readiness_lifecycle.release_all(failed=bool(kill))
 
     def _interactive_runtime_rows(self, rows: Optional[Sequence[int]] = None) -> list[int]:
         if rows is not None:
@@ -2278,6 +2283,20 @@ class SimulationController(QtCore.QObject):
         clear_pending_plot_updates: bool = False,
         stale_fast_handoff_after_display: bool = False,
     ) -> None:
+        if bool(stale_fast_handoff_after_display):
+            active_request_count = self._parallel_batch_active_request_count_or_none()
+            if active_request_count is None or active_request_count > 0:
+                if bool(clear_pending_plot_updates):
+                    self._clear_pending_slider_plot_updates()
+                dispatch_plan = getattr(self, "_active_runtime_dispatch_plan", None)
+                defer_release = getattr(
+                    self._runtime_readiness_lifecycle,
+                    "defer_dispatch_plan_release_until_backend_idle",
+                    None,
+                )
+                if isinstance(dispatch_plan, RuntimeDispatchPlan) and callable(defer_release):
+                    defer_release(dispatch_plan)
+                return
         if bool(keep_lane_pool_alive):
             self._batch_parallel.finish_after_run(
                 keep_lane_pool_alive=True,
@@ -2347,7 +2366,7 @@ class SimulationController(QtCore.QObject):
         self._discarded_slider_preview_generation_id = int(invalidation_request_id)
         self._clear_preview_ownership()
         if bool(close_runtime_owner):
-            self._close_contained_simulation_owner(fast_mode=True, kill=True)
+            self._runtime_readiness_lifecycle.release_preview_launch_contexts(failed=True)
         self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._clear_pending_preview_slider_plot_updates()
         self.ui.batch.clear_active_preview_cache_identity_state()
@@ -3155,6 +3174,7 @@ class SimulationController(QtCore.QObject):
             runtime_snapshot = self._batch_parallel.runtime_snapshot()
             active_parallel = bool(runtime_snapshot.active)
             if not active_parallel and not self._batch_parallel.has_active_requests():
+                self._release_pending_runtime_dispatch_plan_if_backend_idle()
                 if self._batch_parallel.is_pool_stale:
                     self._shutdown_batch_lane_pool(force_terminate=False)
                 self._stop_batch_completion_poll_timer_if_idle()
@@ -3174,6 +3194,7 @@ class SimulationController(QtCore.QObject):
                 ):
                     return
 
+            self._release_pending_runtime_dispatch_plan_if_backend_idle()
             if (
                 self._batch_parallel.is_pool_stale
                 and (not self._batch_parallel.has_active_requests())
@@ -3618,7 +3639,10 @@ class SimulationController(QtCore.QObject):
                     worker.cancel()
             except Exception as exc:
                 self._record_nonfatal_exception("Failed to cancel active worker during restart", exc)
-        self._close_contained_simulation_owner(fast_mode=active_fast, kill=True)
+        self._runtime_readiness_lifecycle.release_launch_contexts_for_run_kind(
+            fast_mode=active_fast,
+            failed=True,
+        )
         if worker is not None:
             self._release_current_simulation_worker()
         self._simulation_running = False
@@ -3767,11 +3791,17 @@ class SimulationController(QtCore.QObject):
 
         if self._worker_is_running(self._simulation_worker):
             self._simulation_worker.cancel()
-            self._close_contained_simulation_owner(fast_mode=active_fast, kill=True)
+            self._runtime_readiness_lifecycle.release_launch_contexts_for_run_kind(
+                fast_mode=active_fast,
+                failed=True,
+            )
             logger.info("Cancellation requested from simulation worker")
             self.ui.run_ui.set_status_text("Cancelling simulation...")
         else:
-            self._close_contained_simulation_owner(fast_mode=active_fast, kill=True)
+            self._runtime_readiness_lifecycle.release_launch_contexts_for_run_kind(
+                fast_mode=active_fast,
+                failed=True,
+            )
             self._simulation_running = False
             self.ui.run_ui.set_run_button_enabled(True)
             self.ui.run_ui.set_stop_button_enabled(False)

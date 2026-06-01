@@ -188,6 +188,27 @@ def _failure(
     return payload
 
 
+def _runtime_task_executable_payload(
+    task: Any,
+    *,
+    run_id: int,
+    set_name: str,
+) -> dict[str, Any]:
+    executable_payload = getattr(task, "executable_payload", None)
+    if not callable(executable_payload):
+        raise TypeError("Batch runtime lane owner requires a runtime task with executable_payload().")
+    raw_payload = executable_payload(run_id=int(run_id), set_name=str(set_name))
+    if not isinstance(raw_payload, Mapping):
+        raise TypeError("Batch runtime lane owner requires runtime task executable payload to be a mapping.")
+    return dict(raw_payload)
+
+
+def _require_runtime_task_executable_payload(task: Any) -> None:
+    executable_payload = getattr(task, "executable_payload", None)
+    if not callable(executable_payload):
+        raise TypeError("Batch runtime lane owner requires a runtime task with executable_payload().")
+
+
 class WarmBatchSimulationLane:
     def __init__(
         self,
@@ -655,7 +676,9 @@ class BatchRuntimeLaneOwner:
         self.completed_outcome_map: dict[str, BatchCompletionRecord] = {}
         self.superseded_request_map: dict[str, BatchRequestHandle] = {}
         self.completed_queue: SimpleQueue[tuple[str, float]] = SimpleQueue()
-        self._current_max_workers: Optional[int] = None
+        self._current_max_workers: Optional[int] = (
+            max(1, int(max_parallel_workers)) if lane_pool is not None else None
+        )
         self._pool_stale = False
         self._lock = threading.Lock()
         self._work_queue: Queue[Any] | None = None
@@ -664,7 +687,7 @@ class BatchRuntimeLaneOwner:
         self._warm_thread: threading.Thread | None = None
         self._warm_requested_max_lanes = 0
         self._warm_pending_max_lanes = 0
-        self._generation = 0
+        self._generation = 1 if lane_pool is not None else 0
         self._warm_failure: str | None = None
         self._shutdown_requested = False
 
@@ -688,6 +711,12 @@ class BatchRuntimeLaneOwner:
     def warm_failure(self) -> str | None:
         with self._lock:
             return self._warm_failure
+
+    def consume_warm_failure(self) -> str | None:
+        with self._lock:
+            value = self._warm_failure
+            self._warm_failure = None
+            return value
 
     def mark_pool_stale(self) -> None:
         self._pool_stale = True
@@ -842,6 +871,7 @@ class BatchRuntimeLaneOwner:
             if not isinstance(pool, BatchLanePoolProtocol):
                 raise TypeError("Batch lane pool factory must return BatchLanePoolProtocol.")
             self.lane_pool = pool
+            self._generation += 1
             self._current_max_workers = int(max_lanes)
             self._pool_stale = False
             self._warm_requested_max_lanes = 0
@@ -1049,7 +1079,7 @@ class BatchRuntimeLaneOwner:
 
     def submit_task(
         self,
-        task: Mapping[str, Any],
+        task: Any,
         *,
         run_id: int,
         request_id: int,
@@ -1062,6 +1092,7 @@ class BatchRuntimeLaneOwner:
         pool = self.lane_pool
         if pool is None:
             raise RuntimeError("Batch lane pool is not initialized.")
+        _require_runtime_task_executable_payload(task)
         sid = str(set_id or "")
         metadata = BatchRequestMetadata(
             set_id=sid,
@@ -1085,7 +1116,11 @@ class BatchRuntimeLaneOwner:
 
         def _target() -> BatchLaneOutcome:
             return pool.run(
-                dict(task or {}),
+                _runtime_task_executable_payload(
+                    task,
+                    run_id=int(run_id),
+                    set_name=metadata.set_name,
+                ),
                 run_id=int(run_id),
                 request_id=int(request_id),
                 set_id=sid,

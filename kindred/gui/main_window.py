@@ -641,7 +641,9 @@ class MainWindow(
             affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
         )
         if outcome.runtime_invalidation_required:
-            self._invalidate_interactive_simulation_runtimes()
+            self._sim_controller.simulation_runtime_inputs_changed(
+                batch_runtime_pool_inputs_changed=False
+            )
         if outcome.active_work_supersede_required:
             if outcome.runtime_invalidation_required:
                 self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
@@ -2177,12 +2179,6 @@ class MainWindow(
             log=logger,
             max_logs=int(max_logs),
         )
-
-    def _invalidate_interactive_simulation_runtimes(self):
-        try:
-            self._sim_controller.invalidate_interactive_simulation_runtimes(kill=False)
-        except Exception:
-            logger.debug("Failed to invalidate interactive simulation runtimes", exc_info=True)
 
     def _on_authoritative_mechanism_input_changed(self) -> None:
         """Apply the ordered lifecycle for an authoritative mechanism transition."""

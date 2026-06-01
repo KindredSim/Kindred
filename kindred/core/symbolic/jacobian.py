@@ -124,6 +124,7 @@ class _EquilibriumRateSource:
     kr_name: str
     keq_name: str
     reverse_std_ratio: float = 1.0
+    reverse_authority: str = "keq"
 
 
 class _ParameterRegistry:
@@ -325,14 +326,17 @@ def _equilibrium_rate_source(
         value=keq,
     )
 
+    reverse_authority = "keq" if keq is not None else "kr"
     try:
         authority = normalize_existing_equilibrium_rate_authority(eq)
     except ValueError:
         authority = None
     if authority is not None and authority.kind == EquilibriumRateAuthorityKind.KR:
         keq = None
+        reverse_authority = "kr"
     elif authority is not None and authority.kind == EquilibriumRateAuthorityKind.KEQ:
         keq = authority.Keq
+        reverse_authority = "keq"
     try:
         reverse_std_ratio = float(authority.reverse_std_ratio) if authority is not None else 1.0
     except Exception:
@@ -347,6 +351,7 @@ def _equilibrium_rate_source(
         kr_name=kr_name,
         keq_name=keq_name,
         reverse_std_ratio=reverse_std_ratio,
+        reverse_authority=reverse_authority,
     )
 
 
@@ -360,6 +365,9 @@ def _equilibrium_rates(
     source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
     kf_value, kr_value, keq_value = _equilibrium_parameter_value_triad(source)
     kf_symbol = registry.parameter(kf_value, label="equilibrium kf", default_name=source.kf_name)
+    if source.reverse_authority == "kr":
+        kr_symbol = registry.parameter(kr_value, label="equilibrium kr", default_name=source.kr_name)
+        return kf_symbol, kr_symbol
     registry.parameter(kr_value, label="equilibrium kr", default_name=source.kr_name)
     keq_symbol = registry.parameter(keq_value, label="equilibrium Keq", default_name=source.keq_name)
     return kf_symbol, effective_reverse_rate_from_keq(
@@ -578,6 +586,7 @@ def _structure_identity_payload(
                 "kf_parameter": source.kf_name,
                 "kr_parameter": source.kr_name,
                 "keq_parameter": source.keq_name,
+                "reverse_authority": source.reverse_authority,
                 "reverse_std_ratio": source.reverse_std_ratio,
             }
         )
@@ -606,7 +615,10 @@ def _symbolic_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
     for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
         source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
         _equilibrium_parameter_value_triad(source)
-        parameter_names.update((source.kf_name, source.kr_name, source.keq_name))
+        if source.reverse_authority == "kr":
+            parameter_names.update((source.kf_name, source.kr_name))
+        else:
+            parameter_names.update((source.kf_name, source.kr_name, source.keq_name))
     return tuple(sorted(parameter_names))
 
 

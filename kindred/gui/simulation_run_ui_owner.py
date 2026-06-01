@@ -68,10 +68,7 @@ class SimulationRunUiOwner:
         self._apply_run_button_state()
 
     def render_runtime_readiness(self, state: object) -> None:
-        self._launch_available = bool(
-            getattr(state, "launch_available", False)
-            or getattr(state, "retryable", False)
-        )
+        self._launch_available = bool(getattr(state, "launch_available", False))
         message = str(getattr(state, "status_text", "") or "").strip()
         if message:
             self.set_status_text(message)

@@ -104,6 +104,7 @@ class BatchRuntimeLaneOwnerProtocol(Protocol):
     def active_request_count(self) -> int: ...
     def active_request_metadata(self, set_id: str) -> dict[str, Any]: ...
     def clear_stale_requests(self) -> None: ...
+    def consume_warm_failure(self) -> str | None: ...
     def discard_request(self, set_id: str) -> None: ...
     def drain_completion_queue(self) -> None: ...
     def enqueue_completion(self, set_id: str) -> None: ...
@@ -128,7 +129,7 @@ class BatchRuntimeLaneOwnerProtocol(Protocol):
     def soft_supersede(self) -> tuple[int, int]: ...
     def submit_task(
         self,
-        task: Mapping[str, Any],
+        task: Any,
         *,
         run_id: int,
         request_id: int,
@@ -167,6 +168,10 @@ class BatchRuntimeSession:
     @property
     def warm_failure(self) -> str | None:
         value = self._lane_owner.warm_failure
+        return None if value is None else str(value)
+
+    def consume_warm_failure(self) -> str | None:
+        value = self._lane_owner.consume_warm_failure()
         return None if value is None else str(value)
 
     @property
@@ -263,7 +268,7 @@ class BatchRuntimeSession:
 
     def submit_task(
         self,
-        task: Mapping[str, Any],
+        task: Any,
         *,
         set_id: str,
         set_name: str,
@@ -273,9 +278,11 @@ class BatchRuntimeSession:
         request = self._require_running_request()
         if callback_identity is None:
             raise ValueError("Batch runtime session task submission requires callback_identity.")
-        request_metadata = {"callback_identity": callback_identity}
+        _require_runtime_task_executable_payload(task)
+        request_metadata = _runtime_task_request_metadata(task)
+        request_metadata["callback_identity"] = callback_identity
         return self._lane_owner.submit_task(
-            dict(task or {}),
+            task,
             run_id=int(request.run_id),
             request_id=int(request.request_id),
             set_id=str(set_id or ""),
@@ -432,3 +439,22 @@ class BatchRuntimeSession:
 
 def _normalize_ids(values: Iterable[str]) -> set[str]:
     return {str(item) for item in values if str(item)}
+
+
+def _runtime_task_request_metadata(task: Any) -> dict[str, Any]:
+    request_metadata = getattr(task, "request_metadata", None)
+    if not callable(request_metadata):
+        raise TypeError("Batch runtime session requires a runtime task with request_metadata().")
+    try:
+        raw = request_metadata()
+    except Exception as exc:
+        raise TypeError("Batch runtime session could not read runtime task metadata.") from exc
+    if not isinstance(raw, Mapping):
+        raise TypeError("Batch runtime session requires runtime task metadata to be a mapping.")
+    return dict(raw)
+
+
+def _require_runtime_task_executable_payload(task: Any) -> None:
+    executable_payload = getattr(task, "executable_payload", None)
+    if not callable(executable_payload):
+        raise TypeError("Batch runtime session requires a runtime task with executable_payload().")

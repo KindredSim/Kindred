@@ -15,6 +15,7 @@ from kindred.core.batch_runtime_session import (
     BatchRuntimeSessionSnapshot,
 )
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+from kindred.gui.controllers.runtime_lane_allocation import RuntimeBackendLease, RuntimeCompatibilityKey
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 
@@ -205,6 +206,74 @@ class ParallelBatchExecutor:
             max_lanes=requested_lanes,
             wait=bool(wait),
         )
+
+    def ensure_backend_lease(
+        self,
+        compatibility_key: RuntimeCompatibilityKey,
+        capacity: int,
+        *,
+        wait: bool,
+    ) -> RuntimeBackendLease | None:
+        requested_lanes = min(
+            int(MAX_PARALLEL_WORKERS_CEILING),
+            max(1, int(capacity)),
+        )
+        warm_failure = self._runtime_session.consume_warm_failure()
+        if warm_failure:
+            raise RuntimeError(str(warm_failure))
+        self._runtime_session.ensure_warm_lane_pool(
+            max_lanes=requested_lanes,
+            wait=bool(wait),
+        )
+        if not self._runtime_session.has_ready_lane_pool(max_lanes=requested_lanes):
+            warm_failure = self._runtime_session.consume_warm_failure()
+            if warm_failure:
+                raise RuntimeError(str(warm_failure))
+            return None
+        snapshot = self._runtime_session.snapshot()
+        pool_token = self._runtime_session.lane_pool_token()
+        if pool_token is None or bool(snapshot.pool_stale):
+            return None
+        return RuntimeBackendLease(
+            lease_id=f"batch-runtime:{pool_token}:{int(snapshot.current_generation)}:{requested_lanes}",
+            pool_token=str(pool_token),
+            generation=int(snapshot.current_generation),
+            compatibility_key=compatibility_key,
+            capacity=requested_lanes,
+        )
+
+    def backend_lease_is_live(self, lease: RuntimeBackendLease) -> bool:
+        pool_token = self._runtime_session.lane_pool_token()
+        if pool_token is None or str(pool_token) != str(lease.pool_token):
+            return False
+        snapshot = self._runtime_session.snapshot()
+        if bool(snapshot.pool_stale):
+            return False
+        if int(snapshot.current_generation) != int(lease.generation):
+            return False
+        return self._runtime_session.has_ready_lane_pool(max_lanes=max(1, int(lease.capacity)))
+
+    def invalidate_backend_lease(
+        self,
+        lease: RuntimeBackendLease | None,
+        *,
+        failed: bool,
+    ) -> None:
+        if bool(failed) and self._backend_lease_matches_current_pool(lease):
+            self._runtime_session.mark_pool_stale()
+
+    def _backend_lease_matches_current_pool(self, lease: RuntimeBackendLease | None) -> bool:
+        if lease is None:
+            return False
+        pool_token = self._runtime_session.lane_pool_token()
+        if pool_token is None or str(pool_token) != str(lease.pool_token):
+            return False
+        snapshot = self._runtime_session.snapshot()
+        if int(snapshot.current_generation) != int(lease.generation):
+            return False
+        if snapshot.current_max_workers is not None and int(lease.capacity) > int(snapshot.current_max_workers):
+            return False
+        return True
 
     def submit_task(
         self,

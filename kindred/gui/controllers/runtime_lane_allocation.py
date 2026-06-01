@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from itertools import count
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 
 @dataclass(frozen=True)
@@ -194,6 +193,7 @@ class RuntimeLaneAllocationRequest:
     scope: str
     queue_policy: str = "queue_tasks"
     nonblocking: bool = True
+    require_backend_lease: bool = False
 
     def __post_init__(self) -> None:
         required = max(1, int(self.required_lane_capacity or 1))
@@ -203,6 +203,7 @@ class RuntimeLaneAllocationRequest:
         object.__setattr__(self, "task_count", max(0, int(self.task_count or 0)))
         object.__setattr__(self, "scope", str(self.scope or "ordinary"))
         object.__setattr__(self, "queue_policy", str(self.queue_policy or "queue_tasks"))
+        object.__setattr__(self, "require_backend_lease", bool(self.require_backend_lease))
 
 
 @dataclass(frozen=True)
@@ -212,12 +213,20 @@ class RuntimeLane:
     generation: int = 0
     state: str = "ready"
     backend_pool_token: str = ""
+    backend_lease_id: str = ""
+    backend_generation: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "lane_id", str(self.lane_id or ""))
         object.__setattr__(self, "generation", int(self.generation))
         object.__setattr__(self, "state", str(self.state or "ready"))
         object.__setattr__(self, "backend_pool_token", str(self.backend_pool_token or ""))
+        object.__setattr__(self, "backend_lease_id", str(self.backend_lease_id or ""))
+        object.__setattr__(
+            self,
+            "backend_generation",
+            int(self.backend_generation or 0),
+        )
 
 
 @dataclass(frozen=True)
@@ -272,12 +281,7 @@ class RuntimeDispatchPlan:
                 lane_generation=int(lane.generation),
                 compatibility_key=lane.compatibility_key,
             )
-        return RuntimeTaskLaneAssignment(
-            task_id=task_key,
-            lane_id=str(lane_id),
-            lane_generation=0,
-            compatibility_key=self.launch_allocation.reservation.compatibility_key,
-        )
+        return None
 
 
 @dataclass(frozen=True)
@@ -294,6 +298,92 @@ class RuntimeTaskLaneAssignment:
 
 
 @dataclass(frozen=True)
+class RuntimeBackendLease:
+    lease_id: str
+    pool_token: str
+    generation: int
+    compatibility_key: RuntimeCompatibilityKey
+    capacity: int
+    state: str = "live"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "lease_id", str(self.lease_id or ""))
+        object.__setattr__(self, "pool_token", str(self.pool_token or ""))
+        object.__setattr__(self, "generation", int(self.generation))
+        object.__setattr__(self, "capacity", max(1, int(self.capacity or 1)))
+        object.__setattr__(self, "state", str(self.state or "live"))
+
+
+@dataclass(frozen=True)
+class RuntimeBackendTask:
+    descriptor: RuntimeTaskDescriptor
+    dispatch_plan_id: str
+    allocation_id: str
+    release_token: str
+    lane_assignment: RuntimeTaskLaneAssignment | None
+    backend_lease: RuntimeBackendLease
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "dispatch_plan_id", str(self.dispatch_plan_id or ""))
+        object.__setattr__(self, "allocation_id", str(self.allocation_id or ""))
+        object.__setattr__(self, "release_token", str(self.release_token or ""))
+
+    def request_metadata(self) -> dict[str, object]:
+        intent_kind = "preview" if self.descriptor.preview_request_id is not None else "ordinary"
+        metadata: dict[str, object] = {
+            "runtime_task_id": self.descriptor.task_id,
+            "runtime_descriptor_hash": self.descriptor.exact_descriptor_hash,
+            "runtime_row": int(self.descriptor.row),
+            "runtime_set_id": self.descriptor.set_id,
+            "runtime_intent_kind": intent_kind,
+            "runtime_request_token": int(self.descriptor.request_token or 0),
+            "runtime_allocation_id": self.allocation_id,
+            "runtime_release_token": self.release_token,
+            "runtime_backend_lease_id": self.backend_lease.lease_id,
+            "runtime_backend_pool_token": self.backend_lease.pool_token,
+            "runtime_backend_generation": int(self.backend_lease.generation),
+            "runtime_backend_capacity": int(self.backend_lease.capacity),
+        }
+        if self.lane_assignment is not None:
+            metadata["runtime_lane_id"] = self.lane_assignment.lane_id
+            metadata["runtime_lane_generation"] = int(self.lane_assignment.lane_generation)
+        if self.descriptor.preview_request_id is not None:
+            metadata["runtime_preview_request_id"] = int(self.descriptor.preview_request_id)
+        if self.descriptor.preview_epoch is not None:
+            metadata["runtime_preview_epoch"] = int(self.descriptor.preview_epoch)
+        return metadata
+
+    def executable_payload(self, *, run_id: int, set_name: str) -> dict[str, object]:
+        return {
+            "run_id": int(run_id),
+            "request_id": int(self.descriptor.request_token or 0),
+            "set_id": str(self.descriptor.set_id),
+            "set_name": str(set_name),
+            "include_mechanism_in_result_payload": True,
+            "simulation_plan": dict(self.descriptor.plan_payload or {}),
+        }
+
+
+class RuntimeBackendLeaseProvider(Protocol):
+    def ensure_backend_lease(
+        self,
+        compatibility_key: RuntimeCompatibilityKey,
+        capacity: int,
+        *,
+        wait: bool,
+    ) -> RuntimeBackendLease | None: ...
+
+    def backend_lease_is_live(self, lease: RuntimeBackendLease) -> bool: ...
+
+    def invalidate_backend_lease(
+        self,
+        lease: RuntimeBackendLease | None,
+        *,
+        failed: bool,
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
 class RuntimeAllocationConsumeResult:
     status: str
     dispatch_plan: RuntimeDispatchPlan | None = None
@@ -305,15 +395,13 @@ class RuntimeLaneAllocator:
     def __init__(
         self,
         *,
-        lane_warmer: Callable[..., Sequence[tuple[str, int]] | int | None] | None = None,
-        backend_lane_is_live: Callable[[RuntimeLane], bool] | None = None,
+        backend_lease_provider: RuntimeBackendLeaseProvider | None = None,
     ) -> None:
         self._allocation_counter = count(1)
         self._lanes: dict[str, RuntimeLane] = {}
         self._allocations: dict[str, RuntimeLaunchAllocation] = {}
         self._released: set[str] = set()
-        self._lane_warmer = lane_warmer
-        self._backend_lane_is_live = backend_lane_is_live
+        self._backend_lease_provider = backend_lease_provider
 
     def register_ready_lane(
         self,
@@ -322,10 +410,12 @@ class RuntimeLaneAllocator:
         lane_id: str,
         generation: int = 0,
         backend_pool_token: str = "",
+        backend_lease_id: str = "",
+        backend_generation: int = 0,
     ) -> RuntimeLane:
         lane_key = str(lane_id or "")
         current = self._lanes.get(lane_key)
-        if current is not None and str(current.state) != "ready":
+        if current is not None and current.state == "reserved":
             return current
         lane = RuntimeLane(
             lane_id=lane_key,
@@ -333,6 +423,8 @@ class RuntimeLaneAllocator:
             generation=int(generation),
             state="ready",
             backend_pool_token=str(backend_pool_token or ""),
+            backend_lease_id=str(backend_lease_id or ""),
+            backend_generation=int(backend_generation or 0),
         )
         self._lanes[lane.lane_id] = lane
         return lane
@@ -357,7 +449,10 @@ class RuntimeLaneAllocator:
         return self._ready_lanes(compatibility_key)
 
     def allocate(self, request: RuntimeLaneAllocationRequest) -> RuntimeLaunchAllocation:
-        ready = self._ready_lanes(request.compatibility_key)
+        ready = self._ready_lanes(
+            request.compatibility_key,
+            require_backend_lease=bool(request.require_backend_lease),
+        )
         accepted = min(len(ready), int(request.preferred_lane_capacity))
         allocation_id = f"alloc-{next(self._allocation_counter)}"
         selected = tuple(ready[:accepted])
@@ -389,6 +484,8 @@ class RuntimeLaneAllocator:
                 generation=lane.generation,
                 state="reserved",
                 backend_pool_token=lane.backend_pool_token,
+                backend_lease_id=lane.backend_lease_id,
+                backend_generation=lane.backend_generation,
             )
         reservation = RuntimeLaneReservation(
             allocation_id=allocation_id,
@@ -435,6 +532,7 @@ class RuntimeLaneAllocator:
             )
         if not prepared.prepared:
             reason = prepared.blocked_reason
+            self.release(allocation.allocation_id, failed=True)
             return RuntimeAllocationConsumeResult(
                 status="blocked",
                 message=str(reason.message if reason is not None else "Prepared request is blocked."),
@@ -477,7 +575,6 @@ class RuntimeLaneAllocator:
         if not allocation_key or allocation_key in self._released:
             return False
         allocation = self._allocations.get(allocation_key)
-        self._released.add(allocation_key)
         if allocation is None:
             return False
         reservation_live = self._reservation_lanes_live(allocation.reservation.lanes)
@@ -487,6 +584,23 @@ class RuntimeLaneAllocator:
             and reservation_live
         )
         next_state = "ready" if reusable else "failed" if bool(failed) or not reservation_live else "released"
+        invalidated_leases: set[tuple[str, str, int]] = set()
+        if bool(failed):
+            for lane in allocation.reservation.lanes:
+                current = self._lanes.get(lane.lane_id, lane)
+                lease = self._backend_lease_from_lane(current)
+                if lease is None:
+                    lease = self._backend_lease_from_lane(lane)
+                if lease is None:
+                    continue
+                lease_key = (lease.lease_id, lease.pool_token, int(lease.generation))
+                if lease_key in invalidated_leases:
+                    continue
+                invalidated_leases.add(lease_key)
+                provider = self._backend_lease_provider
+                if provider is not None:
+                    provider.invalidate_backend_lease(lease, failed=True)
+        self._released.add(allocation_key)
         for lane in allocation.reservation.lanes:
             current = self._lanes.get(lane.lane_id, lane)
             self._lanes[lane.lane_id] = RuntimeLane(
@@ -495,6 +609,8 @@ class RuntimeLaneAllocator:
                 generation=current.generation,
                 state=next_state,
                 backend_pool_token=str(current.backend_pool_token or lane.backend_pool_token),
+                backend_lease_id=str(current.backend_lease_id or lane.backend_lease_id),
+                backend_generation=int(current.backend_generation or 0),
             )
         return True
 
@@ -504,6 +620,21 @@ class RuntimeLaneAllocator:
         self._lanes.clear()
         self._allocations.clear()
 
+    def release_by_intent_kind(self, intent_kind: str, *, failed: bool = False) -> int:
+        target_kind = str(intent_kind or "")
+        if not target_kind:
+            return 0
+        released = 0
+        for allocation in tuple(self._allocations.values()):
+            intent = allocation.launch_intent
+            if intent is None and allocation.prepared_request_set is not None:
+                intent = allocation.prepared_request_set.intent
+            if str(getattr(intent, "intent_kind", "") or "") != target_kind:
+                continue
+            if self.release(allocation.allocation_id, failed=bool(failed)):
+                released += 1
+        return released
+
     def _warm_runtime_lanes(
         self,
         *,
@@ -512,47 +643,42 @@ class RuntimeLaneAllocator:
         wait: bool,
     ) -> None:
         requested = max(1, int(capacity or 1))
-        if self._lane_warmer is None:
-            warmed = requested
-        else:
-            try:
-                warmed = self._lane_warmer(requested, wait=bool(wait))
-            except TypeError:
-                warmed = self._lane_warmer(requested)
-        if warmed is None:
-            warmed_records: Sequence[tuple[str, int]] = ()
-        elif isinstance(warmed, int):
-            warmed_records = tuple((f"runtime-lane-{index + 1}", 1, "") for index in range(max(0, warmed)))
-        else:
-            warmed_records = tuple(warmed)
-        for index, record in enumerate(warmed_records):
-            backend_pool_token = ""
-            if isinstance(record, RuntimeLane):
-                lane_id = record.lane_id
-                generation = record.generation
-                backend_pool_token = record.backend_pool_token
-            else:
-                try:
-                    lane_id, generation, backend_pool_token = record
-                except Exception:
-                    try:
-                        lane_id, generation = record
-                    except Exception:
-                        lane_id, generation = f"runtime-lane-{index + 1}", 1
+        provider = self._backend_lease_provider
+        if provider is None:
+            return
+        lease = provider.ensure_backend_lease(
+            compatibility_key,
+            requested,
+            wait=bool(wait),
+        )
+        if lease is None:
+            return
+        if not self._backend_lease_is_live(lease):
+            return
+        for index in range(max(1, int(lease.capacity or requested))):
             self.register_ready_lane(
                 compatibility_key=compatibility_key,
-                lane_id=str(lane_id),
-                generation=int(generation),
-                backend_pool_token=str(backend_pool_token or ""),
+                lane_id=f"runtime-lane-{index + 1}",
+                generation=int(lease.generation),
+                backend_pool_token=str(lease.pool_token or ""),
+                backend_lease_id=str(lease.lease_id or ""),
+                backend_generation=int(lease.generation),
             )
 
     def _ready_lanes(
         self,
         compatibility_key: RuntimeCompatibilityKey,
+        *,
+        require_backend_lease: bool = False,
     ) -> tuple[RuntimeLane, ...]:
         ready: list[RuntimeLane] = []
         for lane in tuple(self._lanes.values()):
             if lane.compatibility_key != compatibility_key or lane.state != "ready":
+                continue
+            if bool(require_backend_lease) and (
+                not str(lane.backend_lease_id or "")
+                or int(lane.backend_generation or 0) <= 0
+            ):
                 continue
             if not self._lane_is_live(lane):
                 self._lanes[lane.lane_id] = RuntimeLane(
@@ -561,6 +687,8 @@ class RuntimeLaneAllocator:
                     generation=lane.generation,
                     state="failed",
                     backend_pool_token=lane.backend_pool_token,
+                    backend_lease_id=lane.backend_lease_id,
+                    backend_generation=lane.backend_generation,
                 )
                 continue
             ready.append(lane)
@@ -570,11 +698,39 @@ class RuntimeLaneAllocator:
         return bool(lanes) and all(self._lane_is_live(lane) for lane in lanes)
 
     def _lane_is_live(self, lane: RuntimeLane) -> bool:
-        provider = self._backend_lane_is_live
-        if provider is None:
+        if not str(lane.backend_lease_id or ""):
             return True
+        lease = self._backend_lease_from_lane(lane)
+        if lease is None:
+            return False
+        return self._backend_lease_is_live(lease)
+
+    @staticmethod
+    def _backend_lease_from_lane(
+        lane: RuntimeLane | None,
+        *,
+        capacity: int = 1,
+    ) -> RuntimeBackendLease | None:
+        if lane is None or not str(lane.backend_lease_id or ""):
+            return None
+        generation = int(lane.backend_generation or 0)
+        if generation <= 0:
+            return None
+        return RuntimeBackendLease(
+            lease_id=str(lane.backend_lease_id),
+            pool_token=str(lane.backend_pool_token),
+            generation=generation,
+            compatibility_key=lane.compatibility_key,
+            capacity=max(1, int(capacity or 1)),
+            state="live",
+        )
+
+    def _backend_lease_is_live(self, lease: RuntimeBackendLease) -> bool:
+        provider = self._backend_lease_provider
+        if provider is None:
+            return False
         try:
-            return bool(provider(lane))
+            return bool(provider.backend_lease_is_live(lease))
         except Exception:
             return False
 

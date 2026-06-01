@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from kindred.gui.controllers.runtime_lane_allocation import (
+    RuntimeBackendLease,
+    RuntimeBackendTask,
     RuntimeDispatchPlan,
+    RuntimeLane,
     RuntimeTaskDescriptor,
 )
 from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
@@ -47,12 +50,29 @@ class SimulationRuntimeDispatchOwner:
         if not descriptors:
             self._deps.release_dispatch_plan(dispatch_plan, failed=True)
             return False
-        return self._dispatch_task_queue(dispatch_plan, descriptors)
+        try:
+            self._validate_dispatch_plan_ready(dispatch_plan)
+            backend_tasks = tuple(
+                self._backend_task_for_descriptor(
+                    descriptor,
+                    dispatch_plan=dispatch_plan,
+                )
+                for descriptor in descriptors
+            )
+            for descriptor in descriptors:
+                if not dict(descriptor.plan_payload or {}):
+                    raise RuntimeError("Runtime task descriptor is missing a simulation plan.")
+        except Exception as exc:
+            self._deps.release_dispatch_plan(dispatch_plan, failed=True)
+            self._deps.render_failure(str(exc), retryable=True)
+            return False
+        return self._dispatch_task_queue(dispatch_plan, descriptors, backend_tasks)
 
     def _dispatch_task_queue(
         self,
         dispatch_plan: RuntimeDispatchPlan,
         descriptors: tuple[RuntimeTaskDescriptor, ...],
+        backend_tasks: tuple[RuntimeBackendTask, ...],
     ) -> bool:
         context: Mapping[str, Any] | None = None
         began = False
@@ -84,11 +104,10 @@ class SimulationRuntimeDispatchOwner:
             )
             began = True
             self._deps.set_active_dispatch_plan(dispatch_plan)
-            for descriptor in descriptors:
-                if not dict(descriptor.plan_payload or {}):
-                    raise RuntimeError("Runtime task descriptor is missing a simulation plan.")
+            for descriptor, backend_task in zip(descriptors, backend_tasks):
                 self._submit_task_descriptor(
                     descriptor,
+                    backend_task,
                     dispatch_plan=dispatch_plan,
                     run_id=run_id,
                     context=context,
@@ -130,6 +149,7 @@ class SimulationRuntimeDispatchOwner:
     def _submit_task_descriptor(
         self,
         descriptor: RuntimeTaskDescriptor,
+        backend_task: RuntimeBackendTask,
         *,
         dispatch_plan: RuntimeDispatchPlan,
         run_id: int,
@@ -143,15 +163,68 @@ class SimulationRuntimeDispatchOwner:
             context=context,
         )
         self._batch_executor.submit_task(
-            {
-                "run_id": int(run_id),
-                "request_id": int(descriptor.request_token or 0),
-                "set_id": str(descriptor.set_id),
-                "set_name": str(set_name),
-                "include_mechanism_in_result_payload": True,
-                "simulation_plan": dict(descriptor.plan_payload or {}),
-            },
+            backend_task,
             set_id=str(descriptor.set_id),
             set_name=str(set_name),
             callback_identity=callback_identity,
         )
+
+    def _backend_task_for_descriptor(
+        self,
+        descriptor: RuntimeTaskDescriptor,
+        *,
+        dispatch_plan: RuntimeDispatchPlan,
+    ) -> RuntimeBackendTask:
+        lane_assignment = dispatch_plan.assignment_for_task(descriptor.task_id)
+        runtime_lane = self._runtime_lane_for_assignment(dispatch_plan, lane_assignment)
+        if lane_assignment is None or runtime_lane is None:
+            raise RuntimeError("Runtime task descriptor has no runtime lane assignment.")
+        backend_pool_token = str(runtime_lane.backend_pool_token or "")
+        backend_generation = int(runtime_lane.backend_generation or 0)
+        backend_lease_id = str(runtime_lane.backend_lease_id or "")
+        if not backend_lease_id:
+            raise RuntimeError("Runtime task descriptor is missing a provider backend lease.")
+        if not backend_pool_token:
+            raise RuntimeError("Runtime task descriptor is missing a provider backend pool token.")
+        if backend_generation <= 0:
+            raise RuntimeError("Runtime task descriptor is missing a provider backend generation.")
+        return RuntimeBackendTask(
+            descriptor=descriptor,
+            dispatch_plan_id=str(dispatch_plan.launch_allocation.allocation_id),
+            allocation_id=str(dispatch_plan.launch_allocation.allocation_id),
+            release_token=str(dispatch_plan.release_token),
+            lane_assignment=lane_assignment,
+            backend_lease=RuntimeBackendLease(
+                lease_id=backend_lease_id,
+                pool_token=backend_pool_token,
+                generation=backend_generation,
+                compatibility_key=runtime_lane.compatibility_key,
+                capacity=1,
+            ),
+        )
+
+    @staticmethod
+    def _validate_dispatch_plan_ready(dispatch_plan: RuntimeDispatchPlan) -> None:
+        allocation = dispatch_plan.launch_allocation
+        if str(allocation.status or "") != "ready":
+            raise RuntimeError("Runtime dispatch plan is not ready with a reserved allocation.")
+        reservation = allocation.reservation
+        if str(reservation.state or "") != "reserved":
+            raise RuntimeError("Runtime dispatch plan is not ready with a reserved allocation.")
+        if not tuple(reservation.lanes or ()):
+            raise RuntimeError("Runtime dispatch plan has no reserved runtime lanes.")
+
+    @staticmethod
+    def _runtime_lane_for_assignment(
+        dispatch_plan: RuntimeDispatchPlan,
+        lane_assignment: Any,
+    ) -> RuntimeLane | None:
+        if lane_assignment is None:
+            return None
+        lane_id = str(getattr(lane_assignment, "lane_id", "") or "")
+        if not lane_id:
+            return None
+        for lane in dispatch_plan.launch_allocation.reservation.lanes:
+            if str(lane.lane_id) == lane_id:
+                return lane
+        return None

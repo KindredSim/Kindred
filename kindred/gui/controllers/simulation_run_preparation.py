@@ -17,7 +17,11 @@ from kindred.core.simulation_identity import (
 )
 from kindred.core.simulation_plan import SimulationAlgebraPolicy
 from kindred.gui.controllers.batch_run_context_owner import BatchRunStartRequest
-from kindred.gui.controllers.batch_dispatch_plan import BatchSetDispatchInput, build_batch_set_dispatch_plan
+from kindred.gui.controllers.batch_dispatch_plan import (
+    BatchSetDispatchInput,
+    build_batch_set_dispatch_plan,
+    execution_request_payload_from_plan,
+)
 from kindred.gui.controllers.runtime_lane_allocation import (
     PreparedRuntimeRequestSet,
     RuntimeCompatibilityKey,
@@ -1253,6 +1257,15 @@ class SimulationRunPreparationOwner:
             prepared_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id)
             if isinstance(prepared_payload, Mapping):
                 parameter_overrides = dict(prepared_payload.get("parameter_overrides") or {})
+            if not parameter_overrides and isinstance(plan_payload, Mapping):
+                try:
+                    plan_execution_request = execution_request_payload_from_plan(plan_payload)
+                except Exception:
+                    plan_execution_request = None
+                if isinstance(plan_execution_request, Mapping):
+                    parameter_overrides = dict(
+                        plan_execution_request.get("parameter_overrides") or {}
+                    )
             owned_species = tuple(
                 str(name)
                 for name in dispatch_context.owned_species_by_set_id.get(set_id, ())
