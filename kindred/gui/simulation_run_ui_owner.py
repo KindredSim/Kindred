@@ -16,7 +16,7 @@ class SimulationRunUiOwner:
     ) -> None:
         self._results_table_getter = results_table_getter
         self._run_button_requested_enabled = True
-        self._launch_available = True
+        self._launch_available = False
         self._run_button = None
         self._run_action = None
         self._stop_button = None

@@ -171,6 +171,20 @@ class SimulationBatchOwner:
     def requested_show_batch_set_ids(self) -> List[str]:
         return [str(set_id) for set_id in (self._requested_show_batch_set_ids() or [])]
 
+    def effective_display_request_set_ids(self, *, focused_row: Optional[int] = None) -> List[str]:
+        explicit_ids = self._normalized_valid_set_ids(self.requested_show_batch_set_ids())
+        if focused_row is not None:
+            set_id = self.batch_set_id_for_row(int(focused_row))
+        else:
+            set_id = self._set_id_for_current_row()
+        effective: List[str] = []
+        if set_id:
+            effective.append(str(set_id))
+        for explicit_id in explicit_ids:
+            if explicit_id not in effective:
+                effective.append(explicit_id)
+        return effective
+
     def slider_edit_target_set_ids(self) -> List[str]:
         return [str(set_id) for set_id in (self._slider_edit_target_set_ids() or [])]
 
@@ -192,18 +206,19 @@ class SimulationBatchOwner:
 
     def effective_slider_edit_target_set_ids(self, *, focused_row: Optional[int] = None) -> List[str]:
         explicit_ids = self._normalized_valid_set_ids(self.slider_edit_target_set_ids())
-        if explicit_ids:
-            return list(explicit_ids)
         if focused_row is not None:
             set_id = self.batch_set_id_for_row(int(focused_row))
         else:
             set_id = self._set_id_for_current_row()
-        return [str(set_id)] if set_id else []
+        effective: List[str] = []
+        if set_id:
+            effective.append(str(set_id))
+        for explicit_id in explicit_ids:
+            if explicit_id not in effective:
+                effective.append(explicit_id)
+        return effective
 
     def focused_effective_slider_target_set_id(self) -> str:
-        explicit_ids = self._normalized_valid_set_ids(self.slider_edit_target_set_ids())
-        if explicit_ids:
-            return ""
         target_ids = self.effective_slider_edit_target_set_ids()
         return str(target_ids[0]) if target_ids else ""
 
@@ -261,8 +276,14 @@ class SimulationBatchOwner:
             gesture_key == "selection_change"
             or tuple(selected_rows) != tuple(target_selection_rows)
         )
+        display_refresh_needed = bool(
+            gesture_key in {"show_checkbox", "show_membership_change"}
+            or (
+                gesture_key in {"row_body_click", "initial_default_selection"}
+                and focus_change
+            )
+        )
 
-        display_refresh_needed = gesture_key in {"row_body_click", "show_checkbox", "show_membership_change"}
         slider_rebuild_needed = gesture_key in {
             "row_body_click",
             "slider_checkbox",

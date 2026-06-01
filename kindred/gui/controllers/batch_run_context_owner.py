@@ -443,32 +443,6 @@ class BatchParallelStartPayload:
 
 
 @dataclass(frozen=True)
-class BatchSerialNextPayload:
-    pos: int
-    total: int
-    row: int
-    set_id: str
-    set_name: str | None
-    queue_ids: tuple[str, ...]
-    fast_mode: bool
-    request_id: int
-    cache_key: str
-    preview_owner_epoch: int | None
-    full_dsl: str
-    solver_config: Dict[str, Any]
-    t_end: float
-    simulation_plan: Dict[str, Any] | None
-    simulation_plan_by_set_id: Dict[str, Dict[str, Any]]
-    mechanism_text_by_set_id: Dict[str, str]
-    mechanism_signature_by_set_id: Dict[str, str]
-    simulation_identity_by_set_id: Dict[str, Dict[str, Any]]
-    prepared: Dict[str, Any] | None
-    prepared_by_set_id: Dict[str, Dict[str, Any]]
-    scope_identity: Dict[str, Any]
-    preview_batch_cache_token_by_set_id: Dict[str, str]
-
-
-@dataclass(frozen=True)
 class BatchCompletionState:
     active: bool
     parallel: bool
@@ -487,6 +461,13 @@ class BatchCompletionState:
         return len(self.completed_set_ids)
 
 
+@dataclass(frozen=True)
+class CallbackContextResolution:
+    matched: bool
+    context: Dict[str, Any] | None
+    reason: str
+
+
 class BatchRunContextOwner:
     """Owns the mutable batch-run context for SimulationController."""
 
@@ -500,6 +481,25 @@ class BatchRunContextOwner:
 
     def _current_context(self) -> Dict[str, Any]:
         return deepcopy(self._context)
+
+    def context_for_callback_identity(self, identity: object) -> CallbackContextResolution:
+        ctx = self._current_context()
+        if not ctx:
+            return CallbackContextResolution(matched=False, context=None, reason="missing-context")
+        for key, attr in (
+            ("run_id", "run_id"),
+            ("request_id", "request_id"),
+        ):
+            expected = getattr(identity, attr, None)
+            if expected is None or key not in ctx:
+                return CallbackContextResolution(matched=False, context=None, reason="identity-mismatch")
+            if str(ctx.get(key) or "") != str(expected):
+                return CallbackContextResolution(matched=False, context=None, reason="identity-mismatch")
+        expected_cache_key = getattr(identity, "cache_key", None)
+        if expected_cache_key is not None and "cache_key" in ctx:
+            if str(ctx.get("cache_key") or "") != str(expected_cache_key):
+                return CallbackContextResolution(matched=False, context=None, reason="identity-mismatch")
+        return CallbackContextResolution(matched=True, context=ctx, reason="matched")
 
     def callback_context_snapshot(
         self,
@@ -633,6 +633,162 @@ class BatchRunContextOwner:
         context = seed.to_context()
         self._context = context
 
+    def load_runtime_dispatch_context(
+        self,
+        *,
+        dispatch_plan: Any,
+        run_id: int,
+        active: bool,
+        runtime_input_epoch: int,
+        runtime_input_global_epoch: int,
+        runtime_input_set_epoch_by_set_id: Callable[[Sequence[str]], Mapping[str, Any]],
+        label_for_set_id: Callable[[str], str | None],
+    ) -> Dict[str, Any]:
+        descriptors = tuple(getattr(dispatch_plan, "ordered_task_descriptors", ()) or ())
+        launch_allocation = getattr(dispatch_plan, "launch_allocation", None)
+        intent = getattr(launch_allocation, "launch_intent", None)
+        queue_ids = tuple(str(descriptor.set_id) for descriptor in descriptors if str(descriptor.set_id))
+        queue_names = tuple(
+            str(descriptor.set_label or label_for_set_id(str(descriptor.set_id)) or descriptor.set_id)
+            for descriptor in descriptors
+        )
+        requested_show_ids = self._runtime_requested_show_ids(
+            intent=intent,
+            queue_ids=queue_ids,
+        )
+        requested_labels = self._runtime_requested_show_labels(
+            requested_show_ids=requested_show_ids,
+            queue_ids=queue_ids,
+            queue_names=queue_names,
+            intent=intent,
+            label_for_set_id=label_for_set_id,
+        )
+        owned_species_by_set_id = {
+            str(descriptor.set_id): tuple(str(name) for name in descriptor.owned_species if str(name))
+            for descriptor in descriptors
+            if str(descriptor.set_id)
+        }
+        plan_by_set_id = {
+            str(descriptor.set_id): dict(descriptor.plan_payload or {})
+            for descriptor in descriptors
+            if str(descriptor.set_id) and isinstance(descriptor.plan_payload, Mapping)
+        }
+        mechanism_text_by_set_id = {
+            str(descriptor.set_id): str(descriptor.mechanism_text)
+            for descriptor in descriptors
+            if str(descriptor.set_id) and str(descriptor.mechanism_text)
+        }
+        mechanism_signature_by_set_id = {
+            str(descriptor.set_id): str(descriptor.mechanism_signature)
+            for descriptor in descriptors
+            if str(descriptor.set_id) and str(descriptor.mechanism_signature)
+        }
+        simulation_identity_by_set_id = {
+            str(descriptor.set_id): dict(descriptor.simulation_identity or {})
+            for descriptor in descriptors
+            if str(descriptor.set_id) and isinstance(descriptor.simulation_identity, Mapping)
+        }
+        preview_token_by_set_id = {
+            str(descriptor.set_id): str(descriptor.preview_batch_cache_token)
+            for descriptor in descriptors
+            if str(descriptor.set_id) and str(descriptor.preview_batch_cache_token)
+        }
+        runtime_task_identity_by_set_id = {}
+        for descriptor in descriptors:
+            set_id = str(descriptor.set_id)
+            if not set_id:
+                continue
+            assignment = dispatch_plan.assignment_for_task(descriptor.task_id)
+            runtime_task_identity_by_set_id[set_id] = {
+                "allocation_id": str(launch_allocation.allocation_id),
+                "lane_id": str(assignment.lane_id if assignment is not None else ""),
+                "lane_generation": int(assignment.lane_generation if assignment is not None else 0),
+                "row": int(descriptor.row),
+                "task_id": str(descriptor.task_id),
+                "exact_descriptor_hash": str(descriptor.exact_descriptor_hash),
+                "compatibility_key": descriptor.compatibility_key.to_payload(),
+                "cache_key": str(descriptor.cache_key),
+            }
+        requested_members = set(str(set_id) for set_id in queue_ids if str(set_id))
+        primary_display_set_id = next(
+            (str(set_id) for set_id in requested_show_ids if str(set_id) in requested_members),
+            str(requested_show_ids[0]) if requested_show_ids else "",
+        )
+        request_token = getattr(intent, "request_token", None)
+        preview_epoch = getattr(intent, "preview_epoch", None)
+        cache_key = str(descriptors[0].cache_key if descriptors else "")
+        seed = BatchContextSeed(
+            active=bool(active),
+            request_id=int(request_token or 0),
+            run_id=int(run_id),
+            runtime_input_epoch=int(runtime_input_epoch),
+            runtime_input_global_epoch=int(runtime_input_global_epoch),
+            runtime_input_set_epoch_by_set_id=runtime_input_set_epoch_by_set_id(queue_ids),
+            fast_mode=str(getattr(intent, "intent_kind", "") or "") == "preview",
+            completion_mode="runtime_task_queue",
+            keep_lane_pool_alive=bool(getattr(launch_allocation, "retain_lanes_after_success", False)),
+            effective_workers=max(1, int(getattr(launch_allocation, "accepted_capacity", 1) or 1)),
+            cache_key=cache_key,
+            simulation_plan_by_set_id=plan_by_set_id,
+            mechanism_text_by_set_id=mechanism_text_by_set_id,
+            mechanism_signature_by_set_id=mechanism_signature_by_set_id,
+            simulation_identity_by_set_id=simulation_identity_by_set_id,
+            rows=tuple(descriptor.row for descriptor in descriptors),
+            queue_ids=queue_ids,
+            queue_names=queue_names,
+            primary_set_id=str(queue_ids[0]) if queue_ids else None,
+            preview_owner_epoch=int(preview_epoch) if preview_epoch is not None else None,
+            preview_batch_cache_token_by_set_id=preview_token_by_set_id,
+            runtime_task_identity_by_set_id=runtime_task_identity_by_set_id,
+            total=len(descriptors),
+            completed_run_display_intent=CompletedRunDisplayIntent(
+                requested_show_set_ids=requested_show_ids,
+                labels_by_set_id=requested_labels,
+                primary_set_id=primary_display_set_id,
+                cache_key=cache_key,
+                run_id=int(run_id),
+                request_id=int(request_token or 0),
+                owned_species_by_set_id=owned_species_by_set_id,
+                run_target_set_ids=queue_ids,
+            ),
+            computed_owned_species_by_set_id=owned_species_by_set_id,
+        )
+        self.load_context(seed)
+        return self._current_context()
+
+    @staticmethod
+    def _runtime_requested_show_ids(
+        *,
+        intent: Any,
+        queue_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        requested = getattr(intent, "requested_show_set_ids", None)
+        source = requested if requested else queue_ids
+        return tuple(dict.fromkeys(str(set_id) for set_id in (source or ()) if str(set_id)))
+
+    @staticmethod
+    def _runtime_requested_show_labels(
+        *,
+        requested_show_ids: Sequence[str],
+        queue_ids: Sequence[str],
+        queue_names: Sequence[str],
+        intent: Any,
+        label_for_set_id: Callable[[str], str | None],
+    ) -> dict[str, str]:
+        labels = {
+            str(set_id): str(label)
+            for set_id, label in dict(getattr(intent, "requested_show_labels_by_set_id", {}) or {}).items()
+            if str(set_id)
+        }
+        queue_labels = {
+            str(set_id): str(queue_names[index])
+            for index, set_id in enumerate(queue_ids)
+            if str(set_id)
+        }
+        for set_id in requested_show_ids:
+            labels.setdefault(str(set_id), str(queue_labels.get(str(set_id)) or label_for_set_id(str(set_id)) or set_id))
+        return labels
+
     def active_batch_state(
         self,
         context: Mapping[str, Any] | None = None,
@@ -722,78 +878,6 @@ class BatchRunContextOwner:
             simulation_identity_by_set_id={
                 str(set_id): deepcopy(dict(payload))
                 for set_id, payload in dict(ctx.get("simulation_identity_by_set_id") or {}).items()
-                if str(set_id) and isinstance(payload, Mapping)
-            },
-            scope_identity=deepcopy(dict(ctx.get("scope_identity") or {})),
-            preview_batch_cache_token_by_set_id={
-                str(set_id): str(token)
-                for set_id, token in dict(ctx.get("preview_batch_cache_token_by_set_id") or {}).items()
-                if str(set_id)
-            },
-        )
-
-    def serial_next_payload(
-        self,
-        context: Mapping[str, Any] | None = None,
-    ) -> BatchSerialNextPayload | None:
-        ctx = context if isinstance(context, Mapping) else self._context
-        state = self.active_batch_state(ctx)
-        if state is None or not state.active or state.runtime_task_queue or state.parallel:
-            return None
-        queue_ids = state.queue_ids
-        pos = max(0, int(state.pos))
-        if not (0 <= pos < len(queue_ids)):
-            return None
-        rows = state.rows
-        row = int(rows[pos]) if 0 <= pos < len(rows) else 0
-        queue_names = state.queue_names
-        set_id = str(queue_ids[pos])
-        set_name = str(queue_names[pos]) if 0 <= pos < len(queue_names) else None
-        simulation_plan = ctx.get("simulation_plan")
-        prepared = ctx.get("prepared")
-        return BatchSerialNextPayload(
-            pos=pos,
-            total=len(queue_ids),
-            row=row,
-            set_id=set_id,
-            set_name=set_name,
-            queue_ids=queue_ids,
-            fast_mode=bool(state.fast_mode),
-            request_id=int(state.request_id or 0),
-            cache_key=str(ctx.get("cache_key") or ""),
-            preview_owner_epoch=self._optional_int(ctx.get("preview_owner_epoch")),
-            full_dsl=str(ctx.get("full_dsl") or ""),
-            solver_config=deepcopy(dict(ctx.get("solver_config") or {})),
-            t_end=float(self._float_value(ctx.get("t_end"), default=0.0)),
-            simulation_plan=(
-                deepcopy(dict(simulation_plan))
-                if isinstance(simulation_plan, Mapping)
-                else None
-            ),
-            simulation_plan_by_set_id={
-                str(set_id): deepcopy(dict(payload))
-                for set_id, payload in dict(ctx.get("simulation_plan_by_set_id") or {}).items()
-                if str(set_id) and isinstance(payload, Mapping)
-            },
-            mechanism_text_by_set_id={
-                str(set_id): str(text)
-                for set_id, text in dict(ctx.get("mechanism_text_by_set_id") or {}).items()
-                if str(set_id)
-            },
-            mechanism_signature_by_set_id={
-                str(set_id): str(signature)
-                for set_id, signature in dict(ctx.get("mechanism_signature_by_set_id") or {}).items()
-                if str(set_id)
-            },
-            simulation_identity_by_set_id={
-                str(set_id): deepcopy(dict(payload))
-                for set_id, payload in dict(ctx.get("simulation_identity_by_set_id") or {}).items()
-                if str(set_id) and isinstance(payload, Mapping)
-            },
-            prepared=deepcopy(dict(prepared)) if isinstance(prepared, Mapping) else None,
-            prepared_by_set_id={
-                str(set_id): deepcopy(dict(payload))
-                for set_id, payload in dict(ctx.get("prepared_by_set_id") or {}).items()
                 if str(set_id) and isinstance(payload, Mapping)
             },
             scope_identity=deepcopy(dict(ctx.get("scope_identity") or {})),
@@ -1280,7 +1364,6 @@ class BatchRunContextOwner:
         else:
             run_target_set_ids = intent_set_ids
         run_target_members = set(run_target_set_ids)
-        non_run_requested_ids = tuple(set_id for set_id in intent_set_ids if set_id not in run_target_members)
         failed_set_ids = {str(set_id) for set_id in (ctx.get("failed_set_ids") or ()) if str(set_id)}
         failed_intent_set_ids = tuple(set_id for set_id in intent_set_ids if set_id in failed_set_ids)
         failed_run_target_set_ids = tuple(set_id for set_id in run_target_set_ids if set_id in failed_set_ids)
@@ -1291,10 +1374,10 @@ class BatchRunContextOwner:
             return tuple(set_id for set_id in intent_set_ids if set_id in members)
 
         if not display_set_ids:
-            unresolved = _intent_ordered_union(failed_run_target_set_ids, non_run_requested_ids)
+            unresolved = _intent_ordered_union(failed_run_target_set_ids)
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=non_run_requested_ids,
+                missing_set_ids=(),
                 unavailable_set_ids=unresolved,
                 unresolved_intent_set_ids=unresolved,
                 failed_intent_set_ids=failed_intent_set_ids,
@@ -1313,10 +1396,10 @@ class BatchRunContextOwner:
         )
         if unavailable_set_ids and all(set_id in unavailable_set_ids for set_id in display_set_ids):
             semantic_ids = tuple(set_id for set_id in display_set_ids if set_id in unavailable_set_ids)
-            unresolved = _intent_ordered_union(failed_run_target_set_ids, semantic_ids, non_run_requested_ids)
+            unresolved = _intent_ordered_union(failed_run_target_set_ids, semantic_ids)
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=non_run_requested_ids,
+                missing_set_ids=(),
                 unavailable_set_ids=unresolved,
                 unresolved_intent_set_ids=unresolved,
                 failed_intent_set_ids=failed_intent_set_ids,
@@ -1333,10 +1416,10 @@ class BatchRunContextOwner:
                     if set_id in unavailable_set_ids and set_id not in failed_set_ids
                 )
                 missing_ids = tuple(set_id for set_id in display_set_ids if set_id not in unavailable_set_ids)
-                unresolved = _intent_ordered_union(failed_run_target_set_ids, missing_ids, semantic_ids, non_run_requested_ids)
+                unresolved = _intent_ordered_union(failed_run_target_set_ids, missing_ids, semantic_ids)
                 return CompletedRunDisplayCoverage(
                     intent=intent,
-                    missing_set_ids=(*missing_ids, *non_run_requested_ids),
+                    missing_set_ids=missing_ids,
                     unavailable_set_ids=unresolved,
                     unresolved_intent_set_ids=unresolved,
                     failed_intent_set_ids=failed_intent_set_ids,
@@ -1348,7 +1431,7 @@ class BatchRunContextOwner:
                     ),
                 )
             if failed_run_target_set_ids:
-                unresolved = _intent_ordered_union(failed_run_target_set_ids, display_set_ids, non_run_requested_ids)
+                unresolved = _intent_ordered_union(failed_run_target_set_ids, display_set_ids)
                 return CompletedRunDisplayCoverage(
                     intent=intent,
                     missing_set_ids=display_set_ids,
@@ -1359,8 +1442,8 @@ class BatchRunContextOwner:
                 )
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=(*display_set_ids, *non_run_requested_ids),
-                unresolved_intent_set_ids=_intent_ordered_union(display_set_ids, non_run_requested_ids),
+                missing_set_ids=display_set_ids,
+                unresolved_intent_set_ids=_intent_ordered_union(display_set_ids),
                 failed_intent_set_ids=failed_intent_set_ids,
                 cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
             )
@@ -1388,16 +1471,25 @@ class BatchRunContextOwner:
             completed_display_set_ids = tuple(str(entry.set_id) for entry in completion_entries if str(entry.set_id))
             missing_ids = tuple(missing_set_ids)
             semantic_ids = tuple(semantic_unavailable_set_ids)
+            secondary_missing_ids = tuple(
+                set_id
+                for set_id in intent_set_ids
+                if set_id not in run_target_members
+                and set_id not in entries_raw
+                and set_id not in failed_set_ids
+                and set_id not in unavailable_set_ids
+            )
+            diagnostic_missing_ids = _intent_ordered_union(missing_ids, secondary_missing_ids)
             unresolved = _intent_ordered_union(
                 failed_run_target_set_ids,
                 missing_ids,
                 semantic_ids,
-                non_run_requested_ids,
+                secondary_missing_ids,
             )
             if missing_ids and bool(ctx.get("active", False)):
                 return CompletedRunDisplayCoverage(
                     intent=intent,
-                    missing_set_ids=(*missing_ids, *non_run_requested_ids),
+                    missing_set_ids=diagnostic_missing_ids,
                     unavailable_set_ids=unresolved,
                     unresolved_intent_set_ids=unresolved,
                     failed_intent_set_ids=failed_intent_set_ids,
@@ -1419,11 +1511,11 @@ class BatchRunContextOwner:
                     display_primary_set_id=display_primary_set_id,
                     failed_set_ids=failed_run_target_set_ids,
                     unresolved_intent_set_ids=unresolved,
-                    missing_intent_set_ids=(*missing_ids, *non_run_requested_ids),
+                    missing_intent_set_ids=diagnostic_missing_ids,
                     failed_intent_set_ids=failed_intent_set_ids,
                     semantic_unavailable_set_ids=semantic_ids,
                 ),
-                missing_set_ids=(*missing_ids, *non_run_requested_ids),
+                missing_set_ids=diagnostic_missing_ids,
                 unavailable_set_ids=unresolved,
                 unresolved_intent_set_ids=unresolved,
                 failed_intent_set_ids=failed_intent_set_ids,
@@ -1432,10 +1524,10 @@ class BatchRunContextOwner:
         if semantic_unavailable_set_ids:
             semantic_ids = tuple(semantic_unavailable_set_ids)
             missing_ids = tuple(missing_set_ids)
-            unresolved = _intent_ordered_union(failed_run_target_set_ids, missing_ids, semantic_ids, non_run_requested_ids)
+            unresolved = _intent_ordered_union(failed_run_target_set_ids, missing_ids, semantic_ids)
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=(*missing_ids, *non_run_requested_ids),
+                missing_set_ids=missing_ids,
                 unavailable_set_ids=unresolved,
                 unresolved_intent_set_ids=unresolved,
                 failed_intent_set_ids=failed_intent_set_ids,
@@ -1446,11 +1538,10 @@ class BatchRunContextOwner:
             unresolved = _intent_ordered_union(
                 failed_run_target_set_ids,
                 tuple(missing_set_ids),
-                non_run_requested_ids,
             )
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=(*tuple(missing_set_ids), *non_run_requested_ids),
+                missing_set_ids=tuple(missing_set_ids),
                 unresolved_intent_set_ids=unresolved,
                 failed_intent_set_ids=failed_intent_set_ids,
                 cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
@@ -1463,13 +1554,13 @@ class BatchRunContextOwner:
                 display_set_ids=display_set_ids,
                 display_primary_set_id=display_primary_set_id,
                 failed_set_ids=failed_run_target_set_ids,
-                unresolved_intent_set_ids=non_run_requested_ids,
-                missing_intent_set_ids=non_run_requested_ids,
+                unresolved_intent_set_ids=(),
+                missing_intent_set_ids=(),
                 failed_intent_set_ids=failed_intent_set_ids,
                 semantic_unavailable_set_ids=(),
             ),
-            missing_set_ids=non_run_requested_ids,
-            unresolved_intent_set_ids=non_run_requested_ids,
+            missing_set_ids=(),
+            unresolved_intent_set_ids=(),
             failed_intent_set_ids=failed_intent_set_ids,
         )
 

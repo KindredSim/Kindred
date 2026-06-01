@@ -144,11 +144,6 @@ def _cleanup_main_window(window) -> None:
         window.simulation_controller.shutdown_batch_lane_pool(force_terminate=True)
     except Exception as exc:
         logger.debug("Failed to shutdown batch lane pool during test cleanup: %s", exc, exc_info=True)
-    try:
-        window.simulation_controller.release_current_simulation_worker()
-    except Exception as exc:
-        logger.debug("Failed to release simulation worker during test cleanup: %s", exc, exc_info=True)
-
     # Stop preview-session timers before closing to prevent stale timer
     # callbacks from firing during teardown.
     try:

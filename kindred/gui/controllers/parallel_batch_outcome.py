@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome
 from kindred.core.simulation_failure import build_simulation_failure, coerce_simulation_failure
 from kindred.gui.controllers.simulation_callback_freshness import SimulationCallbackFreshnessOwner
+from kindred.gui.controllers.simulation_runtime_backend import RuntimeCompletionDecision
 from kindred.gui.ports import DisplayTransitionOutcome
 
 
@@ -30,9 +31,9 @@ class ParallelBatchOutcomeDependencies:
     freshness: SimulationCallbackFreshnessOwner
     record_nonfatal_exception: Callable[..., None]
     finalize_scoped_batch_success_subset: Callable[..., DisplayTransitionOutcome | None]
-    cleanup_parallel_batch_lane_pool_after_run: Callable[..., None]
+    runtime_display_completed: Callable[..., None]
     show_scoped_batch_failure_summary: Callable[..., None]
-    apply_explicit_failure_pending_replay_policy: Callable[..., None]
+    request_terminal_failure_preview_replay: Callable[..., None]
     reset_parallel_batch_run_and_shutdown_lane_pool: Callable[..., None]
     set_simulation_running: Callable[[bool], None]
     set_slider_simulation_active: Callable[[bool], None]
@@ -199,10 +200,7 @@ class ParallelBatchOutcomeOwner:
         display_transition = self._deps.finalize_scoped_batch_success_subset(ctx)
         if display_transition is not None and not isinstance(display_transition, DisplayTransitionOutcome):
             raise TypeError("Scoped batch display finalization must return DisplayTransitionOutcome or None")
-        self._deps.cleanup_parallel_batch_lane_pool_after_run(
-            keep_lane_pool_alive=False,
-            clear_pending_plot_updates=False,
-        )
+        self._deps.runtime_display_completed(kind="scoped_failure")
         self._deps.set_simulation_running(False)
         self._deps.set_slider_simulation_active(False)
         self._ui.slider.set_slider_triggered_simulation(False)
@@ -214,7 +212,7 @@ class ParallelBatchOutcomeOwner:
             failed_set_ids=summary.failed_set_ids,
             failed_errors=summary.failed_errors,
         )
-        self._deps.apply_explicit_failure_pending_replay_policy(fast_mode=False)
+        self._deps.request_terminal_failure_preview_replay(fast_mode=False)
         return True
 
     def consume_outcome(
@@ -239,8 +237,13 @@ class ParallelBatchOutcomeOwner:
         )
         set_name = resolution.set_name
         callback_identity = meta.get("callback_identity")
-        callback_context = getattr(callback_identity, "callback_context", None)
-        callback_context = callback_context if isinstance(callback_context, Mapping) else None
+        resolved_run_context: Mapping[str, Any] | None = None
+        if callback_identity is not None and hasattr(self._batch_context_owner, "context_for_callback_identity"):
+            context_resolution = self._batch_context_owner.context_for_callback_identity(callback_identity)
+            if bool(getattr(context_resolution, "matched", False)):
+                candidate_context = getattr(context_resolution, "context", None)
+                if isinstance(candidate_context, Mapping):
+                    resolved_run_context = candidate_context
 
         if resolution.stale:
             runtime_session_stale = meta.get("runtime_session_stale")
@@ -271,7 +274,7 @@ class ParallelBatchOutcomeOwner:
             self._ui.run_ui.set_stop_button_enabled(False)
             return False
 
-        if callback_identity is None or callback_context is None:
+        if callback_identity is None or resolved_run_context is None:
             self._deps.record_nonfatal_exception(
                 (
                     "Missing callback identity for active parallel batch outcome "
@@ -291,23 +294,22 @@ class ParallelBatchOutcomeOwner:
             self._ui.run_ui.set_status_text("Batch simulation failed")
             return False
 
-        freshness = self._deps.freshness.assess_callback(callback_identity, context=callback_context)
+        freshness = self._deps.freshness.assess_callback(callback_identity, context=resolved_run_context)
         if freshness.stale_run and int(freshness.active_run_id) > 0:
             return True
         if freshness.dispatch_identity_stale:
             self._deps.freshness.mark_stale_dispatch_identity_callback_consumed(
                 batch_set_id=sid,
-                context=callback_context,
+                context=resolved_run_context,
             )
             return True
         if freshness.runtime_input_stale:
             self._deps.freshness.mark_stale_runtime_input_callback_consumed(
                 batch_set_id=sid,
-                context=callback_context,
+                context=resolved_run_context,
             )
             return True
 
-        self._batch_parallel.discard_request(sid)
         if resolution.failed:
             error_payload = dict(resolution.error_payload or {})
             if self.handle_scoped_failure(
@@ -333,7 +335,7 @@ class ParallelBatchOutcomeOwner:
                 float(completed_ts if completed_ts is not None else -1.0),
                 float(perf_counter()),
             )
-        completion_policy_context = self._batch_context_owner.completion_policy_context(callback_context)
+        completion_policy_context = self._batch_context_owner.completion_policy_context(resolved_run_context)
         try:
             self._completion_callback_owner.handle_completion(
                 resolution.payload,
@@ -359,3 +361,18 @@ class ParallelBatchOutcomeOwner:
             self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
             return False
         return True
+
+    def consume_runtime_completion(self, event: Any) -> RuntimeCompletionDecision:
+        accepted = self.consume_outcome(
+            set_id=str(getattr(event, "set_id", "") or ""),
+            outcome=getattr(event, "outcome", None),
+            source=str(getattr(event, "source", "") or ""),
+            completed_ts=float(getattr(event, "completed_ts", 0.0) or 0.0),
+            completion_record=getattr(event, "record", None),
+            debug_batch_parallel=False,
+        )
+        if bool(accepted):
+            return RuntimeCompletionDecision.accepted_current()
+        return RuntimeCompletionDecision.terminal_failure(
+            "Runtime completion could not be consumed."
+        )

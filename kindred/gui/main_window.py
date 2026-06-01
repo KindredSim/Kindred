@@ -1512,6 +1512,13 @@ class MainWindow(
         finally:
             self._suppress_preference_updates = False
         self._update_temperature_mode_indicator()
+        refresh_runtime_readiness = getattr(
+            getattr(self, "_sim_controller", None),
+            "refresh_interactive_runtime_readiness",
+            None,
+        )
+        if callable(refresh_runtime_readiness):
+            refresh_runtime_readiness()
 
     def _simulation_runtime_settings_snapshot(self) -> Dict[str, object]:
         solver_contract = load_solver_contract()
@@ -3486,7 +3493,7 @@ class MainWindow(
             )
         transition = self.results_controller.apply_authoritative_result_display_transition(
             active_cache_key=active_cache_key,
-            display_scope_ids=self._simulation_batch_owner.requested_show_batch_set_ids(),
+            display_scope_ids=self._simulation_batch_owner.effective_display_request_set_ids(),
             active_cache_invalidated_set_ids=self._simulation_batch_owner.active_cache_invalidated_set_ids() or (),
             display_clear_set_ids=display_clear_set_ids,
             display_clear_scope_is_global=display_clear_scope_is_global,
@@ -4033,6 +4040,9 @@ class MainWindow(
 
     def requested_show_batch_set_ids(self) -> List[str]:
         return [str(s) for s in (self._requested_show_batch_set_ids() or [])]
+
+    def effective_display_request_set_ids(self) -> List[str]:
+        return self._simulation_batch_owner.effective_display_request_set_ids()
 
     def slider_edit_target_set_ids(self) -> List[str]:
         return [str(s) for s in (self._slider_edit_target_set_ids() or [])]
@@ -4768,6 +4778,15 @@ class MainWindow(
                     logger.debug("Failed to resolve focused slider target from batch owner: %s", exc, exc_info=True)
             model.set_focused_effective_edit_target_set_id(focused_target_set_id)
 
+    def _refresh_interactive_runtime_readiness_for_rows(self, rows: Sequence[int]) -> None:
+        refresh_runtime_readiness = getattr(
+            getattr(self, "_sim_controller", None),
+            "refresh_interactive_runtime_readiness",
+            None,
+        )
+        if callable(refresh_runtime_readiness):
+            refresh_runtime_readiness(rows=tuple(int(row) for row in rows or ()))
+
     def _batch_cache_key(
         self,
         *,
@@ -4913,16 +4932,9 @@ class MainWindow(
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
+        self._refresh_interactive_runtime_readiness_for_rows(self._batch_selected_rows())
 
     def _batch_current_change_display_source(self) -> DisplayRefreshSource:
-        table = getattr(self, "_batch_table", None)
-        checker = getattr(table, "current_change_is_user_initiated", None) if table is not None else None
-        if callable(checker):
-            try:
-                if bool(checker()):
-                    return DisplayRefreshSource.EXPLICIT_SHOW_REQUEST
-            except RuntimeError as exc:
-                logger.debug("Failed to inspect batch current-change source: %s", exc, exc_info=True)
         return DisplayRefreshSource.PROGRAMMATIC_SHOW_REQUEST
 
     def _on_batch_model_data_changed(
@@ -4976,6 +4988,9 @@ class MainWindow(
             row=current_row,
         )
         focused_set_id = self._update_focused_batch_set_id(row=current_row)
+        self._refresh_interactive_runtime_readiness_for_rows(
+            getattr(transaction, "run_selected_rows", ())
+        )
         if not focused_set_id:
             return
         if transaction.slider_rebuild_needed:

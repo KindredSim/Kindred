@@ -1056,6 +1056,18 @@ class SimulationResultsPort(Protocol):
         transaction: FreshPreviewDisplayTransaction,
     ) -> SimulationCompletionDisplayOutcome: ...
 
+    def publish_fresh_preview_from_entries(
+        self,
+        *,
+        fresh_preview_entries: Mapping[str, FreshPreviewDisplayEntry],
+        requested_show_set_ids: Sequence[str],
+        target_set_ids: Sequence[str],
+        prefer_set: Optional[str],
+        cache_key: str,
+        request_id: Optional[int],
+        run_id: Optional[int],
+    ) -> Optional[SimulationCompletionDisplayOutcome]: ...
+
     def publish_cached_batch_display_scope(
         self,
         *,

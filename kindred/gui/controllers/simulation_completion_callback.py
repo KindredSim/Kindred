@@ -16,9 +16,10 @@ logger = logging.getLogger(__name__)
 class SimulationCompletionCallbackDependencies:
     freshness: SimulationCallbackFreshnessOwner
     completion_policy_preview_ownership: Callable[[], Any]
-    completion_policy_pending_replay_state: Callable[[], Any]
+    stale_fast_completion_replay_decision: Callable[..., Any]
     apply_completion_policy_state_patch: Callable[..., None]
     apply_lifecycle_effects: Callable[..., None]
+    apply_runtime_effects: Callable[..., None]
 
 
 class SimulationCompletionCallbackOwner:
@@ -53,13 +54,12 @@ class SimulationCompletionCallbackOwner:
         batch_set = callback_identity.batch_set
         batch_set_id = callback_identity.batch_set_id
         cache_key = callback_identity.cache_key
-        ctx: Mapping[str, Any] | None = (
-            callback_identity.callback_context
-            if isinstance(callback_identity.callback_context, Mapping)
-            else None
-        )
+        context_resolution = self._batch_context_owner.context_for_callback_identity(callback_identity)
+        ctx = context_resolution.context if context_resolution.matched else None
         if not isinstance(ctx, Mapping):
-            raise ValueError("simulation completion requires callback_identity.callback_context.")
+            raise ValueError(
+                f"simulation completion requires a current batch context ({context_resolution.reason})."
+            )
         freshness = self._deps.freshness.assess_callback(callback_identity, context=ctx)
         if freshness.stale_run:
             logger.debug(
@@ -148,26 +148,34 @@ class SimulationCompletionCallbackOwner:
             context=policy_context,
             request_id=int(request_id),
             preview_owner_epoch=callback_preview_owner_epoch,
-            pending_replay=self._deps.completion_policy_pending_replay_state(),
-            shutdown_requested=freshness.shutdown_requested,
+        )
+        replay_decision = self._deps.stale_fast_completion_replay_decision(
+            display_current_preview=bool(stale_fast_decision.display_current_preview),
+            shutdown_requested=bool(freshness.shutdown_requested),
+            context_parallel=bool(
+                policy_context is not None
+                and policy_context.active
+                and policy_context.parallel
+            ),
         )
         logger.debug(
             "Active fast completion superseded (request_id=%s, latest=%s, run_id=%s, schedule_pending=%s, display_current_preview=%s, handoff_after_display=%s)",
             request_id,
             latest_request_id,
             run_id,
-            bool(stale_fast_decision.schedule_pending_preview_run),
+            bool(replay_decision.pending_replay_queued),
             bool(stale_fast_decision.display_current_preview),
-            bool(stale_fast_decision.defer_context_deactivation_until_after_display),
+            bool(replay_decision.defer_context_deactivation_until_after_display),
         )
 
         self._deps.apply_completion_policy_state_patch(
             stale_fast_decision.state_patch,
             base_context=state.ctx if isinstance(state.ctx, Mapping) else None,
         )
+        self._deps.apply_runtime_effects(replay_decision.effects)
         if stale_fast_decision.display_current_preview:
             state.stale_fast_handoff_after_display = bool(
-                stale_fast_decision.defer_context_deactivation_until_after_display
+                replay_decision.defer_context_deactivation_until_after_display
             )
             state.explicit_batch_coalescing = self._batch_context_owner.explicit_batch_coalescing_for_completion(
                 slider_triggered=bool(state.slider_triggered),
@@ -190,7 +198,6 @@ class SimulationCompletionCallbackOwner:
                     stale_fast_decision.deactivate_context_immediately
                     and callback_context_matches_current
                 ),
-                schedule_pending_preview_run=bool(stale_fast_decision.schedule_pending_preview_run),
                 reset_status_progress=bool(
                     stale_fast_decision.reset_status_progress
                     and callback_context_matches_current

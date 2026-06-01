@@ -20,11 +20,14 @@ logger = logging.getLogger(__name__)
 class SimulationErrorHandlingDependencies:
     freshness: SimulationCallbackFreshnessOwner
     completion_policy_preview_ownership: Callable[[], Any]
-    completion_policy_pending_replay_state: Callable[[], Any]
+    stale_fast_error_replay_decision: Callable[..., Any]
     apply_completion_policy_state_patch: Callable[..., None]
     apply_lifecycle_effects: Callable[..., None]
+    apply_runtime_effects: Callable[..., None]
+    capture_terminal_failure_preview_replay_snapshot: Callable[..., Any]
+    request_terminal_failure_preview_replay: Callable[..., None]
+    request_pending_preview_replay: Callable[..., None]
     handle_current_preview_simulation_failure: Callable[..., None]
-    has_deferred_preview_replay_intent: Callable[[], bool]
 
 
 class SimulationErrorHandlingOwner:
@@ -57,13 +60,10 @@ class SimulationErrorHandlingOwner:
         error_text = simulation_failure_user_message(error_payload)
         error_detail_text = simulation_failure_detail_text(error_payload)
         cancelled = is_cancelled_failure(error_payload)
-        ctx = (
-            callback_identity.callback_context
-            if isinstance(callback_identity.callback_context, Mapping)
-            else None
-        )
+        context_resolution = self._batch_context_owner.context_for_callback_identity(callback_identity)
+        ctx = context_resolution.context if context_resolution.matched else None
         if not isinstance(ctx, Mapping):
-            raise ValueError("simulation error requires callback_identity.callback_context.")
+            raise ValueError(f"simulation error requires a current batch context ({context_resolution.reason}).")
         freshness = self._deps.freshness.assess_callback(callback_identity, context=ctx)
         if freshness.stale_run:
             logger.debug(
@@ -74,6 +74,20 @@ class SimulationErrorHandlingOwner:
             )
             return
         latest_request_id = freshness.latest_request_id
+        if freshness.dispatch_identity_stale:
+            logger.debug(
+                "Ignoring stale simulation error for mismatched runtime task identity "
+                "(batch_set_id=%s, run_id=%s, request_id=%s): %s",
+                str(batch_set_id or ""),
+                run_id,
+                request_id,
+                error_text,
+            )
+            self._deps.freshness.mark_stale_dispatch_identity_callback_consumed(
+                batch_set_id=batch_set_id,
+                context=ctx,
+            )
+            return
         if freshness.runtime_input_stale:
             logger.debug(
                 "Ignoring stale simulation error (batch_set_id=%s, current_global_epoch=%s): %s",
@@ -99,14 +113,14 @@ class SimulationErrorHandlingOwner:
                 context=policy_context,
                 request_id=int(request_id),
                 preview_owner_epoch=callback_preview_owner_epoch,
-                pending_replay=self._deps.completion_policy_pending_replay_state(),
             )
+            replay_decision = self._deps.stale_fast_error_replay_decision()
             logger.debug(
                 "Active fast error superseded (request_id=%s, latest=%s, run_id=%s, schedule_pending=%s): %s",
                 request_id,
                 latest_request_id,
                 run_id,
-                bool(stale_fast_decision.schedule_pending_preview_run),
+                bool(replay_decision.pending_replay_queued),
                 error_text,
             )
 
@@ -124,13 +138,13 @@ class SimulationErrorHandlingOwner:
                         stale_fast_decision.deactivate_context_immediately
                         and callback_context_matches_current
                     ),
-                    schedule_pending_preview_run=bool(stale_fast_decision.schedule_pending_preview_run),
                     reset_status_progress=bool(
                         stale_fast_decision.reset_status_progress
                         and callback_context_matches_current
                     ),
                 )
             )
+            self._deps.apply_runtime_effects(replay_decision.effects)
             return
         preview_failure_kind = str(error_payload.get("kind") or "").strip().lower()
         preview_failure_details = error_payload.get("details")
@@ -172,15 +186,24 @@ class SimulationErrorHandlingOwner:
 
         if not cancelled and error_detail_text:
             logger.warning("%s", error_detail_text)
-        if cancelled and self._deps.has_deferred_preview_replay_intent():
-            logger.debug("Resuming pending slider update after cancellation")
+        replay_snapshot = (
+            None
+            if bool(cancelled)
+            else self._deps.capture_terminal_failure_preview_replay_snapshot()
+        )
         self._deps.apply_lifecycle_effects(
             self._lifecycle_effect_owner.terminal_error_effects(
                 cancelled=bool(cancelled),
                 error_text=str(error_text),
                 error_detail_text=str(error_detail_text or ""),
                 fast_mode=bool(fast_mode),
-                has_deferred_preview_replay=bool(self._deps.has_deferred_preview_replay_intent()),
             ),
             failed_run_context=ctx if isinstance(ctx, Mapping) else None,
         )
+        if bool(cancelled):
+            self._deps.request_pending_preview_replay(shutdown_requested=False)
+        else:
+            self._deps.request_terminal_failure_preview_replay(
+                fast_mode=bool(fast_mode),
+                replay_snapshot=replay_snapshot,
+            )

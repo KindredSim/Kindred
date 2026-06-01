@@ -124,7 +124,6 @@ class SimulationRunState(QtCore.QObject):
     def __init__(self, *, on_progress_timeout, parent: QtCore.QObject) -> None:
         super().__init__(parent)
         self.simulation_running = False
-        self.simulation_worker = None
         self.processing_progress = False
         self.pending_progress_payload: Optional[Tuple[int, str]] = None
         self.progress_flush_interval_ms = 33

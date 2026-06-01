@@ -5,8 +5,6 @@ import logging
 from time import perf_counter
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
-from PySide6 import QtCore
-
 from kindred.gui.controllers.simulation_completion_policy import CacheAuthorityState, CompletionPolicyContext
 from kindred.gui.controllers.simulation_result_materialization import MaterializedDisplayResult
 from kindred.gui.ports import (
@@ -74,8 +72,7 @@ class SimulationCompletionPublicationDependencies:
     finalize_explicit_batch_dirty_reset: Callable[..., Mapping[str, Any]]
     flush_slider_plot_updates: Callable[..., None]
     show_scoped_batch_failure_summary: Callable[..., None]
-    has_deferred_preview_replay_intent: Callable[[], bool]
-    start_next_batch_simulation: Callable[[], None]
+    request_completion_preview_replay: Callable[..., None]
     clear_pending_progress_status: Callable[[], None] = lambda: None
 
 
@@ -727,6 +724,21 @@ class SimulationCompletionPublicationOwner:
             raise RuntimeError("ResultsController returned an invalid completed-run display outcome")
         return outcome
 
+    def publish_completed_run_display_for_context(
+        self,
+        ctx: Mapping[str, Any],
+    ) -> SimulationCompletionDisplayOutcome:
+        coverage = self._batch_context_owner.completed_run_display_coverage(ctx)
+        return self.publish_completed_run_display_coverage(coverage)
+
+    def publish_completed_run_display_coverage(
+        self,
+        coverage: CompletedRunDisplayCoverage,
+    ) -> SimulationCompletionDisplayOutcome:
+        if coverage.transaction is not None:
+            return self.publish_completed_run_display_transaction(coverage.transaction)
+        return self._completed_run_unavailable_outcome(coverage)
+
     def publish_completed_run_display_unavailable(
         self,
         *,
@@ -916,19 +928,12 @@ class SimulationCompletionPublicationOwner:
         )
         state.ctx = transition.context
         if transition.batch_done:
-            self._deps.apply_lifecycle_effects(
-                self._lifecycle_effect_owner.serial_batch_continue_effects()
-            )
             return True
         self.publish_batch_progress(
             state.batch_set,
             completed=int(transition.completed_count),
             total=total,
         )
-        self._deps.apply_lifecycle_effects(
-            self._lifecycle_effect_owner.serial_batch_continue_effects()
-        )
-        QtCore.QTimer.singleShot(0, self._deps.start_next_batch_simulation)
         return False
 
     def publish_batch_progress(
@@ -996,9 +1001,6 @@ class SimulationCompletionPublicationOwner:
         logger.info("Captured simulation provenance and CTC metadata")
 
     def apply_final_effects(self, state: CompletionCallbackState) -> None:
-        has_deferred_preview_replay = self._deps.has_deferred_preview_replay_intent()
-        if has_deferred_preview_replay:
-            logger.debug("Processing pending slider update after completion")
         cleanup_context = state.ctx if isinstance(state.ctx, Mapping) else {}
         self._deps.apply_lifecycle_effects(
             self._lifecycle_effect_owner.successful_completion_final_effects(
@@ -1006,9 +1008,11 @@ class SimulationCompletionPublicationOwner:
                     cleanup_context
                 ),
                 stale_fast_handoff_after_display=bool(state.stale_fast_handoff_after_display),
-                has_deferred_preview_replay=bool(has_deferred_preview_replay),
                 shutdown_requested=bool(state.shutdown_requested),
             )
+        )
+        self._deps.request_completion_preview_replay(
+            shutdown_requested=bool(state.shutdown_requested),
         )
 
     def _base_species_count(self, result: Mapping[str, Any], *, mechanism: object | None) -> int | None:

@@ -290,6 +290,18 @@ class BatchSimulationCache:
             for set_id in entry_set_ids
             if str(set_id)
         )
+        invalidated_set = set(invalidated_set_ids)
+        valid_set_ids = self.normalize_set_ids(
+            (
+                *valid_set_ids,
+                *(
+                    entry.set_id
+                    for entry in entries
+                    if entry.read_result.entry is not None
+                    and str(entry.set_id) not in invalidated_set
+                ),
+            )
+        )
         return BatchCacheResultReadSnapshot(
             cache_key=normalized_key,
             valid_set_ids=valid_set_ids,

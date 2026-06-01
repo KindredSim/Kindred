@@ -7,7 +7,7 @@ import logging
 import math
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
-from kindred.core.batch_parallel import batch_mechanism_signature
+from kindred.core.batch_parallel import batch_mechanism_signature, compute_effective_batch_workers
 from kindred.core.intervention_schedule import intervention_schedule_identity_fingerprints
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.simulation_identity import (
@@ -120,6 +120,8 @@ class SimulationRunPreparationDependencies:
     ordinary_contained_owner_identity: Callable[..., Dict[str, Any]]
     record_run_cache_key: Callable[..., None]
     runtime_environment_key: Callable[[], str] = lambda: "contained-child-blas-limited"
+    runtime_lane_budget: Callable[[], int] = lambda: int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
+    max_parallel_batch_workers: Callable[[], int] = lambda: int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
 
 
 def build_fast_preview_solver_grid_context(
@@ -1004,7 +1006,6 @@ class SimulationRunPreparationOwner:
         *,
         intent: RuntimeLaunchIntent,
         fast_mode: bool,
-        preferred_lane_capacity: int | None = None,
     ) -> PreparedRuntimeRequestSet:
         rows_or_block = self._runtime_request_rows(intent.rows)
         if isinstance(rows_or_block, RuntimePreparationBlockedReason):
@@ -1101,13 +1102,43 @@ class SimulationRunPreparationOwner:
                     set_ids=tuple(mechanism_context.queue_ids),
                 ),
             )
-        preferred = max(1, int(preferred_lane_capacity or min(len(descriptors), max(1, int(PROJECT_DEFAULTS["max_parallel_batch_workers"])))))
+        preferred = self._runtime_preferred_lane_capacity(rows=rows, descriptor_count=len(descriptors))
         return PreparedRuntimeRequestSet(
             intent=intent,
             compatibility_key=compatibility_key,
             task_descriptors=descriptors,
             required_lane_capacity=1,
             preferred_lane_capacity=preferred,
+        )
+
+    def _runtime_preferred_lane_capacity(
+        self,
+        *,
+        rows: Sequence[int],
+        descriptor_count: int,
+    ) -> int:
+        try:
+            lane_budget = int(self._deps.runtime_lane_budget())
+        except Exception:
+            lane_budget = int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
+        try:
+            max_workers = int(self._deps.max_parallel_batch_workers())
+        except Exception:
+            max_workers = int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
+        row_count = max(0, len(tuple(rows or ())))
+        descriptor_limit = max(1, int(descriptor_count or 1))
+        return max(
+            1,
+            min(
+                max(1, int(lane_budget)),
+                descriptor_limit,
+                int(
+                    compute_effective_batch_workers(
+                        num_sets=row_count,
+                        max_parallel_workers=max(1, int(max_workers)),
+                    )
+                ),
+            ),
         )
 
     def _runtime_request_rows(
@@ -1202,7 +1233,8 @@ class SimulationRunPreparationOwner:
         structural_payload = {
             "execution_profile": "preview" if bool(fast_mode) else "explicit",
             "runtime_parameter_names": list(runtime_parameter_names),
-            "solver_keys": sorted(str(key) for key in dict(solver_context.solver_config or {}).keys()),
+            "solver_config": dict(solver_context.solver_config or {}),
+            "t_end": float(solver_context.t_end),
             "schema_key": "simulation-plan-v1",
         }
         structural_digest = hashlib.sha256(

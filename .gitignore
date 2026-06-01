@@ -37,6 +37,7 @@ Thumbs.db
 
 # Logs and Dev Documentation
 *.log
+docs/
 knownbugs.md
 TODO.md
 AGENTS.md

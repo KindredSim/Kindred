@@ -9,9 +9,18 @@ from kindred.gui.controllers.runtime_lane_allocation import (
     RuntimeBackendTask,
     RuntimeDispatchPlan,
     RuntimeLane,
+    RuntimeReleaseResult,
     RuntimeTaskDescriptor,
 )
 from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
+from kindred.gui.controllers.simulation_runtime_orchestrator import RuntimeUiEffect
+
+
+@dataclass(frozen=True)
+class SimulationRuntimeDispatchResult:
+    started: bool
+    effects: tuple[RuntimeUiEffect, ...] = ()
+    release_result: RuntimeReleaseResult | None = None
 
 
 @dataclass(frozen=True)
@@ -19,13 +28,8 @@ class SimulationRuntimeDispatchDependencies:
     next_run_id: Callable[[], int]
     load_context: Callable[..., Mapping[str, Any]]
     callback_identity_for_descriptor: Callable[..., SimulationCallbackIdentity]
-    set_simulation_running: Callable[[bool], None]
-    set_slider_simulation_active: Callable[[bool], None]
-    release_dispatch_plan: Callable[..., bool]
-    render_failure: Callable[..., None]
-    set_active_dispatch_plan: Callable[[RuntimeDispatchPlan | None], None]
+    runtime_lifecycle: Any
     record_nonfatal_exception: Callable[[str, BaseException], None]
-    start_completion_poll_timer: Callable[[], None]
     deactivate_dispatch_context: Callable[[Mapping[str, Any]], None] | None = None
 
 
@@ -45,11 +49,19 @@ class SimulationRuntimeDispatchOwner:
         self._deps = dependencies
         self._parent = parent
 
-    def dispatch(self, dispatch_plan: RuntimeDispatchPlan) -> bool:
+    def dispatch(self, dispatch_plan: RuntimeDispatchPlan) -> SimulationRuntimeDispatchResult:
         descriptors = tuple(dispatch_plan.ordered_task_descriptors or ())
         if not descriptors:
-            self._deps.release_dispatch_plan(dispatch_plan, failed=True)
-            return False
+            consequence = self._deps.runtime_lifecycle.dispatch_rejected(
+                dispatch_plan,
+                message="Runtime dispatch plan has no tasks.",
+                retryable=True,
+            )
+            return SimulationRuntimeDispatchResult(
+                started=False,
+                effects=tuple(consequence.effects),
+                release_result=consequence.release_result,
+            )
         try:
             self._validate_dispatch_plan_ready(dispatch_plan)
             backend_tasks = tuple(
@@ -63,9 +75,16 @@ class SimulationRuntimeDispatchOwner:
                 if not dict(descriptor.plan_payload or {}):
                     raise RuntimeError("Runtime task descriptor is missing a simulation plan.")
         except Exception as exc:
-            self._deps.release_dispatch_plan(dispatch_plan, failed=True)
-            self._deps.render_failure(str(exc), retryable=True)
-            return False
+            consequence = self._deps.runtime_lifecycle.dispatch_rejected(
+                dispatch_plan,
+                message=str(exc),
+                retryable=True,
+            )
+            return SimulationRuntimeDispatchResult(
+                started=False,
+                effects=tuple(consequence.effects),
+                release_result=consequence.release_result,
+            )
         return self._dispatch_task_queue(dispatch_plan, descriptors, backend_tasks)
 
     def _dispatch_task_queue(
@@ -73,10 +92,13 @@ class SimulationRuntimeDispatchOwner:
         dispatch_plan: RuntimeDispatchPlan,
         descriptors: tuple[RuntimeTaskDescriptor, ...],
         backend_tasks: tuple[RuntimeBackendTask, ...],
-    ) -> bool:
+    ) -> SimulationRuntimeDispatchResult:
         context: Mapping[str, Any] | None = None
         began = False
         submitted = 0
+        abort_release_result: RuntimeReleaseResult | None = None
+        abort_effects: tuple[RuntimeUiEffect, ...] = ()
+        release_result: RuntimeReleaseResult | None = None
         try:
             run_id = self._deps.next_run_id()
             context = self._deps.load_context(
@@ -98,12 +120,11 @@ class SimulationRuntimeDispatchOwner:
                 fast_mode=bool(fast_mode),
                 queue_ids=queue_ids,
                 queue_names=queue_names,
-                keep_lane_pool_alive=bool(dispatch_plan.launch_allocation.retain_lanes_after_success),
                 preview_owner_epoch=dispatch_plan.launch_allocation.launch_intent.preview_epoch,
-                cache_key=str(descriptors[0].cache_key if descriptors else ""),
             )
             began = True
-            self._deps.set_active_dispatch_plan(dispatch_plan)
+            started_consequence = self._deps.runtime_lifecycle.dispatch_started(dispatch_plan)
+            runtime_effects = tuple(started_consequence.effects)
             for descriptor, backend_task in zip(descriptors, backend_tasks):
                 self._submit_task_descriptor(
                     descriptor,
@@ -113,23 +134,18 @@ class SimulationRuntimeDispatchOwner:
                     context=context,
                 )
                 submitted += 1
-            self._deps.set_simulation_running(True)
-            self._deps.set_slider_simulation_active(bool(fast_mode))
-            self._ui.run_ui.set_run_button_enabled(False)
-            self._ui.run_ui.set_stop_button_enabled(True)
-            self._ui.run_ui.set_sim_progress_value(0)
-            self._ui.run_ui.set_status_text(
-                f"Running {len(descriptors)} sets on {accepted_capacity} runtime lanes..."
-            )
-            self._deps.start_completion_poll_timer()
-            return True
+            _ = accepted_capacity
+            return SimulationRuntimeDispatchResult(started=True, effects=runtime_effects)
         except Exception as exc:
             if began or submitted:
                 try:
-                    self._batch_executor.shutdown(
-                        force_terminate=True,
-                        record_nonfatal_exception=self._deps.record_nonfatal_exception,
+                    abort_consequence = self._deps.runtime_lifecycle.dispatch_aborted(
+                        dispatch_plan,
+                        message=str(exc),
+                        retryable=True,
                     )
+                    abort_release_result = abort_consequence.release_result
+                    abort_effects = tuple(abort_consequence.effects)
                 except Exception as shutdown_exc:
                     self._deps.record_nonfatal_exception(
                         "Failed to shut down partially submitted runtime dispatch",
@@ -137,14 +153,19 @@ class SimulationRuntimeDispatchOwner:
                     )
             if context is not None and callable(self._deps.deactivate_dispatch_context):
                 self._deps.deactivate_dispatch_context(context)
-            self._deps.set_active_dispatch_plan(None)
-            self._deps.set_simulation_running(False)
-            self._deps.set_slider_simulation_active(False)
-            self._ui.run_ui.set_run_button_enabled(True)
-            self._ui.run_ui.set_stop_button_enabled(False)
-            self._deps.release_dispatch_plan(dispatch_plan, failed=True)
-            self._deps.render_failure(str(exc), retryable=True)
-            return False
+            if not (began or submitted):
+                rejection_consequence = self._deps.runtime_lifecycle.dispatch_rejected(
+                    dispatch_plan,
+                    message=str(exc),
+                    retryable=True,
+                )
+                release_result = rejection_consequence.release_result
+                abort_effects = tuple(rejection_consequence.effects)
+            return SimulationRuntimeDispatchResult(
+                started=False,
+                effects=abort_effects,
+                release_result=abort_release_result or release_result,
+            )
 
     def _submit_task_descriptor(
         self,
@@ -188,6 +209,9 @@ class SimulationRuntimeDispatchOwner:
             raise RuntimeError("Runtime task descriptor is missing a provider backend pool token.")
         if backend_generation <= 0:
             raise RuntimeError("Runtime task descriptor is missing a provider backend generation.")
+        backend_capacity = int(runtime_lane.backend_lease_capacity or 0)
+        if backend_capacity <= 0:
+            raise RuntimeError("Runtime task descriptor is missing provider backend lease capacity.")
         return RuntimeBackendTask(
             descriptor=descriptor,
             dispatch_plan_id=str(dispatch_plan.launch_allocation.allocation_id),
@@ -199,7 +223,7 @@ class SimulationRuntimeDispatchOwner:
                 pool_token=backend_pool_token,
                 generation=backend_generation,
                 compatibility_key=runtime_lane.compatibility_key,
-                capacity=1,
+                capacity=backend_capacity,
             ),
         )
 

@@ -13,7 +13,6 @@ class SimulationCallbackIdentity:
     batch_set: Optional[str]
     batch_set_id: Optional[str]
     cache_key: str
-    callback_context: Mapping[str, Any]
     simulation_identity: Mapping[str, Any]
     preview_batch_cache_token: Optional[str] = None
     launch_provenance: Mapping[str, Any] | None = None
@@ -33,8 +32,6 @@ class SimulationCallbackIdentity:
             raise ValueError("SimulationCallbackIdentity.request_id is required.")
         if self.cache_key is None:
             raise ValueError("SimulationCallbackIdentity.cache_key is required.")
-        if not isinstance(self.callback_context, Mapping):
-            raise ValueError("SimulationCallbackIdentity.callback_context is required.")
         if not isinstance(self.simulation_identity, Mapping):
             raise ValueError("SimulationCallbackIdentity.simulation_identity is required.")
         object.__setattr__(self, "run_id", int(self.run_id))
@@ -48,7 +45,6 @@ class SimulationCallbackIdentity:
         object.__setattr__(self, "batch_set", str(self.batch_set) if self.batch_set is not None else None)
         object.__setattr__(self, "batch_set_id", str(self.batch_set_id) if self.batch_set_id is not None else None)
         object.__setattr__(self, "cache_key", str(self.cache_key))
-        object.__setattr__(self, "callback_context", self.callback_context)
         object.__setattr__(self, "simulation_identity", dict(self.simulation_identity))
         object.__setattr__(
             self,
@@ -82,7 +78,6 @@ class SimulationCallbackIdentity:
         batch_set: Optional[str],
         batch_set_id: Optional[str],
         cache_key: str,
-        callback_context: Mapping[str, Any],
         simulation_identity: Mapping[str, Any],
         preview_batch_cache_token: Optional[str] = None,
         launch_provenance: Mapping[str, Any] | None = None,
@@ -109,7 +104,6 @@ class SimulationCallbackIdentity:
             batch_set=str(batch_set) if batch_set is not None else None,
             batch_set_id=str(batch_set_id) if batch_set_id is not None else None,
             cache_key=str(cache_key),
-            callback_context=callback_context,
             simulation_identity=simulation_identity,
             preview_batch_cache_token=(
                 str(preview_batch_cache_token) if preview_batch_cache_token is not None else None

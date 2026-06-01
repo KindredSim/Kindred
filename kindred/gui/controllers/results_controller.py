@@ -48,6 +48,7 @@ from kindred.gui.ports import (
     DisplayTransitionCause,
     DisplayTransitionOutcome,
     DisplayTransitionOutcomeKind,
+    FreshPreviewDisplayEntry,
     FreshPreviewDisplayTransaction,
     PlotCsvExportColumn,
     PlotDisplayLayersPayload,
@@ -83,6 +84,24 @@ def _coerce_display_refresh_source(source: object | None) -> DisplayRefreshSourc
             if raw == candidate.value or raw == candidate.name:
                 return candidate
     return DisplayRefreshSource.INCIDENTAL_REFRESH
+
+
+def _display_transition_published(outcome: SimulationCompletionDisplayOutcome | None) -> bool:
+    transition = outcome.transition_outcome if outcome is not None else None
+    return (
+        isinstance(transition, DisplayTransitionOutcome)
+        and transition.kind is DisplayTransitionOutcomeKind.PUBLISHED
+    )
+
+
+def _display_transition_log_reason(outcome: SimulationCompletionDisplayOutcome | None) -> str:
+    transition = outcome.transition_outcome if outcome is not None else None
+    if isinstance(transition, DisplayTransitionOutcome):
+        cause = transition.cause
+        if cause is not None:
+            return str(cause.value)
+        return str(transition.kind.value)
+    return ""
 
 
 @dataclass(frozen=True)
@@ -151,6 +170,14 @@ class BatchDisplayRefreshRequest:
 @dataclass(frozen=True, slots=True)
 class AuthoritativeResultDisplayTransitionOutcome:
     refresh_requested: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSliderReplayDisplayRefresh:
+    display_outcome: SimulationCompletionDisplayOutcome | None = None
+    displayed: bool = False
+    focused_controls_use_workspace: Optional[bool] = None
+    log_reason: str = ""
 
 
 class CompletedRunDisplayConflictPolicy(Enum):
@@ -2730,15 +2757,6 @@ class ResultsController(QtCore.QObject):
     ) -> BatchDisplayRefreshOutcome:
         requested_show_set_ids = tuple(str(set_id) for set_id in (request.requested_show_set_ids or ()) if str(set_id))
         if not requested_show_set_ids:
-            scope_deauthorization = self._deauthorize_active_display_after_display_scope_refresh(
-                request=request,
-                requested_show_set_ids=requested_show_set_ids,
-            )
-            if scope_deauthorization is not None:
-                return BatchDisplayRefreshOutcome(
-                    focused_controls_use_workspace=None,
-                    transition_outcome=scope_deauthorization,
-                )
             if self._completed_run_display_transaction_active():
                 transition_outcome = self._completed_run_denied_unavailable_outcome(
                     request=request,
@@ -2782,9 +2800,15 @@ class ResultsController(QtCore.QObject):
         *,
         display_source: object | None = None,
     ) -> BatchDisplayRefreshOutcome:
-        requested_show_set_ids = tuple(
-            str(set_id) for set_id in (self._ui.requested_show_batch_set_ids() or ()) if str(set_id)
-        )
+        display_request_ids_getter = getattr(self._ui, "effective_display_request_set_ids", None)
+        if callable(display_request_ids_getter):
+            requested_show_set_ids = tuple(
+                str(set_id) for set_id in (display_request_ids_getter() or ()) if str(set_id)
+            )
+        else:
+            requested_show_set_ids = tuple(
+                str(set_id) for set_id in (self._ui.requested_show_batch_set_ids() or ()) if str(set_id)
+            )
         prefer = self._ui.focused_batch_set_id()
         focused_dirty = bool(self._ui.focused_show_request_is_dirty(requested_show_set_ids, prefer))
         request = BatchDisplayRefreshRequest(
@@ -3739,6 +3763,56 @@ class ResultsController(QtCore.QObject):
             transition_outcome=outcome.transition_outcome,
         )
 
+    def publish_fresh_preview_from_entries(
+        self,
+        *,
+        fresh_preview_entries: Mapping[str, FreshPreviewDisplayEntry],
+        requested_show_set_ids: Sequence[str],
+        target_set_ids: Sequence[str],
+        prefer_set: Optional[str],
+        cache_key: str,
+        request_id: Optional[int],
+        run_id: Optional[int],
+    ) -> Optional[SimulationCompletionDisplayOutcome]:
+        entries_by_id = {
+            str(set_id): entry
+            for set_id, entry in dict(fresh_preview_entries or {}).items()
+            if str(set_id) and isinstance(entry, FreshPreviewDisplayEntry)
+        }
+        if not entries_by_id:
+            return None
+        requested_show_ids = tuple(deduped_set_ids(requested_show_set_ids or ()))
+        target_ids = tuple(deduped_set_ids(target_set_ids or ()))
+        if not target_ids:
+            return None
+        display_ids = requested_show_ids or target_ids
+        if (
+            not display_ids
+            or set(display_ids) != set(target_ids)
+            or set(target_ids) != set(entries_by_id)
+        ):
+            return None
+        primary_id = str(prefer_set or "").strip()
+        if primary_id not in display_ids:
+            primary_id = str(display_ids[0])
+        transaction = FreshPreviewDisplayTransaction(
+            entries=tuple(entries_by_id[set_id] for set_id in display_ids),
+            display_set_ids=display_ids,
+            target_set_ids=target_ids,
+            display_primary_set_id=primary_id,
+            cache_key=str(cache_key or ""),
+            display_source=DisplayRefreshSource.SLIDER_REPLAY,
+            requested_show_set_ids=requested_show_ids or display_ids,
+            requested_labels_by_set_id={
+                str(set_id): str(self._ui.batch_name_for_id(str(set_id)) or set_id)
+                for set_id in (requested_show_ids or display_ids)
+                if str(set_id)
+            },
+            request_id=(int(request_id) if request_id is not None else None),
+            run_id=(int(run_id) if run_id is not None else None),
+        )
+        return self.publish_fresh_preview_display(transaction)
+
     def publish_fresh_preview_display(
         self,
         transaction: FreshPreviewDisplayTransaction,
@@ -3884,6 +3958,212 @@ class ResultsController(QtCore.QObject):
         )
         return SimulationCompletionDisplayOutcome(
             transition_outcome=outcome.transition_outcome,
+        )
+
+    def publish_slider_replay_display_scope(
+        self,
+        *,
+        cache_admin: object | None,
+        cache_key: str,
+        cache_kind: str,
+        requested_show_set_ids: Sequence[str],
+        target_set_ids: Sequence[str],
+        prefer_set: Optional[str],
+        valid_set_ids: Sequence[str],
+        fresh_preview_entries: Mapping[str, FreshPreviewDisplayEntry],
+        request_id: Optional[int],
+        run_id: Optional[int],
+    ) -> Optional[SimulationCompletionDisplayOutcome]:
+        if str(cache_kind or "") == "preview":
+            outcome = self.refresh_display_from_request_scope(
+                display_source=DisplayRefreshSource.SLIDER_REPLAY,
+            )
+            if _display_transition_published(outcome):
+                return outcome
+            return self.publish_fresh_preview_from_entries(
+                fresh_preview_entries=fresh_preview_entries,
+                requested_show_set_ids=requested_show_set_ids,
+                target_set_ids=target_set_ids,
+                prefer_set=prefer_set,
+                cache_key=cache_key,
+                request_id=request_id,
+                run_id=run_id,
+            )
+        if valid_set_ids:
+            publisher = getattr(cache_admin, "publish_completion_cache_truth", None)
+            if callable(publisher):
+                publisher(
+                    is_preview=False,
+                    cache_key=str(cache_key),
+                    clear_active_cache_identity_state=False,
+                    active_cache_key=str(cache_key),
+                    active_cache_preview_token=None,
+                    active_cache_preview_scope_set_ids=None,
+                    active_cache_valid_set_ids=valid_set_ids,
+                    active_cache_invalidated_set_ids=None,
+                )
+        return self.publish_cached_batch_display_scope(
+            cache_key=str(cache_key),
+            requested_show_set_ids=requested_show_set_ids,
+            prefer_set=prefer_set,
+            display_source=DisplayRefreshSource.SLIDER_REPLAY,
+        )
+
+    def publish_runtime_slider_replay_display(
+        self,
+        *,
+        cache_admin: object | None,
+        cache_key: str,
+        cache_kind: str,
+        live_requested_show_set_ids: Sequence[str],
+        target_set_ids: Sequence[str],
+        focused_set_id: Optional[str],
+        valid_set_ids: Sequence[str],
+        fresh_preview_entries: Mapping[str, FreshPreviewDisplayEntry],
+        request_id: Optional[int],
+        run_id: Optional[int],
+        accepted_preview_request_id: Optional[int],
+        accepted_preview_owner_epoch: Optional[int],
+        current_preview_request_id: Optional[int],
+        current_preview_owner_epoch: Optional[int],
+        latest_request_id: int,
+        active_run_id: int,
+    ) -> Optional[SimulationCompletionDisplayOutcome]:
+        cache_kind_s = str(cache_kind or "")
+        request_current = self._runtime_slider_replay_request_is_current(
+            cache_kind=cache_kind_s,
+            request_id=request_id,
+            accepted_preview_request_id=accepted_preview_request_id,
+            accepted_preview_owner_epoch=accepted_preview_owner_epoch,
+            current_preview_request_id=current_preview_request_id,
+            current_preview_owner_epoch=current_preview_owner_epoch,
+            latest_request_id=latest_request_id,
+        )
+        if request_id is not None and not bool(request_current):
+            return None
+        if run_id is not None and int(run_id) != int(active_run_id):
+            return None
+        target_ids = tuple(str(set_id) for set_id in target_set_ids or () if str(set_id))
+        live_requested_ids = tuple(
+            str(set_id) for set_id in live_requested_show_set_ids or () if str(set_id)
+        )
+        requested_show_ids = target_ids if cache_kind_s == "preview" and target_ids else live_requested_ids
+        if not requested_show_ids:
+            return None
+        prefer_set = str(focused_set_id or "") or None
+        return self.publish_slider_replay_display_scope(
+            cache_admin=cache_admin,
+            cache_key=str(cache_key),
+            cache_kind=str(cache_kind),
+            requested_show_set_ids=requested_show_ids,
+            target_set_ids=target_ids,
+            prefer_set=prefer_set,
+            valid_set_ids=valid_set_ids,
+            fresh_preview_entries=fresh_preview_entries,
+            request_id=request_id,
+            run_id=run_id,
+        )
+
+    def publish_runtime_slider_replay_display_from_pending(
+        self,
+        *,
+        cache_admin: object | None,
+        pending: object,
+        cache_key: Optional[str] = None,
+        request_id: Optional[int] = None,
+        run_id: Optional[int] = None,
+        current_preview_request_id: Optional[int],
+        current_preview_owner_epoch: Optional[int],
+        latest_request_id: int,
+        active_run_id: int,
+    ) -> RuntimeSliderReplayDisplayRefresh:
+        pending_cache_key = str(getattr(pending, "cache_key", "") or "")
+        pending_cache_kind = str(getattr(pending, "cache_kind", "") or "")
+        resolved_cache_key = str(cache_key or pending_cache_key or "")
+        if not resolved_cache_key:
+            return RuntimeSliderReplayDisplayRefresh()
+        resolved_request_id = (
+            getattr(pending, "request_id", None)
+            if request_id is None
+            else request_id
+        )
+        resolved_run_id = getattr(pending, "run_id", None) if run_id is None else run_id
+        target_set_ids = tuple(
+            str(set_id)
+            for set_id in getattr(pending, "target_set_ids", ())
+            if str(set_id)
+        )
+        try:
+            live_requested_show_set_ids = tuple(
+                str(set_id)
+                for set_id in (self._ui.requested_show_batch_set_ids() or ())
+                if str(set_id)
+            )
+        except Exception as exc:
+            logger.debug("Failed to snapshot requested Show ids for slider replay: %s", exc, exc_info=True)
+            live_requested_show_set_ids = ()
+        try:
+            focused_set_id = self._ui.focused_batch_set_id()
+        except Exception as exc:
+            logger.debug("Failed to snapshot focused set id for slider replay: %s", exc, exc_info=True)
+            focused_set_id = None
+        display_outcome = self.publish_runtime_slider_replay_display(
+            cache_admin=cache_admin,
+            cache_key=resolved_cache_key,
+            cache_kind=pending_cache_kind,
+            live_requested_show_set_ids=live_requested_show_set_ids,
+            target_set_ids=target_set_ids,
+            focused_set_id=focused_set_id,
+            valid_set_ids=getattr(pending, "valid_set_ids", ()),
+            fresh_preview_entries=dict(getattr(pending, "fresh_preview_entries", {}) or {}),
+            request_id=resolved_request_id,
+            run_id=resolved_run_id,
+            accepted_preview_request_id=getattr(pending, "accepted_preview_request_id", None),
+            accepted_preview_owner_epoch=getattr(pending, "accepted_preview_owner_epoch", None),
+            current_preview_request_id=current_preview_request_id,
+            current_preview_owner_epoch=current_preview_owner_epoch,
+            latest_request_id=int(latest_request_id),
+            active_run_id=int(active_run_id),
+        )
+        displayed = _display_transition_published(display_outcome)
+        focus_sync = (
+            getattr(display_outcome, "focused_controls_use_workspace", None)
+            if bool(displayed) and pending_cache_kind == "preview"
+            else None
+        )
+        return RuntimeSliderReplayDisplayRefresh(
+            display_outcome=display_outcome,
+            displayed=bool(displayed),
+            focused_controls_use_workspace=focus_sync,
+            log_reason=_display_transition_log_reason(display_outcome),
+        )
+
+    @staticmethod
+    def _runtime_slider_replay_request_is_current(
+        *,
+        cache_kind: str,
+        request_id: Optional[int],
+        accepted_preview_request_id: Optional[int],
+        accepted_preview_owner_epoch: Optional[int],
+        current_preview_request_id: Optional[int],
+        current_preview_owner_epoch: Optional[int],
+        latest_request_id: int,
+    ) -> bool:
+        if request_id is None:
+            return True
+        if str(cache_kind or "") != "preview":
+            return int(request_id) == int(latest_request_id)
+        if (
+            accepted_preview_request_id is None
+            or accepted_preview_owner_epoch is None
+            or current_preview_request_id is None
+            or current_preview_owner_epoch is None
+        ):
+            return False
+        return (
+            int(current_preview_request_id) == int(request_id)
+            and int(accepted_preview_request_id) == int(request_id)
+            and int(current_preview_owner_epoch) == int(accepted_preview_owner_epoch)
         )
 
     def publish_direct_completion_result(

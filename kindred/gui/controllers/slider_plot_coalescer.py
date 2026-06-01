@@ -53,25 +53,50 @@ class SliderPlotCoalescer(QtCore.QObject):
         set_id: Optional[str],
         cache_key: Optional[str],
         request_id: Optional[int],
-        request_accepted: bool,
         run_id: Optional[int],
-        accepted_preview_request_id: Optional[int],
-        accepted_preview_owner_epoch: Optional[int],
         slider_triggered: bool,
+        preview_request_id: Optional[int],
+        preview_owner_epoch: Optional[int],
+        preview_target_set_ids: Sequence[str],
+        latest_request_id: int,
         valid_set_ids: Optional[Sequence[str]],
         fresh_preview_entry: Optional[FreshPreviewDisplayEntry],
-        target_set_ids: Sequence[str],
         active_run_id: int,
         record_nonfatal_exception: Callable[[str, BaseException], None],
     ) -> None:
         cache_token = str(cache_key or "").strip()
         if not cache_token:
             return
+        request_accepted = self._request_can_display(
+            request_id=request_id,
+            slider_triggered=bool(slider_triggered),
+            preview_request_id=preview_request_id,
+            latest_request_id=int(latest_request_id),
+        )
         if request_id is not None and not bool(request_accepted):
             return
         if run_id is not None and int(run_id) != int(active_run_id):
             return
         incoming_cache_kind = "preview" if bool(slider_triggered) else "result"
+        normalized_targets = (
+            tuple(str(set_id) for set_id in (preview_target_set_ids or ()) if str(set_id))
+            if bool(slider_triggered) and bool(request_accepted)
+            else ()
+        )
+        accepted_preview_request_id = (
+            int(preview_request_id)
+            if bool(slider_triggered)
+            and bool(request_accepted)
+            and preview_request_id is not None
+            else None
+        )
+        accepted_preview_owner_epoch = (
+            int(preview_owner_epoch)
+            if bool(slider_triggered)
+            and bool(request_accepted)
+            and preview_owner_epoch is not None
+            else None
+        )
         if self.pending.set_ids and incoming_cache_kind == "preview":
             pending_owner_key = (
                 self.pending.request_id,
@@ -81,7 +106,6 @@ class SliderPlotCoalescer(QtCore.QObject):
                 self.pending.run_id,
                 self.pending.target_set_ids,
             )
-            normalized_targets = tuple(str(set_id) for set_id in (target_set_ids or ()) if str(set_id))
             incoming_owner_key = (
                 int(request_id) if request_id is not None else None,
                 int(accepted_preview_request_id) if accepted_preview_request_id is not None else None,
@@ -92,7 +116,6 @@ class SliderPlotCoalescer(QtCore.QObject):
             )
             if pending_owner_key != incoming_owner_key:
                 self.pending = PendingSliderPlotUpdate()
-        normalized_targets = tuple(str(set_id) for set_id in (target_set_ids or ()) if str(set_id))
         sid = str(set_id or "").strip()
         if sid:
             self.pending.set_ids.add(sid)
@@ -129,6 +152,20 @@ class SliderPlotCoalescer(QtCore.QObject):
             )
         if not self.timer.isActive():
             self.timer.start()
+
+    @staticmethod
+    def _request_can_display(
+        *,
+        request_id: Optional[int],
+        slider_triggered: bool,
+        preview_request_id: Optional[int],
+        latest_request_id: int,
+    ) -> bool:
+        if request_id is None:
+            return True
+        if bool(slider_triggered):
+            return preview_request_id is not None and int(preview_request_id) == int(request_id)
+        return int(request_id) == int(latest_request_id)
 
     def take_pending(self) -> PendingSliderPlotUpdate:
         if self.timer.isActive():
