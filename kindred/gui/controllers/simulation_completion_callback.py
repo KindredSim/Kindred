@@ -20,6 +20,7 @@ class SimulationCompletionCallbackDependencies:
     apply_completion_policy_state_patch: Callable[..., None]
     apply_lifecycle_effects: Callable[..., None]
     apply_runtime_effects: Callable[..., None]
+    runtime_display_completed: Callable[[str], Any]
 
 
 class SimulationCompletionCallbackOwner:
@@ -192,6 +193,17 @@ class SimulationCompletionCallbackOwner:
             isinstance(state.ctx, Mapping)
             and self._batch_context_owner.context_matches_current_run_identity(state.ctx)
         )
+        if bool(
+            stale_fast_decision.deactivate_context_immediately
+            and callback_context_matches_current
+        ):
+            self._deps.runtime_display_completed(
+                self._lifecycle_effect_owner.runtime_display_completion_kind(
+                    self._batch_context_owner.completion_cleanup_state(
+                        state.ctx if isinstance(state.ctx, Mapping) else {}
+                    )
+                )
+            )
         self._deps.apply_lifecycle_effects(
             self._lifecycle_effect_owner.superseded_fast_completion_effects(
                 deactivate_context_immediately=bool(

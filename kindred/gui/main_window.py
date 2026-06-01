@@ -298,6 +298,9 @@ class MainWindow(
         plumbing = build_simulation_plumbing(self)
         self._sim_ui_port: SimulationUiPorts = plumbing.ui_port
         self._sim_controller = plumbing.controller
+        self._sim_controller.set_preview_display_cache_invalidator(
+            self.results_controller.invalidate_workspace_preview_display_and_cache
+        )
         self._sim_controller.runtime_readiness_render_requested.connect(
             self._apply_simulation_runtime_readiness_render_state
         )
@@ -6178,7 +6181,6 @@ class MainWindow(
     def _commit_slider_value(self, name: str, value: float) -> None:
         self._preview_session.commit_slider_value(name, value)
         self._sim_controller.invalidate_slider_preview_work()
-        self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._preview_session.stop_variable_update_timer()
         self._preview_session.stop_slider_release_commit_timer()
         self._materialize_direct_slider_commit_to_authoritative_editors(name, value)
@@ -6470,7 +6472,6 @@ class MainWindow(
         apply_species_overlays: bool,
     ) -> None:
         self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
-        self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._preview_session.stop_variable_update_timer()
         self._preview_session.stop_slider_release_commit_timer()
         self._apply_runtime_parameter_values_to_mechanism_editors(
@@ -6565,13 +6566,10 @@ class MainWindow(
                 target_set_ids=target_set_ids,
             )
         else:
-            self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
-            self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
-            self._preview_session.reset_mechanism_workspaces(target_set_ids)
-            self.results_controller.clear_display_if_workspace_previews_were_displayed(
-                target_set_ids,
-                clear_plot=False,
+            self._sim_controller.discard_slider_preview_work_preserving_runtime_owner(
+                target_set_ids=target_set_ids,
             )
+            self._preview_session.reset_mechanism_workspaces(target_set_ids)
 
             sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
             if sliders is not None and hasattr(sliders, "end_live_drag"):
@@ -6612,18 +6610,10 @@ class MainWindow(
     ) -> bool:
         """Discard staged slider edits and leave the visible display recoverable."""
         targets = target_set_ids or self._effective_slider_edit_target_set_ids()
-        clear_active_cache_identity = (
-            self._simulation_batch_owner.active_preview_cache_identity_matches_current_workspace()
+        self._sim_controller.invalidate_slider_preview_work(
+            target_set_ids=targets,
         )
-        self._sim_controller.invalidate_slider_preview_work()
         self._preview_session.clear_working_transaction(invalidate_preview_work=False)
-        cleared_display = self.results_controller.clear_display_if_workspace_previews_were_displayed(
-            targets,
-            clear_plot=False,
-        )
-        if clear_active_cache_identity:
-            self._simulation_batch_owner.clear_active_cache_identity_state()
-        self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
 
         sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
         if sliders is not None and hasattr(sliders, "end_live_drag"):
@@ -6648,7 +6638,7 @@ class MainWindow(
             logger.exception("Failed to reset species row")
             self._species_panel_available = False
         self._refresh_slider_transaction_button_state()
-        return bool(cleared_display)
+        return True
 
     # ------------------------------------------------------------------
     # Species mode (Batch Initial Conditions sliders)

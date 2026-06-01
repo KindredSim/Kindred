@@ -26,10 +26,14 @@ class RuntimeBackendCancelResult:
 class RuntimeBackendCloseResult:
     active_after_close: int
     pool_closed: bool
+    pool_token: str = ""
+    generation: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "active_after_close", max(0, int(self.active_after_close or 0)))
         object.__setattr__(self, "pool_closed", bool(self.pool_closed))
+        object.__setattr__(self, "pool_token", str(self.pool_token or ""))
+        object.__setattr__(self, "generation", max(0, int(self.generation or 0)))
 
 
 @dataclass(frozen=True)

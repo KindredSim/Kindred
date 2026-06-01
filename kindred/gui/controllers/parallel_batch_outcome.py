@@ -34,7 +34,7 @@ class ParallelBatchOutcomeDependencies:
     runtime_display_completed: Callable[..., None]
     show_scoped_batch_failure_summary: Callable[..., None]
     request_terminal_failure_preview_replay: Callable[..., None]
-    reset_parallel_batch_run_and_shutdown_lane_pool: Callable[..., None]
+    cancel_runtime_for_parallel_outcome_reset: Callable[..., None]
     set_simulation_running: Callable[[bool], None]
     set_slider_simulation_active: Callable[[bool], None]
 
@@ -215,7 +215,7 @@ class ParallelBatchOutcomeOwner:
         self._deps.request_terminal_failure_preview_replay(fast_mode=False)
         return True
 
-    def consume_outcome(
+    def _consume_outcome_decision(
         self,
         *,
         set_id: str,
@@ -224,7 +224,7 @@ class ParallelBatchOutcomeOwner:
         completed_ts: Optional[float] = None,
         completion_record: Optional[BatchCompletionRecord] = None,
         debug_batch_parallel: bool = False,
-    ) -> bool:
+    ) -> RuntimeCompletionDecision:
         sid = str(set_id or "")
         meta: Dict[str, Any] = {}
         if completion_record is not None:
@@ -265,14 +265,14 @@ class ParallelBatchOutcomeOwner:
                 RuntimeError("stale batch lane outcome"),
             )
             if isinstance(runtime_session_stale, Mapping):
-                return True
-            self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
+                return RuntimeCompletionDecision.ignored_stale()
+            self._deps.cancel_runtime_for_parallel_outcome_reset()
             self._deps.set_simulation_running(False)
             self._deps.set_slider_simulation_active(False)
             self._ui.slider.set_slider_triggered_simulation(False)
             self._ui.run_ui.set_run_button_enabled(True)
             self._ui.run_ui.set_stop_button_enabled(False)
-            return False
+            return RuntimeCompletionDecision.ignored_stale()
 
         if callback_identity is None or resolved_run_context is None:
             self._deps.record_nonfatal_exception(
@@ -284,7 +284,7 @@ class ParallelBatchOutcomeOwner:
                 ),
                 RuntimeError("missing parallel batch callback identity"),
             )
-            self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
+            self._deps.cancel_runtime_for_parallel_outcome_reset()
             self._deps.set_simulation_running(False)
             self._deps.set_slider_simulation_active(False)
             self._ui.slider.set_slider_triggered_simulation(False)
@@ -292,23 +292,25 @@ class ParallelBatchOutcomeOwner:
             self._ui.run_ui.set_run_button_enabled(True)
             self._ui.run_ui.set_stop_button_enabled(False)
             self._ui.run_ui.set_status_text("Batch simulation failed")
-            return False
+            return RuntimeCompletionDecision.terminal_failure(
+                "Missing callback identity for active parallel batch outcome."
+            )
 
         freshness = self._deps.freshness.assess_callback(callback_identity, context=resolved_run_context)
         if freshness.stale_run and int(freshness.active_run_id) > 0:
-            return True
+            return RuntimeCompletionDecision.ignored_stale()
         if freshness.dispatch_identity_stale:
             self._deps.freshness.mark_stale_dispatch_identity_callback_consumed(
                 batch_set_id=sid,
                 context=resolved_run_context,
             )
-            return True
+            return RuntimeCompletionDecision.ignored_stale()
         if freshness.runtime_input_stale:
             self._deps.freshness.mark_stale_runtime_input_callback_consumed(
                 batch_set_id=sid,
                 context=resolved_run_context,
             )
-            return True
+            return RuntimeCompletionDecision.ignored_stale()
 
         if resolution.failed:
             error_payload = dict(resolution.error_payload or {})
@@ -317,13 +319,15 @@ class ParallelBatchOutcomeOwner:
                 set_name=set_name,
                 error_payload=error_payload,
             ):
-                return True
+                return RuntimeCompletionDecision.accepted_current()
             self._error_handling_owner.handle_error(
                 error_payload,
                 callback_identity=callback_identity,
             )
-            self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
-            return False
+            self._deps.cancel_runtime_for_parallel_outcome_reset()
+            return RuntimeCompletionDecision.terminal_failure(
+                "Runtime completion reported a terminal failure."
+            )
 
         if bool(debug_batch_parallel):
             logger.info(
@@ -358,21 +362,40 @@ class ParallelBatchOutcomeOwner:
                     "Failed to surface simulation-complete handling failure to UI",
                     ui_exc,
                 )
-            self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
-            return False
-        return True
+            self._deps.cancel_runtime_for_parallel_outcome_reset()
+            return RuntimeCompletionDecision.terminal_failure(str(exc))
+        return RuntimeCompletionDecision.accepted_current()
+
+    def consume_outcome(
+        self,
+        *,
+        set_id: str,
+        outcome: BatchLaneOutcome,
+        source: str,
+        completed_ts: Optional[float] = None,
+        completion_record: Optional[BatchCompletionRecord] = None,
+        debug_batch_parallel: bool = False,
+    ) -> bool:
+        return bool(
+            self._consume_outcome_decision(
+                set_id=set_id,
+                outcome=outcome,
+                source=source,
+                completed_ts=completed_ts,
+                completion_record=completion_record,
+                debug_batch_parallel=debug_batch_parallel,
+            ).accepted
+        )
 
     def consume_runtime_completion(self, event: Any) -> RuntimeCompletionDecision:
-        accepted = self.consume_outcome(
-            set_id=str(getattr(event, "set_id", "") or ""),
-            outcome=getattr(event, "outcome", None),
-            source=str(getattr(event, "source", "") or ""),
-            completed_ts=float(getattr(event, "completed_ts", 0.0) or 0.0),
-            completion_record=getattr(event, "record", None),
-            debug_batch_parallel=False,
-        )
-        if bool(accepted):
-            return RuntimeCompletionDecision.accepted_current()
-        return RuntimeCompletionDecision.terminal_failure(
-            "Runtime completion could not be consumed."
-        )
+        try:
+            return self._consume_outcome_decision(
+                set_id=str(getattr(event, "set_id", "") or ""),
+                outcome=getattr(event, "outcome", None),
+                source=str(getattr(event, "source", "") or ""),
+                completed_ts=float(getattr(event, "completed_ts", 0.0) or 0.0),
+                completion_record=getattr(event, "record", None),
+                debug_batch_parallel=False,
+            )
+        except Exception as exc:
+            return RuntimeCompletionDecision.terminal_failure(str(exc))

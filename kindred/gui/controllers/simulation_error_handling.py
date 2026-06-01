@@ -24,6 +24,7 @@ class SimulationErrorHandlingDependencies:
     apply_completion_policy_state_patch: Callable[..., None]
     apply_lifecycle_effects: Callable[..., None]
     apply_runtime_effects: Callable[..., None]
+    runtime_cancel_requested: Callable[[str], Any]
     capture_terminal_failure_preview_replay_snapshot: Callable[..., Any]
     request_terminal_failure_preview_replay: Callable[..., None]
     request_pending_preview_replay: Callable[..., None]
@@ -132,6 +133,13 @@ class SimulationErrorHandlingOwner:
                 isinstance(ctx, Mapping)
                 and self._batch_context_owner.context_matches_current_run_identity(ctx)
             )
+            if bool(
+                stale_fast_decision.deactivate_context_immediately
+                and callback_context_matches_current
+            ):
+                self._deps.apply_runtime_effects(
+                    self._deps.runtime_cancel_requested("soft_shutdown")
+                )
             self._deps.apply_lifecycle_effects(
                 self._lifecycle_effect_owner.superseded_fast_error_effects(
                     deactivate_context_immediately=bool(
@@ -190,6 +198,11 @@ class SimulationErrorHandlingOwner:
             None
             if bool(cancelled)
             else self._deps.capture_terminal_failure_preview_replay_snapshot()
+        )
+        self._deps.apply_runtime_effects(
+            self._deps.runtime_cancel_requested(
+                "stop" if bool(cancelled) else "terminal_failure"
+            )
         )
         self._deps.apply_lifecycle_effects(
             self._lifecycle_effect_owner.terminal_error_effects(

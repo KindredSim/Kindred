@@ -5,6 +5,7 @@ import logging
 from time import perf_counter
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
+from kindred.gui.controllers.simulation_lifecycle_effects import SimulationLifecycleEffects
 from kindred.gui.controllers.simulation_completion_policy import CacheAuthorityState, CompletionPolicyContext
 from kindred.gui.controllers.simulation_result_materialization import MaterializedDisplayResult
 from kindred.gui.ports import (
@@ -67,7 +68,9 @@ class CompletionResultState:
 @dataclass(frozen=True)
 class SimulationCompletionPublicationDependencies:
     apply_lifecycle_effects: Callable[..., None]
+    runtime_display_completed: Callable[[str], Any]
     record_nonfatal_exception: Callable[[str, BaseException], None]
+    current_mechanism_species_names: Callable[[], Sequence[str]]
     queue_slider_plot_update: Callable[..., None]
     finalize_explicit_batch_dirty_reset: Callable[..., Mapping[str, Any]]
     flush_slider_plot_updates: Callable[..., None]
@@ -1000,13 +1003,64 @@ class SimulationCompletionPublicationOwner:
         logger.info("Displayed results: %s time points", len(completion.t))
         logger.info("Captured simulation provenance and CTC metadata")
 
+    def finalize_without_result(
+        self,
+        ctx: Mapping[str, Any],
+        *,
+        status_text: str = "Simulation complete",
+        shutdown_requested: bool = False,
+    ) -> None:
+        context = self._batch_context_owner.deactivate_if_active(ctx)
+        try:
+            cleanup_state = self._batch_context_owner.completion_cleanup_state(context)
+            if not cleanup_state.fast_mode:
+                context = self._deps.finalize_explicit_batch_dirty_reset(
+                    context,
+                    species_names=self._deps.current_mechanism_species_names(),
+                )
+            summary = self._batch_context_owner.completion_summary(context)
+            self._deps.apply_lifecycle_effects(
+                self._lifecycle_effect_owner.completion_without_result_ui_effects(
+                    summary=summary,
+                    status_text=str(status_text),
+                )
+            )
+            if summary.failed_set_ids and not summary.fast_mode:
+                self._deps.show_scoped_batch_failure_summary(
+                    failed_set_ids=summary.failed_set_ids,
+                    failed_errors=summary.failed_errors,
+                )
+        finally:
+            cleanup_state = self._batch_context_owner.completion_cleanup_state(context)
+            self._deps.runtime_display_completed(
+                self._lifecycle_effect_owner.runtime_display_completion_kind(cleanup_state)
+            )
+            self._deps.apply_lifecycle_effects(
+                SimulationLifecycleEffects(
+                    reset_slider_triggered=True,
+                    clear_shutdown_request=True,
+                    simulation_running=False,
+                    slider_simulation_active=False,
+                    run_enabled=True,
+                    stop_enabled=False,
+                )
+            )
+            self._deps.request_completion_preview_replay(
+                shutdown_requested=bool(shutdown_requested),
+            )
+
     def apply_final_effects(self, state: CompletionCallbackState) -> None:
         cleanup_context = state.ctx if isinstance(state.ctx, Mapping) else {}
+        cleanup_state = self._batch_context_owner.completion_cleanup_state(cleanup_context)
+        self._deps.runtime_display_completed(
+            self._lifecycle_effect_owner.runtime_display_completion_kind(
+                cleanup_state,
+                stale_fast_handoff_after_display=bool(state.stale_fast_handoff_after_display),
+            )
+        )
         self._deps.apply_lifecycle_effects(
             self._lifecycle_effect_owner.successful_completion_final_effects(
-                cleanup_state=self._batch_context_owner.completion_cleanup_state(
-                    cleanup_context
-                ),
+                cleanup_state=cleanup_state,
                 stale_fast_handoff_after_display=bool(state.stale_fast_handoff_after_display),
                 shutdown_requested=bool(state.shutdown_requested),
             )

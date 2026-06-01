@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 import logging
 import os
 from time import perf_counter
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from PySide6 import QtCore
 
@@ -38,6 +38,7 @@ from kindred.gui.controllers.runtime_lane_allocation import (
     RuntimeTaskDescriptor,
 )
 from kindred.gui.controllers.simulation_runtime_orchestrator import (
+    RuntimeDispatchAcceptance,
     RuntimePreviewReplaySnapshot,
     RuntimePreviewReplayState,
     RuntimeUiEffect,
@@ -221,8 +222,10 @@ class SimulationController(QtCore.QObject):
             render=self.runtime_readiness_render_requested.emit,
             current_runtime_input_epochs=self._runtime_input_epochs_for_sets,
             prepared_request_is_current=self._runtime_prepared_request_is_current,
-            next_preview_replay_request_id=self._next_slider_preview_request_id,
+            next_request_id=self._next_sim_request_id,
+            reserve_request_id=self._reserve_sim_request_id,
         )
+        self._preview_display_cache_invalidator: Callable[..., object] | None = None
         self._runtime_dispatch_owner = SimulationRuntimeDispatchOwner(
             ui=self.ui,
             batch_executor=self._batch_parallel,
@@ -252,7 +255,9 @@ class SimulationController(QtCore.QObject):
             result_materialization_owner=self._result_materialization_owner,
             dependencies=SimulationCompletionPublicationDependencies(
                 apply_lifecycle_effects=self._apply_simulation_lifecycle_effects,
+                runtime_display_completed=self._runtime_orchestrator.display_completed,
                 record_nonfatal_exception=self._record_nonfatal_exception,
+                current_mechanism_species_names=self._current_mechanism_species_for_batch_sync,
                 queue_slider_plot_update=self.queue_slider_plot_update,
                 finalize_explicit_batch_dirty_reset=self._finalize_explicit_batch_dirty_reset,
                 flush_slider_plot_updates=self.flush_slider_plot_updates,
@@ -270,7 +275,15 @@ class SimulationController(QtCore.QObject):
                 current_global_epoch=self._current_runtime_input_global_epoch,
                 current_epoch=self._current_runtime_input_epoch,
                 current_set_epoch=self._runtime_input_set_epoch,
-                finalize_batch_queue_done_without_result=self._finalize_batch_queue_done_without_result,
+                finalize_batch_queue_done_without_result=(
+                    lambda ctx: self._completion_publication_owner.finalize_without_result(
+                        ctx,
+                        status_text="Simulation complete",
+                        shutdown_requested=bool(
+                            getattr(self, "_shutdown_requested_for_close", False)
+                        ),
+                    )
+                ),
             )
         )
         self._completion_callback_owner = SimulationCompletionCallbackOwner(
@@ -286,6 +299,7 @@ class SimulationController(QtCore.QObject):
                 apply_completion_policy_state_patch=self._apply_completion_policy_state_patch,
                 apply_lifecycle_effects=self._apply_simulation_lifecycle_effects,
                 apply_runtime_effects=self._apply_runtime_lifecycle_ui_effects,
+                runtime_display_completed=self._runtime_orchestrator.display_completed,
             ),
         )
         self._error_handling_owner = SimulationErrorHandlingOwner(
@@ -300,6 +314,7 @@ class SimulationController(QtCore.QObject):
                 apply_completion_policy_state_patch=self._apply_completion_policy_state_patch,
                 apply_lifecycle_effects=self._apply_simulation_lifecycle_effects,
                 apply_runtime_effects=self._apply_runtime_lifecycle_ui_effects,
+                runtime_cancel_requested=self._runtime_orchestrator.cancel_requested,
                 capture_terminal_failure_preview_replay_snapshot=(
                     self._capture_terminal_failure_preview_replay_snapshot
                 ),
@@ -326,7 +341,7 @@ class SimulationController(QtCore.QObject):
                 request_terminal_failure_preview_replay=(
                     self._request_terminal_failure_preview_replay_effects
                 ),
-                reset_parallel_batch_run_and_shutdown_lane_pool=self._cancel_runtime_for_parallel_outcome_reset,
+                cancel_runtime_for_parallel_outcome_reset=self._cancel_runtime_for_parallel_outcome_reset,
                 set_simulation_running=self._set_simulation_running,
                 set_slider_simulation_active=self._set_slider_simulation_active,
             ),
@@ -435,22 +450,6 @@ class SimulationController(QtCore.QObject):
         self._run_state.latest_sim_request_id = value_i
         if int(getattr(self._run_state, "sim_request_id", 0) or 0) < value_i:
             self._run_state.sim_request_id = value_i
-
-    @property
-    def _pending_slider_sim_request_id(self) -> Optional[int]:
-        return self._pending_slider_preview_launch.request_id
-
-    @property
-    def _pending_slider_target_set_ids(self) -> Tuple[str, ...]:
-        return tuple(
-            str(set_id)
-            for set_id in (self._pending_slider_preview_launch.target_set_ids or ())
-            if str(set_id)
-        )
-
-    @property
-    def _pending_slider_handoff_queued(self) -> bool:
-        return bool(self._pending_slider_preview_launch.handoff_queued)
 
     @property
     def _pending_slider_preview_launch(self) -> PendingSliderPreviewLaunchState:
@@ -567,18 +566,8 @@ class SimulationController(QtCore.QObject):
         *,
         failed_run_context: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        if bool(effects.shutdown_lane_pool):
-            self._apply_runtime_lifecycle_ui_effects(
-                self._runtime_orchestrator.cancel_requested(
-                    kind=effects.runtime_cancel_kind or "shutdown"
-                )
-            )
-        if bool(effects.cleanup_lane_pool):
-            if bool(effects.clear_pending_plot_updates):
-                self._clear_pending_slider_plot_updates()
-            self._runtime_orchestrator.display_completed(
-                kind=effects.runtime_display_kind or "success"
-            )
+        if bool(effects.clear_pending_plot_updates):
+            self._clear_pending_slider_plot_updates()
         if bool(effects.clear_shutdown_request):
             self._clear_shutdown_request_after_close_cleanup()
         if bool(effects.clear_pending_preview_plot_updates):
@@ -1045,9 +1034,6 @@ class SimulationController(QtCore.QObject):
     def next_sim_request_id(self) -> int:
         return int(self._next_sim_request_id())
 
-    def next_slider_preview_request_id(self) -> int:
-        return int(self._next_slider_preview_request_id())
-
     def _pending_slider_preview_rows(self) -> tuple[int, ...]:
         pending = self._pending_slider_preview_launch
         if not bool(pending.active) or not pending.target_set_ids:
@@ -1101,9 +1087,6 @@ class SimulationController(QtCore.QObject):
 
     def launch_pending_slider_preview_replay(self) -> None:
         pending = self._pending_slider_preview_launch
-        if bool(pending.active) and pending.request_id is None:
-            self.clear_pending_slider_preview_replay(clear_plot_updates=False)
-            return
         rows = self._pending_slider_preview_rows()
         if not rows:
             self.clear_pending_slider_preview_replay(clear_plot_updates=False)
@@ -1139,15 +1122,14 @@ class SimulationController(QtCore.QObject):
             intent=intent,
             fast_mode=True,
         )
-        dispatch_plan = self._runtime_orchestrator.accept_prepared_request(prepared)
-        if dispatch_plan is not None:
-            self._dispatch_runtime_plan(dispatch_plan)
+        self._apply_runtime_dispatch_acceptance(
+            self._runtime_orchestrator.accept_prepared_request(prepared)
+        )
 
     def retry_runtime_readiness(self) -> RuntimeDispatchPlan | None:
-        dispatch_plan = self._runtime_orchestrator.retry_runtime_readiness()
-        if dispatch_plan is not None:
-            self._dispatch_runtime_plan(dispatch_plan)
-        return dispatch_plan
+        return self._apply_runtime_dispatch_acceptance(
+            self._runtime_orchestrator.retry_runtime_readiness()
+        )
 
     def _runtime_requested_show_set_ids(self, fallback_set_ids: Sequence[str]) -> tuple[str, ...]:
         requested: Sequence[str] = ()
@@ -1216,7 +1198,16 @@ class SimulationController(QtCore.QObject):
         self,
         prepared: PreparedRuntimeRequestSet,
     ) -> RuntimeDispatchPlan | None:
-        dispatch_plan = self._runtime_orchestrator.accept_prepared_request(prepared)
+        return self._apply_runtime_dispatch_acceptance(
+            self._runtime_orchestrator.accept_prepared_request(prepared)
+        )
+
+    def _apply_runtime_dispatch_acceptance(
+        self,
+        acceptance: RuntimeDispatchAcceptance,
+    ) -> RuntimeDispatchPlan | None:
+        self._apply_runtime_lifecycle_ui_effects(acceptance.effects)
+        dispatch_plan = acceptance.dispatch_plan
         if dispatch_plan is None:
             return None
         self._dispatch_runtime_plan(dispatch_plan)
@@ -1289,17 +1280,36 @@ class SimulationController(QtCore.QObject):
         self._active_run_id = int(self._run_sequence_id)
         return int(self._run_sequence_id)
 
+    def set_preview_display_cache_invalidator(
+        self,
+        invalidator: Callable[..., object] | None,
+    ) -> None:
+        self._preview_display_cache_invalidator = invalidator
+
     def stop_simulation(self) -> None:
         self._stop_simulation()
 
-    def invalidate_slider_preview_work(self) -> None:
-        self._invalidate_slider_preview_work()
+    def invalidate_slider_preview_work(
+        self,
+        *,
+        target_set_ids: Sequence[str] = (),
+    ) -> None:
+        self._invalidate_slider_preview_work(
+            target_set_ids=target_set_ids,
+        )
 
     def slider_preview_work_intersects_target_scope(self, target_set_ids: Sequence[str]) -> bool:
         return bool(self._preview_work_intersects_runtime_input_scope(target_set_ids))
 
-    def discard_slider_preview_work_preserving_runtime_owner(self) -> None:
-        self._invalidate_slider_preview_work(close_runtime_owner=False)
+    def discard_slider_preview_work_preserving_runtime_owner(
+        self,
+        *,
+        target_set_ids: Sequence[str] = (),
+    ) -> None:
+        self._invalidate_slider_preview_work(
+            target_set_ids=target_set_ids,
+            close_runtime_owner=False,
+        )
 
     def invalidate_active_explicit_simulation_for_authoritative_change(self) -> None:
         self._invalidate_active_explicit_simulation_for_authoritative_change()
@@ -1450,12 +1460,6 @@ class SimulationController(QtCore.QObject):
             context=self._batch_context_owner.completion_policy_context(),
         )
 
-    def _has_active_fast_preview_in_flight(self) -> bool:
-        return self._completion_policy.has_active_fast_preview_in_flight(
-            activity=self._completion_policy_activity_snapshot(),
-            context=self._batch_context_owner.completion_policy_context(),
-        )
-
     def _stale_fast_request_still_owns_current_state(self, request_id: int) -> bool:
         return self._completion_policy.stale_fast_request_still_owns_current_state(
             preview_ownership=self._completion_policy_preview_ownership(),
@@ -1562,14 +1566,14 @@ class SimulationController(QtCore.QObject):
         runtime_rows = self._interactive_runtime_rows(rows)
         target_set_ids = self._run_target_set_ids_for_rows(runtime_rows)
         if not runtime_rows or not target_set_ids:
-            return bool(
-                self._runtime_orchestrator.refresh_readiness(
-                    self._blocked_interactive_runtime_readiness_request(
-                        runtime_rows=runtime_rows,
-                        target_set_ids=target_set_ids,
-                    )
+            consequence = self._runtime_orchestrator.refresh_readiness_consequence(
+                self._blocked_interactive_runtime_readiness_request(
+                    runtime_rows=runtime_rows,
+                    target_set_ids=target_set_ids,
                 )
             )
+            self._apply_runtime_lifecycle_ui_effects(consequence.effects)
+            return bool(consequence.launch_available)
         intent = RuntimeLaunchIntent(
             intent_kind="ordinary",
             ui_action="runtime_readiness",
@@ -1584,12 +1588,13 @@ class SimulationController(QtCore.QObject):
             intent=intent,
             fast_mode=False,
         )
-        launch_available = self._runtime_orchestrator.refresh_readiness(prepared)
+        consequence = self._runtime_orchestrator.refresh_readiness_consequence(prepared)
+        self._apply_runtime_lifecycle_ui_effects(consequence.effects)
         self._prewarm_interactive_preview_runtime_readiness(
             runtime_rows=runtime_rows,
             target_set_ids=target_set_ids,
         )
-        return bool(launch_available)
+        return bool(consequence.launch_available)
 
     def _blocked_interactive_runtime_readiness_request(
         self,
@@ -1682,6 +1687,8 @@ class SimulationController(QtCore.QObject):
                     timer.stop()
             if bool(getattr(effect, "start_completion_polling", False)):
                 self._start_batch_completion_poll_timer()
+            if bool(getattr(effect, "schedule_runtime_warmup_retry", False)):
+                QtCore.QTimer.singleShot(0, self.retry_runtime_readiness)
             render_state = getattr(effect, "render_state", None)
             if render_state is not None:
                 self.runtime_readiness_render_requested.emit(render_state)
@@ -1766,13 +1773,30 @@ class SimulationController(QtCore.QObject):
         if cache_kind in ("", "preview"):
             self._plot_coalescer.clear()
 
-    def _invalidate_slider_preview_work(self, *, close_runtime_owner: bool = True) -> None:
+    def _invalidate_slider_preview_work(
+        self,
+        *,
+        target_set_ids: Sequence[str] = (),
+        close_runtime_owner: bool = True,
+    ) -> None:
         invalidation_request_id = int(self._next_sim_request_id())
         self._discarded_slider_preview_generation_id = int(invalidation_request_id)
         self._clear_preview_ownership()
         self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._clear_pending_preview_slider_plot_updates()
-        self.ui.batch.clear_active_preview_cache_identity_state()
+        preview_invalidator = self._preview_display_cache_invalidator
+        normalized_targets = tuple(str(set_id) for set_id in target_set_ids or () if str(set_id))
+        if callable(preview_invalidator):
+            try:
+                preview_invalidator(
+                    target_set_ids=normalized_targets,
+                    clear_plot=False,
+                )
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    "Failed to invalidate preview display/cache owner state",
+                    exc,
+                )
         state = self._batch_context_owner.active_batch_state()
         if (
             state is not None
@@ -2142,50 +2166,6 @@ class SimulationController(QtCore.QObject):
             )
         return dict(ctx or {})
 
-    def _finalize_batch_queue_done_without_result(
-        self,
-        ctx: Mapping[str, Any],
-        *,
-        status_text: str = "Simulation complete",
-    ) -> None:
-        shutdown_requested = bool(getattr(self, "_shutdown_requested_for_close", False))
-        ctx = self._batch_context_owner.deactivate_if_active(ctx)
-        try:
-            cleanup_state = self._batch_context_owner.completion_cleanup_state(ctx)
-            if not cleanup_state.fast_mode:
-                ctx = self._finalize_explicit_batch_dirty_reset(
-                    ctx,
-                    species_names=self._current_mechanism_species_for_batch_sync(),
-                )
-            summary = self._batch_context_owner.completion_summary(ctx)
-            self._apply_simulation_lifecycle_effects(
-                self._lifecycle_effect_owner.completion_without_result_ui_effects(
-                    summary=summary,
-                    status_text=str(status_text),
-                )
-            )
-            if summary.failed_set_ids and not summary.fast_mode:
-                self._show_scoped_batch_failure_summary(
-                    failed_set_ids=summary.failed_set_ids,
-                    failed_errors=summary.failed_errors,
-                )
-        finally:
-            cleanup_state = self._batch_context_owner.completion_cleanup_state(ctx)
-            self._apply_simulation_lifecycle_effects(
-                SimulationLifecycleEffects(reset_slider_triggered=True)
-            )
-            replay_effects = self._runtime_orchestrator.completion_without_result_finalized(
-                pending_state=self._runtime_preview_replay_state(),
-                shutdown_requested=bool(shutdown_requested),
-                display_kind=self._lifecycle_effect_owner.runtime_display_kind_for_cleanup(
-                    cleanup_state
-                ),
-            )
-            if replay_effects:
-                logger.debug("Processing pending slider update after completion")
-                self._apply_runtime_lifecycle_ui_effects(replay_effects)
-            self._clear_shutdown_request_after_close_cleanup()
-
     def _finalize_scoped_batch_success_subset(
         self,
         ctx: Mapping[str, Any],
@@ -2259,23 +2239,19 @@ class SimulationController(QtCore.QObject):
         """Return a new monotonically increasing simulation request id."""
         return int(self._run_state.next_request_id())
 
-    def _next_slider_preview_request_id(self) -> int:
-        if not self._has_active_fast_preview_in_flight():
-            return int(self._next_sim_request_id())
-
-        latest_request_id = int(getattr(self, "_latest_sim_request_id", 0) or 0)
-        pending_request_id = getattr(self, "_pending_slider_sim_request_id", None)
-        if pending_request_id is not None and int(pending_request_id) > latest_request_id:
-            return int(pending_request_id)
-
+    def _reserve_sim_request_id(self) -> int:
         reserve_request_id = getattr(self._run_state, "reserve_request_id", None)
         if callable(reserve_request_id):
-            reserved_request_id = int(reserve_request_id())
-            if reserved_request_id > latest_request_id:
-                return reserved_request_id
-        synced_request_id = int(max(int(getattr(self._run_state, "sim_request_id", 0) or 0), latest_request_id) + 1)
-        self._sim_request_id = synced_request_id
-        return synced_request_id
+            return int(reserve_request_id())
+        next_request_id = int(
+            max(
+                int(getattr(self._run_state, "sim_request_id", 0) or 0),
+                int(getattr(self, "_latest_sim_request_id", 0) or 0),
+            )
+            + 1
+        )
+        self._sim_request_id = next_request_id
+        return next_request_id
 
     def _flush_pending_slider_updates_for_run(self, *, reset_set_ids: Sequence[str] = ()) -> None:
         """
@@ -2781,6 +2757,9 @@ class SimulationController(QtCore.QObject):
 
         if isinstance(context, Mapping):
             self._batch_context_owner.deactivate_if_active(context)
+        self._apply_runtime_lifecycle_ui_effects(
+            self._runtime_orchestrator.cancel_requested(kind="preview_failure")
+        )
         self._apply_simulation_lifecycle_effects(
             self._lifecycle_effect_owner.current_preview_failure_effects(
                 status_text=str(status_text),

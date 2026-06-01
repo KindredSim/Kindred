@@ -82,12 +82,26 @@ class RuntimeUiEffect:
     progress_value: int | None = None
     status_text: str | None = None
     stop_debounce_timers: bool = False
+    schedule_runtime_warmup_retry: bool = False
 
 
 @dataclass(frozen=True)
 class RuntimeDispatchConsequence:
     effects: tuple[RuntimeUiEffect, ...] = ()
     release_result: RuntimeReleaseResult | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeReadinessConsequence:
+    launch_available: bool = False
+    render_state: SimulationRuntimeReadinessRenderState | None = None
+    effects: tuple[RuntimeUiEffect, ...] = ()
+
+
+@dataclass(frozen=True)
+class RuntimeDispatchAcceptance:
+    dispatch_plan: RuntimeDispatchPlan | None = None
+    effects: tuple[RuntimeUiEffect, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -225,7 +239,8 @@ class SimulationRuntimeOrchestrator:
         render: Callable[[SimulationRuntimeReadinessRenderState], object] | None = None,
         current_runtime_input_epochs: Callable[[Sequence[str]], object] | None = None,
         prepared_request_is_current: Callable[[PreparedRuntimeRequestSet], bool] | None = None,
-        next_preview_replay_request_id: Callable[[], int] | None = None,
+        next_request_id: Callable[[], int] | None = None,
+        reserve_request_id: Callable[[], int] | None = None,
         completion_consumer: RuntimeCompletionConsumer | None = None,
     ) -> None:
         self._allocator = allocator
@@ -233,13 +248,13 @@ class SimulationRuntimeOrchestrator:
         self._render = render
         self._current_runtime_input_epochs = current_runtime_input_epochs
         self._prepared_request_is_current = prepared_request_is_current
-        self._next_preview_replay_request_id = next_preview_replay_request_id
+        self._next_request_id = next_request_id
+        self._reserve_request_id = reserve_request_id
         self._completion_consumer = completion_consumer
         self._last_prepared: PreparedRuntimeRequestSet | None = None
         self._last_dispatch_plan: RuntimeDispatchPlan | None = None
         self._manual_retry_prepared: PreparedRuntimeRequestSet | None = None
         self._backend_warmup_prepared: PreparedRuntimeRequestSet | None = None
-        self._preview_replay_prepared: PreparedRuntimeRequestSet | None = None
         self._dispatch_state = RuntimeDispatchState()
 
     @property
@@ -279,7 +294,10 @@ class SimulationRuntimeOrchestrator:
     def set_completion_consumer(self, completion_consumer: RuntimeCompletionConsumer | None) -> None:
         self._completion_consumer = completion_consumer
 
-    def refresh_readiness(self, prepared: PreparedRuntimeRequestSet) -> bool:
+    def refresh_readiness_consequence(
+        self,
+        prepared: PreparedRuntimeRequestSet,
+    ) -> RuntimeReadinessConsequence:
         self._last_prepared = prepared
         self._manual_retry_prepared = None
         self._last_dispatch_plan = None
@@ -297,8 +315,7 @@ class SimulationRuntimeOrchestrator:
                 launch_available=False,
                 preview_available=False,
             )
-            self._render_state(state)
-            return False
+            return self._readiness_consequence(state)
         if not self._prepared_is_current(prepared):
             state = SimulationRuntimeReadinessRenderState(
                 status="stale",
@@ -306,66 +323,107 @@ class SimulationRuntimeOrchestrator:
                 failed=True,
                 launch_available=False,
             )
-            self._render_state(state)
-            return False
-        self._allocator.ensure_ready_lanes(
-            compatibility_key=prepared.compatibility_key,
-            capacity=prepared.preferred_lane_capacity,
-            task_count=len(prepared.task_descriptors),
-            nonblocking=True,
-        )
-        allocation = self._allocator.allocate(
-            RuntimeLaneAllocationRequest(
-                compatibility_key=prepared.compatibility_key,
-                required_lane_capacity=prepared.required_lane_capacity,
-                preferred_lane_capacity=prepared.preferred_lane_capacity,
-                task_count=len(prepared.task_descriptors),
-                request_token=prepared.intent.request_token,
-                scope=prepared.intent.intent_kind,
-                require_backend_lease=True,
+            return self._readiness_consequence(state)
+        if not self._prepared_runtime_input_epochs_current(prepared):
+            state = SimulationRuntimeReadinessRenderState(
+                status="stale",
+                status_text="Runtime input changed before launch readiness completed.",
+                failed=True,
+                launch_available=False,
             )
-        )
-        if allocation.status != "ready":
+            return self._readiness_consequence(state)
+        try:
+            self._allocator.ensure_ready_lanes(
+                compatibility_key=prepared.compatibility_key,
+                capacity=prepared.preferred_lane_capacity,
+                task_count=len(prepared.task_descriptors),
+                nonblocking=True,
+            )
+            probe = self._allocator.probe_readiness(
+                self._allocation_request(prepared),
+            )
+        except Exception as exc:
+            self._manual_retry_prepared = prepared
+            state = self._failure_render_state(str(exc), retryable=True)
+            return self._readiness_consequence(state)
+        if not probe.ready:
             self._backend_warmup_prepared = prepared
             state = SimulationRuntimeReadinessRenderState(
                 status="warming",
-                status_text=allocation.message or "Preparing runtime lanes...",
+                status_text=probe.message or "Preparing runtime lanes...",
                 launch_available=False,
                 preview_available=prepared.intent.intent_kind == "preview",
             )
-            self._render_state(state)
-            return False
+            return self._readiness_consequence(
+                state,
+                extra_effects=(RuntimeUiEffect(schedule_runtime_warmup_retry=True),),
+            )
+        self._backend_warmup_prepared = None
+        state = SimulationRuntimeReadinessRenderState(
+            status="ready",
+            status_text="Ready",
+            launch_available=prepared.intent.intent_kind != "preview",
+            preview_available=prepared.intent.intent_kind == "preview",
+        )
+        return self._readiness_consequence(state)
+
+    def refresh_readiness(self, prepared: PreparedRuntimeRequestSet) -> bool:
+        return bool(self.refresh_readiness_consequence(prepared).launch_available)
+
+    def accept_prepared_request(self, prepared: PreparedRuntimeRequestSet) -> RuntimeDispatchAcceptance:
+        readiness = self._dispatch_acceptance_readiness(prepared)
+        if not self._readiness_state_is_ready(readiness):
+            return RuntimeDispatchAcceptance(effects=readiness.effects)
+        try:
+            self._allocator.ensure_ready_lanes(
+                compatibility_key=prepared.compatibility_key,
+                capacity=prepared.preferred_lane_capacity,
+                task_count=len(prepared.task_descriptors),
+                nonblocking=True,
+            )
+            allocation = self._allocator.allocate(self._allocation_request(prepared))
+        except Exception as exc:
+            self._manual_retry_prepared = prepared
+            return self._dispatch_acceptance_consequence(
+                self._failure_render_state(str(exc), retryable=True),
+            )
+        if allocation.status != "ready":
+            self._backend_warmup_prepared = prepared
+            return self._dispatch_acceptance_consequence(
+                SimulationRuntimeReadinessRenderState(
+                    status="warming",
+                    status_text=allocation.message or "Preparing runtime lanes...",
+                    launch_available=False,
+                    preview_available=prepared.intent.intent_kind == "preview",
+                ),
+                extra_effects=(RuntimeUiEffect(schedule_runtime_warmup_retry=True),),
+            )
         consumed = self._allocator.consume(allocation, prepared, expected=prepared)
         if consumed.dispatch_plan is None:
-            state = SimulationRuntimeReadinessRenderState(
-                status="blocked",
-                status_text=consumed.message or "Runtime request is blocked.",
-                failed=True,
-                retryable=consumed.retryable,
-                launch_available=False,
+            return self._dispatch_acceptance_consequence(
+                SimulationRuntimeReadinessRenderState(
+                    status="blocked",
+                    status_text=consumed.message or "Runtime request is blocked.",
+                    failed=True,
+                    retryable=consumed.retryable,
+                    launch_available=False,
+                )
             )
-            self._render_state(state)
-            return False
         self._last_dispatch_plan = consumed.dispatch_plan
-        self._render_state(
+        return self._dispatch_acceptance_consequence(
             SimulationRuntimeReadinessRenderState(
                 status="ready",
                 status_text="Ready",
                 launch_available=prepared.intent.intent_kind != "preview",
                 preview_available=prepared.intent.intent_kind == "preview",
-            )
+            ),
+            dispatch_plan=self._last_dispatch_plan,
         )
-        return True
 
-    def accept_prepared_request(self, prepared: PreparedRuntimeRequestSet) -> RuntimeDispatchPlan | None:
-        if not self.refresh_readiness(prepared):
-            return None
-        return self._last_dispatch_plan
-
-    def retry_runtime_readiness(self) -> RuntimeDispatchPlan | None:
+    def retry_runtime_readiness(self) -> RuntimeDispatchAcceptance:
         prepared = self._manual_retry_prepared or self._backend_warmup_prepared or self._last_prepared
         if prepared is None:
-            return None
+            return RuntimeDispatchAcceptance()
         return self.accept_prepared_request(prepared)
 
     def prewarm_compatible_runtime_lanes(self, prepared: PreparedRuntimeRequestSet) -> bool:
@@ -410,8 +468,14 @@ class SimulationRuntimeOrchestrator:
     ) -> RuntimeDispatchConsequence:
         if dispatch_plan is not None:
             self._start_dispatch_state(dispatch_plan)
-        if self._backend is not None:
-            self._backend.close_current_run(force_terminate=True)
+        release_result = self._release_current_dispatch(
+            RuntimeReleaseReason.FAILURE,
+            backend_failure=bool(backend_failure),
+        )
+        close_failure = self._close_backend_run(
+            force_terminate=True,
+            reason=RuntimeReleaseReason.FAILURE,
+        )
         effects: list[RuntimeUiEffect] = [
             RuntimeUiEffect(
                 stop_completion_polling=True,
@@ -425,12 +489,11 @@ class SimulationRuntimeOrchestrator:
                 else None,
             )
         ]
+        if close_failure:
+            effects.append(RuntimeUiEffect(surface_failure=close_failure))
         return RuntimeDispatchConsequence(
             effects=tuple(effects),
-            release_result=self._release_current_dispatch(
-                RuntimeReleaseReason.FAILURE,
-                backend_failure=bool(backend_failure),
-            ),
+            release_result=release_result,
         )
 
     def dispatch_rejected(
@@ -473,17 +536,34 @@ class SimulationRuntimeOrchestrator:
             if self._backend is None:
                 self._release_current_dispatch(RuntimeReleaseReason.SUPERSEDED)
                 return [RuntimeUiEffect(stop_completion_polling=True)]
-            result = self._backend.supersede_current_run()
+            try:
+                result = self._backend.supersede_current_run()
+            except Exception as exc:
+                self._release_current_dispatch(
+                    RuntimeReleaseReason.FAILURE,
+                    backend_failure=True,
+                )
+                return [
+                    RuntimeUiEffect(
+                        stop_completion_polling=True,
+                        surface_failure=f"Runtime backend supersede failed: {exc}",
+                    )
+                ]
             if result.running > 0:
                 self._defer_current_dispatch_release(RuntimeReleaseReason.SUPERSEDED)
                 return []
             else:
                 self._release_current_dispatch(RuntimeReleaseReason.SUPERSEDED)
             return [RuntimeUiEffect(stop_completion_polling=True)]
-        if self._backend is not None:
-            self._backend.close_current_run(force_terminate=kind != "soft_shutdown")
         self._release_current_dispatch(RuntimeReleaseReason.SHUTDOWN)
-        return [RuntimeUiEffect(stop_completion_polling=True)]
+        close_failure = self._close_backend_run(
+            force_terminate=kind != "soft_shutdown",
+            reason=RuntimeReleaseReason.SHUTDOWN,
+        )
+        effects = [RuntimeUiEffect(stop_completion_polling=True)]
+        if close_failure:
+            effects.append(RuntimeUiEffect(surface_failure=close_failure))
+        return effects
 
     def display_completed(self, *, kind: str = "success") -> RuntimeReleaseResult:
         if kind in {"scoped_failure", "failure", "preview_failure"}:
@@ -543,16 +623,21 @@ class SimulationRuntimeOrchestrator:
             self._release_pending_dispatch_plan_after_backend_idle(backend_idle=backend_idle)
             return self._polling_effects_after_runtime_consequence_update()
         except Exception as exc:
-            if backend is not None:
-                backend.close_current_run(force_terminate=True)
             self._release_current_dispatch(
                 RuntimeReleaseReason.FAILURE,
                 backend_failure=True,
             )
+            close_failure = self._close_backend_run(
+                force_terminate=True,
+                reason=RuntimeReleaseReason.FAILURE,
+            )
+            message = str(exc)
+            if close_failure:
+                message = f"{message}; {close_failure}"
             return [
                 RuntimeUiEffect(
                     stop_completion_polling=True,
-                    surface_failure=str(exc),
+                    surface_failure=message,
                 )
             ]
 
@@ -576,19 +661,29 @@ class SimulationRuntimeOrchestrator:
         ] + self.terminal_failure(backend_failed=True)
 
     def terminal_failure(self, *, backend_failed: bool = False) -> list[RuntimeUiEffect]:
-        if self._backend is not None:
-            self._backend.close_current_run(force_terminate=True)
         self._release_current_dispatch(
             RuntimeReleaseReason.FAILURE,
             backend_failure=bool(backend_failed),
         )
-        return [RuntimeUiEffect(stop_completion_polling=True)]
+        close_failure = self._close_backend_run(
+            force_terminate=True,
+            reason=RuntimeReleaseReason.FAILURE,
+        )
+        effects = [RuntimeUiEffect(stop_completion_polling=True)]
+        if close_failure:
+            effects.append(RuntimeUiEffect(surface_failure=close_failure))
+        return effects
 
     def close_requested(self, *, force_terminate: bool = True) -> list[RuntimeUiEffect]:
-        if self._backend is not None:
-            self._backend.close_current_run(force_terminate=bool(force_terminate))
         self._release_current_dispatch(RuntimeReleaseReason.SHUTDOWN)
-        return [RuntimeUiEffect(stop_completion_polling=True)]
+        close_failure = self._close_backend_run(
+            force_terminate=bool(force_terminate),
+            reason=RuntimeReleaseReason.SHUTDOWN,
+        )
+        effects = [RuntimeUiEffect(stop_completion_polling=True)]
+        if close_failure:
+            effects.append(RuntimeUiEffect(surface_failure=close_failure))
+        return effects
 
     def preview_replay_exists(
         self,
@@ -624,8 +719,8 @@ class SimulationRuntimeOrchestrator:
         if bool(handoff_queued):
             return []
         replay_request_id = request_id
-        if replay_request_id is None and callable(self._next_preview_replay_request_id):
-            replay_request_id = self._next_preview_replay_request_id()
+        if replay_request_id is None:
+            replay_request_id = self._allocate_preview_replay_request_id()
         if replay_request_id is None:
             return []
         return [
@@ -652,12 +747,12 @@ class SimulationRuntimeOrchestrator:
         next_request_id: int | None
         if request_id is not None:
             next_request_id = int(request_id)
-        elif bool(preserve_existing_request):
+        elif bool(preserve_existing_request) and current.request_id is not None:
             next_request_id = current.request_id
-        elif callable(self._next_preview_replay_request_id):
-            next_request_id = self._next_preview_replay_request_id()
         else:
-            next_request_id = None
+            next_request_id = self._allocate_preview_replay_request_id()
+        if next_request_id is None:
+            return []
         preserve_handoff_queued = bool(
             current.handoff_queued
             and current.target_set_ids == normalized_targets
@@ -886,50 +981,47 @@ class SimulationRuntimeOrchestrator:
             stop_timers=True,
         )
 
-    def completion_without_result_finalized(
-        self,
-        *,
-        pending_state: object,
-        shutdown_requested: bool,
-        display_kind: str = "success",
-    ) -> list[RuntimeUiEffect]:
-        self.display_completed(kind=display_kind or "success")
-        effects: list[RuntimeUiEffect] = [
-            RuntimeUiEffect(
-                simulation_running=False,
-                slider_simulation_active=False,
-                run_enabled=True,
-                stop_enabled=False,
-            )
-        ]
-        if bool(shutdown_requested):
-            return effects
-        pending = (
-            pending_state
-            if isinstance(pending_state, RuntimePreviewReplayState)
-            else RuntimePreviewReplayState.from_pending(pending_state)
-        )
-        effects.extend(
-            self.preview_replay_requested(
-                active=bool(pending.active),
-                request_id=pending.request_id,
-                target_set_ids=pending.target_set_ids,
-                handoff_queued=bool(pending.handoff_queued),
-                stop_timers=True,
-            )
-        )
-        return effects
-
     def render_failure(self, message: str, *, retryable: bool = True) -> None:
         self._manual_retry_prepared = self._last_prepared if bool(retryable) else None
         self._render_state(
             SimulationRuntimeReadinessRenderState(
                 status="failed",
                 status_text=str(message),
-                launch_available=bool(retryable),
+                launch_available=False,
                 failed=True,
                 retryable=bool(retryable),
             )
+        )
+
+    def _close_backend_run(
+        self,
+        *,
+        force_terminate: bool,
+        reason: RuntimeReleaseReason,
+    ) -> str:
+        backend = self._backend
+        if backend is None:
+            return ""
+        try:
+            result = backend.close_current_run(force_terminate=bool(force_terminate))
+        except Exception as exc:
+            return f"Runtime backend close failed: {exc}"
+        self._clear_backend_pool_after_close(result, reason=reason)
+        return ""
+
+    def _clear_backend_pool_after_close(
+        self,
+        result: object,
+        *,
+        reason: RuntimeReleaseReason,
+    ) -> None:
+        pool_token = str(getattr(result, "pool_token", "") or "")
+        if not pool_token:
+            return
+        self._allocator.clear_backend_pool(
+            pool_token=pool_token,
+            generation=int(getattr(result, "generation", 0) or 0),
+            reason=reason,
         )
 
     def _prepared_is_current(self, prepared: PreparedRuntimeRequestSet) -> bool:
@@ -940,6 +1032,101 @@ class SimulationRuntimeOrchestrator:
             return bool(provider(prepared))
         except Exception:
             return False
+
+    def _prepared_runtime_input_epochs_current(self, prepared: PreparedRuntimeRequestSet) -> bool:
+        provider = self._current_runtime_input_epochs
+        if provider is None:
+            return True
+        expected = {
+            str(key): int(value)
+            for key, value in dict(getattr(prepared.intent, "runtime_input_epochs", {}) or {}).items()
+            if str(key)
+        }
+        if not expected:
+            return True
+        try:
+            current_raw = provider(tuple(prepared.intent.set_ids or ()))
+        except Exception:
+            return False
+        current = {
+            str(key): int(value)
+            for key, value in dict(current_raw or {}).items()
+            if str(key)
+        }
+        return current == expected
+
+    def _allocation_request(self, prepared: PreparedRuntimeRequestSet) -> RuntimeLaneAllocationRequest:
+        return RuntimeLaneAllocationRequest(
+            compatibility_key=prepared.compatibility_key,
+            required_lane_capacity=prepared.required_lane_capacity,
+            preferred_lane_capacity=prepared.preferred_lane_capacity,
+            task_count=len(prepared.task_descriptors),
+            request_token=prepared.intent.request_token,
+            scope=prepared.intent.intent_kind,
+            require_backend_lease=True,
+        )
+
+    def _dispatch_acceptance_readiness(
+        self,
+        prepared: PreparedRuntimeRequestSet,
+    ) -> RuntimeReadinessConsequence:
+        self._last_prepared = prepared
+        self._manual_retry_prepared = None
+        self._last_dispatch_plan = None
+        return self.refresh_readiness_consequence(prepared)
+
+    def _readiness_state_is_ready(self, consequence: RuntimeReadinessConsequence) -> bool:
+        return bool(
+            consequence.render_state is not None
+            and str(consequence.render_state.status or "") == "ready"
+        )
+
+    def _dispatch_acceptance_consequence(
+        self,
+        state: SimulationRuntimeReadinessRenderState,
+        *,
+        dispatch_plan: RuntimeDispatchPlan | None = None,
+        extra_effects: Sequence[RuntimeUiEffect] = (),
+    ) -> RuntimeDispatchAcceptance:
+        readiness = self._readiness_consequence(state, extra_effects=extra_effects)
+        return RuntimeDispatchAcceptance(
+            dispatch_plan=dispatch_plan,
+            effects=readiness.effects,
+        )
+
+    def _allocate_preview_replay_request_id(self) -> int | None:
+        allocator = (
+            self._reserve_request_id
+            if self._active_preview_dispatch_in_flight()
+            else self._next_request_id
+        )
+        if not callable(allocator):
+            return None
+        try:
+            return int(allocator())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _active_preview_dispatch_in_flight(self) -> bool:
+        plan = self._dispatch_state.plan
+        return bool(
+            self._dispatch_state.active
+            and plan is not None
+            and str(plan.launch_allocation.launch_intent.intent_kind or "") == "preview"
+        )
+
+    def _readiness_consequence(
+        self,
+        state: SimulationRuntimeReadinessRenderState,
+        *,
+        extra_effects: tuple[RuntimeUiEffect, ...] = (),
+    ) -> RuntimeReadinessConsequence:
+        self._render_state(state)
+        return RuntimeReadinessConsequence(
+            launch_available=bool(state.launch_available),
+            render_state=state,
+            effects=tuple(extra_effects or ()),
+        )
 
     def _start_dispatch_state(self, dispatch_plan: RuntimeDispatchPlan) -> None:
         self._last_dispatch_plan = dispatch_plan
@@ -1034,7 +1221,7 @@ class SimulationRuntimeOrchestrator:
         return SimulationRuntimeReadinessRenderState(
             status="failed",
             status_text=str(message or ""),
-            launch_available=bool(retryable),
+            launch_available=False,
             failed=True,
             retryable=bool(retryable),
         )

@@ -416,6 +416,10 @@ def build_window_shell(main_window: MainWindow) -> WindowShellComponents:
             main_window._simulation_batch_owner.active_result_cache_read_snapshot
         ),
         clear_active_preview_cache_identity_state=main_window._simulation_batch_owner.clear_active_preview_cache_identity_state,
+        clear_active_cache_identity_state=main_window._simulation_batch_owner.clear_active_cache_identity_state,
+        active_preview_cache_identity_matches_current_workspace=(
+            main_window._simulation_batch_owner.active_preview_cache_identity_matches_current_workspace
+        ),
         set_last_simulation_provenance=main_window._simulation_provenance_owner.set_last_simulation_provenance,
         set_last_simulation_ctc=main_window._simulation_provenance_owner.set_last_simulation_ctc,
         publish_simulation_completion_provenance=(

@@ -225,6 +225,8 @@ class ParallelBatchExecutor:
         return RuntimeBackendCancelResult(cancelled=cancelled, running=running)
 
     def close_current_run(self, *, force_terminate: bool) -> RuntimeBackendCloseResult:
+        pool_token = self._lane_owner.lane_pool_token()
+        generation = int(self._lane_owner.current_generation)
         self._runtime_session.shutdown(
             force_terminate=bool(force_terminate),
             record_nonfatal_exception=self.record_nonfatal_exception,
@@ -232,6 +234,8 @@ class ParallelBatchExecutor:
         return RuntimeBackendCloseResult(
             active_after_close=1 if self._lane_owner.has_active_requests() else 0,
             pool_closed=not bool(self._lane_owner.has_lane_pool()),
+            pool_token=str(pool_token or ""),
+            generation=generation,
         )
 
     def _backend_lease_matches_current_pool(self, lease: RuntimeBackendLease | None) -> bool:

@@ -15,8 +15,6 @@ class SimulationModalError:
 
 @dataclass(frozen=True, slots=True)
 class SimulationLifecycleEffects:
-    cleanup_lane_pool: bool = False
-    shutdown_lane_pool: bool = False
     lane_pool_force_terminate: bool = False
     keep_lane_pool_alive: bool = False
     clear_pending_plot_updates: bool = False
@@ -39,15 +37,13 @@ class SimulationLifecycleEffects:
     repaint_widgets: bool = False
     stop_debounce_timers: bool = False
     modal_error: SimulationModalError | None = None
-    runtime_cancel_kind: str = ""
-    runtime_display_kind: str = ""
 
 
 class SimulationLifecycleEffectOwner:
     """Owns completion/error lifecycle decisions as typed effects."""
 
     @staticmethod
-    def runtime_display_kind_for_cleanup(
+    def runtime_display_completion_kind(
         cleanup_state: BatchCompletionCleanupState,
         *,
         stale_fast_handoff_after_display: bool = False,
@@ -183,9 +179,9 @@ class SimulationLifecycleEffectOwner:
         display_current_preview: bool,
         cleanup_state: BatchCompletionCleanupState,
     ) -> SimulationLifecycleEffects:
+        _ = display_current_preview
+        _ = cleanup_state
         return SimulationLifecycleEffects(
-            cleanup_lane_pool=bool(deactivate_context_immediately),
-            runtime_display_kind=SimulationLifecycleEffectOwner.runtime_display_kind_for_cleanup(cleanup_state),
             clear_pending_plot_updates=bool(deactivate_context_immediately),
             reset_slider_triggered=bool(deactivate_context_immediately),
             simulation_running=False if bool(deactivate_context_immediately) else None,
@@ -205,13 +201,10 @@ class SimulationLifecycleEffectOwner:
         stale_fast_handoff_after_display: bool,
         shutdown_requested: bool,
     ) -> SimulationLifecycleEffects:
+        _ = cleanup_state
+        _ = stale_fast_handoff_after_display
         _ = shutdown_requested
         return SimulationLifecycleEffects(
-            cleanup_lane_pool=True,
-            runtime_display_kind=SimulationLifecycleEffectOwner.runtime_display_kind_for_cleanup(
-                cleanup_state,
-                stale_fast_handoff_after_display=bool(stale_fast_handoff_after_display),
-            ),
             reset_slider_triggered=True,
             simulation_running=False,
             slider_simulation_active=False,
@@ -227,8 +220,6 @@ class SimulationLifecycleEffectOwner:
         reset_status_progress: bool,
     ) -> SimulationLifecycleEffects:
         return SimulationLifecycleEffects(
-            shutdown_lane_pool=bool(deactivate_context_immediately),
-            runtime_cancel_kind="soft_shutdown",
             clear_shutdown_request=bool(deactivate_context_immediately),
             reset_slider_triggered=bool(deactivate_context_immediately),
             simulation_running=False if bool(deactivate_context_immediately) else None,
@@ -249,8 +240,6 @@ class SimulationLifecycleEffectOwner:
         fast_mode: bool,
     ) -> SimulationLifecycleEffects:
         return SimulationLifecycleEffects(
-            shutdown_lane_pool=True,
-            runtime_cancel_kind="stop" if bool(cancelled) else "terminal_failure",
             close_contained_owner=True,
             close_contained_fast_mode=bool(fast_mode),
             close_contained_kill=True,
@@ -277,8 +266,6 @@ class SimulationLifecycleEffectOwner:
     @staticmethod
     def current_preview_failure_effects(*, status_text: str) -> SimulationLifecycleEffects:
         return SimulationLifecycleEffects(
-            shutdown_lane_pool=True,
-            runtime_cancel_kind="preview_failure",
             close_contained_owner=True,
             close_contained_fast_mode=True,
             close_contained_kill=True,

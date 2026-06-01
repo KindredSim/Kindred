@@ -121,6 +121,8 @@ class ResultsControllerPort:
     active_batch_cache_key: Callable[[], str]
     active_result_cache_read_snapshot: Callable[..., BatchCacheResultReadSnapshot]
     clear_active_preview_cache_identity_state: Callable[[], None]
+    clear_active_cache_identity_state: Callable[[], None]
+    active_preview_cache_identity_matches_current_workspace: Callable[[], bool]
     set_last_simulation_provenance: Callable[[Dict[str, Any]], None]
     set_last_simulation_ctc: Callable[[Dict[str, float]], None]
     publish_simulation_completion_provenance: Callable[..., Dict[str, Any]]
@@ -1173,6 +1175,32 @@ class ResultsController(QtCore.QObject):
             clear_plot=bool(clear_plot),
         )
         return True
+
+    def invalidate_workspace_preview_display_and_cache(
+        self,
+        target_set_ids: Sequence[str],
+        *,
+        clear_plot: bool = True,
+        clear_active_cache_identity: bool | None = None,
+    ) -> bool:
+        invalidated = bool(
+            self.clear_display_if_workspace_previews_were_displayed(
+                target_set_ids,
+                clear_plot=bool(clear_plot),
+            )
+        )
+        should_clear_active_cache_identity = clear_active_cache_identity
+        if should_clear_active_cache_identity is None:
+            try:
+                should_clear_active_cache_identity = bool(
+                    self._ui.active_preview_cache_identity_matches_current_workspace()
+                )
+            except Exception:
+                should_clear_active_cache_identity = False
+        if bool(should_clear_active_cache_identity):
+            self._ui.clear_active_cache_identity_state()
+            invalidated = True
+        return invalidated
 
     def _displayed_workspace_preview_set_ids(
         self,

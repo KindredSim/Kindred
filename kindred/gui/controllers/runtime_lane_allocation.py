@@ -227,6 +227,19 @@ class RuntimeLaneAllocationRequest:
 
 
 @dataclass(frozen=True)
+class RuntimeLaneReadinessProbeResult:
+    status: str
+    ready_capacity: int = 0
+    required_capacity: int = 1
+    message: str = ""
+    retryable: bool = True
+
+    @property
+    def ready(self) -> bool:
+        return str(self.status or "") == "ready"
+
+
+@dataclass(frozen=True)
 class RuntimeLane:
     lane_id: str
     compatibility_key: RuntimeCompatibilityKey
@@ -504,6 +517,29 @@ class RuntimeLaneAllocator:
             require_backend_lease=bool(require_backend_lease),
         )
 
+    def probe_readiness(
+        self,
+        request: RuntimeLaneAllocationRequest,
+    ) -> RuntimeLaneReadinessProbeResult:
+        ready = self._ready_lanes(
+            request.compatibility_key,
+            require_backend_lease=bool(request.require_backend_lease),
+        )
+        ready_capacity = min(len(ready), int(request.preferred_lane_capacity))
+        required = max(1, int(request.required_lane_capacity or 1))
+        if ready_capacity < required:
+            return RuntimeLaneReadinessProbeResult(
+                status="waiting",
+                ready_capacity=ready_capacity,
+                required_capacity=required,
+                message="Compatible runtime lanes are not ready.",
+            )
+        return RuntimeLaneReadinessProbeResult(
+            status="ready",
+            ready_capacity=ready_capacity,
+            required_capacity=required,
+        )
+
     def allocate(self, request: RuntimeLaneAllocationRequest) -> RuntimeLaunchAllocation:
         ready = self._ready_lanes(
             request.compatibility_key,
@@ -642,6 +678,33 @@ class RuntimeLaneAllocator:
             reason=reason,
             backend_failure=bool(backend_failure),
         )
+
+    def clear_backend_pool(
+        self,
+        *,
+        pool_token: str,
+        generation: int = 0,
+        reason: RuntimeReleaseReason = RuntimeReleaseReason.SHUTDOWN,
+    ) -> int:
+        token = str(pool_token or "")
+        if not token:
+            return 0
+        generation_i = int(generation or 0)
+        next_state = "failed" if reason is RuntimeReleaseReason.FAILURE else "released"
+        cleared = 0
+        for lane in tuple(self._lanes.values()):
+            if str(lane.backend_pool_token or "") != token:
+                continue
+            if generation_i > 0 and int(lane.backend_generation or 0) != generation_i:
+                continue
+            self._lanes[lane.lane_id] = RuntimeLane(
+                lane_id=lane.lane_id,
+                compatibility_key=lane.compatibility_key,
+                generation=lane.generation,
+                state=next_state,
+            )
+            cleared += 1
+        return cleared
 
     def _release_with_reason(
         self,

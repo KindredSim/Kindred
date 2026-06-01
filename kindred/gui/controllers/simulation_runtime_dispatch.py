@@ -96,6 +96,7 @@ class SimulationRuntimeDispatchOwner:
         context: Mapping[str, Any] | None = None
         began = False
         submitted = 0
+        backend_operation_attempted = False
         abort_release_result: RuntimeReleaseResult | None = None
         abort_effects: tuple[RuntimeUiEffect, ...] = ()
         release_result: RuntimeReleaseResult | None = None
@@ -114,6 +115,7 @@ class SimulationRuntimeDispatchOwner:
             request_id = int(dispatch_plan.launch_allocation.launch_intent.request_token or 0)
             fast_mode = dispatch_plan.launch_allocation.launch_intent.intent_kind == "preview"
             accepted_capacity = max(1, int(dispatch_plan.launch_allocation.accepted_capacity or 1))
+            backend_operation_attempted = True
             self._batch_executor.begin_run(
                 run_id=int(run_id),
                 request_id=int(request_id),
@@ -137,12 +139,13 @@ class SimulationRuntimeDispatchOwner:
             _ = accepted_capacity
             return SimulationRuntimeDispatchResult(started=True, effects=runtime_effects)
         except Exception as exc:
-            if began or submitted:
+            if backend_operation_attempted or began or submitted:
                 try:
                     abort_consequence = self._deps.runtime_lifecycle.dispatch_aborted(
                         dispatch_plan,
                         message=str(exc),
                         retryable=True,
+                        backend_failure=True,
                     )
                     abort_release_result = abort_consequence.release_result
                     abort_effects = tuple(abort_consequence.effects)
@@ -153,7 +156,7 @@ class SimulationRuntimeDispatchOwner:
                     )
             if context is not None and callable(self._deps.deactivate_dispatch_context):
                 self._deps.deactivate_dispatch_context(context)
-            if not (began or submitted):
+            if not (backend_operation_attempted or began or submitted):
                 rejection_consequence = self._deps.runtime_lifecycle.dispatch_rejected(
                     dispatch_plan,
                     message=str(exc),
