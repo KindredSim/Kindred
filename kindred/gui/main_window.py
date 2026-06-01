@@ -44,7 +44,6 @@ from kindred.gui.project_schema import (
 
 if TYPE_CHECKING:
     from kindred.core.mechanism import Mechanism
-    from kindred.core.simulation_preparation import BoundMechanism
     from kindred.gui.controllers.simulation_controller import SimulationController
     from kindred.gui.ports import SimulationUiPorts
     from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableView
@@ -234,7 +233,6 @@ class MainWindow(
         self._preview_session = MainWindowPreviewSession(self)
         self._simulation_dialogs = SimulationDialogs(self)
         self._simulation_run_ui_owner = SimulationRunUiOwner(
-            schedule_runtime_availability_refresh=self._schedule_simulation_runtime_availability_refresh,
             results_table_getter=lambda: getattr(self, "_results_table", None),
         )
         self._variable_runtime = MainWindowVariableRuntime(self)
@@ -300,6 +298,9 @@ class MainWindow(
         plumbing = build_simulation_plumbing(self)
         self._sim_ui_port: SimulationUiPorts = plumbing.ui_port
         self._sim_controller = plumbing.controller
+        self._sim_controller.runtime_readiness_render_requested.connect(
+            self._apply_simulation_runtime_readiness_render_state
+        )
 
     def _init_batch_initial_conditions(self) -> None:
         # Batch initial conditions (source-of-truth for initials after first migration).
@@ -350,7 +351,6 @@ class MainWindow(
         self._batch_table: Optional[BatchInitialConditionsTableView] = None
         self._focused_batch_set_id = ""
         self._last_effective_slider_edit_target_set_ids: tuple[str, ...] = ()
-        self._last_batch_runtime_readiness_refresh_key: tuple[tuple[int, ...], tuple[str, ...]] | None = None
         self._connected_batch_semantics_model = None
         self._connected_batch_selection_model = None
         # (Batch run/caching/executor state lives in self._sim_controller.)
@@ -420,7 +420,7 @@ class MainWindow(
         self._force_lock_editor()
         self._sliders_panel = self._mechanism_editor.detach_slider_pane_for_dock()
         self._species_panel_available = True
-        self._slider_override_buttons_available = True
+        self._runtime_parameter_buttons_available = True
 
         self._mechanism_dock.setWidget(mechanism_dock_components.container)
         self.addDockWidget(self._default_dock_area(self._mechanism_dock), self._mechanism_dock)
@@ -493,21 +493,24 @@ class MainWindow(
         sliders.sliderDragFinished.connect(self._on_slider_drag_finished)
 
         try:
-            self._mechanism_editor._commit_slider_overrides_btn.clicked.connect(self._on_commit_slider_overrides_clicked)
-            self._mechanism_editor._reset_slider_overrides_btn.clicked.connect(self._on_reset_slider_overrides_clicked)
+            self._mechanism_editor._commit_runtime_parameters_btn.clicked.connect(self._on_commit_runtime_parameters_clicked)
+            self._mechanism_editor._reset_runtime_parameters_btn.clicked.connect(self._on_reset_runtime_parameters_clicked)
         except Exception:
-            logger.exception("Failed to connect slider override mode buttons")
-            self._slider_override_buttons_available = False
-            self._disable_slider_override_mode_buttons()
+            logger.exception("Failed to connect runtime parameter buttons")
+            self._runtime_parameter_buttons_available = False
+            self._disable_runtime_parameter_buttons()
 
         self._mechanism_editor.speciesResetRequested.connect(self._on_species_reset_requested)
+        self._mechanism_editor.validationStateChanged.connect(
+            lambda _state: self._simulation_run_ui_owner.refresh_run_button_state()
+        )
         self._mechanism_editor.run_btn.clicked.connect(self._sim_controller.run_simulation)
         self._mechanism_editor.symbolic_calculator_btn.clicked.connect(self._open_symbolic_calculator_panel)
         self._mechanism_editor.mechanismInspectRequested.connect(self._open_mechanism_inspector)
         self._refresh_slider_transaction_button_state()
 
-    def _set_slider_override_mode_buttons_enabled(self, enabled: bool) -> None:
-        for attr in ("_commit_slider_overrides_btn", "_reset_slider_overrides_btn"):
+    def _set_runtime_parameter_buttons_enabled(self, enabled: bool) -> None:
+        for attr in ("_commit_runtime_parameters_btn", "_reset_runtime_parameters_btn"):
             btn = getattr(self._mechanism_editor, attr, None)
             if btn is None:
                 continue
@@ -515,21 +518,21 @@ class MainWindow(
                 btn.setEnabled(bool(enabled))
             except RuntimeError as exc:
                 self._record_best_effort_failure(
-                    f"main_window.slider_override_buttons.set_enabled.{attr}",
-                    message="Failed to update slider override mode button state",
+                    f"main_window.runtime_parameter_buttons.set_enabled.{attr}",
+                    message="Failed to update runtime parameter button state",
                     exc=exc,
                 )
 
-    def _disable_slider_override_mode_buttons(self) -> None:
-        self._set_slider_override_mode_buttons_enabled(False)
+    def _disable_runtime_parameter_buttons(self) -> None:
+        self._set_runtime_parameter_buttons_enabled(False)
 
     def _refresh_slider_transaction_button_state(self) -> None:
-        if not bool(getattr(self, "_slider_override_buttons_available", False)):
-            self._disable_slider_override_mode_buttons()
+        if not bool(getattr(self, "_runtime_parameter_buttons_available", False)):
+            self._disable_runtime_parameter_buttons()
             return
         preview = getattr(self, "_preview_session", None)
         dirty = bool(preview is not None and hasattr(preview, "has_dirty_transaction") and preview.has_dirty_transaction())
-        self._set_slider_override_mode_buttons_enabled(bool(dirty))
+        self._set_runtime_parameter_buttons_enabled(bool(dirty))
 
     def mechanism_editing_locked(self) -> bool:
         owner = getattr(self, "_mechanism_session_owner", None)
@@ -633,15 +636,12 @@ class MainWindow(
             force_runtime_invalidation=bool(force_runtime_invalidation),
             edit_session_active=bool(getattr(owner, "edit_session_active", False)),
             input_suppressed=bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)),
-            slider_runtime_invalidation_suppressed=bool(
-                self._variable_runtime.suppress_slider_runtime_invalidation()
-            ),
             schedule_runtime_refresh=bool(schedule_runtime_refresh),
             canonical_batch_initials_by_set_id=canonical_batch_initials_by_set_id,
             affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
         )
         if outcome.runtime_invalidation_required:
-            self._invalidate_slider_runtime()
+            self._invalidate_interactive_simulation_runtimes()
         if outcome.active_work_supersede_required:
             if outcome.runtime_invalidation_required:
                 self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
@@ -668,7 +668,6 @@ class MainWindow(
             str(transition_source or "authoritative_change") == "authoritative_change"
             and bool(
                 getattr(self, "_suppress_authoritative_mechanism_input_change", False)
-                or self._variable_runtime.suppress_slider_runtime_invalidation()
             )
             and not bool(outcome.runtime_invalidation_required)
             and not bool(outcome.runtime_input_invalidation_required)
@@ -679,8 +678,6 @@ class MainWindow(
         ):
             self._refresh_authoritative_mechanism_derived_ui()
         self._refresh_symbolic_calculator_state()
-        if outcome.readiness_schedule_required:
-            self._schedule_simulation_runtime_availability_refresh(wait=False)
         if (
             bool(outcome.runtime_input_invalidation_required)
             or bool(outcome.runtime_invalidation_required)
@@ -786,13 +783,6 @@ class MainWindow(
                 message="Failed to refresh species sliders after canonical batch initial edit",
                 exc=exc,
             )
-
-    def _schedule_pending_authoritative_mechanism_runtime_refresh(self) -> bool:
-        pending_epoch = self._mechanism_runtime_transition.consume_pending_readiness_epoch()
-        if pending_epoch is None:
-            return False
-        self._schedule_simulation_runtime_availability_refresh(wait=False)
-        return True
 
     def _sync_mechanism_session_owner_after_authoritative_widget_write(
         self,
@@ -1171,7 +1161,7 @@ class MainWindow(
             return False
 
         if decision == "commit":
-            self._on_commit_slider_overrides_clicked()
+            self._on_commit_runtime_parameters_clicked()
             if bool(preview.has_dirty_transaction()):
                 self._simulation_dialogs.message_box_warning(
                     "Pending Slider Changes",
@@ -1520,23 +1510,6 @@ class MainWindow(
         finally:
             self._suppress_preference_updates = False
         self._update_temperature_mode_indicator()
-        self._schedule_simulation_runtime_availability_refresh(wait=False, force_when_hidden=True)
-
-    def _schedule_simulation_runtime_availability_refresh(
-        self,
-        *,
-        wait: bool = False,
-        force_when_hidden: bool = False,
-        selected_run_rows: Optional[Sequence[int]] = None,
-        slider_preview_rows: Optional[Sequence[int]] = None,
-    ) -> None:
-        if (not bool(force_when_hidden)) and not self.isVisible():
-            return
-        self._make_simulation_runtime_available_after_startup(
-            wait=bool(wait),
-            selected_run_rows=selected_run_rows,
-            slider_preview_rows=slider_preview_rows,
-        )
 
     def _simulation_runtime_settings_snapshot(self) -> Dict[str, object]:
         solver_contract = load_solver_contract()
@@ -1569,172 +1542,30 @@ class MainWindow(
         self,
         *,
         batch_runtime_pool_inputs_changed: bool = True,
-        schedule_runtime_availability: bool = True,
-        force_when_hidden: bool = False,
     ) -> None:
-        if self.isVisible():
-            self._set_runtime_backed_controls_ready(False)
         if bool(batch_runtime_pool_inputs_changed):
             self._sim_controller.simulation_runtime_inputs_changed()
         else:
             self._sim_controller.simulation_runtime_inputs_changed(
                 batch_runtime_pool_inputs_changed=False
             )
-        if bool(schedule_runtime_availability):
-            self._schedule_simulation_runtime_availability_refresh(
-                wait=False,
-                force_when_hidden=bool(force_when_hidden),
-            )
 
-    def _make_simulation_runtime_available_after_startup(
+    def _apply_simulation_runtime_readiness_render_state(
         self,
-        *,
-        wait: bool = False,
-        selected_run_rows: Optional[Sequence[int]] = None,
-        slider_preview_rows: Optional[Sequence[int]] = None,
+        state: object,
     ) -> None:
-        if bool(getattr(self, "_simulation_runtime_availability_shutdown_started", False)):
-            return
-        try:
-            self._sim_controller.ensure_current_interactive_simulation_runtimes_available(
-                wait=bool(wait),
-                selected_run_rows=selected_run_rows,
-                slider_preview_rows=slider_preview_rows,
-            )
-            self._poll_interactive_runtime_readiness_after_refresh(
-                selected_run_rows=selected_run_rows,
-                slider_preview_rows=slider_preview_rows,
-            )
-        except Exception as exc:
-            record_gui_best_effort_failure(
-                self,
-                "simulation_runtime_startup_availability",
-                message="Failed to make simulation runtime available after startup",
-                exc=exc,
-                log=logger,
-            )
+        self._simulation_run_ui_owner.render_runtime_readiness(state)
+        self._render_preview_available(bool(getattr(state, "preview_available", False)))
+        preview_unavailable_status = str(getattr(state, "preview_unavailable_status", "") or "").strip()
+        if preview_unavailable_status:
+            self._preview_session.show_preview_unavailable_for_dirty_state(preview_unavailable_status)
 
-    @staticmethod
-    def _runtime_snapshot_controls_ready(snapshot: object) -> bool:
-        return bool(getattr(snapshot, "controls_ready", bool(getattr(snapshot, "ready", False))))
+    def _render_launch_available(self, ready: bool) -> None:
+        self._simulation_run_ui_owner.render_launch_available(bool(ready))
 
-    @staticmethod
-    def _runtime_snapshot_should_poll(snapshot: object) -> bool:
-        should_poll = getattr(snapshot, "should_poll", None)
-        if should_poll is not None:
-            return bool(should_poll)
-        return bool(getattr(snapshot, "required", True) and not getattr(snapshot, "ready", False))
-
-    def _apply_runtime_readiness_failure_status(self, *snapshots: object) -> None:
-        for snapshot in snapshots:
-            if str(getattr(snapshot, "status", "")) != "failed":
-                continue
-            message = str(
-                getattr(snapshot, "message", None)
-                or getattr(snapshot, "failure", None)
-                or "Simulation runtime failed to prepare."
-            )
-            if message:
-                self._status_label.setText(message)
-            return
-
-    def _set_runtime_backed_controls_ready(self, ready: bool) -> None:
-        self._set_runtime_backed_run_controls_ready(bool(ready))
-        self._set_runtime_backed_preview_controls_ready(bool(ready))
-
-    def _set_runtime_backed_run_controls_ready(self, ready: bool) -> None:
-        self._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(bool(ready))
-
-    def _set_runtime_backed_preview_controls_ready(self, ready: bool) -> None:
+    def _render_preview_available(self, ready: bool) -> None:
         ready_value = bool(ready)
         self._simulation_runtime_preview_ready = ready_value
-        try:
-            editor = getattr(self, "_mechanism_editor", None)
-            sliders = getattr(editor, "_variable_sliders", None)
-            if sliders is not None:
-                sliders.setEnabled(ready_value)
-            species_sliders = None
-            if editor is not None and hasattr(editor, "species_sliders_widget"):
-                species_sliders = editor.species_sliders_widget()
-            if species_sliders is not None:
-                species_sliders.setEnabled(ready_value)
-        except Exception:
-            logger.debug("Failed to update slider readiness state", exc_info=True)
-
-    def _poll_interactive_runtime_readiness_after_refresh(
-        self,
-        *,
-        selected_run_rows: Optional[Sequence[int]] = None,
-        slider_preview_rows: Optional[Sequence[int]] = None,
-    ) -> None:
-        if bool(getattr(self, "_simulation_runtime_availability_shutdown_started", False)):
-            return
-        try:
-            explicit_run_rows = selected_run_rows is not None
-            explicit_preview_rows = slider_preview_rows is not None
-            run_rows = (
-                tuple(int(row) for row in selected_run_rows)
-                if explicit_run_rows
-                else None
-            )
-            preview_rows = (
-                tuple(int(row) for row in slider_preview_rows)
-                if explicit_preview_rows
-                else self._effective_slider_edit_target_rows()
-            )
-            ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(
-                fast_mode=False,
-                rows=run_rows,
-            )
-            preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot(preview_rows)
-            run_snapshot = self._sim_controller.selected_run_runtime_snapshot(run_rows)
-            if any(
-                self._runtime_snapshot_should_poll(snapshot)
-                for snapshot in (ordinary_snapshot, preview_snapshot, run_snapshot)
-            ):
-                self._sim_controller.ensure_current_interactive_simulation_runtimes_available(
-                    wait=False,
-                    selected_run_rows=run_rows,
-                    slider_preview_rows=preview_rows,
-                )
-                ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(
-                    fast_mode=False,
-                    rows=run_rows,
-                )
-                preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot(preview_rows)
-                run_snapshot = self._sim_controller.selected_run_runtime_snapshot(run_rows)
-            self._set_runtime_backed_run_controls_ready(
-                self._runtime_snapshot_controls_ready(run_snapshot)
-            )
-            self._set_runtime_backed_preview_controls_ready(
-                self._runtime_snapshot_controls_ready(preview_snapshot)
-            )
-            self._apply_runtime_readiness_failure_status(
-                ordinary_snapshot,
-                preview_snapshot,
-                run_snapshot,
-            )
-            if not any(
-                self._runtime_snapshot_should_poll(snapshot)
-                for snapshot in (ordinary_snapshot, preview_snapshot, run_snapshot)
-            ):
-                return
-        except Exception as exc:
-            record_gui_best_effort_failure(
-                self,
-                "simulation_runtime_readiness_poll",
-                message="Failed to poll simulation runtime readiness",
-                exc=exc,
-                log=logger,
-            )
-            return
-        QtCore.QTimer.singleShot(
-            50,
-            lambda: self._poll_interactive_runtime_readiness_after_refresh(
-                selected_run_rows=run_rows if explicit_run_rows else None,
-                slider_preview_rows=preview_rows if explicit_preview_rows else None,
-            ),
-        )
 
     def _init_mixin_ports(self) -> None:
         self._fitting_ports = FittingMixinPorts(
@@ -1786,7 +1617,6 @@ class MainWindow(
         except Exception:
             logger.debug("Failed to clear variable sliders after programmatic mechanism load", exc_info=True)
             self._preview_session.clear_pending_slider_values()
-            self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
         self._apply_authoritative_mechanism_transition(
             schedule_runtime_refresh=bool(schedule_runtime_refresh),
@@ -2126,7 +1956,7 @@ class MainWindow(
         add_items(
             sim_menu,
             [
-                ("&Run", self._sim_controller.run_simulation, None, "runSimulationAction", "Run kinetic simulation with current mechanism (Ctrl+R or F5)", {"shortcuts": ["Ctrl+R", "F5"]}),
+                ("&Run", self._sim_controller.run_simulation, None, "runSimulationAction", "Run kinetic simulation with current mechanism (Ctrl+R or F5)", {"shortcuts": ["Ctrl+R", "F5"], "store_as": "_run_simulation_action"}),
                 ("&Stop", self._sim_controller.stop_simulation, "Esc", "stopSimulationAction", "Stop running simulation (Esc)"),
                 ("Symbolic Calculator...", self._open_symbolic_calculator_panel, None, "openSymbolicCalculatorAction", "Open Symbolic Calculator panel", {"store_as": "_symbolic_calculator_action"}),
                 None,
@@ -2235,6 +2065,8 @@ class MainWindow(
 
         if store_as:
             setattr(self, store_as, action)
+        if object_name == "runSimulationAction":
+            self._simulation_run_ui_owner.bind_run_action(action)
         return action
 
     def _init_ribbon_host(self) -> None:
@@ -2346,10 +2178,7 @@ class MainWindow(
             max_logs=int(max_logs),
         )
 
-    def _invalidate_slider_runtime(self):
-        """Mark the cached slider runtime as stale."""
-        self._variable_runtime.invalidate_slider_runtime()
-        self._set_runtime_backed_controls_ready(False)
+    def _invalidate_interactive_simulation_runtimes(self):
         try:
             self._sim_controller.invalidate_interactive_simulation_runtimes(kill=False)
         except Exception:
@@ -3695,7 +3524,6 @@ class MainWindow(
         ) + 1
         self._sim_controller.prepare_runtime_work_for_project_apply(epoch=int(runtime_epoch))
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
-        self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
         dataset_import_coordinator = getattr(self, "_dataset_import_coordinator", None)
         if dataset_import_coordinator is not None:
             dataset_import_coordinator.clear_all_datasets()
@@ -3932,11 +3760,7 @@ class MainWindow(
         if simulation_runtime_settings_changed:
             self._refresh_simulation_runtime_after_inputs_changed(
                 batch_runtime_pool_inputs_changed=bool(batch_runtime_pool_settings_changed),
-                schedule_runtime_availability=False,
             )
-        if not self._schedule_pending_authoritative_mechanism_runtime_refresh():
-            self._schedule_simulation_runtime_availability_refresh(wait=False)
-
     def _apply_project_payload_inner(
         self,
         data: Dict[str, Any],
@@ -4301,8 +4125,8 @@ class MainWindow(
             retain_active_cache_identity=bool(retain_active_cache_identity),
         )
 
-    def has_slider_overrides(self) -> bool:
-        return self._simulation_mechanism_owner.has_slider_overrides()
+    def has_local_runtime_parameter_values(self) -> bool:
+        return self._simulation_mechanism_owner.has_local_runtime_parameter_values()
 
     def _simulation_schema_text(self) -> str:
         return self._simulation_mechanism_owner.get_mechanism_text()
@@ -4310,14 +4134,23 @@ class MainWindow(
     def simulation_schema_id(self, *, fast_mode: bool = False) -> str:
         return self._simulation_mechanism_owner.simulation_schema_id(fast_mode=bool(fast_mode))
 
-    def simulation_param_fingerprint(self, set_id: Optional[str] = None, *, fast_mode: bool = False) -> str:
-        return self._simulation_mechanism_owner.simulation_param_fingerprint(
+    def runtime_parameter_fingerprint_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> str:
+        return self._simulation_mechanism_owner.runtime_parameter_fingerprint_for_set(
             set_id=set_id,
             fast_mode=bool(fast_mode),
         )
 
-    def slider_overrides(self, set_id: Optional[str] = None) -> Dict[str, float]:
-        return self._simulation_mechanism_owner.slider_overrides(set_id=set_id)
+    def runtime_parameter_names_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> Sequence[str]:
+        return self._simulation_mechanism_owner.runtime_parameter_names_for_set(
+            set_id=set_id,
+            fast_mode=bool(fast_mode),
+        )
+
+    def runtime_parameter_values_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> Dict[str, float]:
+        return self._simulation_mechanism_owner.runtime_parameter_values_for_set(
+            set_id=set_id,
+            fast_mode=bool(fast_mode),
+        )
 
     def get_mechanism_text(self) -> str:
         return self._simulation_mechanism_owner.get_mechanism_text()
@@ -5084,52 +4917,6 @@ class MainWindow(
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
-        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
-            gesture="selection_change",
-        )
-        self._refresh_runtime_readiness_from_batch_interaction(
-            transaction,
-            context="batch selection change",
-        )
-
-    def _refresh_runtime_readiness_from_batch_interaction(
-        self,
-        transaction: object,
-        *,
-        context: str,
-    ) -> None:
-        if not bool(getattr(transaction, "runtime_readiness_refresh_needed", False)):
-            return
-        refresh_key = (
-            tuple(int(row) for row in (getattr(transaction, "run_selected_rows", ()) or ())),
-            tuple(str(set_id) for set_id in (getattr(transaction, "effective_slider_edit_target_set_ids", ()) or ())),
-        )
-        if refresh_key == getattr(self, "_last_batch_runtime_readiness_refresh_key", None):
-            return
-        try:
-            run_rows = tuple(int(row) for row in (getattr(transaction, "run_selected_rows", ()) or ()))
-            run_snapshot = self._sim_controller.selected_run_runtime_snapshot(run_rows)
-            preview_rows = tuple(
-                int(row)
-                for row in (getattr(transaction, "effective_slider_edit_target_rows", ()) or ())
-            )
-            preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot(preview_rows)
-            self._set_runtime_backed_run_controls_ready(
-                self._runtime_snapshot_controls_ready(run_snapshot)
-            )
-            self._set_runtime_backed_preview_controls_ready(
-                self._runtime_snapshot_controls_ready(preview_snapshot)
-            )
-            self._apply_runtime_readiness_failure_status(run_snapshot, preview_snapshot)
-            if self._runtime_snapshot_should_poll(run_snapshot) or self._runtime_snapshot_should_poll(preview_snapshot):
-                self._schedule_simulation_runtime_availability_refresh(
-                    wait=False,
-                    selected_run_rows=run_rows,
-                    slider_preview_rows=preview_rows,
-                )
-            self._last_batch_runtime_readiness_refresh_key = refresh_key
-        except Exception:
-            logger.debug("Failed to refresh selected-run runtime readiness after %s", context, exc_info=True)
 
     def _batch_current_change_display_source(self) -> DisplayRefreshSource:
         table = getattr(self, "_batch_table", None)
@@ -5203,10 +4990,6 @@ class MainWindow(
                 display_source=self._batch_current_change_display_source(),
                 rebuild_species_sliders=False,
             )
-        self._refresh_runtime_readiness_from_batch_interaction(
-            transaction,
-            context="batch current change",
-        )
 
     def _on_batch_show_membership_changed(self) -> None:
         transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
@@ -5248,10 +5031,6 @@ class MainWindow(
             except RuntimeError as exc:
                 logger.debug("Failed to rebuild species panel after slider target change: %s", exc, exc_info=True)
                 self._species_panel_available = False
-        self._refresh_runtime_readiness_from_batch_interaction(
-            transaction,
-            context="slider target change",
-        )
 
     def _refresh_slider_edit_targets_summary(self) -> None:
         editor = getattr(self, "_mechanism_editor", None)
@@ -5294,13 +5073,17 @@ class MainWindow(
                 rebuild_species_sliders=bool(rebuild_species_sliders),
             )
 
-    def _normalized_slider_overrides(
+    def _runtime_parameter_values_for_materialization(
         self,
         *,
         set_id: Optional[str] = None,
         overrides: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
-        raw = self.slider_overrides(set_id=set_id) if overrides is None else dict(overrides or {})
+        raw = (
+            self.runtime_parameter_values_for_set(set_id=set_id, fast_mode=True)
+            if overrides is None
+            else dict(overrides or {})
+        )
         normalized: Dict[str, float] = {}
         for key, value in raw.items():
             parsed, ok = try_parse_finite_float(value)
@@ -5322,7 +5105,7 @@ class MainWindow(
             text = drag_baseline_text
         else:
             text = base_text
-        override_map = self._normalized_slider_overrides(set_id=set_id, overrides=overrides)
+        override_map = self._runtime_parameter_values_for_materialization(set_id=set_id, overrides=overrides)
         has_energy_overrides = False
         metadata = self.variable_metadata() or {}
         step_analysis_context = None
@@ -5365,7 +5148,7 @@ class MainWindow(
         overrides: Optional[Dict[str, float]] = None,
     ) -> list[tuple[str, float, dict]]:
         meta_map = self.variable_metadata() or {}
-        override_map = self._normalized_slider_overrides(set_id=set_id, overrides=overrides)
+        override_map = self._runtime_parameter_values_for_materialization(set_id=set_id, overrides=overrides)
         energy_overrides: list[tuple[str, float, dict]] = []
         for name, value in override_map.items():
             meta = meta_map.get(name)
@@ -6142,7 +5925,9 @@ class MainWindow(
             slug = re.sub(r"[^A-Za-z0-9_]+", "_", cm_id).strip("_") or "fast_eq"
             var_eq = f"dG_eq_fast__{slug}"
         try:
-            dG_eq = float(self.slider_overrides().get(var_eq, ch.get("dG_eq")))
+            dG_eq = float(
+                self.runtime_parameter_values_for_set(fast_mode=True).get(var_eq, ch.get("dG_eq"))
+            )
         except Exception as exc:
             self._record_best_effort_failure(
                 "main_window.energy_table.fast_eq.dG_eq",
@@ -6231,7 +6016,7 @@ class MainWindow(
         var_act = f"dGact_fwd__{ts}__{reactant}__{product}"
         var_eq = f"dG_eq__{ts}__{reactant}__{product}"
         try:
-            overrides = self.slider_overrides()
+            overrides = self.runtime_parameter_values_for_set(fast_mode=True)
             dG_act = float(overrides.get(var_act, ch.get("dG_act_fwd")))
             dG_eq = float(overrides.get(var_eq, ch.get("dG_eq")))
         except Exception as exc:
@@ -6375,22 +6160,6 @@ class MainWindow(
                 logger.debug("Failed to update plot parameter summary: %s", exc, exc_info=True)
                 self._plot_parameter_summary_stale = True
 
-    def _prepare_slider_runtime(
-        self,
-        param_names: Optional[List[str]] = None,
-        *,
-        set_id: Optional[str] = None,
-    ) -> Optional[BoundMechanism]:
-        return self._variable_runtime.prepare_slider_runtime(param_names=param_names, set_id=set_id)
-
-    def _apply_slider_overrides_to_bindings(
-        self,
-        runtime: Optional[BoundMechanism],
-        *,
-        set_id: Optional[str] = None,
-    ) -> bool:
-        return bool(self._variable_runtime.apply_slider_overrides_to_bindings(runtime, set_id=set_id))
-
     def _on_variable_changed(self, name: str, value: float):
         self._preview_session.on_variable_changed(name, value)
         self._refresh_slider_transaction_button_state()
@@ -6444,7 +6213,7 @@ class MainWindow(
             self._suppress_canonical_batch_initials_transition = previous_suppress
         return ()
 
-    def _materialized_mechanism_editor_source_for_effective_slider_values(
+    def _materialized_mechanism_editor_source_for_runtime_parameter_values(
         self,
         values: Dict[str, float],
     ):
@@ -6514,11 +6283,9 @@ class MainWindow(
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be a MechanismAuthoringSource.")
         transition_required = False
-        previous_suppress = self._variable_runtime.suppress_slider_runtime_invalidation()
         previous_authoritative_suppress = bool(
             getattr(self, "_suppress_authoritative_mechanism_input_change", False)
         )
-        self._variable_runtime.set_suppress_slider_runtime_invalidation(True)
         self._suppress_authoritative_mechanism_input_change = True
         try:
             reactions_widget = self._mechanism_editor._reactions_text
@@ -6556,7 +6323,6 @@ class MainWindow(
                 self._write_complete_authoritative_mechanism_source_to_editor(source)
             transition_required = True
         finally:
-            self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
             self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
         if bool(apply_transition) and bool(transition_required):
             self._apply_authoritative_mechanism_transition(
@@ -6626,29 +6392,29 @@ class MainWindow(
     def _materialize_direct_slider_commit_to_authoritative_editors(self, name: str, value: float) -> None:
         focused_set_id = str(self._preview_session.focused_mechanism_workspace_set_id() or "")
         effective_values = (
-            self._preview_session.effective_slider_values_for_set(focused_set_id)
+            self._preview_session.runtime_parameter_values_for_set(focused_set_id)
             if focused_set_id
             else {}
         )
-        normalized_values = self._normalized_slider_overrides(
+        normalized_values = self._runtime_parameter_values_for_materialization(
             overrides=effective_values or {str(name): float(value)}
         )
         if str(name) not in normalized_values:
             parsed, ok = try_parse_finite_float(value)
             if ok:
                 normalized_values[str(name)] = float(parsed)
-        self._apply_effective_slider_values_to_mechanism_editors(
+        self._apply_runtime_parameter_values_to_mechanism_editors(
             normalized_values,
             description=f"Apply slider {name}",
         )
 
-    def _apply_effective_slider_values_to_mechanism_editors(
+    def _apply_runtime_parameter_values_to_mechanism_editors(
         self,
         values: Dict[str, float],
         *,
         description: str = "Apply slider overrides",
     ) -> None:
-        source = self._materialized_mechanism_editor_source_for_effective_slider_values(values)
+        source = self._materialized_mechanism_editor_source_for_runtime_parameter_values(values)
         self._set_authoritative_mechanism_editor_source(
             source,
             description=str(description),
@@ -6677,7 +6443,6 @@ class MainWindow(
             self._extract_and_populate_variables(preserve_visibility=True)
         except Exception:
             logger.exception("Failed to refresh sliders after authoritative slider materialization")
-            self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
         try:
             panel = self._mechanism_editor.species_sliders_widget()
             if panel is not None and hasattr(panel, "rebuild_from_current_row"):
@@ -6697,7 +6462,7 @@ class MainWindow(
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._preview_session.stop_variable_update_timer()
         self._preview_session.stop_slider_release_commit_timer()
-        self._apply_effective_slider_values_to_mechanism_editors(
+        self._apply_runtime_parameter_values_to_mechanism_editors(
             effective_values,
             description=str(description),
         )
@@ -6721,7 +6486,7 @@ class MainWindow(
             if current_values:
                 focused_set_id = self._preview_session.focused_mechanism_workspace_set_id()
                 if bool(use_workspace):
-                    effective_values = self._preview_session.effective_slider_values(set_id=focused_set_id)
+                    effective_values = self._preview_session.runtime_parameter_values(set_id=focused_set_id)
                 else:
                     effective_values = dict(self._preview_session.param_store.shared_params)
                 metadata = self.variable_metadata() or {}
@@ -6765,23 +6530,23 @@ class MainWindow(
             except Exception:
                 logger.exception("Failed to rebuild species panel while syncing focused mechanism controls")
 
-    def _on_commit_slider_overrides_clicked(self) -> None:
+    def _on_commit_runtime_parameters_clicked(self) -> None:
         """
         Commit current slider values into the DSL editor.
 
-        In override mode, sliders update preview simulations via bound overrides without rewriting
-        the mechanism text. "Commit" applies the current editable slider values to the DSL.
+        Runtime parameter sliders update preview simulations without rewriting
+        the mechanism text. "Commit" applies the current finite parameter values to the DSL.
         """
         focused_set_id = self._preview_session.focused_mechanism_workspace_set_id()
-        effective_values = self._preview_session.effective_slider_values(set_id=focused_set_id)
+        effective_values = self._preview_session.runtime_parameter_values(set_id=focused_set_id)
         self._finalize_authoritative_slider_materialization(
             effective_values,
-            description="Apply slider overrides",
+            description="Apply runtime parameters",
             apply_species_overlays=True,
         )
 
-    def _on_reset_slider_overrides_clicked(self) -> None:
-        """Reset slider overrides back to the baseline DSL values and refresh slider widgets."""
+    def _on_reset_runtime_parameters_clicked(self) -> None:
+        """Reset staged runtime parameter values back to the baseline DSL values."""
         target_set_ids = self._effective_slider_edit_target_set_ids()
         if bool(self._preview_session.has_staged_concentration_overlays()):
             replay_intent = self._preview_session.capture_reset_slider_replay_intent()
@@ -6796,7 +6561,6 @@ class MainWindow(
                 target_set_ids,
                 clear_plot=False,
             )
-            self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
             sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
             if sliders is not None and hasattr(sliders, "end_live_drag"):
@@ -6806,7 +6570,6 @@ class MainWindow(
                 self._extract_and_populate_variables(preserve_visibility=True)
             except Exception:
                 logger.exception("Failed to refresh sliders after override reset")
-                self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
             try:
                 self._update_parameter_table_from_sliders()
             except Exception:
@@ -6850,7 +6613,6 @@ class MainWindow(
         if clear_active_cache_identity:
             self._simulation_batch_owner.clear_active_cache_identity_state()
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
-        self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
         sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
         if sliders is not None and hasattr(sliders, "end_live_drag"):
@@ -6860,7 +6622,6 @@ class MainWindow(
             self._extract_and_populate_variables(preserve_visibility=True)
         except Exception:
             logger.exception("Failed to refresh sliders after override reset")
-            self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
         try:
             self._update_parameter_table_from_sliders()
         except Exception:
@@ -7685,13 +7446,11 @@ class MainWindow(
                 != next_runtime_settings["wegscheider_cyclicity_enabled"]
             )
             if slider_schema_refresh_needed:
-                self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
                 try:
                     self._extract_and_populate_variables(preserve_visibility=True)
                     self._sync_mechanism_controls_to_focused_batch_set()
                 except Exception:
                     logger.exception("Failed to refresh variables after solver settings update")
-                    self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
                     bar = getattr(self, "_status_bar", None)
                     if bar is not None:
                         try:
@@ -7791,16 +7550,6 @@ class MainWindow(
 
     def showEvent(self, event):
         super().showEvent(event)
-        serial_ready = False
-        try:
-            serial_ready = bool(self._sim_controller.interactive_simulation_runtimes_ready())
-        except Exception:
-            serial_ready = False
-            logger.debug("Failed to inspect runtime readiness during show event", exc_info=True)
-        if not serial_ready:
-            self._schedule_simulation_runtime_availability_refresh(wait=False, force_when_hidden=True)
-            return
-        self._poll_interactive_runtime_readiness_after_refresh()
 
     def _prepare_fit_window_shutdown_for_close(self) -> bool:
         tracked_windows = list(self._fitting_runtime_input_publisher.active_windows())

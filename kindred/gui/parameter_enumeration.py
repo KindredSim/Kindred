@@ -13,8 +13,8 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
-    step_entry_role_derived,
-    step_entry_role_editable,
+    step_entry_authored_role_is_derived,
+    step_entry_authored_role_is_editable,
 )
 from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
@@ -120,12 +120,12 @@ def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[s
                 "label": label,
                 "value_valid": bool(ok),
             }
-            editable = step_entry_role_editable(entry, role)
-            derived = step_entry_role_derived(entry, role)
+            editable = step_entry_authored_role_is_editable(entry, role)
+            derived = step_entry_authored_role_is_derived(entry, role)
             if editable is None:
-                editable = authority.role_editability(role)
+                editable = authority.authored_role_is_editable(role)
             if derived is None:
-                derived = authority.role_derived(role)
+                derived = authority.authored_role_is_derived(role)
             if not editable:
                 metadata[name]["editable"] = False
             if derived:

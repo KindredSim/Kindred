@@ -22,8 +22,8 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
-    require_step_entry_role_editable,
-    step_entry_role_editable,
+    require_step_entry_authored_role_is_editable,
+    step_entry_authored_role_is_editable,
 )
 from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.rate_binding import RateBinding
@@ -191,7 +191,7 @@ def _set_mechanism_param(
         eqs = getattr(mechanism, "equilibria", []) or []
         if not (0 <= idx < len(eqs)):
             raise DSLError(f"Unknown parameter {name!r} (equilibrium index out of range)")
-        require_step_entry_role_editable(entry, role, parameter_name=name)
+        require_step_entry_authored_role_is_editable(entry, role, parameter_name=name)
         eq = eqs[idx]
         if role in {"kf", "kr"}:
             current = getattr(eq, role, None)
@@ -232,7 +232,7 @@ def _active_equilibrium_keq_names(mechanism: object, spec: ParameterAlgebraSpec)
         except (TypeError, ValueError):
             continue
         entry_by_keq_name[name] = entry
-        if not bool(step_entry_role_editable(entry, "Keq")):
+        if not bool(step_entry_authored_role_is_editable(entry, "Keq")):
             continue
         active.add(name)
     for stmt in spec.param_statements or []:
@@ -241,7 +241,7 @@ def _active_equilibrium_keq_names(mechanism: object, spec: ParameterAlgebraSpec)
             continue
         entry = entry_by_keq_name.get(name)
         authority = authority_fields_from_step_entry(entry or {})
-        if authority and bool(authority.get("has_thermo_param")) and not bool(step_entry_role_editable(entry or {}, "Keq")):
+        if authority and bool(authority.get("has_thermo_param")) and not bool(step_entry_authored_role_is_editable(entry or {}, "Keq")):
             raise ValueError(f"{name} cannot override dG_eq equilibrium authority.")
         active.add(name)
     return active
@@ -254,7 +254,7 @@ def _validate_parameter_algebra_editable_targets(mechanism: object, spec: Parame
             continue
         kind, _idx, role, entry = target
         if kind == "equilibrium":
-            require_step_entry_role_editable(entry, role, parameter_name=str(stmt.name))
+            require_step_entry_authored_role_is_editable(entry, role, parameter_name=str(stmt.name))
 
 
 def _apply_equilibrium_Keq_constraints_to_values(
@@ -370,7 +370,7 @@ def _parameter_override_warnings_for_spec(
                 inline_name = "kf"
             elif role == "kr" and bool(entry.get("user_provided_kr")):
                 inline_name = "kr"
-            elif role == "Keq" and bool(step_entry_role_editable(entry, "Keq")):
+            elif role == "Keq" and bool(step_entry_authored_role_is_editable(entry, "Keq")):
                 inline_name = "Keq"
 
         if inline_name is None:

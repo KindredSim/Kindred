@@ -5,9 +5,8 @@ from collections.abc import Mapping as MappingABC
 import logging
 import math
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Tuple
 
-from kindred.core.api.simulation import prepare_bound_mechanism
 from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
@@ -25,22 +24,17 @@ from kindred.core.simulator.dsl_text_update import (
 )
 
 if TYPE_CHECKING:
-    from kindred.core.simulation_preparation import BoundMechanism
     from kindred.gui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
 
 
 class MainWindowVariableRuntime:
-    """Owns MainWindow's prepared preview runtime and slider-variable metadata pipeline."""
+    """Owns MainWindow's slider-variable metadata and energy-mode UI pipeline."""
 
     def __init__(self, main_window: "MainWindow") -> None:
         self._mw = main_window
         self._variable_metadata: Dict[str, Dict[str, object]] = {}
-        self._slider_runtime: Optional[BoundMechanism] = None
-        self._slider_runtime_dirty = True
-        self._suppress_slider_runtime_invalidation = False
-        self._slider_runtime_unavailable_reason = ""
 
     def variable_metadata(self) -> Dict[str, Dict[str, object]]:
         return {str(name): dict(meta or {}) for name, meta in self._variable_metadata.items()}
@@ -56,26 +50,6 @@ class MainWindowVariableRuntime:
 
     def clear_variable_metadata(self) -> None:
         self._variable_metadata = {}
-
-    def slider_runtime_dirty(self) -> bool:
-        return bool(self._slider_runtime_dirty)
-
-    def set_slider_runtime_dirty(self, value: bool) -> None:
-        self._slider_runtime_dirty = bool(value)
-
-    def slider_runtime_unavailable_reason(self) -> str:
-        return str(self._slider_runtime_unavailable_reason or "")
-
-    def suppress_slider_runtime_invalidation(self) -> bool:
-        return bool(self._suppress_slider_runtime_invalidation)
-
-    def set_suppress_slider_runtime_invalidation(self, value: bool) -> None:
-        self._suppress_slider_runtime_invalidation = bool(value)
-
-    def clear_prepared_slider_runtime(self, *, dirty: bool = True) -> None:
-        self._slider_runtime = None
-        self._slider_runtime_dirty = bool(dirty)
-        self._slider_runtime_unavailable_reason = ""
 
     def _normalize_visibility_scope_value(self, value: object) -> object:
         if value is None or isinstance(value, (bool, int, str)):
@@ -125,11 +99,6 @@ class MainWindowVariableRuntime:
             )
             signature.append((str(name), scope_meta))
         return tuple(signature)
-
-    def invalidate_slider_runtime(self) -> None:
-        if self.suppress_slider_runtime_invalidation():
-            return
-        self.clear_prepared_slider_runtime(dirty=True)
 
     def sanitize_mechanism_parameter_conflicts(
         self,
@@ -247,7 +216,6 @@ class MainWindowVariableRuntime:
                 finally:
                     setattr(mw, "_suppress_authoritative_mechanism_input_change", previous_authoritative_suppress)
                 mechanism_text = sanitized_text
-                self.set_slider_runtime_dirty(True)
 
             temperature_k = mw.temperature_spinbox_value()
             units = UnitsModel(temperature_K=temperature_k)
@@ -390,13 +358,14 @@ class MainWindowVariableRuntime:
                 )
                 logger.info("Populated %s variable sliders", len(variables))
                 mw._preview_session.sync_committed_slider_values(
-                    {k: v for k, v in variables.items() if metadata.get(k, {}).get("editable") is not False}
+                    {k: v for k, v in variables.items() if metadata.get(k, {}).get("editable") is not False},
+                    schema_text=parse_source.full_dsl,
                 )
                 self.update_parameter_table_from_sliders()
             else:
                 logger.info("No variables found to populate sliders")
                 mw.clear_variable_sliders()
-                mw._preview_session.sync_committed_slider_values({})
+                mw._preview_session.sync_committed_slider_values({}, schema_text=parse_source.full_dsl)
                 self.clear_variable_metadata()
                 self.update_parameter_table_from_sliders()
             self.set_variable_metadata(metadata)
@@ -406,10 +375,8 @@ class MainWindowVariableRuntime:
                 mw.clear_variable_sliders()
             except RuntimeError as clear_exc:
                 logger.debug("Failed to clear sliders after extraction failure: %s", clear_exc, exc_info=True)
-                self.clear_prepared_slider_runtime(dirty=True)
             mw._preview_session.sync_committed_slider_values({})
             self.clear_variable_metadata()
-            self.clear_prepared_slider_runtime(dirty=True)
 
     def update_parameter_table_from_sliders(self) -> None:
         mw = self._mw
@@ -437,92 +404,6 @@ class MainWindowVariableRuntime:
                 updater(dict(params))
         except Exception:
             return
-
-    def prepare_slider_runtime(
-        self,
-        param_names: Optional[List[str]] = None,
-        *,
-        set_id: Optional[str] = None,
-    ) -> Optional[BoundMechanism]:
-        mw = self._mw
-
-        if param_names is None or not param_names:
-            param_names = list(mw.slider_overrides(set_id=set_id).keys())
-        if not param_names:
-            return None
-
-        # Ensure constrained mechanism parameters are bound even if the user isn't directly editing them.
-        try:
-            spec = mw._parameter_algebra_spec_for_ui()
-            if spec is not None and getattr(spec, "param_statements", None):
-                namespace_info = getattr(getattr(spec, "mechanism_namespace", None), "info_by_name", {}) or {}
-                constrained = {p.name for p in spec.param_statements if str(p.name) in namespace_info}
-                if constrained:
-                    param_names = sorted(set(param_names) | constrained)
-        except Exception as exc:
-            logger.debug("Failed to expand slider runtime params from algebra spec: %s", exc, exc_info=True)
-            self.clear_prepared_slider_runtime(dirty=True)
-
-        if self._slider_runtime is not None and not self._slider_runtime_dirty:
-            current_params = set(self._slider_runtime.param_names)
-            requested_params = set(param_names)
-            if requested_params == current_params:
-                return self._slider_runtime
-
-        mechanism_text = mw.canonical_mechanism_source().full_dsl
-        temperature_K = mw._temperature_spinbox.value()
-
-        try:
-            runtime = prepare_bound_mechanism(
-                mechanism_text=mechanism_text,
-                param_names=list(param_names),
-                temperature_K=temperature_K,
-                initials={},
-                wegscheider_cyclicity_enabled=bool(mw._wegscheider_cyclicity_enabled),
-            )
-        except Exception as exc:
-            logger.error("Failed to prepare slider runtime: %s", exc)
-            details = getattr(exc, "details", None)
-            failure = details.get("failure") if isinstance(details, MappingABC) else None
-            failure_details = failure.get("details") if isinstance(failure, MappingABC) else None
-            stage = failure_details.get("stage") if isinstance(failure_details, MappingABC) else None
-            if str(stage or "") == "wegscheider_cyclicity" or "Wegscheider cyclicity" in str(exc):
-                self._slider_runtime_unavailable_reason = "unresolved Wegscheider cyclicity"
-            else:
-                self._slider_runtime_unavailable_reason = ""
-            return None
-
-        self._slider_runtime = runtime
-        self._slider_runtime_dirty = False
-        self._slider_runtime_unavailable_reason = ""
-        return runtime
-
-    def apply_slider_overrides_to_bindings(
-        self,
-        runtime: Optional[BoundMechanism],
-        *,
-        set_id: Optional[str] = None,
-    ) -> bool:
-        mw = self._mw
-
-        if runtime is None or not runtime.bindings:
-            return False
-
-        all_applied = True
-        for name, value in mw.slider_overrides(set_id=set_id).items():
-            binding = runtime.bindings.get(name)
-            if binding is None:
-                all_applied = False
-                continue
-            try:
-                binding.set(float(value))
-            except Exception as exc:
-                all_applied = False
-                logger.warning("Failed to update binding for %s: %s", name, exc)
-
-        if not all_applied:
-            logger.debug("Not all slider bindings could be updated; will re-parse on next run")
-        return all_applied
 
     def is_energy_mode_mechanism(self, mechanism: object) -> bool:
         meta = getattr(mechanism, "metadata", {}) or {}
@@ -947,7 +828,10 @@ class MainWindowVariableRuntime:
 
         if not all_channels:
             mw.clear_variable_sliders()
-            mw._preview_session.sync_committed_slider_values({})
+            mw._preview_session.sync_committed_slider_values(
+                {},
+                schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
+            )
             self.clear_variable_metadata()
             mw._energy_mode_channels = []
             try:
@@ -1077,7 +961,10 @@ class MainWindowVariableRuntime:
                 preserve_visibility=bool(preserve_visibility),
                 visibility_scope_signature=visibility_scope_signature,
             )
-            mw._preview_session.sync_committed_slider_values(dict(variables))
+            mw._preview_session.sync_committed_slider_values(
+                dict(variables),
+                schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
+            )
 
         try:
             plot = mw.main_plot()

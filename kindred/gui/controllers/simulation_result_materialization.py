@@ -106,8 +106,8 @@ class SimulationResultMaterializationOwner:
         energy_mode = bool(
             mechanism is not None
             and (
-                self._ui.runtime.is_energy_mode_mechanism(mechanism)
-                or self._ui.runtime.dsl_has_computational_mode_generated_block(str(mechanism_text))
+                self._ui.variable_runtime.is_energy_mode_mechanism(mechanism)
+                or self._ui.variable_runtime.dsl_has_computational_mode_generated_block(str(mechanism_text))
             )
         )
         if (not bool(is_primary)) or bool(is_preview):
@@ -117,7 +117,7 @@ class SimulationResultMaterializationOwner:
             and mechanism is not None
             and self._ui.solver.dsl_global_temperature_K(str(mechanism_text)) is not None
         ):
-            self._ui.runtime.sync_energy_mode_temperature_from_mechanism(mechanism)
+            self._ui.variable_runtime.sync_energy_mode_temperature_from_mechanism(mechanism)
         elif energy_mode:
             self._ui.mechanism_helpers.set_temperature_override_state(
                 enabled=True,
@@ -169,7 +169,7 @@ class SimulationResultMaterializationOwner:
         if not bool(is_primary):
             return
         if bool(energy_mode) and mechanism is not None:
-            self._ui.runtime.populate_energy_mode_variables_from_mechanism(
+            self._ui.variable_runtime.populate_energy_mode_variables_from_mechanism(
                 mechanism,
                 refresh_sliders=bool((not self._ui.slider.suppress_slider_refresh()) and (not bool(slider_triggered))),
                 preserve_visibility=True,
@@ -183,7 +183,7 @@ class SimulationResultMaterializationOwner:
                 self._ui.slider.set_slider_triggered_simulation(False)
             return
         if not bool(slider_triggered):
-            self._ui.runtime.extract_and_populate_variables(
+            self._ui.variable_runtime.extract_and_populate_variables(
                 preserve_visibility=True
             )
             return

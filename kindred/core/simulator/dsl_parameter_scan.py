@@ -15,7 +15,7 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
-    step_entry_role_editable,
+    step_entry_authored_role_is_editable,
 )
 from . import parameter_algebra
 from kindred.core.mechanism_metadata import MechanismMetadataKeys
@@ -142,9 +142,9 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
                 source=source,
                 step_index=int(step_index),
                 editable=bool(
-                    step_entry_role_editable(entry, role)
-                    if step_entry_role_editable(entry, role) is not None
-                    else authority.role_editability(role)
+                    step_entry_authored_role_is_editable(entry, role)
+                    if step_entry_authored_role_is_editable(entry, role) is not None
+                    else authority.authored_role_is_editable(role)
                 ),
             )
         )

@@ -42,7 +42,6 @@ class SimulationLifecycleEffects:
     schedule_deferred_preview_replay: bool = False
     deferred_replay_stop_timers: bool = True
     apply_explicit_failure_pending_replay: bool = False
-    show_preview_unavailable_status: str | None = None
     modal_error: SimulationModalError | None = None
 
 
@@ -149,7 +148,10 @@ class SimulationLifecycleEffectOwner:
             return SimulationLifecycleEffects(
                 release_worker=bool(deactivate_context_immediately),
                 cleanup_lane_pool=bool(deactivate_context_immediately),
-                keep_lane_pool_alive=bool(cleanup_state.parallel and cleanup_state.keep_lane_pool_alive),
+                keep_lane_pool_alive=bool(
+                    (cleanup_state.runtime_task_queue or cleanup_state.parallel)
+                    and cleanup_state.keep_lane_pool_alive
+                ),
                 clear_pending_plot_updates=bool(deactivate_context_immediately),
                 reset_slider_triggered=bool(deactivate_context_immediately),
                 simulation_running=False if bool(deactivate_context_immediately) else None,
@@ -164,7 +166,10 @@ class SimulationLifecycleEffectOwner:
         return SimulationLifecycleEffects(
             release_worker=bool(deactivate_context_immediately),
             cleanup_lane_pool=bool(deactivate_context_immediately),
-            keep_lane_pool_alive=bool(cleanup_state.parallel and cleanup_state.keep_lane_pool_alive),
+            keep_lane_pool_alive=bool(
+                (cleanup_state.runtime_task_queue or cleanup_state.parallel)
+                and cleanup_state.keep_lane_pool_alive
+            ),
             clear_pending_plot_updates=bool(deactivate_context_immediately),
             reset_slider_triggered=bool(deactivate_context_immediately),
             simulation_running=False if bool(deactivate_context_immediately) else None,
@@ -188,7 +193,10 @@ class SimulationLifecycleEffectOwner:
         return SimulationLifecycleEffects(
             release_worker=True,
             cleanup_lane_pool=True,
-            keep_lane_pool_alive=bool(cleanup_state.parallel and cleanup_state.keep_lane_pool_alive),
+            keep_lane_pool_alive=bool(
+                (cleanup_state.runtime_task_queue or cleanup_state.parallel)
+                and cleanup_state.keep_lane_pool_alive
+            ),
             stale_fast_handoff_after_display=bool(stale_fast_handoff_after_display),
             reset_slider_triggered=True,
             simulation_running=False,
@@ -296,6 +304,5 @@ class SimulationLifecycleEffectOwner:
             stop_enabled=False,
             progress_value=0,
             algebra_status_text="",
-            show_preview_unavailable_status=str(status_text),
             status_text=str(status_text),
         )

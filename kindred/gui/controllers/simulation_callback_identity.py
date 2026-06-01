@@ -17,6 +17,12 @@ class SimulationCallbackIdentity:
     simulation_identity: Mapping[str, Any]
     preview_batch_cache_token: Optional[str] = None
     launch_provenance: Mapping[str, Any] | None = None
+    allocation_id: str = ""
+    lane_id: str = ""
+    lane_generation: int = 0
+    row: int | None = None
+    exact_descriptor_hash: str = ""
+    compatibility_key: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.run_id is None:
@@ -54,6 +60,16 @@ class SimulationCallbackIdentity:
             "launch_provenance",
             dict(self.launch_provenance) if isinstance(self.launch_provenance, Mapping) else None,
         )
+        object.__setattr__(self, "allocation_id", str(self.allocation_id or ""))
+        object.__setattr__(self, "lane_id", str(self.lane_id or ""))
+        object.__setattr__(self, "lane_generation", int(self.lane_generation or 0))
+        object.__setattr__(self, "row", int(self.row) if self.row is not None else None)
+        object.__setattr__(self, "exact_descriptor_hash", str(self.exact_descriptor_hash or ""))
+        object.__setattr__(
+            self,
+            "compatibility_key",
+            dict(self.compatibility_key) if isinstance(self.compatibility_key, Mapping) else None,
+        )
 
     @classmethod
     def capture(
@@ -70,6 +86,12 @@ class SimulationCallbackIdentity:
         simulation_identity: Mapping[str, Any],
         preview_batch_cache_token: Optional[str] = None,
         launch_provenance: Mapping[str, Any] | None = None,
+        allocation_id: str = "",
+        lane_id: str = "",
+        lane_generation: int = 0,
+        row: int | None = None,
+        exact_descriptor_hash: str = "",
+        compatibility_key: Mapping[str, Any] | None = None,
     ) -> "SimulationCallbackIdentity":
         if run_id is None:
             raise ValueError("SimulationCallbackIdentity.run_id is required.")
@@ -93,4 +115,10 @@ class SimulationCallbackIdentity:
                 str(preview_batch_cache_token) if preview_batch_cache_token is not None else None
             ),
             launch_provenance=launch_provenance,
+            allocation_id=str(allocation_id or ""),
+            lane_id=str(lane_id or ""),
+            lane_generation=int(lane_generation or 0),
+            row=int(row) if row is not None else None,
+            exact_descriptor_hash=str(exact_descriptor_hash or ""),
+            compatibility_key=compatibility_key,
         )

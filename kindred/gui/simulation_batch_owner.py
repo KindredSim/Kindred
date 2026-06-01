@@ -8,7 +8,6 @@ import numpy as np
 
 from kindred.core.batch_initial_conditions import (
     resolve_run_scope,
-    strip_reaction_dsl_initial_concentrations,
 )
 from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -17,7 +16,6 @@ from kindred.core.simulation_identity import (
     canonical_initials_fingerprint,
     coerce_simulation_identity,
 )
-from kindred.core.validation import try_parse_finite_float
 from kindred.core.batch_cache_contracts import (
     BatchCacheResultReadSnapshot,
     BatchCacheEntryReadResult,
@@ -102,7 +100,6 @@ class SimulationBatchOwner:
         self._update_batch_row_controls_state = update_batch_row_controls_state
         self._sync_batch_species_columns = sync_batch_species_columns
         self._sync_mechanism_controls_to_focused_batch_set = sync_mechanism_controls_to_focused_batch_set
-        self._symbolic_wegscheider_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
 
     @property
     def _batch_store(self) -> object:
@@ -271,14 +268,6 @@ class SimulationBatchOwner:
             "slider_checkbox",
             "slider_target_change",
         }
-        runtime_readiness_refresh_needed = bool(
-            (
-                gesture_key in {"row_body_click", "selection_change"}
-                and bool(focus_change or selection_change)
-            )
-            or gesture_key in {"slider_checkbox", "slider_target_change"}
-        )
-
         run_rows = tuple(int(row) for row in target_selection_rows)
         empty_reason = "" if run_rows else self.run_selected_empty_target_reason()
 
@@ -298,8 +287,6 @@ class SimulationBatchOwner:
             display_refresh_reason=gesture_key if display_refresh_needed else "",
             slider_rebuild_needed=slider_rebuild_needed,
             slider_rebuild_reason=gesture_key if slider_rebuild_needed else "",
-            runtime_readiness_refresh_needed=runtime_readiness_refresh_needed,
-            runtime_readiness_refresh_reason=gesture_key if runtime_readiness_refresh_needed else "",
         )
 
     def focused_batch_set_id(self) -> Optional[str]:
@@ -906,89 +893,9 @@ class SimulationBatchOwner:
             return self.current_workspace_preview_identity_payload(set_id=sid)
         return None
 
-    def _symbolic_jacobian_identity_for_preview(
-        self,
-        *,
-        set_id: str,
-        mechanism_text: str,
-        solver_config: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        solver_name = str(dict(solver_config or {}).get("solver") or "").strip().lower()
-        if solver_name not in {"bdf", "radau"}:
-            return {}
-        if not bool(dict(solver_config or {}).get("use_sparse_jacobian", False)):
-            return {}
-        if not bool(self._mechanism_owner.has_slider_overrides()):
-            return {}
-        try:
-            mechanism_identity_text = strip_reaction_dsl_initial_concentrations(
-                str(mechanism_text or "")
-            )
-            parameter_overrides = self._normalized_slider_overrides(set_id=str(set_id))
-            from kindred.core.simulation_preparation import (
-                symbolic_jacobian_identity_for_execution_text,
-            )
-
-            payload = symbolic_jacobian_identity_for_execution_text(
-                mechanism_text=mechanism_identity_text,
-                solver_config=dict(solver_config or {}),
-                parameter_overrides=parameter_overrides,
-            )
-            if not payload:
-                return {}
-            return dict(payload)
-        except Exception:
-            return {}
-
-    def _symbolic_wegscheider_identity_for_preview(
-        self,
-        *,
-        mechanism_text: str,
-        solver_config: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        if not bool(dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)):
-            return {}
-        if not bool(self._mechanism_owner.has_slider_overrides()):
-            return {}
-        try:
-            mechanism_identity_text = strip_reaction_dsl_initial_concentrations(
-                str(mechanism_text or "")
-            )
-            solver_identity = repr(
-                {
-                    "temperature_K": dict(solver_config or {}).get("temperature_K"),
-                    "wegscheider_cyclicity_enabled": bool(
-                        dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)
-                    ),
-                }
-            )
-            cache_key = (mechanism_identity_text, solver_identity)
-            cached = self._symbolic_wegscheider_identity_cache.get(cache_key)
-            if cached is not None:
-                return dict(cached)
-            from kindred.core.simulation_preparation import (
-                symbolic_wegscheider_identity_for_execution_text,
-            )
-
-            payload = symbolic_wegscheider_identity_for_execution_text(
-                mechanism_text=mechanism_identity_text,
-                solver_config=dict(solver_config or {}),
-            )
-            if not payload:
-                return {}
-            self._symbolic_wegscheider_identity_cache[cache_key] = dict(payload)
-            return dict(payload)
-        except Exception:
-            return {}
-
     def current_workspace_preview_identity(self, *, set_id: str) -> SimulationIdentity:
         mechanism_source = self._mechanism_source_for_workspace_selection(set_id=str(set_id))
         mechanism_text = mechanism_source.full_dsl
-        symbolic_mechanism_source = self._mechanism_source_for_workspace_selection(
-            set_id=str(set_id),
-            apply_parameter_overrides=False,
-        )
-        symbolic_mechanism_text = symbolic_mechanism_source.full_dsl
         expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
             set_id=str(set_id),
             mechanism_text=mechanism_text,
@@ -1018,7 +925,7 @@ class SimulationBatchOwner:
                 initials_fingerprint = ""
         return SimulationIdentity.build(
             schema_id=self._mechanism_owner.simulation_schema_id(fast_mode=True),
-            param_fingerprint=self._mechanism_owner.simulation_param_fingerprint(
+            param_fingerprint=self._mechanism_owner.runtime_parameter_fingerprint_for_set(
                 set_id=str(set_id),
                 fast_mode=True,
             ),
@@ -1029,16 +936,73 @@ class SimulationBatchOwner:
             intervention_schedule_executable_fingerprint=intervention_schedule_executable_fingerprint,
             preview_batch_cache_token=expected_overlay_token,
             execution_flags=("fast_mode",),
-            symbolic_jacobian_identity=self._symbolic_jacobian_identity_for_preview(
+            symbolic_jacobian_identity=self._workspace_symbolic_jacobian_identity(
                 set_id=str(set_id),
-                mechanism_text=symbolic_mechanism_text,
                 solver_config=expected_solver_config,
             ),
-            symbolic_wegscheider_identity=self._symbolic_wegscheider_identity_for_preview(
+            symbolic_wegscheider_identity=self._workspace_symbolic_wegscheider_identity(
+                set_id=str(set_id),
                 mechanism_text=mechanism_text,
                 solver_config=expected_solver_config,
             ),
         )
+
+    def _workspace_symbolic_jacobian_identity(
+        self,
+        *,
+        set_id: str,
+        solver_config: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        solver_name = str(dict(solver_config or {}).get("solver") or "").strip().lower()
+        if solver_name not in {"bdf", "radau"}:
+            return {}
+        if not bool(dict(solver_config or {}).get("use_sparse_jacobian", False)):
+            return {}
+        try:
+            mechanism_text = self._mechanism_source_for_workspace_selection(
+                set_id=str(set_id),
+                apply_parameter_overrides=False,
+            ).full_dsl
+            parameter_values = getattr(self._mechanism_owner, "runtime_parameter_values_for_set", None)
+            parameter_overrides = (
+                dict(parameter_values(set_id=str(set_id)))
+                if callable(parameter_values)
+                else {}
+            )
+            from kindred.core.simulation_preparation import (
+                symbolic_jacobian_identity_for_execution_text,
+            )
+
+            payload = symbolic_jacobian_identity_for_execution_text(
+                mechanism_text=str(mechanism_text or ""),
+                solver_config=dict(solver_config or {}),
+                parameter_overrides=parameter_overrides,
+            )
+            return dict(payload or {})
+        except Exception:
+            return {}
+
+    def _workspace_symbolic_wegscheider_identity(
+        self,
+        *,
+        set_id: str,
+        mechanism_text: str,
+        solver_config: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if not bool(dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)):
+            return {}
+        try:
+            from kindred.core.simulation_preparation import (
+                symbolic_wegscheider_identity_for_execution_text,
+            )
+
+            payload = symbolic_wegscheider_identity_for_execution_text(
+                mechanism_text=str(mechanism_text or ""),
+                solver_config=dict(solver_config or {}),
+            )
+            return dict(payload or {})
+        except Exception:
+            return {}
 
     def current_workspace_preview_context(
         self,
@@ -1153,7 +1117,6 @@ class SimulationBatchOwner:
             slider_points_override=self._mechanism_owner.mechanism_slider_points_value(),
             slider_solver_override=self._mechanism_owner.mechanism_slider_solver_value(),
             slider_drag_active=bool(self._preview_session.slider_drag_active()),
-            last_slider_change_name=str(self._preview_session.last_slider_change_name() or ""),
         )
         temperature_k = float(self._solver_owner.temperature_spinbox_value())
         t_override = self._solver_owner.dsl_global_temperature_K(str(mechanism_text))
@@ -1182,21 +1145,6 @@ class SimulationBatchOwner:
             except Exception:
                 overlay_token = ""
         return solver_config, float(self._solver_owner.parse_sim_time_seconds()), overlay_token
-
-    def _normalized_slider_overrides(
-        self,
-        *,
-        set_id: Optional[str] = None,
-        overrides: Optional[Dict[str, float]] = None,
-    ) -> Dict[str, float]:
-        raw = self._mechanism_owner.slider_overrides(set_id=set_id) if overrides is None else dict(overrides or {})
-        normalized: Dict[str, float] = {}
-        for key, value in raw.items():
-            parsed, ok = try_parse_finite_float(value)
-            if not ok:
-                continue
-            normalized[str(key)] = float(parsed)
-        return normalized
 
     def _batch_row_for_set_id(self, set_id: str) -> Optional[int]:
         row_for_set_id = getattr(self._batch_store, "row_for_set_id", None)

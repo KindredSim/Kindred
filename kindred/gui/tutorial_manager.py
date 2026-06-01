@@ -328,7 +328,7 @@ class TutorialManager:
                         "Click it to promote the current slider values into the "
                         "canonical mechanism and update the DSL text."
                     ),
-                    target_widget="commitSliderOverridesButton",
+                    target_widget="commitRuntimeParametersButton",
                     arrow_direction="top",
                 ),
                 TutorialStep(
@@ -337,7 +337,7 @@ class TutorialManager:
                         "Click <b>Reset</b> to discard your slider adjustments "
                         "and return to the canonical mechanism values."
                     ),
-                    target_widget="resetSliderOverridesButton",
+                    target_widget="resetRuntimeParametersButton",
                     arrow_direction="top",
                 ),
                 TutorialStep(

@@ -45,7 +45,6 @@ class MainWindowPreviewSession:
         self._param_store: DocumentParameterStore = param_store or DocumentParameterStore()
         self._slider_drag_active = False
         self._slider_triggered_simulation = False
-        self._last_slider_change_name = ""
         self._pending_slider_values: dict[str, float] = {}
         self._staged_concentration_overlays_by_set_id: dict[str, dict[str, float]] = {}
         self._dirty_state_generation_by_set_id: dict[str, int] = {}
@@ -68,6 +67,9 @@ class MainWindowPreviewSession:
         """The canonical parameter store backing this session."""
         return self._param_store
 
+    def set_runtime_parameter_schema(self, schema_text: str) -> None:
+        self._param_store.set_schema(str(schema_text or ""))
+
     def drag_baseline_text(self) -> Optional[str]:
         return self._drag_baseline_text
 
@@ -85,22 +87,6 @@ class MainWindowPreviewSession:
         if port is None:
             raise RuntimeError("Slider preview lifecycle port is not bound.")
         return port
-
-    def _deauthorize_completed_run_display_for_slider_preview_scope(
-        self,
-        target_set_ids: Sequence[str],
-    ) -> bool:
-        port = self._slider_preview_lifecycle_port
-        if port is None:
-            return False
-        deauthorize = getattr(port, "deauthorize_completed_run_display_for_slider_preview_scope", None)
-        if not callable(deauthorize):
-            return False
-        try:
-            return bool(deauthorize(target_set_ids))
-        except Exception:
-            logger.debug("Failed to deauthorize completed-run display for slider preview scope", exc_info=True)
-            return False
 
     def _refresh_transaction_button_state(self) -> None:
         mw = self._mw
@@ -130,18 +116,7 @@ class MainWindowPreviewSession:
         mw = self._mw
         self._clear_active_preview_cache_state()
         mw._refresh_batch_display_from_request_scope()
-        reason = ""
-        variable_runtime = getattr(mw, "_variable_runtime", None)
-        reason_getter = getattr(variable_runtime, "slider_runtime_unavailable_reason", None)
-        if callable(reason_getter):
-            try:
-                reason = str(reason_getter() or "")
-            except Exception:
-                reason = ""
-        if reason == "unresolved Wegscheider cyclicity":
-            mw._status_label.setText("Unresolved Wegscheider cyclicity.")
-        else:
-            mw._status_label.setText("Mechanism invalid — no preview available.")
+        mw._status_label.setText("Mechanism invalid — no preview available.")
 
     def show_preview_unavailable_for_dirty_state(self, message: str) -> None:
         mw = self._mw
@@ -363,7 +338,6 @@ class MainWindowPreviewSession:
 
         if not (has_surviving_gesture_scope or has_surviving_replay_scope):
             self._slider_triggered_simulation = False
-            self._last_slider_change_name = ""
             self._stop_preview_timer("_variable_update_timer")
             self._stop_preview_timer("_species_slider_update_timer")
             return
@@ -641,7 +615,14 @@ class MainWindowPreviewSession:
             return self.slider_gesture_target_set_ids_snapshot()
         return self._capture_slider_gesture_target_snapshot()
 
-    def sync_committed_slider_values(self, values: Dict[str, float]) -> None:
+    def sync_committed_slider_values(
+        self,
+        values: Dict[str, float],
+        *,
+        schema_text: Optional[str] = None,
+    ) -> None:
+        if schema_text is not None:
+            self.set_runtime_parameter_schema(str(schema_text or ""))
         overrides_changed = self._param_store.sync_shared_params(values or {})
         if overrides_changed:
             self._clear_active_preview_cache_state()
@@ -650,11 +631,7 @@ class MainWindowPreviewSession:
     def clear_staged_slider_values(self) -> None:
         self.clear_all_local_mechanism_workspaces()
 
-    def slider_overrides(self, set_id: Optional[str] = None) -> dict[str, float]:
-        target_set_id = str(set_id or "").strip() or self._focused_mechanism_workspace_set_id()
-        return self._workspace_for_set_id(target_set_id)
-
-    def stage_slider_value(self, name: str, value: float, *, target_set_ids: Optional[Sequence[str]] = None) -> None:
+    def stage_runtime_parameter_value(self, name: str, value: float, *, target_set_ids: Optional[Sequence[str]] = None) -> None:
         name_s = str(name)
         value_f = float(value)
         candidate_targets = target_set_ids
@@ -675,21 +652,39 @@ class MainWindowPreviewSession:
             if not set_id_s or set_id_s in seen:
                 continue
             seen.add(set_id_s)
-            if self._param_store.stage_override(set_id_s, name_s, value_f):
+            if self._param_store.stage_runtime_parameter_value(set_id_s, name_s, value_f):
                 changed = True
                 changed_set_ids.append(set_id_s)
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
             self._clear_active_preview_cache_state()
-            self._deauthorize_completed_run_display_for_slider_preview_scope(changed_set_ids)
+            self._deauthorize_completed_display_for_runtime_input_change(changed_set_ids)
         self._refresh_transaction_button_state()
 
-    def effective_slider_values(self, set_id: Optional[str] = None) -> dict[str, float]:
-        target_set_id = str(set_id or "").strip() or self._focused_mechanism_workspace_set_id()
-        return self._param_store.effective_params(target_set_id)
+    def _deauthorize_completed_display_for_runtime_input_change(self, changed_set_ids: Sequence[str]) -> None:
+        set_ids = tuple(str(set_id) for set_id in (changed_set_ids or ()) if str(set_id))
+        if not set_ids:
+            return
+        try:
+            deauthorize = getattr(
+                getattr(self._mw, "results_controller", None),
+                "deauthorize_completed_run_display_for_runtime_input_preview",
+                None,
+            )
+            if callable(deauthorize):
+                deauthorize(
+                    affected_set_ids=set_ids,
+                    affected_scope_is_global=False,
+                )
+        except Exception:
+            logger.debug("Failed to deauthorize completed display after runtime parameter edit", exc_info=True)
 
-    def effective_slider_values_for_set(self, set_id: str) -> dict[str, float]:
-        return self.effective_slider_values(set_id=str(set_id or ""))
+    def runtime_parameter_values(self, set_id: Optional[str] = None) -> dict[str, float]:
+        target_set_id = str(set_id or "").strip() or self._focused_mechanism_workspace_set_id()
+        return self._param_store.runtime_parameter_values(target_set_id)
+
+    def runtime_parameter_values_for_set(self, set_id: str) -> dict[str, float]:
+        return self.runtime_parameter_values(set_id=str(set_id or ""))
 
     def preview_initials_for_row(self, row: int, baseline: Dict[str, float]) -> dict[str, float]:
         merged = {str(key): float(value) for key, value in dict(baseline or {}).items()}
@@ -747,7 +742,6 @@ class MainWindowPreviewSession:
                 changed_set_ids.append(str(set_id))
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
-            self._deauthorize_completed_run_display_for_slider_preview_scope(changed_set_ids)
             self.stage_slider_replay_intent(
                 set_ids=changed_set_ids,
                 source="species_slider",
@@ -841,16 +835,16 @@ class MainWindowPreviewSession:
         changed = False
         pruned_overlays: dict[str, dict[str, float]] = {}
         for set_id, overlay in list(self._staged_concentration_overlays_by_set_id.items()):
-            filtered = {
+            retained = {
                 str(species): float(value)
                 for species, value in dict(overlay or {}).items()
                 if str(species) in allowed_species
             }
-            if filtered != dict(overlay or {}):
+            if retained != dict(overlay or {}):
                 changed = True
                 self._bump_dirty_state_generation([str(set_id)])
-            if filtered:
-                pruned_overlays[str(set_id)] = filtered
+            if retained:
+                pruned_overlays[str(set_id)] = retained
         if not changed:
             return False
         self._staged_concentration_overlays_by_set_id = pruned_overlays
@@ -949,9 +943,6 @@ class MainWindowPreviewSession:
     def slider_triggered_simulation(self) -> bool:
         return bool(self._slider_triggered_simulation)
 
-    def last_slider_change_name(self) -> str:
-        return str(self._last_slider_change_name or "")
-
     def slider_drag_active(self) -> bool:
         return bool(self._slider_drag_active)
 
@@ -1028,7 +1019,6 @@ class MainWindowPreviewSession:
             self._show_invalid_preview_state()
             return
         logger.debug("Variable %s changed to %s", name, value)
-        self._last_slider_change_name = name
         target_set_ids = self._ensure_slider_gesture_target_snapshot()
         intent = self.stage_slider_replay_intent(
             set_ids=target_set_ids,
@@ -1038,7 +1028,7 @@ class MainWindowPreviewSession:
             intent,
             preserve_existing_request=True,
         )
-        self.stage_slider_value(name, float(value), target_set_ids=target_set_ids)
+        self.stage_runtime_parameter_value(name, float(value), target_set_ids=target_set_ids)
         if self._slider_drag_active or self._slider_release_in_progress:
             self._pending_slider_values[name] = value
         mw._refresh_derived_parameters_display()
@@ -1072,7 +1062,6 @@ class MainWindowPreviewSession:
         if not self.is_mechanism_valid_for_preview():
             self._show_invalid_preview_state()
             return
-        self._last_slider_change_name = name
         target_set_ids = self._ensure_slider_gesture_target_snapshot()
         intent = self.stage_slider_replay_intent(
             set_ids=target_set_ids,
@@ -1082,7 +1071,7 @@ class MainWindowPreviewSession:
             intent,
             preserve_existing_request=True,
         )
-        self.stage_slider_value(name, float(value), target_set_ids=target_set_ids)
+        self.stage_runtime_parameter_value(name, float(value), target_set_ids=target_set_ids)
         meta = (mw.variable_metadata() or {}).get(name, {})
         self._slider_triggered_simulation = True
         mw._status_label.setText(f"Updating {name} = {value:.3g}...")
@@ -1140,7 +1129,6 @@ class MainWindowPreviewSession:
         self._species_slider_drag_changed = False
         self._capture_slider_gesture_target_snapshot()
         self._suppress_slider_refresh = True
-        self._last_slider_change_name = f"init:{species}"
 
     def on_species_slider_drag_finished(self, species: str) -> None:
         """Run the species preview using the scope captured at drag start."""
@@ -1169,7 +1157,6 @@ class MainWindowPreviewSession:
             delay_ms_i = 80
         delay_ms_i = max(0, min(500, delay_ms_i))
 
-        self._last_slider_change_name = str(label or "init")
         target_set_ids = (
             self.slider_gesture_target_set_ids_snapshot()
             or self._selected_mechanism_target_set_ids()

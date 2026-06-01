@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import logging
 import math
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -16,6 +18,13 @@ from kindred.core.simulation_identity import (
 from kindred.core.simulation_plan import SimulationAlgebraPolicy
 from kindred.gui.controllers.batch_run_context_owner import BatchRunStartRequest
 from kindred.gui.controllers.batch_dispatch_plan import BatchSetDispatchInput, build_batch_set_dispatch_plan
+from kindred.gui.controllers.runtime_lane_allocation import (
+    PreparedRuntimeRequestSet,
+    RuntimeCompatibilityKey,
+    RuntimeLaunchIntent,
+    RuntimePreparationBlockedReason,
+    RuntimeTaskDescriptor,
+)
 from kindred.gui.ports import CompletedRunDisplayIntent
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
@@ -37,7 +46,7 @@ class RunMechanismContext:
     batch_rows: List[int]
     queue_names: List[str]
     queue_ids: List[str]
-    has_slider_overrides: bool
+    has_runtime_parameter_values: bool
     primary: object | None
     primary_set_id: str | None
     base_source: MechanismAuthoringSource
@@ -53,7 +62,7 @@ class RunSolverContext:
     prepared_payload: Dict[str, Any] | None
     prepared_payload_by_set_id: Dict[str, Dict[str, Any]]
     execution_prepared_payload_by_set_id: Dict[str, Dict[str, Any]]
-    owner_parameter_names_by_set_id: Dict[str, List[str]]
+    runtime_parameter_names_by_set_id: Dict[str, List[str]]
 
 
 @dataclass
@@ -98,14 +107,15 @@ class SimulationRunPreparationDependencies:
     record_nonfatal_exception: Callable[[str, BaseException], None]
     set_simulation_running: Callable[[bool], None]
     set_slider_simulation_active: Callable[[bool], None]
-    slider_runtime_parameter_names: Callable[..., Sequence[str]]
+    runtime_parameter_names_for_set: Callable[..., Sequence[str]]
     pending_initials_for_run_source_set: Callable[..., Dict[str, Any]]
     simulation_identity_for_set: Callable[..., Any]
     resolved_initials_for_batch_row: Callable[..., Dict[str, Any]]
-    slider_execution_parameter_values: Callable[..., Dict[str, Any]]
+    runtime_parameter_values_for_set: Callable[..., Dict[str, Any]]
     preview_contained_owner_identity: Callable[..., Dict[str, Any]]
     ordinary_contained_owner_identity: Callable[..., Dict[str, Any]]
     record_run_cache_key: Callable[..., None]
+    runtime_environment_key: Callable[[], str] = lambda: "contained-child-blas-limited"
 
 
 def build_fast_preview_solver_grid_context(
@@ -116,7 +126,6 @@ def build_fast_preview_solver_grid_context(
     slider_points_override: Optional[int],
     slider_solver_override: Optional[str],
     slider_drag_active: bool,
-    last_slider_change_name: str,
 ) -> Dict[str, Any]:
     from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
 
@@ -132,16 +141,6 @@ def build_fast_preview_solver_grid_context(
         if slider_solver_override is not None:
             solver_label = str(slider_solver_override).strip() or solver_label
             solver, solver_warning = normalize_solver_name(solver_label)
-
-    preview_mode = bool(
-        fast_mode
-        and slider_drag_active
-        and isinstance(last_slider_change_name, str)
-        and last_slider_change_name.startswith("Keq")
-        and last_slider_change_name[3:].isdigit()
-    )
-    if preview_mode:
-        n_points = min(int(n_points), 120)
 
     return {
         "solver": str(solver),
@@ -417,8 +416,8 @@ class SimulationRunMechanismPreparationOwner:
         batch_rows: Sequence[int],
         runtime_readiness_only: bool,
     ) -> RunMechanismContext | None:
-        any_slider_workspace = bool(self._ports.mechanism.has_slider_overrides())
-        has_slider_overrides = bool(fast_mode) and bool(any_slider_workspace)
+        any_runtime_parameter_workspace = bool(self._ports.mechanism.has_local_runtime_parameter_values())
+        has_runtime_parameter_values = bool(fast_mode) and bool(any_runtime_parameter_workspace)
         primary = self._ports.batch.batch_preferred_primary_set_id(batch_rows)
         primary_set_id = str(primary) if primary is not None else None
 
@@ -462,7 +461,7 @@ class SimulationRunMechanismPreparationOwner:
         full_source = self._ports.mechanism.mechanism_source_for_run_set(
             base_source,
             set_id=primary_set_id,
-            apply_parameter_overrides=bool(has_slider_overrides),
+            apply_parameter_overrides=bool(has_runtime_parameter_values),
             strip_initial_concentrations=True,
         )
         full_dsl = full_source.full_dsl
@@ -490,7 +489,7 @@ class SimulationRunMechanismPreparationOwner:
             batch_rows=rows,
             queue_names=queue_names,
             queue_ids=queue_ids,
-            has_slider_overrides=bool(has_slider_overrides),
+            has_runtime_parameter_values=bool(has_runtime_parameter_values),
             primary=primary,
             primary_set_id=primary_set_id,
             base_source=base_source,
@@ -524,7 +523,6 @@ class SimulationRunSolverPreparationOwner:
             slider_points_override=self._ports.mechanism.mechanism_slider_points_value(),
             slider_solver_override=self._ports.mechanism.mechanism_slider_solver_value(),
             slider_drag_active=bool(self._ports.slider.slider_drag_active()),
-            last_slider_change_name=str(self._ports.slider.last_slider_change_name() or ""),
         )
         solver_label = str(solver_grid_context.get("solver_label") or "")
         solver = str(solver_grid_context.get("solver") or "")
@@ -545,14 +543,14 @@ class SimulationRunSolverPreparationOwner:
         prepared_payload: Optional[Dict[str, Any]] = None
         prepared_payload_by_set_id: Dict[str, Dict[str, Any]] = {}
         execution_prepared_payload_by_set_id: Dict[str, Dict[str, Any]] = {}
-        owner_parameter_names_by_set_id: Dict[str, List[str]] = {}
+        runtime_parameter_names_by_set_id: Dict[str, List[str]] = {}
         if bool(fast_mode):
             target_runtime_set_ids = list(mechanism_context.queue_ids)
             if (not target_runtime_set_ids) and mechanism_context.primary_set_id:
                 target_runtime_set_ids = [str(mechanism_context.primary_set_id)]
             for set_id in target_runtime_set_ids:
-                runtime_parameter_names = self._deps.slider_runtime_parameter_names(set_id=str(set_id))
-                owner_parameter_names_by_set_id[str(set_id)] = list(runtime_parameter_names)
+                runtime_parameter_names = self._deps.runtime_parameter_names_for_set(set_id=str(set_id))
+                runtime_parameter_names_by_set_id[str(set_id)] = list(runtime_parameter_names)
             if mechanism_context.primary_set_id:
                 prepared_payload = prepared_payload_by_set_id.get(str(mechanism_context.primary_set_id))
             if prepared_payload is None and prepared_payload_by_set_id:
@@ -602,7 +600,7 @@ class SimulationRunSolverPreparationOwner:
             prepared_payload=prepared_payload if isinstance(prepared_payload, dict) else None,
             prepared_payload_by_set_id=prepared_payload_by_set_id,
             execution_prepared_payload_by_set_id=execution_prepared_payload_by_set_id,
-            owner_parameter_names_by_set_id=owner_parameter_names_by_set_id,
+            runtime_parameter_names_by_set_id=runtime_parameter_names_by_set_id,
         )
 
 
@@ -736,7 +734,7 @@ class SimulationRunDispatchPreparationOwner:
             request_source = self._ports.mechanism.mechanism_source_for_run_set(
                 mechanism_context.base_source,
                 set_id=set_id_s,
-                apply_parameter_overrides=bool(mechanism_context.has_slider_overrides),
+                apply_parameter_overrides=bool(mechanism_context.has_runtime_parameter_values),
                 strip_initial_concentrations=True,
             )
             request_mechanism_text = request_source.full_dsl
@@ -818,7 +816,7 @@ class SimulationRunDispatchPreparationOwner:
             simulation_identity_by_set_id[set_id_s] = identity_payload
             initials_by_set_id[set_id_s] = dict(initials_dict)
             if bool(fast_mode):
-                parameter_overrides_by_set_id[set_id_s] = self._deps.slider_execution_parameter_values(
+                parameter_overrides_by_set_id[set_id_s] = self._deps.runtime_parameter_values_for_set(
                     set_id=set_id_s
                 )
                 if isinstance(prepared_execution_payload, dict):
@@ -846,15 +844,12 @@ class SimulationRunDispatchPreparationOwner:
                     mechanism_signature_by_set_id[set_id_s] = batch_mechanism_signature(
                         simulation_identity=identity,
                     )
-                parameter_names = solver_context.owner_parameter_names_by_set_id.get(set_id_s)
-                if parameter_names is None:
-                    parameter_names = self._deps.slider_runtime_parameter_names(set_id=set_id_s)
                 contained_owner_identity_by_set_id[set_id_s] = self._deps.preview_contained_owner_identity(
                     owner_mechanism_text=str(request_mechanism_text or mechanism_context.owner_full_dsl),
                     solver_config=solver_context.solver_config,
                     t_end=float(solver_context.t_end),
                     set_id=set_id_s,
-                    parameter_names=parameter_names,
+                    parameter_names=solver_context.runtime_parameter_names_by_set_id.get(set_id_s, ()),
                     simulation_identity=simulation_identity_by_set_id.get(set_id_s),
                 )
             else:
@@ -942,6 +937,8 @@ class SimulationRunPreparationOwner:
         ports: SimulationRunPreparationPorts,
         dependencies: SimulationRunPreparationDependencies,
     ) -> None:
+        self._ports = ports
+        self._deps = dependencies
         self._mechanism_owner = SimulationRunMechanismPreparationOwner(
             ports=ports,
             dependencies=dependencies,
@@ -996,4 +993,337 @@ class SimulationRunPreparationOwner:
             runtime_readiness_only=bool(runtime_readiness_only),
             mechanism_context=mechanism_context,
             solver_context=solver_context,
+        )
+
+    def prepare_runtime_request_set(
+        self,
+        *,
+        intent: RuntimeLaunchIntent,
+        fast_mode: bool,
+        preferred_lane_capacity: int | None = None,
+    ) -> PreparedRuntimeRequestSet:
+        rows_or_block = self._runtime_request_rows(intent.rows)
+        if isinstance(rows_or_block, RuntimePreparationBlockedReason):
+            return self._blocked_prepared_request_set(
+                intent=intent,
+                blocked_reason=rows_or_block,
+            )
+        rows = rows_or_block
+        mechanism_context = self.build_mechanism_context_or_abort(
+            fast_mode=bool(fast_mode),
+            request_id=int(intent.request_token or 0),
+            batch_rows=rows,
+            runtime_readiness_only=True,
+        )
+        if mechanism_context is None:
+            return self._blocked_prepared_request_set(
+                intent=intent,
+                blocked_reason=RuntimePreparationBlockedReason(
+                    source="mechanism",
+                    code="mechanism_preparation_blocked",
+                    message="Simulation mechanism is not ready for runtime preparation.",
+                    rows=tuple(rows),
+                ),
+            )
+        solver_context = self.build_solver_context_or_abort(
+            fast_mode=bool(fast_mode),
+            runtime_readiness_only=True,
+            mechanism_context=mechanism_context,
+        )
+        if solver_context is None:
+            return self._blocked_prepared_request_set(
+                intent=intent,
+                blocked_reason=RuntimePreparationBlockedReason(
+                    source="solver",
+                    code="solver_preparation_blocked",
+                    message="Simulation solver settings are not ready for runtime preparation.",
+                    rows=tuple(rows),
+                    set_ids=tuple(mechanism_context.queue_ids),
+                ),
+            )
+        try:
+            dispatch_context = self.build_dispatch_context_or_abort(
+                fast_mode=bool(fast_mode),
+                runtime_readiness_only=True,
+                mechanism_context=mechanism_context,
+                solver_context=solver_context,
+            )
+        except Exception as exc:
+            return self._blocked_prepared_request_set(
+                intent=intent,
+                blocked_reason=RuntimePreparationBlockedReason(
+                    source="dispatch",
+                    code="dispatch_preparation_error",
+                    message=f"Simulation dispatch preparation failed: {exc}",
+                    rows=tuple(rows),
+                    set_ids=tuple(mechanism_context.queue_ids),
+                    retryable=True,
+                ),
+            )
+        if dispatch_context is None:
+            return self._blocked_prepared_request_set(
+                intent=intent,
+                blocked_reason=RuntimePreparationBlockedReason(
+                    source="dispatch",
+                    code="dispatch_preparation_blocked",
+                    message="Simulation dispatch is not ready for runtime preparation.",
+                    rows=tuple(rows),
+                    set_ids=tuple(mechanism_context.queue_ids),
+                ),
+            )
+        compatibility_key = self._runtime_compatibility_key(
+            fast_mode=bool(fast_mode),
+            mechanism_context=mechanism_context,
+            solver_context=solver_context,
+            dispatch_context=dispatch_context,
+        )
+        descriptors = self._runtime_task_descriptors(
+            intent=intent,
+            compatibility_key=compatibility_key,
+            rows=tuple(rows),
+            mechanism_context=mechanism_context,
+            solver_context=solver_context,
+            dispatch_context=dispatch_context,
+        )
+        if not descriptors:
+            return self._blocked_prepared_request_set(
+                intent=intent,
+                compatibility_key=compatibility_key,
+                blocked_reason=RuntimePreparationBlockedReason(
+                    source="dispatch",
+                    code="no_task_descriptors",
+                    message="Simulation dispatch did not produce runtime task descriptors.",
+                    rows=tuple(rows),
+                    set_ids=tuple(mechanism_context.queue_ids),
+                ),
+            )
+        preferred = max(1, int(preferred_lane_capacity or min(len(descriptors), max(1, int(PROJECT_DEFAULTS["max_parallel_batch_workers"])))))
+        return PreparedRuntimeRequestSet(
+            intent=intent,
+            compatibility_key=compatibility_key,
+            task_descriptors=descriptors,
+            required_lane_capacity=1,
+            preferred_lane_capacity=preferred,
+        )
+
+    def _runtime_request_rows(
+        self,
+        batch_rows: Sequence[int],
+    ) -> list[int] | RuntimePreparationBlockedReason:
+        try:
+            row_count = int(self._ports.batch.batch_store_row_count())
+        except Exception as exc:
+            self._deps.record_nonfatal_exception(
+                "Failed to inspect rows for runtime request preparation",
+                exc,
+            )
+            return RuntimePreparationBlockedReason(
+                source="batch",
+                code="row_count_unavailable",
+                message="Simulation rows are not available for runtime preparation.",
+                retryable=True,
+            )
+        rows: list[int] = []
+        invalid_rows: list[int] = []
+        seen: set[int] = set()
+        for row in batch_rows or ():
+            try:
+                row_i = int(row)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if row_i in seen:
+                continue
+            seen.add(row_i)
+            if 0 <= row_i < int(row_count):
+                rows.append(row_i)
+            else:
+                invalid_rows.append(row_i)
+        if invalid_rows:
+            return RuntimePreparationBlockedReason(
+                source="batch",
+                code="invalid_rows",
+                message="Selected simulation rows are no longer available.",
+                rows=tuple(invalid_rows),
+                retryable=True,
+            )
+        if not rows:
+            return RuntimePreparationBlockedReason(
+                source="batch",
+                code="no_rows",
+                message="No simulation rows are selected for runtime preparation.",
+                retryable=False,
+            )
+        try:
+            invalid = self._ports.batch.batch_model_validate_rows(rows)
+        except Exception as exc:
+            self._deps.record_nonfatal_exception(
+                "Failed to validate rows for runtime request preparation",
+                exc,
+            )
+            return RuntimePreparationBlockedReason(
+                source="batch",
+                code="row_validation_failed",
+                message=f"Simulation rows could not be validated. {exc}",
+                rows=tuple(rows),
+                retryable=True,
+            )
+        if invalid:
+            return RuntimePreparationBlockedReason(
+                source="batch",
+                code="invalid_initial_conditions",
+                message="Selected simulation rows have invalid initial conditions.",
+                rows=tuple(rows),
+                retryable=True,
+            )
+        return rows
+
+    def _runtime_compatibility_key(
+        self,
+        *,
+        fast_mode: bool,
+        mechanism_context: RunMechanismContext,
+        solver_context: RunSolverContext,
+        dispatch_context: RunDispatchContext,
+    ) -> RuntimeCompatibilityKey:
+        runtime_parameter_names = tuple(
+            sorted(
+                {
+                    str(name)
+                    for names in dict(solver_context.runtime_parameter_names_by_set_id or {}).values()
+                    for name in list(names or ())
+                    if str(name)
+                }
+            )
+        )
+        structural_payload = {
+            "execution_profile": "preview" if bool(fast_mode) else "explicit",
+            "runtime_parameter_names": list(runtime_parameter_names),
+            "solver_keys": sorted(str(key) for key in dict(solver_context.solver_config or {}).keys()),
+            "schema_key": "simulation-plan-v1",
+        }
+        structural_digest = hashlib.sha256(
+            json.dumps(structural_payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        environment_key = "contained-child-blas-limited"
+        deps = getattr(self, "_deps", None)
+        environment_key_getter = getattr(deps, "runtime_environment_key", None)
+        if callable(environment_key_getter):
+            try:
+                environment_key = str(environment_key_getter() or environment_key)
+            except Exception:
+                environment_key = "runtime-environment-unavailable"
+        return RuntimeCompatibilityKey(
+            structural_digest=structural_digest,
+            runtime_parameter_names=runtime_parameter_names,
+            execution_profile="preview" if bool(fast_mode) else "explicit",
+            environment_key=environment_key,
+            schema_key="simulation-plan-v1",
+        )
+
+    def _runtime_task_descriptors(
+        self,
+        *,
+        intent: RuntimeLaunchIntent,
+        compatibility_key: RuntimeCompatibilityKey,
+        rows: Sequence[int],
+        mechanism_context: RunMechanismContext,
+        solver_context: RunSolverContext,
+        dispatch_context: RunDispatchContext,
+    ) -> tuple[RuntimeTaskDescriptor, ...]:
+        descriptors: list[RuntimeTaskDescriptor] = []
+        runtime_epochs = dict(intent.runtime_input_epochs or {})
+        set_ids_by_row = {
+            int(row): str(set_id)
+            for row, set_id in zip(rows, mechanism_context.queue_ids)
+            if str(set_id)
+        }
+        set_labels_by_row = {
+            int(row): str(set_name)
+            for row, set_name in zip(rows, mechanism_context.queue_names)
+            if str(set_name)
+        }
+        for row in rows:
+            set_id = str(set_ids_by_row.get(int(row)) or "")
+            if not set_id:
+                continue
+            plan_payload = dispatch_context.simulation_plan_by_set_id.get(set_id)
+            if not isinstance(plan_payload, Mapping):
+                continue
+            parameter_overrides = {}
+            prepared_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id)
+            if isinstance(prepared_payload, Mapping):
+                parameter_overrides = dict(prepared_payload.get("parameter_overrides") or {})
+            owned_species = tuple(
+                str(name)
+                for name in dispatch_context.owned_species_by_set_id.get(set_id, ())
+                if str(name)
+            )
+            preview_batch_cache_token = str(
+                dispatch_context.preview_batch_cache_token_by_set_id.get(set_id) or ""
+            )
+            exact_payload = {
+                "row": int(row),
+                "set_id": set_id,
+                "request_token": intent.request_token,
+                "preview_request_id": intent.preview_request_id,
+                "preview_epoch": intent.preview_epoch,
+                "cache_key": str(dispatch_context.cache_key),
+                "mechanism_text": str(dispatch_context.mechanism_text_by_set_id.get(set_id) or ""),
+                "mechanism_signature": str(dispatch_context.mechanism_signature_by_set_id.get(set_id) or ""),
+                "simulation_identity": dict(dispatch_context.simulation_identity_by_set_id.get(set_id) or {}),
+                "owned_species": list(owned_species),
+                "preview_batch_cache_token": preview_batch_cache_token,
+                "plan_payload": dict(plan_payload),
+                "parameter_overrides": parameter_overrides,
+                "runtime_input_epochs": runtime_epochs,
+            }
+            exact_hash = hashlib.sha256(
+                json.dumps(exact_payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            ).hexdigest()
+            descriptors.append(
+                RuntimeTaskDescriptor(
+                    task_id=f"{intent.intent_kind}:{set_id}:{int(row)}",
+                    row=int(row),
+                    set_id=set_id,
+                    request_token=int(intent.request_token) if intent.request_token is not None else None,
+                    compatibility_key=compatibility_key,
+                    exact_descriptor_hash=exact_hash,
+                    plan_payload=dict(plan_payload),
+                    parameter_overrides=parameter_overrides,
+                    preview_request_id=int(intent.preview_request_id)
+                    if intent.preview_request_id is not None
+                    else None,
+                    preview_epoch=int(intent.preview_epoch)
+                    if intent.preview_epoch is not None
+                    else None,
+                    runtime_input_epochs=runtime_epochs,
+                    cache_key=str(dispatch_context.cache_key),
+                    set_label=str(set_labels_by_row.get(int(row)) or set_id),
+                    mechanism_text=str(dispatch_context.mechanism_text_by_set_id.get(set_id) or ""),
+                    mechanism_signature=str(dispatch_context.mechanism_signature_by_set_id.get(set_id) or ""),
+                    simulation_identity=dict(dispatch_context.simulation_identity_by_set_id.get(set_id) or {}),
+                    owned_species=owned_species,
+                    preview_batch_cache_token=preview_batch_cache_token,
+                )
+            )
+        return tuple(descriptors)
+
+    @staticmethod
+    def _blocked_prepared_request_set(
+        *,
+        intent: RuntimeLaunchIntent,
+        blocked_reason: RuntimePreparationBlockedReason,
+        compatibility_key: RuntimeCompatibilityKey | None = None,
+    ) -> PreparedRuntimeRequestSet:
+        key = compatibility_key or RuntimeCompatibilityKey(
+            structural_digest="blocked",
+            execution_profile=str(intent.intent_kind or "ordinary"),
+        )
+        return PreparedRuntimeRequestSet(
+            intent=intent,
+            compatibility_key=key,
+            task_descriptors=(),
+            required_lane_capacity=1,
+            preferred_lane_capacity=1,
+            blocked_reason=blocked_reason,
         )

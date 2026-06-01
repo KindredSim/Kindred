@@ -163,7 +163,11 @@ class ParallelBatchOutcomeOwner:
         error_payload: Mapping[str, Any],
     ) -> bool:
         completion_state = self._batch_context_owner.completion_state()
-        if completion_state is None or not completion_state.active or not completion_state.parallel:
+        if (
+            completion_state is None
+            or not completion_state.active
+            or not (completion_state.runtime_task_queue or completion_state.parallel)
+        ):
             return False
         if completion_state.fast_mode:
             return False
@@ -289,6 +293,12 @@ class ParallelBatchOutcomeOwner:
 
         freshness = self._deps.freshness.assess_callback(callback_identity, context=callback_context)
         if freshness.stale_run and int(freshness.active_run_id) > 0:
+            return True
+        if freshness.dispatch_identity_stale:
+            self._deps.freshness.mark_stale_dispatch_identity_callback_consumed(
+                batch_set_id=sid,
+                context=callback_context,
+            )
             return True
         if freshness.runtime_input_stale:
             self._deps.freshness.mark_stale_runtime_input_callback_consumed(

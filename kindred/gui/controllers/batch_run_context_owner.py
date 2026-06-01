@@ -35,6 +35,7 @@ class BatchContextSeed:
     runtime_input_global_epoch: int | None = None
     runtime_input_set_epoch_by_set_id: Mapping[str, Any] | None = None
     fast_mode: bool | None = None
+    completion_mode: str | None = None
     reuse_parallel_lane_pool: bool | None = None
     keep_lane_pool_alive: bool | None = None
     parallel: bool | None = None
@@ -71,7 +72,7 @@ class BatchContextSeed:
     preview_scope_set_ids: Sequence[str] | None = None
     preview_owner_epoch: int | None = None
     preview_batch_cache_token_by_set_id: Mapping[str, str] | None = None
-    runtime_waiting: bool | None = None
+    runtime_task_identity_by_set_id: Mapping[str, Mapping[str, Any]] | None = None
     active_timeout_s: float | None = None
     completed_run_display_intent: CompletedRunDisplayIntent | None = None
     computed_owned_species_by_set_id: Mapping[str, Sequence[str]] | None = None
@@ -100,6 +101,7 @@ class BatchCallbackContext(MappingABC[str, Any]):
     fast_mode: bool
     parallel: bool
     keep_lane_pool_alive: bool
+    completion_mode: str = ""
     queue_ids: tuple[str, ...] = ()
     queue_names: tuple[str, ...] = ()
     total: int = 0
@@ -122,6 +124,7 @@ class BatchCallbackContext(MappingABC[str, Any]):
     preview_owner_epoch: int | None = None
     completed_run_display_intent: CompletedRunDisplayIntent | None = None
     computed_owned_species_by_set_id: Mapping[str, Sequence[str]] | None = None
+    runtime_task_identity_by_set_id: Mapping[str, Mapping[str, Any]] | None = None
 
     def to_context(self) -> Dict[str, Any]:
         context: Dict[str, Any] = {
@@ -130,6 +133,7 @@ class BatchCallbackContext(MappingABC[str, Any]):
             "run_id": self.run_id,
             "cache_key": str(self.cache_key or ""),
             "fast_mode": bool(self.fast_mode),
+            "completion_mode": str(self.completion_mode or ""),
             "parallel": bool(self.parallel),
             "keep_lane_pool_alive": bool(self.keep_lane_pool_alive),
             "queue_ids": list(self.queue_ids),
@@ -149,6 +153,11 @@ class BatchCallbackContext(MappingABC[str, Any]):
             "explicit_cache_truth_generation": self.explicit_cache_truth_generation,
             "preview_scope_set_ids": self.preview_scope_set_ids,
             "preview_owner_epoch": self.preview_owner_epoch,
+            "runtime_task_identity_by_set_id": {
+                str(set_id): deepcopy(dict(identity))
+                for set_id, identity in dict(self.runtime_task_identity_by_set_id or {}).items()
+                if str(set_id) and isinstance(identity, Mapping)
+            },
         }
         if self.completed_run_display_intent is not None:
             context["completed_run_display_intent"] = self.completed_run_display_intent
@@ -345,6 +354,7 @@ class BatchCompletionSummary:
 class BatchCompletionCleanupState:
     fast_mode: bool
     parallel: bool
+    runtime_task_queue: bool
     keep_lane_pool_alive: bool
 
 
@@ -387,8 +397,8 @@ class BatchExecutionPayloadState:
 class BatchActiveState:
     active: bool
     parallel: bool
+    runtime_task_queue: bool
     fast_mode: bool
-    runtime_waiting: bool
     run_id: int | None
     request_id: int | None
     rows: tuple[int, ...]
@@ -462,6 +472,7 @@ class BatchSerialNextPayload:
 class BatchCompletionState:
     active: bool
     parallel: bool
+    runtime_task_queue: bool
     fast_mode: bool
     keep_lane_pool_alive: bool
     pos: int
@@ -502,6 +513,7 @@ class BatchRunContextOwner:
             run_id=self._optional_int(ctx.get("run_id")),
             cache_key=str(ctx.get("cache_key") or ""),
             fast_mode=self._coerce_bool(ctx.get("fast_mode")),
+            completion_mode=str(ctx.get("completion_mode") or ""),
             parallel=self._coerce_bool(ctx.get("parallel")),
             keep_lane_pool_alive=self._coerce_bool(ctx.get("keep_lane_pool_alive")),
             queue_ids=self._str_tuple(ctx.get("queue_ids"), dedupe=False),
@@ -555,6 +567,11 @@ class BatchRunContextOwner:
                 str(set_id): tuple(str(name) for name in (names or ()) if str(name))
                 for set_id, names in dict(ctx.get(self._COMPUTED_OWNED_SPECIES_BY_SET_ID_KEY) or {}).items()
                 if str(set_id)
+            },
+            runtime_task_identity_by_set_id={
+                str(set_id): deepcopy(dict(identity))
+                for set_id, identity in dict(ctx.get("runtime_task_identity_by_set_id") or {}).items()
+                if str(set_id) and isinstance(identity, Mapping)
             },
         )
 
@@ -624,14 +641,11 @@ class BatchRunContextOwner:
         if not isinstance(ctx, Mapping):
             return None
         active = self._coerce_bool(ctx.get("active"))
-        runtime_waiting = self._coerce_bool(ctx.get("runtime_waiting"))
-        if not active and not runtime_waiting:
-            return None
         return BatchActiveState(
             active=active,
             parallel=self._coerce_bool(ctx.get("parallel")),
+            runtime_task_queue=str(ctx.get("completion_mode") or "") == "runtime_task_queue",
             fast_mode=self._coerce_bool(ctx.get("fast_mode")),
-            runtime_waiting=runtime_waiting,
             run_id=self._optional_int(ctx.get("run_id")),
             request_id=self._optional_int(ctx.get("request_id")),
             rows=self._int_tuple(ctx.get("rows")),
@@ -660,7 +674,7 @@ class BatchRunContextOwner:
     ) -> BatchErrorDispatchContext | None:
         ctx = context if isinstance(context, Mapping) else self._context
         state = self.active_batch_state(ctx)
-        if state is None or not state.active or not state.parallel:
+        if state is None or not state.active or not (state.runtime_task_queue or state.parallel):
             return None
         return BatchErrorDispatchContext(
             run_id=int(state.run_id or 0),
@@ -678,7 +692,7 @@ class BatchRunContextOwner:
     ) -> BatchParallelStartPayload | None:
         ctx = context if isinstance(context, Mapping) else self._context
         state = self.active_batch_state(ctx)
-        if state is None or not state.active or not state.parallel:
+        if state is None or not state.active or not (state.runtime_task_queue or state.parallel):
             return None
         return BatchParallelStartPayload(
             run_id=int(state.run_id or 0),
@@ -724,7 +738,7 @@ class BatchRunContextOwner:
     ) -> BatchSerialNextPayload | None:
         ctx = context if isinstance(context, Mapping) else self._context
         state = self.active_batch_state(ctx)
-        if state is None or not state.active or state.parallel:
+        if state is None or not state.active or state.runtime_task_queue or state.parallel:
             return None
         queue_ids = state.queue_ids
         pos = max(0, int(state.pos))
@@ -798,8 +812,6 @@ class BatchRunContextOwner:
         if not isinstance(ctx, Mapping):
             return None
         active = self._coerce_bool(ctx.get("active"))
-        if not active and not self._coerce_bool(ctx.get("runtime_waiting")):
-            return None
         queue_ids = self._str_tuple(ctx.get("queue_ids"), dedupe=False)
         completed_set_ids = self._str_tuple(ctx.get("completed_set_ids"), dedupe=True)
         total = self._int_value(ctx.get("total"), default=len(queue_ids))
@@ -808,6 +820,7 @@ class BatchRunContextOwner:
         return BatchCompletionState(
             active=active,
             parallel=self._coerce_bool(ctx.get("parallel")),
+            runtime_task_queue=str(ctx.get("completion_mode") or "") == "runtime_task_queue",
             fast_mode=self._coerce_bool(ctx.get("fast_mode")),
             keep_lane_pool_alive=self._coerce_bool(ctx.get("keep_lane_pool_alive")),
             pos=max(0, self._int_value(ctx.get("pos"), default=0)),
@@ -826,6 +839,7 @@ class BatchRunContextOwner:
         return BatchCompletionCleanupState(
             fast_mode=self._coerce_bool(ctx.get("fast_mode")),
             parallel=self._coerce_bool(ctx.get("parallel")),
+            runtime_task_queue=str(ctx.get("completion_mode") or "") == "runtime_task_queue",
             keep_lane_pool_alive=self._coerce_bool(ctx.get("keep_lane_pool_alive")),
         )
 
@@ -952,7 +966,10 @@ class BatchRunContextOwner:
     ) -> bool:
         ctx = context if isinstance(context, Mapping) else self._context
         return bool(
-            self._coerce_bool(ctx.get("parallel"))
+            (
+                self._coerce_bool(ctx.get("parallel"))
+                or str(ctx.get("completion_mode") or "") == "runtime_task_queue"
+            )
             and (not bool(slider_triggered))
             and self._int_value(ctx.get("total"), default=0) > 1
         )
@@ -1497,24 +1514,6 @@ class BatchRunContextOwner:
     def record_cache_key(self, cache_key: str) -> Dict[str, Any]:
         return self._update(cache_key=str(cache_key))
 
-    def mark_runtime_waiting(self, *, required_lanes: int | None = None) -> Dict[str, Any]:
-        context = dict(self._context)
-        context["runtime_waiting"] = True
-        context["active"] = False
-        if required_lanes is None:
-            context.pop("runtime_waiting_required_lanes", None)
-        else:
-            context["runtime_waiting_required_lanes"] = max(1, int(required_lanes))
-        self._context = context
-        return self._current_context()
-
-    def clear_runtime_waiting(self) -> Dict[str, Any]:
-        context = dict(self._context)
-        context.pop("runtime_waiting", None)
-        context.pop("runtime_waiting_required_lanes", None)
-        self._context = context
-        return self._current_context()
-
     def completion_policy_context(
         self,
         context: Mapping[str, Any] | None = None,
@@ -1927,14 +1926,15 @@ class BatchRunContextOwner:
             batch_done=batch_done,
         )
 
-    def record_parallel_stale_callback_consumed_if_active(
+    def record_runtime_task_stale_callback_consumed_if_active(
         self,
         *,
         set_id: str,
     ) -> BatchContextTransition | None:
         context = dict(self._context)
         sid = str(set_id or "").strip()
-        if not sid or not context.get("active") or not bool(context.get("parallel")):
+        runtime_task_active = str(context.get("completion_mode") or "") == "runtime_task_queue"
+        if not sid or not context.get("active") or not runtime_task_active:
             self._context = context
             return None
         return self.record_parallel_stale_callback_consumed(set_id=sid)

@@ -221,7 +221,7 @@ def build_simulation_plumbing(main_window: MainWindow) -> SimulationPlumbing:
         batch=main_window._simulation_batch_owner,
         mechanism=main_window._simulation_mechanism_owner,
         solver=main_window._simulation_solver_owner,
-        runtime=main_window._variable_runtime,
+        variable_runtime=main_window._variable_runtime,
         results=main_window.results_controller,
         provenance=main_window._simulation_provenance_owner,
         mechanism_helpers=main_window._mechanism_helpers,

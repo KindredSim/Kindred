@@ -37,7 +37,6 @@ from kindred.core.simulation_preparation import (
     _fit_simulation_error_from_preparation_error,
     _prepare_preparation_failure,
     _raise_unowned_request_parameter_values,
-    _mechanism_supports_dynamic_symbolic_snapshot,
     _prepared_metadata_with_symbolic_jacobian,
     _reject_requested_algebra_owned_mechanism_parameters_for_fitting,
     _solve_request,
@@ -916,7 +915,6 @@ class SerialFittingEvaluator:
             and bool(getattr(prepared_solver_config, "use_sparse_jacobian", False))
             and str(getattr(prepared_solver_config, "solver", prepared_run.request.solver)).upper() in {"BDF", "RADAU"}
             and prepared_run.request.temperature_schedule is None
-            and _mechanism_supports_dynamic_symbolic_snapshot(prepared_run.mechanism)
         ):
             try:
                 jacobian_func, symbolic_identity = _bind_symbolic_jacobian_for_current_mechanism(

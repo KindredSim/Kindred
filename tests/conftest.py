@@ -121,76 +121,10 @@ def _patch_main_window_test_environment(
         and request.node.get_closest_marker("real_runtime_readiness") is not None
     )
     if not real_runtime_readiness:
-        from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
-
-        class _ReadyTestRuntimeOwner:
-            is_ready = True
-            is_running = True
-            owner_epoch = 1
-
-            @property
-            def simulation_plan_payload(self):
-                return {}
-
-            def solve(self, *_args, **_kwargs):
-                return {}
-
-            def close(self, *, kill: bool = False) -> None:
-                _ = kill
-
-        ready_owner = _ReadyTestRuntimeOwner()
-        monkeypatch.setattr(
-            "kindred.gui.controllers.simulation_controller.SimulationController.ensure_interactive_simulation_runtimes_available",
-            lambda self, *, wait=False, selected_run_rows=None, slider_preview_rows=None: None,
-        )
-        monkeypatch.setattr(
-            "kindred.gui.controllers.simulation_controller.SimulationController.interactive_simulation_runtime_ready",
-            lambda self, *, fast_mode: True,
-        )
-        monkeypatch.setattr(
-            "kindred.gui.controllers.simulation_controller.SimulationController.interactive_simulation_runtimes_ready",
-            lambda self: True,
-        )
-        monkeypatch.setattr(
-            "kindred.gui.controllers.simulation_controller.SimulationController._ready_contained_simulation_owner_for_plan",
-            lambda self, **_kwargs: ready_owner,
-        )
-        monkeypatch.setattr(
-            "kindred.gui.controllers.simulation_controller.SimulationController._acquire_ready_contained_simulation_owner_for_plan",
-            lambda self, **_kwargs: ready_owner,
-        )
-        monkeypatch.setattr(
-            "kindred.core.simulation_runtime_readiness.SimulationRuntimeApplication.acquire_ready_owner",
-            lambda self, **_kwargs: ready_owner,
-        )
-        monkeypatch.setattr(
-            "kindred.gui.controllers.simulation_controller.SimulationController._interactive_simulation_runtime_snapshot",
-            lambda self, *, fast_mode, rows=None: RuntimeReadinessSnapshot(
-                mode="preview" if bool(fast_mode) else "ordinary",
-                status="ready",
-                ready=True,
-                generation=1,
-                required=True,
-                controls_ready=True,
-                polling=False,
-            ),
-        )
-        monkeypatch.setattr(
-            "kindred.gui.controllers.simulation_controller.SimulationController._selected_run_runtime_snapshot",
-            lambda self, rows=None: RuntimeReadinessSnapshot(
-                mode="ordinary",
-                status="ready",
-                ready=True,
-                generation=1,
-                required=True,
-                controls_ready=True,
-                polling=False,
-            ),
-        )
-        monkeypatch.setattr(
-            "kindred.gui.controllers.simulation_controller.SimulationController.ensure_parallel_batch_runtime_ready",
-            lambda self, *, wait=False, required_lanes=None: None,
-        )
+        # Default GUI tests should not restore the deleted readiness authority or
+        # bypass the runtime launch endpoint. Tests that need real runtime
+        # readiness can opt in with @pytest.mark.real_runtime_readiness.
+        pass
 
     def _quiet_dialog(*_args, **_kwargs):
         return QtWidgets.QMessageBox.StandardButton.Ok
@@ -325,7 +259,7 @@ def main_window(qt_app, monkeypatch, tmp_path, request):
     )
     if not real_runtime_readiness:
         try:
-            window._set_runtime_backed_controls_ready(True)
+            window._render_runtime_backed_controls_available(True)
         except Exception as exc:
             logger.debug("Failed to mark stubbed test runtime ready: %s", exc, exc_info=True)
     try:

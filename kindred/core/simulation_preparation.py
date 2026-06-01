@@ -1211,34 +1211,19 @@ def metadata_view_for_mechanism(
 def _mechanism_has_dynamic_rate_bindings(mechanism: Any) -> bool:
     for reaction in getattr(mechanism, "reactions", []) or []:
         value = getattr(reaction, "rate", None)
-        if isinstance(value, RateBinding) or callable(value):
+        if callable(value) and not isinstance(value, RateBinding):
             return True
     for equilibrium in getattr(mechanism, "equilibria", []) or []:
         for attr_name in ("kf", "kr", "Keq"):
             value = getattr(equilibrium, attr_name, None)
-            if isinstance(value, RateBinding) or callable(value):
+            if callable(value) and not isinstance(value, RateBinding):
                 return True
         meta = getattr(equilibrium, "metadata", {}) or {}
         if isinstance(meta, Mapping):
             keq_input = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
-            if isinstance(keq_input, RateBinding) or callable(keq_input):
+            if callable(keq_input) and not isinstance(keq_input, RateBinding):
                 return True
     return False
-
-
-def _mechanism_has_dynamic_keq_input_binding(mechanism: Any) -> bool:
-    for equilibrium in getattr(mechanism, "equilibria", []) or []:
-        meta = getattr(equilibrium, "metadata", {}) or {}
-        if not isinstance(meta, Mapping):
-            continue
-        keq_input = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
-        if isinstance(keq_input, RateBinding) or callable(keq_input):
-            return True
-    return False
-
-
-def _mechanism_supports_dynamic_symbolic_snapshot(mechanism: Any) -> bool:
-    return not _mechanism_has_dynamic_keq_input_binding(mechanism)
 
 
 def _prepare_preparation_failure(stage: str, message: object) -> SimulationPreparationError:
@@ -1431,22 +1416,17 @@ def _prepared_parameter_override_can_apply(mechanism: Any, name: str) -> bool:
         return _scalar_parameter_override_known(mechanism, name)
     kind, idx, role, entry = target
     if kind == "equilibrium":
-        from kindred.core.equilibrium_rate_authority import require_step_entry_role_editable
-
-        try:
-            require_step_entry_role_editable(entry, role, parameter_name=target_name)
-        except ValueError as exc:
-            raise SimulationPreparationError("parameter_overrides", str(exc)) from exc
+        _equilibrium_override_binding_target(
+            mechanism,
+            idx=int(idx),
+            role=str(role),
+            entry=entry,
+        )
+        return True
     candidate = None
     try:
         if kind == "reaction" and role == "k":
             candidate = getattr(mechanism.reactions[int(idx)], "rate", None)
-        elif kind == "equilibrium" and role in {"kf", "kr"}:
-            candidate = getattr(mechanism.equilibria[int(idx)], str(role), None)
-        elif kind == "equilibrium" and role == "Keq":
-            meta = getattr(mechanism.equilibria[int(idx)], "metadata", {}) or {}
-            if isinstance(meta, Mapping):
-                candidate = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
     except Exception:
         candidate = None
     setter = getattr(candidate, "set", None)
@@ -1516,6 +1496,26 @@ def _apply_parameter_overrides_to_prepared_mechanism(
 
     from kindred.core.simulator.step_indexing import lookup_step_param_target
 
+    override_values_by_name = {str(name): float(value) for name, value in mechanism_override_items}
+    _reject_conflicting_equilibrium_reverse_overrides(mechanism, override_values_by_name)
+    binding_target_names: set[str] = set()
+    for name, _value in mechanism_override_items:
+        target_name = _canonical_step_override_name(mechanism, name)
+        target = lookup_step_param_target(mechanism, target_name)
+        if target is None:
+            continue
+        kind, idx, role, entry = target
+        if kind == "equilibrium":
+            _target_role, binding_name = _equilibrium_override_binding_target(
+                mechanism,
+                idx=int(idx),
+                role=str(role),
+                entry=entry,
+            )
+            binding_target_names.add(binding_name)
+    if binding_target_names:
+        _bind_parameters_to_mechanism(mechanism, sorted(binding_target_names))
+
     internal_names = _internal_parameter_algebra_binding_names(
         mechanism,
         requested_names=[name for name, _value in mechanism_override_items],
@@ -1542,14 +1542,25 @@ def _apply_parameter_overrides_to_prepared_mechanism(
                 or override_applied
             )
             continue
-        kind, idx, role, _entry = target
+        kind, idx, role, entry = target
+        target_role = str(role)
+        target_value = float(value)
+        if kind == "equilibrium":
+            target_role, _target_name, target_value = _equilibrium_override_assignment(
+                mechanism,
+                idx=int(idx),
+                role=str(role),
+                entry=entry,
+                value=float(value),
+                override_values_by_name=override_values_by_name,
+            )
         candidate = None
         try:
             if kind == "reaction" and role == "k":
                 candidate = getattr(mechanism.reactions[int(idx)], "rate", None)
-            elif kind == "equilibrium" and role in {"kf", "kr"}:
-                candidate = getattr(mechanism.equilibria[int(idx)], str(role), None)
-            elif kind == "equilibrium" and role == "Keq":
+            elif kind == "equilibrium" and target_role in {"kf", "kr"}:
+                candidate = getattr(mechanism.equilibria[int(idx)], str(target_role), None)
+            elif kind == "equilibrium" and target_role == "Keq":
                 meta = getattr(mechanism.equilibria[int(idx)], "metadata", {}) or {}
                 if isinstance(meta, Mapping):
                     candidate = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
@@ -1558,7 +1569,7 @@ def _apply_parameter_overrides_to_prepared_mechanism(
 
         setter = getattr(candidate, "set", None)
         if callable(setter):
-            setter(float(value))
+            setter(float(target_value))
             override_applied = True
     if override_applied:
         from kindred.core.simulator.parameter_algebra import (
@@ -1602,6 +1613,176 @@ def _canonical_step_override_name(mechanism: Any, name: str) -> str:
     if resolution.canonical_name:
         return str(resolution.canonical_name)
     return name_s
+
+
+def _finite_runtime_override_scalar(value: object, *, label: str) -> float:
+    from kindred.core.validation import try_parse_callable_finite_float
+
+    parsed, ok = try_parse_callable_finite_float(value)
+    if not ok or not math.isfinite(float(parsed)):
+        raise SimulationPreparationError("parameter_overrides", f"{label} must be finite.")
+    return float(parsed)
+
+
+def _equilibrium_step_parameter_name(entry: Mapping[str, Any], role: str) -> str:
+    try:
+        step_index = int(entry.get("step_index"))
+    except (TypeError, ValueError) as exc:
+        raise SimulationPreparationError(
+            "parameter_overrides",
+            f"Equilibrium parameter {role!r} is missing a valid canonical step index.",
+        ) from exc
+    prefix = "Keq" if str(role) == "Keq" else str(role)
+    return f"{prefix}{step_index}"
+
+
+def _equilibrium_override_binding_target(
+    mechanism: Any,
+    *,
+    idx: int,
+    role: str,
+    entry: Mapping[str, Any],
+) -> tuple[str, str]:
+    from kindred.core.equilibrium_rate_authority import EquilibriumRateAuthorityKind
+    from kindred.core.equilibrium_rate_authority import normalize_existing_equilibrium_rate_authority
+
+    eq = mechanism.equilibria[int(idx)]
+    authority = normalize_existing_equilibrium_rate_authority(eq)
+    if authority.kind == EquilibriumRateAuthorityKind.KEQ and role == "kr":
+        return "Keq", _equilibrium_step_parameter_name(entry, "Keq")
+    if authority.kind == EquilibriumRateAuthorityKind.KR and role == "Keq":
+        return "kr", _equilibrium_step_parameter_name(entry, "kr")
+    return str(role), _equilibrium_step_parameter_name(entry, str(role))
+
+
+def _equilibrium_override_assignment(
+    mechanism: Any,
+    *,
+    idx: int,
+    role: str,
+    entry: Mapping[str, Any],
+    value: float,
+    override_values_by_name: Mapping[str, float],
+) -> tuple[str, str, float]:
+    from kindred.core.equilibrium_rate_authority import (
+        EquilibriumRateAuthorityKind,
+        effective_reverse_rate_from_keq,
+        normalize_existing_equilibrium_rate_authority,
+    )
+
+    eq = mechanism.equilibria[int(idx)]
+    authority = normalize_existing_equilibrium_rate_authority(eq)
+    target_role, target_name = _equilibrium_override_binding_target(
+        mechanism,
+        idx=int(idx),
+        role=str(role),
+        entry=entry,
+    )
+    if target_role == role:
+        return target_role, target_name, float(value)
+
+    kf_name = _equilibrium_step_parameter_name(entry, "kf")
+    if kf_name in override_values_by_name:
+        kf_value = float(override_values_by_name[kf_name])
+    else:
+        kf_value = _finite_runtime_override_scalar(
+            getattr(eq, "kf", None),
+            label=f"equilibrium parameter {kf_name}",
+        )
+    reverse_std_ratio = _finite_runtime_override_scalar(
+        authority.reverse_std_ratio,
+        label=f"equilibrium {target_name} reverse standard ratio",
+    )
+    if reverse_std_ratio <= 0.0:
+        raise SimulationPreparationError(
+            "parameter_overrides",
+            f"equilibrium {target_name} reverse standard ratio must be positive.",
+        )
+    if role == "Keq" and authority.kind == EquilibriumRateAuthorityKind.KR:
+        keq_value = float(value)
+        if keq_value <= 0.0:
+            raise SimulationPreparationError(
+                "parameter_overrides",
+                f"equilibrium parameter {_equilibrium_step_parameter_name(entry, 'Keq')} must be positive.",
+            )
+        return (
+            target_role,
+            target_name,
+            float(effective_reverse_rate_from_keq(kf_value, keq_value, reverse_std_ratio)),
+        )
+    if role == "kr" and authority.kind == EquilibriumRateAuthorityKind.KEQ:
+        kr_value = float(value)
+        if abs(kr_value) <= 1e-30:
+            raise SimulationPreparationError(
+                "parameter_overrides",
+                f"equilibrium parameter {_equilibrium_step_parameter_name(entry, 'kr')} must be non-zero.",
+            )
+        return (
+            target_role,
+            target_name,
+            float(kf_value) / (float(kr_value) * float(reverse_std_ratio)),
+        )
+    return target_role, target_name, float(value)
+
+
+def _reject_conflicting_equilibrium_reverse_overrides(
+    mechanism: Any,
+    override_values_by_name: Mapping[str, float],
+) -> None:
+    if not override_values_by_name:
+        return
+    from kindred.core.equilibrium_rate_authority import (
+        effective_reverse_rate_from_keq,
+        normalize_existing_equilibrium_rate_authority,
+    )
+    from kindred.core.simulator.step_indexing import get_step_index_map
+
+    requested = {str(name): float(value) for name, value in override_values_by_name.items()}
+    for entry in get_step_index_map(mechanism):
+        if str(entry.get("kind") or "") != "equilibrium":
+            continue
+        try:
+            idx = int(entry.get("equilibrium_index"))
+        except (TypeError, ValueError):
+            continue
+        kf_name = _equilibrium_step_parameter_name(entry, "kf")
+        kr_name = _equilibrium_step_parameter_name(entry, "kr")
+        keq_name = _equilibrium_step_parameter_name(entry, "Keq")
+        if kr_name not in requested or keq_name not in requested:
+            continue
+        eq = mechanism.equilibria[int(idx)]
+        authority = normalize_existing_equilibrium_rate_authority(eq)
+        kf_value = (
+            float(requested[kf_name])
+            if kf_name in requested
+            else _finite_runtime_override_scalar(getattr(eq, "kf", None), label=f"equilibrium parameter {kf_name}")
+        )
+        reverse_std_ratio = _finite_runtime_override_scalar(
+            authority.reverse_std_ratio,
+            label=f"equilibrium {keq_name} reverse standard ratio",
+        )
+        if reverse_std_ratio <= 0.0:
+            raise SimulationPreparationError(
+                "parameter_overrides",
+                f"equilibrium {keq_name} reverse standard ratio must be positive.",
+            )
+        keq_value = float(requested[keq_name])
+        if keq_value <= 0.0:
+            raise SimulationPreparationError(
+                "parameter_overrides",
+                f"equilibrium parameter {keq_name} must be positive.",
+            )
+        expected_kr = float(effective_reverse_rate_from_keq(kf_value, keq_value, reverse_std_ratio))
+        actual_kr = float(requested[kr_name])
+        if not math.isclose(actual_kr, expected_kr, rel_tol=1e-9, abs_tol=1e-12):
+            raise SimulationPreparationError(
+                "parameter_overrides",
+                (
+                    f"Conflicting equilibrium parameter overrides for {kr_name} and {keq_name}: "
+                    f"{kr_name}={actual_kr:.17g} is inconsistent with "
+                    f"{keq_name}={keq_value:.17g} and {kf_name}={float(kf_value):.17g}."
+                ),
+            )
 
 
 def _apply_scalar_parameter_override_to_prepared_mechanism(
@@ -1825,10 +2006,6 @@ def _build_prepared_run_context(
         and implicit_jacobian_solver
         and temperature_schedule is None
         and _mechanism_has_dynamic_rate_bindings(mechanism)
-        and (
-            not bool(allow_dynamic_binding_symbolic_snapshot)
-            or not _mechanism_supports_dynamic_symbolic_snapshot(mechanism)
-        )
     ):
         classified_status = _symbolic_jacobian_status_for_mechanism(mechanism)
         if classified_status.get("state") == "unsupported":
@@ -2144,7 +2321,6 @@ def _symbolic_jacobian_snapshot_values_for_execution_text(
             unresolved_intervention_schedule=unresolved_intervention_schedule,
         )
         override_names = sorted(parameter_partition.bindable_mechanism_parameter_names)
-        _reject_implicit_equilibrium_constant_overrides(mechanism, override_names)
         internal_names = _internal_parameter_algebra_binding_names(
             mechanism,
             requested_names=override_names,
@@ -2173,29 +2349,12 @@ def _symbolic_jacobian_parameter_values_from_mechanism(
     *,
     parameter_symbols: tuple[str, ...],
 ) -> Dict[str, float]:
-    from kindred.core.simulator.step_indexing import lookup_step_param_target
-    from kindred.core.validation import try_parse_callable_finite_float
+    from kindred.core.symbolic.jacobian import _parameter_values_for_mechanism
 
-    values: Dict[str, float] = {}
-    for name in parameter_symbols:
-        target = lookup_step_param_target(mechanism, str(name))
-        candidate = None
-        if target is not None:
-            kind, idx, role, _entry = target
-            if kind == "reaction" and role == "k":
-                candidate = getattr(mechanism.reactions[int(idx)], "rate", None)
-            elif kind == "equilibrium" and role in {"kf", "kr"}:
-                candidate = getattr(mechanism.equilibria[int(idx)], str(role), None)
-            elif kind == "equilibrium" and role == "Keq":
-                eq = mechanism.equilibria[int(idx)]
-                meta = getattr(eq, "metadata", {}) or {}
-                if isinstance(meta, Mapping):
-                    candidate = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
-        parsed, ok = try_parse_callable_finite_float(candidate)
-        if not ok:
-            raise UnsupportedSymbolicExpressionError(f"Missing symbolic parameter value for {name!r}.")
-        values[str(name)] = float(parsed)
-    return values
+    return _parameter_values_for_mechanism(
+        mechanism,
+        parameter_symbols=parameter_symbols,
+    )
 
 
 def symbolic_wegscheider_identity_for_execution_text(
@@ -2392,7 +2551,6 @@ def prepare_simulation_worker_run(
                 unresolved_intervention_schedule=unresolved_intervention_schedule,
             )
             mechanism_override_names = sorted(parameter_partition.bindable_mechanism_parameter_names)
-            _reject_implicit_equilibrium_constant_overrides(mechanism, mechanism_override_names)
             internal_names = _internal_parameter_algebra_binding_names(
                 mechanism,
                 requested_names=mechanism_override_names,
@@ -2510,7 +2668,6 @@ def prepare_simulation_worker_run(
 
 
 def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]:
-    from kindred.core.equilibrium_rate_authority import require_step_entry_role_editable
     from kindred.core.rate_binding import RateBinding
     from kindred.core.simulator.step_indexing import lookup_step_param_target
     from kindred.core.validation import try_parse_callable_finite_float
@@ -2523,49 +2680,55 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
         if target is None:
             continue
         kind, idx, role, entry = target
+        target_name = name
+        target_role = str(role)
         if kind == "equilibrium":
-            try:
-                require_step_entry_role_editable(entry, role, parameter_name=name)
-            except ValueError as exc:
-                raise SimulationPreparationError("parameter_binding", str(exc)) from exc
+            target_role, target_name = _equilibrium_override_binding_target(
+                mech,
+                idx=int(idx),
+                role=str(role),
+                entry=entry,
+            )
 
-        binding = bindings.get(name)
+        binding = bindings.get(target_name)
         if binding is None:
             if kind == "reaction" and role == "k":
                 rxn = mech.reactions[idx]
                 parsed, ok = try_parse_callable_finite_float(getattr(rxn, "rate", None))
                 init = float(parsed) if ok else 1.0
-            elif kind == "equilibrium" and role in {"kf", "kr"}:
+            elif kind == "equilibrium" and target_role in {"kf", "kr"}:
                 eq = mech.equilibria[idx]
-                parsed, ok = try_parse_callable_finite_float(getattr(eq, role, None))
+                parsed, ok = try_parse_callable_finite_float(getattr(eq, target_role, None))
                 init = float(parsed) if ok else 1.0
-            elif kind == "equilibrium" and role == "Keq":
+            elif kind == "equilibrium" and target_role == "Keq":
                 eq = mech.equilibria[idx]
                 meta = getattr(eq, "metadata", {}) or {}
                 parsed, ok = try_parse_callable_finite_float(
                     meta.get(EquilibriumMetadataKeys.KEQ_INPUT),
                 )
                 if not ok:
+                    parsed, ok = try_parse_callable_finite_float(getattr(eq, "Keq", None))
+                if not ok:
                     raise SimulationPreparationError(
                         "parameter_binding",
                         (
-                            f"Cannot bind {name!r}: equilibrium parameter has no explicit "
+                            f"Cannot bind {target_name!r}: equilibrium parameter has no explicit "
                             "equilibrium-constant source token."
                         ),
                     )
                 init = float(parsed)
             else:
                 init = 1.0
-            binding = RateBinding(name=name, value=float(init))
-            bindings[name] = binding
+            binding = RateBinding(name=target_name, value=float(init))
+            bindings[target_name] = binding
 
         if kind == "reaction" and role == "k":
             rxn = mech.reactions[idx]
             mech.reactions[idx] = replace(rxn, rate=binding)
-        elif kind == "equilibrium" and role in {"kf", "kr"}:
+        elif kind == "equilibrium" and target_role in {"kf", "kr"}:
             eq = mech.equilibria[idx]
-            mech.equilibria[idx] = replace(eq, **{role: binding})
-        elif kind == "equilibrium" and role == "Keq":
+            mech.equilibria[idx] = replace(eq, **{target_role: binding})
+        elif kind == "equilibrium" and target_role == "Keq":
             eq = mech.equilibria[idx]
             meta = dict(getattr(eq, "metadata", {}) or {})
             meta[EquilibriumMetadataKeys.KEQ_INPUT] = binding
@@ -2574,67 +2737,11 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
     return bindings
 
 
-def _implicit_equilibrium_constant_override_names(
-    mechanism: Any,
-    names: Iterable[str],
-    *,
-    exclude: Iterable[str] = (),
-) -> set[str]:
-    from kindred.core.equilibrium_rate_authority import step_entry_role_editable
-    from kindred.core.simulator.step_indexing import get_step_index_map
-
-    requested = {str(name) for name in (names or ()) if str(name or "").strip()}
-    excluded = {str(name) for name in (exclude or ()) if str(name or "").strip()}
-    if not requested:
-        return set()
-    implicit_keq: set[str] = set()
-    for entry in get_step_index_map(mechanism):
-        if str(entry.get("kind") or "") != "equilibrium":
-            continue
-        step_idx_raw = entry.get("step_index")
-        if isinstance(step_idx_raw, int):
-            n = int(step_idx_raw)
-        elif isinstance(step_idx_raw, str) and step_idx_raw.isdigit():
-            n = int(step_idx_raw)
-        else:
-            continue
-        keq_name = f"Keq{n}"
-        if bool(step_entry_role_editable(entry, "Keq")):
-            continue
-        if keq_name in requested and keq_name not in excluded:
-            implicit_keq.add(keq_name)
-    return implicit_keq
-
-
-def _reject_implicit_equilibrium_constant_overrides(
-    mechanism: Any,
-    names: Iterable[str],
-    *,
-    exclude: Iterable[str] = (),
-) -> None:
-    requested_implicit_keq = _implicit_equilibrium_constant_override_names(
-        mechanism,
-        names,
-        exclude=exclude,
-    )
-    if not requested_implicit_keq:
-        return
-    raise SimulationPreparationError(
-        "parameter_algebra",
-        (
-            "Implicit equilibrium parameter(s) "
-            + ", ".join(sorted(requested_implicit_keq))
-            + " are not writable runtime or fitting parameters without an explicit equilibrium-constant source token; "
-            "they are computed from current forward/reverse rates."
-        ),
-    )
-
-
 def _internal_parameter_algebra_binding_names(
     mechanism: Any,
     requested_names: Iterable[str] = (),
 ) -> set[str]:
-    from kindred.core.equilibrium_rate_authority import authority_fields_from_step_entry, step_entry_role_editable
+    from kindred.core.equilibrium_rate_authority import authority_fields_from_step_entry, step_entry_authored_role_is_editable
     from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
     from kindred.core.simulator.step_indexing import get_step_index_map
 
@@ -2684,7 +2791,7 @@ def _internal_parameter_algebra_binding_names(
             continue
         keq_name = f"Keq{n}"
         authority = authority_fields_from_step_entry(entry)
-        has_keq_param = bool(step_entry_role_editable(entry, "Keq"))
+        has_keq_param = bool(step_entry_authored_role_is_editable(entry, "Keq"))
         if not authority:
             raise SimulationPreparationError(
                 "parameter_algebra",
@@ -3072,7 +3179,6 @@ def prepare_bound_mechanism(
             mechanism_parameter_namespace,
             parse_parameter_algebra_spec_from_dsl_text,
         )
-        from kindred.core.simulator.step_indexing import get_step_index_map
 
         mechanism_namespace = mechanism_parameter_namespace(mechanism)
         unresolved_intervention_schedule = parse_intervention_schedule_from_dsl(str(mechanism_text or ""))
@@ -3108,57 +3214,11 @@ def prepare_bound_mechanism(
             str(name) for name in constrained if namespace_info[str(name)].role == "Keq"
         }
         constrained_mutable_targets = set(constrained) - constrained_keq_targets
-        active_keq_names = set(constrained_keq_targets)
         requested = {
             _canonical_step_override_name(mechanism, str(name))
             for name in requested_parameter_partition.bindable_mechanism_parameter_names
             if str(name or "").strip()
         }
-        from kindred.core.equilibrium_rate_authority import authority_fields_from_step_entry, step_entry_role_editable
-
-        requested_implicit_keq: set[str] = set()
-        k_derived = set()
-        for entry in get_step_index_map(mechanism):
-            if str(entry.get("kind") or "") != "equilibrium":
-                continue
-            step_idx_raw = entry.get("step_index")
-            if isinstance(step_idx_raw, int):
-                n = int(step_idx_raw)
-            elif isinstance(step_idx_raw, str) and step_idx_raw.isdigit():
-                n = int(step_idx_raw)
-            else:
-                continue
-            keq_name = f"Keq{n}"
-            authority = authority_fields_from_step_entry(entry)
-            has_keq_param = bool(step_entry_role_editable(entry, "Keq"))
-            if not authority:
-                raise SimulationPreparationError(
-                    "parameter_algebra",
-                    f"Equilibrium step {n} is missing normalized equilibrium_authority metadata.",
-                )
-            has_thermo_param = bool(authority.get("has_thermo_param") or has_keq_param)
-            if has_keq_param:
-                active_keq_names.add(keq_name)
-            elif keq_name in requested and keq_name not in constrained_keq_targets:
-                requested_implicit_keq.add(keq_name)
-            if not has_thermo_param and keq_name not in active_keq_names:
-                continue
-            derive_rate = str(authority.get("derived_role") or "")
-            if derive_rate not in {"kf", "kr"}:
-                derive_rate = "kr"
-            if derive_rate:
-                k_derived.add(f"{derive_rate}{n}")
-
-        if requested_implicit_keq:
-            raise SimulationPreparationError(
-                "parameter_algebra",
-                (
-                    "Implicit equilibrium parameter(s) "
-                    + ", ".join(sorted(requested_implicit_keq))
-                    + " are not writable fit parameters without an explicit equilibrium-constant source token; "
-                    "they are computed from current forward/reverse rates."
-                ),
-            )
         requested_dependent_keq = sorted(str(name) for name in (requested & constrained_keq_targets))
         if requested_dependent_keq:
             raise SimulationPreparationError(
@@ -3169,21 +3229,11 @@ def prepare_bound_mechanism(
                     + ", ".join(requested_dependent_keq)
                 ),
             )
-        requested_derived_rates = sorted(str(name) for name in (requested & k_derived))
-        if requested_derived_rates:
-            raise SimulationPreparationError(
-                "parameter_algebra",
-                (
-                    "Derived equilibrium rate parameter(s) cannot be fitted directly "
-                    "because Keq/algebra constraints overwrite them: "
-                    + ", ".join(requested_derived_rates)
-                ),
-            )
         mech_bind_names = sorted(
             {
                 str(n)
                 for n in (
-                    (requested - constrained_keq_targets - k_derived)
+                    (requested - constrained_keq_targets)
                     | constrained_mutable_targets
                 )
                 if str(n) in namespace_info
@@ -3308,7 +3358,6 @@ def prepare_fitting_objective_context(
         prepared_run_context = _build_prepared_run_context(
             mechanism=bound.mechanism,
             solver_config=prepared_solver_config,
-            allow_dynamic_binding_symbolic_snapshot=_mechanism_supports_dynamic_symbolic_snapshot(bound.mechanism),
         )
     except Exception as exc:
         if isinstance(exc, SimulationPreparationError):
@@ -3543,7 +3592,6 @@ def build_prepared_simulation_func(
             mechanism=bound.mechanism,
             solver_config=prepared_solver_config,
             jacobian_func_override=symbolic_jacobian.jacobian_func,
-            allow_dynamic_binding_symbolic_snapshot=_mechanism_supports_dynamic_symbolic_snapshot(bound.mechanism),
         )
         temperature_schedule = prepared_context.temperature_schedule
         symbolic_jacobian = prepared_context.symbolic_jacobian
@@ -3671,7 +3719,6 @@ def build_prepared_simulation_func(
             bool(prepared_solver_config.use_sparse_jacobian)
             and str(prepared_solver_config.solver).upper() in {"RADAU", "BDF"}
             and temperature_schedule is None
-            and _mechanism_supports_dynamic_symbolic_snapshot(bound.mechanism)
         ):
             try:
                 current_jacobian_func, symbolic_jacobian_identity = _bind_symbolic_jacobian_for_current_mechanism(

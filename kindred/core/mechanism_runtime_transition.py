@@ -193,7 +193,7 @@ class MechanismRuntimeTransitionService:
         force_runtime_invalidation: bool = False,
         edit_session_active: bool = False,
         input_suppressed: bool = False,
-        slider_runtime_invalidation_suppressed: bool = False,
+        runtime_invalidation_suppressed: bool = False,
         schedule_runtime_refresh: bool = True,
         canonical_batch_initials_by_set_id: Mapping[str, object] | None = None,
         affected_set_ids: Sequence[str] = (),
@@ -236,7 +236,7 @@ class MechanismRuntimeTransitionService:
             if (
                 edit_session_blocks_transition
                 or bool(input_suppressed)
-                or bool(slider_runtime_invalidation_suppressed)
+                or bool(runtime_invalidation_suppressed)
             ):
                 return MechanismTransitionOutcome(
                     epoch=int(self._epoch),

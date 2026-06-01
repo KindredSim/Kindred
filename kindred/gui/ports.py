@@ -206,8 +206,6 @@ class ConcentrationSetInteractionTransaction:
     display_refresh_reason: str
     slider_rebuild_needed: bool
     slider_rebuild_reason: str
-    runtime_readiness_refresh_needed: bool
-    runtime_readiness_refresh_reason: str
 
 
 def _normalized_str_tuple(values: Sequence[str] | object) -> tuple[str, ...]:
@@ -732,11 +730,6 @@ class SliderPreviewLifecyclePort(Protocol):
 
     def invalidate_slider_preview_work(self) -> None: ...
 
-    def deauthorize_completed_run_display_for_slider_preview_scope(
-        self,
-        target_set_ids: Sequence[str],
-    ) -> bool: ...
-
     def launch_pending_slider_preview_replay(self) -> None: ...
 
 
@@ -793,9 +786,7 @@ class SimulationRunUiPort(Protocol):
 
     def set_run_button_enabled(self, enabled: bool) -> None: ...
 
-    def set_runtime_backed_run_controls_ready(self, ready: bool) -> None: ...
-
-    def schedule_runtime_availability_refresh(self) -> None: ...
+    def render_launch_available(self, available: bool) -> None: ...
 
     def set_stop_button_enabled(self, enabled: bool) -> None: ...
 
@@ -828,8 +819,6 @@ class SimulationSliderPort(Protocol):
     def set_slider_triggered_simulation(self, value: bool) -> None: ...
 
     def slider_triggered_simulation(self) -> bool: ...
-
-    def last_slider_change_name(self) -> str: ...
 
     def slider_drag_active(self) -> bool: ...
 
@@ -959,13 +948,15 @@ class SimulationMechanismPort(Protocol):
 
     def clear_variable_sliders(self) -> None: ...
 
-    def has_slider_overrides(self) -> bool: ...
+    def has_local_runtime_parameter_values(self) -> bool: ...
 
     def simulation_schema_id(self, *, fast_mode: bool = False) -> str: ...
 
-    def simulation_param_fingerprint(self, set_id: Optional[str] = None, *, fast_mode: bool = False) -> str: ...
+    def runtime_parameter_fingerprint_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> str: ...
 
-    def slider_overrides(self, set_id: Optional[str] = None) -> Dict[str, float]: ...
+    def runtime_parameter_names_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> Sequence[str]: ...
+
+    def runtime_parameter_values_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> Dict[str, float]: ...
 
     def get_mechanism_text(self) -> str: ...
 
@@ -994,18 +985,7 @@ class SimulationSolverPort(Protocol):
     def wegscheider_cyclicity_enabled(self) -> bool: ...
 
 
-class SimulationRuntimePort(Protocol):
-    def prepare_slider_runtime(
-        self,
-        param_names: Optional[list[str]] = None,
-        *,
-        set_id: Optional[str] = None,
-    ) -> Optional[object]: ...
-
-    def apply_slider_overrides_to_bindings(self, runtime: object, *, set_id: Optional[str] = None) -> bool: ...
-
-    def set_slider_runtime_dirty(self, value: bool) -> None: ...
-
+class SimulationVariableRuntimePort(Protocol):
     def is_energy_mode_mechanism(self, mechanism: object) -> bool: ...
 
     def dsl_has_computational_mode_generated_block(self, mechanism_text: str) -> bool: ...
@@ -1075,13 +1055,6 @@ class SimulationResultsPort(Protocol):
         self,
         transaction: FreshPreviewDisplayTransaction,
     ) -> SimulationCompletionDisplayOutcome: ...
-
-    def deauthorize_completed_run_display_for_runtime_input_preview(
-        self,
-        *,
-        affected_set_ids: Sequence[str],
-        affected_scope_is_global: bool,
-    ) -> DisplayTransitionOutcome | None: ...
 
     def publish_cached_batch_display_scope(
         self,
@@ -1175,7 +1148,7 @@ class SimulationUiPorts:
     batch: SimulationBatchPort
     mechanism: SimulationMechanismPort
     solver: SimulationSolverPort
-    runtime: SimulationRuntimePort
+    variable_runtime: SimulationVariableRuntimePort
     results: SimulationResultsPort
     provenance: SimulationProvenancePort
     mechanism_helpers: SimulationMechanismHelpersPort

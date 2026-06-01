@@ -62,6 +62,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     speciesModeChanged = Signal(bool)
     speciesResetRequested = Signal()
     mechanismInspectRequested = Signal()
+    validationStateChanged = Signal(str)
 
     """
     Mechanism editor with Reactions and Notes tabs.
@@ -88,7 +89,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         super().__init__(parent)
 
         self._current_validation_state = "idle"
-        self._run_gated = False
         self._reactions_edit_action: Optional[QtGui.QAction] = None
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -202,15 +202,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_actions_layout.addWidget(self._fine_btn)
 
         # Override mode controls (Commit/Reset)
-        self._commit_slider_overrides_btn = QtWidgets.QPushButton("Apply")
-        self._commit_slider_overrides_btn.setObjectName("commitSliderOverridesButton")
-        self._commit_slider_overrides_btn.setToolTip("Apply current slider values to the canonical mechanism")
-        slider_actions_layout.addWidget(self._commit_slider_overrides_btn)
+        self._commit_runtime_parameters_btn = QtWidgets.QPushButton("Apply")
+        self._commit_runtime_parameters_btn.setObjectName("commitRuntimeParametersButton")
+        self._commit_runtime_parameters_btn.setToolTip("Apply current slider values to the canonical mechanism")
+        slider_actions_layout.addWidget(self._commit_runtime_parameters_btn)
 
-        self._reset_slider_overrides_btn = QtWidgets.QPushButton("Reset")
-        self._reset_slider_overrides_btn.setObjectName("resetSliderOverridesButton")
-        self._reset_slider_overrides_btn.setToolTip("Revert sliders to canonical mechanism values")
-        slider_actions_layout.addWidget(self._reset_slider_overrides_btn)
+        self._reset_runtime_parameters_btn = QtWidgets.QPushButton("Reset")
+        self._reset_runtime_parameters_btn.setObjectName("resetRuntimeParametersButton")
+        self._reset_runtime_parameters_btn.setToolTip("Revert sliders to canonical mechanism values")
+        slider_actions_layout.addWidget(self._reset_runtime_parameters_btn)
 
         # Visibility picker for the unified slider surface.
         self._slider_visibility_picker_btn = QtWidgets.QToolButton()
@@ -634,7 +634,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             Status message to display
         """
         self._current_validation_state = state
-        self._run_btn.setEnabled(state == "valid" and not self._run_gated)
+        self.validationStateChanged.emit(str(state))
         self._run_btn.setToolTip(
             "Run simulation for all selected sets (same as Run Selected in Initial Conditions)"
             if state == "valid"
@@ -704,13 +704,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     @property
     def run_btn(self) -> QtWidgets.QPushButton:
         return self._run_btn
-
-    def set_run_gated(self, gated: bool) -> None:
-        self._run_gated = bool(gated)
-        if self._run_gated:
-            self._run_btn.setEnabled(False)
-        elif self._current_validation_state == "valid":
-            self._run_btn.setEnabled(True)
 
     def is_mechanism_valid(self) -> bool:
         return self._current_validation_state == "valid"

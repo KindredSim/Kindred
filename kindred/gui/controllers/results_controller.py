@@ -1373,6 +1373,18 @@ class ResultsController(QtCore.QObject):
             focused_controls_use_workspace=None,
         )
 
+    def deauthorize_completed_run_display_for_runtime_input_preview(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        affected_scope_is_global: bool,
+    ) -> DisplayTransitionOutcome | None:
+        return self._deauthorize_completed_run_display(
+            transition=_DISPLAY_TRANSITION_RUNTIME_INPUT_PREVIEW_DEAUTHORIZATION,
+            affected_set_ids=affected_set_ids,
+            affected_scope_is_global=bool(affected_scope_is_global),
+        )
+
     def _deauthorize_active_display(
         self,
         *,
@@ -1650,18 +1662,6 @@ class ResultsController(QtCore.QObject):
         )
         self._ui.set_status_text(display_transition_status_text(outcome))
         return outcome
-
-    def deauthorize_completed_run_display_for_runtime_input_preview(
-        self,
-        *,
-        affected_set_ids: Sequence[str],
-        affected_scope_is_global: bool,
-    ) -> DisplayTransitionOutcome | None:
-        return self._deauthorize_completed_run_display(
-            transition=_DISPLAY_TRANSITION_RUNTIME_INPUT_PREVIEW_DEAUTHORIZATION,
-            affected_set_ids=affected_set_ids,
-            affected_scope_is_global=bool(affected_scope_is_global),
-        )
 
     def publish_completed_run_display_unavailable(
         self,

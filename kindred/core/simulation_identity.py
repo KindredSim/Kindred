@@ -547,10 +547,8 @@ def contained_simulation_owner_identity(
 ) -> dict[str, Any]:
     """Build the payload identity that decides contained runtime owner reuse.
 
-    Preview owners may reuse a prepared mechanism across slider value changes,
-    because slider values are applied as request-local parameter overrides.  The
-    identity therefore includes structural mechanism/runtime dimensions and the
-    parameter namespace, but not the current preview parameter values.
+    Preview owners are keyed by structural mechanism/runtime dimensions. Slider
+    parameter values are request-local execution inputs, not preparation identity.
     """
     mode = "preview" if str(execution_mode or "").lower() == "preview" else "explicit"
     identity = coerce_simulation_identity(simulation_identity)
@@ -578,10 +576,6 @@ def contained_simulation_owner_identity(
         if mode != "preview":
             payload["schema_id"] = str(identity.schema_id)
             payload["simulation_identity_key"] = identity.prepared_runtime_key()
-    if mode == "preview":
-        payload["parameter_names"] = sorted(
-            {str(name) for name in (parameter_names or ()) if str(name)}
-        )
     return payload
 
 

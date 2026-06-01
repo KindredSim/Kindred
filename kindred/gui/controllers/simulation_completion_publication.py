@@ -685,7 +685,7 @@ class SimulationCompletionPublicationOwner:
         if total <= 1:
             return False
         current_set_id = str(state.batch_set_id or "").strip()
-        if completion_state.parallel:
+        if completion_state.runtime_task_queue or completion_state.parallel:
             completed = {str(set_id) for set_id in completion_state.completed_set_ids if str(set_id)}
             if current_set_id:
                 completed.add(current_set_id)
@@ -895,7 +895,7 @@ class SimulationCompletionPublicationOwner:
                 state.policy_context,
                 base_context=state.ctx,
             )
-        if completion_state.parallel:
+        if completion_state.runtime_task_queue or completion_state.parallel:
             transition = self._batch_context_owner.record_parallel_success(
                 set_id=state.batch_set_id,
                 total=total,

@@ -48,7 +48,6 @@ class SerialBatchDispatchInput:
     set_id: str
     set_name: str
     initials: Mapping[str, Any]
-    slider_overrides: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)

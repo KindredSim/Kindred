@@ -49,7 +49,7 @@ class EquilibriumRateAuthority:
             raise ValueError(AUTHORITY_ERROR)
         return effective_reverse_rate_from_keq(self.kf if kf is None else kf, keq_value, self.reverse_std_ratio)
 
-    def role_editability(self, role: str) -> bool:
+    def authored_role_is_editable(self, role: str) -> bool:
         role = str(role)
         if role == "kf":
             return True
@@ -61,7 +61,7 @@ class EquilibriumRateAuthority:
             return self.kind == EquilibriumRateAuthorityKind.KEQ and self.dG_eq_J_per_mol is not None
         return False
 
-    def role_derived(self, role: str) -> bool:
+    def authored_role_is_derived(self, role: str) -> bool:
         role = str(role)
         if role == "kr":
             return self.kind == EquilibriumRateAuthorityKind.KEQ
@@ -79,16 +79,16 @@ class EquilibriumRateAuthority:
                 "has_explicit_keq_param": bool(self.has_explicit_keq_param),
                 "has_thermo_param": bool(self.has_thermo_param),
                 "editable": {
-                    "kf": self.role_editability("kf"),
-                    "kr": self.role_editability("kr"),
-                    "Keq": self.role_editability("Keq"),
-                    "dG_eq": self.role_editability("dG_eq"),
+                    "kf": self.authored_role_is_editable("kf"),
+                    "kr": self.authored_role_is_editable("kr"),
+                    "Keq": self.authored_role_is_editable("Keq"),
+                    "dG_eq": self.authored_role_is_editable("dG_eq"),
                 },
                 "derived": {
-                    "kf": self.role_derived("kf"),
-                    "kr": self.role_derived("kr"),
-                    "Keq": self.role_derived("Keq"),
-                    "dG_eq": self.role_derived("dG_eq"),
+                    "kf": self.authored_role_is_derived("kf"),
+                    "kr": self.authored_role_is_derived("kr"),
+                    "Keq": self.authored_role_is_derived("Keq"),
+                    "dG_eq": self.authored_role_is_derived("dG_eq"),
                 },
             },
         }
@@ -488,7 +488,7 @@ def authority_fields_from_step_entry(entry: Mapping[str, Any] | None) -> Mapping
     return value if isinstance(value, Mapping) else {}
 
 
-def step_entry_role_editable(entry: Mapping[str, Any] | None, role: str) -> bool | None:
+def step_entry_authored_role_is_editable(entry: Mapping[str, Any] | None, role: str) -> bool | None:
     fields = authority_fields_from_step_entry(entry)
     editable = fields.get("editable")
     if isinstance(editable, Mapping) and role in editable:
@@ -496,13 +496,13 @@ def step_entry_role_editable(entry: Mapping[str, Any] | None, role: str) -> bool
     return None
 
 
-def require_step_entry_role_editable(
+def require_step_entry_authored_role_is_editable(
     entry: Mapping[str, Any] | None,
     role: str,
     *,
     parameter_name: str | None = None,
 ) -> None:
-    editable = step_entry_role_editable(entry, role)
+    editable = step_entry_authored_role_is_editable(entry, role)
     name = str(parameter_name or role)
     if editable is True:
         return
@@ -511,7 +511,7 @@ def require_step_entry_role_editable(
     raise ValueError(f"{name} is missing normalized equilibrium_authority editability metadata.")
 
 
-def step_entry_role_derived(entry: Mapping[str, Any] | None, role: str) -> bool | None:
+def step_entry_authored_role_is_derived(entry: Mapping[str, Any] | None, role: str) -> bool | None:
     fields = authority_fields_from_step_entry(entry)
     derived = fields.get("derived")
     if isinstance(derived, Mapping) and role in derived:

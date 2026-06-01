@@ -30,6 +30,7 @@ class SimulationCallbackFreshnessDecision:
     missing_preview_owner_epoch: bool
     preview_owner_matches: bool
     superseded_fast_request: bool
+    dispatch_identity_stale: bool = False
 
 
 class SimulationCallbackFreshnessOwner:
@@ -66,6 +67,7 @@ class SimulationCallbackFreshnessOwner:
             latest_request_id=latest_request_id,
         )
         runtime_input_stale = False
+        dispatch_identity_stale = False
         if isinstance(context, Mapping):
             runtime_input_stale = self._deps.batch_context_owner.runtime_input_stale_for_set(
                 context,
@@ -73,6 +75,11 @@ class SimulationCallbackFreshnessOwner:
                 current_global_epoch=current_global_epoch,
                 current_set_epoch=current_set_epoch,
                 current_epoch=current_epoch,
+            )
+            dispatch_identity_stale = self._dispatch_identity_stale(
+                callback_identity,
+                context=context,
+                batch_set_id=batch_set_id,
             )
         return SimulationCallbackFreshnessDecision(
             active_run_id=active_run_id,
@@ -88,6 +95,7 @@ class SimulationCallbackFreshnessOwner:
                 callback_identity.fast_mode
                 and (bool(missing_preview_owner_epoch) or not bool(preview_owner_matches))
             ),
+            dispatch_identity_stale=bool(dispatch_identity_stale),
         )
 
     def mark_stale_runtime_input_callback_consumed(
@@ -101,7 +109,23 @@ class SimulationCallbackFreshnessOwner:
             return
         if isinstance(context, Mapping) and not self._deps.batch_context_owner.context_matches_current_run_identity(context):
             return
-        transition = self._deps.batch_context_owner.record_parallel_stale_callback_consumed_if_active(set_id=set_id)
+        self._mark_runtime_task_callback_consumed(set_id=set_id)
+
+    def mark_stale_dispatch_identity_callback_consumed(
+        self,
+        *,
+        batch_set_id: Optional[str],
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        set_id = str(batch_set_id or "").strip()
+        if not set_id:
+            return
+        if isinstance(context, Mapping) and not self._deps.batch_context_owner.context_matches_current_run_identity(context):
+            return
+        self._mark_runtime_task_callback_consumed(set_id=set_id)
+
+    def _mark_runtime_task_callback_consumed(self, *, set_id: str) -> None:
+        transition = self._deps.batch_context_owner.record_runtime_task_stale_callback_consumed_if_active(set_id=set_id)
         if transition is None:
             return
         if transition.batch_done:
@@ -139,3 +163,44 @@ class SimulationCallbackFreshnessOwner:
         if owner_request_id is None:
             return False
         return int(owner_request_id) == int(request_id) and int(request_id) != int(latest_request_id)
+
+    @staticmethod
+    def _dispatch_identity_stale(
+        callback_identity: SimulationCallbackIdentity,
+        *,
+        context: Mapping[str, Any],
+        batch_set_id: str,
+    ) -> bool:
+        identity_by_set_id = context.get("runtime_task_identity_by_set_id")
+        if not isinstance(identity_by_set_id, Mapping):
+            return False
+        expected = identity_by_set_id.get(str(batch_set_id or ""))
+        if not isinstance(expected, Mapping):
+            return False
+        comparisons = (
+            ("allocation_id", str(getattr(callback_identity, "allocation_id", "") or ""), str(expected.get("allocation_id") or "")),
+            ("lane_id", str(getattr(callback_identity, "lane_id", "") or ""), str(expected.get("lane_id") or "")),
+            (
+                "lane_generation",
+                int(getattr(callback_identity, "lane_generation", 0) or 0),
+                int(expected.get("lane_generation", 0) or 0),
+            ),
+            (
+                "row",
+                None if getattr(callback_identity, "row", None) is None else int(callback_identity.row),
+                None if expected.get("row") is None else int(expected.get("row")),
+            ),
+            (
+                "exact_descriptor_hash",
+                str(getattr(callback_identity, "exact_descriptor_hash", "") or ""),
+                str(expected.get("exact_descriptor_hash") or ""),
+            ),
+            ("cache_key", str(callback_identity.cache_key or ""), str(expected.get("cache_key") or "")),
+        )
+        for _name, actual, expected_value in comparisons:
+            if actual != expected_value:
+                return True
+        actual_compatibility = getattr(callback_identity, "compatibility_key", None)
+        if isinstance(actual_compatibility, Mapping) or isinstance(expected.get("compatibility_key"), Mapping):
+            return dict(actual_compatibility or {}) != dict(expected.get("compatibility_key") or {})
+        return False

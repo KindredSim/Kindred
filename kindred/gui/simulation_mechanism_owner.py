@@ -70,7 +70,7 @@ class SimulationMechanismOwner:
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be a MechanismAuthoringSource.")
         materialized = source
-        if self.has_slider_overrides() and bool(apply_parameter_overrides):
+        if self.has_local_runtime_parameter_values() and bool(apply_parameter_overrides):
             materialized = MechanismAuthoringSource.from_parts(
                 reactions_text=self._apply_reactions_overrides_to_text(
                     materialized.reactions_text,
@@ -141,7 +141,7 @@ class SimulationMechanismOwner:
         if sliders is not None and hasattr(sliders, "clear"):
             sliders.clear()
 
-    def has_slider_overrides(self) -> bool:
+    def has_local_runtime_parameter_values(self) -> bool:
         return bool(self._preview_session.has_local_mechanism_workspaces())
 
     def simulation_schema_id(self, *, fast_mode: bool = False) -> str:
@@ -155,7 +155,7 @@ class SimulationMechanismOwner:
             param_store.set_schema(schema_text)
         return str(param_store.schema_id or "")
 
-    def simulation_param_fingerprint(self, set_id: Optional[str] = None, *, fast_mode: bool = False) -> str:
+    def runtime_parameter_fingerprint_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> str:
         self.simulation_schema_id(fast_mode=bool(fast_mode))
         target_set_id = str(set_id or "").strip()
         param_store = self._preview_session.param_store
@@ -163,15 +163,25 @@ class SimulationMechanismOwner:
             return ""
         return str(param_store.param_fingerprint(target_set_id) or "")
 
-    def slider_overrides(self, set_id: Optional[str] = None) -> Dict[str, float]:
-        raw = self._preview_session.slider_overrides(set_id=set_id)
-        overrides: Dict[str, float] = {}
-        for key, value in raw.items():
+    def runtime_parameter_names_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> list[str]:
+        self.simulation_schema_id(fast_mode=bool(fast_mode))
+        return list(self._preview_session.param_store.parameter_names())
+
+    def runtime_parameter_values_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> Dict[str, float]:
+        self.simulation_schema_id(fast_mode=bool(fast_mode))
+        target_set_id = str(set_id or "").strip()
+        raw = self._preview_session.runtime_parameter_values(set_id=target_set_id)
+        values: Dict[str, float] = {}
+        allowed_names = set(self._preview_session.param_store.parameter_names())
+        for key, value in dict(raw or {}).items():
+            name_s = str(key or "").strip()
+            if not name_s or name_s not in allowed_names:
+                continue
             parsed, ok = try_parse_finite_float(value)
             if not ok:
                 continue
-            overrides[str(key)] = float(parsed)
-        return overrides
+            values[name_s] = float(parsed)
+        return values
 
     def get_mechanism_text(self) -> str:
         return self._simulation_schema_text()

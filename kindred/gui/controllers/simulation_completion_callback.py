@@ -69,6 +69,19 @@ class SimulationCompletionCallbackOwner:
             )
             return
 
+        if freshness.dispatch_identity_stale:
+            logger.debug(
+                "Ignoring stale simulation completion with mismatched dispatch identity (run_id=%s, request_id=%s, set_id=%s)",
+                run_id,
+                request_id,
+                str(batch_set_id or ""),
+            )
+            self._deps.freshness.mark_stale_dispatch_identity_callback_consumed(
+                batch_set_id=batch_set_id,
+                context=ctx,
+            )
+            return
+
         if freshness.runtime_input_stale:
             logger.debug(
                 "Ignoring stale simulation completion (batch_set_id=%s, current_global_epoch=%s)",
