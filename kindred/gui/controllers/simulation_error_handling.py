@@ -6,12 +6,6 @@ from typing import Any, Callable, Mapping
 
 from kindred.gui.controllers.simulation_callback_freshness import SimulationCallbackFreshnessOwner
 from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
-from kindred.core.simulation_failure import (
-    coerce_simulation_failure,
-    is_cancelled_failure,
-    simulation_failure_detail_text,
-    simulation_failure_user_message,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +22,6 @@ class SimulationErrorHandlingDependencies:
     capture_terminal_failure_preview_replay_snapshot: Callable[..., Any]
     request_terminal_failure_preview_replay: Callable[..., None]
     request_pending_preview_replay: Callable[..., None]
-    handle_current_preview_simulation_failure: Callable[..., None]
 
 
 class SimulationErrorHandlingOwner:
@@ -57,10 +50,13 @@ class SimulationErrorHandlingOwner:
         fast_mode = callback_identity.fast_mode
         request_id = callback_identity.request_id
         batch_set_id = callback_identity.batch_set_id
-        error_payload = coerce_simulation_failure(error_msg)
-        error_text = simulation_failure_user_message(error_payload)
-        error_detail_text = simulation_failure_detail_text(error_payload)
-        cancelled = is_cancelled_failure(error_payload)
+        failure_decision = self._completion_policy.resolve_simulation_failure(
+            error_msg,
+            fast_mode=bool(fast_mode),
+        )
+        error_text = failure_decision.error_text
+        error_detail_text = failure_decision.error_detail_text
+        cancelled = failure_decision.cancelled
         context_resolution = self._batch_context_owner.context_for_callback_identity(callback_identity)
         ctx = context_resolution.context if context_resolution.matched else None
         if not isinstance(ctx, Mapping):
@@ -154,39 +150,24 @@ class SimulationErrorHandlingOwner:
             )
             self._deps.apply_runtime_effects(replay_decision.effects)
             return
-        preview_failure_kind = str(error_payload.get("kind") or "").strip().lower()
-        preview_failure_details = error_payload.get("details")
-        preview_failure_source = (
-            str(preview_failure_details.get("source") or "").strip().lower()
-            if isinstance(preview_failure_details, Mapping)
-            else ""
-        )
-        preview_failure_stage = (
-            str(preview_failure_details.get("stage") or "").strip().lower()
-            if isinstance(preview_failure_details, Mapping)
-            else ""
-        )
-        status_only_preview_failure = (
-            preview_failure_kind == "timeout"
-            or preview_failure_kind.endswith("_timeout")
-            or preview_failure_kind.startswith("simulation_containment")
-            or preview_failure_source == "simulation_containment"
-            or preview_failure_stage == "wegscheider_cyclicity"
-        )
-        if bool(fast_mode) and not cancelled and status_only_preview_failure:
+
+        if failure_decision.status_only_preview:
+            logger.warning("Preview simulation error surfaced to status: %s", error_text)
+            if error_detail_text:
+                logger.warning("%s", error_detail_text)
+            self._deps.apply_runtime_effects(
+                self._deps.runtime_cancel_requested(kind="preview_failure")
+            )
             if isinstance(ctx, Mapping):
-                preview_error_text = error_text
-                if preview_failure_stage == "wegscheider_cyclicity":
-                    preview_error_text = str(
-                        error_payload.get("message") or "Unresolved Wegscheider cyclicity."
-                    )
-                self._deps.handle_current_preview_simulation_failure(
-                    error_payload,
-                    error_text=preview_error_text,
-                    error_detail_text=error_detail_text,
-                    context=ctx,
-                )
-                return
+                ctx = self._batch_context_owner.deactivate_if_active(ctx)
+            self._deps.apply_lifecycle_effects(
+                self._lifecycle_effect_owner.current_preview_failure_effects(
+                    status_text=failure_decision.preview_status_text,
+                ),
+                failed_run_context=ctx if isinstance(ctx, Mapping) else None,
+            )
+            return
+
         logger.warning("Simulation error surfaced to UI: %s", error_text)
 
         if not cancelled and error_detail_text:

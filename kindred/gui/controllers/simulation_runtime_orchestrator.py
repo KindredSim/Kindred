@@ -11,6 +11,9 @@ from kindred.gui.controllers.runtime_lane_allocation import (
     RuntimeReleaseReason,
     RuntimeReleaseResult,
 )
+from kindred.gui.controllers.simulation_completion_policy import (
+    normalize_preview_target_set_ids,
+)
 from kindred.gui.controllers.simulation_runtime_backend import (
     RuntimeBackendPort,
     RuntimeCompletionDecision,
@@ -38,6 +41,13 @@ class QueuePreviewReplay:
     target_set_ids: tuple[str, ...]
     stop_timers: bool = True
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "target_set_ids",
+            normalize_preview_target_set_ids(self.target_set_ids),
+        )
+
 
 @dataclass(frozen=True)
 class RuntimePreviewReplayUpdate:
@@ -53,12 +63,24 @@ class RuntimePreviewReplayState:
     handoff_queued: bool = False
     replay_generation: int = 0
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "request_id", _optional_int(self.request_id))
+        object.__setattr__(
+            self,
+            "target_set_ids",
+            normalize_preview_target_set_ids(self.target_set_ids),
+        )
+        object.__setattr__(self, "handoff_queued", bool(self.handoff_queued))
+        object.__setattr__(self, "replay_generation", max(0, int(self.replay_generation or 0)))
+
     @classmethod
     def from_pending(cls, pending: object) -> "RuntimePreviewReplayState":
         return cls(
             active=bool(getattr(pending, "active", False)),
             request_id=_optional_int(getattr(pending, "request_id", None)),
-            target_set_ids=_normalized_targets(getattr(pending, "target_set_ids", ())),
+            target_set_ids=normalize_preview_target_set_ids(
+                getattr(pending, "target_set_ids", ())
+            ),
             handoff_queued=bool(getattr(pending, "handoff_queued", False)),
             replay_generation=int(getattr(pending, "replay_generation", 0) or 0),
         )
@@ -72,6 +94,20 @@ class RuntimePreviewReplaySnapshot:
     replay_generation: int = 0
     dirty_generation_by_set_id: tuple[tuple[str, int], ...] = ()
 
+    def __post_init__(self) -> None:
+        target_set_ids = normalize_preview_target_set_ids(self.target_set_ids)
+        dirty_generations: list[tuple[str, int]] = []
+        target_set = set(target_set_ids)
+        for set_id, generation in tuple(self.dirty_generation_by_set_id or ()):
+            sid = str(set_id or "").strip()
+            normalized_generation = _optional_int(generation)
+            if sid and sid in target_set and normalized_generation is not None:
+                dirty_generations.append((sid, int(normalized_generation)))
+        object.__setattr__(self, "request_id", _optional_int(self.request_id))
+        object.__setattr__(self, "target_set_ids", target_set_ids)
+        object.__setattr__(self, "replay_generation", max(0, int(self.replay_generation or 0)))
+        object.__setattr__(self, "dirty_generation_by_set_id", tuple(dirty_generations))
+
 
 @dataclass(frozen=True)
 class RuntimeUiEffect:
@@ -83,6 +119,12 @@ class RuntimeUiEffect:
     clear_preview_plot_updates: bool = False
     dispatch_ready: RuntimeDispatchPlan | None = None
     surface_failure: str = ""
+    surface_failure_detail_text: str = ""
+    preview_failure_status_text: str = ""
+    preview_failure_context: Mapping[str, object] | None = None
+    superseded_fast_failure: bool = False
+    superseded_fast_failure_reset_status_progress: bool = False
+    superseded_fast_failure_deactivate_context_immediately: bool = False
     render_state: SimulationRuntimeReadinessRenderState | None = None
     simulation_running: bool | None = None
     slider_simulation_active: bool | None = None
@@ -96,7 +138,6 @@ class RuntimeUiEffect:
     warmup_retry_kind: str = ""
     warmup_retry_delay_ms: int = 0
     scoped_failure_summary: RuntimeScopedFailureSummary | None = None
-    current_preview_failure_status_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -244,29 +285,13 @@ def _optional_int(value: object) -> int | None:
         return None
 
 
-def _normalized_targets(values: object) -> tuple[str, ...]:
-    if not values:
-        return ()
-    if isinstance(values, str):
-        values = (values,)
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for value in values:  # type: ignore[union-attr]
-        text = str(value or "").strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        normalized.append(text)
-    return tuple(normalized)
-
-
 def _normalized_dirty_generations(
     *,
     target_set_ids: Sequence[str],
     dirty_generation_by_set_id: Mapping[str, object],
 ) -> tuple[tuple[str, int], ...] | None:
     normalized: list[tuple[str, int]] = []
-    for set_id in _normalized_targets(target_set_ids):
+    for set_id in normalize_preview_target_set_ids(target_set_ids):
         generation = _optional_int(dirty_generation_by_set_id.get(str(set_id)))
         if generation is None:
             return None
@@ -687,7 +712,14 @@ class SimulationRuntimeOrchestrator:
                         ]
                         effects.extend(self._completion_terminal_replay_effects(decision))
                         if decision.message:
-                            effects.append(RuntimeUiEffect(surface_failure=str(decision.message)))
+                            effects.append(
+                                RuntimeUiEffect(
+                                    surface_failure=str(decision.message),
+                                    surface_failure_detail_text=str(
+                                        getattr(decision, "failure_detail_text", "") or ""
+                                    ),
+                                )
+                            )
                         if close_failure:
                             effects.append(RuntimeUiEffect(surface_failure=close_failure))
                         return effects
@@ -734,8 +766,6 @@ class SimulationRuntimeOrchestrator:
                 backend_idle=backend_idle,
                 drained_superseded_release_tokens=drained_superseded_release_tokens,
             )
-            if released is not None and self._runtime_consequences_complete():
-                accumulated_decision_effects = []
             if accumulated_decision_effects:
                 return accumulated_decision_effects
             return self._polling_effects_after_runtime_consequence_update()
@@ -757,6 +787,48 @@ class SimulationRuntimeOrchestrator:
         decision: RuntimeCompletionDecision,
     ) -> list[RuntimeUiEffect]:
         effects: list[RuntimeUiEffect] = []
+        failure_context = getattr(decision, "failure_context", None)
+        preview_failure_context = failure_context if isinstance(failure_context, Mapping) else None
+        if bool(getattr(decision, "superseded_fast_failure", False)):
+            if bool(
+                getattr(
+                    decision,
+                    "superseded_fast_failure_deactivate_context_immediately",
+                    False,
+                )
+            ):
+                effects.extend(self.cancel_requested(kind="soft_shutdown"))
+            effects.append(
+                RuntimeUiEffect(
+                    superseded_fast_failure=True,
+                    superseded_fast_failure_reset_status_progress=bool(
+                        getattr(
+                            decision,
+                            "superseded_fast_failure_reset_status_progress",
+                            False,
+                        )
+                    ),
+                    superseded_fast_failure_deactivate_context_immediately=bool(
+                        getattr(
+                            decision,
+                            "superseded_fast_failure_deactivate_context_immediately",
+                            False,
+                        )
+                    ),
+                    preview_failure_context=preview_failure_context,
+                )
+            )
+        preview_failure_status_text = str(
+            getattr(decision, "preview_failure_status_text", "") or ""
+        )
+        if preview_failure_status_text:
+            effects.extend(self.terminal_failure())
+            effects.append(
+                RuntimeUiEffect(
+                    preview_failure_status_text=preview_failure_status_text,
+                    preview_failure_context=preview_failure_context,
+                )
+            )
         progress = getattr(decision, "scoped_failure_progress", None)
         if progress is not None:
             completed = max(0, int(getattr(progress, "completed", 0) or 0))
@@ -775,16 +847,6 @@ class SimulationRuntimeOrchestrator:
             if isinstance(summary, RuntimeScopedFailureSummary):
                 effects.append(RuntimeUiEffect(scoped_failure_summary=summary))
             effects.extend(self._completion_terminal_replay_effects(decision))
-        current_preview_status = str(
-            getattr(decision, "current_preview_failure_status_text", "") or ""
-        )
-        if current_preview_status:
-            effects.extend(self.terminal_failure())
-            effects.append(
-                RuntimeUiEffect(
-                    current_preview_failure_status_text=current_preview_status,
-                )
-            )
         return effects
 
     def _completion_terminal_replay_effects(
@@ -886,7 +948,7 @@ class SimulationRuntimeOrchestrator:
         active: bool,
         target_set_ids: Sequence[str],
     ) -> bool:
-        return bool(active or _normalized_targets(target_set_ids))
+        return bool(active or normalize_preview_target_set_ids(target_set_ids))
 
     def preview_replay_exists_for_state(self, state: object) -> bool:
         pending = (
@@ -908,7 +970,7 @@ class SimulationRuntimeOrchestrator:
         handoff_queued: bool,
         stop_timers: bool = True,
     ) -> list[RuntimeUiEffect]:
-        targets = _normalized_targets(target_set_ids)
+        targets = normalize_preview_target_set_ids(target_set_ids)
         if not self.preview_replay_exists(active=bool(active), target_set_ids=targets):
             return []
         if bool(handoff_queued):
@@ -938,7 +1000,7 @@ class SimulationRuntimeOrchestrator:
         clear_plot_updates: bool = False,
     ) -> list[RuntimeUiEffect]:
         current = RuntimePreviewReplayState.from_pending(current_state)
-        normalized_targets = _normalized_targets(target_set_ids)
+        normalized_targets = normalize_preview_target_set_ids(target_set_ids)
         next_request_id: int | None
         if request_id is not None:
             next_request_id = int(request_id)
@@ -1000,7 +1062,7 @@ class SimulationRuntimeOrchestrator:
         reset_set_ids: Sequence[str],
     ) -> list[RuntimeUiEffect]:
         pending = RuntimePreviewReplayState.from_pending(current_state)
-        reset_ids = set(_normalized_targets(reset_set_ids))
+        reset_ids = set(normalize_preview_target_set_ids(reset_set_ids))
         surviving = tuple(set_id for set_id in pending.target_set_ids if set_id not in reset_ids)
         if surviving:
             return self.preview_replay_state_requested(
@@ -1138,7 +1200,7 @@ class SimulationRuntimeOrchestrator:
             if isinstance(pending_state, RuntimePreviewReplayState)
             else RuntimePreviewReplayState.from_pending(pending_state)
         )
-        target_set_ids = _normalized_targets(pending.target_set_ids)
+        target_set_ids = normalize_preview_target_set_ids(pending.target_set_ids)
         if not self.preview_replay_exists(active=bool(pending.active), target_set_ids=target_set_ids):
             return RuntimePreviewReplaySnapshot(
                 active=False,
@@ -1704,7 +1766,8 @@ class SimulationRuntimeOrchestrator:
         if not bool(snapshot.active) or not snapshot.target_set_ids:
             return False
         return (
-            _normalized_targets(pending.target_set_ids) == tuple(snapshot.target_set_ids)
+            normalize_preview_target_set_ids(pending.target_set_ids)
+            == tuple(snapshot.target_set_ids)
             and pending.request_id == snapshot.request_id
             and int(pending.replay_generation) == int(snapshot.replay_generation)
         )

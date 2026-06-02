@@ -9,7 +9,6 @@ from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutco
 from kindred.core.simulation_failure import (
     build_simulation_failure,
     coerce_simulation_failure,
-    simulation_failure_user_message,
 )
 from kindred.gui.controllers.simulation_callback_freshness import SimulationCallbackFreshnessOwner
 from kindred.gui.controllers.simulation_runtime_backend import (
@@ -37,6 +36,7 @@ class ParallelBatchOutcomeResolution:
 @dataclass(frozen=True)
 class ParallelBatchOutcomeDependencies:
     freshness: SimulationCallbackFreshnessOwner
+    completion_policy_preview_ownership: Callable[[], Any]
     record_nonfatal_exception: Callable[..., None]
     finalize_scoped_batch_success_subset: Callable[..., DisplayTransitionOutcome | None]
 
@@ -142,18 +142,16 @@ class ParallelBatchOutcomeOwner:
     def __init__(
         self,
         *,
-        ui: Any,
-        batch_parallel: Any,
         batch_context_owner: Any,
         batch_cache: Any,
         completion_callback_owner: Any,
+        completion_policy: Any,
         dependencies: ParallelBatchOutcomeDependencies,
     ) -> None:
-        self._ui = ui
-        self._batch_parallel = batch_parallel
         self._batch_context_owner = batch_context_owner
         self._batch_cache = batch_cache
         self._completion_callback_owner = completion_callback_owner
+        self._completion_policy = completion_policy
         self._deps = dependencies
 
     def handle_scoped_failure(
@@ -308,8 +306,38 @@ class ParallelBatchOutcomeOwner:
             )
             return RuntimeCompletionDecision.ignored_stale()
 
+        completion_policy_context = self._batch_context_owner.completion_policy_context(
+            resolved_run_context
+        )
         if resolution.failed:
             error_payload = dict(resolution.error_payload or {})
+            if bool(getattr(freshness, "superseded_fast_request", False)):
+                stale_fast_decision = self._completion_policy.resolve_superseded_fast_error(
+                    preview_ownership=self._deps.completion_policy_preview_ownership(),
+                    context=completion_policy_context,
+                    request_id=int(getattr(callback_identity, "request_id", outcome.request_id)),
+                    preview_owner_epoch=getattr(
+                        freshness,
+                        "callback_preview_owner_epoch",
+                        None,
+                    ),
+                )
+                callback_context_matches_current = bool(
+                    self._batch_context_owner.context_matches_current_run_identity(
+                        resolved_run_context
+                    )
+                )
+                return RuntimeCompletionDecision.superseded_fast_failure_decision(
+                    failure_context=resolved_run_context,
+                    reset_status_progress=bool(
+                        stale_fast_decision.reset_status_progress
+                        and callback_context_matches_current
+                    ),
+                    deactivate_context_immediately=bool(
+                        stale_fast_decision.deactivate_context_immediately
+                        and callback_context_matches_current
+                    ),
+                )
             scoped_failure_decision = self._handle_scoped_failure_decision(
                 set_id=sid,
                 set_name=set_name,
@@ -317,17 +345,22 @@ class ParallelBatchOutcomeOwner:
             )
             if scoped_failure_decision is not None:
                 return scoped_failure_decision
-            preview_status_text = self._current_preview_failure_status_text(error_payload)
-            if preview_status_text:
+            failure_decision = self._completion_policy.resolve_simulation_failure(
+                error_payload,
+                fast_mode=self._active_completion_fast_mode(),
+            )
+            if failure_decision.status_only_preview:
                 return RuntimeCompletionDecision.accepted_current(
-                    current_preview_failure_status_text=preview_status_text,
+                    preview_failure_status_text=failure_decision.preview_status_text,
+                    failure_context=resolved_run_context,
                 )
             return RuntimeCompletionDecision.terminal_failure(
-                simulation_failure_user_message(error_payload),
+                failure_decision.error_text,
+                failure_detail_text=failure_decision.error_detail_text,
                 terminal_failure_preview_replay_needed=True,
                 terminal_failure_preview_replay_fast_mode=self._active_completion_fast_mode(),
+                failure_context=resolved_run_context,
             )
-
         if bool(debug_batch_parallel):
             logger.info(
                 "BATCH_PAR completion received run_id=%s request_id=%s set_id=%s source=%s completed_at=%.6f received_at=%.6f",
@@ -338,7 +371,6 @@ class ParallelBatchOutcomeOwner:
                 float(completed_ts if completed_ts is not None else -1.0),
                 float(perf_counter()),
             )
-        completion_policy_context = self._batch_context_owner.completion_policy_context(resolved_run_context)
         try:
             self._completion_callback_owner.handle_completion(
                 resolution.payload,
@@ -351,12 +383,16 @@ class ParallelBatchOutcomeOwner:
                 f"Unhandled exception while handling completed batch lane outcome (set_id={sid}, source={str(source)})",
                 exc,
             )
-            try:
-                message = simulation_failure_user_message(str(exc))
-            except Exception:
-                message = str(exc)
+            failure_decision = self._completion_policy.resolve_simulation_failure(
+                build_simulation_failure(
+                    "runtime_completion_exception",
+                    str(exc),
+                ),
+                fast_mode=self._active_completion_fast_mode(),
+            )
             return RuntimeCompletionDecision.terminal_failure(
-                message,
+                failure_decision.error_text,
+                failure_detail_text=failure_decision.error_detail_text,
                 terminal_failure_preview_replay_needed=True,
                 terminal_failure_preview_replay_fast_mode=self._active_completion_fast_mode(),
             )
@@ -368,29 +404,6 @@ class ParallelBatchOutcomeOwner:
         except Exception:
             return False
         return bool(getattr(state, "fast_mode", False))
-
-    def _current_preview_failure_status_text(self, error_payload: Mapping[str, Any]) -> str:
-        if not self._active_completion_fast_mode():
-            return ""
-        payload = coerce_simulation_failure(error_payload)
-        kind = str(payload.get("kind") or "").strip().lower()
-        details = payload.get("details") if isinstance(payload.get("details"), Mapping) else {}
-        source = str(details.get("source") or "").strip().lower()
-        stage = str(details.get("stage") or "").strip().lower()
-        status_only = (
-            kind == "timeout"
-            or kind.endswith("_timeout")
-            or kind.startswith("simulation_containment")
-            or source == "simulation_containment"
-            or stage == "wegscheider_cyclicity"
-        )
-        if not status_only:
-            return ""
-        if kind == "timeout":
-            return "Preview timed out. Adjust sliders or run again."
-        if stage == "wegscheider_cyclicity":
-            return str(payload.get("message") or "Unresolved Wegscheider cyclicity.")
-        return "Preview unavailable. Adjust sliders or run again."
 
     def consume_outcome(
         self,

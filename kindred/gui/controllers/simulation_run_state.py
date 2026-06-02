@@ -5,6 +5,8 @@ from typing import Optional, Sequence, Tuple
 
 from PySide6 import QtCore
 
+from kindred.gui.controllers.simulation_completion_policy import normalize_preview_target_set_ids
+
 
 def _normalize_preview_request_id(value: object) -> Optional[int]:
     if value is None:
@@ -22,20 +24,6 @@ def _normalize_preview_epoch(value: object) -> int:
         return 0
 
 
-def _normalize_preview_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    if isinstance(values, str):
-        values = (values,)
-    for value in values or ():
-        set_id = str(value or "").strip()
-        if not set_id or set_id in seen:
-            continue
-        seen.add(set_id)
-        normalized.append(set_id)
-    return tuple(normalized)
-
-
 def _normalize_preview_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
@@ -46,10 +34,6 @@ def _normalize_preview_bool(value: object) -> bool:
         if text in {"true", "1", "yes", "on"}:
             return True
     return bool(value)
-
-
-def _normalize_preview_owner_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
-    return _normalize_preview_target_set_ids(values)
 
 
 def _normalize_pending_run_rows(values: Sequence[int] | object) -> tuple[int, ...]:
@@ -76,7 +60,7 @@ class PreviewOwnershipState:
         object.__setattr__(
             self,
             "target_set_ids",
-            _normalize_preview_owner_target_set_ids(self.target_set_ids),
+            normalize_preview_target_set_ids(self.target_set_ids),
         )
 
 
@@ -94,7 +78,7 @@ class PendingSliderPreviewLaunchState:
         object.__setattr__(
             self,
             "target_set_ids",
-            _normalize_preview_target_set_ids(self.target_set_ids),
+            normalize_preview_target_set_ids(self.target_set_ids),
         )
         object.__setattr__(self, "handoff_queued", _normalize_preview_bool(self.handoff_queued))
         object.__setattr__(self, "replay_generation", _normalize_preview_epoch(self.replay_generation))
@@ -113,7 +97,7 @@ class PendingRunAfterRuntimeReadyState:
         object.__setattr__(
             self,
             "target_set_ids",
-            _normalize_preview_target_set_ids(self.target_set_ids),
+            normalize_preview_target_set_ids(self.target_set_ids),
         )
         object.__setattr__(self, "intent_signature", str(self.intent_signature or ""))
 

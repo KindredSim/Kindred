@@ -111,7 +111,12 @@ class RuntimeCompletionDecision:
     scoped_failure_summary: RuntimeScopedFailureSummary | None = None
     terminal_failure_preview_replay_needed: bool = False
     terminal_failure_preview_replay_fast_mode: bool = False
-    current_preview_failure_status_text: str = ""
+    failure_detail_text: str = ""
+    preview_failure_status_text: str = ""
+    failure_context: Mapping[str, Any] | None = None
+    superseded_fast_failure: bool = False
+    superseded_fast_failure_reset_status_progress: bool = False
+    superseded_fast_failure_deactivate_context_immediately: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "final_scoped_failure", bool(self.final_scoped_failure))
@@ -125,11 +130,25 @@ class RuntimeCompletionDecision:
             "terminal_failure_preview_replay_fast_mode",
             bool(self.terminal_failure_preview_replay_fast_mode),
         )
+        object.__setattr__(self, "failure_detail_text", str(self.failure_detail_text or ""))
         object.__setattr__(
             self,
-            "current_preview_failure_status_text",
-            str(self.current_preview_failure_status_text or ""),
+            "preview_failure_status_text",
+            str(self.preview_failure_status_text or ""),
         )
+        object.__setattr__(self, "superseded_fast_failure", bool(self.superseded_fast_failure))
+        object.__setattr__(
+            self,
+            "superseded_fast_failure_reset_status_progress",
+            bool(self.superseded_fast_failure_reset_status_progress),
+        )
+        object.__setattr__(
+            self,
+            "superseded_fast_failure_deactivate_context_immediately",
+            bool(self.superseded_fast_failure_deactivate_context_immediately),
+        )
+        if not isinstance(self.failure_context, Mapping):
+            object.__setattr__(self, "failure_context", None)
         if not isinstance(self.scoped_failure_progress, RuntimeScopedFailureProgress):
             object.__setattr__(self, "scoped_failure_progress", None)
         if not isinstance(self.scoped_failure_summary, RuntimeScopedFailureSummary):
@@ -144,7 +163,8 @@ class RuntimeCompletionDecision:
         scoped_failure_summary: RuntimeScopedFailureSummary | None = None,
         terminal_failure_preview_replay_needed: bool = False,
         terminal_failure_preview_replay_fast_mode: bool = False,
-        current_preview_failure_status_text: str = "",
+        preview_failure_status_text: str = "",
+        failure_context: Mapping[str, Any] | None = None,
     ) -> RuntimeCompletionDecision:
         return cls(
             accepted=True,
@@ -156,7 +176,27 @@ class RuntimeCompletionDecision:
             terminal_failure_preview_replay_fast_mode=bool(
                 terminal_failure_preview_replay_fast_mode
             ),
-            current_preview_failure_status_text=str(current_preview_failure_status_text or ""),
+            preview_failure_status_text=str(preview_failure_status_text or ""),
+            failure_context=failure_context if isinstance(failure_context, Mapping) else None,
+        )
+
+    @classmethod
+    def superseded_fast_failure_decision(
+        cls,
+        *,
+        failure_context: Mapping[str, Any] | None = None,
+        reset_status_progress: bool = False,
+        deactivate_context_immediately: bool = False,
+    ) -> RuntimeCompletionDecision:
+        return cls(
+            accepted=False,
+            consumed=True,
+            superseded_fast_failure=True,
+            failure_context=failure_context if isinstance(failure_context, Mapping) else None,
+            superseded_fast_failure_reset_status_progress=bool(reset_status_progress),
+            superseded_fast_failure_deactivate_context_immediately=bool(
+                deactivate_context_immediately
+            ),
         )
 
     @classmethod
@@ -176,8 +216,10 @@ class RuntimeCompletionDecision:
         cls,
         message: str = "",
         *,
+        failure_detail_text: str = "",
         terminal_failure_preview_replay_needed: bool = False,
         terminal_failure_preview_replay_fast_mode: bool = False,
+        failure_context: Mapping[str, Any] | None = None,
     ) -> RuntimeCompletionDecision:
         return cls(
             accepted=False,
@@ -185,12 +227,14 @@ class RuntimeCompletionDecision:
             terminal=True,
             failed=True,
             message=str(message or ""),
+            failure_detail_text=str(failure_detail_text or ""),
             terminal_failure_preview_replay_needed=bool(
                 terminal_failure_preview_replay_needed
             ),
             terminal_failure_preview_replay_fast_mode=bool(
                 terminal_failure_preview_replay_fast_mode
             ),
+            failure_context=failure_context if isinstance(failure_context, Mapping) else None,
         )
 
 

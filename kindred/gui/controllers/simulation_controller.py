@@ -336,17 +336,16 @@ class SimulationController(QtCore.QObject):
                     self._request_terminal_failure_preview_replay_effects
                 ),
                 request_pending_preview_replay=self._request_completion_preview_replay_effects,
-                handle_current_preview_simulation_failure=self._handle_current_preview_simulation_failure,
             ),
         )
         self._parallel_batch_outcome_owner = ParallelBatchOutcomeOwner(
-            ui=self.ui,
-            batch_parallel=self._batch_parallel,
             batch_context_owner=self._batch_context_owner,
             batch_cache=self._batch_cache,
             completion_callback_owner=self._completion_callback_owner,
+            completion_policy=self._completion_policy,
             dependencies=ParallelBatchOutcomeDependencies(
                 freshness=self._callback_freshness_owner,
+                completion_policy_preview_ownership=self._completion_policy_preview_ownership,
                 record_nonfatal_exception=self._record_nonfatal_exception,
                 finalize_scoped_batch_success_subset=self._finalize_scoped_batch_success_subset,
             ),
@@ -1772,23 +1771,6 @@ class SimulationController(QtCore.QObject):
             render_state = getattr(effect, "render_state", None)
             if render_state is not None:
                 self.runtime_readiness_render_requested.emit(render_state)
-            surface_failure = str(getattr(effect, "surface_failure", "") or "")
-            if surface_failure:
-                try:
-                    self._surface_current_parallel_batch_pool_failure_to_ui(
-                        f"Simulation failed:\n\n{surface_failure}"
-                    )
-                except Exception as exc:
-                    self._record_nonfatal_exception("Failed to surface runtime failure effect to UI", exc)
-            current_preview_failure_status_text = str(
-                getattr(effect, "current_preview_failure_status_text", "") or ""
-            )
-            if current_preview_failure_status_text:
-                self._apply_simulation_lifecycle_effects(
-                    self._lifecycle_effect_owner.current_preview_failure_effects(
-                        status_text=current_preview_failure_status_text,
-                    )
-                )
             if getattr(effect, "simulation_running", None) is not None:
                 self._simulation_running = bool(effect.simulation_running)
             if getattr(effect, "slider_simulation_active", None) is not None:
@@ -1836,6 +1818,70 @@ class SimulationController(QtCore.QObject):
                 if bool(replay.stop_timers):
                     self._stop_deferred_preview_replay_timers()
                 QtCore.QTimer.singleShot(0, self.launch_pending_slider_preview_replay)
+            preview_failure_context = getattr(effect, "preview_failure_context", None)
+            if bool(getattr(effect, "superseded_fast_failure", False)):
+                failed_run_context = None
+                if (
+                    bool(
+                        getattr(
+                            effect,
+                            "superseded_fast_failure_deactivate_context_immediately",
+                            False,
+                        )
+                    )
+                    and isinstance(preview_failure_context, Mapping)
+                ):
+                    failed_run_context = self._batch_context_owner.deactivate_if_active(
+                        preview_failure_context
+                    )
+                self._apply_simulation_lifecycle_effects(
+                    self._lifecycle_effect_owner.superseded_fast_error_effects(
+                        deactivate_context_immediately=bool(
+                            getattr(
+                                effect,
+                                "superseded_fast_failure_deactivate_context_immediately",
+                                False,
+                            )
+                        ),
+                        reset_status_progress=bool(
+                            getattr(
+                                effect,
+                                "superseded_fast_failure_reset_status_progress",
+                                False,
+                            )
+                        ),
+                    ),
+                    failed_run_context=failed_run_context
+                    if isinstance(failed_run_context, Mapping)
+                    else None,
+                )
+            preview_failure_status_text = str(
+                getattr(effect, "preview_failure_status_text", "") or ""
+            )
+            if preview_failure_status_text:
+                failed_run_context = None
+                if isinstance(preview_failure_context, Mapping):
+                    failed_run_context = self._batch_context_owner.deactivate_if_active(
+                        preview_failure_context
+                    )
+                self._apply_simulation_lifecycle_effects(
+                    self._lifecycle_effect_owner.current_preview_failure_effects(
+                        status_text=preview_failure_status_text,
+                    ),
+                    failed_run_context=failed_run_context
+                    if isinstance(failed_run_context, Mapping)
+                    else None,
+                )
+            surface_failure = str(getattr(effect, "surface_failure", "") or "")
+            if surface_failure:
+                self.ui.dialogs.message_box_critical(
+                    "Simulation Error",
+                    "Simulation failed:\n\n" + surface_failure,
+                    details=(
+                        str(getattr(effect, "surface_failure_detail_text", "") or "")
+                        or None
+                    ),
+                )
 
     def _supersede_parallel_batch_run_soft(self) -> None:
         """
@@ -2816,42 +2862,6 @@ class SimulationController(QtCore.QObject):
         self._error_handling_owner.handle_error(
             error_msg,
             callback_identity=callback_identity,
-        )
-
-    def _handle_current_preview_simulation_failure(
-        self,
-        error_payload: Mapping[str, Any],
-        *,
-        error_text: str,
-        error_detail_text: str,
-        context: Optional[Mapping[str, Any]],
-    ) -> None:
-        kind = str(error_payload.get("kind") or "").strip().lower()
-        details = error_payload.get("details")
-        stage = (
-            str(details.get("stage") or "").strip().lower()
-            if isinstance(details, Mapping)
-            else ""
-        )
-        if error_detail_text:
-            logger.warning("%s", error_detail_text)
-        if kind == "timeout":
-            status_text = "Preview timed out. Adjust sliders or run again."
-        elif stage == "wegscheider_cyclicity":
-            status_text = str(error_payload.get("message") or "Unresolved Wegscheider cyclicity.")
-        else:
-            status_text = "Preview unavailable. Adjust sliders or run again."
-        logger.warning("Preview simulation failed without modal: %s", error_text)
-
-        self._apply_runtime_lifecycle_ui_effects(
-            self._runtime_orchestrator.cancel_requested(kind="preview_failure")
-        )
-        if isinstance(context, Mapping):
-            self._batch_context_owner.deactivate_if_active(context)
-        self._apply_simulation_lifecycle_effects(
-            self._lifecycle_effect_owner.current_preview_failure_effects(
-                status_text=str(status_text),
-            )
         )
 
     def _stop_simulation(self):

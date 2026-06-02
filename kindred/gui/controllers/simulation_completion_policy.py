@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
-from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
-
+from kindred.core.simulation_failure import (
+    coerce_simulation_failure,
+    is_cancelled_failure,
+    simulation_failure_detail_text,
+    simulation_failure_user_message,
+)
 
 def _normalize_optional_int(value: object) -> Optional[int]:
     if value is None:
@@ -52,6 +56,10 @@ def _normalize_str_sequence(values: object, *, dedupe: bool) -> tuple[str, ...]:
         seen.add(text)
         normalized.append(text)
     return tuple(normalized)
+
+
+def normalize_preview_target_set_ids(values: object) -> tuple[str, ...]:
+    return _normalize_str_sequence(values, dedupe=True)
 
 
 def _normalize_set_ids(values: object) -> tuple[str, ...]:
@@ -246,6 +254,24 @@ class SupersededFastDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class SimulationFailurePolicyDecision:
+    kind: str
+    error_payload: Mapping[str, Any]
+    error_text: str
+    error_detail_text: str = ""
+    preview_status_text: str = ""
+    cancelled: bool = False
+
+    @property
+    def status_only_preview(self) -> bool:
+        return self.kind == "status_only_preview"
+
+    @property
+    def terminal(self) -> bool:
+        return self.kind == "terminal"
+
+
+@dataclass(frozen=True, slots=True)
 class CacheReconciliationDecision:
     clear_active_cache_identity_state: bool
     active_cache_key: Optional[str]
@@ -294,6 +320,57 @@ class DirtyResetTrackingDecision:
 
 
 class SimulationCompletionPolicy:
+    @staticmethod
+    def resolve_simulation_failure(
+        error_payload: object,
+        *,
+        fast_mode: bool,
+    ) -> SimulationFailurePolicyDecision:
+        payload = coerce_simulation_failure(error_payload)
+        error_text = simulation_failure_user_message(payload)
+        error_detail_text = simulation_failure_detail_text(payload)
+        cancelled = is_cancelled_failure(payload)
+        if bool(fast_mode) and not cancelled:
+            status_text = SimulationCompletionPolicy._status_only_preview_failure_text(payload)
+            if status_text:
+                return SimulationFailurePolicyDecision(
+                    kind="status_only_preview",
+                    error_payload=payload,
+                    error_text=error_text,
+                    error_detail_text=error_detail_text,
+                    preview_status_text=status_text,
+                    cancelled=False,
+                )
+        return SimulationFailurePolicyDecision(
+            kind="terminal",
+            error_payload=payload,
+            error_text=error_text,
+            error_detail_text=error_detail_text,
+            cancelled=bool(cancelled),
+        )
+
+    @staticmethod
+    def _status_only_preview_failure_text(error_payload: Mapping[str, Any]) -> str:
+        payload = coerce_simulation_failure(error_payload)
+        kind = str(payload.get("kind") or "").strip().lower()
+        details = payload.get("details") if isinstance(payload.get("details"), Mapping) else {}
+        source = str(details.get("source") or "").strip().lower()
+        stage = str(details.get("stage") or "").strip().lower()
+        status_only = (
+            kind == "timeout"
+            or kind.endswith("_timeout")
+            or kind.startswith("simulation_containment")
+            or source == "simulation_containment"
+            or stage == "wegscheider_cyclicity"
+        )
+        if not status_only:
+            return ""
+        if kind == "timeout":
+            return "Preview timed out. Adjust sliders or run again."
+        if stage == "wegscheider_cyclicity":
+            return str(payload.get("message") or "Unresolved Wegscheider cyclicity.")
+        return "Preview unavailable. Adjust sliders or run again."
+
     def has_active_explicit_simulation(
         self,
         *,
@@ -321,7 +398,7 @@ class SimulationCompletionPolicy:
     def stale_fast_request_still_owns_current_state(
         self,
         *,
-        preview_ownership: PreviewOwnershipState,
+        preview_ownership: Any,
         request_id: int,
         preview_owner_epoch: Optional[int] = None,
     ) -> bool:
@@ -336,7 +413,7 @@ class SimulationCompletionPolicy:
     def preview_request_can_display(
         self,
         *,
-        preview_ownership: PreviewOwnershipState,
+        preview_ownership: Any,
         request_id: Optional[int],
     ) -> bool:
         if request_id is None:
@@ -388,7 +465,7 @@ class SimulationCompletionPolicy:
     def resolve_superseded_fast_completion(
         self,
         *,
-        preview_ownership: PreviewOwnershipState,
+        preview_ownership: Any,
         context: Optional[CompletionPolicyContext],
         request_id: int,
         preview_owner_epoch: Optional[int] = None,
@@ -430,7 +507,7 @@ class SimulationCompletionPolicy:
     def resolve_superseded_fast_error(
         self,
         *,
-        preview_ownership: PreviewOwnershipState,
+        preview_ownership: Any,
         context: Optional[CompletionPolicyContext],
         request_id: int,
         preview_owner_epoch: Optional[int] = None,
