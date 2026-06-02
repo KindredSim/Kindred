@@ -16,6 +16,7 @@ from kindred.gui.controllers.simulation_runtime_backend import (
     RuntimeCompletionDecision,
     RuntimeCompletionConsumer,
     RuntimeCompletionEvent,
+    RuntimeScopedFailureSummary,
 )
 from kindred.gui.controllers.simulation_runtime_readiness_lifecycle import (
     SimulationRuntimeReadinessEndpointState,
@@ -94,6 +95,8 @@ class RuntimeUiEffect:
     cancel_warmup_retry_kinds: tuple[str, ...] = ()
     warmup_retry_kind: str = ""
     warmup_retry_delay_ms: int = 0
+    scoped_failure_summary: RuntimeScopedFailureSummary | None = None
+    current_preview_failure_status_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -229,6 +232,7 @@ class RuntimeDeferredReleaseState:
     dispatch_plan: RuntimeDispatchPlan | None = None
     reason: RuntimeReleaseReason | None = None
     wait_for_backend_idle: bool = False
+    superseded_drain_token: str = ""
 
 
 def _optional_int(value: object) -> int | None:
@@ -282,6 +286,8 @@ class SimulationRuntimeOrchestrator:
         next_request_id: Callable[[], int] | None = None,
         reserve_request_id: Callable[[], int] | None = None,
         completion_consumer: RuntimeCompletionConsumer | None = None,
+        preview_replay_state: Callable[[], object] | None = None,
+        dirty_generation_by_set_id: Callable[[Sequence[str]], Mapping[str, object]] | None = None,
     ) -> None:
         self._allocator = allocator
         self._backend = backend
@@ -291,6 +297,8 @@ class SimulationRuntimeOrchestrator:
         self._next_request_id = next_request_id
         self._reserve_request_id = reserve_request_id
         self._completion_consumer = completion_consumer
+        self._preview_replay_state = preview_replay_state
+        self._dirty_generation_by_set_id = dirty_generation_by_set_id
         self._last_dispatch_plan: RuntimeDispatchPlan | None = None
         self._manual_retry_prepared: PreparedRuntimeRequestSet | None = None
         self._manual_retry_kind: str = ""
@@ -453,8 +461,15 @@ class SimulationRuntimeOrchestrator:
             return RuntimeDispatchAcceptance()
         return self.accept_prepared_request(prepared)
 
-    def prewarm_compatible_runtime_lanes(self, prepared: PreparedRuntimeRequestSet) -> bool:
+    def prewarm_compatible_runtime_lanes(
+        self,
+        prepared: PreparedRuntimeRequestSet,
+        *,
+        prepared_is_current: Callable[[PreparedRuntimeRequestSet], bool] | None = None,
+    ) -> bool:
         if not prepared.prepared:
+            return False
+        if prepared_is_current is not None and not bool(prepared_is_current(prepared)):
             return False
         self._allocator.ensure_ready_lanes(
             compatibility_key=prepared.compatibility_key,
@@ -572,21 +587,33 @@ class SimulationRuntimeOrchestrator:
                 if close_failure:
                     message = f"{message}; {close_failure}"
                 return [
-                    RuntimeUiEffect(
-                        stop_completion_polling=True,
-                        cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
-                        surface_failure=message,
-                    )
+                    self._ready_reset_effect(stop_completion_polling=True),
+                    RuntimeUiEffect(surface_failure=message),
                 ]
             if result.running > 0:
+                if not str(result.superseded_drain_token or ""):
+                    _, close_failure = self._close_failed_runtime(backend_failure=True)
+                    message = "Runtime backend soft-supersede reported running work with a missing superseded drain token."
+                    if close_failure:
+                        message = f"{message}; {close_failure}"
+                    return [
+                        self._ready_reset_effect(stop_completion_polling=True),
+                        RuntimeUiEffect(surface_failure=message),
+                    ]
                 self._clear_retry_prepared_states()
                 self._last_dispatch_plan = None
-                self._stage_invalidated_dispatch_release(RuntimeReleaseReason.SUPERSEDED)
+                self._stage_invalidated_dispatch_release(
+                    RuntimeReleaseReason.SUPERSEDED,
+                    superseded_drain_token=result.superseded_drain_token,
+                )
                 return [self._ready_reset_effect(stop_completion_polling=False)]
             self._clear_retry_prepared_states()
             self._release_current_dispatch(RuntimeReleaseReason.SUPERSEDED)
-            self._release_invalidated_dispatches(reason=RuntimeReleaseReason.SUPERSEDED)
-            return [self._ready_reset_effect(stop_completion_polling=True)]
+            return [
+                self._ready_reset_effect(
+                    stop_completion_polling=not bool(self._deferred_release_states)
+                )
+            ]
         self._clear_retry_prepared_states()
         self._release_current_dispatch(RuntimeReleaseReason.SHUTDOWN)
         self._release_invalidated_dispatches(reason=RuntimeReleaseReason.SHUTDOWN)
@@ -616,9 +643,13 @@ class SimulationRuntimeOrchestrator:
             poll_result = backend.poll_completed_records()
             polled_records = tuple(poll_result.records)
             backend_idle = bool(poll_result.backend_idle)
+            drained_superseded_release_tokens = tuple(
+                poll_result.drained_superseded_release_tokens
+            )
             if not polled_records:
                 released = self._release_pending_dispatch_plan_after_backend_idle(
                     backend_idle=backend_idle,
+                    drained_superseded_release_tokens=drained_superseded_release_tokens,
                 )
                 if released is not None:
                     return self._polling_effects_after_runtime_consequence_update()
@@ -631,6 +662,7 @@ class SimulationRuntimeOrchestrator:
                 return self._polling_effects_after_runtime_consequence_update()
             if not polled_records and self._dispatch_state.active:
                 return []
+            accumulated_decision_effects: list[RuntimeUiEffect] = []
             for polled in polled_records:
                 record = polled.record
                 event = RuntimeCompletionEvent(
@@ -641,6 +673,7 @@ class SimulationRuntimeOrchestrator:
                     completed_ts=float(polled.completed_ts or 0.0),
                 )
                 consumer = self._completion_consumer
+                runtime_consequences_pending = not self._runtime_consequences_complete()
                 decision = (
                     consumer.consume_runtime_completion(event)
                     if consumer is not None
@@ -650,12 +683,11 @@ class SimulationRuntimeOrchestrator:
                     if decision.failed:
                         _, close_failure = self._close_failed_runtime()
                         effects = [
-                            RuntimeUiEffect(
-                                stop_completion_polling=True,
-                                cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
-                                surface_failure=str(decision.message or ""),
-                            )
+                            self._ready_reset_effect(stop_completion_polling=True)
                         ]
+                        effects.extend(self._completion_terminal_replay_effects(decision))
+                        if decision.message:
+                            effects.append(RuntimeUiEffect(surface_failure=str(decision.message)))
                         if close_failure:
                             effects.append(RuntimeUiEffect(surface_failure=close_failure))
                         return effects
@@ -668,17 +700,44 @@ class SimulationRuntimeOrchestrator:
                     ]
                 if decision.accepted:
                     self._record_accepted_completion(event)
+                    decision_effects = self._completion_decision_effects(decision)
+                    if (
+                        runtime_consequences_pending
+                        and self._runtime_consequences_complete()
+                    ):
+                        accumulated_decision_effects = list(decision_effects)
+                        break
+                    if decision_effects:
+                        accumulated_decision_effects.extend(decision_effects)
                     if decision.stop_current_poll_batch:
                         break
                     continue
                 if decision.consumed:
                     self._record_consumed_completion(event)
+                    decision_effects = self._completion_decision_effects(decision)
+                    if (
+                        runtime_consequences_pending
+                        and self._runtime_consequences_complete()
+                    ):
+                        accumulated_decision_effects = list(decision_effects)
+                        break
+                    if decision_effects:
+                        accumulated_decision_effects.extend(decision_effects)
                     if decision.stop_current_poll_batch:
                         break
                     continue
+                if decision.stop_current_poll_batch and not decision.consumed:
+                    return self.parallel_outcome_reset()
                 if decision.stop_current_poll_batch:
                     break
-            self._release_pending_dispatch_plan_after_backend_idle(backend_idle=backend_idle)
+            released = self._release_pending_dispatch_plan_after_backend_idle(
+                backend_idle=backend_idle,
+                drained_superseded_release_tokens=drained_superseded_release_tokens,
+            )
+            if released is not None and self._runtime_consequences_complete():
+                accumulated_decision_effects = []
+            if accumulated_decision_effects:
+                return accumulated_decision_effects
             return self._polling_effects_after_runtime_consequence_update()
         except Exception as exc:
             _, close_failure = self._close_failed_runtime(backend_failure=True)
@@ -692,6 +751,74 @@ class SimulationRuntimeOrchestrator:
                     surface_failure=message,
                 )
             ]
+
+    def _completion_decision_effects(
+        self,
+        decision: RuntimeCompletionDecision,
+    ) -> list[RuntimeUiEffect]:
+        effects: list[RuntimeUiEffect] = []
+        progress = getattr(decision, "scoped_failure_progress", None)
+        if progress is not None:
+            completed = max(0, int(getattr(progress, "completed", 0) or 0))
+            total = max(1, int(getattr(progress, "total", 1) or 1))
+            label = str(getattr(progress, "set_label", "") or "set")
+            effects.append(
+                RuntimeUiEffect(
+                    progress_value=max(0, min(100, int((completed / float(total)) * 100.0))),
+                    status_text=f"Failed {label} ({completed}/{total})",
+                )
+            )
+        if bool(getattr(decision, "final_scoped_failure", False)):
+            self.display_completed(kind="scoped_failure")
+            effects.append(self._scoped_failure_completion_effect())
+            summary = getattr(decision, "scoped_failure_summary", None)
+            if isinstance(summary, RuntimeScopedFailureSummary):
+                effects.append(RuntimeUiEffect(scoped_failure_summary=summary))
+            effects.extend(self._completion_terminal_replay_effects(decision))
+        current_preview_status = str(
+            getattr(decision, "current_preview_failure_status_text", "") or ""
+        )
+        if current_preview_status:
+            effects.extend(self.terminal_failure())
+            effects.append(
+                RuntimeUiEffect(
+                    current_preview_failure_status_text=current_preview_status,
+                )
+            )
+        return effects
+
+    def _completion_terminal_replay_effects(
+        self,
+        decision: RuntimeCompletionDecision,
+    ) -> list[RuntimeUiEffect]:
+        if not bool(getattr(decision, "terminal_failure_preview_replay_needed", False)):
+            return []
+        state_provider = self._preview_replay_state
+        dirty_provider = self._dirty_generation_by_set_id
+        if not callable(state_provider) or not callable(dirty_provider):
+            return []
+        pending_state = state_provider()
+        pending = RuntimePreviewReplayState.from_pending(pending_state)
+        dirty_generations = dirty_provider(pending.target_set_ids)
+        return self.terminal_failure_replay_requested(
+            fast_mode=bool(getattr(decision, "terminal_failure_preview_replay_fast_mode", False)),
+            pending_state=pending,
+            replay_snapshot=None,
+            dirty_generation_by_set_id=dirty_generations,
+        )
+
+    def _scoped_failure_completion_effect(self) -> RuntimeUiEffect:
+        return RuntimeUiEffect(
+            stop_completion_polling=True,
+            cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
+            simulation_running=False,
+            slider_simulation_active=False,
+            reset_slider_triggered=True,
+            run_enabled=True,
+            stop_enabled=False,
+            progress_value=100,
+            status_text="Ready",
+        )
 
     def pool_settings_changed(self) -> list[RuntimeUiEffect]:
         return self.cancel_requested(kind="soft_shutdown")
@@ -1368,15 +1495,22 @@ class SimulationRuntimeOrchestrator:
             status_text="Ready",
         )
 
-    def _stage_invalidated_dispatch_release(self, reason: RuntimeReleaseReason) -> None:
+    def _stage_invalidated_dispatch_release(
+        self,
+        reason: RuntimeReleaseReason,
+        *,
+        superseded_drain_token: str = "",
+    ) -> None:
         dispatch_plan = self._dispatch_state.plan
         if dispatch_plan is None:
             return
+        normalized_token = str(superseded_drain_token or "")
         self._deferred_release_states = self._deferred_release_states + (
             RuntimeDeferredReleaseState(
                 dispatch_plan=dispatch_plan,
                 reason=reason,
-                wait_for_backend_idle=True,
+                wait_for_backend_idle=not bool(normalized_token),
+                superseded_drain_token=normalized_token,
             ),
         )
         self._dispatch_state = RuntimeDispatchState()
@@ -1386,27 +1520,46 @@ class SimulationRuntimeOrchestrator:
         *,
         reason: RuntimeReleaseReason | None = None,
         backend_idle: bool | None = None,
+        drained_superseded_release_tokens: Sequence[str] = (),
         backend_failure: bool = False,
     ) -> tuple[RuntimeReleaseResult, ...]:
         if not self._deferred_release_states:
             return ()
-        if backend_idle is not None and any(
-            state.wait_for_backend_idle and not bool(backend_idle)
-            for state in self._deferred_release_states
-        ):
-            return ()
+        drained_tokens = {
+            str(token)
+            for token in drained_superseded_release_tokens or ()
+            if str(token)
+        }
         pending = self._deferred_release_states
-        self._deferred_release_states = ()
-        return tuple(
-            self._release_dispatch_plan(
-                state.dispatch_plan,
-                reason if reason is not None else state.reason,
-                backend_failure=bool(backend_failure),
+        retained: list[RuntimeDeferredReleaseState] = []
+        released: list[RuntimeReleaseResult] = []
+        force_release = reason is not None or bool(backend_failure)
+        for state in pending:
+            state_reason = reason if reason is not None else state.reason
+            if state.dispatch_plan is None or state_reason is None:
+                continue
+            drain_token = str(state.superseded_drain_token or "")
+            if not force_release and drain_token and drain_token not in drained_tokens:
+                retained.append(state)
+                continue
+            if (
+                not force_release
+                and not drain_token
+                and backend_idle is not None
+                and state.wait_for_backend_idle
+                and not bool(backend_idle)
+            ):
+                retained.append(state)
+                continue
+            released.append(
+                self._release_dispatch_plan(
+                    state.dispatch_plan,
+                    state_reason,
+                    backend_failure=bool(backend_failure),
+                )
             )
-            for state in pending
-            if state.dispatch_plan is not None
-            and (reason is not None or state.reason is not None)
-        )
+        self._deferred_release_states = tuple(retained)
+        return tuple(released)
 
     def _defer_current_dispatch_release(self, reason: RuntimeReleaseReason) -> None:
         if self._dispatch_state.plan is None:
@@ -1420,8 +1573,12 @@ class SimulationRuntimeOrchestrator:
         self,
         *,
         backend_idle: bool,
+        drained_superseded_release_tokens: Sequence[str] = (),
     ) -> RuntimeReleaseResult | None:
-        deferred_results = self._release_invalidated_dispatches(backend_idle=backend_idle)
+        deferred_results = self._release_invalidated_dispatches(
+            backend_idle=backend_idle,
+            drained_superseded_release_tokens=drained_superseded_release_tokens,
+        )
         if deferred_results:
             return deferred_results[-1]
         plan = self._dispatch_state.plan

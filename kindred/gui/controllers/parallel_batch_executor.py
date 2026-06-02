@@ -40,7 +40,7 @@ def default_batch_lane_pool_factory(max_lanes: int, limit_blas_threads: bool) ->
 class ParallelBatchExecutor:
     """Backend dispatch and lease-provider adapter for runtime lifecycle."""
 
-    __slots__ = ("_lane_owner", "_runtime_session")
+    __slots__ = ("_lane_owner", "_runtime_session", "_pending_superseded_drain_tokens")
 
     def __init__(
         self,
@@ -59,6 +59,7 @@ class ParallelBatchExecutor:
             lane_pool=lane_pool,
         )
         self._runtime_session = BatchRuntimeSession(self._lane_owner)
+        self._pending_superseded_drain_tokens: tuple[str, ...] = ()
 
     @property
     def lane_pool_factory(self) -> Callable[[int, bool], Any]:
@@ -215,14 +216,31 @@ class ParallelBatchExecutor:
         )
 
     def poll_completed_records(self) -> RuntimeBackendPollResult:
+        drained_tokens: list[str] = []
+        pending_tokens: list[str] = []
+        for token in self._pending_superseded_drain_tokens:
+            if self._runtime_session.superseded_drain_token_drained(token):
+                drained_tokens.append(token)
+            else:
+                pending_tokens.append(token)
+        self._pending_superseded_drain_tokens = tuple(pending_tokens)
         return RuntimeBackendPollResult(
             records=tuple(self._runtime_session.poll_completed_records()),
             active_after_poll=1 if self._lane_owner.has_active_requests() else 0,
+            drained_superseded_release_tokens=tuple(drained_tokens),
         )
 
     def supersede_current_run(self) -> RuntimeBackendCancelResult:
-        cancelled, running = self._runtime_session.soft_supersede_active_run()
-        return RuntimeBackendCancelResult(cancelled=cancelled, running=running)
+        cancelled, running, drain_token = self._runtime_session.soft_supersede_active_run()
+        if drain_token:
+            self._pending_superseded_drain_tokens = self._pending_superseded_drain_tokens + (
+                str(drain_token),
+            )
+        return RuntimeBackendCancelResult(
+            cancelled=cancelled,
+            running=running,
+            superseded_drain_token=drain_token,
+        )
 
     def close_current_run(self, *, force_terminate: bool) -> RuntimeBackendCloseResult:
         pool_token = self._lane_owner.lane_pool_token()
@@ -231,6 +249,7 @@ class ParallelBatchExecutor:
             force_terminate=bool(force_terminate),
             record_nonfatal_exception=self.record_nonfatal_exception,
         )
+        self._pending_superseded_drain_tokens = ()
         return RuntimeBackendCloseResult(
             active_after_close=1 if self._lane_owner.has_active_requests() else 0,
             pool_closed=not bool(self._lane_owner.has_lane_pool()),

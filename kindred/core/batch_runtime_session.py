@@ -69,7 +69,8 @@ class BatchRuntimeLaneOwnerProtocol(Protocol):
         force_terminate: bool,
         record_nonfatal_exception: Callable[[str, BaseException], None],
     ) -> None: ...
-    def soft_supersede(self) -> tuple[int, int]: ...
+    def soft_supersede(self) -> tuple[int, int, str]: ...
+    def superseded_drain_token_drained(self, token: str) -> bool: ...
     def submit_task(
         self,
         task: Any,
@@ -210,10 +211,13 @@ class BatchRuntimeSession:
         self._update_completion_state()
         return accepted
 
-    def soft_supersede_active_run(self) -> tuple[int, int]:
-        cancelled, running = self._lane_owner.soft_supersede()
+    def soft_supersede_active_run(self) -> tuple[int, int, str]:
+        cancelled, running, drain_token = self._lane_owner.soft_supersede()
         self._state = BatchRuntimeSessionState.SUPERSEDED
-        return int(cancelled), int(running)
+        return int(cancelled), int(running), str(drain_token or "")
+
+    def superseded_drain_token_drained(self, token: str) -> bool:
+        return bool(self._lane_owner.superseded_drain_token_drained(token))
 
 
     def shutdown(

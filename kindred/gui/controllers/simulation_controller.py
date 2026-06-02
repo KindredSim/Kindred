@@ -116,6 +116,17 @@ class _SerialBatchDispatchState:
     context: Mapping[str, Any] | None
 
 
+def _normalized_preview_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        values = (values,)
+    normalized: list[str] = []
+    for set_id in values or ():
+        text = str(set_id)
+        if text:
+            normalized.append(text)
+    return tuple(normalized)
+
+
 class SimulationController(QtCore.QObject):
     """
     Simulation execution + batch orchestration controller.
@@ -225,6 +236,8 @@ class SimulationController(QtCore.QObject):
             prepared_request_is_current=self._runtime_prepared_request_is_current,
             next_request_id=self._next_sim_request_id,
             reserve_request_id=self._reserve_sim_request_id,
+            preview_replay_state=self._runtime_preview_replay_state,
+            dirty_generation_by_set_id=self._runtime_dirty_generation_facts,
         )
         self._preview_display_cache_invalidator: Callable[..., object] | None = None
         self._runtime_dispatch_owner = SimulationRuntimeDispatchOwner(
@@ -332,19 +345,10 @@ class SimulationController(QtCore.QObject):
             batch_context_owner=self._batch_context_owner,
             batch_cache=self._batch_cache,
             completion_callback_owner=self._completion_callback_owner,
-            error_handling_owner=self._error_handling_owner,
             dependencies=ParallelBatchOutcomeDependencies(
                 freshness=self._callback_freshness_owner,
                 record_nonfatal_exception=self._record_nonfatal_exception,
                 finalize_scoped_batch_success_subset=self._finalize_scoped_batch_success_subset,
-                runtime_display_completed=self._runtime_orchestrator.display_completed,
-                show_scoped_batch_failure_summary=self._show_scoped_batch_failure_summary,
-                request_terminal_failure_preview_replay=(
-                    self._request_terminal_failure_preview_replay_effects
-                ),
-                cancel_runtime_for_parallel_outcome_reset=self._cancel_runtime_for_parallel_outcome_reset,
-                set_simulation_running=self._set_simulation_running,
-                set_slider_simulation_active=self._set_slider_simulation_active,
             ),
         )
         self._runtime_orchestrator.set_completion_consumer(self._parallel_batch_outcome_owner)
@@ -1234,7 +1238,9 @@ class SimulationController(QtCore.QObject):
             if int(ownership.epoch) != int(intent.preview_epoch):
                 return False
             expected_targets = tuple(str(set_id) for set_id in intent.set_ids if str(set_id))
-            if expected_targets and tuple(ownership.target_set_ids) != expected_targets:
+            if expected_targets and _normalized_preview_target_set_ids(
+                ownership.target_set_ids
+            ) != _normalized_preview_target_set_ids(expected_targets):
                 return False
             return True
         request_token = intent.request_token
@@ -1591,11 +1597,6 @@ class SimulationController(QtCore.QObject):
             self._runtime_orchestrator.pool_settings_changed()
         )
 
-    def _cancel_runtime_for_parallel_outcome_reset(self) -> None:
-        self._apply_runtime_lifecycle_ui_effects(
-            self._runtime_orchestrator.cancel_requested(kind="parallel_outcome_reset")
-        )
-
     def _simulation_runtime_inputs_changed(
         self,
         *,
@@ -1699,15 +1700,33 @@ class SimulationController(QtCore.QObject):
         )
         if not callable(prewarm):
             return False
+        runtime_targets = tuple(str(set_id) for set_id in target_set_ids if str(set_id))
+        preview_ownership = self._preview_ownership
+        preview_request_id = getattr(preview_ownership, "request_id", None)
+        preview_epoch = getattr(preview_ownership, "epoch", None)
+        preview_targets = tuple(
+            str(set_id)
+            for set_id in getattr(preview_ownership, "target_set_ids", ()) or ()
+            if str(set_id)
+        )
+        if (
+            preview_request_id is None
+            or preview_epoch is None
+            or _normalized_preview_target_set_ids(preview_targets)
+            != _normalized_preview_target_set_ids(runtime_targets)
+        ):
+            return False
         intent = RuntimeLaunchIntent(
             intent_kind="preview",
             ui_action="slider_preview_readiness",
             rows=tuple(runtime_rows),
-            set_ids=tuple(str(set_id) for set_id in target_set_ids if str(set_id)),
-            requested_show_set_ids=self._runtime_requested_show_set_ids(target_set_ids),
-            requested_show_labels_by_set_id=self._runtime_requested_show_labels_by_set_id(target_set_ids),
-            request_token=None,
-            runtime_input_epochs=self._runtime_input_epochs_for_sets(target_set_ids),
+            set_ids=runtime_targets,
+            requested_show_set_ids=self._runtime_requested_show_set_ids(runtime_targets),
+            requested_show_labels_by_set_id=self._runtime_requested_show_labels_by_set_id(runtime_targets),
+            request_token=int(preview_request_id),
+            preview_request_id=int(preview_request_id),
+            preview_epoch=int(preview_epoch),
+            runtime_input_epochs=self._runtime_input_epochs_for_sets(runtime_targets),
         )
         try:
             prepared = self._run_preparation_owner.prepare_runtime_request_set(
@@ -1720,7 +1739,12 @@ class SimulationController(QtCore.QObject):
                 exc,
             )
             return False
-        return bool(prewarm(prepared))
+        return bool(
+            prewarm(
+                prepared,
+                prepared_is_current=self._runtime_prepared_request_is_current,
+            )
+        )
 
     def _apply_runtime_lifecycle_ui_effects(
         self,
@@ -1756,10 +1780,27 @@ class SimulationController(QtCore.QObject):
                     )
                 except Exception as exc:
                     self._record_nonfatal_exception("Failed to surface runtime failure effect to UI", exc)
+            current_preview_failure_status_text = str(
+                getattr(effect, "current_preview_failure_status_text", "") or ""
+            )
+            if current_preview_failure_status_text:
+                self._apply_simulation_lifecycle_effects(
+                    self._lifecycle_effect_owner.current_preview_failure_effects(
+                        status_text=current_preview_failure_status_text,
+                    )
+                )
             if getattr(effect, "simulation_running", None) is not None:
                 self._simulation_running = bool(effect.simulation_running)
             if getattr(effect, "slider_simulation_active", None) is not None:
                 self._slider_simulation_active = bool(effect.slider_simulation_active)
+            scoped_failure_summary = getattr(effect, "scoped_failure_summary", None)
+            if scoped_failure_summary is not None:
+                self._show_scoped_batch_failure_summary(
+                    failed_set_ids=tuple(
+                        getattr(scoped_failure_summary, "failed_set_ids", ()) or ()
+                    ),
+                    failed_errors=dict(getattr(scoped_failure_summary, "failed_errors", {}) or {}),
+                )
             if getattr(effect, "run_enabled", None) is not None:
                 self.ui.run_ui.set_run_button_enabled(bool(effect.run_enabled))
             if getattr(effect, "stop_enabled", None) is not None:

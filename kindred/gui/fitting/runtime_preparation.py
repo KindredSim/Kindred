@@ -87,14 +87,17 @@ class FittingRuntimePreparationOwner:
             )
             window.refresh_run_button_enabled_state()
             return
-        window.fit_runtime_readiness.set_desired_identity(identity)
         snapshot = window.fit_runtime_readiness.snapshot()
-        if snapshot.state is FittingRuntimeReadinessState.PREPARING:
-            window.set_fit_status("Preparing fitting runtime...")
-            window.set_fit_stop_enabled(True)
-        elif snapshot.state is FittingRuntimeReadinessState.READY:
+        is_ready_for = getattr(window.fit_runtime_readiness, "is_ready_for", None)
+        ready_for_current_identity = (
+            snapshot.state is FittingRuntimeReadinessState.READY
+            and callable(is_ready_for)
+            and bool(is_ready_for(identity))
+        )
+        if ready_for_current_identity:
             window.set_fit_status("Fitting runtime ready")
-            window.set_fit_stop_enabled(False)
+        else:
+            window.set_fit_status("Fitting inputs ready")
         window.refresh_run_button_enabled_state()
 
     def cancel_preparation(self, *, kill: bool) -> bool:

@@ -1557,8 +1557,8 @@ class FittingWindow(QtWidgets.QDialog):
         readiness = self._fit_runtime_readiness.snapshot()
         preparing = readiness.state is FittingRuntimeReadinessState.PREPARING
         invalid = bool(self._invalid_applied_used_dataset_ids_for_run())
-        ready = self._fit_runtime_ready_for_run_button()
-        self._run_button.setEnabled((not running) and (not preparing) and not invalid and ready)
+        launchable = self._fit_runtime_launchable_for_run_button()
+        self._run_button.setEnabled((not running) and (not preparing) and not invalid and launchable)
 
     def _fit_runtime_ready_for_run_button(self) -> bool:
         snapshot = self._fit_runtime_readiness.snapshot()
@@ -1568,6 +1568,17 @@ class FittingWindow(QtWidgets.QDialog):
         if not self._fit_runtime_identity_matches_current_noncollecting_inputs(identity):
             return False
         return self._fit_runtime_readiness.is_ready_for(identity)
+
+    def _fit_runtime_launchable_for_run_button(self) -> bool:
+        if self._fit_runtime_ready_for_run_button():
+            return True
+        try:
+            launch_result = self.build_current_launch_result(
+                purpose=FittingLaunchPurpose.PASSIVE_READINESS,
+            )
+        except RuntimeError:
+            return False
+        return launch_result.identity is not None
 
     def _fit_runtime_identity_matches_current_noncollecting_inputs(self, identity: Optional[FittingRuntimeIdentity]) -> bool:
         if identity is None:
@@ -2953,7 +2964,7 @@ class FittingWindow(QtWidgets.QDialog):
         if running:
             self._run_button.setEnabled(False)
         else:
-            self._run_button.setEnabled((not preparing) and not invalid_applied and self._fit_runtime_ready_for_run_button())
+            self._run_button.setEnabled((not preparing) and not invalid_applied and self._fit_runtime_launchable_for_run_button())
         self._stop_button.setEnabled(bool(running) or preparing)
         try:
             self._run_results_tab.set_view_autorange_locked(running)

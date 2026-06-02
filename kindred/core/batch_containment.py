@@ -675,6 +675,8 @@ class BatchRuntimeLaneOwner:
         self.active_request_meta: dict[str, dict[str, Any]] = {}
         self.completed_outcome_map: dict[str, BatchCompletionRecord] = {}
         self.superseded_request_map: dict[str, BatchRequestHandle] = {}
+        self._superseded_drain_token_keys: dict[str, frozenset[str]] = {}
+        self._superseded_drain_token_sequence = 0
         self.completed_queue: SimpleQueue[tuple[str, float]] = SimpleQueue()
         self._current_max_workers: Optional[int] = (
             max(1, int(max_parallel_workers)) if lane_pool is not None else None
@@ -789,6 +791,7 @@ class BatchRuntimeLaneOwner:
         self.reset_active_run_state()
         with self._lock:
             self.superseded_request_map = {}
+            self._superseded_drain_token_keys = {}
         self.drain_completion_queue()
 
     def _prune_completed_superseded_locked(self) -> None:
@@ -818,6 +821,31 @@ class BatchRuntimeLaneOwner:
             f"{str(metadata.set_id)}:"
             f"{id(handle)}"
         )
+
+    def superseded_drain_token_for_keys(self, keys: tuple[str, ...]) -> str:
+        normalized_keys = frozenset(str(key) for key in keys or () if str(key))
+        if not normalized_keys:
+            return ""
+        with self._lock:
+            self._superseded_drain_token_sequence += 1
+            token = f"superseded-drain:{self._superseded_drain_token_sequence}"
+            self._superseded_drain_token_keys[token] = normalized_keys
+            return token
+
+    def superseded_drain_token_drained(self, token: str) -> bool:
+        normalized_token = str(token or "")
+        if not normalized_token:
+            return True
+        with self._lock:
+            self._prune_completed_superseded_locked()
+            keys = self._superseded_drain_token_keys.get(normalized_token)
+            if keys is None:
+                return not bool(self.active_request_map or self.superseded_request_map)
+            pending = set(self.superseded_request_map or {})
+            drained = not any(key in pending for key in keys)
+            if drained:
+                self._superseded_drain_token_keys.pop(normalized_token, None)
+            return drained
 
     def clear_stale_requests(self) -> None:
         self.reset_active_run_state()
@@ -1241,23 +1269,26 @@ class BatchRuntimeLaneOwner:
                 record_nonfatal_exception("Failed batch lane pool shutdown", exc)
         self.reset_run_state()
 
-    def soft_supersede(self) -> tuple[int, int]:
+    def soft_supersede(self) -> tuple[int, int, str]:
         with self._lock:
             active = dict(self.active_request_map or {})
             self._generation += 1
             self.active_request_map = {}
             self.active_request_meta = {}
             self.completed_outcome_map = {}
+            token_keys: list[str] = []
             for handle in active.values():
                 if isinstance(handle, BatchRequestHandle):
-                    self.superseded_request_map[self._superseded_request_key(handle)] = handle
+                    key = self._superseded_request_key(handle)
+                    self.superseded_request_map[key] = handle
+                    token_keys.append(key)
         running = 0
         for handle in active.values():
             if isinstance(handle, BatchRequestHandle):
                 handle.mark_superseded()
             running += 1
         self.drain_completion_queue()
-        return 0, running
+        return 0, running, self.superseded_drain_token_for_keys(tuple(token_keys))
 
     def _handle_completed_request(self, handle: BatchRequestHandle) -> None:
         if handle.superseded or int(handle.metadata.generation) != int(self._generation):

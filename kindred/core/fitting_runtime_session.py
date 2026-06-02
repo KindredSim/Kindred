@@ -142,23 +142,59 @@ class FittingRuntimeSession:
 
     def warm(self, *, cancellation_check: Optional[Callable[[], bool]] = None, lane_count: Optional[int] = None) -> None:
         lanes = self._ensure_lanes(lane_count=lane_count)
-        if len(lanes) > 1:
-            self._ensure_scheduler(worker_count=len(lanes))
-        for lane in lanes:
+        lanes_to_warm = [
+            lane
+            for lane in lanes
+            if id(lane) not in self._warmed_lane_ids
+        ]
+        if not lanes_to_warm:
+            if len(lanes) > 1:
+                self._ensure_scheduler(worker_count=len(lanes))
+            return
+
+        def _warm_lane(lane: Any) -> Any:
             self._raise_if_cancelled(cancellation_check)
-            lane_id = id(lane)
-            if lane_id in self._warmed_lane_ids:
-                continue
             warm = getattr(lane, "warm", None)
+            if callable(warm):
+                warm(cancellation_check=cancellation_check)
+            return lane
+
+        if len(lanes_to_warm) == 1:
+            lane = lanes_to_warm[0]
             try:
-                if callable(warm):
-                    warm(cancellation_check=cancellation_check)
+                _warm_lane(lane)
             except BaseException:
                 self._invalidate_lane(lane, kill=True)
                 raise
-            self._warmed_lane_ids.add(lane_id)
+            self._warmed_lane_ids.add(id(lane))
             with self._lock:
                 self._ledger.lane_warms += 1
+            if len(lanes) > 1:
+                self._ensure_scheduler(worker_count=len(lanes))
+            return
+
+        scheduler = self._ensure_scheduler(worker_count=len(lanes))
+        futures = {
+            scheduler.submit(_warm_lane, lane): lane
+            for lane in lanes_to_warm
+        }
+        warmed_lanes: list[Any] = []
+        failures: list[tuple[Any, BaseException]] = []
+        for future, lane in futures.items():
+            try:
+                warmed_lane = future.result()
+            except BaseException as exc:
+                failures.append((lane, exc))
+                continue
+            warmed_lanes.append(warmed_lane)
+        for warmed_lane in warmed_lanes:
+            self._warmed_lane_ids.add(id(warmed_lane))
+            with self._lock:
+                self._ledger.lane_warms += 1
+        if failures:
+            for lane, _exc in failures:
+                self._invalidate_lane(lane, kill=True)
+            raise failures[0][1]
 
     def evaluate_one(
         self,

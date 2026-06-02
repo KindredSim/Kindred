@@ -49,7 +49,7 @@ def _normalize_preview_bool(value: object) -> bool:
 
 
 def _normalize_preview_owner_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
-    return tuple(sorted(_normalize_preview_target_set_ids(values)))
+    return _normalize_preview_target_set_ids(values)
 
 
 def _normalize_pending_run_rows(values: Sequence[int] | object) -> tuple[int, ...]:
