@@ -267,12 +267,7 @@ class ParallelBatchOutcomeOwner:
             if isinstance(runtime_session_stale, Mapping):
                 return RuntimeCompletionDecision.ignored_stale(consumed=False)
             self._deps.cancel_runtime_for_parallel_outcome_reset()
-            self._deps.set_simulation_running(False)
-            self._deps.set_slider_simulation_active(False)
-            self._ui.slider.set_slider_triggered_simulation(False)
-            self._ui.run_ui.set_run_button_enabled(True)
-            self._ui.run_ui.set_stop_button_enabled(False)
-            return RuntimeCompletionDecision.ignored_stale(consumed=False)
+            return RuntimeCompletionDecision.reset_requested()
 
         if callback_identity is None or resolved_run_context is None:
             self._deps.record_nonfatal_exception(

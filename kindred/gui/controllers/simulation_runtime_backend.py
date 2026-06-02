@@ -71,6 +71,7 @@ class RuntimeCompletionDecision:
     terminal: bool = False
     failed: bool = False
     message: str = ""
+    stop_current_poll_batch: bool = False
 
     @classmethod
     def accepted_current(cls) -> RuntimeCompletionDecision:
@@ -79,6 +80,14 @@ class RuntimeCompletionDecision:
     @classmethod
     def ignored_stale(cls, *, consumed: bool = True) -> RuntimeCompletionDecision:
         return cls(accepted=False, consumed=bool(consumed))
+
+    @classmethod
+    def reset_requested(cls, *, consumed: bool = False) -> RuntimeCompletionDecision:
+        return cls(
+            accepted=False,
+            consumed=bool(consumed),
+            stop_current_poll_batch=True,
+        )
 
     @classmethod
     def terminal_failure(cls, message: str = "") -> RuntimeCompletionDecision:

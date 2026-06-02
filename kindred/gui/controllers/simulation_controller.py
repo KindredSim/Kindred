@@ -1768,6 +1768,8 @@ class SimulationController(QtCore.QObject):
                 self.ui.run_ui.set_sim_progress_value(int(effect.progress_value))
             if getattr(effect, "status_text", None) is not None:
                 self.ui.run_ui.set_status_text(str(effect.status_text))
+            if bool(getattr(effect, "reset_slider_triggered", False)):
+                self.ui.slider.set_slider_triggered_simulation(False)
             if bool(getattr(effect, "stop_debounce_timers", False)):
                 self._stop_slider_debounce_timers_for_lifecycle_effect()
             if bool(getattr(effect, "clear_preview_replay", False)):
