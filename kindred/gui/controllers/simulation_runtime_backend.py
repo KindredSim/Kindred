@@ -67,22 +67,24 @@ class RuntimeCompletionEvent:
 @dataclass(frozen=True)
 class RuntimeCompletionDecision:
     accepted: bool = True
+    consumed: bool = True
     terminal: bool = False
     failed: bool = False
     message: str = ""
 
     @classmethod
     def accepted_current(cls) -> RuntimeCompletionDecision:
-        return cls(accepted=True)
+        return cls(accepted=True, consumed=True)
 
     @classmethod
-    def ignored_stale(cls) -> RuntimeCompletionDecision:
-        return cls(accepted=False)
+    def ignored_stale(cls, *, consumed: bool = True) -> RuntimeCompletionDecision:
+        return cls(accepted=False, consumed=bool(consumed))
 
     @classmethod
     def terminal_failure(cls, message: str = "") -> RuntimeCompletionDecision:
         return cls(
             accepted=False,
+            consumed=False,
             terminal=True,
             failed=True,
             message=str(message or ""),

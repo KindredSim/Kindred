@@ -22,6 +22,14 @@ from kindred.gui.controllers.simulation_runtime_readiness_lifecycle import (
     SimulationRuntimeReadinessRenderState,
 )
 
+_RUNTIME_WARMUP_RETRY_REFRESH_READINESS = "refresh_readiness"
+_RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH = "accept_dispatch"
+_RUNTIME_WARMUP_RETRY_KINDS = (
+    _RUNTIME_WARMUP_RETRY_REFRESH_READINESS,
+    _RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH,
+)
+_RUNTIME_WARMUP_RETRY_DELAY_MS = 50
+
 
 @dataclass(frozen=True)
 class QueuePreviewReplay:
@@ -82,7 +90,9 @@ class RuntimeUiEffect:
     progress_value: int | None = None
     status_text: str | None = None
     stop_debounce_timers: bool = False
-    schedule_runtime_warmup_retry: bool = False
+    cancel_warmup_retry_kinds: tuple[str, ...] = ()
+    warmup_retry_kind: str = ""
+    warmup_retry_delay_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -116,6 +126,7 @@ class RuntimeDispatchState:
     plan: RuntimeDispatchPlan | None = None
     expected_completion_set_ids: frozenset[str] = frozenset()
     accepted_completion_set_ids: frozenset[str] = frozenset()
+    consumed_completion_set_ids: frozenset[str] = frozenset()
     pending_release_reason: RuntimeReleaseReason | None = None
     release_requires_backend_idle: bool = False
     release_result: RuntimeReleaseResult | None = None
@@ -143,18 +154,37 @@ class RuntimeDispatchState:
     def all_expected_completions_consumed(self) -> bool:
         if not self.expected_completion_set_ids:
             return False
-        return self.expected_completion_set_ids.issubset(self.accepted_completion_set_ids)
+        return self.expected_completion_set_ids.issubset(self.consumed_completion_set_ids)
 
     def accepted_completion(self, set_id: str) -> "RuntimeDispatchState":
         normalized = str(set_id or "").strip()
         if not normalized:
             return self
         accepted = set(self.accepted_completion_set_ids)
+        consumed = set(self.consumed_completion_set_ids)
         accepted.add(normalized)
+        consumed.add(normalized)
         return RuntimeDispatchState(
             plan=self.plan,
             expected_completion_set_ids=self.expected_completion_set_ids,
             accepted_completion_set_ids=frozenset(accepted),
+            consumed_completion_set_ids=frozenset(consumed),
+            pending_release_reason=self.pending_release_reason,
+            release_requires_backend_idle=self.release_requires_backend_idle,
+            release_result=self.release_result,
+        )
+
+    def consumed_completion(self, set_id: str) -> "RuntimeDispatchState":
+        normalized = str(set_id or "").strip()
+        if not normalized:
+            return self
+        consumed = set(self.consumed_completion_set_ids)
+        consumed.add(normalized)
+        return RuntimeDispatchState(
+            plan=self.plan,
+            expected_completion_set_ids=self.expected_completion_set_ids,
+            accepted_completion_set_ids=self.accepted_completion_set_ids,
+            consumed_completion_set_ids=frozenset(consumed),
             pending_release_reason=self.pending_release_reason,
             release_requires_backend_idle=self.release_requires_backend_idle,
             release_result=self.release_result,
@@ -172,6 +202,7 @@ class RuntimeDispatchState:
             plan=self.plan,
             expected_completion_set_ids=self.expected_completion_set_ids,
             accepted_completion_set_ids=self.accepted_completion_set_ids,
+            consumed_completion_set_ids=self.consumed_completion_set_ids,
             pending_release_reason=reason,
             release_requires_backend_idle=bool(after_backend_idle),
             release_result=self.release_result,
@@ -185,6 +216,7 @@ class RuntimeDispatchState:
             plan=self.plan,
             expected_completion_set_ids=self.expected_completion_set_ids,
             accepted_completion_set_ids=self.accepted_completion_set_ids,
+            consumed_completion_set_ids=self.consumed_completion_set_ids,
             pending_release_reason=None,
             release_requires_backend_idle=False,
             release_result=release_result,
@@ -252,17 +284,23 @@ class SimulationRuntimeOrchestrator:
         self._reserve_request_id = reserve_request_id
         self._completion_consumer = completion_consumer
         self._last_prepared: PreparedRuntimeRequestSet | None = None
+        self._last_prepared_retry_kind: str = ""
         self._last_dispatch_plan: RuntimeDispatchPlan | None = None
         self._manual_retry_prepared: PreparedRuntimeRequestSet | None = None
-        self._backend_warmup_prepared: PreparedRuntimeRequestSet | None = None
+        self._manual_retry_kind: str = ""
+        self._readiness_retry_prepared: PreparedRuntimeRequestSet | None = None
+        self._acceptance_retry_prepared: PreparedRuntimeRequestSet | None = None
         self._dispatch_state = RuntimeDispatchState()
 
     @property
     def endpoint_state(self) -> SimulationRuntimeReadinessEndpointState:
-        pending = self._backend_warmup_prepared or self._manual_retry_prepared
+        pending = self._pending_retry_prepared()
         return SimulationRuntimeReadinessEndpointState(
             manual_retry_available=self._manual_retry_prepared is not None,
-            backend_warmup_pending=self._backend_warmup_prepared is not None,
+            backend_warmup_pending=bool(
+                self._readiness_retry_prepared is not None
+                or self._acceptance_retry_prepared is not None
+            ),
             pending_intent_kind="" if pending is None else str(pending.intent.intent_kind),
         )
 
@@ -280,7 +318,10 @@ class SimulationRuntimeOrchestrator:
 
     @property
     def backend_warmup_pending(self) -> bool:
-        return self._backend_warmup_prepared is not None
+        return bool(
+            self._readiness_retry_prepared is not None
+            or self._acceptance_retry_prepared is not None
+        )
 
     @property
     def all_expected_completions_consumed(self) -> bool:
@@ -288,7 +329,7 @@ class SimulationRuntimeOrchestrator:
 
     @property
     def pending_intent_kind(self) -> str:
-        pending = self._backend_warmup_prepared or self._manual_retry_prepared
+        pending = self._pending_retry_prepared()
         return "" if pending is None else str(pending.intent.intent_kind)
 
     def set_completion_consumer(self, completion_consumer: RuntimeCompletionConsumer | None) -> None:
@@ -299,81 +340,38 @@ class SimulationRuntimeOrchestrator:
         prepared: PreparedRuntimeRequestSet,
     ) -> RuntimeReadinessConsequence:
         self._last_prepared = prepared
+        self._last_prepared_retry_kind = _RUNTIME_WARMUP_RETRY_REFRESH_READINESS
         self._manual_retry_prepared = None
+        self._manual_retry_kind = ""
         self._last_dispatch_plan = None
-        if not prepared.prepared:
-            reason = prepared.blocked_reason
-            state = SimulationRuntimeReadinessRenderState(
-                status="blocked",
-                status_text=(
-                    str(reason.message)
-                    if reason is not None
-                    else "Select at least one set before running."
-                ),
-                failed=True,
-                retryable=bool(reason.retryable) if reason is not None else False,
-                launch_available=False,
-                preview_available=False,
-            )
-            return self._readiness_consequence(state)
-        if not self._prepared_is_current(prepared):
-            state = SimulationRuntimeReadinessRenderState(
-                status="stale",
-                status_text="Runtime launch readiness changed before backend warmup completed.",
-                failed=True,
-                launch_available=False,
-            )
-            return self._readiness_consequence(state)
-        if not self._prepared_runtime_input_epochs_current(prepared):
-            state = SimulationRuntimeReadinessRenderState(
-                status="stale",
-                status_text="Runtime input changed before launch readiness completed.",
-                failed=True,
-                launch_available=False,
-            )
-            return self._readiness_consequence(state)
-        try:
-            self._allocator.ensure_ready_lanes(
-                compatibility_key=prepared.compatibility_key,
-                capacity=prepared.preferred_lane_capacity,
-                task_count=len(prepared.task_descriptors),
-                nonblocking=True,
-            )
-            probe = self._allocator.probe_readiness(
-                self._allocation_request(prepared),
-            )
-        except Exception as exc:
-            self._manual_retry_prepared = prepared
-            state = self._failure_render_state(str(exc), retryable=True)
-            return self._readiness_consequence(state)
-        if not probe.ready:
-            self._backend_warmup_prepared = prepared
-            state = SimulationRuntimeReadinessRenderState(
-                status="warming",
-                status_text=probe.message or "Preparing runtime lanes...",
-                launch_available=False,
-                preview_available=prepared.intent.intent_kind == "preview",
-            )
-            return self._readiness_consequence(
-                state,
-                extra_effects=(RuntimeUiEffect(schedule_runtime_warmup_retry=True),),
-            )
-        self._backend_warmup_prepared = None
-        state = SimulationRuntimeReadinessRenderState(
-            status="ready",
-            status_text="Ready",
-            launch_available=prepared.intent.intent_kind != "preview",
-            preview_available=prepared.intent.intent_kind == "preview",
+        self._clear_warmup_retry_prepared(_RUNTIME_WARMUP_RETRY_REFRESH_READINESS)
+        return self._probe_readiness_consequence(
+            prepared,
+            warmup_retry_kind=_RUNTIME_WARMUP_RETRY_REFRESH_READINESS,
         )
-        return self._readiness_consequence(state)
 
     def refresh_readiness(self, prepared: PreparedRuntimeRequestSet) -> bool:
         return bool(self.refresh_readiness_consequence(prepared).launch_available)
 
     def accept_prepared_request(self, prepared: PreparedRuntimeRequestSet) -> RuntimeDispatchAcceptance:
-        readiness = self._dispatch_acceptance_readiness(prepared)
+        self._last_prepared = prepared
+        self._last_prepared_retry_kind = _RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH
+        self._manual_retry_prepared = None
+        self._manual_retry_kind = ""
+        self._last_dispatch_plan = None
+        self._clear_warmup_retry_prepared(_RUNTIME_WARMUP_RETRY_REFRESH_READINESS)
+        self._clear_warmup_retry_prepared(_RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH)
+        cancel_readiness_retry = (
+            self._cancel_warmup_retry_effect(_RUNTIME_WARMUP_RETRY_REFRESH_READINESS),
+        )
+        readiness = self._probe_readiness_consequence(
+            prepared,
+            warmup_retry_kind=_RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH,
+        )
         if not self._readiness_state_is_ready(readiness):
-            return RuntimeDispatchAcceptance(effects=readiness.effects)
+            return RuntimeDispatchAcceptance(
+                effects=cancel_readiness_retry + tuple(readiness.effects or ())
+            )
         try:
             self._allocator.ensure_ready_lanes(
                 compatibility_key=prepared.compatibility_key,
@@ -383,12 +381,20 @@ class SimulationRuntimeOrchestrator:
             )
             allocation = self._allocator.allocate(self._allocation_request(prepared))
         except Exception as exc:
-            self._manual_retry_prepared = prepared
+            self._set_manual_retry_prepared(
+                prepared,
+                retry_kind=_RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH,
+            )
+            self._clear_warmup_retry_prepared(_RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH)
             return self._dispatch_acceptance_consequence(
                 self._failure_render_state(str(exc), retryable=True),
+                extra_effects=cancel_readiness_retry,
             )
         if allocation.status != "ready":
-            self._backend_warmup_prepared = prepared
+            self._store_warmup_retry_prepared(
+                _RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH,
+                prepared,
+            )
             return self._dispatch_acceptance_consequence(
                 SimulationRuntimeReadinessRenderState(
                     status="warming",
@@ -396,7 +402,12 @@ class SimulationRuntimeOrchestrator:
                     launch_available=False,
                     preview_available=prepared.intent.intent_kind == "preview",
                 ),
-                extra_effects=(RuntimeUiEffect(schedule_runtime_warmup_retry=True),),
+                extra_effects=(
+                    self._warmup_retry_effect(
+                        _RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH,
+                        cancel_retry_kinds=(_RUNTIME_WARMUP_RETRY_REFRESH_READINESS,),
+                    ),
+                ),
             )
         consumed = self._allocator.consume(allocation, prepared, expected=prepared)
         if consumed.dispatch_plan is None:
@@ -407,8 +418,10 @@ class SimulationRuntimeOrchestrator:
                     failed=True,
                     retryable=consumed.retryable,
                     launch_available=False,
-                )
+                ),
+                extra_effects=cancel_readiness_retry,
             )
+        self._clear_retry_prepared_states(clear_manual_retry=False)
         self._last_dispatch_plan = consumed.dispatch_plan
         return self._dispatch_acceptance_consequence(
             SimulationRuntimeReadinessRenderState(
@@ -418,10 +431,21 @@ class SimulationRuntimeOrchestrator:
                 preview_available=prepared.intent.intent_kind == "preview",
             ),
             dispatch_plan=self._last_dispatch_plan,
+            extra_effects=cancel_readiness_retry,
         )
 
-    def retry_runtime_readiness(self) -> RuntimeDispatchAcceptance:
-        prepared = self._manual_retry_prepared or self._backend_warmup_prepared or self._last_prepared
+    def retry_readiness_refresh(self) -> RuntimeReadinessConsequence:
+        prepared = self._readiness_retry_prepared
+        if prepared is None and self._manual_retry_kind == _RUNTIME_WARMUP_RETRY_REFRESH_READINESS:
+            prepared = self._manual_retry_prepared
+        if prepared is None:
+            return RuntimeReadinessConsequence()
+        return self.refresh_readiness_consequence(prepared)
+
+    def retry_dispatch_acceptance(self) -> RuntimeDispatchAcceptance:
+        prepared = self._acceptance_retry_prepared
+        if prepared is None and self._manual_retry_kind == _RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH:
+            prepared = self._manual_retry_prepared
         if prepared is None:
             return RuntimeDispatchAcceptance()
         return self.accept_prepared_request(prepared)
@@ -446,6 +470,7 @@ class SimulationRuntimeOrchestrator:
             effects=(
                 RuntimeUiEffect(
                     start_completion_polling=True,
+                    cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
                     simulation_running=True,
                     slider_simulation_active=bool(fast_mode),
                     run_enabled=False,
@@ -466,6 +491,7 @@ class SimulationRuntimeOrchestrator:
         retryable: bool = True,
         backend_failure: bool = False,
     ) -> RuntimeDispatchConsequence:
+        self._clear_retry_prepared_states()
         if dispatch_plan is not None:
             self._start_dispatch_state(dispatch_plan)
         release_result = self._release_current_dispatch(
@@ -479,6 +505,7 @@ class SimulationRuntimeOrchestrator:
         effects: list[RuntimeUiEffect] = [
             RuntimeUiEffect(
                 stop_completion_polling=True,
+                cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
                 simulation_running=False,
                 slider_simulation_active=False,
                 run_enabled=True,
@@ -504,6 +531,7 @@ class SimulationRuntimeOrchestrator:
         retryable: bool = True,
     ) -> RuntimeDispatchConsequence:
         effect = RuntimeUiEffect(
+            cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
             simulation_running=False,
             slider_simulation_active=False,
             run_enabled=True,
@@ -534,11 +562,24 @@ class SimulationRuntimeOrchestrator:
             return self.pool_settings_changed()
         if kind == "soft_supersede":
             if self._backend is None:
+                self._clear_retry_prepared_states()
                 self._release_current_dispatch(RuntimeReleaseReason.SUPERSEDED)
-                return [RuntimeUiEffect(stop_completion_polling=True)]
+                return [
+                    RuntimeUiEffect(
+                        stop_completion_polling=True,
+                        cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
+                        simulation_running=False,
+                        slider_simulation_active=False,
+                        run_enabled=True,
+                        stop_enabled=False,
+                        progress_value=0,
+                        status_text="Ready",
+                    )
+                ]
             try:
                 result = self._backend.supersede_current_run()
             except Exception as exc:
+                self._clear_retry_prepared_states()
                 self._release_current_dispatch(
                     RuntimeReleaseReason.FAILURE,
                     backend_failure=True,
@@ -546,21 +587,45 @@ class SimulationRuntimeOrchestrator:
                 return [
                     RuntimeUiEffect(
                         stop_completion_polling=True,
+                        cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
                         surface_failure=f"Runtime backend supersede failed: {exc}",
                     )
                 ]
             if result.running > 0:
                 self._defer_current_dispatch_release(RuntimeReleaseReason.SUPERSEDED)
-                return []
-            else:
-                self._release_current_dispatch(RuntimeReleaseReason.SUPERSEDED)
-            return [RuntimeUiEffect(stop_completion_polling=True)]
+                return [RuntimeUiEffect(cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS)]
+            self._clear_retry_prepared_states()
+            self._release_current_dispatch(RuntimeReleaseReason.SUPERSEDED)
+            return [
+                RuntimeUiEffect(
+                    stop_completion_polling=True,
+                    cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
+                    simulation_running=False,
+                    slider_simulation_active=False,
+                    run_enabled=True,
+                    stop_enabled=False,
+                    progress_value=0,
+                    status_text="Ready",
+                )
+            ]
+        self._clear_retry_prepared_states()
         self._release_current_dispatch(RuntimeReleaseReason.SHUTDOWN)
         close_failure = self._close_backend_run(
             force_terminate=kind != "soft_shutdown",
             reason=RuntimeReleaseReason.SHUTDOWN,
         )
-        effects = [RuntimeUiEffect(stop_completion_polling=True)]
+        effects = [
+            RuntimeUiEffect(
+                stop_completion_polling=True,
+                cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
+                simulation_running=False,
+                slider_simulation_active=False,
+                run_enabled=True,
+                stop_enabled=False,
+                progress_value=0,
+                status_text="Ready",
+            )
+        ]
         if close_failure:
             effects.append(RuntimeUiEffect(surface_failure=close_failure))
         return effects
@@ -614,15 +679,19 @@ class SimulationRuntimeOrchestrator:
                     return [
                         RuntimeUiEffect(
                             stop_completion_polling=True,
+                            cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
                             surface_failure=str(decision.message or ""),
                         )
                     ]
-                if not decision.accepted:
-                    return []
-                self._record_accepted_completion(event)
+                if decision.accepted:
+                    self._record_accepted_completion(event)
+                    continue
+                if decision.consumed:
+                    self._record_consumed_completion(event)
             self._release_pending_dispatch_plan_after_backend_idle(backend_idle=backend_idle)
             return self._polling_effects_after_runtime_consequence_update()
         except Exception as exc:
+            self._clear_retry_prepared_states()
             self._release_current_dispatch(
                 RuntimeReleaseReason.FAILURE,
                 backend_failure=True,
@@ -637,6 +706,7 @@ class SimulationRuntimeOrchestrator:
             return [
                 RuntimeUiEffect(
                     stop_completion_polling=True,
+                    cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
                     surface_failure=message,
                 )
             ]
@@ -651,6 +721,7 @@ class SimulationRuntimeOrchestrator:
         return [
             RuntimeUiEffect(
                 stop_completion_polling=True,
+                cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
                 simulation_running=False,
                 slider_simulation_active=False,
                 run_enabled=True,
@@ -661,6 +732,7 @@ class SimulationRuntimeOrchestrator:
         ] + self.terminal_failure(backend_failed=True)
 
     def terminal_failure(self, *, backend_failed: bool = False) -> list[RuntimeUiEffect]:
+        self._clear_retry_prepared_states()
         self._release_current_dispatch(
             RuntimeReleaseReason.FAILURE,
             backend_failure=bool(backend_failed),
@@ -669,18 +741,35 @@ class SimulationRuntimeOrchestrator:
             force_terminate=True,
             reason=RuntimeReleaseReason.FAILURE,
         )
-        effects = [RuntimeUiEffect(stop_completion_polling=True)]
+        effects = [
+            RuntimeUiEffect(
+                stop_completion_polling=True,
+                cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
+            )
+        ]
         if close_failure:
             effects.append(RuntimeUiEffect(surface_failure=close_failure))
         return effects
 
     def close_requested(self, *, force_terminate: bool = True) -> list[RuntimeUiEffect]:
+        self._clear_retry_prepared_states()
         self._release_current_dispatch(RuntimeReleaseReason.SHUTDOWN)
         close_failure = self._close_backend_run(
             force_terminate=bool(force_terminate),
             reason=RuntimeReleaseReason.SHUTDOWN,
         )
-        effects = [RuntimeUiEffect(stop_completion_polling=True)]
+        effects = [
+            RuntimeUiEffect(
+                stop_completion_polling=True,
+                cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
+                simulation_running=False,
+                slider_simulation_active=False,
+                run_enabled=True,
+                stop_enabled=False,
+                progress_value=0,
+                status_text="Ready",
+            )
+        ]
         if close_failure:
             effects.append(RuntimeUiEffect(surface_failure=close_failure))
         return effects
@@ -816,6 +905,12 @@ class SimulationRuntimeOrchestrator:
             )
         return self.preview_replay_cleared(clear_plot_updates=True)
 
+    def preview_replay_launch_unavailable(self, *, current_state: object) -> list[RuntimeUiEffect]:
+        pending = RuntimePreviewReplayState.from_pending(current_state)
+        if not self.preview_replay_exists_for_state(pending):
+            return []
+        return self.preview_replay_cleared(clear_plot_updates=False)
+
     def stale_fast_completion_replay_decision(
         self,
         *,
@@ -908,6 +1003,24 @@ class SimulationRuntimeOrchestrator:
             stop_timers=bool(stop_timers),
         )
 
+    def preview_invalidation_settled(
+        self,
+        *,
+        has_active_explicit_simulation: bool,
+    ) -> list[RuntimeUiEffect]:
+        if bool(has_active_explicit_simulation):
+            return []
+        return [
+            RuntimeUiEffect(
+                simulation_running=False,
+                slider_simulation_active=False,
+                run_enabled=True,
+                stop_enabled=False,
+                progress_value=0,
+                status_text="Ready",
+            )
+        ]
+
     def terminal_failure_replay_snapshot(
         self,
         *,
@@ -982,7 +1095,15 @@ class SimulationRuntimeOrchestrator:
         )
 
     def render_failure(self, message: str, *, retryable: bool = True) -> None:
-        self._manual_retry_prepared = self._last_prepared if bool(retryable) else None
+        self._clear_retry_prepared_states(clear_manual_retry=False)
+        if bool(retryable):
+            self._set_manual_retry_prepared(
+                self._last_prepared,
+                retry_kind=self._last_prepared_retry_kind,
+            )
+        else:
+            self._manual_retry_prepared = None
+            self._manual_retry_kind = ""
         self._render_state(
             SimulationRuntimeReadinessRenderState(
                 status="failed",
@@ -1066,14 +1187,81 @@ class SimulationRuntimeOrchestrator:
             require_backend_lease=True,
         )
 
-    def _dispatch_acceptance_readiness(
+    def _probe_readiness_consequence(
         self,
         prepared: PreparedRuntimeRequestSet,
+        *,
+        warmup_retry_kind: str,
     ) -> RuntimeReadinessConsequence:
-        self._last_prepared = prepared
-        self._manual_retry_prepared = None
-        self._last_dispatch_plan = None
-        return self.refresh_readiness_consequence(prepared)
+        if not prepared.prepared:
+            reason = prepared.blocked_reason
+            state = SimulationRuntimeReadinessRenderState(
+                status="blocked",
+                status_text=(
+                    str(reason.message)
+                    if reason is not None
+                    else "Select at least one set before running."
+                ),
+                failed=True,
+                retryable=bool(reason.retryable) if reason is not None else False,
+                launch_available=False,
+                preview_available=False,
+            )
+            return self._readiness_consequence(state)
+        if not self._prepared_is_current(prepared):
+            state = SimulationRuntimeReadinessRenderState(
+                status="stale",
+                status_text="Runtime launch readiness changed before backend warmup completed.",
+                failed=True,
+                launch_available=False,
+            )
+            return self._readiness_consequence(state)
+        if not self._prepared_runtime_input_epochs_current(prepared):
+            state = SimulationRuntimeReadinessRenderState(
+                status="stale",
+                status_text="Runtime input changed before launch readiness completed.",
+                failed=True,
+                launch_available=False,
+            )
+            return self._readiness_consequence(state)
+        try:
+            self._allocator.ensure_ready_lanes(
+                compatibility_key=prepared.compatibility_key,
+                capacity=prepared.preferred_lane_capacity,
+                task_count=len(prepared.task_descriptors),
+                nonblocking=True,
+            )
+            probe = self._allocator.probe_readiness(
+                self._allocation_request(prepared),
+            )
+        except Exception as exc:
+            self._set_manual_retry_prepared(
+                prepared,
+                retry_kind=warmup_retry_kind,
+            )
+            self._clear_warmup_retry_prepared(warmup_retry_kind)
+            state = self._failure_render_state(str(exc), retryable=True)
+            return self._readiness_consequence(state)
+        if not probe.ready:
+            self._store_warmup_retry_prepared(warmup_retry_kind, prepared)
+            state = SimulationRuntimeReadinessRenderState(
+                status="warming",
+                status_text=probe.message or "Preparing runtime lanes...",
+                launch_available=False,
+                preview_available=prepared.intent.intent_kind == "preview",
+            )
+            return self._readiness_consequence(
+                state,
+                extra_effects=(self._warmup_retry_effect(warmup_retry_kind),),
+            )
+        self._clear_warmup_retry_prepared(warmup_retry_kind)
+        state = SimulationRuntimeReadinessRenderState(
+            status="ready",
+            status_text="Ready",
+            launch_available=prepared.intent.intent_kind != "preview",
+            preview_available=prepared.intent.intent_kind == "preview",
+        )
+        return self._readiness_consequence(state)
 
     def _readiness_state_is_ready(self, consequence: RuntimeReadinessConsequence) -> bool:
         return bool(
@@ -1135,6 +1323,9 @@ class SimulationRuntimeOrchestrator:
     def _record_accepted_completion(self, event: RuntimeCompletionEvent) -> None:
         self._dispatch_state = self._dispatch_state.accepted_completion(event.set_id)
 
+    def _record_consumed_completion(self, event: RuntimeCompletionEvent) -> None:
+        self._dispatch_state = self._dispatch_state.consumed_completion(event.set_id)
+
     def _release_current_dispatch(
         self,
         reason: RuntimeReleaseReason,
@@ -1190,6 +1381,75 @@ class SimulationRuntimeOrchestrator:
         if self._dispatch_state.release_requires_backend_idle and not bool(backend_idle):
             return None
         return self._release_dispatch_plan(plan, reason)
+
+    def _pending_retry_prepared(self) -> PreparedRuntimeRequestSet | None:
+        return (
+            self._acceptance_retry_prepared
+            or self._readiness_retry_prepared
+            or self._manual_retry_prepared
+        )
+
+    def _set_manual_retry_prepared(
+        self,
+        prepared: PreparedRuntimeRequestSet | None,
+        *,
+        retry_kind: str,
+    ) -> None:
+        self._manual_retry_prepared = prepared
+        self._manual_retry_kind = (
+            str(retry_kind or "")
+            if prepared is not None and str(retry_kind or "") in _RUNTIME_WARMUP_RETRY_KINDS
+            else ""
+        )
+
+    def _store_warmup_retry_prepared(
+        self,
+        warmup_retry_kind: str,
+        prepared: PreparedRuntimeRequestSet,
+    ) -> None:
+        if warmup_retry_kind == _RUNTIME_WARMUP_RETRY_REFRESH_READINESS:
+            self._readiness_retry_prepared = prepared
+            return
+        if warmup_retry_kind == _RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH:
+            self._acceptance_retry_prepared = prepared
+
+    def _clear_warmup_retry_prepared(self, warmup_retry_kind: str) -> None:
+        if warmup_retry_kind == _RUNTIME_WARMUP_RETRY_REFRESH_READINESS:
+            self._readiness_retry_prepared = None
+            return
+        if warmup_retry_kind == _RUNTIME_WARMUP_RETRY_ACCEPT_DISPATCH:
+            self._acceptance_retry_prepared = None
+
+    def _clear_retry_prepared_states(self, *, clear_manual_retry: bool = True) -> None:
+        self._readiness_retry_prepared = None
+        self._acceptance_retry_prepared = None
+        if clear_manual_retry:
+            self._manual_retry_prepared = None
+            self._manual_retry_kind = ""
+
+    def _warmup_retry_effect(
+        self,
+        warmup_retry_kind: str,
+        *,
+        cancel_retry_kinds: Sequence[str] = (),
+    ) -> RuntimeUiEffect:
+        return RuntimeUiEffect(
+            cancel_warmup_retry_kinds=tuple(
+                str(kind or "")
+                for kind in tuple(cancel_retry_kinds or ())
+                if str(kind or "") in _RUNTIME_WARMUP_RETRY_KINDS
+            ),
+            warmup_retry_kind=str(warmup_retry_kind or ""),
+            warmup_retry_delay_ms=int(_RUNTIME_WARMUP_RETRY_DELAY_MS),
+        )
+
+    def _cancel_warmup_retry_effect(self, *retry_kinds: str) -> RuntimeUiEffect:
+        normalized = tuple(
+            str(kind or "")
+            for kind in tuple(retry_kinds or _RUNTIME_WARMUP_RETRY_KINDS)
+            if str(kind or "") in _RUNTIME_WARMUP_RETRY_KINDS
+        )
+        return RuntimeUiEffect(cancel_warmup_retry_kinds=normalized)
 
     def _runtime_consequences_complete(self) -> bool:
         state = self._dispatch_state

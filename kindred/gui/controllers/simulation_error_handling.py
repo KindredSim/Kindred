@@ -24,7 +24,7 @@ class SimulationErrorHandlingDependencies:
     apply_completion_policy_state_patch: Callable[..., None]
     apply_lifecycle_effects: Callable[..., None]
     apply_runtime_effects: Callable[..., None]
-    runtime_cancel_requested: Callable[[str], Any]
+    runtime_cancel_requested: Callable[..., Any]
     capture_terminal_failure_preview_replay_snapshot: Callable[..., Any]
     request_terminal_failure_preview_replay: Callable[..., None]
     request_pending_preview_replay: Callable[..., None]
@@ -138,7 +138,7 @@ class SimulationErrorHandlingOwner:
                 and callback_context_matches_current
             ):
                 self._deps.apply_runtime_effects(
-                    self._deps.runtime_cancel_requested("soft_shutdown")
+                    self._deps.runtime_cancel_requested(kind="soft_shutdown")
                 )
             self._deps.apply_lifecycle_effects(
                 self._lifecycle_effect_owner.superseded_fast_error_effects(
@@ -189,9 +189,6 @@ class SimulationErrorHandlingOwner:
                 return
         logger.warning("Simulation error surfaced to UI: %s", error_text)
 
-        if isinstance(ctx, Mapping):
-            ctx = self._batch_context_owner.deactivate_if_active(ctx)
-
         if not cancelled and error_detail_text:
             logger.warning("%s", error_detail_text)
         replay_snapshot = (
@@ -201,9 +198,11 @@ class SimulationErrorHandlingOwner:
         )
         self._deps.apply_runtime_effects(
             self._deps.runtime_cancel_requested(
-                "stop" if bool(cancelled) else "terminal_failure"
+                kind="stop" if bool(cancelled) else "terminal_failure"
             )
         )
+        if isinstance(ctx, Mapping):
+            ctx = self._batch_context_owner.deactivate_if_active(ctx)
         self._deps.apply_lifecycle_effects(
             self._lifecycle_effect_owner.terminal_error_effects(
                 cancelled=bool(cancelled),

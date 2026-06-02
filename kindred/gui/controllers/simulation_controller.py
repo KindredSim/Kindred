@@ -202,6 +202,7 @@ class SimulationController(QtCore.QObject):
         self._batch_completion_poll_timer = QtCore.QTimer(self)
         self._batch_completion_poll_timer.setInterval(20)
         self._batch_completion_poll_timer.timeout.connect(self._poll_parallel_batch_completions)
+        self._runtime_warmup_retry_timers: Dict[str, QtCore.QTimer] = {}
 
         self._plot_coalescer = SliderPlotCoalescer(
             on_timeout=self._flush_slider_plot_updates,
@@ -728,10 +729,14 @@ class SimulationController(QtCore.QObject):
 
     def _clear_failed_fast_preview_ownership(self) -> None:
         self._clear_preview_ownership()
-        self._clear_pending_slider_preview_replay_state(clear_plot_updates=False)
+        self.clear_pending_slider_preview_replay(clear_plot_updates=False)
 
     def clear_pending_slider_preview_replay(self, *, clear_plot_updates: bool = True) -> None:
-        self._clear_pending_slider_preview_replay_state(clear_plot_updates=bool(clear_plot_updates))
+        self._apply_runtime_lifecycle_ui_effects(
+            self._runtime_orchestrator.preview_replay_cleared(
+                clear_plot_updates=bool(clear_plot_updates)
+            )
+        )
 
     def _set_pending_slider_preview_replay_state(self, state: object) -> None:
         self._run_state.pending_slider_preview_launch = PendingSliderPreviewLaunchState(
@@ -1089,7 +1094,11 @@ class SimulationController(QtCore.QObject):
         pending = self._pending_slider_preview_launch
         rows = self._pending_slider_preview_rows()
         if not rows:
-            self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+            self._apply_runtime_lifecycle_ui_effects(
+                self._runtime_orchestrator.preview_replay_launch_unavailable(
+                    current_state=pending,
+                )
+            )
             return
         request_token = pending.request_id
         target_set_ids = tuple(str(set_id) for set_id in pending.target_set_ids or () if str(set_id))
@@ -1126,10 +1135,50 @@ class SimulationController(QtCore.QObject):
             self._runtime_orchestrator.accept_prepared_request(prepared)
         )
 
-    def retry_runtime_readiness(self) -> RuntimeDispatchPlan | None:
+    def retry_runtime_readiness_refresh(self) -> bool:
+        consequence = self._runtime_orchestrator.retry_readiness_refresh()
+        self._apply_runtime_lifecycle_ui_effects(consequence.effects)
+        return bool(consequence.launch_available)
+
+    def retry_runtime_dispatch_acceptance(self) -> RuntimeDispatchPlan | None:
         return self._apply_runtime_dispatch_acceptance(
-            self._runtime_orchestrator.retry_runtime_readiness()
+            self._runtime_orchestrator.retry_dispatch_acceptance()
         )
+
+    def _schedule_runtime_warmup_retry(self, *, retry_kind: str, delay_ms: int) -> None:
+        normalized_kind = str(retry_kind or "").strip().lower()
+        if normalized_kind not in {"refresh_readiness", "accept_dispatch"}:
+            return
+        timer = self._runtime_warmup_retry_timers.get(normalized_kind)
+        if timer is None:
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(
+                lambda kind=normalized_kind: self._run_runtime_warmup_retry(kind)
+            )
+            self._runtime_warmup_retry_timers[normalized_kind] = timer
+        if timer.isActive():
+            return
+        timer.start(max(1, int(delay_ms or 50)))
+
+    def _cancel_runtime_warmup_retries(self, *retry_kinds: str) -> None:
+        normalized_kinds = tuple(
+            str(kind or "").strip().lower()
+            for kind in tuple(retry_kinds or ())
+            if str(kind or "").strip().lower() in {"refresh_readiness", "accept_dispatch"}
+        )
+        for normalized_kind in normalized_kinds:
+            timer = self._runtime_warmup_retry_timers.get(normalized_kind)
+            if timer is not None and timer.isActive():
+                timer.stop()
+
+    def _run_runtime_warmup_retry(self, retry_kind: str) -> None:
+        normalized_kind = str(retry_kind or "").strip().lower()
+        if normalized_kind == "refresh_readiness":
+            self.retry_runtime_readiness_refresh()
+            return
+        if normalized_kind == "accept_dispatch":
+            self.retry_runtime_dispatch_acceptance()
 
     def _runtime_requested_show_set_ids(self, fallback_set_ids: Sequence[str]) -> tuple[str, ...]:
         requested: Sequence[str] = ()
@@ -1687,8 +1736,15 @@ class SimulationController(QtCore.QObject):
                     timer.stop()
             if bool(getattr(effect, "start_completion_polling", False)):
                 self._start_batch_completion_poll_timer()
-            if bool(getattr(effect, "schedule_runtime_warmup_retry", False)):
-                QtCore.QTimer.singleShot(0, self.retry_runtime_readiness)
+            cancel_retry_kinds = tuple(getattr(effect, "cancel_warmup_retry_kinds", ()) or ())
+            if cancel_retry_kinds:
+                self._cancel_runtime_warmup_retries(*cancel_retry_kinds)
+            warmup_retry_kind = str(getattr(effect, "warmup_retry_kind", "") or "").strip().lower()
+            if warmup_retry_kind:
+                self._schedule_runtime_warmup_retry(
+                    retry_kind=warmup_retry_kind,
+                    delay_ms=int(getattr(effect, "warmup_retry_delay_ms", 0) or 50),
+                )
             render_state = getattr(effect, "render_state", None)
             if render_state is not None:
                 self.runtime_readiness_render_requested.emit(render_state)
@@ -1746,14 +1802,14 @@ class SimulationController(QtCore.QObject):
         pool recreation on every minor parameter update.
         """
         state = self._batch_context_owner.active_batch_state()
-        if state is not None and state.active and (state.runtime_task_queue or state.parallel):
-            self._batch_context_owner.deactivate()
 
         self._clear_pending_slider_plot_updates()
 
         self._apply_runtime_lifecycle_ui_effects(
             self._runtime_orchestrator.cancel_requested(kind="soft_supersede")
         )
+        if state is not None and state.active and (state.runtime_task_queue or state.parallel):
+            self._batch_context_owner.deactivate()
 
         if bool(getattr(self, "_debug_batch_parallel", False)):
             logger.info("BATCH_PAR soft-supersede requested")
@@ -1798,28 +1854,21 @@ class SimulationController(QtCore.QObject):
                     exc,
                 )
         state = self._batch_context_owner.active_batch_state()
-        if (
+        active_fast_runtime = bool(
             state is not None
             and state.active
             and (state.runtime_task_queue or state.parallel)
             and state.fast_mode
-        ):
+        )
+        if active_fast_runtime:
             self._supersede_parallel_batch_run_soft()
         has_active_explicit_simulation = self._has_active_explicit_simulation()
         self.ui.slider.set_slider_triggered_simulation(False)
-        self._slider_simulation_active = False
-        if has_active_explicit_simulation:
-            return
-        self._simulation_running = False
-        try:
-            self.ui.run_ui.set_run_button_enabled(True)
-            self.ui.run_ui.set_stop_button_enabled(False)
-            self.ui.run_ui.set_status_text("Ready")
-            self.ui.run_ui.set_sim_progress_value(0)
-        except Exception as exc:
-            self._record_nonfatal_exception(
-                "Failed to reset Run/Stop/status/progress after invalidating slider preview work",
-                exc,
+        if not active_fast_runtime:
+            self._apply_runtime_lifecycle_ui_effects(
+                self._runtime_orchestrator.preview_invalidation_settled(
+                    has_active_explicit_simulation=bool(has_active_explicit_simulation),
+                )
             )
 
     def _invalidate_active_explicit_simulation_for_authoritative_change(self) -> None:
@@ -2627,15 +2676,11 @@ class SimulationController(QtCore.QObject):
     # ------------------------------------------------------------------
     def _cancel_active_run_for_restart(self) -> None:
         state = self._batch_context_owner.active_batch_state()
-        if state is not None and state.active:
-            self._batch_context_owner.deactivate()
         self._apply_runtime_lifecycle_ui_effects(
             self._runtime_orchestrator.cancel_requested(kind="shutdown")
         )
-        self._simulation_running = False
-        self._slider_simulation_active = False
-        self.ui.run_ui.set_run_button_enabled(True)
-        self.ui.run_ui.set_stop_button_enabled(False)
+        if state is not None and state.active:
+            self._batch_context_owner.deactivate()
 
     def _clear_slider_triggered_preflight_state(self, *, fast_mode: bool) -> None:
         if bool(fast_mode):
@@ -2755,11 +2800,11 @@ class SimulationController(QtCore.QObject):
             status_text = "Preview unavailable. Adjust sliders or run again."
         logger.warning("Preview simulation failed without modal: %s", error_text)
 
-        if isinstance(context, Mapping):
-            self._batch_context_owner.deactivate_if_active(context)
         self._apply_runtime_lifecycle_ui_effects(
             self._runtime_orchestrator.cancel_requested(kind="preview_failure")
         )
+        if isinstance(context, Mapping):
+            self._batch_context_owner.deactivate_if_active(context)
         self._apply_simulation_lifecycle_effects(
             self._lifecycle_effect_owner.current_preview_failure_effects(
                 status_text=str(status_text),
@@ -2773,14 +2818,8 @@ class SimulationController(QtCore.QObject):
         logger.info("Stop simulation requested")
 
         state = self._batch_context_owner.active_batch_state()
-        if state is not None and state.active:
-            self._batch_context_owner.deactivate()
         self._apply_runtime_lifecycle_ui_effects(
             self._runtime_orchestrator.cancel_requested(kind="shutdown")
         )
-
-        self._simulation_running = False
-        self.ui.run_ui.set_run_button_enabled(True)
-        self.ui.run_ui.set_stop_button_enabled(False)
-        self.ui.run_ui.set_status_text("Ready")
-        self.ui.run_ui.set_sim_progress_value(0)
+        if state is not None and state.active:
+            self._batch_context_owner.deactivate()

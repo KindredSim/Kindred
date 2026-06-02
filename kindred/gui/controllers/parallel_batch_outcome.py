@@ -265,14 +265,14 @@ class ParallelBatchOutcomeOwner:
                 RuntimeError("stale batch lane outcome"),
             )
             if isinstance(runtime_session_stale, Mapping):
-                return RuntimeCompletionDecision.ignored_stale()
+                return RuntimeCompletionDecision.ignored_stale(consumed=False)
             self._deps.cancel_runtime_for_parallel_outcome_reset()
             self._deps.set_simulation_running(False)
             self._deps.set_slider_simulation_active(False)
             self._ui.slider.set_slider_triggered_simulation(False)
             self._ui.run_ui.set_run_button_enabled(True)
             self._ui.run_ui.set_stop_button_enabled(False)
-            return RuntimeCompletionDecision.ignored_stale()
+            return RuntimeCompletionDecision.ignored_stale(consumed=False)
 
         if callback_identity is None or resolved_run_context is None:
             self._deps.record_nonfatal_exception(
@@ -298,7 +298,7 @@ class ParallelBatchOutcomeOwner:
 
         freshness = self._deps.freshness.assess_callback(callback_identity, context=resolved_run_context)
         if freshness.stale_run and int(freshness.active_run_id) > 0:
-            return RuntimeCompletionDecision.ignored_stale()
+            return RuntimeCompletionDecision.ignored_stale(consumed=False)
         if freshness.dispatch_identity_stale:
             self._deps.freshness.mark_stale_dispatch_identity_callback_consumed(
                 batch_set_id=sid,

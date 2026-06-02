@@ -68,7 +68,7 @@ class CompletionResultState:
 @dataclass(frozen=True)
 class SimulationCompletionPublicationDependencies:
     apply_lifecycle_effects: Callable[..., None]
-    runtime_display_completed: Callable[[str], Any]
+    runtime_display_completed: Callable[..., Any]
     record_nonfatal_exception: Callable[[str, BaseException], None]
     current_mechanism_species_names: Callable[[], Sequence[str]]
     queue_slider_plot_update: Callable[..., None]
@@ -1033,7 +1033,7 @@ class SimulationCompletionPublicationOwner:
         finally:
             cleanup_state = self._batch_context_owner.completion_cleanup_state(context)
             self._deps.runtime_display_completed(
-                self._lifecycle_effect_owner.runtime_display_completion_kind(cleanup_state)
+                kind=self._lifecycle_effect_owner.runtime_display_completion_kind(cleanup_state)
             )
             self._deps.apply_lifecycle_effects(
                 SimulationLifecycleEffects(
@@ -1053,7 +1053,7 @@ class SimulationCompletionPublicationOwner:
         cleanup_context = state.ctx if isinstance(state.ctx, Mapping) else {}
         cleanup_state = self._batch_context_owner.completion_cleanup_state(cleanup_context)
         self._deps.runtime_display_completed(
-            self._lifecycle_effect_owner.runtime_display_completion_kind(
+            kind=self._lifecycle_effect_owner.runtime_display_completion_kind(
                 cleanup_state,
                 stale_fast_handoff_after_display=bool(state.stale_fast_handoff_after_display),
             )
