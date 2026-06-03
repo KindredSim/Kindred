@@ -30,6 +30,7 @@ from kindred.core.analysis.fit_dataset_payload import (
     coerce_fit_dataset_specs,
     read_fit_dataset_payload,
 )
+from kindred.core.datasets.observation_payload import copy_observations_map, dense_view_from_observations
 from kindred.core.analysis.dataset_parameter_overrides import (
     coerce_fit_dataset_parameter_overrides,
     split_fit_dataset_parameter_overrides,
@@ -421,11 +422,19 @@ class FittingWindow(QtWidgets.QDialog):
             ds_id = str(entry.get("id") or "").strip()
             if not ds_id or ds_id in self._loaded_dataset_pool:
                 continue
+            observations = (
+                copy_observations_map(entry.get("observations"))
+                if isinstance(entry.get("observations"), dict)
+                else {}
+            )
             try:
                 t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1).copy()
             except Exception:
                 t_values = np.asarray([], dtype=float)
-            raw_series = entry.get("species_data") or entry.get("species") or {}
+            if observations:
+                t_values, raw_series = dense_view_from_observations(observations)
+            else:
+                raw_series = entry.get("species_data") or entry.get("species") or {}
             series_map: dict[str, np.ndarray] = {}
             series_failures: list[str] = []
             if isinstance(raw_series, dict):
@@ -451,6 +460,7 @@ class FittingWindow(QtWidgets.QDialog):
             self._loaded_dataset_pool[ds_id] = {
                 "id": ds_id,
                 "label": str(entry.get("label") or ds_id),
+                "observations": observations,
                 "t": t_values,
                 "species_data": series_map,
             }
@@ -1039,6 +1049,11 @@ class FittingWindow(QtWidgets.QDialog):
                     else FitDatasetPayloadResult.absent()
                 )
                 continue
+            observations = (
+                copy_observations_map(entry.get("observations"))
+                if isinstance(entry.get("observations"), dict)
+                else None
+            )
             series_map = entry.get("species_data") or {}
             t_values = entry.get("t", np.asarray([]))
             x_name = str(entry.get("x_name") or "t").strip() or "t"
@@ -1046,6 +1061,7 @@ class FittingWindow(QtWidgets.QDialog):
             x_mapping_mode = str(entry.get("x_mapping_mode") or "auto").strip() or "auto"
             result = read_fit_dataset_payload(
                 dataset_id=ds_id,
+                observations=observations,
                 t=t_values,
                 species_data=series_map,
                 selected_species=selection,
@@ -1068,8 +1084,16 @@ class FittingWindow(QtWidgets.QDialog):
         normalized: List[Dict[str, Any]] = []
         for entry in entries or []:
             dataset_id = str(entry.get("id", entry.get("label", "dataset")))
-            t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1)
-            species_data_raw = entry.get("species_data") or entry.get("species") or {}
+            observations = (
+                copy_observations_map(entry.get("observations"))
+                if isinstance(entry.get("observations"), dict)
+                else {}
+            )
+            if observations:
+                t_values, species_data_raw = dense_view_from_observations(observations)
+            else:
+                t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1)
+                species_data_raw = entry.get("species_data") or entry.get("species") or {}
             species_data: Dict[str, np.ndarray] = {}
             for species_name, values in species_data_raw.items():
                 try:
@@ -1094,6 +1118,7 @@ class FittingWindow(QtWidgets.QDialog):
                 {
                     "id": dataset_id,
                     "label": str(entry.get("label", "") or "").strip() or dataset_id,
+                    "observations": observations,
                     "t": t_values,
                     "species_data": species_data,
                     "selected_species": list(selected_species),
@@ -1808,6 +1833,11 @@ class FittingWindow(QtWidgets.QDialog):
             pool_entry = self._loaded_dataset_pool.get(ds_id)
             if not isinstance(pool_entry, dict):
                 continue
+            observations = (
+                copy_observations_map(pool_entry.get("observations"))
+                if isinstance(pool_entry.get("observations"), dict)
+                else {}
+            )
             t_values = np.asarray(pool_entry.get("t", []), dtype=float).reshape(-1).copy()
             full_series = pool_entry.get("species_data") or {}
             series_map: Dict[str, np.ndarray] = {}
@@ -1835,6 +1865,7 @@ class FittingWindow(QtWidgets.QDialog):
                 {
                     "id": ds_id,
                     "label": str(pool_entry.get("label", "") or "").strip() or ds_id,
+                    "observations": observations,
                     "t": t_values,
                     "species_data": {},  # applied selection starts empty
                     "selected_species": [],

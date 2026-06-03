@@ -167,4 +167,4 @@ def test_float_stringification_roundtrips_cleanly_through_parse_csv_rows(tmp_pat
 
     assert rows[0]["A"] == repr(value)
     _time_source, payload = parse_csv_rows(rows)
-    assert payload["species"]["A"][0] == value
+    assert payload["observations"]["A"]["y"][0] == value

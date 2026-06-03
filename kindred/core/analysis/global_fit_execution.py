@@ -41,6 +41,7 @@ from kindred.core.simulation_failure import (
 )
 from kindred.core.simulation_series_payload import coerce_simulation_series_payload
 from kindred.core.analysis.x_mapping import normalize_x_mapping_mode
+from kindred.core.datasets.observation_payload import copy_observations_map, observations_have_points
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,7 @@ class DatasetFitInfo:
     t_obs: Optional[np.ndarray] = None  # Observed time values used for fitting
     x_name: str = "t"  # Observed X-axis name for render projection
     x_obs: Optional[np.ndarray] = None  # Observed non-time X values when x_name != "t"
+    observed_x_by_species: Dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass
@@ -129,7 +131,9 @@ class GlobalFitResult:
     model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     residual_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     plot_observed_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
+    plot_observed_x: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     plot_model_x: Dict[str, np.ndarray] = field(default_factory=dict)
+    plot_model_x_by_species: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     plot_model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     alignment_report: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
@@ -413,6 +417,45 @@ def _align_series(series: np.ndarray, sim_time: Optional[np.ndarray], target_tim
     raise ValueError(
         f"Simulation output has {values.size} points but dataset uses {target_time.size}.",
     )
+
+
+def _payload_observations(payload: FitDatasetSpec) -> Dict[str, Dict[str, np.ndarray]]:
+    observations = copy_observations_map(getattr(payload, "observations", None))
+    if observations_have_points(observations):
+        return observations
+    t_exp = np.asarray(payload.t_exp, dtype=float).reshape(-1)
+    fallback: Dict[str, Dict[str, np.ndarray]] = {}
+    for idx, species_name in enumerate(payload.species_list):
+        values = np.asarray(payload.y_matrix[idx], dtype=float).reshape(-1)
+        finite_mask = np.isfinite(values)
+        fallback[str(species_name)] = {
+            "t": t_exp[finite_mask].copy(),
+            "y": values[finite_mask].copy(),
+        }
+    return fallback
+
+
+def _payload_x_obs_by_species(payload: FitDatasetSpec) -> Dict[str, np.ndarray]:
+    return {
+        str(name): np.asarray(values, dtype=float).reshape(-1)
+        for name, values in dict(getattr(payload, "x_obs_by_species", None) or {}).items()
+        if str(name).strip()
+    }
+
+
+def _shared_axis_or_empty(axis_map: Mapping[str, np.ndarray]) -> np.ndarray:
+    normalized = [
+        np.asarray(values, dtype=float).reshape(-1)
+        for name, values in dict(axis_map or {}).items()
+        if str(name).strip()
+    ]
+    if not normalized:
+        return np.asarray([], dtype=float)
+    reference = normalized[0]
+    for candidate in normalized[1:]:
+        if candidate.size != reference.size or not np.allclose(candidate, reference):
+            return np.asarray([], dtype=float)
+    return reference.copy()
 
 
 @dataclass(frozen=True)
@@ -1117,10 +1160,9 @@ class GlobalFitObjective:
             payload = item.payload
             ds_id = payload.dataset_id
             species_list = payload.species_list
-            y_matrix = payload.y_matrix
-            t_exp = payload.t_exp
+            observations = _payload_observations(payload)
             x_name = payload.x_name
-            x_obs = payload.x_obs if x_name != "t" else None
+            x_obs_by_species = _payload_x_obs_by_species(payload) if x_name != "t" else {}
             x_mode = payload.x_mode
             weight = self._weights.get(ds_id, 1.0)
             target_weights = dict(getattr(payload, "target_weights", {}) or {})
@@ -1151,38 +1193,43 @@ class GlobalFitObjective:
                 if key not in self._warned_objective_keys:
                     self._warned_objective_keys.add(key)
                     logger.warning("Simulation failed for %s: %s", ds_id, exc)
-                for idx in range(int(y_matrix.shape[0])):
-                    species_name = str(species_list[idx])
+                for species_name in species_list:
                     target_weight = float(target_multipliers.get(species_name, 1.0))
-                    y_exp = np.asarray(y_matrix[idx], dtype=float).reshape(-1)
+                    y_exp = np.asarray(observations[species_name]["y"], dtype=float).reshape(-1)
                     all_residuals.extend(
                         (float(weight) * float(target_weight) * self._penalty_value) * np.ones_like(y_exp, dtype=float)
                     )
                 if x_name != "t" and x_mode in ("auto", "time_guided"):
-                    all_residuals.extend(
-                        (float(weight) * self._penalty_value)
-                        * np.ones_like(np.asarray(t_exp, dtype=float).reshape(-1), dtype=float)
-                    )
+                    for species_name in species_list:
+                        species_x_obs = (
+                            np.asarray(x_obs_by_species.get(species_name), dtype=float).reshape(-1)
+                            if species_name in x_obs_by_species
+                            else np.asarray([], dtype=float)
+                        )
+                        if species_x_obs.size == 0:
+                            continue
+                        target_weight = float(target_multipliers.get(species_name, 1.0))
+                        all_residuals.extend(
+                            (float(weight) * float(target_weight) * self._penalty_value)
+                            * np.ones_like(species_x_obs, dtype=float)
+                        )
                 continue
 
             sim_time = evaluation.sim_time
             sim_species = evaluation.sim_species
 
             need_dx_penalty = bool(x_name != "t" and x_mode in ("auto", "time_guided"))
-            dx_penalty_scale = 1.0
-            if need_dx_penalty and x_obs is not None:
-                try:
-                    y_span = _robust_span(y_matrix)
-                    x_span = _robust_span(x_obs)
-                    if y_span > 0.0:
-                        dx_penalty_scale = float(y_span / max(x_span, 1e-12))
-                except Exception:
-                    dx_penalty_scale = 1.0
-
-            aligner: Optional[_ParametricXAligner] = None
-            for idx, species_name in enumerate(species_list):
+            aligners: Dict[str, _ParametricXAligner] = {}
+            for species_name in species_list:
                 _raise_if_fitting_cancelled(self._cancellation_check)
-                y_exp = y_matrix[idx]
+                species_obs = observations[species_name]
+                obs_t = np.asarray(species_obs["t"], dtype=float).reshape(-1)
+                y_exp = np.asarray(species_obs["y"], dtype=float).reshape(-1)
+                species_x_obs = (
+                    np.asarray(x_obs_by_species.get(species_name), dtype=float).reshape(-1)
+                    if species_name in x_obs_by_species
+                    else None
+                )
                 target_weight = float(target_multipliers.get(str(species_name), 1.0))
                 effective_weight = float(weight) * float(target_weight)
                 model_series = sim_species.get(species_name)
@@ -1202,7 +1249,7 @@ class GlobalFitObjective:
 
                 try:
                     if x_name == "t":
-                        y_sim = _align_series(model_series, sim_time, t_exp)
+                        y_sim = _align_series(model_series, sim_time, obs_t)
                     else:
                         x_model_series = sim_species.get(x_name)
                         if x_model_series is None:
@@ -1210,21 +1257,23 @@ class GlobalFitObjective:
                                 f"X series '{x_name}' missing in simulation result for dataset '{ds_id}'.",
                                 failed_params=failed_param_snapshot,
                             )
-                        if x_obs is None:
+                        if species_x_obs is None:
                             raise FitSimulationError(
-                                f"Dataset '{ds_id}' is missing x_obs for X='{x_name}'.",
+                                f"Dataset '{ds_id}' species '{species_name}' is missing x observations for X='{x_name}'.",
                                 failed_params=failed_param_snapshot,
                             )
+                        aligner = aligners.get(species_name)
                         if aligner is None:
                             aligner = _ParametricXAligner(
                                 mode=x_mode,
-                                t_obs=t_exp,
-                                x_obs=x_obs,
+                                t_obs=obs_t,
+                                x_obs=species_x_obs,
                                 t_sim=sim_time,
                                 x_model=np.asarray(x_model_series, dtype=float),
                                 dataset_label=ds_id,
                                 x_name=x_name,
                             )
+                            aligners[species_name] = aligner
                         y_sim = aligner.align(
                             y_model=np.asarray(model_series, dtype=float),
                             y_name=species_name,
@@ -1296,30 +1345,36 @@ class GlobalFitObjective:
                     all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
                     continue
                 all_residuals.extend(np.asarray(residual_vector, dtype=float).reshape(-1))
-
-            if need_dx_penalty:
-                dx_block = None
-                if aligner is not None and aligner.mapping_dx is not None:
-                    dx_block = np.asarray(aligner.mapping_dx, dtype=float).reshape(-1)
-                if (
-                    dx_block is None
-                    or dx_block.size != np.asarray(t_exp, dtype=float).reshape(-1).size
-                    or not np.all(np.isfinite(dx_block))
-                ):
-                    all_residuals.extend(
-                        (float(weight) * self._penalty_value)
-                        * np.ones_like(np.asarray(t_exp, dtype=float).reshape(-1), dtype=float)
-                    )
-                else:
-                    lam = 1.0
-                    dx_resid = float(weight) * (lam * float(dx_penalty_scale) * dx_block)
-                    if not np.all(np.isfinite(dx_resid)):
+                if need_dx_penalty:
+                    aligner = aligners.get(species_name)
+                    dx_block = None
+                    if aligner is not None and aligner.mapping_dx is not None:
+                        dx_block = np.asarray(aligner.mapping_dx, dtype=float).reshape(-1)
+                    if (
+                        dx_block is None
+                        or species_x_obs is None
+                        or dx_block.size != species_x_obs.size
+                        or not np.all(np.isfinite(dx_block))
+                    ):
                         all_residuals.extend(
-                            (float(weight) * self._penalty_value)
-                            * np.ones_like(np.asarray(t_exp, dtype=float).reshape(-1), dtype=float)
+                            (effective_weight * self._penalty_value)
+                            * np.ones_like(y_exp, dtype=float)
                         )
                     else:
-                        all_residuals.extend(np.asarray(dx_resid, dtype=float).reshape(-1))
+                        try:
+                            y_span = _robust_span(y_exp)
+                            x_span = _robust_span(species_x_obs)
+                            dx_penalty_scale = float(y_span / max(x_span, 1e-12)) if y_span > 0.0 else 1.0
+                        except Exception:
+                            dx_penalty_scale = 1.0
+                        dx_resid = effective_weight * (float(dx_penalty_scale) * dx_block)
+                        if not np.all(np.isfinite(dx_resid)):
+                            all_residuals.extend(
+                                (effective_weight * self._penalty_value)
+                                * np.ones_like(y_exp, dtype=float)
+                            )
+                        else:
+                            all_residuals.extend(np.asarray(dx_resid, dtype=float).reshape(-1))
 
         residuals = np.asarray(all_residuals, dtype=float).ravel()
 
@@ -1370,7 +1425,9 @@ def assemble_global_fit_result(
     model_series_map: Dict[str, Dict[str, np.ndarray]] = {}
     residual_series_map: Dict[str, Dict[str, np.ndarray]] = {}
     plot_observed_series_map: Dict[str, Dict[str, np.ndarray]] = {}
+    plot_observed_x_map: Dict[str, Dict[str, np.ndarray]] = {}
     plot_model_x_map: Dict[str, np.ndarray] = {}
+    plot_model_x_by_species_map: Dict[str, Dict[str, np.ndarray]] = {}
     plot_model_series_map: Dict[str, Dict[str, np.ndarray]] = {}
     final_dataset_failures: Dict[str, FitDiagnostic] = {}
     final_dataset_warnings: Dict[str, str] = {}
@@ -1421,10 +1478,10 @@ def assemble_global_fit_result(
         payload = item.payload
         ds_id = payload.dataset_id
         species_list = payload.species_list
-        y_matrix = payload.y_matrix
         t_exp = payload.t_exp
+        observations = _payload_observations(payload)
         x_name = payload.x_name
-        x_obs = payload.x_obs if x_name != "t" else None
+        x_obs_by_species = _payload_x_obs_by_species(payload) if x_name != "t" else {}
         x_mode = payload.x_mode
         failed_param_snapshot = item.failed_param_snapshot
         _raise_if_fitting_cancelled(cancellation_check)
@@ -1466,33 +1523,43 @@ def assemble_global_fit_result(
             sim_species = evaluation.sim_species
 
         plot_mask: Optional[np.ndarray] = None
-        if x_name == "t":
-            plot_x = np.asarray(t_exp, dtype=float).reshape(-1)
-        else:
-            plot_x = np.asarray([], dtype=float)
-            if sim_time is not None and isinstance(sim_species, dict) and x_name in sim_species:
-                t0 = float(np.min(np.asarray(t_exp, dtype=float)))
-                t1 = float(np.max(np.asarray(t_exp, dtype=float)))
-                if t0 > t1:
-                    t0, t1 = t1, t0
-                t_scale = max(1.0, abs(t0), abs(t1))
-                t_pad = 1e-12 * t_scale
-                plot_mask = (sim_time >= (t0 - t_pad)) & (sim_time <= (t1 + t_pad))
-                if np.any(plot_mask):
-                    try:
-                        plot_x = np.asarray(sim_species.get(x_name), dtype=float).reshape(-1)[plot_mask]
-                    except Exception:
-                        plot_x = np.asarray([], dtype=float)
-        plot_model_x_map[ds_id] = np.asarray(plot_x, dtype=float).reshape(-1)
+        plot_x = np.asarray([], dtype=float)
+        if x_name != "t" and sim_time is not None and isinstance(sim_species, dict) and x_name in sim_species:
+            t0 = float(np.min(np.asarray(t_exp, dtype=float)))
+            t1 = float(np.max(np.asarray(t_exp, dtype=float)))
+            if t0 > t1:
+                t0, t1 = t1, t0
+            t_scale = max(1.0, abs(t0), abs(t1))
+            t_pad = 1e-12 * t_scale
+            plot_mask = (sim_time >= (t0 - t_pad)) & (sim_time <= (t1 + t_pad))
+            if np.any(plot_mask):
+                try:
+                    plot_x = np.asarray(sim_species.get(x_name), dtype=float).reshape(-1)[plot_mask]
+                except Exception:
+                    plot_x = np.asarray([], dtype=float)
 
         residual_blocks: List[np.ndarray] = []
         exp_blocks: List[np.ndarray] = []
-        aligner: Optional[_ParametricXAligner] = None
+        alignment_dx_blocks: List[np.ndarray] = []
+        alignment_exact_blocks: List[np.ndarray] = []
+        aligners: Dict[str, _ParametricXAligner] = {}
 
-        for idx, species_name in enumerate(species_list):
-            y_exp = np.asarray(y_matrix[idx], dtype=float).reshape(-1)
+        for species_name in species_list:
+            species_obs = observations[species_name]
+            obs_t = np.asarray(species_obs["t"], dtype=float).reshape(-1)
+            y_exp = np.asarray(species_obs["y"], dtype=float).reshape(-1)
+            species_x_obs = (
+                np.asarray(x_obs_by_species.get(species_name), dtype=float).reshape(-1)
+                if species_name in x_obs_by_species
+                else None
+            )
             exp_blocks.append(y_exp)
             plot_observed_series_map.setdefault(ds_id, {})[species_name] = y_exp.copy()
+            plot_observed_x_map.setdefault(ds_id, {})[species_name] = (
+                obs_t.copy()
+                if x_name == "t"
+                else np.asarray(species_x_obs, dtype=float).reshape(-1).copy()
+            )
             penalty_block = np.full_like(y_exp, penalty_value, dtype=float)
 
             if not (isinstance(sim_species, dict) and species_name in sim_species):
@@ -1511,7 +1578,7 @@ def assemble_global_fit_result(
                 continue
 
             try:
-                y_sim_time = _align_series(sim_species[species_name], sim_time, t_exp)
+                y_sim_time = _align_series(sim_species[species_name], sim_time, obs_t)
                 model_series_map.setdefault(ds_id, {})[species_name] = y_sim_time
             except Exception as exc:
                 if ds_id not in final_dataset_failures:
@@ -1535,21 +1602,23 @@ def assemble_global_fit_result(
                             f"X series '{x_name}' missing in simulation result for dataset '{ds_id}'.",
                             failed_params=failed_param_snapshot,
                         )
-                    if x_obs is None:
+                    if species_x_obs is None:
                         raise FitSimulationError(
-                            f"Dataset '{ds_id}' is missing x_obs for X='{x_name}'.",
+                            f"Dataset '{ds_id}' species '{species_name}' is missing x observations for X='{x_name}'.",
                             failed_params=failed_param_snapshot,
                         )
+                    aligner = aligners.get(species_name)
                     if aligner is None:
                         aligner = _ParametricXAligner(
                             mode=x_mode,
-                            t_obs=t_exp,
-                            x_obs=x_obs,
+                            t_obs=obs_t,
+                            x_obs=species_x_obs,
                             t_sim=sim_time,
                             x_model=np.asarray(x_model_series, dtype=float),
                             dataset_label=ds_id,
                             x_name=x_name,
                         )
+                        aligners[species_name] = aligner
                     y_sim_resid = aligner.align(
                         y_model=np.asarray(sim_species[species_name], dtype=float),
                         y_name=species_name,
@@ -1586,24 +1655,36 @@ def assemble_global_fit_result(
                 residual_series_map.setdefault(ds_id, {})[species_name] = raw_residual
 
             if x_name == "t":
-                plot_model_series_map.setdefault(ds_id, {})[species_name] = y_sim_time
+                plot_model_series_map.setdefault(ds_id, {})[species_name] = np.asarray(y_sim_resid, dtype=float).reshape(-1)
+                plot_model_x_by_species_map.setdefault(ds_id, {})[species_name] = obs_t.copy()
             else:
+                sliced = None
                 if plot_mask is not None and isinstance(sim_species, dict) and species_name in sim_species:
                     values = np.asarray(sim_species[species_name], dtype=float).reshape(-1)
                     try:
                         sliced = np.asarray(values[plot_mask], dtype=float).reshape(-1)
                     except (IndexError, TypeError, ValueError):
                         sliced = None
-                    if sliced is not None:
-                        plot_model_series_map.setdefault(ds_id, {})[species_name] = sliced
+                if sliced is not None and plot_x.size == sliced.size:
+                    plot_model_series_map.setdefault(ds_id, {})[species_name] = sliced
+                    plot_model_x_by_species_map.setdefault(ds_id, {})[species_name] = plot_x.copy()
+                else:
+                    plot_model_series_map.setdefault(ds_id, {})[species_name] = np.asarray(y_sim_resid, dtype=float).reshape(-1)
+                    plot_model_x_by_species_map.setdefault(ds_id, {})[species_name] = np.asarray(species_x_obs, dtype=float).reshape(-1).copy()
 
-        if aligner is not None and aligner.penalized_out is not None and x_name != "t" and x_obs is not None:
-            try:
-                dx = np.asarray(aligner.penalized_out.dx, dtype=float).reshape(-1)
-                exact = np.asarray(aligner.penalized_out.exact, dtype=bool).reshape(-1)
-            except Exception:
-                dx = np.asarray([], dtype=float)
-                exact = np.asarray([], dtype=bool)
+            aligner = aligners.get(species_name)
+            if aligner is not None and aligner.penalized_out is not None and x_name != "t" and species_x_obs is not None:
+                try:
+                    alignment_dx_blocks.append(np.asarray(aligner.penalized_out.dx, dtype=float).reshape(-1))
+                    alignment_exact_blocks.append(np.asarray(aligner.penalized_out.exact, dtype=bool).reshape(-1))
+                except Exception:
+                    pass
+
+        plot_model_x_map[ds_id] = _shared_axis_or_empty(plot_model_x_by_species_map.get(ds_id, {}))
+
+        if alignment_dx_blocks and x_name != "t":
+            dx = np.concatenate(alignment_dx_blocks)
+            exact = np.concatenate(alignment_exact_blocks) if alignment_exact_blocks else np.asarray([], dtype=bool)
             abs_dx = np.abs(dx[np.isfinite(dx)])
             max_abs_dx = float(np.max(abs_dx)) if abs_dx.size else float("inf")
             med_abs_dx = float(np.median(abs_dx)) if abs_dx.size else float("inf")
@@ -1616,7 +1697,12 @@ def assemble_global_fit_result(
                 "median_abs_dx": med_abs_dx,
             }
             if bool(np.any(~exact)):
-                x_span = _robust_span(x_obs)
+                x_blocks = [
+                    np.asarray(values, dtype=float).reshape(-1)
+                    for values in x_obs_by_species.values()
+                    if np.asarray(values, dtype=float).reshape(-1).size
+                ]
+                x_span = _robust_span(np.concatenate(x_blocks)) if x_blocks else 0.0
                 rel = (max_abs_dx / max(x_span, 1e-12)) if np.isfinite(max_abs_dx) else float("inf")
                 if ds_id not in final_dataset_warnings:
                     final_dataset_warnings[ds_id] = (
@@ -1638,6 +1724,11 @@ def assemble_global_fit_result(
         rmse = np.sqrt(np.mean(residuals**2)) if residuals.size else float(penalty_value)
         mae = np.mean(np.abs(residuals)) if residuals.size else float(penalty_value)
 
+        observed_axis_by_species = {
+            str(name): np.asarray(values, dtype=float).reshape(-1)
+            for name, values in dict(plot_observed_x_map.get(ds_id, {})).items()
+        }
+        shared_observed_axis = _shared_axis_or_empty(observed_axis_by_species)
         dataset_info.append(
             DatasetFitInfo(
                 dataset_id=ds_id,
@@ -1648,9 +1739,10 @@ def assemble_global_fit_result(
                 residuals=residuals,
                 n_points=int(residuals.size),
                 weight=weights.get(ds_id, 1.0),
-                t_obs=np.asarray(t_exp, dtype=float).reshape(-1),
+                t_obs=shared_observed_axis.copy() if x_name == "t" and shared_observed_axis.size else None,
                 x_name=x_name,
-                x_obs=None if x_obs is None else np.asarray(x_obs, dtype=float).reshape(-1),
+                x_obs=shared_observed_axis.copy() if x_name != "t" and shared_observed_axis.size else None,
+                observed_x_by_species=observed_axis_by_species,
             )
         )
 
@@ -1747,7 +1839,9 @@ def assemble_global_fit_result(
         model_series=model_series_map,
         residual_series=residual_series_map,
         plot_observed_series=plot_observed_series_map,
+        plot_observed_x=plot_observed_x_map,
         plot_model_x=plot_model_x_map,
+        plot_model_x_by_species=plot_model_x_by_species_map,
         plot_model_series=plot_model_series_map,
         alignment_report=dict(alignment_report),
     )

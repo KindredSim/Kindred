@@ -786,7 +786,7 @@ class RunResultsTab(QtWidgets.QWidget):
         }
         current_species = fitted_species[0]
         data_x = (
-            dataset_projection.observed_x
+            dataset_projection.observed_x_for_species(current_species)
             if dataset_projection is not None
             else _as_float_array(entry.get("x_obs", entry.get("t")))
         )

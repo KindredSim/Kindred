@@ -9,8 +9,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
-import numpy as np
-
+from kindred.core.datasets.observation_payload import observations_from_payload, seeded_values_at_t0
 from .validation import validate_name
 
 __all__ = [
@@ -26,7 +25,7 @@ __all__ = [
     "strip_named_reaction_dsl_initial_concentration_sets",
     "strip_reaction_dsl_initial_concentrations",
     "resolve_run_scope",
-    "seed_batch_set_from_dataset_first_row",
+    "seed_batch_set_from_dataset_observations",
 ]
 
 
@@ -1052,38 +1051,17 @@ def dataset_base_label(name: str) -> str:
     return base
 
 
-def seed_batch_set_from_dataset_first_row(
+def seed_batch_set_from_dataset_observations(
     dataset: Dict[str, object],
     mechanism_species: Sequence[str],
     *,
     tol: float,
 ) -> Dict[str, float]:
-    """
-    If dataset starts at ~t=0 (abs(t0)<=tol), seed species present from row 0 and
-    missing species to 0. Otherwise return empty dict.
-    """
-    try:
-        t = np.asarray((dataset or {}).get("t", []), dtype=float).reshape(-1)
-    except Exception:
-        t = np.asarray([], dtype=float)
-    if t.size == 0:
+    observations = observations_from_payload(dataset)
+    if not observations:
         return {}
-    t0 = float(t[0])
-    if not (abs(t0) <= float(tol)):
-        return {}
-    species_map = (dataset or {}).get("species") or {}
-    if not isinstance(species_map, dict):
-        species_map = {}
-
-    seeded: Dict[str, float] = {}
-    for sp in mechanism_species:
-        sp_name = str(sp)
-        if sp_name in species_map:
-            try:
-                y = np.asarray(species_map[sp_name], dtype=float).reshape(-1)
-                seeded[sp_name] = float(y[0]) if y.size else 0.0
-            except Exception:
-                seeded[sp_name] = 0.0
-        else:
-            seeded[sp_name] = 0.0
-    return seeded
+    return seeded_values_at_t0(
+        observations,
+        mechanism_species=mechanism_species,
+        tol=float(tol),
+    )

@@ -164,6 +164,16 @@ class GridPlotView(QtWidgets.QWidget):
         all_species = frozen.get("all_species")
         if isinstance(all_species, dict):
             frozen["all_species"] = {str(k): _freeze_1d(v) for k, v in all_species.items()}
+        all_observations = frozen.get("all_observations")
+        if isinstance(all_observations, dict):
+            frozen["all_observations"] = {
+                str(name): {
+                    "t": _freeze_1d((spec or {}).get("t", [])),
+                    "y": _freeze_1d((spec or {}).get("y", [])),
+                }
+                for name, spec in all_observations.items()
+                if str(name)
+            }
         if "current_species" in frozen:
             frozen["current_species"] = str(frozen.get("current_species") or "")
         if "x_label" in frozen:
@@ -432,6 +442,12 @@ class GridPlotView(QtWidgets.QWidget):
         color_manager = ColorManager.instance()
         available_species = []
         for dataset in self._datasets:
+            fit_projection = dataset.get("fit_render_projection")
+            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
+                available_species.extend(str(name) for name in fit_projection.observed_series.keys() if str(name))
+                continue
+            all_observations = dataset.get("all_observations", {}) if isinstance(dataset.get("all_observations", {}), dict) else {}
+            available_species.extend(str(name) for name in all_observations.keys() if str(name))
             all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
             available_species.extend(str(name) for name in all_species.keys() if str(name))
         color_manager.seed_species(available_species)
@@ -447,12 +463,11 @@ class GridPlotView(QtWidgets.QWidget):
             chi_squared = dataset.get("chi_squared")
             r_squared = dataset.get("r_squared")
             all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
+            all_observations = dataset.get("all_observations", {}) if isinstance(dataset.get("all_observations", {}), dict) else {}
             fit_projection = dataset.get("fit_render_projection")
             if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
-                model_x = fit_projection.model_x
                 model_series = fit_projection.model_series
             else:
-                model_x = None
                 model_series = {}
 
             try:
@@ -508,8 +523,25 @@ class GridPlotView(QtWidgets.QWidget):
                 data_key = f"{species_name}::data"
                 model_key = f"{species_name}::model"
 
-                if species_name in all_species:
+                projection_active = isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok"
+                observation_spec = all_observations.get(species_name) if isinstance(all_observations.get(species_name), dict) else None
+                if projection_active and species_name in fit_projection.observed_series:
+                    y_data = np.asarray(fit_projection.observed_series[species_name], dtype=float).reshape(-1)
+                    species_data_x = fit_projection.observed_x_for_species(species_name)
+                elif observation_spec is not None:
+                    y_data = np.asarray(observation_spec.get("y", []), dtype=float).reshape(-1)
+                    species_data_x = np.asarray(observation_spec.get("t", []), dtype=float).reshape(-1)
+                elif species_name in all_species:
                     y_data = np.asarray(all_species[species_name], dtype=float).reshape(-1)
+                    species_data_x = (
+                        fit_projection.observed_x_for_species(species_name)
+                        if projection_active
+                        else data_x
+                    )
+                else:
+                    y_data = None
+                    species_data_x = np.asarray([], dtype=float)
+                if y_data is not None:
                     data_item = self._ensure_curve_item(
                         plot,
                         idx,
@@ -524,18 +556,18 @@ class GridPlotView(QtWidgets.QWidget):
                             data_item.setSymbolSize(5)
                             data_item.setSymbolBrush(self._pg.mkBrush(*color_rgb, 150))
                             data_item.setSymbolPen(self._pg.mkPen(color=color_rgb, width=1))
-                            if data_x.size == y_data.size:
-                                data_item.setData(data_x, y_data)
+                            if species_data_x.size == y_data.size:
+                                data_item.setData(species_data_x, y_data)
                                 data_item.setVisible(True)
                             else:
-                                warn_key = (str(name or ""), data_key, int(data_x.size), int(y_data.size))
+                                warn_key = (str(name or ""), data_key, int(species_data_x.size), int(y_data.size))
                                 if warn_key not in self._warned_shape_mismatches:
                                     self._warned_shape_mismatches.add(warn_key)
                                     logger.warning(
                                         "GridPlotView: skip data curve with shape mismatch dataset=%s series=%s x_len=%d y_len=%d",
                                         name,
                                         species_name,
-                                        int(data_x.size),
+                                        int(species_data_x.size),
                                         int(y_data.size),
                                     )
                                 try:
@@ -565,16 +597,13 @@ class GridPlotView(QtWidgets.QWidget):
                     if isinstance(model_series, dict) and species_name in model_series:
                         y_model = model_series[species_name]
 
-                    if y_model is not None and model_x is not None:
+                    if y_model is not None:
                         try:
                             y_model_arr = np.asarray(y_model, dtype=float).reshape(-1)
                         except Exception:
                             y_model_arr = None
                         if y_model_arr is not None:
-                            try:
-                                x_model_arr = np.asarray(model_x, dtype=float).reshape(-1)
-                            except Exception:
-                                x_model_arr = None
+                            x_model_arr = fit_projection.model_x_for_species(species_name) if projection_active else None
                             if x_model_arr is None:
                                 continue
                             model_item = self._ensure_curve_item(
@@ -986,6 +1015,13 @@ class GridPlotView(QtWidgets.QWidget):
         all_species_names = set()
 
         for dataset in self._datasets:
+            fit_projection = dataset.get("fit_render_projection")
+            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
+                all_species_names.update(str(name) for name in fit_projection.observed_series.keys() if str(name))
+                continue
+            all_observations = dataset.get("all_observations", {})
+            if isinstance(all_observations, dict):
+                all_species_names.update(str(name) for name in all_observations.keys() if str(name))
             all_species = dataset.get('all_species', {})
             all_species_names.update(all_species.keys())
 

@@ -7,6 +7,7 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from kindred.core.datasets.observation_payload import observations_have_points
 from kindred.gui.dataset_payload_snapshot import copy_dataset_payload
 from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 
@@ -47,8 +48,8 @@ class DatasetRegistry:
 
     def commit_dataset(self, display_name: str, payload: Dict[str, Any]) -> DatasetRecord:
         clean_payload = self._copy_payload(payload)
-        species = clean_payload.get("species")
-        if not isinstance(species, dict) or not species:
+        observations = clean_payload.get("observations")
+        if not isinstance(observations, dict) or not observations_have_points(observations):
             raise DatasetOwnerError("Dataset contains no numeric species columns.")
         unique_name = self._unique_display_name(str(display_name))
         dataset_id = self._allocate_id()

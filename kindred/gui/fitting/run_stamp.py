@@ -159,16 +159,27 @@ def _normalize_dataset_specs_block(dataset_specs: Optional[Sequence[object]]) ->
     for spec in dataset_specs:
         if not isinstance(spec, FitDatasetSpec):
             return None
-        x_obs_block = None if spec.x_obs is None else _array_identity_block(spec.x_obs)
+        observations_block = {
+            str(name): {
+                "t": _array_identity_block(values.get("t", [])),
+                "y": _array_identity_block(values.get("y", [])),
+            }
+            for name, values in sorted((spec.observations or {}).items())
+            if str(name).strip()
+        }
+        x_obs_by_species_block = {
+            str(name): _array_identity_block(values)
+            for name, values in sorted((getattr(spec, "x_obs_by_species", None) or {}).items())
+            if str(name).strip()
+        }
         normalized.append(
             {
                 "id": str(spec.dataset_id),
-                "t": _array_identity_block(spec.t_exp),
                 "species": [str(name) for name in spec.species_list],
-                "y": _array_identity_block(spec.y_matrix),
                 "point_count": int(spec.point_count),
+                "observations": observations_block,
                 "x_name": str(spec.x_name),
-                "x_obs": x_obs_block,
+                "x_obs_by_species": x_obs_by_species_block,
                 "x_mapping_mode": str(spec.x_mode),
                 "target_weights": {
                     str(name): _float_to_canonical_str(value)
@@ -177,6 +188,10 @@ def _normalize_dataset_specs_block(dataset_specs: Optional[Sequence[object]]) ->
                 },
             }
         )
+        if not observations_block:
+            normalized[-1]["t"] = _array_identity_block(spec.t_exp)
+            normalized[-1]["y"] = _array_identity_block(spec.y_matrix)
+            normalized[-1]["x_obs"] = None if spec.x_obs is None else _array_identity_block(spec.x_obs)
     return sorted(normalized, key=lambda item: str(item["id"]))
 
 

@@ -16,6 +16,11 @@ from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetPayloadResult,
     read_fit_dataset_payload,
 )
+from kindred.core.datasets.observation_payload import (
+    copy_observations_map,
+    dense_view_from_observations,
+    observations_from_payload,
+)
 from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
 from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 from kindred.gui.fitting.batch_mapping import (
@@ -256,16 +261,15 @@ def _record_failure(
 def _coerce_dataset_payload(
     *,
     dataset_id: str,
-    t_values: np.ndarray,
-    species_map: Dict[str, np.ndarray],
+    observations: Mapping[str, Mapping[str, object]],
 ) -> FitDatasetPayloadResult:
-    if not species_map:
+    observations_map = copy_observations_map(observations)
+    if not observations_map:
         return FitDatasetPayloadResult.absent()
     return read_fit_dataset_payload(
         dataset_id=str(dataset_id),
-        t=np.asarray(t_values, dtype=float).reshape(-1),
-        species_data={str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in species_map.items()},
-        selected_species=list(species_map.keys()),
+        observations=observations_map,
+        selected_species=list(observations_map.keys()),
     )
 
 
@@ -299,8 +303,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
 
     has_any_species = False
     for payload in (datasets_map or {}).values():
-        species_map = (payload or {}).get("species") or {}
-        if isinstance(species_map, dict) and species_map:
+        if observations_from_payload(payload):
             has_any_species = True
             break
     if not has_any_species:
@@ -429,8 +432,13 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                 apply_batch_mapping_to_settings(settings, batch_store, target_set)
                 if created and batch_store is not None and not seeded:
                     try:
-                        t_arr = np.asarray((dataset_payload or {}).get("t", []), dtype=float).reshape(-1)
-                        t0 = float(t_arr[0]) if t_arr.size else float("nan")
+                        all_times = []
+                        for spec in observations_from_payload(dataset_payload).values():
+                            t_arr = np.asarray(spec.get("t", []), dtype=float).reshape(-1)
+                            finite_times = t_arr[np.isfinite(t_arr)]
+                            if finite_times.size:
+                                all_times.extend(float(value) for value in finite_times)
+                        t0 = float(min(all_times)) if all_times else float("nan")
                     except Exception:
                         t0 = float("nan")
                     if not (abs(t0) <= T0_SEED_TOL_S):
@@ -526,8 +534,8 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
     dataset_payloads: List[Dict[str, object]] = []
     dataset_payload_results: Dict[str, object] = {}
     for dataset_id, payload in datasets_map.items():
-        t_values = np.asarray(payload.get("t", []), dtype=float).reshape(-1)
-        species_map = payload.get("species") or {}
+        observations = observations_from_payload(payload)
+        t_values, species_map = dense_view_from_observations(observations)
         series_map: Dict[str, np.ndarray] = {}
         if isinstance(species_map, dict):
             for name, values in species_map.items():
@@ -549,6 +557,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
             {
                 "id": str(dataset_id),
                 "label": display_name_by_id.get(str(dataset_id), str(dataset_id)),
+                "observations": copy_observations_map(observations),
                 "t": t_values,
                 "species_data": series_map,
                 "selected_species": [],
@@ -558,8 +567,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         )
         fit_payload = _coerce_dataset_payload(
             dataset_id=str(dataset_id),
-            t_values=t_values,
-            species_map=series_map,
+            observations=observations,
         )
         dataset_payload_results[str(dataset_id)] = fit_payload
         payload_dict = getattr(fit_payload, "payload", None)

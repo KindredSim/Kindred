@@ -39,6 +39,21 @@ def _coerce_stats(values: Optional[Mapping[str, Any]]) -> Dict[str, float]:
     return stats
 
 
+def _shared_axis_or_empty(axis_map: Optional[Mapping[str, object]]) -> np.ndarray:
+    normalized = [
+        _coerce_array(values, field_name="shared_axis")
+        for name, values in dict(axis_map or {}).items()
+        if str(name or "").strip()
+    ]
+    if not normalized:
+        return np.asarray([], dtype=float)
+    reference = normalized[0]
+    for candidate in normalized[1:]:
+        if candidate.size != reference.size or not np.allclose(candidate, reference):
+            return np.asarray([], dtype=float)
+    return reference.copy()
+
+
 @dataclass(frozen=True)
 class FitRenderDatasetProjection:
     """Validated render data for one committed dataset."""
@@ -49,6 +64,8 @@ class FitRenderDatasetProjection:
     observed_series: Mapping[str, np.ndarray]
     model_x: np.ndarray
     model_series: Mapping[str, np.ndarray]
+    observed_x_by_species: Mapping[str, np.ndarray] = field(default_factory=dict)
+    model_x_by_species: Mapping[str, np.ndarray] = field(default_factory=dict)
     dataset_stats: Mapping[str, float] = field(default_factory=dict)
     status: str = "ok"
     diagnostics: Tuple[str, ...] = ()
@@ -64,30 +81,50 @@ class FitRenderDatasetProjection:
         if not observed_x_label:
             observed_x_label = "Time"
         model_x = _coerce_array(self.model_x, field_name=f"{dataset_id}.model_x")
+        observed_axis_source = dict(self.observed_x_by_species or {})
+        observed_x_by_species: Dict[str, np.ndarray] = {}
         observed_series: Dict[str, np.ndarray] = {}
         for raw_name, raw_values in dict(self.observed_series or {}).items():
             name = str(raw_name or "").strip()
             if not name:
                 continue
             values = _coerce_array(raw_values, field_name=f"{dataset_id}.{name}.observed")
-            if len(values) != len(observed_x):
-                raise ValueError(f"{dataset_id}.{name} observed length must match observed_x length.")
+            if status == "ok" and name not in observed_axis_source:
+                raise ValueError(f"{dataset_id}.{name} requires observed_x_by_species.")
+            axis_raw = observed_axis_source.get(name, observed_x)
+            axis = _coerce_array(axis_raw, field_name=f"{dataset_id}.{name}.observed_x")
+            if len(values) != len(axis):
+                raise ValueError(f"{dataset_id}.{name} observed length must match its observed_x length.")
             observed_series[name] = values
+            observed_x_by_species[name] = axis
+        model_axis_source = dict(self.model_x_by_species or {})
+        model_x_by_species: Dict[str, np.ndarray] = {}
         model_series: Dict[str, np.ndarray] = {}
         for raw_name, raw_values in dict(self.model_series or {}).items():
             name = str(raw_name or "").strip()
             if not name:
                 continue
             values = _coerce_array(raw_values, field_name=f"{dataset_id}.{name}")
-            if len(values) != len(model_x):
-                raise ValueError(f"{dataset_id}.{name} length must match model_x length.")
+            if status == "ok" and name not in model_axis_source:
+                raise ValueError(f"{dataset_id}.{name} requires model_x_by_species.")
+            axis_raw = model_axis_source.get(name, model_x)
+            axis = _coerce_array(axis_raw, field_name=f"{dataset_id}.{name}.model_x")
+            if len(values) != len(axis):
+                raise ValueError(f"{dataset_id}.{name} length must match its model_x length.")
             model_series[name] = values
+            model_x_by_species[name] = axis
         if status == "ok" and not model_series:
             raise ValueError("FitRenderDatasetProjection.model_series is required.")
-        if status == "ok" and observed_x.size == 0:
-            raise ValueError("FitRenderDatasetProjection.observed_x is required.")
         if status == "ok" and not observed_series:
             raise ValueError("FitRenderDatasetProjection.observed_series is required.")
+        if status == "ok" and not observed_x_by_species:
+            raise ValueError("FitRenderDatasetProjection.observed_x_by_species is required.")
+        if status == "ok" and not model_x_by_species:
+            raise ValueError("FitRenderDatasetProjection.model_x_by_species is required.")
+        if status == "ok" and set(observed_series) != set(model_series):
+            raise ValueError(
+                f"{dataset_id} observed/model species sets must match for a valid render projection."
+            )
 
         diagnostics = tuple(str(item) for item in (self.diagnostics or ()))
 
@@ -95,11 +132,25 @@ class FitRenderDatasetProjection:
         object.__setattr__(self, "observed_x", observed_x)
         object.__setattr__(self, "observed_x_label", observed_x_label)
         object.__setattr__(self, "observed_series", observed_series)
+        object.__setattr__(self, "observed_x_by_species", observed_x_by_species)
         object.__setattr__(self, "model_x", model_x)
         object.__setattr__(self, "model_series", model_series)
+        object.__setattr__(self, "model_x_by_species", model_x_by_species)
         object.__setattr__(self, "dataset_stats", _coerce_stats(self.dataset_stats))
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "diagnostics", diagnostics)
+
+    def observed_x_for_species(self, species_name: str) -> np.ndarray:
+        name = str(species_name or "").strip()
+        if name and name in self.observed_x_by_species:
+            return np.asarray(self.observed_x_by_species[name], dtype=float).reshape(-1).copy()
+        return np.asarray(self.observed_x, dtype=float).reshape(-1).copy()
+
+    def model_x_for_species(self, species_name: str) -> np.ndarray:
+        name = str(species_name or "").strip()
+        if name and name in self.model_x_by_species:
+            return np.asarray(self.model_x_by_species[name], dtype=float).reshape(-1).copy()
+        return np.asarray(self.model_x, dtype=float).reshape(-1).copy()
 
 
 @dataclass(frozen=True)
@@ -180,8 +231,10 @@ def build_fit_render_projection(
     observed_x_by_dataset: Mapping[str, object],
     observed_x_label_by_dataset: Optional[Mapping[str, object]] = None,
     observed_series_by_dataset: Optional[Mapping[str, Mapping[str, object]]] = None,
+    observed_x_by_species_by_dataset: Optional[Mapping[str, Mapping[str, object]]] = None,
     model_x_by_dataset: Mapping[str, object],
     model_series_by_dataset: Mapping[str, Mapping[str, object]],
+    model_x_by_species_by_dataset: Optional[Mapping[str, Mapping[str, object]]] = None,
     dataset_stats_by_dataset: Optional[Mapping[str, Mapping[str, Any]]] = None,
     dataset_ids: Optional[Sequence[str]] = None,
 ) -> FitRenderProjection:
@@ -195,12 +248,14 @@ def build_fit_render_projection(
         observed_x = observed_x_by_dataset.get(dataset_id)
         observed_x_label = (observed_x_label_by_dataset or {}).get(dataset_id, "Time")
         observed_series = (observed_series_by_dataset or {}).get(dataset_id)
+        observed_x_by_species = (observed_x_by_species_by_dataset or {}).get(dataset_id)
         model_x = model_x_by_dataset.get(dataset_id)
         model_series = model_series_by_dataset.get(dataset_id)
+        model_x_by_species = (model_x_by_species_by_dataset or {}).get(dataset_id)
         if (
-            observed_x is None
+            not isinstance(observed_x_by_species, Mapping)
             or not isinstance(observed_series, Mapping)
-            or model_x is None
+            or not isinstance(model_x_by_species, Mapping)
             or not isinstance(model_series, Mapping)
         ):
             datasets[dataset_id] = FitRenderDatasetProjection(
@@ -208,8 +263,10 @@ def build_fit_render_projection(
                 observed_x=np.asarray([], dtype=float),
                 observed_x_label=str(observed_x_label or "Time"),
                 observed_series={},
+                observed_x_by_species={},
                 model_x=np.asarray([], dtype=float),
                 model_series={},
+                model_x_by_species={},
                 dataset_stats=(dataset_stats_by_dataset or {}).get(dataset_id, {}),
                 status="missing_projection",
                 diagnostics=("Render projection arrays were not available.",),
@@ -218,11 +275,13 @@ def build_fit_render_projection(
         try:
             datasets[dataset_id] = FitRenderDatasetProjection(
                 dataset_id=dataset_id,
-                observed_x=observed_x,
+                observed_x=np.asarray([], dtype=float) if observed_x is None else observed_x,
                 observed_x_label=str(observed_x_label or "Time"),
                 observed_series=observed_series,
-                model_x=model_x,
+                observed_x_by_species=observed_x_by_species or {},
+                model_x=np.asarray([], dtype=float) if model_x is None else model_x,
                 model_series=model_series,
+                model_x_by_species=model_x_by_species or {},
                 dataset_stats=(dataset_stats_by_dataset or {}).get(dataset_id, {}),
                 status="ok",
                 diagnostics=(),
@@ -233,8 +292,10 @@ def build_fit_render_projection(
                 observed_x=np.asarray([], dtype=float),
                 observed_x_label=str(observed_x_label or "Time"),
                 observed_series={},
+                observed_x_by_species={},
                 model_x=np.asarray([], dtype=float),
                 model_series={},
+                model_x_by_species={},
                 dataset_stats=(dataset_stats_by_dataset or {}).get(dataset_id, {}),
                 status="invalid_projection",
                 diagnostics=("Render projection arrays failed validation.",),
@@ -264,6 +325,9 @@ def projection_from_global_fit_result(
     observed_x_by_dataset: Dict[str, np.ndarray] = {}
     observed_x_label_by_dataset: Dict[str, str] = {}
     observed_series_by_dataset = getattr(result, "plot_observed_series", {}) or {}
+    observed_x_by_species_by_dataset = getattr(result, "plot_observed_x", {}) or {}
+    model_x_by_dataset: Dict[str, np.ndarray] = {}
+    model_x_by_species_by_dataset = getattr(result, "plot_model_x_by_species", {}) or {}
     for info in (getattr(result, "dataset_info", None) or []):
         dataset_id = str(getattr(info, "dataset_id", "") or "").strip()
         if not dataset_id:
@@ -273,15 +337,21 @@ def projection_from_global_fit_result(
             "r_squared": float(getattr(info, "r_squared", 0.0)),
         }
         x_name = str(getattr(info, "x_name", "t") or "t").strip() or "t"
-        if x_name == "t":
-            observed = getattr(info, "t_obs", None)
-            label = "Time"
-        else:
-            observed = getattr(info, "x_obs", None)
-            label = x_name
-        if observed is not None:
-            observed_x_by_dataset[dataset_id] = np.asarray(observed, dtype=float).reshape(-1)
+        label = "Time" if x_name == "t" else x_name
+        shared_observed = _shared_axis_or_empty(observed_x_by_species_by_dataset.get(dataset_id))
+        if shared_observed.size:
+            observed_x_by_dataset[dataset_id] = shared_observed
+        if (
+            dataset_id in observed_x_by_dataset
+            or isinstance(observed_x_by_species_by_dataset.get(dataset_id), Mapping)
+            or dataset_id in observed_series_by_dataset
+        ):
             observed_x_label_by_dataset[dataset_id] = label
+        species_model_axes = model_x_by_species_by_dataset.get(dataset_id)
+        if isinstance(species_model_axes, Mapping) and species_model_axes:
+            model_x = _shared_axis_or_empty(species_model_axes)
+            if model_x.size:
+                model_x_by_dataset[dataset_id] = model_x
     return build_fit_render_projection(
         phase=phase,
         run_stamp_hash=run_stamp_hash,
@@ -290,8 +360,10 @@ def projection_from_global_fit_result(
         observed_x_by_dataset=observed_x_by_dataset,
         observed_x_label_by_dataset=observed_x_label_by_dataset,
         observed_series_by_dataset=observed_series_by_dataset,
-        model_x_by_dataset=getattr(result, "plot_model_x", {}) or {},
+        observed_x_by_species_by_dataset=observed_x_by_species_by_dataset,
+        model_x_by_dataset=model_x_by_dataset,
         model_series_by_dataset=getattr(result, "plot_model_series", {}) or {},
+        model_x_by_species_by_dataset=model_x_by_species_by_dataset,
         dataset_stats_by_dataset=dataset_stats,
         dataset_ids=dataset_ids,
     )

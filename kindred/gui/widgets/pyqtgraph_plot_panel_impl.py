@@ -11,6 +11,7 @@ import numpy as np
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt
 
+from kindred.core.datasets.observation_payload import dense_view_from_observations, observations_from_payload
 from kindred.gui.color_manager import ColorManager
 from kindred.gui.ports import (
     CopyAllDisplayBlock,
@@ -760,16 +761,15 @@ if PYQTGRAPH_AVAILABLE:
         def render_dataset_layers(
             self,
             *,
-            data_t: np.ndarray,
+            data_t: object,
             dataset_series: Dict[str, np.ndarray],
-            model_t: Optional[np.ndarray] = None,
+            model_t: object = None,
             model_series: Optional[Dict[str, np.ndarray]] = None,
             visible_species: Sequence[str],
             xlabel: str,
             ylabel: str,
         ) -> None:
             """Render dataset-tab scatter/model layers without clearing unrelated backend state."""
-            t_arr = _try_1d_float_array(data_t)
             series_map = {
                 str(name): _try_1d_float_array(values)
                 for name, values in (dataset_series or {}).items()
@@ -778,16 +778,35 @@ if PYQTGRAPH_AVAILABLE:
             active_dataset = {name: values for name, values in series_map.items() if values.size}
             visible = {str(name) for name in (visible_species or []) if str(name)}
 
-            model_t_arr = _try_1d_float_array(model_t) if model_t is not None else np.asarray([], dtype=float)
             model_map = {
                 str(name): _try_1d_float_array(values)
                 for name, values in (model_series or {}).items()
                 if str(name)
             }
+            if isinstance(data_t, dict):
+                data_t_map = {
+                    str(name): _try_1d_float_array(values)
+                    for name, values in data_t.items()
+                    if str(name)
+                }
+                t_arr = np.asarray([], dtype=float)
+            else:
+                data_t_map = {}
+                t_arr = _try_1d_float_array(data_t)
+            if isinstance(model_t, dict):
+                model_t_map = {
+                    str(name): _try_1d_float_array(values)
+                    for name, values in model_t.items()
+                    if str(name)
+                }
+                model_t_arr = np.asarray([], dtype=float)
+            else:
+                model_t_map = {}
+                model_t_arr = _try_1d_float_array(model_t) if model_t is not None else np.asarray([], dtype=float)
 
             self._set_dataset_axis_labels(xlabel=xlabel, ylabel=ylabel)
 
-            if t_arr.size == 0 or not active_dataset:
+            if (t_arr.size == 0 and not data_t_map) or not active_dataset:
                 self._prune_dataset_scatter_items(set())
                 self._prune_dataset_model_items(set())
                 return
@@ -798,12 +817,13 @@ if PYQTGRAPH_AVAILABLE:
             active_scatter_keys: Set[str] = set()
             active_model_keys: Set[str] = set()
             for species_name, y_data in active_dataset.items():
-                if y_data.shape[0] != t_arr.shape[0]:
+                species_t = data_t_map.get(species_name, t_arr)
+                if y_data.shape[0] != species_t.shape[0]:
                     logger.warning(
                         "Dataset layer length mismatch for %s: %s vs %s",
                         species_name,
                         int(y_data.shape[0]),
-                        int(t_arr.shape[0]),
+                        int(species_t.shape[0]),
                     )
                     continue
 
@@ -812,7 +832,7 @@ if PYQTGRAPH_AVAILABLE:
                 active_scatter_keys.add(species_name)
                 self._upsert_dataset_scatter_item(
                     key=species_name,
-                    x_data=t_arr,
+                    x_data=species_t,
                     y_data=y_data,
                     brush=brush,
                     size=8,
@@ -821,14 +841,15 @@ if PYQTGRAPH_AVAILABLE:
                 self._dataset_scatter_items[species_name].setVisible(species_name in visible)
 
                 model_values = model_map.get(species_name)
-                if model_t_arr.size == 0 or model_values is None:
+                species_model_t = model_t_map.get(species_name, model_t_arr)
+                if species_model_t.size == 0 or model_values is None:
                     continue
-                if model_values.shape[0] != model_t_arr.shape[0]:
+                if model_values.shape[0] != species_model_t.shape[0]:
                     logger.warning(
                         "Dataset model length mismatch for %s: %s vs %s",
                         species_name,
                         int(model_values.shape[0]),
-                        int(model_t_arr.shape[0]),
+                        int(species_model_t.shape[0]),
                     )
                     continue
 
@@ -836,7 +857,7 @@ if PYQTGRAPH_AVAILABLE:
                 active_model_keys.add(species_name)
                 self._upsert_dataset_model_item(
                     key=species_name,
-                    x_data=model_t_arr,
+                    x_data=species_model_t,
                     y_data=model_values,
                     pen=pen,
                     name=f"{species_name} (model)",
@@ -1765,13 +1786,17 @@ if PYQTGRAPH_AVAILABLE:
             Parameters
             ----------
             datasets : dict
-                Mapping of dataset name -> {'t': array, 'species': {name: array}}
+                Mapping of dataset name -> canonical dataset payload or local dense overlay payload.
             """
             normalized: Dict[str, Dict[str, np.ndarray]] = {}
             for name, payload in (datasets or {}).items():
                 try:
-                    t_raw = np.asarray(payload.get("t", []), dtype=float).reshape(-1)
-                    species_raw = payload.get("species") or {}
+                    observations = observations_from_payload(payload)
+                    if observations:
+                        t_raw, species_raw = dense_view_from_observations(observations)
+                    else:
+                        t_raw = np.asarray(payload.get("t", []), dtype=float).reshape(-1)
+                        species_raw = payload.get("species") or {}
                     if t_raw.size == 0 or not species_raw:
                         continue
                     species_norm: Dict[str, np.ndarray] = {}
@@ -1781,6 +1806,8 @@ if PYQTGRAPH_AVAILABLE:
                             species_norm[str(sp_name)] = arr
                     if species_norm:
                         normalized[name] = {"t": t_raw, "species": species_norm}
+                        if observations:
+                            normalized[name]["observations"] = observations
                 except Exception as exc:
                     logger.warning("Failed to normalize dataset '%s' for overlay: %s", name, exc)
 
@@ -2510,7 +2537,16 @@ if PYQTGRAPH_AVAILABLE:
                         # Guard against future resolver changes selecting a disabled column.
                         continue
 
-                    y_array = np.asarray(y_source, dtype=float).reshape(-1)
+                    observation_spec = None
+                    if x_name == "t":
+                        raw_obs = payload.get("observations")
+                        if isinstance(raw_obs, dict):
+                            observation_spec = raw_obs.get(resolved_key) or raw_obs.get(species)
+                    if isinstance(observation_spec, dict):
+                        x_array = np.asarray(observation_spec.get("t", []), dtype=float).reshape(-1)
+                        y_array = np.asarray(observation_spec.get("y", []), dtype=float).reshape(-1)
+                    else:
+                        y_array = np.asarray(y_source, dtype=float).reshape(-1)
                     if y_array.size == 0:
                         warnings.append(f"{dataset_name}: '{resolved_key}' has no data")
                         continue

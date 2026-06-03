@@ -8,6 +8,8 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 
 import numpy as np
 
+from kindred.core.datasets.observation_payload import dataset_payload_from_observations
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["CsvImportInterrupted", "load_csv_dataset", "parse_csv_rows"]
@@ -27,7 +29,7 @@ def load_csv_dataset(
     """
     Load a CSV dataset using explicit or automatic column mapping.
 
-    Returns (dataset_name, {'t': array, 'species': dict, 'metadata': dict}).
+    Returns (dataset_name, canonical dataset payload).
     """
     with open(filepath, "r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -36,6 +38,7 @@ def load_csv_dataset(
             time_column=time_column,
             species_columns=species_columns,
             interruption_checker=interruption_checker,
+            source_label=os.path.basename(filepath),
         )
     dataset_name = os.path.basename(filepath)
     return dataset_name, data
@@ -46,6 +49,9 @@ def parse_csv_rows(
     time_column: Optional[str] = None,
     species_columns: Optional[Sequence[str]] = None,
     interruption_checker: Optional[Callable[[], bool]] = None,
+    *,
+    source_label: Optional[str] = None,
+    sheet_name: Optional[str] = None,
 ) -> Tuple[str, Dict[str, object]]:
     """Convert CSV rows to a dataset payload."""
 
@@ -95,6 +101,22 @@ def parse_csv_rows(
             return snippet[: max_len - 3] + "..."
         return snippet
 
+    def _source_prefix() -> str:
+        parts: list[str] = []
+        if str(source_label or "").strip():
+            parts.append(f"file '{str(source_label).strip()}'")
+        if str(sheet_name or "").strip():
+            parts.append(f"sheet '{str(sheet_name).strip()}'")
+        if not parts:
+            return ""
+        return ", ".join(parts) + ", "
+
+    def _species_error(row_index: int, column: str, raw_value: str, exc: BaseException) -> ValueError:
+        return ValueError(
+            f"{_source_prefix()}row {row_index}, column '{column}': invalid numeric observation "
+            f"{raw_value!r} ({exc})."
+        )
+
     # Resolve species columns
     if species_columns:
         requested = [name.strip() for name in species_columns if name and name.strip()]
@@ -112,9 +134,10 @@ def parse_csv_rows(
     else:
         species_candidates = [col for col in columns if col != time_col]
 
-    t_values_list: List[float] = []
     active_species_columns = list(species_candidates)
-    species_value_lists: Dict[str, List[float]] = {col: [] for col in active_species_columns}
+    species_observations: Dict[str, Dict[str, List[float]]] = {
+        col: {"t": [], "y": []} for col in active_species_columns
+    }
     saw_nonempty_row = False
 
     for row_index, row in enumerate(itertools.chain((first,), row_iter), start=1):
@@ -140,41 +163,42 @@ def parse_csv_rows(
                 f"'{time_col}' ({_row_snippet(normalized_row)})."
             ) from exc
 
-        t_values_list.append(parsed_time)
-
         for col in list(active_species_columns):
             _raise_if_interrupted()
+            raw_value = normalized_row[col]
+            if not raw_value:
+                continue
             try:
-                species_value_lists[col].append(float(normalized_row[col]))
+                parsed_value = float(raw_value)
             except Exception as exc:
-                if species_columns:
-                    raise ValueError(f"Species column '{col}' contains non-numeric values: {exc}") from exc
-                logger.debug("Skipping non-numeric column '%s': %s", col, exc)
-                active_species_columns.remove(col)
-                species_value_lists.pop(col, None)
+                logger.debug("Invalid non-numeric observation in column '%s': %s", col, exc)
+                raise _species_error(row_index, col, raw_value, exc) from exc
+            species_observations[col]["t"].append(parsed_time)
+            species_observations[col]["y"].append(parsed_value)
 
     if not saw_nonempty_row:
         raise ValueError("CSV file contains only blank lines in the data section.")
 
-    t_values = np.array(t_values_list, dtype=float)
-
-    species: Dict[str, np.ndarray] = {}
+    observations: Dict[str, Dict[str, np.ndarray]] = {}
     for col in species_candidates:
         _raise_if_interrupted()
-        values = species_value_lists.get(col)
-        if values is None:
+        spec = species_observations.get(col)
+        if spec is None or not spec["t"]:
             continue
-        species[col] = np.array(values, dtype=float)
+        observations[col] = {
+            "t": np.asarray(spec["t"], dtype=float),
+            "y": np.asarray(spec["y"], dtype=float),
+        }
 
-    if not species:
+    if not observations:
         raise ValueError("No numeric species columns found. Provide explicit column names.")
 
     mapping_source = "explicit" if explicit_mapping else "auto"
     metadata = {
         "time_column": time_col,
-        "species_columns": list(species.keys()),
+        "species_columns": list(observations.keys()),
         "mapping_source": mapping_source,
     }
 
-    data = {"t": t_values, "species": species, "metadata": metadata}
+    data = dataset_payload_from_observations(observations, metadata=metadata)
     return str(time_col), data

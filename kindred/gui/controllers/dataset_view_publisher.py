@@ -11,6 +11,7 @@ from kindred.core.analysis.global_fit_projection import (
     FitRenderDatasetProjection,
     FitRenderProjection,
 )
+from kindred.core.datasets.observation_payload import dense_view_from_observations
 from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 from kindred.gui.controllers.dataset_registry import DatasetRecord
 
@@ -163,19 +164,27 @@ class DatasetViewPublisher:
 
     def _prepare_dataset_entry(self, record: DatasetRecord) -> Dict[str, Any]:
         payload = record.payload
-        species = payload.get("species", {})
-        if not species:
+        observations = payload.get("observations", {})
+        if not observations:
             raise DatasetOwnerError("Dataset contains no numeric species columns.")
 
-        t = np.asarray(payload["t"])
-        all_species_data = {sp_name: np.asarray(sp_data) for sp_name, sp_data in species.items()}
-        default_species = sorted(species.keys())[0]
+        all_observations = {
+            str(species_name): {
+                "t": np.asarray(spec.get("t", []), dtype=float),
+                "y": np.asarray(spec.get("y", []), dtype=float),
+            }
+            for species_name, spec in dict(observations).items()
+            if isinstance(spec, dict)
+        }
+        t, all_species_data = dense_view_from_observations(all_observations)
+        default_species = sorted(all_observations.keys())[0]
 
         return {
             "name": str(record.display_name),
             "dataset_id": str(record.dataset_id),
             "t": t,
             "species": all_species_data,
+            "observations": all_observations,
             "series_name": default_species,
             "metadata": dict(payload.get("metadata") or {}),
         }
@@ -221,6 +230,7 @@ class DatasetViewPublisher:
             xlabel=payload["x_label"],
             ylabel=payload["current_species"],
             all_species=species_map,
+            observations=payload["all_observations"],
             chi_squared=payload["chi_squared"],
             r_squared=payload["r_squared"],
             fit_render_projection=payload["fit_render_projection"],
@@ -231,6 +241,7 @@ class DatasetViewPublisher:
 
     def _dataset_render_payload(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         projection = self._projection_for_entry(entry)
+        observation_map = entry.get("observations") if isinstance(entry.get("observations"), dict) else {}
         base_species = entry.get("species") if isinstance(entry.get("species"), dict) else {}
         if projection is not None:
             projection_species = {
@@ -238,13 +249,21 @@ class DatasetViewPublisher:
                 for species, values in dict(projection.observed_series).items()
                 if str(species)
             }
+            observation_map = {
+                str(species): {
+                    "t": projection.observed_x_for_species(str(species)),
+                    "y": np.asarray(values, dtype=float).reshape(-1),
+                }
+                for species, values in dict(projection.observed_series).items()
+                if str(species)
+            }
             species_map = projection_species or base_species
-            data_x = projection.observed_x
+            data_x = projection.observed_x_for_species(str(entry.get("series_name") or ""))
             x_label = projection.observed_x_label
             stats = dict(projection.dataset_stats)
         else:
             species_map = base_species
-            data_x = entry["t"]
+            data_x = np.asarray(entry.get("t", []), dtype=float)
             x_label = "Time"
             stats = {}
 
@@ -252,12 +271,21 @@ class DatasetViewPublisher:
         if current_species not in species_map and species_map:
             current_species = sorted(species_map.keys())[0]
             entry["series_name"] = current_species
-        data_y = species_map[current_species] if current_species in species_map else np.asarray([], dtype=float)
+        if projection is not None:
+            data_x = projection.observed_x_for_species(current_species)
+            data_y = species_map[current_species] if current_species in species_map else np.asarray([], dtype=float)
+        elif current_species in observation_map:
+            spec = observation_map[current_species]
+            data_x = np.asarray(spec.get("t", []), dtype=float)
+            data_y = np.asarray(spec.get("y", []), dtype=float)
+        else:
+            data_y = species_map[current_species] if current_species in species_map else np.asarray([], dtype=float)
         return {
             "data_x": data_x,
             "x_label": x_label,
             "data_y": data_y,
             "all_species": species_map,
+            "all_observations": observation_map,
             "current_species": current_species,
             "fit_render_projection": projection,
             "chi_squared": stats.get("chi_squared"),
@@ -286,6 +314,7 @@ class DatasetViewPublisher:
                     "chi_squared": payload["chi_squared"],
                     "r_squared": payload["r_squared"],
                     "all_species": payload["all_species"],
+                    "all_observations": payload["all_observations"],
                     "current_species": payload["current_species"],
                 }
             )

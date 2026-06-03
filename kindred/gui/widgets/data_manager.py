@@ -21,6 +21,11 @@ from kindred.core.datasets.excel_import import (
     list_sheets,
     read_excel_sheet_rows,
 )
+from kindred.core.datasets.observation_payload import (
+    dense_view_from_observations,
+    observations_from_payload,
+    scale_payload_in_place,
+)
 from kindred.gui.widgets.import_config import (
     ImportConfig,
     ResolvedSheetPlan,
@@ -85,6 +90,7 @@ class CSVLoaderWorker(QtCore.QThread):
                 time_column=self._time_column,
                 species_columns=self._species_columns,
                 interruption_checker=self.isInterruptionRequested,
+                source_label=os.path.basename(self.filepath),
             )
         return data
 
@@ -118,7 +124,7 @@ class CSVLoaderWorker(QtCore.QThread):
             logger.debug(
                 "Parsed CSV dataset: time column '%s', species columns: %s",
                 data.get("metadata", {}).get("time_column"),
-                list(data['species'].keys()),
+                list((data.get("observations") or {}).keys()),
             )
 
             self.progress.emit(80)
@@ -129,13 +135,14 @@ class CSVLoaderWorker(QtCore.QThread):
             self.progress.emit(100)
 
             # Log success before emitting signal
-            species = data.get('species', {})
+            observations = data.get('observations', {})
+            total_points = sum(len(spec.get("t", [])) for spec in observations.values()) if isinstance(observations, dict) else 0
             logger.info(
                 "CSV import completed: %s (%d rows, %d species: %s)",
                 dataset_name,
-                len(data.get('t', [])),
-                len(species),
-                list(species.keys()),
+                total_points,
+                len(observations),
+                list(observations.keys()),
             )
 
             self.loaded.emit(dataset_name, data)
@@ -177,6 +184,8 @@ class ExcelLoaderWorker(QtCore.QThread):
                 time_column=plan.time_column,
                 species_columns=list(plan.species_columns),
                 interruption_checker=self.isInterruptionRequested,
+                source_label=os.path.basename(self.filepath),
+                sheet_name=plan.sheet_name,
             )
         return f"{os.path.basename(self.filepath)}::{plan.sheet_name}", data
 
@@ -726,13 +735,12 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._maybe_finalize_load_cycle()
 
     def _apply_unit_conversion(self, data: dict, plan: ResolvedSheetPlan) -> None:
+        scale_payload_in_place(
+            data,
+            time_factor=plan.time_factor,
+            conc_factors=plan.conc_factors,
+        )
         metadata = data.setdefault("metadata", {})
-        if plan.time_factor != 1.0:
-            data["t"] = data["t"] * plan.time_factor
-        for species_name in list(data["species"].keys()):
-            factor = plan.conc_factors[species_name]
-            if factor != 1.0:
-                data["species"][species_name] = data["species"][species_name] * factor
         metadata["original_time_unit"] = plan.original_time_unit
         metadata["original_concentration_units"] = dict(plan.original_conc_units)
 
@@ -831,8 +839,8 @@ class DataManagerPanel(QtWidgets.QWidget):
         name = str(record.display_name)
         data = record.payload
         self._preview_label.show()
-        t = data['t']
-        species = data['species']
+        observations = observations_from_payload(data)
+        t, species = dense_view_from_observations(observations)
 
         metadata = data.get('metadata', {})
         mapping_source = metadata.get('mapping_source', 'auto')

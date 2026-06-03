@@ -9,7 +9,10 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.batch_initial_conditions import dataset_base_label, seed_batch_set_from_dataset_first_row
+from kindred.core.batch_initial_conditions import (
+    dataset_base_label,
+    seed_batch_set_from_dataset_observations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -326,7 +329,7 @@ def create_and_seed_batch_set(
     row_idx, created = ensure_batch_set_row(batch_store, batch_model, preferred_name)
     seeded = False
     if created and batch_store is not None:
-        seeded_values = seed_batch_set_from_dataset_first_row(
+        seeded_values = seed_batch_set_from_dataset_observations(
             dataset_payload,
             mechanism_species,
             tol=float(tol),

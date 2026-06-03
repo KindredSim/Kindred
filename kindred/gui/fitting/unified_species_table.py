@@ -15,6 +15,7 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
 
+from kindred.core.datasets.observation_payload import copy_observations_map, dense_view_from_observations
 from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
 
@@ -212,10 +213,18 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             ds_id = str(entry.get("id") or "").strip()
             if not ds_id:
                 continue
-            t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1)
+            observations = (
+                copy_observations_map(entry.get("observations"))
+                if isinstance(entry.get("observations"), dict)
+                else {}
+            )
+            if observations:
+                t_values, raw_series = dense_view_from_observations(observations)
+            else:
+                t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1)
+                raw_series = entry.get("species_data") or entry.get("species") or {}
             if t_values.size == 0:
                 continue
-            raw_series = entry.get("species_data") or entry.get("species") or {}
             series_map: Dict[str, np.ndarray] = {}
             parse_failures: List[str] = []
             if isinstance(raw_series, dict):
@@ -232,8 +241,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                                 "Skipping invalid fit-target series '%s' for dataset '%s': %s",
                                 key, ds_id, exc, exc_info=True,
                             )
-                        continue
-                    if arr.size != t_values.size:
                         continue
                     series_map[key] = arr
 

@@ -207,6 +207,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
         ylabel: str = "Concentration",
         xlabel: str = "Time",
         all_species: Optional[Dict[str, Any]] = None,
+        observations: Optional[Dict[str, Any]] = None,
         chi_squared: Optional[float] = None,
         r_squared: Optional[float] = None,
         fit_render_projection: Optional[FitRenderDatasetProjection] = None,
@@ -224,6 +225,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
             xlabel=xlabel,
             ylabel=ylabel,
             all_species=all_species,
+            observations=observations,
         )
         if fit_render_projection is not None:
             panel.apply_fit_render_projection(fit_render_projection)

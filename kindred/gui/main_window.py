@@ -35,6 +35,7 @@ from kindred.core.simulator.dsl_text_update import (
     step_rewrite_block_reason,
 )
 from kindred.core.validation import try_parse_finite_float
+from kindred.core.datasets.observation_payload import dense_view_from_observations, observations_from_payload
 from kindred.gui.project_schema import (
     FITTING_DEFAULTS_KEYS,
     PROJECT_DEFAULTS,
@@ -1755,12 +1756,12 @@ class MainWindow(
 
         snapshot: Dict[str, Dict[str, Any]] = {}
         for name, dataset in dataset_registry.presentation_payloads_by_display_name().items():
-            t = dataset.get("t")
-            species = dataset.get("species") or {}
-            num_points = int(len(np.asarray(t).reshape(-1))) if t is not None else 0
+            observations = observations_from_payload(dataset)
+            t_values, _species_data = dense_view_from_observations(observations)
+            num_points = int(t_values.size)
             snapshot[name] = {
                 "num_points": num_points,
-                "species": list(species.keys()),
+                "species": list(observations.keys()),
             }
         return snapshot
 

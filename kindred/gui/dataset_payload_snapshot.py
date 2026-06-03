@@ -5,18 +5,24 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Mapping
 
-import numpy as np
+from kindred.core.datasets.observation_payload import canonicalize_dataset_payload
 
 
 def copy_dataset_payload(payload: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return an owned dataset payload snapshot with copied numeric arrays."""
-    source = dict(payload or {})
-    species = source.get("species") if isinstance(source.get("species"), Mapping) else {}
-    return {
-        "t": np.asarray(source.get("t", []), dtype=float).copy(),
-        "species": {
-            str(name): np.asarray(values, dtype=float).copy()
-            for name, values in species.items()
+    source = canonicalize_dataset_payload(payload)
+    copied = {
+        "observations": {
+            str(name): {
+                "t": source["observations"][str(name)]["t"].copy(),
+                "y": source["observations"][str(name)]["y"].copy(),
+            }
+            for name in dict(source.get("observations") or {}).keys()
         },
         "metadata": deepcopy(dict(source.get("metadata") or {})),
     }
+    for key, value in dict(source).items():
+        if key in copied:
+            continue
+        copied[key] = deepcopy(value)
+    return copied

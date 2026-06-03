@@ -9,12 +9,29 @@ from typing import Any, Callable, Dict, List, Sequence
 import numpy as np
 from PySide6 import QtWidgets
 
+from kindred.core.datasets.observation_payload import dense_view_from_observations, observations_from_payload
 from kindred.gui.controllers.dataset_fit_settings_store import DatasetFitSettingsStore
 from kindred.gui.controllers.dataset_registry import DatasetRecord, DatasetRegistry
 from kindred.gui.controllers.dataset_view_publisher import DatasetViewPublisher
 from kindred.gui.widgets.dataset_import_session import DatasetImportCompletion
 
 logger = logging.getLogger(__name__)
+
+
+def _payload_point_count(payload: Dict[str, Any]) -> int:
+    observations = observations_from_payload(payload)
+    t_values, _species = dense_view_from_observations(observations)
+    return int(t_values.size)
+
+
+def _payload_earliest_time(payload: Dict[str, Any]) -> float:
+    all_times: list[float] = []
+    for spec in observations_from_payload(payload).values():
+        t_arr = np.asarray(spec.get("t", []), dtype=float).reshape(-1)
+        finite_times = t_arr[np.isfinite(t_arr)]
+        if finite_times.size:
+            all_times.extend(float(value) for value in finite_times)
+    return float(min(all_times)) if all_times else float("nan")
 
 
 class DatasetImportCoordinator:
@@ -93,8 +110,8 @@ class DatasetImportCoordinator:
 
         if len(records) == 1:
             record = records[0]
-            t = np.asarray(record.payload.get("t", [])).reshape(-1)
-            self._status_setter(f"Dataset '{record.display_name}' loaded ({len(t)} points)")
+            point_count = _payload_point_count(record.payload)
+            self._status_setter(f"Dataset '{record.display_name}' loaded ({point_count} points)")
         else:
             self._status_setter(f"{len(records)} datasets loaded")
         self._overlay_sync()
@@ -314,8 +331,7 @@ class DatasetImportCoordinator:
             return str(action)
         if created and batch_store is not None and not seeded:
             try:
-                t_arr = np.asarray((record.payload or {}).get("t", []), dtype=float).reshape(-1)
-                t0 = float(t_arr[0]) if t_arr.size else float("nan")
+                t0 = _payload_earliest_time(record.payload)
             except Exception:
                 t0 = float("nan")
             if not (abs(t0) <= T0_SEED_TOL_S):

@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.datasets.observation_payload import export_rows_from_observations
 from kindred.gui.project_schema import (
     QSETTINGS_KEY_MAP,
     get_default_project_payload,
@@ -349,6 +350,12 @@ class ProjectController(QtCore.QObject):
 
     @staticmethod
     def _normalize_export_payload(payload: Dict[str, object]) -> Optional[Dict[str, object]]:
+        observations = payload.get("observations")
+        if isinstance(observations, dict) and observations:
+            normalized: Dict[str, object] = {"observations": dict(observations)}
+            if payload.get("x_header") is not None:
+                normalized["x_header"] = str(payload.get("x_header"))
+            return normalized
         t_raw = payload.get("t")
         if t_raw is None:
             return None
@@ -428,6 +435,12 @@ class ProjectController(QtCore.QObject):
         # must not reach into plot-private UI state.
         _ = plot
         scope = str(scope or "")
+        observations = payload.get("observations")
+        if isinstance(observations, dict) and observations:
+            header, rows = export_rows_from_observations(observations)
+            if header:
+                header[0] = str(payload.get("x_header") or "Time")
+            return header, rows
         t_values = np.asarray(payload.get("t"), dtype=float).reshape(-1)
         if t_values.size == 0:
             raise ValueError("Time axis has no points to export.")
@@ -441,9 +454,9 @@ class ProjectController(QtCore.QObject):
         arrays: List[np.ndarray] = []
         for name in species_names:
             arr = np.asarray(series[name], dtype=float).reshape(-1)
-            if arr.shape[0] != t_values.shape[0]:
+            if arr.size != t_values.size:
                 raise ValueError(
-                    f"Series '{name}' length ({arr.shape[0]}) does not match time grid ({t_values.shape[0]})."
+                    f"Series '{name}' length ({arr.size}) does not match time axis length ({t_values.size})."
                 )
             arrays.append(arr)
 
