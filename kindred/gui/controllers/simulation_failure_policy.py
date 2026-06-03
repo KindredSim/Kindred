@@ -16,6 +16,7 @@ from kindred.gui.controllers.simulation_completion_policy import (
     PolicyStatePatch,
     SimulationCompletionPolicy,
 )
+from kindred.gui.controllers.preview_target_identity import normalize_preview_target_set_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +125,40 @@ class FailureUiConsequenceRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class FailureDisplayConsequenceRequest:
+    kind: str = "none"
+    target_set_ids: tuple[str, ...] = ()
+    request_id: int | None = None
+    run_id: int | None = None
+    preview_owner_epoch: int | None = None
+    status_text: str = ""
+    failure_payload: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "target_set_ids",
+            normalize_preview_target_set_ids(self.target_set_ids),
+        )
+        if self.request_id is not None:
+            object.__setattr__(self, "request_id", int(self.request_id))
+        if self.run_id is not None:
+            object.__setattr__(self, "run_id", int(self.run_id))
+        if self.preview_owner_epoch is not None:
+            object.__setattr__(self, "preview_owner_epoch", int(self.preview_owner_epoch))
+        object.__setattr__(self, "status_text", str(self.status_text or ""))
+        object.__setattr__(
+            self,
+            "failure_payload",
+            dict(self.failure_payload) if isinstance(self.failure_payload, Mapping) else None,
+        )
+
+    @classmethod
+    def none(cls) -> "FailureDisplayConsequenceRequest":
+        return cls()
+
+
+@dataclass(frozen=True, slots=True)
 class SimulationFailureDecision:
     disposition: str
     envelope: SimulationFailureEnvelope | None = None
@@ -133,6 +168,7 @@ class SimulationFailureDecision:
     context_mutation: FailureContextMutationRequest = field(default_factory=FailureContextMutationRequest.none)
     runtime_consequence: FailureRuntimeConsequenceRequest = field(default_factory=FailureRuntimeConsequenceRequest.none)
     ui_consequence: FailureUiConsequenceRequest = field(default_factory=FailureUiConsequenceRequest.none)
+    display_consequence: FailureDisplayConsequenceRequest = field(default_factory=FailureDisplayConsequenceRequest.none)
     accepted_runtime_completion: bool = False
     consumed_runtime_completion: bool = True
     terminal_runtime_completion: bool = False
@@ -353,6 +389,18 @@ class SimulationFailurePolicyOwner:
                     kind="current_preview_failure",
                     status_text=str(classification.preview_status_text or ""),
                 ),
+                display_consequence=FailureDisplayConsequenceRequest(
+                    kind="deauthorize_current_preview_failure",
+                    target_set_ids=self._current_preview_failure_display_target_set_ids(
+                        policy_context=policy_context,
+                        callback_identity=callback_identity,
+                    ),
+                    request_id=int(callback_identity.request_id),
+                    run_id=int(callback_identity.run_id),
+                    preview_owner_epoch=callback_identity.preview_owner_epoch,
+                    status_text=str(classification.preview_status_text or ""),
+                    failure_payload=envelope.payload,
+                ),
                 accepted_runtime_completion=True,
                 consumed_runtime_completion=True,
                 log_message=classification.error_text,
@@ -365,6 +413,37 @@ class SimulationFailurePolicyOwner:
             freshness=freshness,
             fast_mode=active_fast_mode,
         )
+
+    def _current_preview_failure_display_target_set_ids(
+        self,
+        *,
+        policy_context: CompletionPolicyContext | None,
+        callback_identity: SimulationCallbackIdentity,
+    ) -> tuple[str, ...]:
+        for raw_values in (
+            getattr(policy_context, "preview_scope_set_ids", None),
+            getattr(policy_context, "explicit_cache_preview_scope_set_ids", None),
+            getattr(policy_context, "queue_ids", None),
+        ):
+            values = normalize_preview_target_set_ids(raw_values or ())
+            if values:
+                return values
+
+        try:
+            ownership = self._completion_policy_preview_ownership()
+        except Exception:
+            ownership = None
+        owner_request_id = getattr(ownership, "request_id", None)
+        owner_epoch = getattr(ownership, "epoch", None)
+        callback_epoch = getattr(callback_identity, "preview_owner_epoch", None)
+        if owner_request_id is not None and int(owner_request_id) == int(callback_identity.request_id):
+            epoch_matches = callback_epoch is None or owner_epoch is None or int(owner_epoch) == int(callback_epoch)
+            if bool(epoch_matches):
+                values = normalize_preview_target_set_ids(getattr(ownership, "target_set_ids", ()) or ())
+                if values:
+                    return values
+
+        return normalize_preview_target_set_ids((getattr(callback_identity, "batch_set_id", "") or "",))
 
     def _resolve_stale_runtime_lane_outcome(
         self,

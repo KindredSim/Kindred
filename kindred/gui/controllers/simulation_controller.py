@@ -77,6 +77,7 @@ from kindred.gui.controllers.simulation_lifecycle_effects import (
     SimulationLifecycleEffects,
 )
 from kindred.gui.controllers.simulation_failure_policy import (
+    FailureDisplayConsequenceRequest,
     SimulationFailureDecision,
     SimulationFailurePolicyOwner,
 )
@@ -954,6 +955,8 @@ class SimulationController(QtCore.QObject):
                 explicit_cache_invalidated_set_ids=cache_state.explicit_cache_invalidated_set_ids,
             )
 
+        self._apply_failure_display_consequence(decision.display_consequence)
+
         if decision.disposition == "scoped_failure_final" and isinstance(mutation_result.context, Mapping):
             display_transition = self._finalize_scoped_batch_success_subset(mutation_result.context)
             if display_transition is not None and not isinstance(display_transition, DisplayTransitionOutcome):
@@ -987,6 +990,29 @@ class SimulationController(QtCore.QObject):
 
         if decision.terminal_failure and envelope is not None and bool(envelope.cancelled):
             self._request_completion_preview_replay_effects(shutdown_requested=False)
+
+    def _apply_failure_display_consequence(
+        self,
+        consequence: FailureDisplayConsequenceRequest | object | None,
+    ) -> None:
+        if not isinstance(consequence, FailureDisplayConsequenceRequest):
+            return
+        if consequence.kind != "deauthorize_current_preview_failure":
+            return
+        if not consequence.target_set_ids:
+            return
+        try:
+            self.ui.results.deauthorize_current_preview_failure(
+                target_set_ids=consequence.target_set_ids,
+                request_id=consequence.request_id,
+                run_id=consequence.run_id,
+                status_text=consequence.status_text,
+            )
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to deauthorize current preview display after preview failure",
+                exc,
+            )
 
     def _capture_dirty_state_by_set_id(
         self,

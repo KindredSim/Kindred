@@ -162,6 +162,7 @@ class DisplayTransitionCause(Enum):
     NO_DISPLAYABLE_COMPLETION_RESULTS = "no_displayable_completion_results"
     NO_DISPLAYABLE_PREVIEW_RESULTS = "no_displayable_preview_results"
     IN_FLIGHT_COVERAGE_UNAVAILABLE = "in_flight_coverage_unavailable"
+    CURRENT_PREVIEW_FAILED = "current_preview_failed"
     FRESH_PREVIEW_READY = "fresh_preview_ready"
     DIRECT_RESULT_READY = "direct_result_ready"
     SHOW_REMOVED_ACTIVE_SET = "show_removed_active_set"
@@ -1073,6 +1074,15 @@ class SimulationResultsPort(Protocol):
         *,
         display_source: Optional[DisplayRefreshSource] = None,
     ) -> "BatchDisplayRefreshOutcome": ...
+
+    def deauthorize_current_preview_failure(
+        self,
+        *,
+        target_set_ids: Sequence[str],
+        request_id: Optional[int] = None,
+        run_id: Optional[int] = None,
+        status_text: str = "",
+    ) -> DisplayTransitionOutcome | None: ...
 
 
 class SimulationProvenancePort(Protocol):

@@ -1124,6 +1124,7 @@ class ResultsController(QtCore.QObject):
         cause: DisplayTransitionCause = DisplayTransitionCause.MANUAL_CLEAR,
         requested_show_set_ids: Sequence[str] | None = None,
         requested_labels_by_set_id: Mapping[str, str] | None = None,
+        request_scope: DisplayRequestScopeSnapshot | None = None,
         attempted_display_set_ids: Sequence[str] = (),
         affected_set_ids: Sequence[str] = (),
         unresolved_intent_set_ids: Sequence[str] = (),
@@ -1138,6 +1139,7 @@ class ResultsController(QtCore.QObject):
             active_transaction=None,
             previous_transaction=previous_transaction,
             display_status=display_status,
+            request_scope=request_scope,
             requested_show_set_ids=(
                 requested_show_set_ids
                 if requested_show_set_ids is not None
@@ -1175,6 +1177,65 @@ class ResultsController(QtCore.QObject):
             clear_plot=bool(clear_plot),
         )
         return True
+
+    def deauthorize_current_preview_failure(
+        self,
+        *,
+        target_set_ids: Sequence[str],
+        request_id: Optional[int] = None,
+        run_id: Optional[int] = None,
+        status_text: str = "",
+    ) -> DisplayTransitionOutcome | None:
+        target_ids = deduped_set_ids(target_set_ids)
+        if not target_ids:
+            return None
+        active_transaction = self._active_display_transaction
+        if not isinstance(active_transaction, ActiveDisplayTransaction):
+            self._ui.clear_active_preview_cache_identity_state()
+            return None
+        display_ids = deduped_set_ids(active_transaction.display_set_ids)
+        if not set(target_ids).intersection(display_ids):
+            self._ui.clear_active_preview_cache_identity_state()
+            return None
+
+        preview_backed = active_transaction.kind in {
+            ActiveDisplayKind.FRESH_PREVIEW,
+            ActiveDisplayKind.WORKSPACE_PREVIEW,
+        }
+        if not preview_backed:
+            preview_backed = any(
+                isinstance(metadata.workspace_preview_provenance, Mapping)
+                for metadata in dict(active_transaction.sets or {}).values()
+                if str(metadata.set_id or "") in set(target_ids)
+            )
+        if not preview_backed:
+            self._ui.clear_active_preview_cache_identity_state()
+            return None
+
+        self._ui.clear_active_preview_cache_identity_state()
+        request_scope = self._current_display_request_scope(
+            requested_show_set_ids=target_ids,
+            run_target_set_ids=target_ids,
+            run_id=run_id,
+            request_id=request_id,
+        )
+        outcome = self.clear_active_display_transaction(
+            outcome_kind=DisplayTransitionOutcomeKind.CLEARED,
+            display_status=DisplayStatus.NO_COMPLETE_DISPLAYABLE_REQUEST_SCOPE,
+            event_kind=DisplayEventKind.DISPLAY_CLEARED,
+            cause=DisplayTransitionCause.CURRENT_PREVIEW_FAILED,
+            requested_show_set_ids=target_ids,
+            requested_labels_by_set_id=request_scope.requested_labels_by_set_id,
+            request_scope=request_scope,
+            attempted_display_set_ids=target_ids,
+            affected_set_ids=target_ids,
+            unresolved_intent_set_ids=target_ids,
+            failed_intent_set_ids=target_ids,
+            clear_plot=True,
+        )
+        if status_text:
+            self._ui.set_status_text(str(status_text))
+        return outcome
 
     def invalidate_workspace_preview_display_and_cache(
         self,

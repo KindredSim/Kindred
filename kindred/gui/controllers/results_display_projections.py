@@ -263,6 +263,11 @@ def display_transition_status_text(
             "Preview pending.",
             transition_outcome,
         )
+    if cause is DisplayTransitionCause.CURRENT_PREVIEW_FAILED:
+        return _with_request_outcome_status_suffix(
+            "Current preview failed.",
+            transition_outcome,
+        )
     if cause is DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE:
         return _with_request_outcome_status_suffix(_SEMANTIC_DISPLAY_UNAVAILABLE_STATUS, transition_outcome)
     if cause is DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS:
