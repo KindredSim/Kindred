@@ -6,6 +6,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Set, Tuple
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.gui.controllers.preview_target_identity import normalize_preview_target_set_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -675,17 +676,7 @@ class BatchDisplayRequestResolution:
 
 
 def _normalize_slider_replay_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    if isinstance(values, str):
-        values = (values,)
-    for value in values or ():
-        set_id = str(value or "").strip()
-        if not set_id or set_id in seen:
-            continue
-        seen.add(set_id)
-        normalized.append(set_id)
-    return tuple(normalized)
+    return normalize_preview_target_set_ids(values)
 
 
 def _normalize_slider_replay_scope_kind(value: SliderReplayScopeKind | str | object) -> SliderReplayScopeKind:

@@ -4003,12 +4003,7 @@ class ResultsController(QtCore.QObject):
         run_id: Optional[int],
     ) -> Optional[SimulationCompletionDisplayOutcome]:
         if str(cache_kind or "") == "preview":
-            outcome = self.refresh_display_from_request_scope(
-                display_source=DisplayRefreshSource.SLIDER_REPLAY,
-            )
-            if _display_transition_published(outcome):
-                return outcome
-            return self.publish_fresh_preview_from_entries(
+            fresh_outcome = self.publish_fresh_preview_from_entries(
                 fresh_preview_entries=fresh_preview_entries,
                 requested_show_set_ids=requested_show_set_ids,
                 target_set_ids=target_set_ids,
@@ -4017,6 +4012,16 @@ class ResultsController(QtCore.QObject):
                 request_id=request_id,
                 run_id=run_id,
             )
+            if _display_transition_published(fresh_outcome):
+                return fresh_outcome
+            if fresh_preview_entries:
+                return fresh_outcome
+            outcome = self.refresh_display_from_request_scope(
+                display_source=DisplayRefreshSource.SLIDER_REPLAY,
+            )
+            if _display_transition_published(outcome):
+                return outcome
+            return fresh_outcome
         if valid_set_ids:
             publisher = getattr(cache_admin, "publish_completion_cache_truth", None)
             if callable(publisher):

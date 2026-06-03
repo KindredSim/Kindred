@@ -348,7 +348,6 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
-            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
             | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
         )
         self.horizontalHeader().setStretchLastSection(False)

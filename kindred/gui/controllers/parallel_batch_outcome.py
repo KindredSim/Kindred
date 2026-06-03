@@ -3,20 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from time import perf_counter
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome
-from kindred.core.simulation_failure import (
-    build_simulation_failure,
-    coerce_simulation_failure,
-)
-from kindred.gui.controllers.simulation_callback_freshness import SimulationCallbackFreshnessOwner
-from kindred.gui.controllers.simulation_runtime_backend import (
-    RuntimeCompletionDecision,
-    RuntimeScopedFailureProgress,
-    RuntimeScopedFailureSummary,
-)
-from kindred.gui.ports import DisplayTransitionOutcome
+from kindred.core.simulation_failure import build_simulation_failure
+from kindred.gui.controllers.simulation_runtime_backend import RuntimeCompletionDecision
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
+from kindred.gui.controllers.simulation_failure_policy import SimulationFailureInput
 
 
 logger = logging.getLogger(__name__)
@@ -35,10 +28,7 @@ class ParallelBatchOutcomeResolution:
 
 @dataclass(frozen=True)
 class ParallelBatchOutcomeDependencies:
-    freshness: SimulationCallbackFreshnessOwner
-    completion_policy_preview_ownership: Callable[[], Any]
-    record_nonfatal_exception: Callable[..., None]
-    finalize_scoped_batch_success_subset: Callable[..., DisplayTransitionOutcome | None]
+    record_nonfatal_exception: Any
 
 
 def resolve_parallel_batch_outcome(
@@ -139,89 +129,42 @@ def resolve_parallel_batch_outcome(
 
 
 class ParallelBatchOutcomeOwner:
+    """Adapter for runtime-lane batch outcomes.
+
+    This owner adapts backend completion records and publishes successful
+    completions.  Runtime/preview failure policy is delegated to the canonical
+    SimulationFailurePolicyOwner and returned as a typed RuntimeCompletionDecision.
+    """
+
     def __init__(
         self,
         *,
         batch_context_owner: Any,
-        batch_cache: Any,
         completion_callback_owner: Any,
-        completion_policy: Any,
+        failure_policy_owner: Any,
         dependencies: ParallelBatchOutcomeDependencies,
     ) -> None:
         self._batch_context_owner = batch_context_owner
-        self._batch_cache = batch_cache
         self._completion_callback_owner = completion_callback_owner
-        self._completion_policy = completion_policy
+        self._failure_policy_owner = failure_policy_owner
         self._deps = dependencies
 
-    def handle_scoped_failure(
-        self,
-        *,
-        set_id: str,
-        set_name: str,
-        error_payload: Mapping[str, Any],
-    ) -> bool:
-        return self._handle_scoped_failure_decision(
-            set_id=set_id,
-            set_name=set_name,
-            error_payload=error_payload,
-        ) is not None
+    def _callback_identity_from_metadata(self, meta: Mapping[str, Any]) -> SimulationCallbackIdentity | None:
+        callback_identity = meta.get("callback_identity")
+        return callback_identity if isinstance(callback_identity, SimulationCallbackIdentity) else None
 
-    def _handle_scoped_failure_decision(
+    def _context_for_callback_identity(
         self,
-        *,
-        set_id: str,
-        set_name: str,
-        error_payload: Mapping[str, Any],
-    ) -> RuntimeCompletionDecision | None:
-        completion_state = self._batch_context_owner.completion_state()
-        if (
-            completion_state is None
-            or not completion_state.active
-            or not (completion_state.runtime_task_queue or completion_state.parallel)
+        callback_identity: SimulationCallbackIdentity | None,
+    ) -> Mapping[str, Any] | None:
+        if callback_identity is None or not hasattr(self._batch_context_owner, "context_for_callback_identity"):
+            return None
+        context_resolution = self._batch_context_owner.context_for_callback_identity(callback_identity)
+        if bool(getattr(context_resolution, "matched", False)) and isinstance(
+            getattr(context_resolution, "context", None), Mapping
         ):
-            return None
-        if completion_state.fast_mode:
-            return None
-        total = max(1, int(completion_state.total or len(completion_state.queue_ids) or 1))
-        if total <= 1:
-            return None
-
-        sid = str(set_id or "")
-        failure = coerce_simulation_failure(error_payload)
-        transition = self._batch_context_owner.record_scoped_failure(set_id=sid, failure=failure)
-        ctx = transition.context
-        cache_state = self._batch_context_owner.scoped_failure_cache_state(ctx)
-        self._batch_cache.record_explicit_scoped_failure_cache_state(
-            cache_key=str(cache_state.cache_key),
-            explicit_cache_valid_set_ids=cache_state.explicit_cache_valid_set_ids,
-            explicit_cache_invalidated_set_ids=cache_state.explicit_cache_invalidated_set_ids,
-        )
-        completed_count = int(transition.completed_count)
-        if completed_count < total:
-            label = str(set_name or sid or "set")
-            return RuntimeCompletionDecision.accepted_current(
-                scoped_failure_progress=RuntimeScopedFailureProgress(
-                    set_label=label,
-                    completed=completed_count,
-                    total=total,
-                )
-            )
-
-        ctx = self._batch_context_owner.deactivate()
-        display_transition = self._deps.finalize_scoped_batch_success_subset(ctx)
-        if display_transition is not None and not isinstance(display_transition, DisplayTransitionOutcome):
-            raise TypeError("Scoped batch display finalization must return DisplayTransitionOutcome or None")
-        summary = self._batch_context_owner.completion_summary(ctx)
-        return RuntimeCompletionDecision.accepted_current(
-            final_scoped_failure=True,
-            scoped_failure_summary=RuntimeScopedFailureSummary(
-                failed_set_ids=tuple(summary.failed_set_ids or ()),
-                failed_errors=dict(summary.failed_errors or {}),
-            ),
-            terminal_failure_preview_replay_needed=True,
-            terminal_failure_preview_replay_fast_mode=False,
-        )
+            return getattr(context_resolution, "context")
+        return None
 
     def _consume_outcome_decision(
         self,
@@ -244,14 +187,8 @@ class ParallelBatchOutcomeOwner:
             completion_record=completion_record,
         )
         set_name = resolution.set_name
-        callback_identity = meta.get("callback_identity")
-        resolved_run_context: Mapping[str, Any] | None = None
-        if callback_identity is not None and hasattr(self._batch_context_owner, "context_for_callback_identity"):
-            context_resolution = self._batch_context_owner.context_for_callback_identity(callback_identity)
-            if bool(getattr(context_resolution, "matched", False)):
-                candidate_context = getattr(context_resolution, "context", None)
-                if isinstance(candidate_context, Mapping):
-                    resolved_run_context = candidate_context
+        callback_identity = self._callback_identity_from_metadata(meta)
+        resolved_run_context = self._context_for_callback_identity(callback_identity)
 
         if resolution.stale:
             runtime_session_stale = meta.get("runtime_session_stale")
@@ -272,11 +209,26 @@ class ParallelBatchOutcomeOwner:
                 ),
                 RuntimeError("stale batch lane outcome"),
             )
-            if isinstance(runtime_session_stale, Mapping):
-                return RuntimeCompletionDecision.ignored_stale(consumed=False)
-            return RuntimeCompletionDecision.reset_requested()
+            decision = self._failure_policy_owner.resolve_failure(
+                SimulationFailureInput(
+                    error_payload=resolution.error_payload or build_simulation_failure(
+                        "stale_batch_lane_outcome",
+                        "Rejected stale batch lane outcome.",
+                    ),
+                    origin="runtime_lane",
+                    callback_identity=callback_identity,
+                    set_id=sid,
+                    set_name=set_name,
+                    source=str(source),
+                    context=resolved_run_context,
+                    active_fast_mode=self._active_completion_fast_mode(),
+                    stale_runtime_lane_outcome=True,
+                    runtime_session_stale=runtime_session_stale if isinstance(runtime_session_stale, Mapping) else None,
+                )
+            )
+            return RuntimeCompletionDecision.from_failure_decision(decision)
 
-        if callback_identity is None or resolved_run_context is None:
+        if callback_identity is None:
             self._deps.record_nonfatal_exception(
                 (
                     "Missing callback identity for active parallel batch outcome "
@@ -286,81 +238,43 @@ class ParallelBatchOutcomeOwner:
                 ),
                 RuntimeError("missing parallel batch callback identity"),
             )
-            return RuntimeCompletionDecision.terminal_failure(
-                "Missing callback identity for active parallel batch outcome."
+            decision = self._failure_policy_owner.resolve_failure(
+                SimulationFailureInput(
+                    error_payload=build_simulation_failure(
+                        "runtime_missing_callback_identity",
+                        "Missing callback identity for active parallel batch outcome.",
+                    ),
+                    origin="runtime_lane",
+                    callback_identity=None,
+                    set_id=sid,
+                    set_name=set_name,
+                    source=str(source),
+                    active_fast_mode=self._active_completion_fast_mode(),
+                )
             )
+            return RuntimeCompletionDecision.from_failure_decision(decision)
 
-        freshness = self._deps.freshness.assess_callback(callback_identity, context=resolved_run_context)
-        if freshness.stale_run and int(freshness.active_run_id) > 0:
-            return RuntimeCompletionDecision.ignored_stale(consumed=False)
-        if freshness.dispatch_identity_stale:
-            self._deps.freshness.mark_stale_dispatch_identity_callback_consumed(
-                batch_set_id=sid,
-                context=resolved_run_context,
-            )
-            return RuntimeCompletionDecision.ignored_stale()
-        if freshness.runtime_input_stale:
-            self._deps.freshness.mark_stale_runtime_input_callback_consumed(
-                batch_set_id=sid,
-                context=resolved_run_context,
-            )
-            return RuntimeCompletionDecision.ignored_stale()
-
-        completion_policy_context = self._batch_context_owner.completion_policy_context(
-            resolved_run_context
-        )
         if resolution.failed:
-            error_payload = dict(resolution.error_payload or {})
-            if bool(getattr(freshness, "superseded_fast_request", False)):
-                stale_fast_decision = self._completion_policy.resolve_superseded_fast_error(
-                    preview_ownership=self._deps.completion_policy_preview_ownership(),
-                    context=completion_policy_context,
-                    request_id=int(getattr(callback_identity, "request_id", outcome.request_id)),
-                    preview_owner_epoch=getattr(
-                        freshness,
-                        "callback_preview_owner_epoch",
-                        None,
-                    ),
+            decision = self._failure_policy_owner.resolve_failure(
+                SimulationFailureInput(
+                    error_payload=dict(resolution.error_payload or {}),
+                    origin="runtime_lane",
+                    callback_identity=callback_identity,
+                    set_id=sid,
+                    set_name=set_name,
+                    source=str(source),
+                    context=resolved_run_context,
+                    active_fast_mode=self._active_completion_fast_mode(),
+                    allow_scoped_failure=True,
                 )
-                callback_context_matches_current = bool(
-                    self._batch_context_owner.context_matches_current_run_identity(
-                        resolved_run_context
-                    )
-                )
-                return RuntimeCompletionDecision.superseded_fast_failure_decision(
-                    failure_context=resolved_run_context,
-                    reset_status_progress=bool(
-                        stale_fast_decision.reset_status_progress
-                        and callback_context_matches_current
-                    ),
-                    deactivate_context_immediately=bool(
-                        stale_fast_decision.deactivate_context_immediately
-                        and callback_context_matches_current
-                    ),
-                )
-            scoped_failure_decision = self._handle_scoped_failure_decision(
-                set_id=sid,
-                set_name=set_name,
-                error_payload=error_payload,
             )
-            if scoped_failure_decision is not None:
-                return scoped_failure_decision
-            failure_decision = self._completion_policy.resolve_simulation_failure(
-                error_payload,
-                fast_mode=self._active_completion_fast_mode(),
-            )
-            if failure_decision.status_only_preview:
-                return RuntimeCompletionDecision.accepted_current(
-                    preview_failure_status_text=failure_decision.preview_status_text,
-                    failure_context=resolved_run_context,
-                )
-            return RuntimeCompletionDecision.terminal_failure(
-                failure_decision.error_text,
-                failure_detail_text=failure_decision.error_detail_text,
-                terminal_failure_preview_replay_needed=True,
-                terminal_failure_preview_replay_fast_mode=self._active_completion_fast_mode(),
-                failure_context=resolved_run_context,
-            )
+            return RuntimeCompletionDecision.from_failure_decision(decision)
+
+        policy_context = (
+            self._batch_context_owner.completion_policy_context(resolved_run_context)
+            if isinstance(resolved_run_context, Mapping)
+            else None
+        )
         if bool(debug_batch_parallel):
             logger.info(
                 "BATCH_PAR completion received run_id=%s request_id=%s set_id=%s source=%s completed_at=%.6f received_at=%.6f",
@@ -376,26 +290,29 @@ class ParallelBatchOutcomeOwner:
                 resolution.payload,
                 debug_batch_parallel=bool(debug_batch_parallel),
                 callback_identity=callback_identity,
-                policy_context=completion_policy_context,
+                policy_context=policy_context,
             )
         except Exception as exc:
             self._deps.record_nonfatal_exception(
                 f"Unhandled exception while handling completed batch lane outcome (set_id={sid}, source={str(source)})",
                 exc,
             )
-            failure_decision = self._completion_policy.resolve_simulation_failure(
-                build_simulation_failure(
-                    "runtime_completion_exception",
-                    str(exc),
-                ),
-                fast_mode=self._active_completion_fast_mode(),
+            decision = self._failure_policy_owner.resolve_failure(
+                SimulationFailureInput(
+                    error_payload=build_simulation_failure(
+                        "runtime_completion_exception",
+                        str(exc),
+                    ),
+                    origin="runtime_completion_exception",
+                    callback_identity=callback_identity,
+                    set_id=sid,
+                    set_name=set_name,
+                    source=str(source),
+                    context=resolved_run_context,
+                    active_fast_mode=self._active_completion_fast_mode(),
+                )
             )
-            return RuntimeCompletionDecision.terminal_failure(
-                failure_decision.error_text,
-                failure_detail_text=failure_decision.error_detail_text,
-                terminal_failure_preview_replay_needed=True,
-                terminal_failure_preview_replay_fast_mode=self._active_completion_fast_mode(),
-            )
+            return RuntimeCompletionDecision.from_failure_decision(decision)
         return RuntimeCompletionDecision.accepted_current()
 
     def _active_completion_fast_mode(self) -> bool:
@@ -437,4 +354,11 @@ class ParallelBatchOutcomeOwner:
                 debug_batch_parallel=False,
             )
         except Exception as exc:
-            return RuntimeCompletionDecision.terminal_failure(str(exc))
+            decision = self._failure_policy_owner.resolve_failure(
+                SimulationFailureInput(
+                    error_payload=build_simulation_failure("runtime_completion_consumer_exception", str(exc)),
+                    origin="runtime_completion_consumer_exception",
+                    active_fast_mode=self._active_completion_fast_mode(),
+                )
+            )
+            return RuntimeCompletionDecision.from_failure_decision(decision)

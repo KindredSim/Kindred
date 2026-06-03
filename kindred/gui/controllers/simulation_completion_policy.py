@@ -58,10 +58,6 @@ def _normalize_str_sequence(values: object, *, dedupe: bool) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def normalize_preview_target_set_ids(values: object) -> tuple[str, ...]:
-    return _normalize_str_sequence(values, dedupe=True)
-
-
 def _normalize_set_ids(values: object) -> tuple[str, ...]:
     return _normalize_str_sequence(values, dedupe=True)
 

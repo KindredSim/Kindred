@@ -5,6 +5,8 @@ from enum import Enum
 from itertools import count
 from typing import Any, Mapping, Protocol, Sequence
 
+from kindred.gui.controllers.preview_target_identity import normalize_preview_target_set_ids
+
 
 @dataclass(frozen=True)
 class RuntimeLaunchIntent:
@@ -27,12 +29,12 @@ class RuntimeLaunchIntent:
         object.__setattr__(
             self,
             "set_ids",
-            tuple(str(set_id) for set_id in self.set_ids or () if str(set_id)),
+            normalize_preview_target_set_ids(self.set_ids),
         )
         object.__setattr__(
             self,
             "requested_show_set_ids",
-            tuple(str(set_id) for set_id in self.requested_show_set_ids or () if str(set_id)),
+            normalize_preview_target_set_ids(self.requested_show_set_ids),
         )
         object.__setattr__(
             self,
@@ -119,7 +121,7 @@ class RuntimePreparationBlockedReason:
         object.__setattr__(
             self,
             "set_ids",
-            tuple(str(set_id) for set_id in self.set_ids or () if str(set_id)),
+            normalize_preview_target_set_ids(self.set_ids),
         )
 
 

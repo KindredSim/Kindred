@@ -22,6 +22,7 @@ from kindred.gui.controllers.batch_dispatch_plan import (
     build_batch_set_dispatch_plan,
     execution_request_payload_from_plan,
 )
+from kindred.gui.controllers.preview_target_identity import normalize_preview_target_set_ids
 from kindred.gui.controllers.runtime_lane_allocation import (
     PreparedRuntimeRequestSet,
     RuntimeCompatibilityKey,
@@ -279,15 +280,7 @@ def build_run_start_context(
 
 
 def _deduped_nonempty_set_ids(set_ids: Sequence[str]) -> tuple[str, ...]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for set_id in set_ids or ():
-        sid = str(set_id or "").strip()
-        if not sid or sid in seen:
-            continue
-        seen.add(sid)
-        result.append(sid)
-    return tuple(result)
+    return normalize_preview_target_set_ids(set_ids)
 
 
 def _completed_run_display_labels_by_set_id(
@@ -1103,11 +1096,12 @@ class SimulationRunPreparationOwner:
                 ),
             )
         preferred = self._runtime_preferred_lane_capacity(rows=rows, descriptor_count=len(descriptors))
+        required = preferred if bool(fast_mode) else 1
         return PreparedRuntimeRequestSet(
             intent=intent,
             compatibility_key=compatibility_key,
             task_descriptors=descriptors,
-            required_lane_capacity=1,
+            required_lane_capacity=required,
             preferred_lane_capacity=preferred,
         )
 

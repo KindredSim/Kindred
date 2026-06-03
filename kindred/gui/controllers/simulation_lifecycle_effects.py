@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from kindred.gui.controllers.batch_run_context_owner import BatchCompletionCleanupState
 
@@ -11,6 +11,7 @@ class SimulationModalError:
     title: str
     message: str
     details: str | None = None
+    failure_payload: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +215,67 @@ class SimulationLifecycleEffectOwner:
         )
 
     @staticmethod
+    def failure_decision_effects(decision: object) -> SimulationLifecycleEffects:
+        ui_consequence = getattr(decision, "ui_consequence", None)
+        kind = str(getattr(ui_consequence, "kind", "none") or "none")
+        if kind in {"none", ""}:
+            return SimulationLifecycleEffects()
+
+        if kind == "superseded_fast_error":
+            runtime_consequence = getattr(decision, "runtime_consequence", None)
+            return SimulationLifecycleEffectOwner.superseded_fast_error_effects(
+                deactivate_context_immediately=(
+                    str(getattr(runtime_consequence, "kind", "none") or "none") == "soft_shutdown"
+                ),
+                reset_status_progress=bool(str(getattr(ui_consequence, "status_text", "") or "")),
+            )
+
+        if kind == "current_preview_failure":
+            return SimulationLifecycleEffectOwner.current_preview_failure_effects(
+                status_text=str(getattr(ui_consequence, "status_text", "") or "Preview unavailable. Adjust sliders or run again."),
+            )
+
+        if kind == "terminal_failure":
+            envelope = getattr(decision, "envelope", None)
+            payload = getattr(envelope, "payload", None)
+            callback_identity = getattr(decision, "callback_identity", None)
+            runtime_consequence = getattr(decision, "runtime_consequence", None)
+            return SimulationLifecycleEffectOwner.terminal_error_effects(
+                cancelled=bool(getattr(envelope, "cancelled", False)),
+                error_text=str(getattr(envelope, "user_message", "") or "Simulation failed"),
+                error_detail_text=str(getattr(envelope, "detail_text", "") or ""),
+                fast_mode=bool(
+                    getattr(callback_identity, "fast_mode", False)
+                    or getattr(runtime_consequence, "replay_fast_mode", False)
+                ),
+                error_payload=dict(payload) if isinstance(payload, Mapping) else None,
+            )
+
+        if kind == "scoped_failure_progress":
+            completed = max(0, int(getattr(ui_consequence, "completed", 0) or 0))
+            total = max(1, int(getattr(ui_consequence, "total", 1) or 1))
+            label = str(getattr(ui_consequence, "progress_label", "") or "set")
+            return SimulationLifecycleEffectOwner.progress_update(
+                progress_value=max(0, min(100, int((completed / float(total)) * 100.0))),
+                status_text=f"Failed {label} ({completed}/{total})",
+            )
+
+        if kind == "scoped_failure_final":
+            return SimulationLifecycleEffects(
+                reset_slider_triggered=True,
+                simulation_running=False,
+                slider_simulation_active=False,
+                run_enabled=True,
+                stop_enabled=False,
+                progress_value=100,
+                status_text="Ready",
+                stop_debounce_timers=True,
+                clear_shutdown_request=True,
+            )
+
+        return SimulationLifecycleEffects()
+
+    @staticmethod
     def superseded_fast_error_effects(
         *,
         deactivate_context_immediately: bool,
@@ -232,12 +294,52 @@ class SimulationLifecycleEffectOwner:
         )
 
     @staticmethod
+    def _terminal_failure_detail_text(
+        *,
+        error_detail_text: str,
+        error_payload: Mapping[str, Any] | None,
+    ) -> str:
+        lines: list[str] = []
+        detail = str(error_detail_text or "").strip()
+        if detail:
+            lines.append(detail)
+        if isinstance(error_payload, Mapping):
+            header_parts = []
+            kind = str(error_payload.get("kind") or "").strip()
+            code = str(error_payload.get("code") or "").strip()
+            exc_type = str(error_payload.get("exc_type") or "").strip()
+            if kind:
+                header_parts.append(f"kind={kind}")
+            if code:
+                header_parts.append(f"code={code}")
+            if exc_type:
+                header_parts.append(f"exc_type={exc_type}")
+            if header_parts:
+                lines.append("Failure payload: " + ", ".join(header_parts))
+            details = error_payload.get("details")
+            if isinstance(details, Mapping) and details:
+                lines.append("Details:")
+                for key in sorted(str(k) for k in details.keys()):
+                    lines.append(f"  {key}: {details.get(key)}")
+            context = error_payload.get("context")
+            if isinstance(context, Mapping) and context:
+                context_lines = []
+                for key in ("file_path", "line", "col", "line_text"):
+                    value = context.get(key)
+                    if value is not None:
+                        context_lines.append(f"{key}: {value}")
+                if context_lines:
+                    lines.append("Context: " + "; ".join(context_lines))
+        return "\n".join(lines).strip()
+
+    @staticmethod
     def terminal_error_effects(
         *,
         cancelled: bool,
         error_text: str,
         error_detail_text: str,
         fast_mode: bool,
+        error_payload: Mapping[str, Any] | None = None,
     ) -> SimulationLifecycleEffects:
         return SimulationLifecycleEffects(
             close_contained_owner=True,
@@ -258,7 +360,11 @@ class SimulationLifecycleEffectOwner:
                 else SimulationModalError(
                     title="Simulation Error",
                     message=f"Simulation failed:\n\n{error_text}",
-                    details=error_detail_text or None,
+                    details=SimulationLifecycleEffectOwner._terminal_failure_detail_text(
+                        error_detail_text=error_detail_text,
+                        error_payload=error_payload,
+                    ) or None,
+                    failure_payload=dict(error_payload) if isinstance(error_payload, Mapping) else None,
                 )
             ),
         )

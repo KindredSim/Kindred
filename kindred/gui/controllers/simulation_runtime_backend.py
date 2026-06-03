@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from kindred.core.batch_containment import BatchPolledCompletion, BatchRequestHandle
+from kindred.gui.controllers.simulation_failure_policy import SimulationFailureDecision
 from kindred.gui.controllers.runtime_lane_allocation import (
     RuntimeBackendLease,
     RuntimeBackendTask,
@@ -73,32 +74,6 @@ class RuntimeCompletionEvent:
 
 
 @dataclass(frozen=True)
-class RuntimeScopedFailureProgress:
-    set_label: str
-    completed: int
-    total: int
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "set_label", str(self.set_label or "set"))
-        object.__setattr__(self, "completed", max(0, int(self.completed or 0)))
-        object.__setattr__(self, "total", max(1, int(self.total or 1)))
-
-
-@dataclass(frozen=True)
-class RuntimeScopedFailureSummary:
-    failed_set_ids: tuple[str, ...] = ()
-    failed_errors: Mapping[str, Any] | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "failed_set_ids",
-            tuple(str(set_id) for set_id in self.failed_set_ids or () if str(set_id)),
-        )
-        object.__setattr__(self, "failed_errors", dict(self.failed_errors or {}))
-
-
-@dataclass(frozen=True)
 class RuntimeCompletionDecision:
     accepted: bool = True
     consumed: bool = True
@@ -106,105 +81,47 @@ class RuntimeCompletionDecision:
     failed: bool = False
     message: str = ""
     stop_current_poll_batch: bool = False
-    scoped_failure_progress: RuntimeScopedFailureProgress | None = None
-    final_scoped_failure: bool = False
-    scoped_failure_summary: RuntimeScopedFailureSummary | None = None
-    terminal_failure_preview_replay_needed: bool = False
-    terminal_failure_preview_replay_fast_mode: bool = False
-    failure_detail_text: str = ""
-    preview_failure_status_text: str = ""
-    failure_context: Mapping[str, Any] | None = None
-    superseded_fast_failure: bool = False
-    superseded_fast_failure_reset_status_progress: bool = False
-    superseded_fast_failure_deactivate_context_immediately: bool = False
+    failure_decision: SimulationFailureDecision | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "final_scoped_failure", bool(self.final_scoped_failure))
-        object.__setattr__(
-            self,
-            "terminal_failure_preview_replay_needed",
-            bool(self.terminal_failure_preview_replay_needed),
-        )
-        object.__setattr__(
-            self,
-            "terminal_failure_preview_replay_fast_mode",
-            bool(self.terminal_failure_preview_replay_fast_mode),
-        )
-        object.__setattr__(self, "failure_detail_text", str(self.failure_detail_text or ""))
-        object.__setattr__(
-            self,
-            "preview_failure_status_text",
-            str(self.preview_failure_status_text or ""),
-        )
-        object.__setattr__(self, "superseded_fast_failure", bool(self.superseded_fast_failure))
-        object.__setattr__(
-            self,
-            "superseded_fast_failure_reset_status_progress",
-            bool(self.superseded_fast_failure_reset_status_progress),
-        )
-        object.__setattr__(
-            self,
-            "superseded_fast_failure_deactivate_context_immediately",
-            bool(self.superseded_fast_failure_deactivate_context_immediately),
-        )
-        if not isinstance(self.failure_context, Mapping):
-            object.__setattr__(self, "failure_context", None)
-        if not isinstance(self.scoped_failure_progress, RuntimeScopedFailureProgress):
-            object.__setattr__(self, "scoped_failure_progress", None)
-        if not isinstance(self.scoped_failure_summary, RuntimeScopedFailureSummary):
-            object.__setattr__(self, "scoped_failure_summary", None)
+        object.__setattr__(self, "accepted", bool(self.accepted))
+        object.__setattr__(self, "consumed", bool(self.consumed))
+        object.__setattr__(self, "terminal", bool(self.terminal))
+        object.__setattr__(self, "failed", bool(self.failed))
+        object.__setattr__(self, "message", str(self.message or ""))
+        object.__setattr__(self, "stop_current_poll_batch", bool(self.stop_current_poll_batch))
+        if not isinstance(self.failure_decision, SimulationFailureDecision):
+            object.__setattr__(self, "failure_decision", None)
 
     @classmethod
-    def accepted_current(
+    def accepted_current(cls) -> "RuntimeCompletionDecision":
+        return cls(accepted=True, consumed=True)
+
+    @classmethod
+    def from_failure_decision(
         cls,
-        *,
-        scoped_failure_progress: RuntimeScopedFailureProgress | None = None,
-        final_scoped_failure: bool = False,
-        scoped_failure_summary: RuntimeScopedFailureSummary | None = None,
-        terminal_failure_preview_replay_needed: bool = False,
-        terminal_failure_preview_replay_fast_mode: bool = False,
-        preview_failure_status_text: str = "",
-        failure_context: Mapping[str, Any] | None = None,
-    ) -> RuntimeCompletionDecision:
+        failure_decision: SimulationFailureDecision,
+    ) -> "RuntimeCompletionDecision":
         return cls(
-            accepted=True,
-            consumed=True,
-            scoped_failure_progress=scoped_failure_progress,
-            final_scoped_failure=bool(final_scoped_failure),
-            scoped_failure_summary=scoped_failure_summary,
-            terminal_failure_preview_replay_needed=bool(terminal_failure_preview_replay_needed),
-            terminal_failure_preview_replay_fast_mode=bool(
-                terminal_failure_preview_replay_fast_mode
+            accepted=bool(failure_decision.accepted_runtime_completion),
+            consumed=bool(failure_decision.consumed_runtime_completion),
+            terminal=bool(failure_decision.terminal_runtime_completion),
+            failed=bool(failure_decision.failed_runtime_completion),
+            message=(
+                str(failure_decision.envelope.user_message)
+                if failure_decision.envelope is not None
+                else str(failure_decision.log_message or "")
             ),
-            preview_failure_status_text=str(preview_failure_status_text or ""),
-            failure_context=failure_context if isinstance(failure_context, Mapping) else None,
+            stop_current_poll_batch=bool(failure_decision.stop_current_poll_batch),
+            failure_decision=failure_decision,
         )
 
     @classmethod
-    def superseded_fast_failure_decision(
-        cls,
-        *,
-        failure_context: Mapping[str, Any] | None = None,
-        reset_status_progress: bool = False,
-        deactivate_context_immediately: bool = False,
-    ) -> RuntimeCompletionDecision:
-        return cls(
-            accepted=False,
-            consumed=True,
-            superseded_fast_failure=True,
-            failure_context=failure_context if isinstance(failure_context, Mapping) else None,
-            superseded_fast_failure_reset_status_progress=bool(reset_status_progress),
-            superseded_fast_failure_deactivate_context_immediately=bool(
-                deactivate_context_immediately
-            ),
-        )
-
-    @classmethod
-    def ignored_stale(cls, *, consumed: bool = True) -> RuntimeCompletionDecision:
+    def ignored_stale(cls, *, consumed: bool = True) -> "RuntimeCompletionDecision":
         return cls(accepted=False, consumed=bool(consumed))
 
     @classmethod
-    def reset_requested(cls, *, consumed: bool = False) -> RuntimeCompletionDecision:
+    def reset_requested(cls, *, consumed: bool = False) -> "RuntimeCompletionDecision":
         return cls(
             accepted=False,
             consumed=bool(consumed),
@@ -212,29 +129,13 @@ class RuntimeCompletionDecision:
         )
 
     @classmethod
-    def terminal_failure(
-        cls,
-        message: str = "",
-        *,
-        failure_detail_text: str = "",
-        terminal_failure_preview_replay_needed: bool = False,
-        terminal_failure_preview_replay_fast_mode: bool = False,
-        failure_context: Mapping[str, Any] | None = None,
-    ) -> RuntimeCompletionDecision:
+    def terminal_failure(cls, message: str = "") -> "RuntimeCompletionDecision":
         return cls(
             accepted=False,
             consumed=False,
             terminal=True,
             failed=True,
             message=str(message or ""),
-            failure_detail_text=str(failure_detail_text or ""),
-            terminal_failure_preview_replay_needed=bool(
-                terminal_failure_preview_replay_needed
-            ),
-            terminal_failure_preview_replay_fast_mode=bool(
-                terminal_failure_preview_replay_fast_mode
-            ),
-            failure_context=failure_context if isinstance(failure_context, Mapping) else None,
         )
 
 

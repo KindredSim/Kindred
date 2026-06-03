@@ -47,6 +47,39 @@ class SliderPlotCoalescer(QtCore.QObject):
             self.timer.stop()
         self.pending = PendingSliderPlotUpdate()
 
+    def requeue_pending(
+        self,
+        pending: PendingSliderPlotUpdate,
+        *,
+        interval_ms: Optional[int] = None,
+    ) -> None:
+        """Restore a pending update for a later flush.
+
+        Preview display is only valid once all targeted fresh-preview entries
+        have arrived.  The controller uses this to avoid publishing an older
+        cached display for a partially completed preview batch.
+        """
+        if self.timer.isActive():
+            self.timer.stop()
+        self.pending = PendingSliderPlotUpdate(
+            set_ids=set(pending.set_ids),
+            target_set_ids=tuple(pending.target_set_ids or ()),
+            cache_key=pending.cache_key,
+            cache_kind=pending.cache_kind,
+            request_id=pending.request_id,
+            run_id=pending.run_id,
+            accepted_preview_request_id=pending.accepted_preview_request_id,
+            accepted_preview_owner_epoch=pending.accepted_preview_owner_epoch,
+            valid_set_ids=pending.valid_set_ids,
+            fresh_preview_entries=dict(pending.fresh_preview_entries),
+        )
+        delay_ms = self.slider_interval_ms if interval_ms is None else int(interval_ms)
+        try:
+            self.timer.setInterval(max(1, int(delay_ms)))
+        except Exception:
+            self.timer.setInterval(max(1, int(self.slider_interval_ms)))
+        self.timer.start()
+
     def queue(
         self,
         *,

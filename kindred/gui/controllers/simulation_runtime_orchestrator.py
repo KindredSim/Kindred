@@ -11,15 +11,13 @@ from kindred.gui.controllers.runtime_lane_allocation import (
     RuntimeReleaseReason,
     RuntimeReleaseResult,
 )
-from kindred.gui.controllers.simulation_completion_policy import (
-    normalize_preview_target_set_ids,
-)
+from kindred.gui.controllers.preview_target_identity import normalize_preview_target_set_ids
+from kindred.gui.controllers.simulation_failure_policy import SimulationFailureDecision
 from kindred.gui.controllers.simulation_runtime_backend import (
     RuntimeBackendPort,
     RuntimeCompletionDecision,
     RuntimeCompletionConsumer,
     RuntimeCompletionEvent,
-    RuntimeScopedFailureSummary,
 )
 from kindred.gui.controllers.simulation_runtime_readiness_lifecycle import (
     SimulationRuntimeReadinessEndpointState,
@@ -119,12 +117,7 @@ class RuntimeUiEffect:
     clear_preview_plot_updates: bool = False
     dispatch_ready: RuntimeDispatchPlan | None = None
     surface_failure: str = ""
-    surface_failure_detail_text: str = ""
-    preview_failure_status_text: str = ""
-    preview_failure_context: Mapping[str, object] | None = None
-    superseded_fast_failure: bool = False
-    superseded_fast_failure_reset_status_progress: bool = False
-    superseded_fast_failure_deactivate_context_immediately: bool = False
+    simulation_failure_decision: SimulationFailureDecision | None = None
     render_state: SimulationRuntimeReadinessRenderState | None = None
     simulation_running: bool | None = None
     slider_simulation_active: bool | None = None
@@ -137,7 +130,6 @@ class RuntimeUiEffect:
     cancel_warmup_retry_kinds: tuple[str, ...] = ()
     warmup_retry_kind: str = ""
     warmup_retry_delay_ms: int = 0
-    scoped_failure_summary: RuntimeScopedFailureSummary | None = None
 
 
 @dataclass(frozen=True)
@@ -706,20 +698,15 @@ class SimulationRuntimeOrchestrator:
                 )
                 if decision.terminal:
                     if decision.failed:
+                        failure_decision = getattr(decision, "failure_decision", None)
+                        if isinstance(failure_decision, SimulationFailureDecision):
+                            effects = self.failure_decision_requested(failure_decision)
+                            effects.append(RuntimeUiEffect(simulation_failure_decision=failure_decision))
+                            return effects
                         _, close_failure = self._close_failed_runtime()
-                        effects = [
-                            self._ready_reset_effect(stop_completion_polling=True)
-                        ]
-                        effects.extend(self._completion_terminal_replay_effects(decision))
+                        effects = [self._ready_reset_effect(stop_completion_polling=True)]
                         if decision.message:
-                            effects.append(
-                                RuntimeUiEffect(
-                                    surface_failure=str(decision.message),
-                                    surface_failure_detail_text=str(
-                                        getattr(decision, "failure_detail_text", "") or ""
-                                    ),
-                                )
-                            )
+                            effects.append(RuntimeUiEffect(surface_failure=str(decision.message)))
                         if close_failure:
                             effects.append(RuntimeUiEffect(surface_failure=close_failure))
                         return effects
@@ -786,86 +773,84 @@ class SimulationRuntimeOrchestrator:
         self,
         decision: RuntimeCompletionDecision,
     ) -> list[RuntimeUiEffect]:
+        failure_decision = getattr(decision, "failure_decision", None)
+        if isinstance(failure_decision, SimulationFailureDecision):
+            consequence_effects = self.failure_decision_requested(failure_decision)
+            decision_effect = RuntimeUiEffect(simulation_failure_decision=failure_decision)
+            if getattr(failure_decision, "disposition", "") == "superseded_fast_failure":
+                return [decision_effect, *consequence_effects]
+            return [*consequence_effects, decision_effect]
+        return []
+
+    def failure_decision_requested(
+        self,
+        decision: SimulationFailureDecision,
+        *,
+        current_state: object | None = None,
+        terminal_replay_snapshot: RuntimePreviewReplaySnapshot | None = None,
+    ) -> list[RuntimeUiEffect]:
+        runtime = decision.runtime_consequence
+        kind = str(getattr(runtime, "kind", "none") or "none")
         effects: list[RuntimeUiEffect] = []
-        failure_context = getattr(decision, "failure_context", None)
-        preview_failure_context = failure_context if isinstance(failure_context, Mapping) else None
-        if bool(getattr(decision, "superseded_fast_failure", False)):
-            if bool(
-                getattr(
-                    decision,
-                    "superseded_fast_failure_deactivate_context_immediately",
-                    False,
-                )
-            ):
-                effects.extend(self.cancel_requested(kind="soft_shutdown"))
-            effects.append(
-                RuntimeUiEffect(
-                    superseded_fast_failure=True,
-                    superseded_fast_failure_reset_status_progress=bool(
-                        getattr(
-                            decision,
-                            "superseded_fast_failure_reset_status_progress",
-                            False,
-                        )
-                    ),
-                    superseded_fast_failure_deactivate_context_immediately=bool(
-                        getattr(
-                            decision,
-                            "superseded_fast_failure_deactivate_context_immediately",
-                            False,
-                        )
-                    ),
-                    preview_failure_context=preview_failure_context,
-                )
-            )
-        preview_failure_status_text = str(
-            getattr(decision, "preview_failure_status_text", "") or ""
-        )
-        if preview_failure_status_text:
+
+        if kind == "soft_shutdown":
+            effects.extend(self.cancel_requested(kind="soft_shutdown"))
+        elif kind == "preview_failure":
             effects.extend(self.terminal_failure())
-            effects.append(
-                RuntimeUiEffect(
-                    preview_failure_status_text=preview_failure_status_text,
-                    preview_failure_context=preview_failure_context,
-                )
-            )
-        progress = getattr(decision, "scoped_failure_progress", None)
-        if progress is not None:
-            completed = max(0, int(getattr(progress, "completed", 0) or 0))
-            total = max(1, int(getattr(progress, "total", 1) or 1))
-            label = str(getattr(progress, "set_label", "") or "set")
-            effects.append(
-                RuntimeUiEffect(
-                    progress_value=max(0, min(100, int((completed / float(total)) * 100.0))),
-                    status_text=f"Failed {label} ({completed}/{total})",
-                )
-            )
-        if bool(getattr(decision, "final_scoped_failure", False)):
+        elif kind == "terminal_failure":
+            effects.extend(self.terminal_failure(backend_failed=bool(getattr(runtime, "backend_failed", False))))
+        elif kind == "stop":
+            effects.extend(self.cancel_requested(kind="stop"))
+        elif kind == "scoped_failure_complete":
             self.display_completed(kind="scoped_failure")
-            effects.append(self._scoped_failure_completion_effect())
-            summary = getattr(decision, "scoped_failure_summary", None)
-            if isinstance(summary, RuntimeScopedFailureSummary):
-                effects.append(RuntimeUiEffect(scoped_failure_summary=summary))
-            effects.extend(self._completion_terminal_replay_effects(decision))
+            effects.append(
+                RuntimeUiEffect(
+                    stop_completion_polling=True,
+                    cancel_warmup_retry_kinds=_RUNTIME_WARMUP_RETRY_KINDS,
+                )
+            )
+        elif kind == "parallel_outcome_reset":
+            effects.extend(self.parallel_outcome_reset())
+
+        if bool(getattr(runtime, "stale_fast_error_replay_needed", False)):
+            replay_source = current_state if current_state is not None else (self._preview_replay_state() if callable(self._preview_replay_state) else None)
+            if replay_source is not None:
+                replay_state = RuntimePreviewReplayState.from_pending(replay_source)
+                replay_decision = self.stale_fast_error_replay_decision(current_state=replay_state)
+                effects.extend(replay_decision.effects)
+
+        if bool(getattr(runtime, "terminal_replay_needed", False)):
+            effects.extend(
+                self._failure_terminal_replay_effects(
+                    decision,
+                    current_state=current_state,
+                    replay_snapshot=terminal_replay_snapshot,
+                )
+            )
         return effects
 
-    def _completion_terminal_replay_effects(
+    def _failure_terminal_replay_effects(
         self,
-        decision: RuntimeCompletionDecision,
+        decision: SimulationFailureDecision,
+        *,
+        current_state: object | None = None,
+        replay_snapshot: RuntimePreviewReplaySnapshot | None = None,
     ) -> list[RuntimeUiEffect]:
-        if not bool(getattr(decision, "terminal_failure_preview_replay_needed", False)):
-            return []
         state_provider = self._preview_replay_state
         dirty_provider = self._dirty_generation_by_set_id
-        if not callable(state_provider) or not callable(dirty_provider):
+        if not callable(dirty_provider):
             return []
-        pending_state = state_provider()
-        pending = RuntimePreviewReplayState.from_pending(pending_state)
+        source_state = current_state
+        if source_state is None and callable(state_provider):
+            source_state = state_provider()
+        if source_state is None:
+            return []
+        pending = RuntimePreviewReplayState.from_pending(source_state)
         dirty_generations = dirty_provider(pending.target_set_ids)
         return self.terminal_failure_replay_requested(
-            fast_mode=bool(getattr(decision, "terminal_failure_preview_replay_fast_mode", False)),
+            fast_mode=bool(getattr(decision.runtime_consequence, "replay_fast_mode", False)),
             pending_state=pending,
-            replay_snapshot=None,
+            replay_snapshot=replay_snapshot,
             dirty_generation_by_set_id=dirty_generations,
         )
 

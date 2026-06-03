@@ -76,6 +76,11 @@ from kindred.gui.controllers.simulation_lifecycle_effects import (
     SimulationLifecycleEffectOwner,
     SimulationLifecycleEffects,
 )
+from kindred.gui.controllers.simulation_failure_policy import (
+    SimulationFailureDecision,
+    SimulationFailurePolicyOwner,
+)
+from kindred.gui.controllers.preview_target_identity import normalize_preview_target_set_ids
 from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.core.runtime_defaults import contained_child_blas_thread_env
 from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
@@ -115,16 +120,6 @@ class _SerialBatchDispatchState:
     cache_key: str
     context: Mapping[str, Any] | None
 
-
-def _normalized_preview_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
-    if isinstance(values, (str, bytes)):
-        values = (values,)
-    normalized: list[str] = []
-    for set_id in values or ():
-        text = str(set_id)
-        if text:
-            normalized.append(text)
-    return tuple(normalized)
 
 
 class SimulationController(QtCore.QObject):
@@ -316,38 +311,24 @@ class SimulationController(QtCore.QObject):
                 runtime_display_completed=self._runtime_orchestrator.display_completed,
             ),
         )
-        self._error_handling_owner = SimulationErrorHandlingOwner(
-            ui=self.ui,
+        self._failure_policy_owner = SimulationFailurePolicyOwner(
             batch_context_owner=self._batch_context_owner,
             completion_policy=self._completion_policy,
-            lifecycle_effect_owner=self._lifecycle_effect_owner,
+            freshness=self._callback_freshness_owner,
+            completion_policy_preview_ownership=self._completion_policy_preview_ownership,
+        )
+        self._error_handling_owner = SimulationErrorHandlingOwner(
+            failure_policy_owner=self._failure_policy_owner,
             dependencies=SimulationErrorHandlingDependencies(
-                freshness=self._callback_freshness_owner,
-                completion_policy_preview_ownership=self._completion_policy_preview_ownership,
-                stale_fast_error_replay_decision=self._stale_fast_error_replay_decision,
-                apply_completion_policy_state_patch=self._apply_completion_policy_state_patch,
-                apply_lifecycle_effects=self._apply_simulation_lifecycle_effects,
-                apply_runtime_effects=self._apply_runtime_lifecycle_ui_effects,
-                runtime_cancel_requested=self._runtime_orchestrator.cancel_requested,
-                capture_terminal_failure_preview_replay_snapshot=(
-                    self._capture_terminal_failure_preview_replay_snapshot
-                ),
-                request_terminal_failure_preview_replay=(
-                    self._request_terminal_failure_preview_replay_effects
-                ),
-                request_pending_preview_replay=self._request_completion_preview_replay_effects,
+                apply_failure_decision=self._apply_canonical_simulation_failure_decision,
             ),
         )
         self._parallel_batch_outcome_owner = ParallelBatchOutcomeOwner(
             batch_context_owner=self._batch_context_owner,
-            batch_cache=self._batch_cache,
             completion_callback_owner=self._completion_callback_owner,
-            completion_policy=self._completion_policy,
+            failure_policy_owner=self._failure_policy_owner,
             dependencies=ParallelBatchOutcomeDependencies(
-                freshness=self._callback_freshness_owner,
-                completion_policy_preview_ownership=self._completion_policy_preview_ownership,
                 record_nonfatal_exception=self._record_nonfatal_exception,
-                finalize_scoped_batch_success_subset=self._finalize_scoped_batch_success_subset,
             ),
         )
         self._runtime_orchestrator.set_completion_consumer(self._parallel_batch_outcome_owner)
@@ -494,7 +475,7 @@ class SimulationController(QtCore.QObject):
         *,
         fallback_rows: Sequence[int] = (),
     ) -> list[int]:
-        target_ids = [str(set_id).strip() for set_id in target_set_ids or () if str(set_id).strip()]
+        target_ids = list(normalize_preview_target_set_ids(target_set_ids))
         if target_ids:
             rows_by_set_id: Dict[str, int] = {}
             try:
@@ -923,16 +904,89 @@ class SimulationController(QtCore.QObject):
         *,
         base_context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[CompletionPolicyContext]:
-        updated_context = None
-        if patch.context is not None:
-            updated_context = patch.context
-            self._batch_context_owner.serialize_completion_policy_context(
-                patch.context,
-                base_context=base_context,
-            )
+        updated_context = self._batch_context_owner.apply_completion_policy_state_patch(
+            patch,
+            base_context=base_context,
+        )
         if bool(getattr(patch, "clear_discarded_slider_preview_generation", False)):
             self._discarded_slider_preview_generation_id = None
         return updated_context
+
+    def _apply_canonical_simulation_failure_decision(
+        self,
+        decision: SimulationFailureDecision | object | None,
+        *,
+        runtime_already_applied: bool = False,
+    ) -> None:
+        if not isinstance(decision, SimulationFailureDecision):
+            return
+
+        envelope = decision.envelope
+        if decision.disposition.startswith("ignore_"):
+            mutation_result = self._batch_context_owner.apply_failure_context_mutation(decision.context_mutation)
+            if bool(getattr(mutation_result, "batch_done", False)) and isinstance(mutation_result.context, Mapping):
+                self._completion_publication_owner.finalize_without_result(
+                    mutation_result.context,
+                    status_text="Simulation complete",
+                    shutdown_requested=bool(getattr(self, "_shutdown_requested_for_close", False)),
+                )
+            return
+
+        terminal_replay_snapshot = None
+        if (
+            decision.terminal_failure
+            and envelope is not None
+            and not bool(envelope.cancelled)
+            and not bool(runtime_already_applied)
+        ):
+            terminal_replay_snapshot = self._capture_terminal_failure_preview_replay_snapshot()
+
+        mutation_result = self._batch_context_owner.apply_failure_context_mutation(decision.context_mutation)
+        patch = getattr(decision.context_mutation, "state_patch", None)
+        if bool(getattr(patch, "clear_discarded_slider_preview_generation", False)):
+            self._discarded_slider_preview_generation_id = None
+
+        cache_state = getattr(mutation_result, "scoped_failure_cache_state", None)
+        if cache_state is not None:
+            self._batch_cache.record_explicit_scoped_failure_cache_state(
+                cache_key=str(cache_state.cache_key),
+                explicit_cache_valid_set_ids=cache_state.explicit_cache_valid_set_ids,
+                explicit_cache_invalidated_set_ids=cache_state.explicit_cache_invalidated_set_ids,
+            )
+
+        if decision.disposition == "scoped_failure_final" and isinstance(mutation_result.context, Mapping):
+            display_transition = self._finalize_scoped_batch_success_subset(mutation_result.context)
+            if display_transition is not None and not isinstance(display_transition, DisplayTransitionOutcome):
+                raise TypeError("Scoped batch display finalization must return DisplayTransitionOutcome or None")
+            summary = getattr(mutation_result, "scoped_failure_summary", None)
+            if summary is None:
+                summary = self._batch_context_owner.completion_summary(mutation_result.context)
+            self._show_scoped_batch_failure_summary(
+                failed_set_ids=tuple(summary.failed_set_ids or ()),
+                failed_errors=dict(summary.failed_errors or {}),
+            )
+
+        if not bool(runtime_already_applied):
+            self._apply_runtime_lifecycle_ui_effects(
+                self._runtime_orchestrator.failure_decision_requested(
+                    decision,
+                    current_state=self._runtime_preview_replay_state(),
+                    terminal_replay_snapshot=terminal_replay_snapshot,
+                )
+            )
+
+        failed_context = (
+            mutation_result.context
+            if isinstance(getattr(mutation_result, "context", None), Mapping)
+            else decision.matched_context
+        )
+        self._apply_simulation_lifecycle_effects(
+            self._lifecycle_effect_owner.failure_decision_effects(decision),
+            failed_run_context=failed_context if isinstance(failed_context, Mapping) else None,
+        )
+
+        if decision.terminal_failure and envelope is not None and bool(envelope.cancelled):
+            self._request_completion_preview_replay_effects(shutdown_requested=False)
 
     def _capture_dirty_state_by_set_id(
         self,
@@ -1104,7 +1158,7 @@ class SimulationController(QtCore.QObject):
             )
             return
         request_token = pending.request_id
-        target_set_ids = tuple(str(set_id) for set_id in pending.target_set_ids or () if str(set_id))
+        target_set_ids = normalize_preview_target_set_ids(pending.target_set_ids)
         preview_ownership = getattr(self, "_preview_ownership", None)
         if request_token is not None and target_set_ids:
             preview_ownership = self._claim_preview_ownership(
@@ -1236,10 +1290,8 @@ class SimulationController(QtCore.QObject):
                 return False
             if int(ownership.epoch) != int(intent.preview_epoch):
                 return False
-            expected_targets = tuple(str(set_id) for set_id in intent.set_ids if str(set_id))
-            if expected_targets and _normalized_preview_target_set_ids(
-                ownership.target_set_ids
-            ) != _normalized_preview_target_set_ids(expected_targets):
+            expected_targets = normalize_preview_target_set_ids(intent.set_ids)
+            if expected_targets and normalize_preview_target_set_ids(ownership.target_set_ids) != expected_targets:
                 return False
             return True
         request_token = intent.request_token
@@ -1651,7 +1703,7 @@ class SimulationController(QtCore.QObject):
         runtime_rows: Sequence[int],
         target_set_ids: Sequence[str],
     ) -> PreparedRuntimeRequestSet:
-        normalized_targets = tuple(str(set_id) for set_id in target_set_ids or () if str(set_id))
+        normalized_targets = normalize_preview_target_set_ids(target_set_ids)
         intent = RuntimeLaunchIntent(
             intent_kind="ordinary",
             ui_action="runtime_readiness",
@@ -1699,20 +1751,15 @@ class SimulationController(QtCore.QObject):
         )
         if not callable(prewarm):
             return False
-        runtime_targets = tuple(str(set_id) for set_id in target_set_ids if str(set_id))
+        runtime_targets = normalize_preview_target_set_ids(target_set_ids)
         preview_ownership = self._preview_ownership
         preview_request_id = getattr(preview_ownership, "request_id", None)
         preview_epoch = getattr(preview_ownership, "epoch", None)
-        preview_targets = tuple(
-            str(set_id)
-            for set_id in getattr(preview_ownership, "target_set_ids", ()) or ()
-            if str(set_id)
-        )
+        preview_targets = normalize_preview_target_set_ids(getattr(preview_ownership, "target_set_ids", ()))
         if (
             preview_request_id is None
             or preview_epoch is None
-            or _normalized_preview_target_set_ids(preview_targets)
-            != _normalized_preview_target_set_ids(runtime_targets)
+            or preview_targets != runtime_targets
         ):
             return False
         intent = RuntimeLaunchIntent(
@@ -1775,14 +1822,6 @@ class SimulationController(QtCore.QObject):
                 self._simulation_running = bool(effect.simulation_running)
             if getattr(effect, "slider_simulation_active", None) is not None:
                 self._slider_simulation_active = bool(effect.slider_simulation_active)
-            scoped_failure_summary = getattr(effect, "scoped_failure_summary", None)
-            if scoped_failure_summary is not None:
-                self._show_scoped_batch_failure_summary(
-                    failed_set_ids=tuple(
-                        getattr(scoped_failure_summary, "failed_set_ids", ()) or ()
-                    ),
-                    failed_errors=dict(getattr(scoped_failure_summary, "failed_errors", {}) or {}),
-                )
             if getattr(effect, "run_enabled", None) is not None:
                 self.ui.run_ui.set_run_button_enabled(bool(effect.run_enabled))
             if getattr(effect, "stop_enabled", None) is not None:
@@ -1818,69 +1857,18 @@ class SimulationController(QtCore.QObject):
                 if bool(replay.stop_timers):
                     self._stop_deferred_preview_replay_timers()
                 QtCore.QTimer.singleShot(0, self.launch_pending_slider_preview_replay)
-            preview_failure_context = getattr(effect, "preview_failure_context", None)
-            if bool(getattr(effect, "superseded_fast_failure", False)):
-                failed_run_context = None
-                if (
-                    bool(
-                        getattr(
-                            effect,
-                            "superseded_fast_failure_deactivate_context_immediately",
-                            False,
-                        )
-                    )
-                    and isinstance(preview_failure_context, Mapping)
-                ):
-                    failed_run_context = self._batch_context_owner.deactivate_if_active(
-                        preview_failure_context
-                    )
-                self._apply_simulation_lifecycle_effects(
-                    self._lifecycle_effect_owner.superseded_fast_error_effects(
-                        deactivate_context_immediately=bool(
-                            getattr(
-                                effect,
-                                "superseded_fast_failure_deactivate_context_immediately",
-                                False,
-                            )
-                        ),
-                        reset_status_progress=bool(
-                            getattr(
-                                effect,
-                                "superseded_fast_failure_reset_status_progress",
-                                False,
-                            )
-                        ),
-                    ),
-                    failed_run_context=failed_run_context
-                    if isinstance(failed_run_context, Mapping)
-                    else None,
-                )
-            preview_failure_status_text = str(
-                getattr(effect, "preview_failure_status_text", "") or ""
-            )
-            if preview_failure_status_text:
-                failed_run_context = None
-                if isinstance(preview_failure_context, Mapping):
-                    failed_run_context = self._batch_context_owner.deactivate_if_active(
-                        preview_failure_context
-                    )
-                self._apply_simulation_lifecycle_effects(
-                    self._lifecycle_effect_owner.current_preview_failure_effects(
-                        status_text=preview_failure_status_text,
-                    ),
-                    failed_run_context=failed_run_context
-                    if isinstance(failed_run_context, Mapping)
-                    else None,
+            failure_decision = getattr(effect, "simulation_failure_decision", None)
+            if isinstance(failure_decision, SimulationFailureDecision):
+                self._apply_canonical_simulation_failure_decision(
+                    failure_decision,
+                    runtime_already_applied=True,
                 )
             surface_failure = str(getattr(effect, "surface_failure", "") or "")
             if surface_failure:
                 self.ui.dialogs.message_box_critical(
                     "Simulation Error",
                     "Simulation failed:\n\n" + surface_failure,
-                    details=(
-                        str(getattr(effect, "surface_failure_detail_text", "") or "")
-                        or None
-                    ),
+                    details=None,
                 )
 
     def _supersede_parallel_batch_run_soft(self) -> None:
@@ -1930,7 +1918,7 @@ class SimulationController(QtCore.QObject):
         self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._clear_pending_preview_slider_plot_updates()
         preview_invalidator = self._preview_display_cache_invalidator
-        normalized_targets = tuple(str(set_id) for set_id in target_set_ids or () if str(set_id))
+        normalized_targets = normalize_preview_target_set_ids(target_set_ids)
         if callable(preview_invalidator):
             try:
                 preview_invalidator(
@@ -1969,7 +1957,7 @@ class SimulationController(QtCore.QObject):
 
     @staticmethod
     def _normalize_runtime_input_set_ids(set_ids: Sequence[str] | None) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(str(set_id) for set_id in (set_ids or ()) if str(set_id)))
+        return normalize_preview_target_set_ids(set_ids)
 
     def _runtime_input_set_epoch(self, set_id: str) -> int:
         set_id_s = str(set_id or "").strip()
@@ -1991,7 +1979,7 @@ class SimulationController(QtCore.QObject):
         state = self._batch_context_owner.active_batch_state()
         if state is None or not state.active or state.fast_mode:
             return ()
-        return tuple(str(set_id) for set_id in state.queue_ids if str(set_id))
+        return normalize_preview_target_set_ids(state.queue_ids)
 
     def _preview_work_intersects_runtime_input_scope(self, affected_set_ids: Sequence[str]) -> bool:
         affected_scope = set(self._normalize_runtime_input_set_ids(affected_set_ids))
@@ -2083,6 +2071,43 @@ class SimulationController(QtCore.QObject):
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
 
+    def _pending_preview_plot_update_is_current(self, pending: object) -> bool:
+        ownership = self._preview_ownership
+        request_id = getattr(pending, "accepted_preview_request_id", None)
+        owner_epoch = getattr(pending, "accepted_preview_owner_epoch", None)
+        if request_id is None or owner_epoch is None:
+            return False
+        if ownership.request_id is None or ownership.epoch is None:
+            return False
+        try:
+            if int(request_id) != int(ownership.request_id):
+                return False
+            if int(owner_epoch) != int(ownership.epoch):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        pending_targets = normalize_preview_target_set_ids(getattr(pending, "target_set_ids", ()))
+        return pending_targets == normalize_preview_target_set_ids(ownership.target_set_ids)
+
+    def _pending_preview_plot_update_needs_full_coverage(self, pending: object) -> bool:
+        if str(getattr(pending, "cache_kind", "") or "") != "preview":
+            return False
+        target_ids = set(normalize_preview_target_set_ids(getattr(pending, "target_set_ids", ())))
+        if not target_ids:
+            return False
+        fresh_entries = getattr(pending, "fresh_preview_entries", {})
+        fresh_ids = set(
+            normalize_preview_target_set_ids(
+                fresh_entries.keys() if isinstance(fresh_entries, Mapping) else ()
+            )
+        )
+        if target_ids.issubset(fresh_ids):
+            return False
+        if not self._pending_preview_plot_update_is_current(pending):
+            return False
+        state = self._batch_context_owner.active_batch_state()
+        return bool(state is not None and state.active and state.fast_mode)
+
     def _flush_slider_plot_updates(
         self,
         *,
@@ -2092,6 +2117,12 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int] = None,
     ) -> bool:
         pending = self._plot_coalescer.take_pending()
+        if self._pending_preview_plot_update_needs_full_coverage(pending):
+            self._plot_coalescer.requeue_pending(
+                pending,
+                interval_ms=max(1, int(self._slider_plot_coalesce_interval_ms)),
+            )
+            return False
         pending_set_ids = set(pending.set_ids)
 
         refresh = self.ui.results.publish_runtime_slider_replay_display_from_pending(
@@ -2322,19 +2353,6 @@ class SimulationController(QtCore.QObject):
             raise TypeError("Completed-run display publication must return SimulationCompletionDisplayOutcome")
         return outcome.transition_outcome
 
-    def _try_handle_scoped_batch_failure(
-        self,
-        *,
-        set_id: str,
-        set_name: str,
-        error_payload: Mapping[str, Any],
-    ) -> bool:
-        return self._parallel_batch_outcome_owner.handle_scoped_failure(
-            set_id=set_id,
-            set_name=set_name,
-            error_payload=error_payload,
-        )
-
     def _consume_parallel_batch_outcome(
         self,
         *,
@@ -2423,7 +2441,7 @@ class SimulationController(QtCore.QObject):
         target_set_ids: Optional[Sequence[str]] = None,
     ) -> list[int]:
         _ = candidate_rows
-        snapshot_set_ids = [str(set_id) for set_id in (target_set_ids or ()) if str(set_id)]
+        snapshot_set_ids = list(normalize_preview_target_set_ids(target_set_ids))
         if not snapshot_set_ids:
             return []
 

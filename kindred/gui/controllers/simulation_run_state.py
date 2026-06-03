@@ -5,7 +5,7 @@ from typing import Optional, Sequence, Tuple
 
 from PySide6 import QtCore
 
-from kindred.gui.controllers.simulation_completion_policy import normalize_preview_target_set_ids
+from kindred.gui.controllers.preview_target_identity import normalize_preview_target_set_ids
 
 
 def _normalize_preview_request_id(value: object) -> Optional[int]:

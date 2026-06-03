@@ -374,6 +374,18 @@ class BatchScopedFailureCacheState:
 
 
 @dataclass(frozen=True)
+class BatchFailureContextMutationResult:
+    context: Dict[str, Any] | None = None
+    mutated: bool = False
+    batch_done: bool = False
+    completed_count: int = 0
+    total: int = 0
+    set_label: str = ""
+    scoped_failure_cache_state: BatchScopedFailureCacheState | None = None
+    scoped_failure_summary: BatchCompletionSummary | None = None
+
+
+@dataclass(frozen=True)
 class BatchPendingDirtyResetState:
     set_ids: tuple[str, ...]
     generation_by_set_id: Dict[str, int]
@@ -1601,6 +1613,91 @@ class BatchRunContextOwner:
             return deepcopy(dict(ctx))
         self._context = dict(ctx)
         return self.deactivate()
+
+    def apply_completion_policy_state_patch(
+        self,
+        patch: object,
+        *,
+        base_context: Mapping[str, Any] | None = None,
+    ) -> CompletionPolicyContext | None:
+        context = getattr(patch, "context", None)
+        if isinstance(context, CompletionPolicyContext):
+            self.serialize_completion_policy_context(
+                context,
+                base_context=base_context,
+            )
+            return context
+        return None
+
+    def apply_failure_context_mutation(
+        self,
+        mutation: object,
+    ) -> BatchFailureContextMutationResult:
+        kind = str(getattr(mutation, "kind", "none") or "none")
+        if not kind or kind == "none":
+            return BatchFailureContextMutationResult(context=self._current_context(), mutated=False)
+
+        context = getattr(mutation, "context", None)
+        context_arg = context if isinstance(context, Mapping) else None
+        set_id = str(getattr(mutation, "set_id", "") or "")
+        set_label = str(getattr(mutation, "set_name", "") or set_id or "set")
+
+        if kind == "deactivate_if_active":
+            ctx = self.deactivate_if_active(context_arg)
+            return BatchFailureContextMutationResult(context=ctx, mutated=True)
+
+        if kind == "apply_state_patch":
+            patch = getattr(mutation, "state_patch", None)
+            updated = self.apply_completion_policy_state_patch(
+                patch,
+                base_context=(
+                    getattr(mutation, "base_context", None)
+                    if isinstance(getattr(mutation, "base_context", None), Mapping)
+                    else context_arg
+                ),
+            )
+            ctx = self._current_context() if updated is not None else (dict(context_arg) if isinstance(context_arg, Mapping) else self._current_context())
+            return BatchFailureContextMutationResult(context=ctx, mutated=updated is not None)
+
+        if kind in {"mark_stale_dispatch_identity_consumed", "mark_stale_runtime_input_consumed"}:
+            transition = self.record_runtime_task_stale_callback_consumed_if_active(set_id=set_id)
+            if transition is None:
+                return BatchFailureContextMutationResult(context=self._current_context(), mutated=False)
+            return BatchFailureContextMutationResult(
+                context=transition.context,
+                mutated=True,
+                batch_done=bool(transition.batch_done),
+                completed_count=int(transition.completed_count),
+            )
+
+        if kind in {"record_scoped_failure", "record_scoped_failure_and_deactivate"}:
+            failure_payload = getattr(mutation, "failure_payload", None)
+            transition = self.record_scoped_failure(
+                set_id=set_id,
+                failure=dict(failure_payload or {}) if isinstance(failure_payload, Mapping) else {},
+            )
+            ctx = transition.context
+            cache_state = self.scoped_failure_cache_state(ctx)
+            summary = None
+            batch_done = False
+            if kind == "record_scoped_failure_and_deactivate":
+                ctx = self.deactivate()
+                summary = self.completion_summary(ctx)
+                batch_done = True
+            completion_state = self.completion_state(ctx)
+            total = max(0, int(completion_state.total if completion_state is not None else 0))
+            return BatchFailureContextMutationResult(
+                context=ctx,
+                mutated=True,
+                batch_done=batch_done,
+                completed_count=int(transition.completed_count),
+                total=total,
+                set_label=set_label,
+                scoped_failure_cache_state=cache_state,
+                scoped_failure_summary=summary,
+            )
+
+        return BatchFailureContextMutationResult(context=self._current_context(), mutated=False)
 
     def record_cache_key(self, cache_key: str) -> Dict[str, Any]:
         return self._update(cache_key=str(cache_key))
