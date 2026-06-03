@@ -628,6 +628,8 @@ class FreshPreviewDisplayEntry:
     completion_provenance: Mapping[str, Any] | None
     owned_species: tuple[str, ...]
     display_species: tuple[str, ...]
+    canonical_reference_entry: Mapping[str, Any] | None = None
+    canonical_reference_cache_key: str | None = None
     workspace_preview_provenance: Mapping[str, Any] | None = None
 
     def to_display_payload(self) -> Dict[str, Any]:

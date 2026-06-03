@@ -6563,8 +6563,13 @@ class MainWindow(
         target_set_ids = self._effective_slider_edit_target_set_ids()
         if bool(self._preview_session.has_staged_concentration_overlays()):
             replay_intent = self._preview_session.capture_reset_slider_replay_intent()
+            invalidation_target_set_ids = (
+                list(replay_intent.target_set_ids)
+                if replay_intent is not None and getattr(replay_intent, "target_set_ids", ())
+                else target_set_ids
+            )
             self._discard_pending_slider_edits_for_invalidation(
-                target_set_ids=target_set_ids,
+                target_set_ids=invalidation_target_set_ids,
             )
         else:
             self._sim_controller.discard_slider_preview_work_preserving_runtime_owner(
@@ -6601,6 +6606,8 @@ class MainWindow(
         if replay_intent is not None:
             self._preview_session.submit_slider_replay_intent(replay_intent)
             self._sim_controller.launch_pending_slider_preview_replay()
+            if self.results_controller.active_display_transaction() is None:
+                self._refresh_batch_display_from_request_scope()
         else:
             self._refresh_batch_display_from_request_scope()
 

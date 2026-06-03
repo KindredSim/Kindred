@@ -455,6 +455,31 @@ class SimulationCompletionPublicationOwner:
             candidate = None
         if isinstance(candidate, Mapping):
             workspace_provenance = dict(candidate)
+        canonical_reference_entry: Mapping[str, Any] | None = None
+        active_cache_key = str(self._batch_cache.active_cache_key or "").strip()
+        active_valid_set_ids = {
+            str(candidate_set_id)
+            for candidate_set_id in (self._batch_cache.active_cache_valid_set_ids or ())
+            if str(candidate_set_id)
+        }
+        active_invalidated_set_ids = {
+            str(candidate_set_id)
+            for candidate_set_id in (self._batch_cache.active_cache_invalidated_set_ids or ())
+            if str(candidate_set_id)
+        }
+        if (
+            active_cache_key
+            and set_id not in active_invalidated_set_ids
+            and (not active_valid_set_ids or set_id in active_valid_set_ids)
+        ):
+            explicit_entry = self._batch_cache.entry_for_set(
+                cache_key=active_cache_key,
+                set_id=set_id,
+                is_preview=False,
+                require_completion_provenance=True,
+            )
+            if explicit_entry.entry is not None:
+                canonical_reference_entry = dict(explicit_entry.entry)
         owned_species = self._base_owned_species_from_completion(completion)
         materialized = self._materialize_completion_display(
             completion,
@@ -472,6 +497,8 @@ class SimulationCompletionPublicationOwner:
             completion_provenance=self.direct_completion_provenance_payload(completion),
             owned_species=materialized.owned_species,
             display_species=materialized.display_species,
+            canonical_reference_entry=canonical_reference_entry,
+            canonical_reference_cache_key=(str(active_cache_key) if active_cache_key else None),
             workspace_preview_provenance=workspace_provenance,
         )
 

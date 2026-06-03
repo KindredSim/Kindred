@@ -291,6 +291,7 @@ if PYQTGRAPH_AVAILABLE:
             self._dark_mode = False
             self._scalar_values: Dict[str, float] = {}
             self._y_selection_user_touched: bool = False
+            self._preserved_y_selection_visibility: Dict[str, bool] = {}
             self._auto_range_enabled: bool = True
             self._manual_range_values: tuple[
                 Optional[float],
@@ -615,6 +616,9 @@ if PYQTGRAPH_AVAILABLE:
             preserve_y_selection = bool(self._y_selection_user_touched)
             previous_visibility = dict(self._visible)
             previous_series_names = set(self._series.keys())
+            if preserve_y_selection and not previous_series_names and self._preserved_y_selection_visibility:
+                previous_visibility = dict(self._preserved_y_selection_visibility)
+                previous_series_names = set(previous_visibility.keys())
             self._t = np.asarray(t, dtype=float).reshape(-1)
             self._series = {str(k): np.asarray(v, dtype=float).reshape(-1) for k, v in dict(series or {}).items()}
             new_series_names = set(self._series.keys())
@@ -635,6 +639,7 @@ if PYQTGRAPH_AVAILABLE:
                 self._visible = {k: True for k in self._series.keys()}
                 if preserve_y_selection:
                     self._y_selection_user_touched = False
+            self._preserved_y_selection_visibility = {}
             color_manager = ColorManager.instance()
             provided_owned = {str(name).strip() for name in (owned_species or []) if str(name).strip()}
             series_keys = {str(name).strip() for name in self._series.keys() if str(name).strip()}
@@ -743,8 +748,17 @@ if PYQTGRAPH_AVAILABLE:
                 )
             return {"layers": layers}
 
-        def clear_display_transaction_state(self) -> None:
+        def clear_display_transaction_state(self, *, preserve_y_selection_state: bool = False) -> None:
+            preserved_visibility = (
+                dict(self._visible)
+                if bool(preserve_y_selection_state) and bool(self._y_selection_user_touched)
+                else {}
+            )
+            preserved_touched = bool(preserve_y_selection_state) and bool(self._y_selection_user_touched)
             self.clear()
+            if preserved_touched:
+                self._y_selection_user_touched = True
+                self._preserved_y_selection_visibility = preserved_visibility
             self.set_statistics_results({}, prefer="")
 
         def has_display_data(self) -> bool:
@@ -3057,6 +3071,7 @@ if PYQTGRAPH_AVAILABLE:
             self._guide_items = []
             self._scalar_values = {}
             self._y_selection_user_touched = False
+            self._preserved_y_selection_visibility = {}
             self._auto_range_enabled = True
             self._manual_range_values = (None, None, None, None)
             self._simulation_set_label = None
@@ -3180,7 +3195,7 @@ if PYQTGRAPH_AVAILABLE:
                 if isinstance(layer, PlotDisplayLayer) and self._is_reference_layer(layer)
             ]
             if not reference_layers:
-                return True
+                return False
             return all(bool(layer.visible) for layer in reference_layers)
 
         def _apply_axis_inversion_state(self) -> None:

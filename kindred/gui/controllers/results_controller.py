@@ -68,7 +68,7 @@ class ResultsDisplayPlotPort(Protocol):
     def set_statistics_results(self, results: Dict[str, object], *, prefer: str) -> None: ...
     def stats_table(self) -> object: ...
     def overlay_snapshot(self) -> Dict[str, object]: ...
-    def clear_display_transaction_state(self) -> None: ...
+    def clear_display_transaction_state(self, *, preserve_y_selection_state: bool = False) -> None: ...
     def transaction_export_axis_state(self, scope: str) -> Dict[str, object]: ...
     def dataset_overlay_export_columns(self, scope: str) -> Sequence[PlotCsvExportColumn]: ...
     def intervention_annotation_state(self) -> Dict[str, object]: ...
@@ -1101,6 +1101,12 @@ class ResultsController(QtCore.QObject):
                 plot.clear_display_transaction_state()
             except Exception as exc:
                 logger.debug("Failed to clear display transaction plot state: %s", exc, exc_info=True)
+        else:
+            try:
+                plot = self._main_plot()
+                plot.clear_display_transaction_state(preserve_y_selection_state=True)
+            except Exception as exc:
+                logger.debug("Failed to clear display transaction plot state: %s", exc, exc_info=True)
         try:
             self._clear_direct_completion_provenance()
         except Exception as exc:
@@ -1495,10 +1501,20 @@ class ResultsController(QtCore.QObject):
         affected_set_ids: Sequence[str],
         affected_scope_is_global: bool,
     ) -> DisplayTransitionOutcome | None:
-        return self._deauthorize_completed_run_display(
-            transition=_DISPLAY_TRANSITION_RUNTIME_INPUT_PREVIEW_DEAUTHORIZATION,
+        if not self._completed_run_display_transaction_active():
+            return None
+        if not self._affected_scope_intersects_active_plotted_display(
             affected_set_ids=affected_set_ids,
             affected_scope_is_global=bool(affected_scope_is_global),
+        ):
+            return None
+        return self.clear_active_display_transaction(
+            display_status=DisplayStatus.NO_COMPLETE_DISPLAYABLE_REQUEST_SCOPE,
+            affected_set_ids=affected_set_ids,
+            unresolved_intent_set_ids=affected_set_ids,
+            event_kind=_DISPLAY_TRANSITION_RUNTIME_INPUT_PREVIEW_DEAUTHORIZATION.event_kind,
+            cause=_DISPLAY_TRANSITION_RUNTIME_INPUT_PREVIEW_DEAUTHORIZATION.cause,
+            clear_plot=False,
         )
 
     def _deauthorize_active_display(
@@ -1999,36 +2015,6 @@ class ResultsController(QtCore.QObject):
             intervention_annotations=intervention_annotations,
             show_intervention_annotations=show_intervention_annotations,
         )
-
-    def _authorized_reference_metadata_for_refresh(
-        self,
-        *,
-        previous_transaction: ActiveDisplayTransaction | None,
-        display_set_ids: Sequence[str],
-    ) -> Dict[str, DisplaySetMetadata]:
-        if not isinstance(previous_transaction, ActiveDisplayTransaction):
-            return {}
-        display_ids = set(deduped_set_ids(display_set_ids))
-        if not display_ids:
-            return {}
-        reference_metadata: Dict[str, DisplaySetMetadata] = {}
-        for raw_layer_id, metadata in dict(previous_transaction.sets or {}).items():
-            if not isinstance(metadata, DisplaySetMetadata):
-                continue
-            if metadata.role is not DisplaySetRole.REFERENCE_OVERLAY:
-                continue
-            if str(metadata.set_id or "").strip() not in display_ids:
-                continue
-            layer_id = str(metadata.layer_id or raw_layer_id or "").strip()
-            if not layer_id:
-                continue
-            if bool(metadata.visible) != bool(self._reference_overlays_visible):
-                metadata = replace(
-                    metadata,
-                    visible=bool(self._reference_overlays_visible),
-                )
-            reference_metadata[layer_id] = metadata
-        return reference_metadata
 
     def _record_display_transition_outcome(
         self,
@@ -3992,6 +3978,33 @@ class ResultsController(QtCore.QObject):
             )
             if display_metadata is not None:
                 additional_metadata.append(display_metadata)
+        for entry in entries:
+            display_metadata = None
+            if isinstance(entry.canonical_reference_entry, Mapping):
+                reference_entry = dict(entry.canonical_reference_entry)
+                display_metadata = display_metadata_for_entry(
+                    label=str(entry.label),
+                    entry={
+                        **reference_entry,
+                        "display_species": tuple(
+                            str(name)
+                            for name in (reference_entry.get("display_species") or ())
+                            if str(name)
+                        ),
+                    },
+                    set_id=str(entry.set_id),
+                    role=DisplaySetRole.REFERENCE_OVERLAY,
+                    layer_id=f"reference:{entry.set_id}",
+                    visible=self._reference_overlays_visible,
+                )
+            elif not str(entry.canonical_reference_cache_key or "").strip():
+                display_metadata = self._validated_active_reference_metadata_for_fresh_preview(
+                    previous_transaction=self._active_display_transaction,
+                    set_id=str(entry.set_id),
+                    expected_display_set_ids=expected_ids,
+                )
+            if display_metadata is not None:
+                additional_metadata.append(display_metadata)
         workspace_provenance_by_set_id = {
             str(entry.set_id): dict(entry.workspace_preview_provenance)
             for entry in entries
@@ -4002,13 +4015,6 @@ class ResultsController(QtCore.QObject):
                 DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
                 affected_set_ids=expected_ids,
             )
-        prior_reference_metadata = self._authorized_reference_metadata_for_refresh(
-            previous_transaction=self._active_display_transaction,
-            display_set_ids=expected_ids,
-        )
-        for layer_id, metadata in prior_reference_metadata.items():
-            if layer_id not in {str(item.layer_id or "") for item in additional_metadata}:
-                additional_metadata.append(metadata)
         primary_series = series_by_set_id[str(primary.set_id)]
         outcome = self._apply_batch_display_transaction(
             t=np.asarray(primary.t, dtype=float),
@@ -4048,6 +4054,35 @@ class ResultsController(QtCore.QObject):
         return SimulationCompletionDisplayOutcome(
             transition_outcome=outcome.transition_outcome,
         )
+
+    def _validated_active_reference_metadata_for_fresh_preview(
+        self,
+        *,
+        previous_transaction: ActiveDisplayTransaction | None,
+        set_id: str,
+        expected_display_set_ids: Sequence[str],
+    ) -> DisplaySetMetadata | None:
+        if not isinstance(previous_transaction, ActiveDisplayTransaction):
+            return None
+        expected_ids = set(deduped_set_ids(expected_display_set_ids))
+        if not expected_ids:
+            return None
+        if set(previous_transaction.display_set_ids) != expected_ids:
+            return None
+        sid = str(set_id or "").strip()
+        if not sid:
+            return None
+        for metadata in dict(previous_transaction.sets or {}).values():
+            if not isinstance(metadata, DisplaySetMetadata):
+                continue
+            if metadata.role is not DisplaySetRole.REFERENCE_OVERLAY:
+                continue
+            if str(metadata.set_id or "").strip() != sid:
+                continue
+            if bool(metadata.visible) != bool(self._reference_overlays_visible):
+                return replace(metadata, visible=bool(self._reference_overlays_visible))
+            return metadata
+        return None
 
     def publish_slider_replay_display_scope(
         self,

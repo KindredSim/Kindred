@@ -742,6 +742,8 @@ class MainWindowPreviewSession:
                 changed_set_ids.append(str(set_id))
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
+            self._clear_active_preview_cache_state()
+            self._deauthorize_completed_display_for_runtime_input_change(changed_set_ids)
             self.stage_slider_replay_intent(
                 set_ids=changed_set_ids,
                 source="species_slider",
