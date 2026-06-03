@@ -66,6 +66,7 @@ def parse_csv_rows(
 
     columns = list(first.keys())
     explicit_mapping = bool(time_column or species_columns)
+    explicit_species_mapping = bool(species_columns)
 
     # Resolve time column
     if time_column:
@@ -171,8 +172,13 @@ def parse_csv_rows(
             try:
                 parsed_value = float(raw_value)
             except Exception as exc:
+                error = _species_error(row_index, col, raw_value, exc)
                 logger.debug("Invalid non-numeric observation in column '%s': %s", col, exc)
-                raise _species_error(row_index, col, raw_value, exc) from exc
+                if explicit_species_mapping:
+                    raise error from exc
+                # Auto mode salvages usable numeric observations row-by-row and
+                # treats nonnumeric cells as absent observations for that row.
+                continue
             species_observations[col]["t"].append(parsed_time)
             species_observations[col]["y"].append(parsed_value)
 

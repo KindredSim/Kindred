@@ -2500,11 +2500,11 @@ if PYQTGRAPH_AVAILABLE:
                         for key in enabled_for_dataset
                         if key in species_payload
                     }
-                resolved_x_column, x_array = self._resolve_overlay_x_source(x_name, payload)
-                if x_array is None:
+                resolved_x_column, base_x_array = self._resolve_overlay_x_source(x_name, payload)
+                if base_x_array is None:
                     warnings.append(f"{dataset_name}: missing '{x_name}' values")
                     continue
-                if x_array.size == 0:
+                if base_x_array.size == 0:
                     warnings.append(f"{dataset_name}: '{resolved_x_column or x_name}' has no data")
                     continue
 
@@ -2543,24 +2543,25 @@ if PYQTGRAPH_AVAILABLE:
                         if isinstance(raw_obs, dict):
                             observation_spec = raw_obs.get(resolved_key) or raw_obs.get(species)
                     if isinstance(observation_spec, dict):
-                        x_array = np.asarray(observation_spec.get("t", []), dtype=float).reshape(-1)
-                        y_array = np.asarray(observation_spec.get("y", []), dtype=float).reshape(-1)
+                        entry_x_array = np.asarray(observation_spec.get("t", []), dtype=float).reshape(-1)
+                        entry_y_array = np.asarray(observation_spec.get("y", []), dtype=float).reshape(-1)
                     else:
-                        y_array = np.asarray(y_source, dtype=float).reshape(-1)
-                    if y_array.size == 0:
+                        entry_x_array = base_x_array
+                        entry_y_array = np.asarray(y_source, dtype=float).reshape(-1)
+                    if entry_y_array.size == 0:
                         warnings.append(f"{dataset_name}: '{resolved_key}' has no data")
                         continue
-                    if y_array.shape[0] != x_array.shape[0]:
+                    if entry_y_array.shape[0] != entry_x_array.shape[0]:
                         warnings.append(
-                            f"{dataset_name}: '{resolved_key}' length ({y_array.shape[0]}) != '{x_name}' ({x_array.shape[0]})"
+                            f"{dataset_name}: '{resolved_key}' length ({entry_y_array.shape[0]}) != '{x_name}' ({entry_x_array.shape[0]})"
                         )
                         continue
                     overlays.append(
                         _OverlaySeries(
                             dataset_name,
                             species,
-                            x_array,
-                            y_array,
+                            entry_x_array,
+                            entry_y_array,
                             x_name,
                             resolved_x_column,
                             str(resolved_key),
@@ -2597,16 +2598,16 @@ if PYQTGRAPH_AVAILABLE:
                         if y_array.size == 0:
                             warnings.append(f"{dataset_name}: '{raw_column}' has no data")
                             continue
-                        if y_array.shape[0] != x_array.shape[0]:
+                        if y_array.shape[0] != base_x_array.shape[0]:
                             warnings.append(
-                                f"{dataset_name}: '{raw_column}' length ({y_array.shape[0]}) != '{x_name}' ({x_array.shape[0]})"
+                                f"{dataset_name}: '{raw_column}' length ({y_array.shape[0]}) != '{x_name}' ({base_x_array.shape[0]})"
                             )
                             continue
                         overlays.append(
                             _OverlaySeries(
                                 dataset_name,
                                 str(raw_column),
-                                x_array,
+                                base_x_array,
                                 y_array,
                                 x_name,
                                 resolved_x_column,
