@@ -2749,19 +2749,7 @@ class ResultsController(QtCore.QObject):
         requested_show_set_ids = tuple(str(set_id) for set_id in (request.requested_show_set_ids or ()) if str(set_id))
         if not requested_show_set_ids:
             if self._completed_run_display_transaction_active():
-                transition_outcome = self._completed_run_denied_unavailable_outcome(
-                    request=request,
-                    resolution=request.resolution,
-                    requested_show_set_ids=requested_show_set_ids,
-                )
-                outcome = self._completed_run_display_noop_refresh_outcome_for_request(
-                    request=request,
-                    resolution=request.resolution,
-                )
-                return BatchDisplayRefreshOutcome(
-                    focused_controls_use_workspace=outcome.focused_controls_use_workspace,
-                    transition_outcome=transition_outcome,
-                )
+                self.clear_active_display_transaction()
             self._clear_unpublished_batch_display_request()
             return BatchDisplayRefreshOutcome(
                 focused_controls_use_workspace=bool(request.focused_set_dirty),
@@ -4016,7 +4004,7 @@ class ResultsController(QtCore.QObject):
         live_requested_ids = tuple(
             str(set_id) for set_id in live_requested_show_set_ids or () if str(set_id)
         )
-        requested_show_ids = target_ids if cache_kind_s == "preview" and target_ids else live_requested_ids
+        requested_show_ids = live_requested_ids
         if not requested_show_ids:
             return None
         prefer_set = str(focused_set_id or "") or None

@@ -20,13 +20,14 @@ _MAX_SPECIES_COLUMN_WIDTH = 160
 class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
     showMembershipChanged = QtCore.Signal()
     sliderEditTargetsChanged = QtCore.Signal()
+    canonicalInitialsChanged = QtCore.Signal(object, str, bool)
 
     def __init__(self, store: BatchInitialConditionsStore, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
         self._store = store
         self._invalid: set[Tuple[int, str]] = set()
         self._slider_edit_target_set_ids: list[str] = []
-        self._focused_effective_edit_target_set_id = ""
+        self._active_effective_edit_target_set_id = ""
 
     def store(self) -> BatchInitialConditionsStore:
         return self._store
@@ -70,20 +71,20 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         self.sliderEditTargetsChanged.emit()
         return True
 
-    def focused_effective_edit_target_set_id(self) -> str:
+    def active_effective_edit_target_set_id(self) -> str:
         valid_ids = set(self._store.set_ids())
-        focused_set_id = str(self._focused_effective_edit_target_set_id or "").strip()
-        return focused_set_id if focused_set_id in valid_ids else ""
+        active_set_id = str(self._active_effective_edit_target_set_id or "").strip()
+        return active_set_id if active_set_id in valid_ids else ""
 
-    def set_focused_effective_edit_target_set_id(self, set_id: str | None) -> bool:
+    def set_active_effective_edit_target_set_id(self, set_id: str | None) -> bool:
         valid_ids = set(self._store.set_ids())
         normalized = str(set_id or "").strip()
         if normalized not in valid_ids:
             normalized = ""
-        before = self.focused_effective_edit_target_set_id()
+        before = self.active_effective_edit_target_set_id()
         if normalized == before:
             return False
-        self._focused_effective_edit_target_set_id = normalized
+        self._active_effective_edit_target_set_id = normalized
         changed_ids = {sid for sid in (before, normalized) if sid}
         changed_rows = [
             int(row)
@@ -92,6 +93,30 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         ]
         self._emit_checkbox_column_change(self.edit_target_column(), changed_rows)
         return True
+
+    def emit_canonical_initials_changed(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        transition_source: str,
+        discard_dirty_preview: bool = True,
+    ) -> None:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        valid_ids = set(self._store.set_ids())
+        for set_id in affected_set_ids or ():
+            set_id_s = str(set_id or "").strip()
+            if not set_id_s or set_id_s in seen or set_id_s not in valid_ids:
+                continue
+            seen.add(set_id_s)
+            normalized.append(set_id_s)
+        if not normalized:
+            return
+        self.canonicalInitialsChanged.emit(
+            tuple(normalized),
+            str(transition_source or "batch_initials_table_edit"),
+            bool(discard_dirty_preview),
+        )
 
     def requested_show_set_ids(self) -> list[str]:
         return [str(set_id) for set_id in self._store.requested_show_set_ids()]
@@ -130,7 +155,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         if not set_id:
             return False
         return (
-            set_id == self.focused_effective_edit_target_set_id()
+            set_id == self.active_effective_edit_target_set_id()
             and set_id not in set(self.slider_edit_target_set_ids())
         )
 
@@ -156,7 +181,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             if section == self.edit_target_column():
                 return "Slider"
             if section == self.show_column():
-                return "Show"
+                return "Plot"
             return ""
         return str(section + 1)
 
@@ -182,7 +207,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
 
         if role in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
             if col == self.edit_target_column():
-                return "focus" if self._is_temporarily_focus_target_row(row) else ""
+                return "active" if self._is_temporarily_focus_target_row(row) else ""
             if col == self.show_column():
                 return ""
             if col == 0:
@@ -204,10 +229,10 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 return self.data(index, QtCore.Qt.DisplayRole)
             if col == self.edit_target_column():
                 if self._is_temporarily_focus_target_row(row):
-                    return "Focused row is temporarily included in slider edit scope."
-                return "Select which set the interactive sliders control"
+                    return "Active set is used while no slider pins are selected."
+                return "Select which set the interactive sliders control."
             if col == self.show_column():
-                return "Request this set for the next display refresh"
+                return "Plot this set when cached or completed results are available."
             return None
 
         if role == QtCore.Qt.ForegroundRole and col == self.edit_target_column():
@@ -282,6 +307,11 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         else:
             self._invalid.discard((row, sp))
         self.dataChanged.emit(index, index, [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole])
+        self.emit_canonical_initials_changed(
+            affected_set_ids=(str(self._store.set_id_for_row(int(row)) or ""),),
+            transition_source="batch_initials_table_edit",
+            discard_dirty_preview=True,
+        )
         return True
 
     def reset_invalid(self) -> None:
@@ -513,45 +543,20 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         impacted_rows = sorted({int(r) for r, _c in changed})
         model.validate_rows(impacted_rows)
 
-        changed_set_owner = model.parent()
-        pending_changed_set_ids = getattr(changed_set_owner, "_pending_canonical_batch_initials_changed_set_ids", None)
-        previous_pending_set = pending_changed_set_ids if isinstance(pending_changed_set_ids, list) else None
-        if changed_set_owner is not None:
-            try:
-                setattr(changed_set_owner, "_pending_canonical_batch_initials_changed_set_ids", [])
-            except Exception:
-                changed_set_owner = None
-        try:
-            for row, column in changed:
-                changed_index = model.index(int(row), int(column))
-                if changed_index.isValid():
-                    model.dataChanged.emit(
-                        changed_index,
-                        changed_index,
-                        [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
-                    )
-        finally:
-            affected_set_ids: tuple[str, ...] = ()
-            if changed_set_owner is not None:
-                pending_set = getattr(
-                    changed_set_owner,
-                    "_pending_canonical_batch_initials_changed_set_ids",
-                    set(),
+        affected_set_ids: list[str] = []
+        for row, column in changed:
+            changed_index = model.index(int(row), int(column))
+            if changed_index.isValid():
+                model.dataChanged.emit(
+                    changed_index,
+                    changed_index,
+                    [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
                 )
-                if isinstance(pending_set, list):
-                    affected_set_ids = tuple(str(set_id) for set_id in pending_set if str(set_id))
-                try:
-                    setattr(
-                        changed_set_owner,
-                        "_pending_canonical_batch_initials_changed_set_ids",
-                        previous_pending_set,
-                    )
-                except Exception:
-                    pass
-            transition = getattr(changed_set_owner, "_apply_canonical_batch_initials_transition", None)
-            if callable(transition) and affected_set_ids:
-                transition(
-                    affected_set_ids=affected_set_ids,
-                    transition_source="batch_initials_table_paste",
-                    discard_dirty_preview=True,
-                )
+            set_id = str(store.set_id_for_row(int(row)) or "").strip()
+            if set_id and set_id not in affected_set_ids:
+                affected_set_ids.append(set_id)
+        model.emit_canonical_initials_changed(
+            affected_set_ids=tuple(affected_set_ids),
+            transition_source="batch_initials_table_paste",
+            discard_dirty_preview=True,
+        )

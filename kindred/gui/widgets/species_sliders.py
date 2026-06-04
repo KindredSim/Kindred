@@ -365,6 +365,16 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         if not self._rows:
             self.rebuild_from_current_row()
             return
+        row = self._primary_source_row()
+        if row is None:
+            self.rebuild_from_current_row()
+            return
+        self._current_row = int(row)
+        try:
+            set_id = self._model.store().set_id_for_row(int(row))
+        except Exception:
+            set_id = ""
+        self._current_set_id = str(set_id or "") or None
         self._refresh_from_model(recompute_ranges=bool(recompute_ranges))
 
     def _refresh_from_model(self, *, recompute_ranges: bool) -> None:

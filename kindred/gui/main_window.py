@@ -272,7 +272,12 @@ class MainWindow(
         self._mechanism_runtime_transition = MechanismRuntimeTransitionService()
         self._authoritative_mechanism_runtime_refresh_defer_depth = 0
         self._suppress_canonical_batch_initials_transition = False
-        self._pending_canonical_batch_initials_changed_set_ids: list[str] | None = None
+        self._pending_canonical_batch_initials_transition_set_ids: tuple[str, ...] = ()
+        self._pending_canonical_batch_initials_transition_source = "batch_initials_table_edit"
+        self._pending_canonical_batch_initials_discard_dirty_preview = True
+        self._canonical_batch_initials_transition_queued = False
+        self._pending_interactive_runtime_readiness_rows: tuple[int, ...] = ()
+        self._interactive_runtime_readiness_refresh_queued = False
 
         # Fitting state.
         self._last_fit_result = None
@@ -327,7 +332,7 @@ class MainWindow(
             batch_selected_rows=self._batch_selected_rows,
             requested_show_batch_set_ids=self._requested_show_batch_set_ids,
             slider_edit_target_set_ids=self._slider_edit_target_set_ids,
-            focused_batch_set_id=self._cached_focused_batch_set_id_value,
+            active_batch_set_id=self._active_batch_set_id,
             batch_current_row=self._batch_current_row,
             batch_set_id_for_row=self._batch_set_id_for_row,
             batch_set_name_for_id=self._batch_set_name_for_id,
@@ -353,7 +358,6 @@ class MainWindow(
             sync_mechanism_controls_to_focused_batch_set=self._sync_mechanism_controls_to_focused_batch_set,
         )
         self._batch_table: Optional[BatchInitialConditionsTableView] = None
-        self._focused_batch_set_id = ""
         self._last_effective_slider_edit_target_set_ids: tuple[str, ...] = ()
         self._connected_batch_semantics_model = None
         self._connected_batch_selection_model = None
@@ -1229,7 +1233,7 @@ class MainWindow(
             for signal_name, slot in (
                 ("showMembershipChanged", self._on_batch_show_membership_changed),
                 ("sliderEditTargetsChanged", self._on_slider_edit_targets_changed),
-                ("dataChanged", self._on_batch_model_data_changed),
+                ("canonicalInitialsChanged", self._on_batch_canonical_initials_changed),
             ):
                 signal = getattr(model, signal_name, None)
                 if signal is None:
@@ -1284,7 +1288,7 @@ class MainWindow(
             try:
                 current_model.showMembershipChanged.connect(self._on_batch_show_membership_changed)
                 current_model.sliderEditTargetsChanged.connect(self._on_slider_edit_targets_changed)
-                current_model.dataChanged.connect(self._on_batch_model_data_changed)
+                current_model.canonicalInitialsChanged.connect(self._on_batch_canonical_initials_changed)
             except RuntimeError as exc:
                 logger.debug("Failed to connect batch model semantics signals: %s", exc, exc_info=True)
         if current_selection_model is not None:
@@ -4042,6 +4046,9 @@ class MainWindow(
     def batch_set_ids_for_scope(self, scope: str) -> List[str]:
         return self._simulation_batch_owner.batch_set_ids_for_scope(str(scope))
 
+    def run_target_ui_state(self) -> object:
+        return self._simulation_batch_owner.run_target_ui_state()
+
     def requested_show_batch_set_ids(self) -> List[str]:
         return [str(s) for s in (self._requested_show_batch_set_ids() or [])]
 
@@ -4059,7 +4066,7 @@ class MainWindow(
         return int(row) if row is not None else None
 
     def focused_batch_set_id(self) -> Optional[str]:
-        value = self._cached_focused_batch_set_id_value()
+        value = self._active_batch_set_id()
         return str(value) if value else None
 
     def batch_set_id_for_row(self, row: int) -> Optional[str]:
@@ -4330,12 +4337,10 @@ class MainWindow(
     def _batch_set_id_for_row(self, row: int) -> Optional[str]:
         try:
             if hasattr(self._batch_store, "set_id_for_row"):
-                return str(self._batch_store.set_id_for_row(int(row)))
+                set_id = self._batch_store.set_id_for_row(int(row))
+                return str(set_id) if set_id is not None else None
         except Exception:
             return None
-        names = list(self._batch_store.set_names())
-        if 0 <= int(row) < len(names):
-            return str(names[int(row)])
         return None
 
     def _batch_set_id_for_name(self, set_name: str) -> Optional[str]:
@@ -4449,10 +4454,13 @@ class MainWindow(
         except RuntimeError as exc:
             logger.debug("Failed to invalidate stale slider preview targets: %s", exc, exc_info=True)
 
-    def _cached_focused_batch_set_id_value(self) -> str:
-        focused_set_id = str(getattr(self, "_focused_batch_set_id", "") or "").strip()
-        if focused_set_id and self._batch_store.row_for_set_id(focused_set_id) is not None:
-            return focused_set_id
+    def _active_batch_set_id(self) -> str:
+        current_row = self._batch_current_row()
+        if current_row is None:
+            return ""
+        active_set_id = str(self._batch_set_id_for_row(int(current_row)) or "").strip()
+        if active_set_id and self._batch_row_for_set_id(active_set_id) is not None:
+            return active_set_id
         return ""
 
     def _batch_row_for_set_id(self, set_id: str) -> Optional[int]:
@@ -4460,24 +4468,6 @@ class MainWindow(
             return self._batch_store.row_for_set_id(str(set_id or ""))
         except Exception:
             return None
-
-    def _set_cached_focused_batch_set_id(self, set_id: str) -> str:
-        focused_set_id = str(set_id or "").strip()
-        if focused_set_id and self._batch_row_for_set_id(focused_set_id) is None:
-            focused_set_id = ""
-        self._focused_batch_set_id = focused_set_id
-        return focused_set_id
-
-    def _update_focused_batch_set_id(self, *, row: Optional[int] = None) -> str:
-        target_row = self._batch_current_row() if row is None else int(row)
-        focused_set_id = ""
-        if target_row is not None:
-            focused_set_id = str(self._batch_set_id_for_row(int(target_row)) or "").strip()
-        if not focused_set_id:
-            focused_set_id = str(getattr(self, "_focused_batch_set_id", "") or "").strip()
-            if focused_set_id and self._batch_row_for_set_id(focused_set_id) is None:
-                focused_set_id = ""
-        return self._set_cached_focused_batch_set_id(focused_set_id)
 
     def _next_default_batch_set_name(self) -> str:
         existing = {str(n) for n in (self._batch_store.set_names() or [])}
@@ -4503,7 +4493,6 @@ class MainWindow(
             return
         idx = self._batch_model.index(int(row_idx), 0)
         table.setCurrentIndex(idx)
-        self._update_focused_batch_set_id(row=int(row_idx))
         sel = table.selectionModel()
         if sel is not None:
             signals_blocked = False
@@ -4579,7 +4568,6 @@ class MainWindow(
                 sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
             if new_rows:
                 table.setCurrentIndex(self._batch_model.index(int(new_rows[0]), 0))
-                self._update_focused_batch_set_id(row=int(new_rows[0]))
         finally:
             if signals_blocked:
                 try:
@@ -4679,7 +4667,6 @@ class MainWindow(
             return
         idx = self._batch_model.index(int(row), 0)
         table.setCurrentIndex(idx)
-        self._update_focused_batch_set_id(row=int(row))
         sel = table.selectionModel()
         if sel is None:
             return
@@ -4772,15 +4759,16 @@ class MainWindow(
         if hasattr(self, "_move_batch_down_btn"):
             self._move_batch_down_btn.setEnabled(bool(allow_reorder))
         model = getattr(self, "_batch_model", None)
-        if model is not None and hasattr(model, "set_focused_effective_edit_target_set_id"):
-            focused_target_set_id = ""
+        if model is not None and hasattr(model, "set_active_effective_edit_target_set_id"):
+            active_target_set_id = ""
             owner = getattr(self, "_simulation_batch_owner", None)
             if owner is not None and hasattr(owner, "focused_effective_slider_target_set_id"):
                 try:
-                    focused_target_set_id = owner.focused_effective_slider_target_set_id()
+                    active_target_set_id = owner.focused_effective_slider_target_set_id()
                 except Exception as exc:
                     logger.debug("Failed to resolve focused slider target from batch owner: %s", exc, exc_info=True)
-            model.set_focused_effective_edit_target_set_id(focused_target_set_id)
+            model.set_active_effective_edit_target_set_id(active_target_set_id)
+        self._refresh_run_target_ui_from_batch_scope()
 
     def _refresh_interactive_runtime_readiness_for_rows(self, rows: Sequence[int]) -> None:
         refresh_runtime_readiness = getattr(
@@ -4789,7 +4777,110 @@ class MainWindow(
             None,
         )
         if callable(refresh_runtime_readiness):
-            refresh_runtime_readiness(rows=tuple(int(row) for row in rows or ()))
+            normalized_rows = tuple(int(row) for row in rows or ())
+            refresh_runtime_readiness(rows=normalized_rows or None)
+
+    def _queue_interactive_runtime_readiness_refresh(self, rows: Sequence[int]) -> None:
+        normalized = tuple(dict.fromkeys(int(row) for row in (rows or ())))
+        self._pending_interactive_runtime_readiness_rows = normalized
+        if bool(getattr(self, "_interactive_runtime_readiness_refresh_queued", False)):
+            return
+        self._interactive_runtime_readiness_refresh_queued = True
+        if QtCore.QCoreApplication.instance() is None:
+            return
+        QtCore.QTimer.singleShot(0, self._flush_interactive_runtime_readiness_refresh)
+
+    def _flush_interactive_runtime_readiness_refresh(self) -> None:
+        rows = tuple(getattr(self, "_pending_interactive_runtime_readiness_rows", ()) or ())
+        self._pending_interactive_runtime_readiness_rows = ()
+        self._interactive_runtime_readiness_refresh_queued = False
+        if not rows:
+            return
+        self._refresh_interactive_runtime_readiness_for_rows(rows)
+
+    def _queue_canonical_batch_initials_transition(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        transition_source: str,
+        discard_dirty_preview: bool,
+    ) -> None:
+        normalized = tuple(
+            dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id))
+        )
+        if not normalized:
+            return
+        owner = getattr(self, "_simulation_batch_owner", None)
+        if owner is not None and hasattr(owner, "record_active_result_cache_staleness"):
+            try:
+                owner.record_active_result_cache_staleness(
+                    set_ids=normalized,
+                    is_global=False,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Failed to cheaply mark active result cache stale for canonical batch initials edit: %s",
+                    exc,
+                    exc_info=True,
+                )
+        pending = list(getattr(self, "_pending_canonical_batch_initials_transition_set_ids", ()) or ())
+        for set_id in normalized:
+            if set_id not in pending:
+                pending.append(set_id)
+        self._pending_canonical_batch_initials_transition_set_ids = tuple(pending)
+        self._pending_canonical_batch_initials_transition_source = str(
+            transition_source or "batch_initials_table_edit"
+        )
+        self._pending_canonical_batch_initials_discard_dirty_preview = bool(discard_dirty_preview)
+        if bool(getattr(self, "_canonical_batch_initials_transition_queued", False)):
+            return
+        self._canonical_batch_initials_transition_queued = True
+        if QtCore.QCoreApplication.instance() is None:
+            return
+        QtCore.QTimer.singleShot(0, self._flush_canonical_batch_initials_transition)
+
+    def _flush_canonical_batch_initials_transition(self) -> None:
+        affected_set_ids = tuple(
+            getattr(self, "_pending_canonical_batch_initials_transition_set_ids", ()) or ()
+        )
+        transition_source = str(
+            getattr(
+                self,
+                "_pending_canonical_batch_initials_transition_source",
+                "batch_initials_table_edit",
+            )
+            or "batch_initials_table_edit"
+        )
+        discard_dirty_preview = bool(
+            getattr(self, "_pending_canonical_batch_initials_discard_dirty_preview", True)
+        )
+        self._pending_canonical_batch_initials_transition_set_ids = ()
+        self._canonical_batch_initials_transition_queued = False
+        if not affected_set_ids:
+            return
+        self._apply_canonical_batch_initials_transition(
+            affected_set_ids=affected_set_ids,
+            transition_source=transition_source,
+            discard_dirty_preview=discard_dirty_preview,
+        )
+
+    def _refresh_run_target_ui_from_batch_scope(self) -> None:
+        owner = getattr(self, "_simulation_batch_owner", None)
+        ui_owner = getattr(self, "_simulation_run_ui_owner", None)
+        if owner is None or ui_owner is None or not hasattr(owner, "run_target_ui_state"):
+            return
+        try:
+            state = owner.run_target_ui_state()
+        except Exception as exc:
+            logger.debug("Failed to resolve run-target UI state: %s", exc, exc_info=True)
+            return
+        render = getattr(ui_owner, "render_run_target_state", None)
+        if callable(render):
+            render(
+                button_text=str(getattr(state, "button_text", "Run") or "Run"),
+                target_available=bool(getattr(state, "enabled", False)),
+                tooltip=str(getattr(state, "empty_reason", "") or ""),
+            )
 
     def _batch_cache_key(
         self,
@@ -4833,14 +4924,14 @@ class MainWindow(
         total = int(self._batch_store.row_count())
         if total <= 0:
             return None
-        focused_set_id = self._cached_focused_batch_set_id_value()
+        active_set_id = self._active_batch_set_id()
         row_ids = {
             str(self._batch_set_id_for_row(int(row)) or "").strip()
             for row in rows or ()
             if 0 <= int(row) < total
         }
-        if focused_set_id and focused_set_id in row_ids:
-            return focused_set_id
+        if active_set_id and active_set_id in row_ids:
+            return active_set_id
         for r in rows:
             rr = int(r)
             if 0 <= rr < total:
@@ -4906,7 +4997,6 @@ class MainWindow(
         rows = tuple(int(row) for row in (getattr(resolution, "selected_rows", ()) or ()))
         focused_row_raw = getattr(resolution, "focused_row", None)
         focused_row = int(focused_row_raw) if focused_row_raw is not None else None
-        focused_set_id = str(getattr(resolution, "focused_set_id", "") or "").strip()
         signals_blocked = False
         try:
             sel.blockSignals(True)
@@ -4927,19 +5017,33 @@ class MainWindow(
                     sel.blockSignals(False)
                 except RuntimeError as exc:
                     logger.debug("Failed to unblock batch selection signals: %s", exc, exc_info=True)
-        if focused_set_id:
-            self._set_cached_focused_batch_set_id(focused_set_id)
-        elif focused_row is not None:
-            self._update_focused_batch_set_id(row=focused_row)
-        else:
-            self._set_cached_focused_batch_set_id("")
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
-        self._refresh_interactive_runtime_readiness_for_rows(self._batch_selected_rows())
+        owner = getattr(self, "_simulation_batch_owner", None)
+        if owner is not None and hasattr(owner, "run_target_ui_state"):
+            try:
+                rows = tuple(int(row) for row in owner.run_target_ui_state().target_rows)
+            except Exception:
+                rows = tuple(int(row) for row in self._batch_selected_rows())
+        else:
+            rows = tuple(int(row) for row in self._batch_selected_rows())
+        self._queue_interactive_runtime_readiness_refresh(rows)
 
     def _batch_current_change_display_source(self) -> DisplayRefreshSource:
         return DisplayRefreshSource.PROGRAMMATIC_SHOW_REQUEST
+
+    def _on_batch_canonical_initials_changed(
+        self,
+        affected_set_ids: object,
+        transition_source: str,
+        discard_dirty_preview: bool,
+    ) -> None:
+        self._queue_canonical_batch_initials_transition(
+            affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
+            transition_source=str(transition_source or "batch_initials_table_edit"),
+            discard_dirty_preview=bool(discard_dirty_preview),
+        )
 
     def _on_batch_model_data_changed(
         self,
@@ -4972,34 +5076,36 @@ class MainWindow(
                 set_id = ""
             if set_id and set_id not in affected_set_ids:
                 affected_set_ids.append(set_id)
-        pending_set = getattr(self, "_pending_canonical_batch_initials_changed_set_ids", None)
-        if isinstance(pending_set, list):
-            for set_id in affected_set_ids:
-                set_id_s = str(set_id)
-                if set_id_s and set_id_s not in pending_set:
-                    pending_set.append(set_id_s)
-            return
-        self._apply_canonical_batch_initials_transition(
+        self._queue_canonical_batch_initials_transition(
             affected_set_ids=tuple(affected_set_ids),
             transition_source="batch_initials_table_edit",
             discard_dirty_preview=True,
         )
 
     def _on_batch_current_changed(self, *_args) -> None:
+        self._update_batch_row_controls_state()
         current_row = self._batch_current_row()
         transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
             gesture="row_body_click",
             row=current_row,
         )
-        focused_set_id = self._update_focused_batch_set_id(row=current_row)
-        self._refresh_interactive_runtime_readiness_for_rows(
+        self._queue_interactive_runtime_readiness_refresh(
             getattr(transaction, "run_selected_rows", ())
         )
-        if not focused_set_id:
-            return
-        if transaction.slider_rebuild_needed:
+        try:
             self._refresh_slider_edit_targets_summary()
             self._reconcile_slider_target_membership_change()
+        except Exception as exc:
+            logger.debug("Failed to refresh slider target membership after row activation: %s", exc, exc_info=True)
+        try:
+            panel = self._mechanism_editor.species_sliders_widget()
+            if panel is not None and hasattr(panel, "refresh_current_row_from_model"):
+                panel.refresh_current_row_from_model(recompute_ranges=True)
+            elif panel is not None and hasattr(panel, "rebuild_from_current_row"):
+                panel.rebuild_from_current_row()
+        except RuntimeError as exc:
+            logger.debug("Failed to refresh species panel after row activation: %s", exc, exc_info=True)
+            self._species_panel_available = False
         if transaction.display_refresh_needed:
             self._refresh_batch_display_from_request_scope(
                 display_source=self._batch_current_change_display_source(),
@@ -5041,7 +5147,9 @@ class MainWindow(
         if transaction.slider_rebuild_needed:
             try:
                 panel = self._mechanism_editor.species_sliders_widget()
-                if panel is not None and hasattr(panel, "rebuild_from_current_row"):
+                if panel is not None and hasattr(panel, "refresh_current_row_from_model"):
+                    panel.refresh_current_row_from_model(recompute_ranges=True)
+                elif panel is not None and hasattr(panel, "rebuild_from_current_row"):
                     panel.rebuild_from_current_row()
             except RuntimeError as exc:
                 logger.debug("Failed to rebuild species panel after slider target change: %s", exc, exc_info=True)
@@ -6653,19 +6761,7 @@ class MainWindow(
     # ------------------------------------------------------------------
 
     def _sync_cached_focus_to_current_batch_row(self) -> None:
-        table = getattr(self, "_batch_table", None)
-        model = getattr(self, "_batch_model", None)
-        if table is None or model is None:
-            return
-        if model.rowCount() <= 0:
-            return
-        current = table.currentIndex()
-        if not current.isValid():
-            return
-        row = int(current.row())
-        if not (0 <= row < int(model.rowCount())):
-            return
-        self._update_focused_batch_set_id(row=row)
+        return
 
     def _select_initial_batch_row_if_needed(self) -> None:
         table = getattr(self, "_batch_table", None)

@@ -89,9 +89,9 @@ class SimulationPanel(QtWidgets.QWidget):
         self.num_points_spinbox.setMaximumWidth(140)
         self.num_points_spinbox.valueChanged.connect(lambda _v: on_solver_summary_refresh())
 
-        self.run_btn = QtWidgets.QPushButton("Run Selected")
+        self.run_btn = QtWidgets.QPushButton("Run")
         self.run_btn.setObjectName("runSelectedButton")
-        self.run_btn.setToolTip("Run kinetic simulation for selected sets (Ctrl+R or F5)")
+        self.run_btn.setToolTip("Run kinetic simulation for the current run target (Ctrl+R or F5)")
         self.run_btn.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         self.run_btn.clicked.connect(on_run_selected)
 

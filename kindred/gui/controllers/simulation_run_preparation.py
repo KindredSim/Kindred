@@ -442,10 +442,11 @@ class SimulationRunMechanismPreparationOwner:
         names = list(self._ports.batch.batch_store_set_names())
         queue_names = [str(names[r]) for r in rows if 0 <= int(r) < len(names)]
         queue_ids = [
-            str(self._ports.batch.batch_set_id_for_row(int(r)) or str(names[int(r)]))
+            str(self._ports.batch.batch_set_id_for_row(int(r)) or "")
             for r in rows
             if 0 <= int(r) < len(names)
         ]
+        queue_ids = [set_id for set_id in queue_ids if str(set_id)]
         preview_owner_epoch = None
         if bool(fast_mode) and not bool(runtime_readiness_only):
             preview_ownership = self._deps.claim_preview_ownership(

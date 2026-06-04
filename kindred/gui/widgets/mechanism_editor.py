@@ -636,7 +636,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._current_validation_state = state
         self.validationStateChanged.emit(str(state))
         self._run_btn.setToolTip(
-            "Run simulation for all selected sets (same as Run Selected in Initial Conditions)"
+            "Run simulation for the current run target from Initial Conditions"
             if state == "valid"
             else "No valid mechanism \u2014 enter a valid reaction mechanism to enable"
         )

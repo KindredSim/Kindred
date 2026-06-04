@@ -94,7 +94,7 @@ class TutorialManager:
                 TutorialStep(
                     title="Run the simulation",
                     instruction=(
-                        "Click <b>Run Selected</b> to solve the ODEs and plot "
+                        "Click <b>Run</b> to solve the ODEs and plot "
                         "concentration vs. time."
                     ),
                     target_widget="runSelectedButton",
@@ -251,7 +251,7 @@ class TutorialManager:
                 TutorialStep(
                     title="Run selected sets",
                     instruction=(
-                        "Click <b>Run Selected</b> to simulate only the selected "
+                        "Click <b>Run</b> to simulate the current run target "
                         "sets. Unselected sets are not affected."
                     ),
                     target_widget="runSelectedButton",

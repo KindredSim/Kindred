@@ -56,6 +56,15 @@ class BatchSelectionStateResolution:
     focused_set_id: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class RunTargetUiState:
+    target_rows: tuple[int, ...]
+    target_set_ids: tuple[str, ...]
+    button_text: str
+    enabled: bool
+    empty_reason: str = ""
+
+
 class SimulationBatchOwner:
     """Thin Qt adapter for batch table/store, cache identity, and display-request resolution."""
 
@@ -65,7 +74,6 @@ class SimulationBatchOwner:
         batch_selected_rows: Callable[[], Sequence[int]],
         requested_show_batch_set_ids: Callable[[], Sequence[str]],
         slider_edit_target_set_ids: Callable[[], Sequence[str]],
-        focused_batch_set_id: Callable[[], Optional[str]],
         batch_current_row: Callable[[], Optional[int]],
         batch_set_id_for_row: Callable[[int], Optional[str]],
         batch_set_name_for_id: Callable[[str], Optional[str]],
@@ -83,11 +91,15 @@ class SimulationBatchOwner:
         update_batch_row_controls_state: Callable[[], None],
         sync_batch_species_columns: Callable[..., None],
         sync_mechanism_controls_to_focused_batch_set: Callable[..., None],
+        active_batch_set_id: Callable[[], Optional[str]] | None = None,
     ) -> None:
+        if active_batch_set_id is None:
+            def active_batch_set_id() -> Optional[str]:
+                return None
         self._batch_selected_rows = batch_selected_rows
         self._requested_show_batch_set_ids = requested_show_batch_set_ids
         self._slider_edit_target_set_ids = slider_edit_target_set_ids
-        self._focused_batch_set_id = focused_batch_set_id
+        self._active_batch_set_id = active_batch_set_id
         self._batch_current_row = batch_current_row
         self._batch_set_id_for_row = batch_set_id_for_row
         self._batch_set_name_for_id = batch_set_name_for_id
@@ -127,6 +139,8 @@ class SimulationBatchOwner:
         scope_key = str(scope or "").strip().lower()
         if scope_key == "all":
             return list(range(total))
+        if scope_key in {"run", "selected-else-active", "selected_else_active"}:
+            return [int(row) for row in self.run_target_ui_state().target_rows]
         return resolve_run_scope(
             selected_rows=self._batch_selected_rows(),
             total_rows=total,
@@ -177,18 +191,8 @@ class SimulationBatchOwner:
         return [str(set_id) for set_id in (self._requested_show_batch_set_ids() or [])]
 
     def effective_display_request_set_ids(self, *, focused_row: Optional[int] = None) -> List[str]:
-        explicit_ids = self._normalized_valid_set_ids(self.requested_show_batch_set_ids())
-        if focused_row is not None:
-            set_id = self.batch_set_id_for_row(int(focused_row))
-        else:
-            set_id = self._set_id_for_current_row()
-        effective: List[str] = []
-        if set_id:
-            effective.append(str(set_id))
-        for explicit_id in explicit_ids:
-            if explicit_id not in effective:
-                effective.append(explicit_id)
-        return effective
+        _ = focused_row
+        return self._normalized_valid_set_ids(self.requested_show_batch_set_ids())
 
     def slider_edit_target_set_ids(self) -> List[str]:
         return [str(set_id) for set_id in (self._slider_edit_target_set_ids() or [])]
@@ -211,30 +215,66 @@ class SimulationBatchOwner:
 
     def effective_slider_edit_target_set_ids(self, *, focused_row: Optional[int] = None) -> List[str]:
         explicit_ids = self._normalized_valid_set_ids(self.slider_edit_target_set_ids())
+        if explicit_ids:
+            return explicit_ids
         if focused_row is not None:
             set_id = self.batch_set_id_for_row(int(focused_row))
         else:
-            set_id = self._set_id_for_current_row()
-        effective: List[str] = []
-        if set_id:
-            effective.append(str(set_id))
-        for explicit_id in explicit_ids:
-            if explicit_id not in effective:
-                effective.append(explicit_id)
-        return effective
+            set_id = self.focused_batch_set_id()
+        return [str(set_id)] if set_id else []
 
     def focused_effective_slider_target_set_id(self) -> str:
         target_ids = self.effective_slider_edit_target_set_ids()
         return str(target_ids[0]) if target_ids else ""
 
-    def run_selected_empty_target_reason(self) -> str:
+    def run_target_ui_state(self) -> RunTargetUiState:
         total = int(self._batch_store.row_count())
         if total <= 0:
-            return "Add at least one set before running."
-        return "Select at least one set before running."
+            return RunTargetUiState(
+                target_rows=(),
+                target_set_ids=(),
+                button_text="Run",
+                enabled=False,
+                empty_reason="Add at least one set before running.",
+            )
+
+        selected_rows = tuple(int(row) for row in self.batch_rows_for_scope("selected"))
+        if selected_rows:
+            target_rows = selected_rows
+            button_text = (
+                "Run Selected Set"
+                if len(target_rows) == 1
+                else f"Run Selected ({len(target_rows)})"
+            )
+        else:
+            active_set_id = str(self.focused_batch_set_id() or "").strip()
+            active_row = self._batch_row_for_set_id(active_set_id) if active_set_id else None
+            target_rows = (int(active_row),) if active_row is not None else ()
+            button_text = "Run Active Set" if target_rows else "Run"
+
+        target_set_ids = tuple(
+            str(set_id)
+            for set_id in (
+                self.batch_set_id_for_row(int(row))
+                for row in target_rows
+            )
+            if str(set_id)
+        )
+        enabled = bool(target_rows and target_set_ids)
+        empty_reason = "" if enabled else "Choose an active set or select one or more sets to run."
+        return RunTargetUiState(
+            target_rows=tuple(int(row) for row in target_rows if 0 <= int(row) < total),
+            target_set_ids=target_set_ids,
+            button_text=button_text,
+            enabled=enabled,
+            empty_reason=empty_reason,
+        )
+
+    def run_selected_empty_target_reason(self) -> str:
+        return self.run_target_ui_state().empty_reason
 
     def selected_run_target_rows(self) -> List[int]:
-        return self.batch_rows_for_scope("selected")
+        return [int(row) for row in self.run_target_ui_state().target_rows]
 
     def concentration_set_interaction_transaction(
         self,
@@ -254,7 +294,7 @@ class SimulationBatchOwner:
         set_id = self.batch_set_id_for_row(int(row_i)) if row_i is not None else None
         set_id_s = str(set_id or "")
 
-        focused_set_id = str(self._focused_batch_set_id() or "").strip()
+        focused_set_id = str(self.focused_batch_set_id() or "").strip()
         selected_rows = tuple(int(row) for row in self.batch_rows_for_scope("selected"))
         target_selection_rows = selected_rows
         if gesture_key in {"row_body_click", "initial_default_selection"} and row_i is not None:
@@ -281,21 +321,11 @@ class SimulationBatchOwner:
             gesture_key == "selection_change"
             or tuple(selected_rows) != tuple(target_selection_rows)
         )
-        display_refresh_needed = bool(
-            gesture_key in {"show_checkbox", "show_membership_change"}
-            or (
-                gesture_key in {"row_body_click", "initial_default_selection"}
-                and focus_change
-            )
-        )
+        display_refresh_needed = bool(gesture_key in {"show_checkbox", "show_membership_change"})
 
-        slider_rebuild_needed = gesture_key in {
-            "row_body_click",
-            "slider_checkbox",
-            "slider_target_change",
-        }
-        run_rows = tuple(int(row) for row in target_selection_rows)
-        empty_reason = "" if run_rows else self.run_selected_empty_target_reason()
+        slider_rebuild_needed = gesture_key in {"slider_checkbox", "slider_target_change"}
+        run_rows = self.run_target_ui_state().target_rows
+        empty_reason = self.run_target_ui_state().empty_reason if not run_rows else ""
 
         return ConcentrationSetInteractionTransaction(
             gesture=gesture_key,
@@ -316,7 +346,7 @@ class SimulationBatchOwner:
         )
 
     def focused_batch_set_id(self) -> Optional[str]:
-        value = self._focused_batch_set_id()
+        value = self._active_batch_set_id()
         return str(value) if value else None
 
     def preview_initials_for_row(self, row: int, baseline: Dict[str, float]) -> Dict[str, float]:
@@ -689,7 +719,7 @@ class SimulationBatchOwner:
         invalidated_set_ids = {
             str(set_id) for set_id in (batch_cache.active_cache_invalidated_set_ids or ()) if str(set_id)
         }
-        focused_set_id = str(self._focused_batch_set_id() or "").strip()
+        focused_set_id = str(self.focused_batch_set_id() or "").strip()
 
         resolved_entries: list[ResolvedBatchDisplayRequestEntry] = []
         has_workspace_display_request = False

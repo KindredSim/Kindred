@@ -1264,17 +1264,17 @@ class SimulationController(QtCore.QObject):
             self.retry_runtime_dispatch_acceptance()
 
     def _runtime_requested_show_set_ids(self, fallback_set_ids: Sequence[str]) -> tuple[str, ...]:
+        _ = fallback_set_ids
         requested: Sequence[str] = ()
         try:
             requested = self.ui.batch.requested_show_batch_set_ids()
         except Exception:
             requested = ()
         ordered: list[str] = []
-        for group in (fallback_set_ids or (), requested or ()):
-            for raw_set_id in group or ():
-                set_id = str(raw_set_id or "").strip()
-                if set_id and set_id not in ordered:
-                    ordered.append(set_id)
+        for raw_set_id in requested or ():
+            set_id = str(raw_set_id or "").strip()
+            if set_id and set_id not in ordered:
+                ordered.append(set_id)
         return tuple(ordered)
 
     def _runtime_requested_show_labels_by_set_id(
@@ -1664,9 +1664,13 @@ class SimulationController(QtCore.QObject):
                 seen.add(row_i)
             return normalized
         try:
-            rows = list(self.ui.batch.batch_rows_for_scope("selected"))
+            state = self.ui.batch.run_target_ui_state()
+            rows = list(getattr(state, "target_rows", ()) or ())
         except Exception:
-            rows = []
+            try:
+                rows = list(self.ui.batch.batch_rows_for_scope("selected"))
+            except Exception:
+                rows = []
         return [int(row) for row in rows]
 
     def _parallel_batch_pool_settings_changed(self) -> None:
@@ -1730,6 +1734,14 @@ class SimulationController(QtCore.QObject):
         target_set_ids: Sequence[str],
     ) -> PreparedRuntimeRequestSet:
         normalized_targets = normalize_preview_target_set_ids(target_set_ids)
+        empty_reason = "Select at least one set before running."
+        try:
+            state = self.ui.batch.run_target_ui_state()
+            resolved_reason = str(getattr(state, "empty_reason", "") or "").strip()
+            if resolved_reason:
+                empty_reason = resolved_reason
+        except Exception:
+            pass
         intent = RuntimeLaunchIntent(
             intent_kind="ordinary",
             ui_action="runtime_readiness",
@@ -1755,7 +1767,7 @@ class SimulationController(QtCore.QObject):
             blocked_reason=RuntimePreparationBlockedReason(
                 source="selection",
                 code="no_targets",
-                message="Select at least one set before running.",
+                message=empty_reason,
                 rows=tuple(runtime_rows or ()),
                 set_ids=normalized_targets,
                 retryable=False,
@@ -2727,8 +2739,19 @@ class SimulationController(QtCore.QObject):
         )
 
     def _run_selected_rows_or_abort(self) -> list[int] | None:
-        selected_rows = list(self.ui.batch.batch_rows_for_scope("selected"))
-        selected_target_set_ids = self._run_target_set_ids_for_rows(selected_rows)
+        try:
+            run_target_state = self.ui.batch.run_target_ui_state()
+            selected_rows = [int(row) for row in (getattr(run_target_state, "target_rows", ()) or ())]
+            selected_target_set_ids = tuple(
+                str(set_id)
+                for set_id in (getattr(run_target_state, "target_set_ids", ()) or ())
+                if str(set_id)
+            )
+            empty_reason = str(getattr(run_target_state, "empty_reason", "") or "")
+        except Exception:
+            selected_rows = list(self.ui.batch.batch_rows_for_scope("selected"))
+            selected_target_set_ids = self._run_target_set_ids_for_rows(selected_rows)
+            empty_reason = self.ui.batch.run_selected_empty_target_reason()
         auto_lock_result = self.ui.mechanism.auto_lock_for_run()
         if not auto_lock_result:
             self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
@@ -2738,7 +2761,7 @@ class SimulationController(QtCore.QObject):
             return None
         self._discarded_slider_preview_generation_id = None
         if bool(getattr(self, "_simulation_running", False)):
-            logger.info("Superseding active simulation with new Run Selected request")
+            logger.info("Superseding active simulation with new Run request")
             self._cancel_active_run_for_restart()
 
         rows_to_run = self._run_rows_for_target_set_ids(
@@ -2746,7 +2769,7 @@ class SimulationController(QtCore.QObject):
             fallback_rows=selected_rows,
         )
         if not rows_to_run:
-            reason = self.ui.batch.run_selected_empty_target_reason()
+            reason = empty_reason or self.ui.batch.run_selected_empty_target_reason()
             self.ui.dialogs.message_box_warning("No Sets", reason)
             return None
 

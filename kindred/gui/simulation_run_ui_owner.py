@@ -17,6 +17,9 @@ class SimulationRunUiOwner:
         self._results_table_getter = results_table_getter
         self._run_button_requested_enabled = True
         self._launch_available = False
+        self._run_target_available = False
+        self._run_button_text = "Run"
+        self._run_button_tooltip = ""
         self._run_button = None
         self._run_action = None
         self._stop_button = None
@@ -24,6 +27,7 @@ class SimulationRunUiOwner:
         self._status_label = None
         self._algebra_status_label = None
         self._mechanism_editor = None
+        self._last_runtime_readiness_status = ""
 
     @property
     def requested_run_enabled(self) -> bool:
@@ -63,6 +67,18 @@ class SimulationRunUiOwner:
         self._run_button_requested_enabled = bool(enabled)
         self._apply_run_button_state()
 
+    def render_run_target_state(
+        self,
+        *,
+        button_text: str,
+        target_available: bool,
+        tooltip: str,
+    ) -> None:
+        self._run_target_available = bool(target_available)
+        self._run_button_text = str(button_text or "Run")
+        self._run_button_tooltip = str(tooltip or "")
+        self._apply_run_button_state()
+
     def render_launch_available(self, available: bool) -> None:
         self._launch_available = bool(available)
         self._apply_run_button_state()
@@ -71,9 +87,12 @@ class SimulationRunUiOwner:
         self._launch_available = bool(getattr(state, "launch_available", False))
         message = str(getattr(state, "status_text", "") or "").strip()
         if message:
-            self.set_status_text(message)
+            current_status = self._status_text_value()
+            if not current_status or current_status == "Ready" or current_status == self._last_runtime_readiness_status:
+                self._set_status_text(message, source="runtime_readiness")
         elif bool(getattr(state, "clear_status", False)):
-            self.set_status_text("")
+            if self._status_text_value() == self._last_runtime_readiness_status:
+                self._set_status_text("", source="runtime_readiness")
         if bool(getattr(state, "failed", False)):
             self.set_stop_button_enabled(False)
             self.set_sim_progress_value(0)
@@ -87,8 +106,24 @@ class SimulationRunUiOwner:
             self._stop_button.setEnabled(bool(enabled))
 
     def set_status_text(self, text: str) -> None:
+        self._set_status_text(text, source="explicit")
+
+    def _status_text_value(self) -> str:
+        label = self._status_label
+        if label is None:
+            return ""
+        try:
+            return str(label.text())
+        except (RuntimeError, AttributeError):
+            return ""
+
+    def _set_status_text(self, text: str, *, source: str) -> None:
         if self._status_label is not None:
             set_bounded_label_text(self._status_label, str(text), max_width=420)
+        if str(source) == "runtime_readiness":
+            self._last_runtime_readiness_status = str(text)
+        else:
+            self._last_runtime_readiness_status = ""
 
     def set_sim_progress_value(self, value: int) -> None:
         if self._progress is not None:
@@ -113,13 +148,23 @@ class SimulationRunUiOwner:
         button = self._run_button
         if button is None:
             return
-        effective_enabled = bool(self._run_button_requested_enabled and self._launch_available)
+        button.setText(self._run_button_text)
+        button.setToolTip(self._run_button_tooltip)
+        effective_enabled = bool(
+            self._run_button_requested_enabled
+            and self._launch_available
+            and self._run_target_available
+        )
         button.setEnabled(effective_enabled)
         if self._run_action is not None:
             self._run_action.setEnabled(effective_enabled)
+            self._run_action.setText(self._run_button_text)
+            self._run_action.setToolTip(self._run_button_tooltip)
         editor = self._mechanism_editor
         if editor is None:
             return
+        editor.run_btn.setText(self._run_button_text)
+        editor.run_btn.setToolTip(self._run_button_tooltip)
         if effective_enabled:
             editor.run_btn.setEnabled(editor.is_mechanism_valid())
         else:
