@@ -50,7 +50,6 @@ from kindred.gui.ports import (
     DisplayTransitionOutcomeKind,
     FreshPreviewDisplayEntry,
     FreshPreviewDisplayTransaction,
-    PlotCsvExportColumn,
     PlotDisplayLayersPayload,
     PlotLayerKind,
     ResolvedBatchDisplayRequestEntry,
@@ -70,7 +69,6 @@ class ResultsDisplayPlotPort(Protocol):
     def overlay_snapshot(self) -> Dict[str, object]: ...
     def clear_display_transaction_state(self, *, preserve_y_selection_state: bool = False) -> None: ...
     def transaction_export_axis_state(self, scope: str) -> Dict[str, object]: ...
-    def dataset_overlay_export_columns(self, scope: str) -> Sequence[PlotCsvExportColumn]: ...
     def intervention_annotation_state(self) -> Dict[str, object]: ...
     def set_intervention_annotations_from_provenance(self, provenance: Mapping[str, object] | None) -> None: ...
 
@@ -300,9 +298,10 @@ class ResultsController(QtCore.QObject):
 
     def set_reference_overlays_visible(self, visible: bool) -> None:
         show = bool(visible)
-        self._reference_overlays_visible = show
+        previous_visible = self._reference_overlays_visible
         previous_transaction = self._active_display_transaction
         if not isinstance(previous_transaction, ActiveDisplayTransaction):
+            self._reference_overlays_visible = show
             return
 
         updated_sets: Dict[str, DisplaySetMetadata] = {}
@@ -318,15 +317,20 @@ class ResultsController(QtCore.QObject):
             if layer_id:
                 updated_sets[layer_id] = metadata
         if not has_reference_metadata or not changed:
+            self._reference_overlays_visible = show
             return
 
         updated_transaction = replace(previous_transaction, sets=updated_sets)
-        self._active_display_transaction = updated_transaction
         plot = self._main_plot()
-        self._set_plot_display_layers(
+        refreshed = self._set_plot_display_layers(
             plot=plot,
             active_display_transaction=updated_transaction,
         )
+        if not bool(refreshed):
+            self._reference_overlays_visible = previous_visible
+            return
+        self._reference_overlays_visible = show
+        self._active_display_transaction = updated_transaction
         stats_results_map = stats_results_map_from_display_transaction(
             updated_transaction,
             include_reference_overlays=True,
@@ -667,19 +671,10 @@ class ResultsController(QtCore.QObject):
         primary: str,
         primary_entry: Mapping[str, Any],
         snapshot: BatchCacheResultReadSnapshot,
-        active_entries_by_set_id: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Mapping[str, Any]]:
         displayed_entries: dict[str, Mapping[str, Any]] = {str(primary): primary_entry}
-        active_entries = {
-            str(set_id): entry
-            for set_id, entry in dict(active_entries_by_set_id or {}).items()
-            if str(set_id) and isinstance(entry, Mapping)
-        }
         for sid in available:
             if sid == primary:
-                continue
-            if str(sid) in active_entries:
-                displayed_entries[str(sid)] = active_entries[str(sid)]
                 continue
             other = self._cache_entry_for_set_id(
                 set_id=sid,
@@ -690,45 +685,6 @@ class ResultsController(QtCore.QObject):
                 continue
             displayed_entries[str(sid)] = other
         return displayed_entries
-
-    def _active_display_entries_by_requested_id(
-        self,
-        requested_show_set_ids: Sequence[str],
-        *,
-        excluded_set_ids: Sequence[str] = (),
-    ) -> dict[str, Mapping[str, Any]]:
-        transaction = self._active_display_transaction
-        if transaction is None:
-            return {}
-        requested_ids = set(deduped_set_ids(requested_show_set_ids))
-        excluded_ids = set(deduped_set_ids(excluded_set_ids))
-        active_display_ids = set(deduped_set_ids(transaction.display_set_ids))
-        entries: dict[str, Mapping[str, Any]] = {}
-        for metadata in dict(transaction.sets or {}).values():
-            if not isinstance(metadata, DisplaySetMetadata):
-                continue
-            set_id = str(metadata.set_id or "").strip()
-            if (
-                not set_id
-                or set_id in excluded_ids
-                or set_id not in requested_ids
-                or set_id not in active_display_ids
-            ):
-                continue
-            if metadata.role is DisplaySetRole.REFERENCE_OVERLAY:
-                continue
-            payload: Dict[str, object] = {
-                "t": metadata.t,
-                "series": dict(metadata.series or {}),
-            }
-            if metadata.owned_species:
-                payload["owned_species"] = tuple(metadata.owned_species)
-            if metadata.display_species:
-                payload["display_species"] = tuple(metadata.display_species)
-            if isinstance(metadata.completion_provenance, Mapping):
-                payload["completion_provenance"] = dict(metadata.completion_provenance)
-            entries[set_id] = payload
-        return entries
 
     @staticmethod
     def _explicit_display_species_for_entry(entry: Mapping[str, Any]) -> tuple[str, ...]:
@@ -1900,51 +1856,11 @@ class ResultsController(QtCore.QObject):
         candidate = plot.transaction_export_axis_state(normalized_scope)
         if isinstance(candidate, Mapping):
             axis_state.update(dict(candidate))
-        header, rows = build_main_plot_csv_export(
+        return build_main_plot_csv_export(
             active_transaction=active_transaction,
             scope=normalized_scope,
             axis_state=axis_state,
         )
-        header, rows = self._append_plot_owned_csv_export_columns(
-            header,
-            rows,
-            plot.dataset_overlay_export_columns(normalized_scope),
-        )
-        return header, rows
-
-    @staticmethod
-    def _append_plot_owned_csv_export_columns(
-        header: Sequence[str],
-        rows: Sequence[Sequence[object]],
-        columns: Sequence[PlotCsvExportColumn],
-    ) -> tuple[list[str], list[list[object]]]:
-        extra_columns: list[tuple[str, np.ndarray]] = []
-        for column in columns or ():
-            if not isinstance(column, PlotCsvExportColumn):
-                continue
-            header_text = str(column.header or "").strip()
-            if not header_text:
-                continue
-            values = np.asarray(column.values).reshape(-1)
-            if values.size <= 0:
-                continue
-            extra_columns.append((header_text, values))
-        base_header = list(header)
-        base_rows = [list(row) for row in rows]
-        if not extra_columns:
-            return base_header, base_rows
-        combined_header = base_header + [name for name, _values in extra_columns]
-        max_len = max(len(base_rows), *(values.shape[0] for _name, values in extra_columns))
-        combined_rows: list[list[object]] = []
-        for idx in range(max_len):
-            if idx < len(base_rows):
-                row = list(base_rows[idx])
-            else:
-                row = [""] * len(base_header)
-            for _name, values in extra_columns:
-                row.append(values[idx] if idx < values.shape[0] else "")
-            combined_rows.append(row)
-        return combined_header, combined_rows
 
     def reset_stale_cache_warning_status(self) -> None:
         transition = self._last_display_transition_outcome
@@ -3003,10 +2919,6 @@ class ResultsController(QtCore.QObject):
             snapshot=snapshot,
         )
         cache_available_ids = tuple(str(set_id) for set_id in coverage.available_ids if str(set_id))
-        active_entries_by_set_id = self._active_display_entries_by_requested_id(
-            requested_ids,
-            excluded_set_ids=invalidated_ids,
-        )
         invalidated_requested_ids = tuple(
             set_id for set_id in requested_ids if set_id in set(invalidated_ids)
         )
@@ -3033,49 +2945,6 @@ class ResultsController(QtCore.QObject):
             )
             return CachedBatchDisplayScopeOutcome(
                 transition_outcome=transition_outcome,
-            )
-        if active_entries_by_set_id and not cache_available_ids:
-            missing_ids = tuple(
-                set_id for set_id in requested_ids if set_id not in active_entries_by_set_id
-            )
-            transition_outcome = self._record_unpublished_display_request_outcome(
-                cause=coverage.unavailable_cause or DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE,
-                affected_set_ids=requested_ids,
-                requested_show_set_ids=requested_ids,
-                requested_labels_by_set_id={
-                    str(set_id): str(self._ui.batch_name_for_id(str(set_id)) or set_id)
-                    for set_id in requested_ids
-                },
-                unresolved_intent_set_ids=missing_ids,
-                missing_intent_set_ids=missing_ids,
-            )
-            return CachedBatchDisplayScopeOutcome(
-                transition_outcome=transition_outcome,
-            )
-        if active_entries_by_set_id:
-            merged_available_ids = tuple(
-                deduped_set_ids(
-                    (
-                        *coverage.available_ids,
-                        *(
-                            set_id
-                            for set_id in requested_ids
-                            if set_id in active_entries_by_set_id
-                        ),
-                    )
-                )
-            )
-            requested_id_set = set(coverage.requested_show_set_ids)
-            merged_id_set = set(merged_available_ids)
-            coverage = CachedBatchDisplayScopeCoverage(
-                requested_show_set_ids=list(coverage.requested_show_set_ids),
-                available_ids=list(merged_available_ids),
-                full_coverage=bool(requested_id_set and requested_id_set <= merged_id_set),
-                unavailable_cause=(
-                    None
-                    if requested_id_set and requested_id_set <= merged_id_set
-                    else coverage.unavailable_cause
-                ),
             )
         if not coverage.full_coverage:
             missing_ids = tuple(
@@ -3139,7 +3008,6 @@ class ResultsController(QtCore.QObject):
             primary=primary,
             primary_entry=entry,
             snapshot=snapshot,
-            active_entries_by_set_id=active_entries_by_set_id,
         )
         semantic_unavailable_ids = self._semantic_unavailable_display_set_ids(transaction_entries_by_set_id)
         if semantic_unavailable_ids:
@@ -3392,22 +3260,23 @@ class ResultsController(QtCore.QObject):
                 semantic_unavailable_ids = tuple(deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
                 displayable_entries_by_id.pop(resolved_id, None)
                 continue
-            if resolved.canonical_entry is not None and not isinstance(
-                resolved.canonical_entry.get("completion_provenance"),
+            canonical_reference_entry = resolved.authority.canonical_reference_entry
+            if canonical_reference_entry is not None and not isinstance(
+                canonical_reference_entry.get("completion_provenance"),
                 Mapping,
             ):
                 return _resolved_unpublished_outcome(
                     cause=DisplayTransitionCause.INVALID_CACHE_ENTRY,
                     affected_set_ids=(resolved_id,),
                 )
-            if resolved.canonical_entry is not None and not owned_species_for_display_entry(
-                resolved.canonical_entry,
+            if canonical_reference_entry is not None and not owned_species_for_display_entry(
+                canonical_reference_entry,
             ):
                 semantic_unavailable_ids = tuple(deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
                 displayable_entries_by_id.pop(resolved_id, None)
                 continue
-            if resolved.canonical_entry is not None and self._semantic_unavailable_display_set_ids(
-                {resolved_id: resolved.canonical_entry}
+            if canonical_reference_entry is not None and self._semantic_unavailable_display_set_ids(
+                {resolved_id: canonical_reference_entry}
             ):
                 semantic_unavailable_ids = tuple(deduped_set_ids((*semantic_unavailable_ids, resolved_id)))
                 displayable_entries_by_id.pop(resolved_id, None)
@@ -3453,13 +3322,14 @@ class ResultsController(QtCore.QObject):
             if display_metadata is not None:
                 additional_metadata.append(display_metadata)
         for resolved in resolved_entries:
-            if resolved.canonical_entry is None:
+            canonical_reference_entry = resolved.authority.canonical_reference_entry
+            if canonical_reference_entry is None:
                 continue
             display_metadata = display_metadata_for_entry(
                 label=str(resolved.label),
                 entry={
-                    **dict(resolved.canonical_entry),
-                    "display_species": self._explicit_display_species_for_entry(resolved.canonical_entry),
+                    **dict(canonical_reference_entry),
+                    "display_species": self._explicit_display_species_for_entry(canonical_reference_entry),
                 },
                 set_id=str(resolved.set_id),
                 role=DisplaySetRole.REFERENCE_OVERLAY,
@@ -3474,9 +3344,13 @@ class ResultsController(QtCore.QObject):
             for resolved in resolved_entries
             if str(resolved.set_id) and isinstance(resolved.workspace_preview_provenance, Mapping)
         }
+        primary_has_workspace_provenance = (
+            isinstance(primary.workspace_preview_provenance, Mapping)
+            and bool(primary.workspace_preview_provenance)
+        )
         display_transition = (
             _DISPLAY_TRANSITION_WORKSPACE_PREVIEW
-            if workspace_provenance_by_set_id
+            if primary_has_workspace_provenance
             else _DISPLAY_TRANSITION_RESOLVED_REFRESH
         )
         normalized_display_source = _coerce_display_refresh_source(display_source)
@@ -3980,8 +3854,9 @@ class ResultsController(QtCore.QObject):
                 additional_metadata.append(display_metadata)
         for entry in entries:
             display_metadata = None
-            if isinstance(entry.canonical_reference_entry, Mapping):
-                reference_entry = dict(entry.canonical_reference_entry)
+            canonical_reference_entry = entry.authority.canonical_reference_entry
+            if isinstance(canonical_reference_entry, Mapping):
+                reference_entry = dict(canonical_reference_entry)
                 display_metadata = display_metadata_for_entry(
                     label=str(entry.label),
                     entry={
@@ -3996,12 +3871,6 @@ class ResultsController(QtCore.QObject):
                     role=DisplaySetRole.REFERENCE_OVERLAY,
                     layer_id=f"reference:{entry.set_id}",
                     visible=self._reference_overlays_visible,
-                )
-            elif not str(entry.canonical_reference_cache_key or "").strip():
-                display_metadata = self._validated_active_reference_metadata_for_fresh_preview(
-                    previous_transaction=self._active_display_transaction,
-                    set_id=str(entry.set_id),
-                    expected_display_set_ids=expected_ids,
                 )
             if display_metadata is not None:
                 additional_metadata.append(display_metadata)
@@ -4054,35 +3923,6 @@ class ResultsController(QtCore.QObject):
         return SimulationCompletionDisplayOutcome(
             transition_outcome=outcome.transition_outcome,
         )
-
-    def _validated_active_reference_metadata_for_fresh_preview(
-        self,
-        *,
-        previous_transaction: ActiveDisplayTransaction | None,
-        set_id: str,
-        expected_display_set_ids: Sequence[str],
-    ) -> DisplaySetMetadata | None:
-        if not isinstance(previous_transaction, ActiveDisplayTransaction):
-            return None
-        expected_ids = set(deduped_set_ids(expected_display_set_ids))
-        if not expected_ids:
-            return None
-        if set(previous_transaction.display_set_ids) != expected_ids:
-            return None
-        sid = str(set_id or "").strip()
-        if not sid:
-            return None
-        for metadata in dict(previous_transaction.sets or {}).values():
-            if not isinstance(metadata, DisplaySetMetadata):
-                continue
-            if metadata.role is not DisplaySetRole.REFERENCE_OVERLAY:
-                continue
-            if str(metadata.set_id or "").strip() != sid:
-                continue
-            if bool(metadata.visible) != bool(self._reference_overlays_visible):
-                return replace(metadata, visible=bool(self._reference_overlays_visible))
-            return metadata
-        return None
 
     def publish_slider_replay_display_scope(
         self,
@@ -4255,11 +4095,31 @@ class ResultsController(QtCore.QObject):
             active_run_id=int(active_run_id),
         )
         displayed = _display_transition_published(display_outcome)
+        requested_show_ids_for_focus = (
+            target_set_ids
+            if pending_cache_kind == "preview" and target_set_ids
+            else live_requested_show_set_ids
+        )
         focus_sync = (
             getattr(display_outcome, "focused_controls_use_workspace", None)
             if bool(displayed) and pending_cache_kind == "preview"
             else None
         )
+        if bool(displayed) and pending_cache_kind == "preview" and focus_sync is None:
+            try:
+                focus_sync = bool(
+                    self._ui.focused_show_request_is_dirty(
+                        requested_show_ids_for_focus,
+                        focused_set_id,
+                    )
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Failed to derive focused workspace sync for slider replay refresh: %s",
+                    exc,
+                    exc_info=True,
+                )
+                focus_sync = None
         return RuntimeSliderReplayDisplayRefresh(
             display_outcome=display_outcome,
             displayed=bool(displayed),

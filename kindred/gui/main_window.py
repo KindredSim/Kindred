@@ -6741,6 +6741,8 @@ class MainWindow(
                 clear_plot=False,
             )
             self._refresh_slider_transaction_button_state()
+            if self.results_controller.active_display_transaction() is None:
+                self._refresh_batch_display_from_request_scope()
             self._queue_species_slider_simulation(label="init:reset", delay_ms=0)
 
     def _on_species_slider_edited(self, species: str, value: float) -> None:

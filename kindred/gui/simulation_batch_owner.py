@@ -20,11 +20,16 @@ from kindred.core.batch_cache_contracts import (
     BatchCacheResultReadSnapshot,
     BatchCacheEntryReadResult,
 )
+from kindred.gui.display_authority import (
+    compose_resolved_display_request_entry,
+    resolve_canonical_reference_authority,
+)
 from kindred.gui.ports import (
     BatchDisplayRequestCoverage,
     BatchDisplayRequestResolution,
     ConcentrationSetInteractionTransaction,
     DisplayTransitionCause,
+    RequestScopeRestoreTruth,
     ResolvedBatchDisplayRequestEntry,
 )
 
@@ -708,29 +713,37 @@ class SimulationBatchOwner:
                 )
                 if preview_entry.entry is not None:
                     has_resolved_workspace_preview = True
-                    canonical_entry = None
-                    if (
-                        active_cache_key
-                        and set_id not in invalidated_set_ids
-                        and (not active_valid_set_ids or set_id in active_valid_set_ids)
-                    ):
-                        explicit_entry = batch_cache.entry_for_set(
+                    workspace_preview_provenance = self.workspace_preview_display_provenance_for_entry(
+                        set_id,
+                        preview_entry.entry,
+                    )
+                    reference_authority = resolve_canonical_reference_authority(
+                        set_id=set_id,
+                        active_cache_key=active_cache_key,
+                        active_cache_valid_set_ids=active_valid_set_ids,
+                        active_cache_invalidated_set_ids=invalidated_set_ids,
+                        workspace_preview_provenance=workspace_preview_provenance,
+                        load_canonical_reference_candidate=lambda: batch_cache.entry_for_set(
                             cache_key=active_cache_key,
                             set_id=set_id,
                             is_preview=False,
                             require_completion_provenance=True,
-                        )
-                        canonical_entry = explicit_entry.entry
+                        ).entry,
+                    )
                     resolved_entries.append(
-                        ResolvedBatchDisplayRequestEntry(
+                        compose_resolved_display_request_entry(
                             set_id=str(set_id),
                             label=str(label),
-                            entry=preview_entry.entry,
-                            canonical_entry=canonical_entry,
-                            workspace_preview_provenance=self.workspace_preview_display_provenance_for_entry(
-                                set_id,
-                                preview_entry.entry,
+                            active_display_payload=preview_entry.entry,
+                            canonical_reference_candidate=(
+                                reference_authority.canonical_reference_candidate
                             ),
+                            canonical_reference_eligible_for_current_inputs=(
+                                reference_authority.canonical_reference_eligible_for_current_inputs
+                            ),
+                            invalidation_context=reference_authority.invalidation_context,
+                            request_scope_restore_truth=RequestScopeRestoreTruth.WORKSPACE_PREVIEW,
+                            workspace_preview_provenance=workspace_preview_provenance,
                         )
                     )
                     if set_id == focused_set_id:
@@ -761,8 +774,20 @@ class SimulationBatchOwner:
                     missing_explicit_entry = True
                 continue
             if explicit_entry.entry is not None:
+                explicit_authority = resolve_canonical_reference_authority(
+                    set_id=set_id,
+                    active_cache_key=active_cache_key,
+                    active_cache_valid_set_ids=active_valid_set_ids,
+                    active_cache_invalidated_set_ids=invalidated_set_ids,
+                )
                 resolved_entries.append(
-                    ResolvedBatchDisplayRequestEntry(set_id=str(set_id), label=str(label), entry=explicit_entry.entry)
+                    compose_resolved_display_request_entry(
+                        set_id=str(set_id),
+                        label=str(label),
+                        active_display_payload=explicit_entry.entry,
+                        invalidation_context=explicit_authority.invalidation_context,
+                        request_scope_restore_truth=RequestScopeRestoreTruth.EXPLICIT_CACHE,
+                    )
                 )
                 if set_id == focused_set_id:
                     focused_request_uses_workspace_controls = False

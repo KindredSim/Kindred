@@ -100,13 +100,6 @@ class PlotDisplayLayersPayload:
         )
         object.__setattr__(self, "show_intervention_annotations", bool(self.show_intervention_annotations))
 
-
-@dataclass(frozen=True, slots=True)
-class PlotCsvExportColumn:
-    header: str
-    values: Any
-
-
 @dataclass(frozen=True, slots=True)
 class CopyAllDisplayBlock:
     set_id: str
@@ -508,13 +501,59 @@ class BatchDisplayRefreshOutcome:
     transition_outcome: DisplayTransitionOutcome | None = None
 
 
+class CanonicalReferenceEligibility(Enum):
+    UNAVAILABLE = "unavailable"
+    PROVEN = "proven"
+    SAME_AS_ACTIVE_RESULT = "same_as_active_result"
+
+
+class RequestScopeRestoreTruth(Enum):
+    NONE = "none"
+    WORKSPACE_PREVIEW = "workspace_preview"
+    EXPLICIT_CACHE = "explicit_cache"
+
+
+@dataclass(frozen=True, slots=True)
+class DisplayAuthorityInvalidationContext:
+    active_cache_key: str = ""
+    active_cache_set_is_valid: bool | None = None
+    active_cache_set_is_invalidated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class DisplayAuthorityBundle:
+    active_display_payload: Mapping[str, Any]
+    canonical_reference_payload: Mapping[str, Any] | None = None
+    canonical_reference_eligible_for_current_inputs: bool = False
+    canonical_reference_eligibility: CanonicalReferenceEligibility = (
+        CanonicalReferenceEligibility.UNAVAILABLE
+    )
+    invalidation_context: DisplayAuthorityInvalidationContext = field(
+        default_factory=DisplayAuthorityInvalidationContext
+    )
+    request_scope_restore_truth: RequestScopeRestoreTruth = RequestScopeRestoreTruth.NONE
+
+    @property
+    def canonical_reference_entry(self) -> Mapping[str, Any] | None:
+        if self.canonical_reference_eligibility is not CanonicalReferenceEligibility.PROVEN:
+            return None
+        return self.canonical_reference_payload
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedBatchDisplayRequestEntry:
     set_id: str
     label: str
-    entry: Mapping[str, Any]
-    canonical_entry: Mapping[str, Any] | None = None
+    authority: DisplayAuthorityBundle
     workspace_preview_provenance: Dict[str, Any] | None = None
+
+    @property
+    def entry(self) -> Mapping[str, Any]:
+        return self.authority.active_display_payload
+
+    @property
+    def canonical_entry(self) -> Mapping[str, Any] | None:
+        return self.authority.canonical_reference_entry
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,31 +660,55 @@ class CompletedRunDisplayCoverage:
 class FreshPreviewDisplayEntry:
     set_id: str
     label: str
-    t: Any
-    series: Mapping[str, Any]
-    algebra_scalars: Mapping[str, object]
-    solver_provenance: Mapping[str, Any] | None
-    completion_provenance: Mapping[str, Any] | None
-    owned_species: tuple[str, ...]
-    display_species: tuple[str, ...]
-    canonical_reference_entry: Mapping[str, Any] | None = None
-    canonical_reference_cache_key: str | None = None
+    authority: DisplayAuthorityBundle
     workspace_preview_provenance: Mapping[str, Any] | None = None
 
+    @property
+    def t(self) -> Any:
+        return self.authority.active_display_payload.get("t")
+
+    @property
+    def series(self) -> Mapping[str, Any]:
+        raw_series = self.authority.active_display_payload.get("series")
+        return raw_series if isinstance(raw_series, Mapping) else {}
+
+    @property
+    def algebra_scalars(self) -> Mapping[str, object]:
+        raw_scalars = self.authority.active_display_payload.get("algebra_scalars")
+        return raw_scalars if isinstance(raw_scalars, Mapping) else {}
+
+    @property
+    def solver_provenance(self) -> Mapping[str, Any] | None:
+        raw_solver_provenance = self.authority.active_display_payload.get("solver_provenance")
+        return raw_solver_provenance if isinstance(raw_solver_provenance, Mapping) else None
+
+    @property
+    def completion_provenance(self) -> Mapping[str, Any] | None:
+        raw_completion_provenance = self.authority.active_display_payload.get("completion_provenance")
+        return raw_completion_provenance if isinstance(raw_completion_provenance, Mapping) else None
+
+    @property
+    def owned_species(self) -> tuple[str, ...]:
+        return tuple(
+            str(name)
+            for name in (self.authority.active_display_payload.get("owned_species") or ())
+            if str(name)
+        )
+
+    @property
+    def display_species(self) -> tuple[str, ...]:
+        return tuple(
+            str(name)
+            for name in (self.authority.active_display_payload.get("display_species") or ())
+            if str(name)
+        )
+
+    @property
+    def canonical_reference_entry(self) -> Mapping[str, Any] | None:
+        return self.authority.canonical_reference_entry
+
     def to_display_payload(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "t": self.t,
-            "series": dict(self.series or {}),
-            "algebra_scalars": dict(self.algebra_scalars or {}),
-            "solver_provenance": dict(self.solver_provenance or {}),
-        }
-        if isinstance(self.completion_provenance, Mapping):
-            payload["completion_provenance"] = dict(self.completion_provenance)
-        if self.owned_species:
-            payload["owned_species"] = tuple(str(name) for name in self.owned_species if str(name))
-        if self.display_species:
-            payload["display_species"] = tuple(str(name) for name in self.display_species if str(name))
-        return payload
+        return dict(self.authority.active_display_payload or {})
 
 
 @dataclass(frozen=True, slots=True)

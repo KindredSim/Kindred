@@ -17,7 +17,6 @@ from kindred.gui.ports import (
     CopyAllDisplayBlock,
     CopyAllExportPlan,
     CopyAllMissingItem,
-    PlotCsvExportColumn,
     PlotDisplayLayer,
     PlotDisplayLayersPayload,
     PlotLayerKind,
@@ -929,50 +928,6 @@ if PYQTGRAPH_AVAILABLE:
                 "x_header": str(derived_label or x_name),
                 "y_names": tuple(str(name) for name in y_names if str(name)),
             }
-
-        def dataset_overlay_export_columns(self, scope: str) -> List[PlotCsvExportColumn]:
-            """Return plot-owned dataset overlay CSV columns for ADT export composition."""
-            normalized_scope = str(scope or "axis")
-            if normalized_scope == "axis":
-                overlay_series = list(self._visible_overlay_series)
-                warnings = list(self._visible_overlay_warnings)
-            else:
-                self._ensure_export_all_overlay_cache()
-                overlay_series = list(self._export_all_overlay_series)
-                warnings = list(self._export_all_overlay_warnings)
-
-            active_overlays = self._overlay_panel.selected_datasets()
-            if warnings and active_overlays:
-                warning_msg = "\n".join(f" - {msg}" for msg in warnings)
-                raise ValueError(
-                    "Cannot export overlay datasets until issues are resolved:\n" + warning_msg
-                )
-
-            x_name = self._x_axis_name or "t"
-            _x_data, derived_label = self._get_x_data()
-            x_header = str(derived_label or x_name)
-            columns: List[PlotCsvExportColumn] = []
-            for entry in overlay_series:
-                x_overlay_array = _try_1d_float_array(entry.x)
-                y_overlay_array = _try_1d_float_array(entry.y)
-                if x_overlay_array.size == 0 or y_overlay_array.size == 0:
-                    continue
-                if y_overlay_array.shape[0] != x_overlay_array.shape[0]:
-                    continue
-                block_label = self._dataset_overlay_block_label(entry.dataset)
-                columns.append(
-                    PlotCsvExportColumn(
-                        header=self._qualified_copy_header(block_label, x_header),
-                        values=x_overlay_array,
-                    )
-                )
-                columns.append(
-                    PlotCsvExportColumn(
-                        header=self._copy_series_header(block_label, str(entry.species)),
-                        values=y_overlay_array,
-                    )
-                )
-            return columns
 
         def _get_clipboard(self):
             """Clipboard accessor seam (monkeypatchable in tests)."""
@@ -3485,10 +3440,6 @@ else:
         def build_visible_export(self, scope: str):
             """Stub method."""
             raise RuntimeError("PyQtGraph is required for overlay exports.")
-
-        def dataset_overlay_export_columns(self, scope: str):
-            """Stub method."""
-            return []
 
         def analysis_tabs_widget(self):
             """Stub method."""
