@@ -154,6 +154,7 @@ def compose_display_authority_bundle(
     if candidate_payload is not None:
         if _display_payloads_match(active_payload, candidate_payload):
             canonical_reference_eligibility = CanonicalReferenceEligibility.SAME_AS_ACTIVE_RESULT
+            canonical_reference_payload = candidate_payload
         elif bool(canonical_reference_eligible_for_current_inputs):
             canonical_reference_eligibility = CanonicalReferenceEligibility.PROVEN
             canonical_reference_payload = candidate_payload

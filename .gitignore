@@ -17,6 +17,8 @@ __pycache__/
 build/
 dist/
 dist*/
+tests/private/
+tests/private/*
 
 # Type checker / linter caches
 .mypy_cache/
@@ -45,3 +47,6 @@ ARCH_RULES.md
 AUDIT.md
 DSL_REFERENCE.md
 tools/diagnostics/
+
+# Local/private tests - never commit
+/tests/private/

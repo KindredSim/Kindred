@@ -797,24 +797,26 @@ class SimulationBatchOwner:
                 is_preview=False,
                 require_completion_provenance=True,
             )
-            if set_id in invalidated_set_ids:
-                if explicit_entry.state == "invalid":
-                    invalid_entry = True
-                else:
-                    missing_explicit_entry = True
-                continue
             if explicit_entry.entry is not None:
                 explicit_authority = resolve_canonical_reference_authority(
                     set_id=set_id,
                     active_cache_key=active_cache_key,
                     active_cache_valid_set_ids=active_valid_set_ids,
                     active_cache_invalidated_set_ids=invalidated_set_ids,
+                    workspace_preview_provenance={"restore_truth": "explicit_cache"},
+                    load_canonical_reference_candidate=lambda: explicit_entry.entry,
                 )
                 resolved_entries.append(
                     compose_resolved_display_request_entry(
                         set_id=str(set_id),
                         label=str(label),
                         active_display_payload=explicit_entry.entry,
+                        canonical_reference_candidate=(
+                            explicit_authority.canonical_reference_candidate
+                        ),
+                        canonical_reference_eligible_for_current_inputs=(
+                            explicit_authority.canonical_reference_eligible_for_current_inputs
+                        ),
                         invalidation_context=explicit_authority.invalidation_context,
                         request_scope_restore_truth=RequestScopeRestoreTruth.EXPLICIT_CACHE,
                     )

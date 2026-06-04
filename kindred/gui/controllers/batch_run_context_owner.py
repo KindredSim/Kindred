@@ -775,7 +775,7 @@ class BatchRunContextOwner:
         queue_ids: Sequence[str],
     ) -> tuple[str, ...]:
         requested = getattr(intent, "requested_show_set_ids", None)
-        source = requested if requested else queue_ids
+        source = queue_ids if requested is None else requested
         return tuple(dict.fromkeys(str(set_id) for set_id in (source or ()) if str(set_id)))
 
     @staticmethod
@@ -1366,10 +1366,15 @@ class BatchRunContextOwner:
         if not isinstance(ctx, Mapping):
             return CompletedRunDisplayCoverage(cause=DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS)
         intent = ctx.get(self._COMPLETED_RUN_DISPLAY_INTENT_KEY)
-        if not isinstance(intent, CompletedRunDisplayIntent) or not intent.requested_show_set_ids:
+        if not isinstance(intent, CompletedRunDisplayIntent):
             return CompletedRunDisplayCoverage(cause=DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS)
-        intent_set_ids = tuple(str(set_id) for set_id in intent.requested_show_set_ids if str(set_id))
         run_target_ids_raw = tuple(str(set_id) for set_id in intent.run_target_set_ids if str(set_id))
+        requested_show_ids = tuple(str(set_id) for set_id in intent.requested_show_set_ids if str(set_id))
+        intent_set_ids = requested_show_ids
+        if not intent_set_ids:
+            return CompletedRunDisplayCoverage(cause=DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS)
+        all_run_target_members = set(run_target_ids_raw)
+        non_run_requested_ids = tuple(set_id for set_id in intent_set_ids if set_id not in all_run_target_members)
         run_target_members = set(run_target_ids_raw)
         if run_target_members:
             run_target_set_ids = tuple(set_id for set_id in intent_set_ids if set_id in run_target_members)
@@ -1386,10 +1391,11 @@ class BatchRunContextOwner:
             return tuple(set_id for set_id in intent_set_ids if set_id in members)
 
         if not display_set_ids:
-            unresolved = _intent_ordered_union(failed_run_target_set_ids)
+            diagnostic_missing_ids = _intent_ordered_union(non_run_requested_ids)
+            unresolved = _intent_ordered_union(failed_run_target_set_ids, non_run_requested_ids)
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=(),
+                missing_set_ids=diagnostic_missing_ids,
                 unavailable_set_ids=unresolved,
                 unresolved_intent_set_ids=unresolved,
                 failed_intent_set_ids=failed_intent_set_ids,
@@ -1408,10 +1414,11 @@ class BatchRunContextOwner:
         )
         if unavailable_set_ids and all(set_id in unavailable_set_ids for set_id in display_set_ids):
             semantic_ids = tuple(set_id for set_id in display_set_ids if set_id in unavailable_set_ids)
-            unresolved = _intent_ordered_union(failed_run_target_set_ids, semantic_ids)
+            diagnostic_missing_ids = _intent_ordered_union(non_run_requested_ids)
+            unresolved = _intent_ordered_union(failed_run_target_set_ids, semantic_ids, non_run_requested_ids)
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=(),
+                missing_set_ids=diagnostic_missing_ids,
                 unavailable_set_ids=unresolved,
                 unresolved_intent_set_ids=unresolved,
                 failed_intent_set_ids=failed_intent_set_ids,
@@ -1428,10 +1435,16 @@ class BatchRunContextOwner:
                     if set_id in unavailable_set_ids and set_id not in failed_set_ids
                 )
                 missing_ids = tuple(set_id for set_id in display_set_ids if set_id not in unavailable_set_ids)
-                unresolved = _intent_ordered_union(failed_run_target_set_ids, missing_ids, semantic_ids)
+                diagnostic_missing_ids = _intent_ordered_union(missing_ids, non_run_requested_ids)
+                unresolved = _intent_ordered_union(
+                    failed_run_target_set_ids,
+                    missing_ids,
+                    semantic_ids,
+                    non_run_requested_ids,
+                )
                 return CompletedRunDisplayCoverage(
                     intent=intent,
-                    missing_set_ids=missing_ids,
+                    missing_set_ids=diagnostic_missing_ids,
                     unavailable_set_ids=unresolved,
                     unresolved_intent_set_ids=unresolved,
                     failed_intent_set_ids=failed_intent_set_ids,
@@ -1443,19 +1456,25 @@ class BatchRunContextOwner:
                     ),
                 )
             if failed_run_target_set_ids:
-                unresolved = _intent_ordered_union(failed_run_target_set_ids, display_set_ids)
+                diagnostic_missing_ids = _intent_ordered_union(display_set_ids, non_run_requested_ids)
+                unresolved = _intent_ordered_union(
+                    failed_run_target_set_ids,
+                    display_set_ids,
+                    non_run_requested_ids,
+                )
                 return CompletedRunDisplayCoverage(
                     intent=intent,
-                    missing_set_ids=display_set_ids,
+                    missing_set_ids=diagnostic_missing_ids,
                     unavailable_set_ids=unresolved,
                     unresolved_intent_set_ids=unresolved,
                     failed_intent_set_ids=failed_intent_set_ids,
                     cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
                 )
+            diagnostic_missing_ids = _intent_ordered_union(display_set_ids, non_run_requested_ids)
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=display_set_ids,
-                unresolved_intent_set_ids=_intent_ordered_union(display_set_ids),
+                missing_set_ids=diagnostic_missing_ids,
+                unresolved_intent_set_ids=_intent_ordered_union(display_set_ids, non_run_requested_ids),
                 failed_intent_set_ids=failed_intent_set_ids,
                 cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
             )
@@ -1536,10 +1555,16 @@ class BatchRunContextOwner:
         if semantic_unavailable_set_ids:
             semantic_ids = tuple(semantic_unavailable_set_ids)
             missing_ids = tuple(missing_set_ids)
-            unresolved = _intent_ordered_union(failed_run_target_set_ids, missing_ids, semantic_ids)
+            diagnostic_missing_ids = _intent_ordered_union(missing_ids, non_run_requested_ids)
+            unresolved = _intent_ordered_union(
+                failed_run_target_set_ids,
+                missing_ids,
+                semantic_ids,
+                non_run_requested_ids,
+            )
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=missing_ids,
+                missing_set_ids=diagnostic_missing_ids,
                 unavailable_set_ids=unresolved,
                 unresolved_intent_set_ids=unresolved,
                 failed_intent_set_ids=failed_intent_set_ids,
@@ -1550,10 +1575,12 @@ class BatchRunContextOwner:
             unresolved = _intent_ordered_union(
                 failed_run_target_set_ids,
                 tuple(missing_set_ids),
+                non_run_requested_ids,
             )
+            diagnostic_missing_ids = _intent_ordered_union(tuple(missing_set_ids), non_run_requested_ids)
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                missing_set_ids=tuple(missing_set_ids),
+                missing_set_ids=diagnostic_missing_ids,
                 unresolved_intent_set_ids=unresolved,
                 failed_intent_set_ids=failed_intent_set_ids,
                 cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,

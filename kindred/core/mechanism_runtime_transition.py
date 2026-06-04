@@ -48,6 +48,24 @@ def _changed_set_ids(
     return tuple(changed)
 
 
+def _merge_scoped_mapping_identity(
+    previous: tuple[tuple[str, str], ...] | None,
+    patch: tuple[tuple[str, str], ...],
+    affected_set_ids: Sequence[str],
+) -> tuple[tuple[str, str], ...]:
+    affected = _normalize_set_ids(affected_set_ids)
+    if not affected or previous is None:
+        return patch
+    merged = dict(previous)
+    patch_map = dict(patch)
+    for set_id in affected:
+        if set_id in patch_map:
+            merged[set_id] = patch_map[set_id]
+        else:
+            merged.pop(set_id, None)
+    return tuple(sorted(merged.items()))
+
+
 @dataclass(frozen=True)
 class AuthoritativeMechanismSnapshot:
     reactions_text: str
@@ -201,8 +219,18 @@ class MechanismRuntimeTransitionService:
         source_s = str(source or "authoritative_change")
         runtime_invalidation_required = False
         canonical_identity_supplied = canonical_batch_initials_by_set_id is not None
-        canonical_identity = (
+        supplied_affected_set_ids = _normalize_set_ids(affected_set_ids)
+        supplied_canonical_identity = (
             _normalize_mapping_identity(canonical_batch_initials_by_set_id)
+            if canonical_identity_supplied
+            else ()
+        )
+        canonical_identity = (
+            _merge_scoped_mapping_identity(
+                self._current_canonical_batch_initials_identity,
+                supplied_canonical_identity,
+                supplied_affected_set_ids,
+            )
             if canonical_identity_supplied
             else self._current_canonical_batch_initials_identity
         )
@@ -211,7 +239,7 @@ class MechanismRuntimeTransitionService:
             if canonical_identity_supplied
             else ()
         )
-        affected_set_ids_t = _normalize_set_ids(affected_set_ids) or canonical_changed_set_ids
+        affected_set_ids_t = supplied_affected_set_ids or canonical_changed_set_ids
         runtime_input_invalidation_required = bool(
             canonical_identity_supplied
             and (

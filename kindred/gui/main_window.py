@@ -627,6 +627,32 @@ class MainWindow(
                 )
         return identities
 
+    def _canonical_batch_initials_identity_for_set_ids(
+        self,
+        set_ids: Sequence[str],
+    ) -> Dict[str, str]:
+        identities: Dict[str, str] = {}
+        normalized = tuple(
+            dict.fromkeys(str(set_id).strip() for set_id in (set_ids or ()) if str(set_id).strip())
+        )
+        if not normalized:
+            return identities
+        for set_id in normalized:
+            row = self._batch_row_for_set_id(str(set_id))
+            if row is None:
+                continue
+            try:
+                identities[str(set_id)] = canonical_initials_fingerprint(
+                    self.batch_initials_for_row(int(row))
+                )
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.runtime_transition.canonical_initials_identity",
+                    message="Failed to fingerprint scoped canonical batch initials for runtime transition",
+                    exc=exc,
+                )
+        return identities
+
     def _apply_authoritative_mechanism_transition(
         self,
         *,
@@ -713,7 +739,9 @@ class MainWindow(
             return
         outcome = self._apply_authoritative_mechanism_transition(
             transition_source=str(transition_source or "canonical_batch_initials_change"),
-            canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
+            canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_for_set_ids(
+                affected_set_ids_t
+            ),
             affected_set_ids=affected_set_ids_t,
         )
         if bool(discard_dirty_preview) and (
@@ -4842,19 +4870,6 @@ class MainWindow(
         )
         if not normalized:
             return
-        owner = getattr(self, "_simulation_batch_owner", None)
-        if owner is not None and hasattr(owner, "record_active_result_cache_staleness"):
-            try:
-                owner.record_active_result_cache_staleness(
-                    set_ids=normalized,
-                    is_global=False,
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Failed to cheaply mark active result cache stale for canonical batch initials edit: %s",
-                    exc,
-                    exc_info=True,
-                )
         pending = list(getattr(self, "_pending_canonical_batch_initials_transition_set_ids", ()) or ())
         for set_id in normalized:
             if set_id not in pending:
@@ -4868,6 +4883,7 @@ class MainWindow(
             return
         self._canonical_batch_initials_transition_queued = True
         if QtCore.QCoreApplication.instance() is None:
+            self._flush_canonical_batch_initials_transition()
             return
         QtCore.QTimer.singleShot(0, self._flush_canonical_batch_initials_transition)
 
@@ -4987,8 +5003,6 @@ class MainWindow(
         species_sync_snapshot = self._simulation_batch_owner.batch_species_column_sync_snapshot()
 
         self._batch_model.set_species(new_species)
-        if int(self._batch_store.row_count()) > 0:
-            self._batch_model.validate_rows(range(int(self._batch_store.row_count())))
         prune_changed = False
         try:
             if hasattr(self._preview_session, "prune_staged_concentration_overlays_to_species"):

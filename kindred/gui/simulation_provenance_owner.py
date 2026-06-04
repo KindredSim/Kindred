@@ -49,6 +49,9 @@ class SimulationProvenanceOwner:
         *,
         display_transaction: Mapping[str, Any] | None,
         display_sets: Sequence[Mapping[str, Any]] | None,
+        t: Any = None,
+        series: Mapping[str, Any] | None = None,
+        species_names: Sequence[str] | None = None,
     ) -> Dict[str, Any]:
         provenance = dict(self._last_simulation_provenance or {})
         if isinstance(display_transaction, Mapping):
@@ -61,6 +64,23 @@ class SimulationProvenanceOwner:
             ]
         else:
             provenance.pop("display_sets", None)
+        if t is not None:
+            try:
+                t_array = np.asarray(t, dtype=float)
+                provenance["t"] = t_array
+                provenance["num_points"] = len(t_array)
+            except Exception:
+                provenance["t"] = t
+        if isinstance(series, Mapping):
+            provenance["series"] = {
+                str(name): np.asarray(values, dtype=float)
+                for name, values in dict(series or {}).items()
+                if str(name)
+            }
+        if species_names is not None:
+            species_list = [str(name) for name in species_names if str(name)]
+            provenance["species_names"] = species_list
+            provenance["num_species"] = len(species_list)
         self._last_simulation_provenance = provenance
         return dict(provenance)
 

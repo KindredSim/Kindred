@@ -40,6 +40,7 @@ from kindred.gui.ports import (
     CompletionDisplayEntry,
     CompletedRunDisplayTransaction,
     DisplayEventKind,
+    DisplayProjectionState,
     DisplayRefreshSource,
     DisplayRequestScopeSnapshot,
     DisplaySetMetadata,
@@ -291,76 +292,334 @@ class ResultsController(QtCore.QObject):
         self._ui = ui
         self._active_display_transaction: ActiveDisplayTransaction | None = None
         self._reference_overlays_visible: bool = True
+        self._display_projection_state = DisplayProjectionState(
+            visible_result_set_ids=(),
+            reference_overlays_visible=True,
+            primary_visible_set_id="",
+        )
         self._last_display_transition_outcome: DisplayTransitionOutcome | None = None
 
     def active_display_transaction(self) -> ActiveDisplayTransaction | None:
         return self._active_display_transaction
 
-    def set_reference_overlays_visible(self, visible: bool) -> None:
-        show = bool(visible)
-        previous_visible = self._reference_overlays_visible
-        previous_transaction = self._active_display_transaction
-        if not isinstance(previous_transaction, ActiveDisplayTransaction):
-            self._reference_overlays_visible = show
-            return
+    def _active_result_set_ids(
+        self,
+        active_display_transaction: ActiveDisplayTransaction | None = None,
+    ) -> tuple[str, ...]:
+        transaction = (
+            active_display_transaction
+            if isinstance(active_display_transaction, ActiveDisplayTransaction)
+            else self._active_display_transaction
+        )
+        if not isinstance(transaction, ActiveDisplayTransaction):
+            return ()
+        result_ids: list[str] = []
+        for raw_set_id in transaction.display_set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if set_id and set_id not in result_ids:
+                result_ids.append(set_id)
+        for metadata in dict(transaction.sets or {}).values():
+            if metadata.role not in {DisplaySetRole.PRIMARY_RESULT, DisplaySetRole.RESULT_OVERLAY}:
+                continue
+            set_id = str(metadata.set_id or "").strip()
+            if set_id and set_id not in result_ids:
+                result_ids.append(set_id)
+        return tuple(result_ids)
 
-        updated_sets: Dict[str, DisplaySetMetadata] = {}
-        has_reference_metadata = False
+    def _choose_primary_visible_set_id(
+        self,
+        visible_result_set_ids: Sequence[str],
+        *,
+        active_display_transaction: ActiveDisplayTransaction | None = None,
+    ) -> str:
+        visible_ids = tuple(deduped_set_ids(visible_result_set_ids))
+        if not visible_ids:
+            return ""
+        transaction = (
+            active_display_transaction
+            if isinstance(active_display_transaction, ActiveDisplayTransaction)
+            else self._active_display_transaction
+        )
+        if isinstance(transaction, ActiveDisplayTransaction):
+            primary = str(transaction.primary_display_set_id or "").strip()
+            if primary in visible_ids:
+                return primary
+        return str(visible_ids[0])
+
+    def _projection_state_for_requested_show_ids(
+        self,
+        requested_show_set_ids: Sequence[str],
+        *,
+        active_display_transaction: ActiveDisplayTransaction | None = None,
+    ) -> DisplayProjectionState:
+        active_ids = self._active_result_set_ids(active_display_transaction)
+        active_id_set = set(active_ids)
+        visible_ids = tuple(
+            set_id
+            for set_id in deduped_set_ids(requested_show_set_ids)
+            if set_id in active_id_set
+        )
+        return DisplayProjectionState(
+            visible_result_set_ids=visible_ids,
+            reference_overlays_visible=bool(self._reference_overlays_visible),
+            primary_visible_set_id=self._choose_primary_visible_set_id(
+                visible_ids,
+                active_display_transaction=active_display_transaction,
+            ),
+        )
+
+    def _set_display_projection_state(self, state: DisplayProjectionState) -> None:
+        if not isinstance(state, DisplayProjectionState):
+            raise TypeError("_set_display_projection_state requires DisplayProjectionState")
+        self._display_projection_state = state
+        self._reference_overlays_visible = bool(state.reference_overlays_visible)
+
+    def _current_display_projection_state(self) -> DisplayProjectionState:
+        state = getattr(self, "_display_projection_state", None)
+        if isinstance(state, DisplayProjectionState):
+            return state
+        fallback = DisplayProjectionState(
+            visible_result_set_ids=self._active_result_set_ids(),
+            reference_overlays_visible=bool(getattr(self, "_reference_overlays_visible", True)),
+            primary_visible_set_id=self._choose_primary_visible_set_id(
+                self._active_result_set_ids()
+            ),
+        )
+        self._set_display_projection_state(fallback)
+        return fallback
+
+    def _active_reference_overlay_set_ids(self) -> tuple[str, ...]:
+        transaction = self._active_display_transaction
+        if not isinstance(transaction, ActiveDisplayTransaction):
+            return ()
+        ids: list[str] = []
+        for metadata in dict(transaction.sets or {}).values():
+            if metadata.role is not DisplaySetRole.REFERENCE_OVERLAY:
+                continue
+            set_id = str(metadata.set_id or "").strip()
+            if set_id and set_id not in ids:
+                ids.append(set_id)
+        return tuple(ids)
+
+    @staticmethod
+    def _canonical_reference_entry_from_metadata(
+        metadata: DisplaySetMetadata,
+    ) -> Mapping[str, Any] | None:
+        provenance = metadata.provenance if isinstance(metadata.provenance, Mapping) else {}
+        reference_entry = provenance.get("canonical_reference_entry") if isinstance(provenance, Mapping) else None
+        return reference_entry if isinstance(reference_entry, Mapping) else None
+
+    @staticmethod
+    def _with_canonical_reference_source(
+        metadata: DisplaySetMetadata,
+        reference_entry: Mapping[str, Any] | None,
+    ) -> DisplaySetMetadata:
+        if not isinstance(reference_entry, Mapping):
+            return metadata
+        provenance = dict(metadata.provenance or {})
+        provenance["canonical_reference_entry"] = dict(reference_entry)
+        return replace(metadata, provenance=provenance)
+
+    def _active_transaction_with_reference_sources(
+        self,
+        transaction: ActiveDisplayTransaction,
+        reference_entries_by_set_id: Mapping[str, Mapping[str, Any]] | None,
+    ) -> ActiveDisplayTransaction:
+        if not isinstance(reference_entries_by_set_id, Mapping) or not reference_entries_by_set_id:
+            return transaction
+        reference_sources = {
+            str(set_id): dict(entry)
+            for set_id, entry in dict(reference_entries_by_set_id or {}).items()
+            if str(set_id) and isinstance(entry, Mapping)
+        }
+        if not reference_sources:
+            return transaction
         changed = False
-        for raw_layer_id, metadata in dict(previous_transaction.sets or {}).items():
-            layer_id = str(raw_layer_id or "").strip()
-            if metadata.role is DisplaySetRole.REFERENCE_OVERLAY:
-                has_reference_metadata = True
-                if bool(metadata.visible) != show:
-                    metadata = replace(metadata, visible=show)
-                    changed = True
-            if layer_id:
-                updated_sets[layer_id] = metadata
-        if not has_reference_metadata or not changed:
-            self._reference_overlays_visible = show
-            return
+        updated_sets: Dict[str, DisplaySetMetadata] = {}
+        for layer_id, metadata in dict(transaction.sets or {}).items():
+            if metadata.role in {DisplaySetRole.PRIMARY_RESULT, DisplaySetRole.RESULT_OVERLAY}:
+                reference_entry = reference_sources.get(str(metadata.set_id or ""))
+                updated = self._with_canonical_reference_source(metadata, reference_entry)
+                changed = changed or updated is not metadata
+                updated_sets[str(layer_id)] = updated
+            else:
+                updated_sets[str(layer_id)] = metadata
+        return replace(transaction, sets=updated_sets) if changed else transaction
 
-        updated_transaction = replace(previous_transaction, sets=updated_sets)
+    def _visible_result_set_ids_without_reference_overlay(self) -> tuple[str, ...]:
+        reference_ids = set(self._active_reference_overlay_set_ids())
+        state = self._current_display_projection_state()
+        return tuple(
+            set_id
+            for set_id in state.visible_result_set_ids
+            if str(set_id) and str(set_id) not in reference_ids
+        )
+
+    def _hydrate_reference_overlays_for_projection(self, set_ids: Sequence[str]) -> bool:
+        requested = tuple(deduped_set_ids(set_ids))
+        if not requested:
+            return False
+        transaction = self._active_display_transaction
+        if not isinstance(transaction, ActiveDisplayTransaction):
+            return False
+        updated_sets: Dict[str, DisplaySetMetadata] = dict(transaction.sets or {})
+        hydrated = False
+        for set_id in requested:
+            reference_layer_id = f"reference:{set_id}"
+            if reference_layer_id in updated_sets:
+                continue
+            result_metadata = next(
+                (
+                    metadata
+                    for metadata in updated_sets.values()
+                    if metadata.role in {DisplaySetRole.PRIMARY_RESULT, DisplaySetRole.RESULT_OVERLAY}
+                    and str(metadata.set_id or "") == str(set_id)
+                ),
+                None,
+            )
+            if not isinstance(result_metadata, DisplaySetMetadata):
+                continue
+            reference_entry = self._canonical_reference_entry_from_metadata(result_metadata)
+            if not isinstance(reference_entry, Mapping):
+                continue
+            display_metadata = display_metadata_for_entry(
+                label=str(result_metadata.label or result_metadata.set_id),
+                entry={
+                    **dict(reference_entry),
+                    "display_species": self._explicit_display_species_for_entry(reference_entry),
+                },
+                set_id=str(set_id),
+                role=DisplaySetRole.REFERENCE_OVERLAY,
+                layer_id=reference_layer_id,
+            )
+            if display_metadata is None:
+                continue
+            updated_sets[reference_layer_id] = display_metadata
+            hydrated = True
+        if hydrated:
+            self._active_display_transaction = replace(transaction, sets=updated_sets)
+        return hydrated
+
+    def _render_active_display_projection(self) -> bool:
+        transaction = self._active_display_transaction
+        if not isinstance(transaction, ActiveDisplayTransaction):
+            return False
         plot = self._main_plot()
-        refreshed = self._set_plot_display_layers(
+        projection_state = self._current_display_projection_state()
+        if not self._set_plot_display_layers(
             plot=plot,
-            active_display_transaction=updated_transaction,
-        )
-        if not bool(refreshed):
-            self._reference_overlays_visible = previous_visible
-            return
-        self._reference_overlays_visible = show
-        self._active_display_transaction = updated_transaction
+            active_display_transaction=transaction,
+            projection_state=projection_state,
+        ):
+            return False
         stats_results_map = stats_results_map_from_display_transaction(
-            updated_transaction,
+            transaction,
             include_reference_overlays=True,
-            presentation_labels_by_set_id=self._popup_labels_by_set_id(updated_transaction.display_set_ids),
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(
+                projection_state.visible_result_set_ids
+            ),
+            projection_state=projection_state,
         )
-        prefer = f"result:{updated_transaction.primary_display_set_id}"
-        for metadata in dict(updated_transaction.sets or {}).values():
-            if (
-                metadata.role is DisplaySetRole.PRIMARY_RESULT
-                and str(metadata.set_id) == str(updated_transaction.primary_display_set_id)
-            ):
-                prefer = str(metadata.layer_id or prefer)
-                break
+        prefer = (
+            f"result:{projection_state.primary_visible_set_id}"
+            if projection_state.primary_visible_set_id
+            else ""
+        )
         try:
             plot.set_statistics_results(stats_results_map, prefer=prefer)
             self._publish_main_plot_results_table(plot=plot)
         except Exception as exc:
-            logger.exception("Failed to refresh reference visibility statistics projection: %s", exc)
+            logger.exception("Failed to refresh display projection statistics: %s", exc)
         self.refresh_active_display_transaction_provenance_projection()
-        self._record_display_transition_outcome(
+        return True
+
+    def _record_display_projection_transition(
+        self,
+        *,
+        previous_projection_state: DisplayProjectionState | None = None,
+    ) -> DisplayTransitionOutcome | None:
+        transaction = self._active_display_transaction
+        if not isinstance(transaction, ActiveDisplayTransaction):
+            return None
+        projection_state = self._current_display_projection_state()
+        return self._record_display_transition_outcome(
             outcome_kind=DisplayTransitionOutcomeKind.PUBLISHED,
-            active_transaction=updated_transaction,
-            previous_transaction=previous_transaction,
-            display_status=updated_transaction.status,
-            display_set_ids=updated_transaction.display_set_ids,
-            attempted_display_set_ids=updated_transaction.display_set_ids,
-            affected_set_ids=updated_transaction.display_set_ids,
+            active_transaction=transaction,
+            previous_transaction=transaction,
+            display_status=transaction.status,
+            requested_show_set_ids=projection_state.visible_result_set_ids,
+            display_set_ids=projection_state.visible_result_set_ids,
+            attempted_display_set_ids=projection_state.visible_result_set_ids,
+            affected_set_ids=projection_state.visible_result_set_ids,
             event_kind=DisplayEventKind.SHOW_SCOPE_CHANGED,
-            cause=self._display_cause_for_active_kind(updated_transaction.kind),
+            cause=self._display_cause_for_active_kind(transaction.kind),
         )
+
+    def _primary_metadata_for_projection(
+        self,
+        active_display_transaction: ActiveDisplayTransaction,
+        projection_state: DisplayProjectionState | None = None,
+    ) -> DisplaySetMetadata | None:
+        state = (
+            projection_state
+            if isinstance(projection_state, DisplayProjectionState)
+            else self._current_display_projection_state()
+        )
+        primary_set_id = str(state.primary_visible_set_id or "").strip()
+        if not primary_set_id:
+            primary_set_id = str(active_display_transaction.primary_display_set_id or "").strip()
+        if not primary_set_id:
+            return None
+        return next(
+            (
+                metadata
+                for metadata in dict(active_display_transaction.sets or {}).values()
+                if metadata.role in {DisplaySetRole.PRIMARY_RESULT, DisplaySetRole.RESULT_OVERLAY}
+                and str(metadata.set_id) == primary_set_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _provenance_series_payload_for_metadata(
+        metadata: DisplaySetMetadata,
+    ) -> tuple[np.ndarray, Dict[str, np.ndarray], list[str]]:
+        display_series_by_name = {
+            str(name): np.asarray(values, dtype=float)
+            for name, values in dict(metadata.series or {}).items()
+            if str(name)
+        }
+        display_species = [
+            str(name)
+            for name in (metadata.display_species or ())
+            if str(name) and str(name) in display_series_by_name
+        ]
+        display_series = {
+            name: display_series_by_name[name]
+            for name in display_species
+            if name in display_series_by_name
+        }
+        return np.asarray(metadata.t, dtype=float), display_series, display_species
+
+    def set_reference_overlays_visible(self, visible: bool) -> None:
+        show = bool(visible)
+        previous_state = self._current_display_projection_state()
+        transaction = self._active_display_transaction
+        if not isinstance(transaction, ActiveDisplayTransaction):
+            self._set_display_projection_state(
+                replace(previous_state, reference_overlays_visible=show)
+            )
+            return
+        next_state = replace(previous_state, reference_overlays_visible=show)
+        self._set_display_projection_state(next_state)
+        if show:
+            missing_reference_ids = self._visible_result_set_ids_without_reference_overlay()
+            if missing_reference_ids:
+                self._hydrate_reference_overlays_for_projection(missing_reference_ids)
+        if not self._render_active_display_projection():
+            self._set_display_projection_state(previous_state)
+            return
+        self._record_display_projection_transition(previous_projection_state=previous_state)
 
     def publish_deferred_display_request(
         self,
@@ -731,7 +990,10 @@ class ResultsController(QtCore.QObject):
         stats_results_map = stats_results_map_from_display_transaction(
             active_display_transaction,
             include_reference_overlays=False,
-            presentation_labels_by_set_id=self._popup_labels_by_set_id(active_display_transaction.display_set_ids),
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(
+                self._current_display_projection_state().visible_result_set_ids
+            ),
+            projection_state=self._current_display_projection_state(),
         )
         try:
             self._ui.update_main_plot_statistics(
@@ -775,7 +1037,10 @@ class ResultsController(QtCore.QObject):
         stats_results_map = stats_results_map_from_display_transaction(
             active_display_transaction,
             include_reference_overlays=True,
-            presentation_labels_by_set_id=self._popup_labels_by_set_id(active_display_transaction.display_set_ids),
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(
+                self._current_display_projection_state().visible_result_set_ids
+            ),
+            projection_state=self._current_display_projection_state(),
         )
         try:
             self._ui.update_main_plot_statistics(
@@ -826,7 +1091,10 @@ class ResultsController(QtCore.QObject):
         stats_results_map = stats_results_map_from_display_transaction(
             active_display_transaction,
             include_reference_overlays=True,
-            presentation_labels_by_set_id=self._popup_labels_by_set_id(active_display_transaction.display_set_ids),
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(
+                self._current_display_projection_state().visible_result_set_ids
+            ),
+            projection_state=self._current_display_projection_state(),
         )
         try:
             self._ui.update_main_plot_statistics(
@@ -873,7 +1141,10 @@ class ResultsController(QtCore.QObject):
         stats_results_map = stats_results_map_from_display_transaction(
             active_display_transaction,
             include_reference_overlays=True,
-            presentation_labels_by_set_id=self._popup_labels_by_set_id(active_display_transaction.display_set_ids),
+            presentation_labels_by_set_id=self._popup_labels_by_set_id(
+                self._current_display_projection_state().visible_result_set_ids
+            ),
+            projection_state=self._current_display_projection_state(),
         )
         try:
             self._ui.update_main_plot_statistics(
@@ -951,6 +1222,7 @@ class ResultsController(QtCore.QObject):
     ) -> Optional[str]:
         transaction_payload = display_transaction_provenance_payload(
             active_display_transaction,
+            projection_state=self._current_display_projection_state(),
         )
         if not isinstance(direct_completion_provenance, Mapping):
             if not transaction_payload:
@@ -961,32 +1233,15 @@ class ResultsController(QtCore.QObject):
             payload = dict(direct_completion_provenance)
             payload.update(transaction_payload)
         if isinstance(active_display_transaction, ActiveDisplayTransaction):
-            primary_metadata = next(
-                (
-                    metadata
-                    for metadata in dict(active_display_transaction.sets or {}).values()
-                    if metadata.role is DisplaySetRole.PRIMARY_RESULT
-                    and str(metadata.set_id) == str(active_display_transaction.primary_display_set_id)
-                ),
-                None,
+            primary_metadata = self._primary_metadata_for_projection(
+                active_display_transaction,
+                self._current_display_projection_state(),
             )
             if isinstance(primary_metadata, DisplaySetMetadata):
-                display_series_by_name = {
-                    str(name): np.asarray(values, dtype=float)
-                    for name, values in dict(primary_metadata.series or {}).items()
-                    if str(name)
-                }
-                display_species = [
-                    str(name)
-                    for name in (primary_metadata.display_species or ())
-                    if str(name) and str(name) in display_series_by_name
-                ]
-                display_series = {
-                    name: display_series_by_name[name]
-                    for name in display_species
-                    if name in display_series_by_name
-                }
-                payload["t"] = np.asarray(primary_metadata.t, dtype=float)
+                t_array, display_series, display_species = self._provenance_series_payload_for_metadata(
+                    primary_metadata
+                )
+                payload["t"] = t_array
                 payload["series"] = display_series
                 payload["species_names"] = display_species
         if not payload:
@@ -1006,11 +1261,27 @@ class ResultsController(QtCore.QObject):
             return
         payload = display_transaction_provenance_payload(
             active_transaction,
+            projection_state=self._current_display_projection_state(),
         )
+        primary_metadata = self._primary_metadata_for_projection(
+            active_transaction,
+            self._current_display_projection_state(),
+        )
+        primary_payload: Dict[str, object] = {}
+        if isinstance(primary_metadata, DisplaySetMetadata):
+            t_array, display_series, display_species = self._provenance_series_payload_for_metadata(
+                primary_metadata
+            )
+            primary_payload = {
+                "t": t_array,
+                "series": display_series,
+                "species_names": display_species,
+            }
         try:
             self._ui.update_display_transaction_provenance(
                 display_transaction=payload.get("display_transaction"),
                 display_sets=payload.get("display_sets"),
+                **primary_payload,
             )
         except Exception as exc:
             logger.exception("Failed to refresh display transaction provenance projection: %s", exc)
@@ -1051,16 +1322,17 @@ class ResultsController(QtCore.QObject):
     ) -> ActiveDisplayTransaction | None:
         previous_transaction = self._active_display_transaction
         self._active_display_transaction = None
+        self._set_display_projection_state(
+            DisplayProjectionState(
+                visible_result_set_ids=(),
+                reference_overlays_visible=bool(getattr(self, "_reference_overlays_visible", True)),
+                primary_visible_set_id="",
+            )
+        )
         if bool(clear_plot):
             try:
                 plot = self._main_plot()
                 plot.clear_display_transaction_state()
-            except Exception as exc:
-                logger.debug("Failed to clear display transaction plot state: %s", exc, exc_info=True)
-        else:
-            try:
-                plot = self._main_plot()
-                plot.clear_display_transaction_state(preserve_y_selection_state=True)
             except Exception as exc:
                 logger.debug("Failed to clear display transaction plot state: %s", exc, exc_info=True)
         try:
@@ -1659,17 +1931,22 @@ class ResultsController(QtCore.QObject):
     ) -> DisplayTransitionOutcome | None:
         if request.display_source is not DisplayRefreshSource.EXPLICIT_SHOW_REQUEST:
             return None
-        display_set_ids = self._active_plotted_display_set_ids()
-        if not display_set_ids:
+        if not isinstance(self._active_display_transaction, ActiveDisplayTransaction):
             return None
         requested_show_set = {str(set_id) for set_id in (requested_show_set_ids or ()) if str(set_id)}
-        removed_display_ids = tuple(sorted(display_set_ids - requested_show_set))
-        if not removed_display_ids:
+        previous_state = self._current_display_projection_state()
+        if set(previous_state.visible_result_set_ids) == requested_show_set:
             return None
-        return self._deauthorize_active_display(
-            transition=_DISPLAY_TRANSITION_DISPLAY_SCOPE_REMOVAL_DEAUTHORIZATION,
-            affected_set_ids=removed_display_ids,
-            affected_scope_is_global=False,
+        self._set_display_projection_state(
+            self._projection_state_for_requested_show_ids(requested_show_set_ids)
+        )
+        if self._current_display_projection_state() == previous_state:
+            return None
+        if not self._render_active_display_projection():
+            self._set_display_projection_state(previous_state)
+            return None
+        return self._record_display_projection_transition(
+            previous_projection_state=previous_state
         )
 
     def _focus_unavailable_cause_for_completed_run_denial(
@@ -1840,6 +2117,7 @@ class ResultsController(QtCore.QObject):
     def build_main_plot_copy_all_export_plan(self) -> object | None:
         return build_copy_all_export_plan(
             self._active_display_transaction,
+            projection_state=self._current_display_projection_state(),
         )
 
     def build_main_plot_csv_export(self, scope: str) -> tuple[list[str], list[list[object]]]:
@@ -1860,6 +2138,7 @@ class ResultsController(QtCore.QObject):
             active_transaction=active_transaction,
             scope=normalized_scope,
             axis_state=axis_state,
+            projection_state=self._current_display_projection_state(),
         )
 
     def reset_stale_cache_warning_status(self) -> None:
@@ -2229,6 +2508,7 @@ class ResultsController(QtCore.QObject):
         cache_key: str = "",
         run_id: int | None = None,
         request_id: int | None = None,
+        canonical_reference_entries_by_set_id: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> CachedBatchDisplayScopeOutcome:
         attempted_display_ids = tuple(deduped_set_ids(display_set_ids))
         request_scope = self._current_display_request_scope(
@@ -2256,6 +2536,7 @@ class ResultsController(QtCore.QObject):
                 transition_outcome=transition_outcome,
             )
         previous_transaction = self._active_display_transaction
+        previous_projection_state = self._current_display_projection_state()
         active_transaction = self._active_transaction_for_display_commit(
             t=np.asarray(t, dtype=float),
             series=series,
@@ -2271,9 +2552,19 @@ class ResultsController(QtCore.QObject):
             run_id=run_id,
             request_id=request_id,
         )
+        active_transaction = self._active_transaction_with_reference_sources(
+            active_transaction,
+            canonical_reference_entries_by_set_id,
+        )
+        projection_state = self._projection_state_for_requested_show_ids(
+            requested_show_set_ids or attempted_display_ids,
+            active_display_transaction=active_transaction,
+        )
+        self._set_display_projection_state(projection_state)
         plot = self._main_plot()
         metadata_failure = metadata_applier(plot, active_transaction)
         if metadata_failure:
+            self._set_display_projection_state(previous_projection_state)
             transition_outcome = self._record_failed_display_transaction_attempt(
                 previous_transaction=previous_transaction,
                 affected_set_ids=attempted_display_ids,
@@ -2748,9 +3039,14 @@ class ResultsController(QtCore.QObject):
     ) -> BatchDisplayRefreshOutcome:
         requested_show_set_ids = tuple(str(set_id) for set_id in (request.requested_show_set_ids or ()) if str(set_id))
         if not requested_show_set_ids:
-            if self._completed_run_display_transaction_active():
-                self.clear_active_display_transaction()
-            self._clear_unpublished_batch_display_request()
+            previous_state = self._current_display_projection_state()
+            self._set_display_projection_state(
+                self._projection_state_for_requested_show_ids(())
+            )
+            if self._active_display_transaction is not None:
+                if not self._render_active_display_projection():
+                    self._set_display_projection_state(previous_state)
+            self._clear_unpublished_batch_display_request(clear_plot=False)
             return BatchDisplayRefreshOutcome(
                 focused_controls_use_workspace=bool(request.focused_set_dirty),
             )
@@ -3278,6 +3574,11 @@ class ResultsController(QtCore.QObject):
                 semantic_unavailable_set_ids=semantic_unavailable_ids,
             )
         resolved_entries = tuple(entries_by_id.values())
+        canonical_reference_entries_by_set_id = {
+            str(resolved.set_id): dict(resolved.authority.canonical_reference_entry)
+            for resolved in resolved_entries
+            if isinstance(resolved.authority.canonical_reference_entry, Mapping)
+        }
         unresolved_outcome_ids = tuple(
             deduped_set_ids((*unresolved_intent_set_ids, *semantic_unavailable_ids))
         )
@@ -3322,7 +3623,6 @@ class ResultsController(QtCore.QObject):
                 set_id=str(resolved.set_id),
                 role=DisplaySetRole.REFERENCE_OVERLAY,
                 layer_id=f"reference:{resolved.set_id}",
-                visible=self._reference_overlays_visible,
             )
             if display_metadata is not None:
                 additional_metadata.append(display_metadata)
@@ -3418,6 +3718,7 @@ class ResultsController(QtCore.QObject):
             unresolved_intent_set_ids=unresolved_outcome_ids,
             missing_intent_set_ids=missing_intent_set_ids,
             semantic_unavailable_set_ids=semantic_unavailable_ids,
+            canonical_reference_entries_by_set_id=canonical_reference_entries_by_set_id,
         )
 
     def publish_completed_run_display_transaction(
@@ -3776,6 +4077,11 @@ class ResultsController(QtCore.QObject):
                 DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
                 affected_set_ids=expected_ids,
             )
+        canonical_reference_entries_by_set_id = {
+            str(entry.set_id): dict(entry.authority.canonical_reference_entry)
+            for entry in entries
+            if isinstance(entry.authority.canonical_reference_entry, Mapping)
+        }
         primary_id = str(transaction.display_primary_set_id or "").strip()
         primary = entries_by_id.get(primary_id)
         if primary is None:
@@ -3858,7 +4164,6 @@ class ResultsController(QtCore.QObject):
                     set_id=str(entry.set_id),
                     role=DisplaySetRole.REFERENCE_OVERLAY,
                     layer_id=f"reference:{entry.set_id}",
-                    visible=self._reference_overlays_visible,
                 )
             if display_metadata is not None:
                 additional_metadata.append(display_metadata)
@@ -3907,6 +4212,7 @@ class ResultsController(QtCore.QObject):
             cache_key=transaction.cache_key,
             run_id=transaction.run_id,
             request_id=transaction.request_id,
+            canonical_reference_entries_by_set_id=canonical_reference_entries_by_set_id,
         )
         return SimulationCompletionDisplayOutcome(
             transition_outcome=outcome.transition_outcome,
@@ -4215,14 +4521,21 @@ class ResultsController(QtCore.QObject):
         *,
         plot: ResultsDisplayPlotPort,
         active_display_transaction: ActiveDisplayTransaction,
+        projection_state: DisplayProjectionState | None = None,
     ) -> bool:
         try:
+            state = (
+                projection_state
+                if isinstance(projection_state, DisplayProjectionState)
+                else self._current_display_projection_state()
+            )
             plot.set_display_layers(
                 plot_display_layers_payload(
                     active_display_transaction,
                     presentation_labels_by_set_id=self._popup_labels_by_set_id(
-                        active_display_transaction.display_set_ids,
+                        state.visible_result_set_ids,
                     ),
+                    projection_state=state,
                 )
             )
             return True

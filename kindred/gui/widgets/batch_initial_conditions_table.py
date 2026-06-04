@@ -299,7 +299,11 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         if not (0 <= col - 1 < len(species)):
             return False
         sp = species[col - 1]
-        self._store.set_value(row, sp, str(value))
+        current_value = self._store.get_value(row, sp)
+        next_value = str(value)
+        if current_value == next_value:
+            return True
+        self._store.set_value(row, sp, next_value)
 
         invalid_now = self._store.validate_numeric_cells(rows=[row])
         if (row, sp) in invalid_now:
@@ -553,6 +557,8 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
                     changed_index,
                     [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
                 )
+            if int(column) == 0:
+                continue
             set_id = str(store.set_id_for_row(int(row)) or "").strip()
             if set_id and set_id not in affected_set_ids:
                 affected_set_ids.append(set_id)

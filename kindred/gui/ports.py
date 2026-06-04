@@ -84,6 +84,7 @@ class PlotDisplayLayersPayload:
     layers: tuple[PlotDisplayLayer, ...]
     intervention_annotations: tuple[Mapping[str, Any], ...] = ()
     show_intervention_annotations: bool = False
+    reference_layers_hydratable: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "transaction_id", str(self.transaction_id or "").strip())
@@ -99,6 +100,7 @@ class PlotDisplayLayersPayload:
             _immutable_display_mapping_tuple(self.intervention_annotations),
         )
         object.__setattr__(self, "show_intervention_annotations", bool(self.show_intervention_annotations))
+        object.__setattr__(self, "reference_layers_hydratable", bool(self.reference_layers_hydratable))
 
 @dataclass(frozen=True, slots=True)
 class CopyAllDisplayBlock:
@@ -365,6 +367,22 @@ class DisplaySetMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class DisplayProjectionState:
+    visible_result_set_ids: tuple[str, ...] = ()
+    reference_overlays_visible: bool = True
+    primary_visible_set_id: str = ""
+
+    def __post_init__(self) -> None:
+        visible_ids = _normalized_str_tuple(self.visible_result_set_ids)
+        primary = str(self.primary_visible_set_id or "").strip()
+        if primary and primary not in visible_ids:
+            primary = visible_ids[0] if visible_ids else ""
+        object.__setattr__(self, "visible_result_set_ids", visible_ids)
+        object.__setattr__(self, "reference_overlays_visible", bool(self.reference_overlays_visible))
+        object.__setattr__(self, "primary_visible_set_id", primary)
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveDisplayTransaction:
     transaction_id: str
     kind: ActiveDisplayKind
@@ -535,7 +553,10 @@ class DisplayAuthorityBundle:
 
     @property
     def canonical_reference_entry(self) -> Mapping[str, Any] | None:
-        if self.canonical_reference_eligibility is not CanonicalReferenceEligibility.PROVEN:
+        if self.canonical_reference_eligibility not in {
+            CanonicalReferenceEligibility.PROVEN,
+            CanonicalReferenceEligibility.SAME_AS_ACTIVE_RESULT,
+        }:
             return None
         return self.canonical_reference_payload
 
