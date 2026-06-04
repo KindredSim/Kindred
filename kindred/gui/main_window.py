@@ -321,6 +321,7 @@ class MainWindow(
             batch_model_getter=lambda: self._batch_model,
             confirm_overwrite=self._confirm_initial_condition_import_overwrite,
             notify_rows_changed=self._notify_batch_initial_rows_changed,
+            notify_canonical_rows_changed=self._notify_canonical_batch_initial_rows_changed,
             sync_species_columns=self._sync_batch_species_columns,
             temperature_getter=lambda: float(self._temperature_spinbox.value()),
         )
@@ -2797,6 +2798,36 @@ class MainWindow(
         except Exception:
             logger.debug("Failed to notify batch model after migrated initial concentration rows changed", exc_info=True)
 
+    def _notify_canonical_batch_initial_rows_changed(
+        self,
+        rows: Sequence[int],
+        transition_source: str,
+        discard_dirty_preview: bool,
+    ) -> None:
+        batch_model = getattr(self, "_batch_model", None)
+        if batch_model is None or not hasattr(batch_model, "emit_canonical_initials_changed"):
+            return
+        affected_set_ids = tuple(
+            dict.fromkeys(
+                str(self._batch_set_id_for_row(int(row)) or "").strip()
+                for row in rows or ()
+                if str(self._batch_set_id_for_row(int(row)) or "").strip()
+            )
+        )
+        if not affected_set_ids:
+            return
+        try:
+            batch_model.emit_canonical_initials_changed(
+                affected_set_ids=affected_set_ids,
+                transition_source=str(transition_source or "initial_conditions_import_reconciliation"),
+                discard_dirty_preview=bool(discard_dirty_preview),
+            )
+        except Exception:
+            logger.debug(
+                "Failed to emit canonical batch initials transition after migrated rows changed",
+                exc_info=True,
+            )
+
     def _load_custom_shortcuts(self, shortcuts_dict: dict):
         """
         Load custom keyboard shortcuts from saved settings.
@@ -4770,15 +4801,18 @@ class MainWindow(
             model.set_active_effective_edit_target_set_id(active_target_set_id)
         self._refresh_run_target_ui_from_batch_scope()
 
-    def _refresh_interactive_runtime_readiness_for_rows(self, rows: Sequence[int]) -> None:
+    def _refresh_interactive_runtime_readiness_for_rows(self, rows: Sequence[int] | None) -> None:
         refresh_runtime_readiness = getattr(
             getattr(self, "_sim_controller", None),
             "refresh_interactive_runtime_readiness",
             None,
         )
         if callable(refresh_runtime_readiness):
-            normalized_rows = tuple(int(row) for row in rows or ())
-            refresh_runtime_readiness(rows=normalized_rows or None)
+            if rows is None:
+                refresh_runtime_readiness(rows=None)
+            else:
+                normalized_rows = tuple(int(row) for row in rows or ())
+                refresh_runtime_readiness(rows=normalized_rows)
 
     def _queue_interactive_runtime_readiness_refresh(self, rows: Sequence[int]) -> None:
         normalized = tuple(dict.fromkeys(int(row) for row in (rows or ())))
@@ -4794,8 +4828,6 @@ class MainWindow(
         rows = tuple(getattr(self, "_pending_interactive_runtime_readiness_rows", ()) or ())
         self._pending_interactive_runtime_readiness_rows = ()
         self._interactive_runtime_readiness_refresh_queued = False
-        if not rows:
-            return
         self._refresh_interactive_runtime_readiness_for_rows(rows)
 
     def _queue_canonical_batch_initials_transition(
@@ -4955,6 +4987,8 @@ class MainWindow(
         species_sync_snapshot = self._simulation_batch_owner.batch_species_column_sync_snapshot()
 
         self._batch_model.set_species(new_species)
+        if int(self._batch_store.row_count()) > 0:
+            self._batch_model.validate_rows(range(int(self._batch_store.row_count())))
         prune_changed = False
         try:
             if hasattr(self._preview_session, "prune_staged_concentration_overlays_to_species"):

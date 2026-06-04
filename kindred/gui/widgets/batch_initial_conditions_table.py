@@ -326,7 +326,8 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         self.beginResetModel()
         try:
             self._store.set_species(species_names)
-            self._invalid.clear()
+            all_rows = list(range(int(self._store.row_count())))
+            self._invalid = self._store.validate_numeric_cells(rows=all_rows) if all_rows else set()
         finally:
             self.endResetModel()
 

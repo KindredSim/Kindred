@@ -59,6 +59,7 @@ class InitialConditionsImportOwner:
         batch_model_getter: Callable[[], Any],
         confirm_overwrite: Callable[[Sequence[str]], bool],
         notify_rows_changed: Callable[[Sequence[int]], None],
+        notify_canonical_rows_changed: Callable[[Sequence[int], str, bool], None] | None = None,
         sync_species_columns: Callable[[Sequence[str]], None],
         temperature_getter: Callable[[], float],
     ) -> None:
@@ -66,6 +67,7 @@ class InitialConditionsImportOwner:
         self._batch_model_getter = batch_model_getter
         self._confirm_overwrite = confirm_overwrite
         self._notify_rows_changed = notify_rows_changed
+        self._notify_canonical_rows_changed = notify_canonical_rows_changed
         self._sync_species_columns = sync_species_columns
         self._temperature_getter = temperature_getter
 
@@ -158,6 +160,12 @@ class InitialConditionsImportOwner:
         migrated_rows = self._materialize_imported_sets(seed_sets=plan.seed_sets)
         if migrated_rows:
             self._notify_rows_changed(migrated_rows)
+            if callable(self._notify_canonical_rows_changed):
+                self._notify_canonical_rows_changed(
+                    migrated_rows,
+                    "initial_conditions_import_reconciliation",
+                    True,
+                )
         return InitialConditionsReconciliationResult(
             InitialConditionsImportStatus.APPLIED,
             plan.source,

@@ -147,6 +147,18 @@ def select_batch_set(
                         message="Failed to unblock batch selection signals while selecting a mapped batch set",
                         exc=exc,
                     )
+        emit_selection_changed = getattr(selection_model, "selectionChanged", None)
+        emit = getattr(emit_selection_changed, "emit", None)
+        if callable(emit):
+            try:
+                emit(selection_model.selection(), QtCore.QItemSelection())
+            except Exception as exc:
+                _record_failure(
+                    record_failure,
+                    f"{failure_key_prefix}.selection_model.selection_changed_emit",
+                    message="Failed to republish selection change after selecting a mapped batch set",
+                    exc=exc,
+                )
     try:
         batch_table.scrollTo(idx)
     except Exception as exc:
@@ -352,4 +364,21 @@ def create_and_seed_batch_set(
                 record_failure=record_failure,
                 failure_key=f"{failure_key_prefix}.seed.data_changed",
             )
+            emit_canonical_initials_changed = getattr(batch_model, "emit_canonical_initials_changed", None)
+            if callable(emit_canonical_initials_changed):
+                try:
+                    set_id = str(batch_store.set_id_for_row(int(row_idx)) or "").strip()
+                    if set_id:
+                        emit_canonical_initials_changed(
+                            affected_set_ids=(set_id,),
+                            transition_source="batch_mapping_dataset_seed",
+                            discard_dirty_preview=True,
+                        )
+                except Exception as exc:
+                    _record_failure(
+                        record_failure,
+                        f"{failure_key_prefix}.seed.canonical_initials_changed",
+                        message="Failed to publish canonical initials change after dataset batch-set seeding",
+                        exc=exc,
+                    )
     return int(row_idx), bool(created), bool(seeded)
