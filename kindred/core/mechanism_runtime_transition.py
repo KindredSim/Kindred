@@ -48,21 +48,25 @@ def _changed_set_ids(
     return tuple(changed)
 
 
-def _merge_scoped_mapping_identity(
+def _merge_partial_mapping_identity(
     previous: tuple[tuple[str, str], ...] | None,
-    patch: tuple[tuple[str, str], ...],
-    affected_set_ids: Sequence[str],
+    partial: tuple[tuple[str, str], ...],
+    affected_set_ids: Sequence[str] | None = None,
 ) -> tuple[tuple[str, str], ...]:
-    affected = _normalize_set_ids(affected_set_ids)
-    if not affected or previous is None:
-        return patch
-    merged = dict(previous)
-    patch_map = dict(patch)
-    for set_id in affected:
-        if set_id in patch_map:
-            merged[set_id] = patch_map[set_id]
+    """Merge a scoped identity delta into the stored full identity map."""
+    merged = dict(previous or ())
+    partial_map = {str(key or "").strip(): str(value or "") for key, value in partial if str(key or "").strip()}
+    scoped_ids = _normalize_set_ids(affected_set_ids) or _normalize_set_ids(partial_map.keys())
+    for set_id in scoped_ids:
+        if set_id in partial_map:
+            merged[set_id] = partial_map[set_id]
         else:
             merged.pop(set_id, None)
+    for key, value in partial:
+        normalized_key = str(key or "").strip()
+        if not normalized_key or normalized_key in scoped_ids:
+            continue
+        merged[normalized_key] = str(value or "")
     return tuple(sorted(merged.items()))
 
 
@@ -215,38 +219,51 @@ class MechanismRuntimeTransitionService:
         schedule_runtime_refresh: bool = True,
         canonical_batch_initials_by_set_id: Mapping[str, object] | None = None,
         affected_set_ids: Sequence[str] = (),
+        canonical_batch_initials_scope_is_partial: bool = False,
     ) -> MechanismTransitionOutcome:
         source_s = str(source or "authoritative_change")
         runtime_invalidation_required = False
         canonical_identity_supplied = canonical_batch_initials_by_set_id is not None
-        supplied_affected_set_ids = _normalize_set_ids(affected_set_ids)
-        supplied_canonical_identity = (
+        canonical_delta_identity = (
             _normalize_mapping_identity(canonical_batch_initials_by_set_id)
             if canonical_identity_supplied
             else ()
         )
-        canonical_identity = (
-            _merge_scoped_mapping_identity(
+        affected_set_ids_t = _normalize_set_ids(affected_set_ids)
+        if canonical_identity_supplied and bool(canonical_batch_initials_scope_is_partial):
+            canonical_identity = _merge_partial_mapping_identity(
                 self._current_canonical_batch_initials_identity,
-                supplied_canonical_identity,
-                supplied_affected_set_ids,
+                canonical_delta_identity,
+                affected_set_ids_t,
             )
-            if canonical_identity_supplied
-            else self._current_canonical_batch_initials_identity
-        )
-        canonical_changed_set_ids = (
-            _changed_set_ids(self._current_canonical_batch_initials_identity, canonical_identity or ())
-            if canonical_identity_supplied
-            else ()
-        )
-        affected_set_ids_t = supplied_affected_set_ids or canonical_changed_set_ids
+            previous_for_diff = self._current_canonical_batch_initials_identity
+            scoped_change_ids = affected_set_ids_t or _normalize_set_ids(
+                key for key, _value in canonical_delta_identity
+            )
+            if previous_for_diff is None:
+                canonical_changed_set_ids = scoped_change_ids
+            else:
+                previous_map = dict(previous_for_diff)
+                current_map = dict(canonical_identity)
+                canonical_changed_set_ids = _normalize_set_ids(
+                    set_id
+                    for set_id in scoped_change_ids
+                    if previous_map.get(set_id) != current_map.get(set_id)
+                )
+        elif canonical_identity_supplied:
+            canonical_identity = canonical_delta_identity
+            canonical_changed_set_ids = _changed_set_ids(
+                self._current_canonical_batch_initials_identity,
+                canonical_identity or (),
+            )
+        else:
+            canonical_identity = self._current_canonical_batch_initials_identity
+            canonical_changed_set_ids = ()
+        affected_set_ids_t = affected_set_ids_t or canonical_changed_set_ids
         runtime_input_invalidation_required = bool(
             canonical_identity_supplied
             and (
-                (
-                    self._current_canonical_batch_initials_identity is not None
-                    and canonical_identity != self._current_canonical_batch_initials_identity
-                )
+                bool(canonical_changed_set_ids)
                 or (
                     self._current_canonical_batch_initials_identity is None
                     and bool(affected_set_ids_t)

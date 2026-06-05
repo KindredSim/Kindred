@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import logging
-import math
 import os
 from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -48,9 +47,6 @@ from kindred.gui.controllers.simulation_runtime_orchestrator import (
 from kindred.gui.controllers.simulation_runtime_dispatch import (
     SimulationRuntimeDispatchDependencies,
     SimulationRuntimeDispatchOwner,
-)
-from kindred.gui.controllers.simulation_runtime_readiness_lifecycle import (
-    SimulationRuntimeReadinessRenderState,
 )
 from kindred.gui.controllers.simulation_result_materialization import SimulationResultMaterializationOwner
 from kindred.gui.controllers.simulation_completion_policy import (
@@ -1696,101 +1692,42 @@ class SimulationController(QtCore.QObject):
     def refresh_interactive_runtime_readiness(
         self,
         rows: Optional[Sequence[int]] = None,
+        *,
+        fast_mode: bool = False,
     ) -> bool:
         runtime_rows = self._interactive_runtime_rows(rows)
         target_set_ids = self._run_target_set_ids_for_rows(runtime_rows)
-        state = self._cheap_interactive_runtime_readiness_state(
-            runtime_rows=runtime_rows,
-            target_set_ids=target_set_ids,
-        )
-        self._publish_interactive_runtime_readiness_state(state)
-        return bool(state.launch_available)
-
-    def _publish_interactive_runtime_readiness_state(
-        self,
-        state: SimulationRuntimeReadinessRenderState,
-    ) -> None:
-        self.runtime_readiness_render_requested.emit(state)
-
-    def _cheap_interactive_runtime_readiness_state(
-        self,
-        *,
-        runtime_rows: Sequence[int],
-        target_set_ids: Sequence[str],
-    ) -> SimulationRuntimeReadinessRenderState:
-        blocked_reason = self._cheap_interactive_runtime_blocked_reason(
-            runtime_rows=runtime_rows,
-            target_set_ids=target_set_ids,
-        )
-        if blocked_reason:
-            return SimulationRuntimeReadinessRenderState(
-                status="blocked",
-                status_text=blocked_reason,
-                launch_available=False,
-            )
-        return SimulationRuntimeReadinessRenderState(
-            status="ready",
-            status_text="Ready",
-            launch_available=True,
-        )
-
-    def _cheap_interactive_runtime_blocked_reason(
-        self,
-        *,
-        runtime_rows: Sequence[int],
-        target_set_ids: Sequence[str],
-    ) -> str:
         if not runtime_rows or not target_set_ids:
-            return self._interactive_runtime_empty_target_reason()
-        try:
-            target_state = self.ui.batch.run_target_ui_state()
-            target_available = getattr(target_state, "enabled", None)
-            if target_available is None:
-                target_available = getattr(target_state, "target_available", None)
-            if target_available is not None and not bool(target_available):
-                reason = str(getattr(target_state, "empty_reason", "") or "").strip()
-                return reason or "Select at least one set before running."
-        except Exception:
-            pass
-        try:
-            if not bool(self.ui.mechanism.is_mechanism_ready_for_run()):
-                return "Simulation mechanism is not ready."
-        except Exception:
-            return "Simulation mechanism is not ready."
-        try:
-            solver_name = str(self.ui.solver.initial_solver_name() or "").strip()
-        except Exception:
-            solver_name = ""
-        if not solver_name:
-            return "Select a solver before running."
-        try:
-            t_end = float(self.ui.solver.parse_sim_time_seconds())
-            if not math.isfinite(t_end) or t_end <= 0.0:
-                return "Simulation end time must be positive."
-        except Exception:
-            return "Simulation end time must be positive."
-        try:
-            invalid = self.ui.batch.batch_model_validate_rows(tuple(runtime_rows))
-        except Exception:
-            invalid = set()
-        if invalid:
-            return "Initial concentrations must be numeric."
-        for row in runtime_rows:
-            try:
-                self.ui.batch.batch_initials_for_row(int(row))
-            except Exception:
-                return "Initial concentrations must be numeric."
-        return ""
-
-    def _interactive_runtime_empty_target_reason(self) -> str:
-        try:
-            state = self.ui.batch.run_target_ui_state()
-            reason = str(getattr(state, "empty_reason", "") or "").strip()
-            if reason:
-                return reason
-        except Exception:
-            pass
-        return "Select at least one set before running."
+            consequence = self._runtime_orchestrator.refresh_readiness_consequence(
+                self._blocked_interactive_runtime_readiness_request(
+                    runtime_rows=runtime_rows,
+                    target_set_ids=target_set_ids,
+                )
+            )
+            self._apply_runtime_lifecycle_ui_effects(consequence.effects)
+            return bool(consequence.launch_available)
+        intent = RuntimeLaunchIntent(
+            intent_kind="ordinary",
+            ui_action="runtime_readiness",
+            rows=tuple(runtime_rows),
+            set_ids=target_set_ids,
+            requested_show_set_ids=self._runtime_requested_show_set_ids(target_set_ids),
+            requested_show_labels_by_set_id=self._runtime_requested_show_labels_by_set_id(target_set_ids),
+            request_token=None,
+            runtime_input_epochs=self._runtime_input_epochs_for_sets(target_set_ids),
+        )
+        prepared = self._run_preparation_owner.prepare_runtime_request_set(
+            intent=intent,
+            fast_mode=bool(fast_mode),
+        )
+        consequence = self._runtime_orchestrator.refresh_readiness_consequence(prepared)
+        self._apply_runtime_lifecycle_ui_effects(consequence.effects)
+        if not bool(fast_mode):
+            self._prewarm_interactive_preview_runtime_readiness(
+                runtime_rows=runtime_rows,
+                target_set_ids=target_set_ids,
+            )
+        return bool(consequence.launch_available)
 
     def _blocked_interactive_runtime_readiness_request(
         self,

@@ -104,6 +104,8 @@ _STARTUP_HEIGHT_RATIO = 0.88
 _MIN_STARTUP_WIDTH = 1280
 _MIN_STARTUP_HEIGHT = 820
 _FALLBACK_STARTUP_SIZE = QtCore.QSize(1440, 900)
+_CANONICAL_BATCH_INITIALS_TRANSITION_DEBOUNCE_MS = 220
+_INTERACTIVE_RUNTIME_READINESS_REFRESH_DEBOUNCE_MS = 80
 
 
 @dataclass(frozen=True)
@@ -276,8 +278,19 @@ class MainWindow(
         self._pending_canonical_batch_initials_transition_source = "batch_initials_table_edit"
         self._pending_canonical_batch_initials_discard_dirty_preview = True
         self._canonical_batch_initials_transition_queued = False
+        self._canonical_batch_initials_transition_timer = QtCore.QTimer(self)
+        self._canonical_batch_initials_transition_timer.setSingleShot(True)
+        self._canonical_batch_initials_transition_timer.timeout.connect(
+            self._flush_canonical_batch_initials_transition
+        )
         self._pending_interactive_runtime_readiness_rows: tuple[int, ...] = ()
         self._interactive_runtime_readiness_refresh_queued = False
+        self._last_interactive_runtime_readiness_signature: tuple[tuple[int, ...], tuple[str, ...]] | None = None
+        self._interactive_runtime_readiness_refresh_timer = QtCore.QTimer(self)
+        self._interactive_runtime_readiness_refresh_timer.setSingleShot(True)
+        self._interactive_runtime_readiness_refresh_timer.timeout.connect(
+            self._flush_interactive_runtime_readiness_refresh
+        )
 
         # Fitting state.
         self._last_fit_result = None
@@ -455,7 +468,7 @@ class MainWindow(
             on_move_selected_batch_sets_up=self._move_selected_batch_sets_up,
             on_move_selected_batch_sets_down=self._move_selected_batch_sets_down,
             on_delete_selected_batch_sets=self._delete_selected_batch_sets,
-            on_run_selected=self._sim_controller.run_simulation,
+            on_run_selected=self._run_simulation_after_flushing_batch_initials,
             on_stop=self._sim_controller.stop_simulation,
             on_solver_method_changed=self._on_solver_method_changed,
             on_solver_summary_refresh=self._update_solver_summary_label,
@@ -513,7 +526,7 @@ class MainWindow(
         self._mechanism_editor.validationStateChanged.connect(
             lambda _state: self._simulation_run_ui_owner.refresh_run_button_state()
         )
-        self._mechanism_editor.run_btn.clicked.connect(self._sim_controller.run_simulation)
+        self._mechanism_editor.run_btn.clicked.connect(self._run_simulation_after_flushing_batch_initials)
         self._mechanism_editor.symbolic_calculator_btn.clicked.connect(self._open_symbolic_calculator_panel)
         self._mechanism_editor.mechanismInspectRequested.connect(self._open_mechanism_inspector)
         self._refresh_slider_transaction_button_state()
@@ -632,13 +645,21 @@ class MainWindow(
         set_ids: Sequence[str],
     ) -> Dict[str, str]:
         identities: Dict[str, str] = {}
-        normalized = tuple(
+        requested_ids = tuple(
             dict.fromkeys(str(set_id).strip() for set_id in (set_ids or ()) if str(set_id).strip())
         )
-        if not normalized:
+        if not requested_ids:
             return identities
-        for set_id in normalized:
-            row = self._batch_row_for_set_id(str(set_id))
+        for set_id in requested_ids:
+            try:
+                row = self._batch_row_for_set_id(str(set_id))
+            except Exception as exc:
+                row = None
+                self._record_best_effort_failure(
+                    "main_window.runtime_transition.canonical_initials_identity.row_lookup",
+                    message="Failed to resolve batch row for scoped canonical initial fingerprint",
+                    exc=exc,
+                )
             if row is None:
                 continue
             try:
@@ -647,7 +668,7 @@ class MainWindow(
                 )
             except Exception as exc:
                 self._record_best_effort_failure(
-                    "main_window.runtime_transition.canonical_initials_identity",
+                    "main_window.runtime_transition.canonical_initials_identity.scoped",
                     message="Failed to fingerprint scoped canonical batch initials for runtime transition",
                     exc=exc,
                 )
@@ -661,6 +682,7 @@ class MainWindow(
         transition_source: str = "authoritative_change",
         canonical_batch_initials_by_set_id: Optional[Mapping[str, object]] = None,
         affected_set_ids: Sequence[str] = (),
+        canonical_batch_initials_scope_is_partial: bool = False,
     ) -> MechanismTransitionOutcome:
         if schedule_runtime_refresh is None:
             schedule_runtime_refresh = not self._authoritative_mechanism_runtime_refresh_deferred()
@@ -674,6 +696,7 @@ class MainWindow(
             schedule_runtime_refresh=bool(schedule_runtime_refresh),
             canonical_batch_initials_by_set_id=canonical_batch_initials_by_set_id,
             affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
+            canonical_batch_initials_scope_is_partial=bool(canonical_batch_initials_scope_is_partial),
         )
         if outcome.runtime_invalidation_required:
             self._sim_controller.simulation_runtime_inputs_changed(
@@ -737,12 +760,14 @@ class MainWindow(
         )
         if not affected_set_ids_t:
             return
+        scoped_initial_identities = self._canonical_batch_initials_identity_for_set_ids(
+            affected_set_ids_t
+        )
         outcome = self._apply_authoritative_mechanism_transition(
             transition_source=str(transition_source or "canonical_batch_initials_change"),
-            canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_for_set_ids(
-                affected_set_ids_t
-            ),
+            canonical_batch_initials_by_set_id=scoped_initial_identities,
             affected_set_ids=affected_set_ids_t,
+            canonical_batch_initials_scope_is_partial=True,
         )
         if bool(discard_dirty_preview) and (
             bool(outcome.runtime_input_invalidation_required)
@@ -1263,6 +1288,7 @@ class MainWindow(
                 ("showMembershipChanged", self._on_batch_show_membership_changed),
                 ("sliderEditTargetsChanged", self._on_slider_edit_targets_changed),
                 ("canonicalInitialsChanged", self._on_batch_canonical_initials_changed),
+                ("initialRowsEdited", self._on_batch_initial_rows_edited),
             ):
                 signal = getattr(model, signal_name, None)
                 if signal is None:
@@ -1318,6 +1344,9 @@ class MainWindow(
                 current_model.showMembershipChanged.connect(self._on_batch_show_membership_changed)
                 current_model.sliderEditTargetsChanged.connect(self._on_slider_edit_targets_changed)
                 current_model.canonicalInitialsChanged.connect(self._on_batch_canonical_initials_changed)
+                initial_rows_edited = getattr(current_model, "initialRowsEdited", None)
+                if initial_rows_edited is not None:
+                    initial_rows_edited.connect(self._on_batch_initial_rows_edited)
             except RuntimeError as exc:
                 logger.debug("Failed to connect batch model semantics signals: %s", exc, exc_info=True)
         if current_selection_model is not None:
@@ -1554,8 +1583,10 @@ class MainWindow(
             "refresh_interactive_runtime_readiness",
             None,
         )
+        self._update_batch_row_controls_state()
         if callable(refresh_runtime_readiness):
             refresh_runtime_readiness()
+            self._last_interactive_runtime_readiness_signature = self._current_run_target_readiness_signature()
 
     def _simulation_runtime_settings_snapshot(self) -> Dict[str, object]:
         solver_contract = load_solver_contract()
@@ -2002,7 +2033,7 @@ class MainWindow(
         add_items(
             sim_menu,
             [
-                ("&Run", self._sim_controller.run_simulation, None, "runSimulationAction", "Run kinetic simulation with current mechanism (Ctrl+R or F5)", {"shortcuts": ["Ctrl+R", "F5"], "store_as": "_run_simulation_action"}),
+                ("&Run", self._run_simulation_after_flushing_batch_initials, None, "runSimulationAction", "Run kinetic simulation with current mechanism (Ctrl+R or F5)", {"shortcuts": ["Ctrl+R", "F5"], "store_as": "_run_simulation_action"}),
                 ("&Stop", self._sim_controller.stop_simulation, "Esc", "stopSimulationAction", "Stop running simulation (Esc)"),
                 ("Symbolic Calculator...", self._open_symbolic_calculator_panel, None, "openSymbolicCalculatorAction", "Open Symbolic Calculator panel", {"store_as": "_symbolic_calculator_action"}),
                 None,
@@ -4829,6 +4860,52 @@ class MainWindow(
             model.set_active_effective_edit_target_set_id(active_target_set_id)
         self._refresh_run_target_ui_from_batch_scope()
 
+    def _current_run_target_readiness_signature(self) -> tuple[tuple[int, ...], tuple[str, ...]]:
+        owner = getattr(self, "_simulation_batch_owner", None)
+        if owner is None or not hasattr(owner, "run_target_ui_state"):
+            return ((), ())
+        try:
+            state = owner.run_target_ui_state()
+        except Exception as exc:
+            logger.debug("Failed to resolve run-target readiness signature: %s", exc, exc_info=True)
+            return ((), ())
+        rows = tuple(
+            dict.fromkeys(
+                int(row)
+                for row in (getattr(state, "target_rows", ()) or ())
+                if int(row) >= 0
+            )
+        )
+        set_ids = tuple(
+            dict.fromkeys(
+                str(set_id).strip()
+                for set_id in (getattr(state, "target_set_ids", ()) or ())
+                if str(set_id).strip()
+            )
+        )
+        return (rows, set_ids)
+
+    def _maybe_queue_run_target_runtime_readiness_refresh(self, *, force: bool = False) -> None:
+        signature = self._current_run_target_readiness_signature()
+        rows, set_ids = signature
+        previous = getattr(self, "_last_interactive_runtime_readiness_signature", None)
+        if not rows or not set_ids:
+            self._last_interactive_runtime_readiness_signature = signature
+            return
+        if not bool(force) and previous == signature:
+            return
+        self._last_interactive_runtime_readiness_signature = signature
+        self._queue_interactive_runtime_readiness_refresh(rows)
+
+    def _commit_active_batch_table_editor(self) -> None:
+        table = getattr(self, "_batch_table", None)
+        commit = getattr(table, "commit_active_editor", None)
+        if callable(commit):
+            try:
+                commit()
+            except Exception as exc:
+                logger.debug("Failed to commit active batch table editor before run: %s", exc, exc_info=True)
+
     def _refresh_interactive_runtime_readiness_for_rows(self, rows: Sequence[int] | None) -> None:
         refresh_runtime_readiness = getattr(
             getattr(self, "_sim_controller", None),
@@ -4837,22 +4914,31 @@ class MainWindow(
         )
         if callable(refresh_runtime_readiness):
             if rows is None:
-                refresh_runtime_readiness(rows=None)
+                refresh_runtime_readiness(rows=None, fast_mode=True)
             else:
                 normalized_rows = tuple(int(row) for row in rows or ())
-                refresh_runtime_readiness(rows=normalized_rows)
+                refresh_runtime_readiness(rows=normalized_rows, fast_mode=True)
 
     def _queue_interactive_runtime_readiness_refresh(self, rows: Sequence[int]) -> None:
         normalized = tuple(dict.fromkeys(int(row) for row in (rows or ())))
         self._pending_interactive_runtime_readiness_rows = normalized
-        if bool(getattr(self, "_interactive_runtime_readiness_refresh_queued", False)):
-            return
         self._interactive_runtime_readiness_refresh_queued = True
         if QtCore.QCoreApplication.instance() is None:
+            self._flush_interactive_runtime_readiness_refresh()
             return
-        QtCore.QTimer.singleShot(0, self._flush_interactive_runtime_readiness_refresh)
+        timer = getattr(self, "_interactive_runtime_readiness_refresh_timer", None)
+        if isinstance(timer, QtCore.QTimer):
+            timer.start(_INTERACTIVE_RUNTIME_READINESS_REFRESH_DEBOUNCE_MS)
+        else:
+            QtCore.QTimer.singleShot(
+                _INTERACTIVE_RUNTIME_READINESS_REFRESH_DEBOUNCE_MS,
+                self._flush_interactive_runtime_readiness_refresh,
+            )
 
     def _flush_interactive_runtime_readiness_refresh(self) -> None:
+        timer = getattr(self, "_interactive_runtime_readiness_refresh_timer", None)
+        if isinstance(timer, QtCore.QTimer) and timer.isActive():
+            timer.stop()
         rows = tuple(getattr(self, "_pending_interactive_runtime_readiness_rows", ()) or ())
         self._pending_interactive_runtime_readiness_rows = ()
         self._interactive_runtime_readiness_refresh_queued = False
@@ -4864,6 +4950,7 @@ class MainWindow(
         affected_set_ids: Sequence[str],
         transition_source: str,
         discard_dirty_preview: bool,
+        debounce_ms: int = _CANONICAL_BATCH_INITIALS_TRANSITION_DEBOUNCE_MS,
     ) -> None:
         normalized = tuple(
             dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id))
@@ -4879,15 +4966,24 @@ class MainWindow(
             transition_source or "batch_initials_table_edit"
         )
         self._pending_canonical_batch_initials_discard_dirty_preview = bool(discard_dirty_preview)
-        if bool(getattr(self, "_canonical_batch_initials_transition_queued", False)):
-            return
         self._canonical_batch_initials_transition_queued = True
         if QtCore.QCoreApplication.instance() is None:
             self._flush_canonical_batch_initials_transition()
             return
-        QtCore.QTimer.singleShot(0, self._flush_canonical_batch_initials_transition)
+        timer = getattr(self, "_canonical_batch_initials_transition_timer", None)
+        delay_ms = max(0, int(debounce_ms))
+        if isinstance(timer, QtCore.QTimer):
+            timer.start(delay_ms)
+        else:
+            QtCore.QTimer.singleShot(
+                delay_ms,
+                self._flush_canonical_batch_initials_transition,
+            )
 
     def _flush_canonical_batch_initials_transition(self) -> None:
+        timer = getattr(self, "_canonical_batch_initials_transition_timer", None)
+        if isinstance(timer, QtCore.QTimer) and timer.isActive():
+            timer.stop()
         affected_set_ids = tuple(
             getattr(self, "_pending_canonical_batch_initials_transition_set_ids", ()) or ()
         )
@@ -4912,6 +5008,11 @@ class MainWindow(
             discard_dirty_preview=discard_dirty_preview,
         )
 
+    def _run_simulation_after_flushing_batch_initials(self) -> None:
+        self._commit_active_batch_table_editor()
+        self._flush_canonical_batch_initials_transition()
+        self._sim_controller.run_simulation()
+
     def _refresh_run_target_ui_from_batch_scope(self) -> None:
         owner = getattr(self, "_simulation_batch_owner", None)
         ui_owner = getattr(self, "_simulation_run_ui_owner", None)
@@ -4929,6 +5030,7 @@ class MainWindow(
                 target_available=bool(getattr(state, "enabled", False)),
                 tooltip=str(getattr(state, "empty_reason", "") or ""),
             )
+        self._maybe_queue_run_target_runtime_readiness_refresh()
 
     def _batch_cache_key(
         self,
@@ -5068,15 +5170,6 @@ class MainWindow(
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
-        owner = getattr(self, "_simulation_batch_owner", None)
-        if owner is not None and hasattr(owner, "run_target_ui_state"):
-            try:
-                rows = tuple(int(row) for row in owner.run_target_ui_state().target_rows)
-            except Exception:
-                rows = tuple(int(row) for row in self._batch_selected_rows())
-        else:
-            rows = tuple(int(row) for row in self._batch_selected_rows())
-        self._queue_interactive_runtime_readiness_refresh(rows)
 
     def _batch_current_change_display_source(self) -> DisplayRefreshSource:
         return DisplayRefreshSource.PROGRAMMATIC_SHOW_REQUEST
@@ -5091,54 +5184,42 @@ class MainWindow(
             affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
             transition_source=str(transition_source or "batch_initials_table_edit"),
             discard_dirty_preview=bool(discard_dirty_preview),
+            debounce_ms=0,
         )
 
-    def _on_batch_model_data_changed(
+    def _on_batch_initial_rows_edited(
         self,
-        top_left: QtCore.QModelIndex,
-        bottom_right: QtCore.QModelIndex,
-        roles: Sequence[int] | None = None,
-        ) -> None:
-        if not top_left.isValid() or not bottom_right.isValid():
-            return
-        display_role = int(getattr(QtCore.Qt.DisplayRole, "value", QtCore.Qt.DisplayRole))
-        normalized_roles = {int(getattr(role, "value", role)) for role in (roles or ())}
-        if normalized_roles and display_role not in normalized_roles:
-            return
-        if bool(getattr(self, "_suppress_canonical_batch_initials_transition", False)):
-            return
-        first_species_col = 1
-        try:
-            last_species_col = first_species_col + len(list(self._batch_store.visible_species())) - 1
-        except Exception:
-            last_species_col = 0
-        if last_species_col < first_species_col:
-            return
-        if int(bottom_right.column()) < first_species_col or int(top_left.column()) > last_species_col:
-            return
-        affected_set_ids: list[str] = []
-        for row in range(int(top_left.row()), int(bottom_right.row()) + 1):
-            try:
-                set_id = str(self._batch_set_id_for_row(int(row)) or "").strip()
-            except Exception:
-                set_id = ""
-            if set_id and set_id not in affected_set_ids:
-                affected_set_ids.append(set_id)
+        affected_set_ids: object,
+        transition_source: str,
+        discard_dirty_preview: bool,
+    ) -> None:
         self._queue_canonical_batch_initials_transition(
-            affected_set_ids=tuple(affected_set_ids),
-            transition_source="batch_initials_table_edit",
-            discard_dirty_preview=True,
+            affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
+            transition_source=str(transition_source or "batch_initials_table_edit"),
+            discard_dirty_preview=bool(discard_dirty_preview),
+            debounce_ms=_CANONICAL_BATCH_INITIALS_TRANSITION_DEBOUNCE_MS,
         )
 
-    def _on_batch_current_changed(self, *_args) -> None:
+    @staticmethod
+    def _row_from_model_index(index: object) -> Optional[int]:
+        if index is None or not hasattr(index, "isValid") or not index.isValid():
+            return None
+        try:
+            return int(index.row())
+        except Exception:
+            return None
+
+    def _on_batch_current_changed(self, current: object = None, previous: object = None) -> None:
         self._update_batch_row_controls_state()
-        current_row = self._batch_current_row()
+        current_row = self._row_from_model_index(current)
+        if current_row is None:
+            current_row = self._batch_current_row()
+        previous_row = self._row_from_model_index(previous)
+        if previous_row is not None and current_row == previous_row:
+            return
         transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
             gesture="row_body_click",
             row=current_row,
-        )
-        self._queue_interactive_runtime_readiness_refresh(
-            getattr(transaction, "run_selected_rows", ())
         )
         try:
             self._refresh_slider_edit_targets_summary()
@@ -6600,7 +6681,7 @@ class MainWindow(
             dict.fromkeys(str(set_id) for set_id in (affected_canonical_initial_set_ids or ()) if str(set_id))
         )
         canonical_initials_identity = (
-            self._canonical_batch_initials_identity_by_set_id()
+            self._canonical_batch_initials_identity_for_set_ids(affected_set_ids_t)
             if affected_set_ids_t
             else None
         )
@@ -6608,6 +6689,7 @@ class MainWindow(
             transition_source="slider_materialization",
             canonical_batch_initials_by_set_id=canonical_initials_identity,
             affected_set_ids=affected_set_ids_t,
+            canonical_batch_initials_scope_is_partial=bool(affected_set_ids_t),
         )
         try:
             self._extract_and_populate_variables(preserve_visibility=True)

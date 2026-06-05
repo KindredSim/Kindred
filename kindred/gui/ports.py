@@ -84,7 +84,6 @@ class PlotDisplayLayersPayload:
     layers: tuple[PlotDisplayLayer, ...]
     intervention_annotations: tuple[Mapping[str, Any], ...] = ()
     show_intervention_annotations: bool = False
-    reference_layers_hydratable: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "transaction_id", str(self.transaction_id or "").strip())
@@ -100,7 +99,6 @@ class PlotDisplayLayersPayload:
             _immutable_display_mapping_tuple(self.intervention_annotations),
         )
         object.__setattr__(self, "show_intervention_annotations", bool(self.show_intervention_annotations))
-        object.__setattr__(self, "reference_layers_hydratable", bool(self.reference_layers_hydratable))
 
 @dataclass(frozen=True, slots=True)
 class CopyAllDisplayBlock:
@@ -368,18 +366,36 @@ class DisplaySetMetadata:
 
 @dataclass(frozen=True, slots=True)
 class DisplayProjectionState:
-    visible_result_set_ids: tuple[str, ...] = ()
-    reference_overlays_visible: bool = True
+    """Reversible view projection over an authorized display transaction.
+
+    ``ActiveDisplayTransaction`` is result truth: the completed, cached, or
+    preview results that are currently authorized. ``DisplayProjectionState``
+    is only the view filter layered on top of that truth. ``None`` for
+    ``visible_result_set_ids`` means "show every result in the transaction";
+    an empty tuple means "hide every result while retaining the transaction".
+    """
+
+    visible_result_set_ids: tuple[str, ...] | None = None
     primary_visible_set_id: str = ""
+    reference_overlays_visible: bool = True
 
     def __post_init__(self) -> None:
-        visible_ids = _normalized_str_tuple(self.visible_result_set_ids)
-        primary = str(self.primary_visible_set_id or "").strip()
-        if primary and primary not in visible_ids:
-            primary = visible_ids[0] if visible_ids else ""
-        object.__setattr__(self, "visible_result_set_ids", visible_ids)
-        object.__setattr__(self, "reference_overlays_visible", bool(self.reference_overlays_visible))
-        object.__setattr__(self, "primary_visible_set_id", primary)
+        if self.visible_result_set_ids is not None:
+            object.__setattr__(
+                self,
+                "visible_result_set_ids",
+                _normalized_str_tuple(self.visible_result_set_ids),
+            )
+        object.__setattr__(
+            self,
+            "primary_visible_set_id",
+            str(self.primary_visible_set_id or "").strip(),
+        )
+        object.__setattr__(
+            self,
+            "reference_overlays_visible",
+            bool(self.reference_overlays_visible),
+        )
 
 
 @dataclass(frozen=True, slots=True)

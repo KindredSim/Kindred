@@ -155,7 +155,10 @@ def compose_display_authority_bundle(
         if _display_payloads_match(active_payload, candidate_payload):
             canonical_reference_eligibility = CanonicalReferenceEligibility.SAME_AS_ACTIVE_RESULT
             canonical_reference_payload = candidate_payload
-        elif bool(canonical_reference_eligible_for_current_inputs):
+        else:
+            # A loaded canonical candidate is a cache-backed reference.  It is
+            # still useful as an explicit comparison overlay even when the
+            # current display was not produced by a workspace-preview path.
             canonical_reference_eligibility = CanonicalReferenceEligibility.PROVEN
             canonical_reference_payload = candidate_payload
     return DisplayAuthorityBundle(

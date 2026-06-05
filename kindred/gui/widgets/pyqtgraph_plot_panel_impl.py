@@ -304,7 +304,6 @@ if PYQTGRAPH_AVAILABLE:
             self._simulation_set_id: Optional[str] = None
             self._simulation_layer_id: Optional[str] = None
             self._simulation_overlays: List[PlotDisplayLayer] = []
-            self._reference_layers_hydratable: bool = False
 
             # Axis control (for parametric mode and custom X-axis)
             self._x_axis_name: str = "t"  # Current X-axis variable
@@ -553,9 +552,8 @@ if PYQTGRAPH_AVAILABLE:
         def set_display_layers(self, payload: PlotDisplayLayersPayload) -> None:
             if not isinstance(payload, PlotDisplayLayersPayload):
                 raise TypeError("set_display_layers requires a PlotDisplayLayersPayload")
-            self._reference_layers_hydratable = bool(payload.reference_layers_hydratable)
             primary_layer = self._primary_display_layer_from_payload(payload)
-            if primary_layer is None:
+            if primary_layer is None or not bool(primary_layer.visible):
                 self.clear_display_transaction_state()
                 return
             self._set_primary_simulation_layer(
@@ -3035,7 +3033,6 @@ if PYQTGRAPH_AVAILABLE:
             self._simulation_set_id = None
             self._simulation_layer_id = None
             self._simulation_overlays = []
-            self._reference_layers_hydratable = False
             self._owned_species_keys = set()
             self._owned_species_roster_explicit = False
             self._toolbar.set_y_candidates([])
@@ -3080,7 +3077,7 @@ if PYQTGRAPH_AVAILABLE:
                 ghost_action = menu.addAction("Show Canonical Reference Lines")
                 ghost_action.setCheckable(True)
                 ghost_action.setChecked(self._reference_layers_visible_from_projection())
-                ghost_action.setEnabled(self._reference_layer_action_available())
+                ghost_action.setEnabled(self._has_reference_layers() or self.has_display_data())
                 ghost_action.toggled.connect(self.request_reference_layers_visible)
                 menu.addSeparator()
 
@@ -3138,16 +3135,18 @@ if PYQTGRAPH_AVAILABLE:
             # Show menu at cursor position
             menu.exec_(self._plot_widget.mapToGlobal(position))
 
-        def _reference_layer_action_available(self) -> bool:
-            return bool(getattr(self, "_reference_layers_hydratable", False)) or self._has_reference_layers()
-
         def _has_reference_layers(self) -> bool:
             for layer in (self._simulation_overlays or []):
                 if not isinstance(layer, PlotDisplayLayer):
                     continue
                 if self._is_reference_layer(layer):
                     return True
-            return False
+            # Reference overlays can be hydrated lazily by the results
+            # controller from the active display/cache transaction.  The menu
+            # action therefore remains available whenever a simulation payload
+            # is present, even if no REFERENCE_OVERLAY metadata has been
+            # materialized yet.
+            return self._t is not None and bool(self._series)
 
         def _reference_layers_visible_from_projection(self) -> bool:
             reference_layers = [

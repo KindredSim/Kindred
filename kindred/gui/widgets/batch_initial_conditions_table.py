@@ -21,6 +21,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
     showMembershipChanged = QtCore.Signal()
     sliderEditTargetsChanged = QtCore.Signal()
     canonicalInitialsChanged = QtCore.Signal(object, str, bool)
+    initialRowsEdited = QtCore.Signal(object, str, bool)
 
     def __init__(self, store: BatchInitialConditionsStore, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
@@ -94,13 +95,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         self._emit_checkbox_column_change(self.edit_target_column(), changed_rows)
         return True
 
-    def emit_canonical_initials_changed(
-        self,
-        *,
-        affected_set_ids: Sequence[str],
-        transition_source: str,
-        discard_dirty_preview: bool = True,
-    ) -> None:
+    def _normalized_existing_set_ids(self, affected_set_ids: Sequence[str]) -> tuple[str, ...]:
         normalized: list[str] = []
         seen: set[str] = set()
         valid_ids = set(self._store.set_ids())
@@ -110,9 +105,42 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 continue
             seen.add(set_id_s)
             normalized.append(set_id_s)
+        return tuple(normalized)
+
+    def emit_canonical_initials_changed(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        transition_source: str,
+        discard_dirty_preview: bool = True,
+    ) -> None:
+        normalized = self._normalized_existing_set_ids(affected_set_ids)
         if not normalized:
             return
         self.canonicalInitialsChanged.emit(
+            tuple(normalized),
+            str(transition_source or "batch_initials_table_edit"),
+            bool(discard_dirty_preview),
+        )
+
+    def emit_initial_rows_edited(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        transition_source: str,
+        discard_dirty_preview: bool = True,
+    ) -> None:
+        """Emit a lightweight edit notification for user table edits.
+
+        The table model should report local data mutations; higher-level
+        controllers decide when a debounced edit becomes a runtime identity
+        transition.  ``canonicalInitialsChanged`` is retained for deliberate
+        programmatic changes that already represent a canonical-table update.
+        """
+        normalized = self._normalized_existing_set_ids(affected_set_ids)
+        if not normalized:
+            return
+        self.initialRowsEdited.emit(
             tuple(normalized),
             str(transition_source or "batch_initials_table_edit"),
             bool(discard_dirty_preview),
@@ -311,7 +339,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         else:
             self._invalid.discard((row, sp))
         self.dataChanged.emit(index, index, [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole])
-        self.emit_canonical_initials_changed(
+        self.emit_initial_rows_edited(
             affected_set_ids=(str(self._store.set_id_for_row(int(row)) or ""),),
             transition_source="batch_initials_table_edit",
             discard_dirty_preview=True,
@@ -402,6 +430,26 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
 
     def current_change_is_user_initiated(self) -> bool:
         return self._user_current_change_depth > 0
+
+    def commit_active_editor(self) -> None:
+        """Commit an in-place editor before external actions read the store.
+
+        Run/Apply buttons live outside the table, so a click can arrive while a
+        delegate editor still owns the newest text.  This method deliberately
+        keeps that concern inside the table view instead of forcing controllers
+        to know delegate/editor details.
+        """
+        editor = QtWidgets.QApplication.focusWidget()
+        if editor is None or not self.isAncestorOf(editor):
+            return
+        try:
+            self.commitData(editor)
+        except (RuntimeError, AttributeError, TypeError):
+            return
+        try:
+            self.closeEditor(editor, QtWidgets.QAbstractItemDelegate.EndEditHint.NoHint)
+        except (RuntimeError, AttributeError, TypeError):
+            pass
 
     def _begin_user_current_change(self) -> None:
         self._user_current_change_depth += 1
@@ -562,7 +610,7 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             set_id = str(store.set_id_for_row(int(row)) or "").strip()
             if set_id and set_id not in affected_set_ids:
                 affected_set_ids.append(set_id)
-        model.emit_canonical_initials_changed(
+        model.emit_initial_rows_edited(
             affected_set_ids=tuple(affected_set_ids),
             transition_source="batch_initials_table_paste",
             discard_dirty_preview=True,

@@ -144,16 +144,26 @@ class SimulationRunUiOwner:
             set_bounded_label_text(self._algebra_status_label, str(text), max_width=420)
             self._algebra_status_label.setToolTip(str(details or ""))
 
+    def _mechanism_run_target_is_valid(self) -> bool:
+        editor = self._mechanism_editor
+        if editor is None or not hasattr(editor, "is_mechanism_valid"):
+            return True
+        try:
+            return bool(editor.is_mechanism_valid())
+        except (RuntimeError, AttributeError):
+            return False
+
     def _apply_run_button_state(self) -> None:
         button = self._run_button
         if button is None:
             return
         button.setText(self._run_button_text)
         button.setToolTip(self._run_button_tooltip)
+        mechanism_valid = self._mechanism_run_target_is_valid()
         effective_enabled = bool(
             self._run_button_requested_enabled
-            and self._launch_available
             and self._run_target_available
+            and mechanism_valid
         )
         button.setEnabled(effective_enabled)
         if self._run_action is not None:
@@ -165,7 +175,4 @@ class SimulationRunUiOwner:
             return
         editor.run_btn.setText(self._run_button_text)
         editor.run_btn.setToolTip(self._run_button_tooltip)
-        if effective_enabled:
-            editor.run_btn.setEnabled(editor.is_mechanism_valid())
-        else:
-            editor.run_btn.setEnabled(False)
+        editor.run_btn.setEnabled(effective_enabled)

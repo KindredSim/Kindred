@@ -14,7 +14,6 @@ from kindred.gui.ports import (
     CopyAllMissingItem,
     DisplayEventKind,
     DisplaySetMetadata,
-    DisplayProjectionState,
     DisplaySetRole,
     DisplayStatus,
     DisplayTransitionCause,
@@ -63,110 +62,6 @@ def ordered_display_transaction_metadata(
     )
 
 
-def _projection_visible_result_set_ids(
-    transaction: ActiveDisplayTransaction,
-    projection_state: DisplayProjectionState | None,
-) -> tuple[str, ...]:
-    if isinstance(projection_state, DisplayProjectionState):
-        return tuple(projection_state.visible_result_set_ids)
-    return tuple(str(set_id) for set_id in (transaction.display_set_ids or ()) if str(set_id))
-
-
-def _projection_primary_visible_set_id(
-    transaction: ActiveDisplayTransaction,
-    projection_state: DisplayProjectionState | None,
-) -> str:
-    visible_ids = _projection_visible_result_set_ids(transaction, projection_state)
-    if not visible_ids:
-        return ""
-    if isinstance(projection_state, DisplayProjectionState):
-        primary = str(projection_state.primary_visible_set_id or "").strip()
-        if primary in visible_ids:
-            return primary
-    transaction_primary = str(transaction.primary_display_set_id or "").strip()
-    return transaction_primary if transaction_primary in visible_ids else visible_ids[0]
-
-
-def _projection_includes_reference_overlays(
-    projection_state: DisplayProjectionState | None,
-    *,
-    include_reference_overlays: bool = True,
-) -> bool:
-    if not bool(include_reference_overlays):
-        return False
-    if isinstance(projection_state, DisplayProjectionState):
-        return bool(projection_state.reference_overlays_visible)
-    return True
-
-
-def _metadata_has_reference_authority(metadata: DisplaySetMetadata) -> bool:
-    if metadata.role is DisplaySetRole.REFERENCE_OVERLAY:
-        return True
-    provenance = metadata.provenance if isinstance(metadata.provenance, Mapping) else {}
-    reference_entry = provenance.get("canonical_reference_entry") if isinstance(provenance, Mapping) else None
-    return isinstance(reference_entry, Mapping)
-
-
-def _projection_can_hydrate_reference_layers(
-    transaction: ActiveDisplayTransaction,
-    *,
-    visible_result_set_ids: Sequence[str],
-) -> bool:
-    visible_ids = {str(set_id) for set_id in visible_result_set_ids if str(set_id)}
-    if not visible_ids:
-        return False
-    for metadata in ordered_display_transaction_metadata(transaction):
-        set_id = str(metadata.set_id or "").strip()
-        if not set_id or set_id not in visible_ids:
-            continue
-        if _metadata_has_reference_authority(metadata):
-            return True
-    return False
-
-
-def _metadata_visible_in_projection(
-    metadata: DisplaySetMetadata,
-    *,
-    visible_result_set_ids: Sequence[str],
-    reference_overlays_visible: bool,
-    projection_state: DisplayProjectionState | None,
-) -> bool:
-    set_id = str(metadata.set_id or "").strip()
-    if not set_id or set_id not in set(visible_result_set_ids):
-        return False
-    if not isinstance(projection_state, DisplayProjectionState) and not bool(metadata.visible):
-        return False
-    if metadata.role is DisplaySetRole.REFERENCE_OVERLAY:
-        return bool(reference_overlays_visible)
-    return metadata.role in {DisplaySetRole.PRIMARY_RESULT, DisplaySetRole.RESULT_OVERLAY}
-
-
-def _metadata_included_in_plot_payload(
-    metadata: DisplaySetMetadata,
-    *,
-    visible_result_set_ids: Sequence[str],
-    reference_overlays_visible: bool,
-    projection_state: DisplayProjectionState | None,
-) -> bool:
-    if isinstance(projection_state, DisplayProjectionState):
-        return _metadata_visible_in_projection(
-            metadata,
-            visible_result_set_ids=visible_result_set_ids,
-            reference_overlays_visible=reference_overlays_visible,
-            projection_state=projection_state,
-        )
-    set_id = str(metadata.set_id or "").strip()
-    return bool(
-        set_id
-        and set_id in set(visible_result_set_ids)
-        and metadata.role in {
-            DisplaySetRole.PRIMARY_RESULT,
-            DisplaySetRole.RESULT_OVERLAY,
-            DisplaySetRole.REFERENCE_OVERLAY,
-        }
-    )
-
-
 def _plot_kind_for_display_role(role: DisplaySetRole) -> PlotLayerKind:
     if role is DisplaySetRole.PRIMARY_RESULT:
         return PlotLayerKind.PRIMARY_SERIES
@@ -198,32 +93,16 @@ def plot_display_layers_payload(
     transaction: ActiveDisplayTransaction,
     *,
     presentation_labels_by_set_id: Mapping[str, str] | None = None,
-    projection_state: DisplayProjectionState | None = None,
 ) -> PlotDisplayLayersPayload:
     layers: list[PlotDisplayLayer] = []
     primary_layer_id = ""
-    visible_result_set_ids = _projection_visible_result_set_ids(transaction, projection_state)
-    primary_visible_set_id = _projection_primary_visible_set_id(transaction, projection_state)
-    reference_overlays_visible = _projection_includes_reference_overlays(projection_state)
     presentation_labels = {
         str(set_id): str(label)
         for set_id, label in dict(presentation_labels_by_set_id or {}).items()
         if str(set_id)
     }
     for metadata in ordered_display_transaction_metadata(transaction):
-        if not _metadata_included_in_plot_payload(
-            metadata,
-            visible_result_set_ids=visible_result_set_ids,
-            reference_overlays_visible=reference_overlays_visible,
-            projection_state=projection_state,
-        ):
-            continue
         kind = _plot_kind_for_display_role(metadata.role)
-        if (
-            metadata.role in {DisplaySetRole.PRIMARY_RESULT, DisplaySetRole.RESULT_OVERLAY}
-            and str(metadata.set_id or "") == primary_visible_set_id
-        ):
-            kind = PlotLayerKind.PRIMARY_SERIES
         layer_id = _metadata_layer_id(metadata, kind=kind)
         if kind is PlotLayerKind.PRIMARY_SERIES and not primary_layer_id:
             primary_layer_id = layer_id
@@ -247,13 +126,13 @@ def plot_display_layers_payload(
                 x=metadata.t,
                 y=dict(metadata.series or {}),
                 y_series=tuple(metadata.display_species or ()),
-                visible=True if isinstance(projection_state, DisplayProjectionState) else bool(metadata.visible),
+                visible=bool(metadata.visible),
                 style_metadata=style_metadata,
                 source_metadata=source_metadata,
             )
         )
     if not primary_layer_id:
-        primary_set_id = primary_visible_set_id
+        primary_set_id = str(transaction.primary_display_set_id or "").strip()
         primary_layer_id = f"{PlotLayerKind.PRIMARY_SERIES.value}:{primary_set_id}" if primary_set_id else ""
     return PlotDisplayLayersPayload(
         transaction_id=str(transaction.transaction_id or ""),
@@ -261,10 +140,6 @@ def plot_display_layers_payload(
         layers=tuple(layers),
         intervention_annotations=tuple(transaction.intervention_annotations or ()),
         show_intervention_annotations=bool(transaction.show_intervention_annotations),
-        reference_layers_hydratable=_projection_can_hydrate_reference_layers(
-            transaction,
-            visible_result_set_ids=visible_result_set_ids,
-        ),
     )
 
 
@@ -273,13 +148,7 @@ def stats_results_map_from_display_transaction(
     *,
     include_reference_overlays: bool,
     presentation_labels_by_set_id: Mapping[str, str] | None = None,
-    projection_state: DisplayProjectionState | None = None,
 ) -> Dict[str, Dict[str, object]]:
-    visible_result_set_ids = _projection_visible_result_set_ids(transaction, projection_state)
-    reference_overlays_visible = _projection_includes_reference_overlays(
-        projection_state,
-        include_reference_overlays=include_reference_overlays,
-    )
     presentation_labels = {
         str(set_id): str(label)
         for set_id, label in dict(presentation_labels_by_set_id or {}).items()
@@ -287,12 +156,9 @@ def stats_results_map_from_display_transaction(
     }
     results_map: Dict[str, Dict[str, object]] = {}
     for metadata in ordered_display_transaction_metadata(transaction):
-        if not _metadata_visible_in_projection(
-            metadata,
-            visible_result_set_ids=visible_result_set_ids,
-            reference_overlays_visible=reference_overlays_visible,
-            projection_state=projection_state,
-        ):
+        if not bool(metadata.visible):
+            continue
+        if metadata.role is DisplaySetRole.REFERENCE_OVERLAY and not bool(include_reference_overlays):
             continue
         layer_id = str(metadata.layer_id or "").strip()
         if not layer_id:
@@ -582,28 +448,18 @@ def display_mapping_payload(value: Mapping[str, Any] | None) -> Dict[str, object
 
 def display_transaction_provenance_payload(
     transaction: ActiveDisplayTransaction | None,
-    *,
-    projection_state: DisplayProjectionState | None = None,
 ) -> Dict[str, object]:
     if not isinstance(transaction, ActiveDisplayTransaction):
         return {}
-    visible_result_set_ids = _projection_visible_result_set_ids(transaction, projection_state)
-    reference_overlays_visible = _projection_includes_reference_overlays(projection_state)
     display_sets: list[Dict[str, object]] = []
     for metadata in ordered_display_transaction_metadata(transaction):
-        projected_visible = _metadata_visible_in_projection(
-            metadata,
-            visible_result_set_ids=visible_result_set_ids,
-            reference_overlays_visible=reference_overlays_visible,
-            projection_state=projection_state,
-        )
         display_sets.append(
             {
                 "set_id": str(metadata.set_id or ""),
                 "label": display_set_presentation_label(metadata),
                 "role": metadata.role.value if isinstance(metadata.role, DisplaySetRole) else str(metadata.role),
                 "layer_id": str(metadata.layer_id or ""),
-                "visible": bool(projected_visible),
+                "visible": bool(metadata.visible),
                 "owned_species": list(metadata.owned_species or ()),
                 "display_species": list(metadata.display_species or ()),
                 "workspace_preview_provenance": display_mapping_payload(
@@ -688,22 +544,13 @@ def _copy_all_display_block_from_metadata(metadata: DisplaySetMetadata) -> objec
 
 def build_copy_all_export_plan(
     active_transaction: ActiveDisplayTransaction | None,
-    *,
-    projection_state: DisplayProjectionState | None = None,
 ) -> object | None:
     if active_transaction is None:
         return None
-    visible_result_set_ids = _projection_visible_result_set_ids(active_transaction, projection_state)
-    reference_overlays_visible = _projection_includes_reference_overlays(projection_state)
     display_blocks: list[object] = []
     missing_items: list[object] = []
     for metadata in ordered_display_transaction_metadata(active_transaction):
-        if not _metadata_visible_in_projection(
-            metadata,
-            visible_result_set_ids=visible_result_set_ids,
-            reference_overlays_visible=reference_overlays_visible,
-            projection_state=projection_state,
-        ):
+        if not bool(metadata.visible):
             continue
         block = _copy_all_display_block_from_metadata(metadata)
         if block is not None:
@@ -726,7 +573,6 @@ def build_main_plot_csv_export(
     active_transaction: ActiveDisplayTransaction,
     scope: str,
     axis_state: Mapping[str, object],
-    projection_state: DisplayProjectionState | None = None,
 ) -> tuple[list[str], list[list[object]]]:
     normalized_scope = str(scope or "axis")
     x_name = str(axis_state.get("x_name") or "t")
@@ -734,15 +580,8 @@ def build_main_plot_csv_export(
     requested_y_names = tuple(str(name) for name in (axis_state.get("y_names") or ()) if str(name))
     columns: list[tuple[str, np.ndarray]] = []
     missing_display_sets: list[str] = []
-    visible_result_set_ids = _projection_visible_result_set_ids(active_transaction, projection_state)
-    reference_overlays_visible = _projection_includes_reference_overlays(projection_state)
     for metadata in ordered_display_transaction_metadata(active_transaction):
-        if not _metadata_visible_in_projection(
-            metadata,
-            visible_result_set_ids=visible_result_set_ids,
-            reference_overlays_visible=reference_overlays_visible,
-            projection_state=projection_state,
-        ):
+        if not bool(metadata.visible):
             continue
         label = _csv_export_label(metadata)
         t_array = np.asarray(metadata.t if metadata.t is not None else [], dtype=float).reshape(-1)
