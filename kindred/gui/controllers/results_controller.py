@@ -388,6 +388,24 @@ class ResultsController(QtCore.QObject):
             requested_ids = active_ids if state_ids is None else tuple(deduped_set_ids(state_ids))
         return tuple(set_id for set_id in requested_ids if set_id in active_set)
 
+    def _projected_transaction_for_display_provenance(
+        self,
+        transaction: ActiveDisplayTransaction,
+    ) -> ActiveDisplayTransaction | None:
+        projected = self._projected_transaction_for_plot(transaction)
+        if projected is not None:
+            return projected
+        if not isinstance(transaction, ActiveDisplayTransaction):
+            return None
+        # Preserve the display transaction identity/status while making the
+        # current projection explicit: no result/reference layers are visible.
+        return replace(
+            transaction,
+            display_set_ids=(),
+            primary_display_set_id="",
+            sets={},
+        )
+
     def _projected_transaction_for_plot(
         self,
         transaction: ActiveDisplayTransaction,
@@ -594,6 +612,7 @@ class ResultsController(QtCore.QObject):
             self._ui.set_status_text("Plot hidden; active results retained.")
         else:
             self._ui.set_status_text(display_transition_status_text(transition_outcome))
+        self.refresh_active_display_transaction_provenance_projection()
         return BatchDisplayRefreshOutcome(
             focused_controls_use_workspace=None,
             transition_outcome=transition_outcome,
@@ -611,19 +630,6 @@ class ResultsController(QtCore.QObject):
             return True
         active_ids = set(active_transaction.display_set_ids or ())
         return all(set_id in active_ids for set_id in requested_ids)
-
-    def _entry_from_display_metadata(self, metadata: DisplaySetMetadata) -> Dict[str, object] | None:
-        if not isinstance(metadata, DisplaySetMetadata):
-            return None
-        if not isinstance(metadata.completion_provenance, Mapping):
-            return None
-        return {
-            "t": metadata.t,
-            "series": dict(metadata.series or {}),
-            "display_species": tuple(metadata.display_species or ()),
-            "owned_species": tuple(metadata.owned_species or ()),
-            "completion_provenance": dict(metadata.completion_provenance or {}),
-        }
 
     def _cached_reference_entry_for_set_id(self, set_id: str) -> Mapping[str, Any] | None:
         cache_key = str(self._ui.active_batch_cache_key() or "").strip()
@@ -669,10 +675,9 @@ class ResultsController(QtCore.QObject):
             if not sid or sid in existing_reference_ids:
                 continue
             entry = self._cached_reference_entry_for_set_id(sid)
-            if entry is None:
-                source_metadata = result_metadata_by_id.get(sid)
-                entry = self._entry_from_display_metadata(source_metadata) if source_metadata is not None else None
             if not isinstance(entry, Mapping):
+                # Canonical reference overlays are cache/display-authority truth.
+                # Never fabricate them from the currently displayed result.
                 continue
             entry_payload = {
                 **dict(entry),
@@ -1312,8 +1317,13 @@ class ResultsController(QtCore.QObject):
         direct_completion_provenance: Mapping[str, Any] | None,
         active_display_transaction: ActiveDisplayTransaction | None = None,
     ) -> Optional[str]:
+        provenance_transaction = (
+            self._projected_transaction_for_display_provenance(active_display_transaction)
+            if isinstance(active_display_transaction, ActiveDisplayTransaction)
+            else None
+        )
         transaction_payload = display_transaction_provenance_payload(
-            active_display_transaction,
+            provenance_transaction,
         )
         if not isinstance(direct_completion_provenance, Mapping):
             if not transaction_payload:
@@ -1323,13 +1333,13 @@ class ResultsController(QtCore.QObject):
         else:
             payload = dict(direct_completion_provenance)
             payload.update(transaction_payload)
-        if isinstance(active_display_transaction, ActiveDisplayTransaction):
+        if isinstance(provenance_transaction, ActiveDisplayTransaction):
             primary_metadata = next(
                 (
                     metadata
-                    for metadata in dict(active_display_transaction.sets or {}).values()
+                    for metadata in dict(provenance_transaction.sets or {}).values()
                     if metadata.role is DisplaySetRole.PRIMARY_RESULT
-                    and str(metadata.set_id) == str(active_display_transaction.primary_display_set_id)
+                    and str(metadata.set_id) == str(provenance_transaction.primary_display_set_id)
                 ),
                 None,
             )
@@ -1368,7 +1378,7 @@ class ResultsController(QtCore.QObject):
         if not isinstance(active_transaction, ActiveDisplayTransaction):
             return
         payload = display_transaction_provenance_payload(
-            active_transaction,
+            self._projected_transaction_for_display_provenance(active_transaction),
         )
         try:
             self._ui.update_display_transaction_provenance(

@@ -83,6 +83,12 @@ class SimulationRunUiOwner:
         self._launch_available = bool(available)
         self._apply_run_button_state()
 
+    def mark_launch_readiness_stale(self) -> None:
+        # The effective run target or runtime inputs changed.  Disable launch
+        # until the runtime-readiness owner publishes fresh launch truth.
+        self._launch_available = False
+        self._apply_run_button_state()
+
     def render_runtime_readiness(self, state: object) -> None:
         self._launch_available = bool(getattr(state, "launch_available", False))
         message = str(getattr(state, "status_text", "") or "").strip()
@@ -162,6 +168,7 @@ class SimulationRunUiOwner:
         mechanism_valid = self._mechanism_run_target_is_valid()
         effective_enabled = bool(
             self._run_button_requested_enabled
+            and self._launch_available
             and self._run_target_available
             and mechanism_valid
         )

@@ -769,6 +769,9 @@ class MainWindow(
             affected_set_ids=affected_set_ids_t,
             canonical_batch_initials_scope_is_partial=True,
         )
+        if bool(outcome.runtime_input_invalidation_required) or bool(outcome.runtime_invalidation_required):
+            self._last_interactive_runtime_readiness_signature = None
+            self._maybe_queue_run_target_runtime_readiness_refresh(force=True)
         if bool(discard_dirty_preview) and (
             bool(outcome.runtime_input_invalidation_required)
             or bool(outcome.runtime_invalidation_required)
@@ -4885,16 +4888,24 @@ class MainWindow(
         )
         return (rows, set_ids)
 
+    def _mark_launch_readiness_stale(self) -> None:
+        ui_owner = getattr(self, "_simulation_run_ui_owner", None)
+        mark_stale = getattr(ui_owner, "mark_launch_readiness_stale", None)
+        if callable(mark_stale):
+            mark_stale()
+
     def _maybe_queue_run_target_runtime_readiness_refresh(self, *, force: bool = False) -> None:
         signature = self._current_run_target_readiness_signature()
         rows, set_ids = signature
         previous = getattr(self, "_last_interactive_runtime_readiness_signature", None)
         if not rows or not set_ids:
             self._last_interactive_runtime_readiness_signature = signature
+            self._mark_launch_readiness_stale()
             return
         if not bool(force) and previous == signature:
             return
         self._last_interactive_runtime_readiness_signature = signature
+        self._mark_launch_readiness_stale()
         self._queue_interactive_runtime_readiness_refresh(rows)
 
     def _commit_active_batch_table_editor(self) -> None:
