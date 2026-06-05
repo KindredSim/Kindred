@@ -1209,6 +1209,18 @@ class SimulationProvenancePort(Protocol):
         tail_strategy: str,
     ) -> Tuple[float, str, bool, float, str]: ...
 
+    def update_display_transaction_provenance(
+        self,
+        *,
+        display_transaction: Optional[Mapping[str, Any]],
+        display_sets: Optional[Sequence[Mapping[str, Any]]],
+        species_names: Optional[Sequence[str]] = None,
+        t: Any = None,
+        series: Optional[Mapping[str, Any]] = None,
+        algebra_scalars: Optional[Mapping[str, Any]] = None,
+        clear_result_payload: bool = False,
+    ) -> Dict[str, Any]: ...
+
     def publish_simulation_completion_provenance(
         self,
         *,

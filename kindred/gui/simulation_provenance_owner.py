@@ -49,20 +49,135 @@ class SimulationProvenanceOwner:
         *,
         display_transaction: Mapping[str, Any] | None,
         display_sets: Sequence[Mapping[str, Any]] | None,
+        species_names: Sequence[str] | None = None,
+        t: Any = None,
+        series: Mapping[str, Any] | None = None,
+        algebra_scalars: Mapping[str, Any] | None = None,
+        clear_result_payload: bool = False,
     ) -> Dict[str, Any]:
+        """Update display-projection provenance without mixing result owners.
+
+        Projection changes can replace the visible primary result while leaving
+        the underlying completed result transaction intact.  Updating only
+        ``display_transaction``/``display_sets`` would leave stale primary
+        result fields (species/CTC and, in older payloads, t/series) from the
+        previous projection.  This method therefore updates or clears the
+        projection-owned primary-result payload atomically with the display
+        metadata.
+        """
         provenance = dict(self._last_simulation_provenance or {})
         if isinstance(display_transaction, Mapping):
             provenance["display_transaction"] = dict(display_transaction)
         else:
             provenance.pop("display_transaction", None)
-        if display_sets:
+        if display_sets is not None:
             provenance["display_sets"] = [
                 dict(item) for item in display_sets if isinstance(item, Mapping)
             ]
         else:
             provenance.pop("display_sets", None)
+
+        if bool(clear_result_payload):
+            provenance["species_names"] = []
+            provenance["num_species"] = 0
+            provenance["num_points"] = 0
+            if "t" in provenance:
+                provenance["t"] = []
+            if "series" in provenance:
+                provenance["series"] = {}
+            for key in ("ctc", "algebra_scalars"):
+                provenance.pop(key, None)
+            self.set_last_simulation_ctc({})
+            self._last_simulation_provenance = provenance
+            return dict(provenance)
+
+        if species_names is not None and t is not None and series is not None:
+            species_list = [str(name) for name in species_names if str(name)]
+            normalized_t = np.asarray(t, dtype=float).reshape(-1)
+            normalized_series = {
+                str(name): np.asarray(values, dtype=float)
+                for name, values in dict(series or {}).items()
+                if str(name)
+            }
+            display_series = {
+                name: normalized_series[name]
+                for name in species_list
+                if name in normalized_series
+            }
+            provenance["species_names"] = list(display_series.keys())
+            provenance["num_species"] = len(display_series)
+            provenance["num_points"] = int(normalized_t.size)
+            if algebra_scalars:
+                provenance["algebra_scalars"] = dict(algebra_scalars)
+            else:
+                provenance.pop("algebra_scalars", None)
+
+            # The historical provenance payload may or may not contain raw time
+            # and series arrays.  Keep that contract stable: if a payload has
+            # those fields, replace them with the projected primary data; if it
+            # never stored raw arrays, do not introduce a large new payload.
+            if "t" in provenance:
+                provenance["t"] = normalized_t.tolist()
+            if "series" in provenance:
+                provenance["series"] = {
+                    name: values.tolist() for name, values in display_series.items()
+                }
+
+            ctc_values, ctc_metadata = self._ctc_payload_for_series(
+                normalized_t,
+                display_series,
+            )
+            self.set_last_simulation_ctc(ctc_values)
+            if ctc_metadata:
+                provenance["ctc"] = ctc_metadata
+            else:
+                provenance.pop("ctc", None)
+
         self._last_simulation_provenance = provenance
         return dict(provenance)
+
+    def _ctc_payload_for_series(
+        self,
+        t: Any,
+        series: Mapping[str, Any],
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        normalized_t = np.asarray(t, dtype=float).reshape(-1)
+        ctc_values: Dict[str, float] = {}
+        ctc_metadata: Dict[str, Any] = {}
+        if normalized_t.size == 0:
+            return ctc_values, ctc_metadata
+        for species_name, conc_array in dict(series or {}).items():
+            values = np.asarray(conc_array, dtype=float).reshape(-1)
+            if values.size == 0 or values.size != normalized_t.size:
+                continue
+            final_conc = values[-1]
+            max_conc = np.max(np.abs(values))
+            threshold = max(1e-10, 0.01 * max_conc)
+
+            if abs(final_conc) < threshold:
+                ctc_value, method, is_uniform, eps_used, tail_used = self.integrate_ctc(
+                    normalized_t,
+                    values,
+                    uniformity_eps=1e-6,
+                    tail_strategy="38",
+                )
+            else:
+                deviation = np.abs(values - final_conc)
+                ctc_value, method, is_uniform, eps_used, tail_used = self.integrate_ctc(
+                    normalized_t,
+                    deviation,
+                    uniformity_eps=1e-6,
+                    tail_strategy="38",
+                )
+
+            ctc_values[str(species_name)] = float(ctc_value)
+            ctc_metadata = {
+                "integration_method": method,
+                "uniform_grid_detected": is_uniform,
+                "uniformity_eps": eps_used,
+                "tail_strategy": tail_used,
+            }
+        return ctc_values, ctc_metadata
 
     def publish_simulation_completion_provenance(
         self,
@@ -140,38 +255,7 @@ class SimulationProvenanceOwner:
         if fit_meta:
             provenance["fit"] = fit_meta
 
-        ctc_values: Dict[str, float] = {}
-        ctc_metadata: Dict[str, Any] = {}
-        for species_name, conc_array in series.items():
-            values = np.asarray(conc_array, dtype=float)
-            final_conc = values[-1]
-            max_conc = np.max(np.abs(values))
-            threshold = max(1e-10, 0.01 * max_conc)
-
-            if abs(final_conc) < threshold:
-                ctc_value, method, is_uniform, eps_used, tail_used = self.integrate_ctc(
-                    t,
-                    values,
-                    uniformity_eps=1e-6,
-                    tail_strategy="38",
-                )
-            else:
-                deviation = np.abs(values - final_conc)
-                ctc_value, method, is_uniform, eps_used, tail_used = self.integrate_ctc(
-                    t,
-                    deviation,
-                    uniformity_eps=1e-6,
-                    tail_strategy="38",
-                )
-
-            ctc_values[str(species_name)] = float(ctc_value)
-            ctc_metadata = {
-                "integration_method": method,
-                "uniform_grid_detected": is_uniform,
-                "uniformity_eps": eps_used,
-                "tail_strategy": tail_used,
-            }
-
+        ctc_values, ctc_metadata = self._ctc_payload_for_series(t, series)
         self.set_last_simulation_ctc(ctc_values)
         if ctc_metadata:
             provenance["ctc"] = ctc_metadata

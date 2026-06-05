@@ -16,7 +16,8 @@ class SimulationRunUiOwner:
     ) -> None:
         self._results_table_getter = results_table_getter
         self._run_button_requested_enabled = True
-        self._launch_available = False
+        self._runtime_launch_available = False
+        self._launch_readiness_stale = False
         self._run_target_available = False
         self._run_button_text = "Run"
         self._run_button_tooltip = ""
@@ -34,8 +35,16 @@ class SimulationRunUiOwner:
         return bool(self._run_button_requested_enabled)
 
     @property
+    def runtime_launch_available(self) -> bool:
+        return bool(self._runtime_launch_available)
+
+    @property
     def launch_available(self) -> bool:
-        return bool(self._launch_available)
+        return bool(self._runtime_launch_available and not self._launch_readiness_stale)
+
+    @property
+    def launch_readiness_stale(self) -> bool:
+        return bool(self._launch_readiness_stale)
 
     def bind_widgets(
         self,
@@ -80,17 +89,20 @@ class SimulationRunUiOwner:
         self._apply_run_button_state()
 
     def render_launch_available(self, available: bool) -> None:
-        self._launch_available = bool(available)
+        self._runtime_launch_available = bool(available)
+        self._launch_readiness_stale = False
         self._apply_run_button_state()
 
     def mark_launch_readiness_stale(self) -> None:
-        # The effective run target or runtime inputs changed.  Disable launch
-        # until the runtime-readiness owner publishes fresh launch truth.
-        self._launch_available = False
+        # Runtime readiness truth is owned by render_runtime_readiness() /
+        # render_launch_available().  This is only a UI gate saying that the
+        # last published readiness is stale relative to newer inputs.
+        self._launch_readiness_stale = True
         self._apply_run_button_state()
 
     def render_runtime_readiness(self, state: object) -> None:
-        self._launch_available = bool(getattr(state, "launch_available", False))
+        self._runtime_launch_available = bool(getattr(state, "launch_available", False))
+        self._launch_readiness_stale = False
         message = str(getattr(state, "status_text", "") or "").strip()
         if message:
             current_status = self._status_text_value()
@@ -168,7 +180,8 @@ class SimulationRunUiOwner:
         mechanism_valid = self._mechanism_run_target_is_valid()
         effective_enabled = bool(
             self._run_button_requested_enabled
-            and self._launch_available
+            and self._runtime_launch_available
+            and not self._launch_readiness_stale
             and self._run_target_available
             and mechanism_valid
         )

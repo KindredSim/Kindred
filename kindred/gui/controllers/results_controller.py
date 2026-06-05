@@ -495,6 +495,22 @@ class ResultsController(QtCore.QObject):
         return None
 
     @staticmethod
+    def _algebra_scalars_from_display_metadata(
+        metadata: DisplaySetMetadata,
+    ) -> Mapping[str, Any] | None:
+        for source in (
+            metadata.completion_provenance,
+            metadata.provenance,
+            metadata.workspace_preview_provenance,
+        ):
+            if not isinstance(source, Mapping):
+                continue
+            raw_scalars = source.get("algebra_scalars")
+            if isinstance(raw_scalars, Mapping):
+                return dict(raw_scalars)
+        return None
+
+    @staticmethod
     def _prefer_layer_id_for_projected_transaction(
         transaction: ActiveDisplayTransaction,
     ) -> str:
@@ -1354,6 +1370,8 @@ class ResultsController(QtCore.QObject):
                     for name in (primary_metadata.display_species or ())
                     if str(name) and str(name) in display_series_by_name
                 ]
+                if not display_species:
+                    display_species = list(display_series_by_name.keys())
                 display_series = {
                     name: display_series_by_name[name]
                     for name in display_species
@@ -1362,6 +1380,11 @@ class ResultsController(QtCore.QObject):
                 payload["t"] = np.asarray(primary_metadata.t, dtype=float)
                 payload["series"] = display_series
                 payload["species_names"] = display_species
+                algebra_scalars = self._algebra_scalars_from_display_metadata(primary_metadata)
+                if algebra_scalars:
+                    payload["algebra_scalars"] = dict(algebra_scalars)
+                else:
+                    payload.pop("algebra_scalars", None)
         if not payload:
             self._clear_direct_completion_provenance()
             return None
@@ -1377,14 +1400,41 @@ class ResultsController(QtCore.QObject):
         active_transaction = self._active_display_transaction
         if not isinstance(active_transaction, ActiveDisplayTransaction):
             return
-        payload = display_transaction_provenance_payload(
-            self._projected_transaction_for_display_provenance(active_transaction),
+        projected_transaction = self._projected_transaction_for_display_provenance(active_transaction)
+        payload = display_transaction_provenance_payload(projected_transaction)
+        primary_metadata = (
+            self._primary_result_metadata_from_transaction(projected_transaction)
+            if isinstance(projected_transaction, ActiveDisplayTransaction)
+            else None
         )
-        try:
-            self._ui.update_display_transaction_provenance(
-                display_transaction=payload.get("display_transaction"),
-                display_sets=payload.get("display_sets"),
+        update_kwargs: dict[str, object] = {
+            "display_transaction": payload.get("display_transaction"),
+            "display_sets": payload.get("display_sets"),
+        }
+        if isinstance(primary_metadata, DisplaySetMetadata):
+            series_by_name = {
+                str(name): np.asarray(values, dtype=float)
+                for name, values in dict(primary_metadata.series or {}).items()
+                if str(name)
+            }
+            display_species = [
+                str(name)
+                for name in (primary_metadata.display_species or ())
+                if str(name) and str(name) in series_by_name
+            ]
+            if not display_species:
+                display_species = list(series_by_name.keys())
+            update_kwargs.update(
+                species_names=display_species,
+                t=np.asarray(primary_metadata.t, dtype=float),
+                series={name: series_by_name[name] for name in display_species if name in series_by_name},
+                algebra_scalars=self._algebra_scalars_from_display_metadata(primary_metadata),
+                clear_result_payload=False,
             )
+        else:
+            update_kwargs["clear_result_payload"] = True
+        try:
+            self._ui.update_display_transaction_provenance(**update_kwargs)
         except Exception as exc:
             logger.exception("Failed to refresh display transaction provenance projection: %s", exc)
 
