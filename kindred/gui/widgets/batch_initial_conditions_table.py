@@ -5,6 +5,7 @@ from typing import Optional, Sequence, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
+from kindred.gui.display_name_policy import STATUS_ITEM_LABEL_MAX_CHARS, compact_set_label
 
 __all__ = [
     "BatchInitialConditionsTableModel",
@@ -240,7 +241,10 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 return ""
             if col == 0:
                 names = self._store.set_names()
-                return names[row] if 0 <= row < len(names) else ""
+                full_name = names[row] if 0 <= row < len(names) else ""
+                if role == QtCore.Qt.EditRole:
+                    return full_name
+                return compact_set_label(full_name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display
             species = self._store.visible_species()
             if 0 <= col - 1 < len(species):
                 return self._store.get_value(row, species[col - 1])

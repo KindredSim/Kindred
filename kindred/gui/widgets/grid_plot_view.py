@@ -17,10 +17,14 @@ from PySide6 import QtCore, QtWidgets, QtGui
 
 from kindred.core.analysis.global_fit_projection import FitRenderDatasetProjection
 from kindred.gui.color_manager import ColorManager
+from kindred.gui.display_name_policy import PLOT_TITLE_LABEL_MAX_CHARS, compact_plot_title_label
 from kindred.gui.plot_config import try_import_pyqtgraph
 from kindred.gui.diagnostics import record_best_effort_failure
 
 logger = logging.getLogger(__name__)
+
+_LOCKED_LEFT_AXIS_WIDTH = 92
+_LOCKED_BOTTOM_AXIS_HEIGHT = 48
 
 __all__ = ["GridPlotView"]
 
@@ -300,13 +304,13 @@ class GridPlotView(QtWidgets.QWidget):
 
         # Conservative defaults + headroom, clamped to avoid absurd gutters.
         if left_w <= 1.0:
-            left_w = 80.0
+            left_w = float(_LOCKED_LEFT_AXIS_WIDTH)
         else:
-            left_w = min(140.0, max(80.0, left_w + 12.0))
+            left_w = min(140.0, max(float(_LOCKED_LEFT_AXIS_WIDTH), left_w + 12.0))
         if bottom_h <= 1.0:
-            bottom_h = 45.0
+            bottom_h = float(_LOCKED_BOTTOM_AXIS_HEIGHT)
         else:
-            bottom_h = min(95.0, max(45.0, bottom_h + 8.0))
+            bottom_h = min(95.0, max(float(_LOCKED_BOTTOM_AXIS_HEIGHT), bottom_h + 8.0))
 
         self._locked_left_axis_width = int(math.ceil(left_w))
         self._locked_bottom_axis_height = int(math.ceil(bottom_h))
@@ -330,24 +334,58 @@ class GridPlotView(QtWidgets.QWidget):
                     exc=exc,
                 )
 
-        if self._locked_left_axis_width is not None:
-            try:
-                left_axis.setWidth(float(self._locked_left_axis_width))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "locked_left_axis_width",
-                    message="GridPlotView: failed to set locked left axis width",
-                    exc=exc,
-                )
-        if self._locked_bottom_axis_height is not None:
-            try:
-                bottom_axis.setHeight(float(self._locked_bottom_axis_height))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "locked_bottom_axis_height",
-                    message="GridPlotView: failed to set locked bottom axis height",
-                    exc=exc,
-                )
+        if self._locked_left_axis_width is None:
+            self._locked_left_axis_width = _LOCKED_LEFT_AXIS_WIDTH
+        if self._locked_bottom_axis_height is None:
+            self._locked_bottom_axis_height = _LOCKED_BOTTOM_AXIS_HEIGHT
+        try:
+            left_axis.setWidth(float(self._locked_left_axis_width))
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "locked_left_axis_width",
+                message="GridPlotView: failed to set locked left axis width",
+                exc=exc,
+            )
+        try:
+            bottom_axis.setHeight(float(self._locked_bottom_axis_height))
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "locked_bottom_axis_height",
+                message="GridPlotView: failed to set locked bottom axis height",
+                exc=exc,
+            )
+
+    def _set_plot_axis_labels(
+        self,
+        plot: Any,
+        *,
+        x_label: str,
+        x_units: object = None,
+        y_label: str = "Concentration",
+        y_units: object = "M",
+        dataset_name: object = "",
+    ) -> None:
+        state = (str(x_label or ""), None if x_units is None else str(x_units), str(y_label or ""), None if y_units is None else str(y_units))
+        if getattr(plot, "_kindred_axis_label_state", None) == state:
+            return
+        try:
+            if state[1]:
+                plot.setLabel("bottom", state[0], units=state[1])
+            else:
+                plot.setLabel("bottom", state[0])
+            if state[3]:
+                plot.setLabel("left", state[2], units=state[3])
+            else:
+                plot.setLabel("left", state[2])
+            setattr(plot, "_kindred_axis_label_state", state)
+            if bool(getattr(self, "_autorange_locked", False)):
+                self._apply_locked_axis_style(plot)
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "plot_labels",
+                message=f"GridPlotView: failed to update plot labels for dataset={dataset_name!r}",
+                exc=exc,
+            )
 
     def _dataset_structure_key(self, datasets: Sequence[Dict[str, Any]]) -> Tuple[Tuple[str, ...], int, int]:
         ids = tuple(str((ds or {}).get("name") or "") for ds in (datasets or []))
@@ -355,8 +393,7 @@ class GridPlotView(QtWidgets.QWidget):
         return (ids, int(n_rows), int(n_cols))
 
     def _configure_plot_static(self, plot: Any) -> None:
-        plot.setLabel("bottom", "Time", units="s")
-        plot.setLabel("left", "Concentration", units="M")
+        self._set_plot_axis_labels(plot, x_label="Time", x_units="s", y_label="Concentration", y_units="M")
         plot.showGrid(x=True, y=True, alpha=0.3)
         font = QtGui.QFont()
         font.setPointSize(7)
@@ -470,45 +507,54 @@ class GridPlotView(QtWidgets.QWidget):
             else:
                 model_series = {}
 
-            try:
-                if x_units:
-                    plot.setLabel("bottom", x_label, units=str(x_units))
-                else:
-                    plot.setLabel("bottom", x_label)
-                plot.setLabel("left", "Concentration", units="M")
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "plot_labels",
-                    message=f"GridPlotView: failed to update plot labels for dataset={name!r}",
-                    exc=exc,
-                )
+            self._set_plot_axis_labels(
+                plot,
+                x_label=x_label,
+                x_units=x_units,
+                y_label="Concentration",
+                y_units="M",
+                dataset_name=name,
+            )
 
-            # Title with fit quality.
-            title = str(name or "")
+            # Title with fit quality. Keep subplot titles short so grid cells prioritize data area.
+            # During an active fit, freeze layout-bearing title text/color as well; live metric
+            # changes belong in the tracker/details, not in geometry that can resize the plot grid.
+            full_name = str(dataset.get("full_name") or name or "")
+            compact_name = compact_plot_title_label(name or full_name, max_chars=PLOT_TITLE_LABEL_MAX_CHARS)
+            title = str(compact_name.display or "")
+            tooltip_parts = [str(full_name or compact_name.full or "").strip()]
+            locked_layout = bool(getattr(self, "_autorange_locked", False))
+            color = (51, 51, 51)
             if chi_squared is not None:
                 try:
                     chi_val = float(chi_squared)
                 except Exception:
                     chi_val = None
                 if chi_val is not None:
-                    title = f"{title} (χ² = {chi_val:.3e})"
-                    color = self._get_color_for_chi_squared(chi_val)
-                else:
-                    color = (51, 51, 51)
+                    metric_text = f"χ² = {chi_val:.3e}"
+                    tooltip_parts.append(metric_text)
+                    if not locked_layout:
+                        title = f"{title} ({metric_text})"
+                        color = self._get_color_for_chi_squared(chi_val)
             elif r_squared is not None:
                 try:
                     r2_val = float(r_squared)
                 except Exception:
                     r2_val = None
                 if r2_val is not None:
-                    title = f"{title} (R² = {r2_val:.3f})"
-                    color = self._get_color_for_r_squared(r2_val)
-                else:
-                    color = (51, 51, 51)
-            else:
-                color = (51, 51, 51)
+                    metric_text = f"R² = {r2_val:.3f}"
+                    tooltip_parts.append(metric_text)
+                    if not locked_layout:
+                        title = f"{title} ({metric_text})"
+                        color = self._get_color_for_r_squared(r2_val)
+            title_tooltip = "\n".join(part for part in tooltip_parts if part)
             try:
-                plot.setTitle(title, color=color, size="10pt")
+                title_state = (title, tuple(color), "10pt")
+                if getattr(plot, "_kindred_title_state", None) != title_state:
+                    plot.setTitle(title, color=color, size="10pt")
+                    setattr(plot, "_kindred_title_state", title_state)
+                if hasattr(plot, "setToolTip"):
+                    plot.setToolTip(str(title_tooltip or ""))
             except Exception as exc:
                 self._record_best_effort_failure(
                     "plot_title",
@@ -917,6 +963,23 @@ class GridPlotView(QtWidgets.QWidget):
                 continue
             self._locked_view_ranges[idx] = (x_range, y_range)
 
+    def _restore_locked_view_ranges(self) -> None:
+        if not bool(getattr(self, "_autorange_locked", False)):
+            return
+        for idx, plot in enumerate(list(self._plot_items)):
+            frozen = self._locked_view_ranges.get(idx)
+            if not frozen:
+                continue
+            try:
+                plot.setXRange(float(frozen[0][0]), float(frozen[0][1]), padding=0)
+                plot.setYRange(float(frozen[1][0]), float(frozen[1][1]), padding=0)
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "restore_locked_view_range",
+                    message=f"GridPlotView: failed to restore locked view range for subplot={idx}",
+                    exc=exc,
+                )
+
     def set_species_selection(self, species_names: Sequence[str]) -> None:
         """
         Update the multi-select list with the provided species names.
@@ -996,6 +1059,7 @@ class GridPlotView(QtWidgets.QWidget):
         if needs_rebuild:
             self._rebuild_structure()
         self._update_plot_data_in_place()
+        self._restore_locked_view_ranges()
 
     def _toggle_legend(self, visible: bool) -> None:
         """Toggle legend visibility and redraw grid."""

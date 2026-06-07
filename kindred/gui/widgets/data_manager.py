@@ -38,6 +38,7 @@ from kindred.gui.widgets.import_config import (
 )
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
 from kindred.gui.controllers.dataset_registry import DatasetRecord
+from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label
 from kindred.gui.widgets.dataset_import_session import (
     DatasetImportCompletion,
     DatasetImportSession,
@@ -265,6 +266,8 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         # Dataset list
         self._dataset_list = QtWidgets.QListWidget()
+        self._dataset_list.setUniformItemSizes(True)
+        self._dataset_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._dataset_list.currentItemChanged.connect(self._on_dataset_selected)
         layout.addWidget(self._dataset_list)
 
@@ -321,8 +324,11 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._visible_records_by_id = {str(record.dataset_id): record for record in records}
         self._dataset_list.clear()
         for record in records:
-            item = QtWidgets.QListWidgetItem(str(record.display_name))
+            compact = compact_dataset_label(record.display_name, max_chars=DATASET_LIST_LABEL_MAX_CHARS)
+            item = QtWidgets.QListWidgetItem(compact.display)
+            item.setToolTip(compact.full)
             item.setData(Qt.UserRole, str(record.dataset_id))
+            item.setData(Qt.UserRole + 1, compact.full)
             self._dataset_list.addItem(item)
         self._preview_label.setText("No dataset selected")
         self._preview_label.hide()

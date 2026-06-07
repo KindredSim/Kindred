@@ -20,6 +20,7 @@ from kindred.core.analysis.global_fit_projection import (
     FitRenderProjection,
 )
 from kindred.gui.widgets.grid_plot_view import GridPlotView
+from kindred.gui.display_name_policy import TAB_LABEL_MAX_CHARS, compact_dataset_label, dataset_alias
 
 if TYPE_CHECKING:
     from kindred.core.analysis.global_fitting import GlobalFitResult
@@ -348,6 +349,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._all_datasets_plot_view: Optional[GridPlotView] = None
         self._render_projection: Optional[FitRenderProjection] = None
         self._stale_plot_view_keys: set[str] = set()
+        self._view_autorange_locked = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -462,8 +464,8 @@ class RunResultsTab(QtWidgets.QWidget):
         result: List[tuple] = []
         for ds_id in ids:
             lbl = raw_labels[ds_id]
-            display = f"{lbl} ({ds_id})" if label_counts[lbl] > 1 else lbl
-            result.append((display, dict(self._last_dataset_fitted_params[ds_id])))
+            display_full = f"{lbl} ({ds_id})" if label_counts[lbl] > 1 else lbl
+            result.append((display_full, dict(self._last_dataset_fitted_params[ds_id])))
         return result
 
     def update_statistics(self, stats: Dict[str, Any]) -> None:
@@ -497,16 +499,19 @@ class RunResultsTab(QtWidgets.QWidget):
         self._dataset_plot_views = {}
         self._dataset_tab_ids = []
 
-        for entry in self._dataset_entries:
+        for index, entry in enumerate(self._dataset_entries):
             ds_id = str(entry.get("id") or "").strip()
             if not ds_id:
                 continue
-            title = str(entry.get("label") or ds_id)
+            full_title = str(entry.get("label") or ds_id)
+            compact_title = compact_dataset_label(full_title, max_chars=TAB_LABEL_MAX_CHARS)
             plot_view = self._create_plot_view(f"global_fit_results_plot_{ds_id}")
             self._dataset_tab_ids.append(ds_id)
             self._dataset_plot_views[ds_id] = plot_view
             self._subtab_stack.addWidget(plot_view)
-            self._subtabs.addTab(title)
+            tab_index = self._subtabs.addTab(compact_title.display)
+            self._subtabs.setTabToolTip(tab_index, compact_title.full)
+            self._subtabs.setTabData(tab_index, {"dataset_id": ds_id, "alias": dataset_alias(index), "full_label": compact_title.full})
 
         self._all_datasets_plot_view = None
         if self._dataset_entries:
@@ -586,10 +591,11 @@ class RunResultsTab(QtWidgets.QWidget):
         self._clear_subtabs()
 
     def set_view_autorange_locked(self, running: bool) -> None:
+        self._view_autorange_locked = bool(running)
         for plot_view in list(self._dataset_plot_views.values()):
-            plot_view.set_autorange_locked(bool(running))
+            plot_view.set_autorange_locked(self._view_autorange_locked)
         if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.set_autorange_locked(bool(running))
+            self._all_datasets_plot_view.set_autorange_locked(self._view_autorange_locked)
 
     def set_dark_mode(self, enabled: bool) -> None:
         self._dark_mode = bool(enabled)
@@ -617,6 +623,7 @@ class RunResultsTab(QtWidgets.QWidget):
         plot_view.setObjectName(object_name)
         plot_view.set_controls_visible(False)
         plot_view.set_dark_mode(self._dark_mode)
+        plot_view.set_autorange_locked(self._view_autorange_locked)
         return plot_view
 
     def _refresh_plot_views(
@@ -809,8 +816,19 @@ class RunResultsTab(QtWidgets.QWidget):
             if dataset_projection is not None
             else ("Time" if x_name == "t" else x_name)
         )
+        entry_id = str(entry.get("id") or "").strip()
+        entry_index = 0
+        try:
+            entry_index = next(
+                i for i, candidate in enumerate(self._dataset_entries)
+                if str(candidate.get("id") or "").strip() == entry_id
+            )
+        except Exception:
+            entry_index = 0
+        full_name = str(entry.get("label") or entry.get("id") or "")
         return {
-            "name": str(entry.get("label") or entry.get("id") or ""),
+            "name": dataset_alias(entry_index),
+            "full_name": full_name,
             "data_x": data_x,
             "data_y": data_y,
             "fit_render_projection": dataset_projection,

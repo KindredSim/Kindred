@@ -17,6 +17,7 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
+from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label
 from kindred.core.analysis.dataset_sampling import compute_windowed_indices
 from kindred.gui.fitting.constants import _SAMPLING_ALL_POINTS_SENTINEL
 
@@ -137,7 +138,11 @@ class DataTab(QtWidgets.QWidget):
             check_item.setData(Qt.UserRole, entry["id"])
             self._dataset_table.setItem(row, 0, check_item)
 
-            name_item = QtWidgets.QTableWidgetItem(entry["label"])
+            full_label = str(entry.get("label", "") or entry.get("id") or "")
+            compact_label = compact_dataset_label(full_label, max_chars=DATASET_LIST_LABEL_MAX_CHARS)
+            name_item = QtWidgets.QTableWidgetItem(compact_label.display)
+            name_item.setToolTip(compact_label.full)
+            name_item.setData(Qt.UserRole + 1, compact_label.full)
             name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self._dataset_table.setItem(row, 1, name_item)
 
@@ -173,7 +178,7 @@ class DataTab(QtWidgets.QWidget):
             if str(item.data(Qt.UserRole) or "").strip() == ds_id:
                 name_item = self._dataset_table.item(row, 1)
                 if name_item is not None:
-                    label = str(name_item.text()).strip()
+                    label = str(name_item.data(Qt.UserRole + 1) or name_item.toolTip() or name_item.text()).strip()
                     if label:
                         return label
                 return ds_id
@@ -189,10 +194,10 @@ class DataTab(QtWidgets.QWidget):
         ds_id = str(item.data(Qt.UserRole) or "").strip() if item is not None else ""
         return ds_id or None
 
-    def set_sampling_secondary_error(self, message: Optional[str]) -> None:
+    def set_sampling_secondary_error(self, message: Optional[str], *, tooltip_text: Optional[str] = None) -> None:
         """Set or clear the secondary error message on the sampling footer."""
         if hasattr(self, "_sampling_footer"):
-            self._sampling_footer.set_secondary_error(message)
+            self._sampling_footer.set_secondary_error(message, tooltip_text=tooltip_text)
 
     def load_sampling_for_selected_row(self) -> None:
         """Load sampling controls for whichever dataset row is currently selected."""

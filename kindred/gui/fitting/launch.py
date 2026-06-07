@@ -131,6 +131,7 @@ class FittingLaunchRejection:
     title: str
     message: str
     passive_status: str = "Fitting runtime not ready"
+    detailed_message: str = ""
 
 
 @dataclass(frozen=True)

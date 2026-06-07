@@ -95,6 +95,15 @@ from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
 from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices, compute_windowed_indices
 from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_SENTINEL, DEFAULT_PARALLEL_STARTS
+from kindred.gui.display_name_policy import (
+    FOOTER_SUMMARY_MAX_CHARS,
+    INLINE_ERROR_MAX_CHARS,
+    STATUS_ITEM_LABEL_MAX_CHARS,
+    compact_diagnostic_text,
+    compact_dataset_label,
+    summarize_named_count,
+)
+from kindred.gui.ui_helpers import set_compact_label_text
 
 logger = logging.getLogger(__name__)
 
@@ -577,13 +586,11 @@ class FittingWindow(QtWidgets.QDialog):
         invalid = self._invalid_applied_used_dataset_ids_for_run()
         if invalid:
             if explicit:
-                labels = [self._dataset_label_for_id(ds_id) for ds_id in invalid]
-                QtWidgets.QMessageBox.warning(
-                    self,
+                summary = self._dataset_count_summary_for_ids(invalid)
+                self._show_diagnostic_warning(
                     "Global Fit",
-                    "Run Fit is disabled due to invalid applied settings for: "
-                    + ", ".join(labels)
-                    + ".",
+                    f"Run Fit is disabled due to invalid applied settings for {summary.display}.",
+                    details=summary.tooltip,
                 )
             else:
                 self._set_fit_status("Fitting runtime not ready: invalid applied settings")
@@ -663,7 +670,7 @@ class FittingWindow(QtWidgets.QDialog):
         if rejection is None:
             return
         if purpose is FittingLaunchPurpose.EXPLICIT_RUN and rejection.title:
-            QtWidgets.QMessageBox.warning(self, rejection.title, rejection.message)
+            self._show_diagnostic_warning(rejection.title, rejection.message, details=getattr(rejection, "detailed_message", ""))
         elif rejection.passive_status:
             self._set_fit_status(rejection.passive_status)
 
@@ -838,15 +845,27 @@ class FittingWindow(QtWidgets.QDialog):
             result = self._global_payload_results.get(ds_id)
             if isinstance(result, FitDatasetPayloadResult) and result.state == "invalid":
                 reason = str(result.error or "Dataset payload is invalid.")
+                dataset_label = self._dataset_label_for_id(ds_id) or ds_id
+                dataset_identity = (
+                    f"{dataset_label} [{ds_id}]"
+                    if str(dataset_label).strip() != ds_id
+                    else ds_id
+                )
                 return None, FittingLaunchRejection(
                     title="Global Fit",
-                    message=f"Dataset '{ds_id}' has invalid payload:\n{reason}",
+                    message=f"Dataset '{dataset_identity}' has invalid payload:\n{reason}",
                     passive_status="Fitting runtime not ready: invalid dataset payloads",
                 )
             if ds_id not in self._global_payload_lookup:
+                dataset_label = self._dataset_label_for_id(ds_id) or ds_id
+                dataset_identity = (
+                    f"{dataset_label} [{ds_id}]"
+                    if str(dataset_label).strip() != ds_id
+                    else ds_id
+                )
                 return None, FittingLaunchRejection(
                     title="Global Fit",
-                    message=f"Dataset '{ds_id}' is missing payloads.",
+                    message=f"Dataset '{dataset_identity}' is missing payloads.",
                     passive_status="Fitting runtime not ready: missing dataset payloads",
                 )
             datasets.append(dict(self._global_payload_lookup[ds_id]))
@@ -854,7 +873,37 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _set_fit_status(self, text: str) -> None:
         if hasattr(self, "_status_label"):
-            self._status_label.setText(str(text))
+            set_compact_label_text(
+                self._status_label,
+                str(text),
+                max_chars=FOOTER_SUMMARY_MAX_CHARS,
+                max_width=620,
+                diagnostic=True,
+            )
+
+    def _show_diagnostic_warning(
+        self,
+        title: str,
+        message: str,
+        *,
+        details: str = "",
+    ) -> None:
+        full_message = str(message or "")
+        compact = compact_diagnostic_text(full_message, max_chars=INLINE_ERROR_MAX_CHARS)
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        dialog.setWindowTitle(str(title or "Kindred"))
+        dialog.setText(compact.display)
+        detail_parts = []
+        if compact.was_elided or compact.display != full_message:
+            detail_parts.append(full_message)
+        details_s = str(details or "")
+        if details_s and details_s not in detail_parts:
+            detail_parts.append(details_s)
+        if detail_parts:
+            dialog.setDetailedText("\n\n".join(detail_parts))
+        dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+        dialog.exec()
 
     def _set_fit_stop_enabled(self, enabled: bool) -> None:
         if hasattr(self, "_stop_button"):
@@ -1225,11 +1274,11 @@ class FittingWindow(QtWidgets.QDialog):
         self._species_table.targetsApplied.connect(self._on_targets_applied)
         self._species_table.validityChanged.connect(self._on_targets_validity_changed)
         self._species_table.statusMessage.connect(self._on_targets_status_message)
-        self._params_ics_tab.statusMessage.connect(self._status_label.setText)
+        self._params_ics_tab.statusMessage.connect(self._set_fit_status)
         self._params_ics_tab.runtimeInputsChanged.connect(self._on_fit_runtime_inputs_changed)
         self._connect_fit_runtime_input_signals()
-        self._run_results_tab.statusMessage.connect(self._status_label.setText)
-        self._data_tab.statusMessage.connect(self._status_label.setText)
+        self._run_results_tab.statusMessage.connect(self._set_fit_status)
+        self._data_tab.statusMessage.connect(self._set_fit_status)
         self._data_targets_tab.unified_list.datasetIncludeChanged.connect(self._on_data_tab_include_changed)
         self._data_targets_tab.unified_list.addRequested.connect(self._open_add_datasets_dialog)
         self._data_targets_tab.unified_list.removeRequested.connect(self._remove_datasets_from_session)
@@ -1272,7 +1321,7 @@ class FittingWindow(QtWidgets.QDialog):
                 self._discard_fit_runtime_session(kill=True)
                 self._set_running_state(False)
                 if hasattr(self, "_status_label"):
-                    self._status_label.setText("Fitting runtime inputs changed; fit cancelled")
+                    self._set_fit_status("Fitting runtime inputs changed; fit cancelled")
             else:
                 self._fit_run_state_owner.clear_superseded()
             self._fit_runtime_readiness.set_desired_identity(None)
@@ -1343,11 +1392,11 @@ class FittingWindow(QtWidgets.QDialog):
 
         if had_entry or had_pool or had_order or had_state:
             self._sync_after_session_dataset_change()
-            self._status_label.setText("Project datasets removed")
+            self._set_fit_status("Project datasets removed")
             return
         if authority_invalidated:
             self._refresh_project_apply_controls(prefer_broadest=True)
-            self._status_label.setText("Project datasets removed")
+            self._set_fit_status("Project datasets removed")
 
     def _on_algebraic_observable_requested(self, selection: dict) -> None:
         """Handle algebraic observable add request from ParametersIcsTab."""
@@ -1374,11 +1423,14 @@ class FittingWindow(QtWidgets.QDialog):
         status_col.setContentsMargins(0, 0, 0, 0)
         status_col.setSpacing(2)
         self._status_label = QtWidgets.QLabel("Ready")
+        self._status_label.setWordWrap(False)
+        self._status_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         status_col.addWidget(self._status_label)
         self._run_block_reason_label = QtWidgets.QLabel(status_col_widget)
         self._run_block_reason_label.setObjectName("global_fit_run_block_reason_label")
-        self._run_block_reason_label.setWordWrap(True)
+        self._run_block_reason_label.setWordWrap(False)
         self._run_block_reason_label.setStyleSheet("font-size: 11px;")
+        self._run_block_reason_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         self._run_block_reason_label.hide()
         status_col.addWidget(self._run_block_reason_label)
         control_row.addWidget(status_col_widget, stretch=3)
@@ -1543,12 +1595,15 @@ class FittingWindow(QtWidgets.QDialog):
             return
         invalid = self._invalid_sampling_applied_used_dataset_ids()
         if invalid:
-            labels = [self._dataset_label_for_id(ds_id) for ds_id in invalid]
-            joined = ", ".join(labels)
+            summary = self._dataset_count_summary_for_ids(invalid)
             message = (
-                f"Run Fit disabled: {joined} has invalid applied sampling. Adjust sampling and Apply, or uncheck Use."
+                f"Run Fit disabled: {summary.display} has invalid applied sampling. Adjust sampling and Apply, or uncheck Use."
             )
-            self._data_tab.set_sampling_secondary_error(message)
+            tooltip = (
+                f"Run Fit disabled: {summary.full}\n\n"
+                "Invalid applied sampling. Adjust sampling and Apply, or uncheck Use."
+            )
+            self._data_tab.set_sampling_secondary_error(message, tooltip_text=tooltip)
         else:
             self._data_tab.set_sampling_secondary_error(None)
         self._refresh_run_button_enabled_state()
@@ -1566,6 +1621,21 @@ class FittingWindow(QtWidgets.QDialog):
             if str(entry.get("id") or "").strip() == ds_id:
                 return str(entry.get("label", "") or "").strip() or str(dataset_id)
         return str(dataset_id)
+
+    def _dataset_identity_label_for_id(self, dataset_id: str) -> str:
+        ds_id = str(dataset_id or "").strip()
+        label = self._dataset_label_for_id(ds_id) or ds_id
+        label_s = str(label or "").strip()
+        if not ds_id or label_s == ds_id:
+            return label_s or ds_id
+        return f"{label_s} [{ds_id}]"
+
+    def _dataset_count_summary_for_ids(self, dataset_ids: Sequence[str]):
+        return summarize_named_count(
+            [self._dataset_identity_label_for_id(ds_id) for ds_id in dataset_ids],
+            singular="dataset",
+            item_max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
+        )
 
     def _invalid_applied_used_dataset_ids_for_run(self) -> List[str]:
         invalid = set(self._species_table.invalid_applied_used_dataset_ids())
@@ -1730,13 +1800,24 @@ class FittingWindow(QtWidgets.QDialog):
 
         # Run Fit disabling while invalid applied.
         if invalid_applied:
-            labels = [self._dataset_label_for_id(ds_id) for ds_id in sorted(invalid_applied)]
-            joined = ", ".join(labels)
+            summary = self._dataset_count_summary_for_ids(sorted(invalid_applied))
             message = (
-                f"Run Fit disabled: {joined} has no applied fit targets. Select targets and Apply, or uncheck Use."
+                f"Run Fit disabled: {summary.display} has no applied fit targets. Select targets and Apply, or uncheck Use."
             )
             if hasattr(self, "_run_block_reason_label"):
-                self._run_block_reason_label.setText(f"{message} Open Data and Targets to apply targets.")
+                full_message = (
+                    f"Run Fit disabled: {summary.full}\n\n"
+                    "No applied fit targets. Select targets and Apply, or uncheck Use. "
+                    "Open Data and Targets to apply targets."
+                )
+                set_compact_label_text(
+                    self._run_block_reason_label,
+                    message,
+                    max_chars=FOOTER_SUMMARY_MAX_CHARS,
+                    max_width=620,
+                    diagnostic=True,
+                    tooltip_text=full_message,
+                )
                 self._run_block_reason_label.show()
         else:
             if hasattr(self, "_run_block_reason_label"):
@@ -1745,7 +1826,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_run_button_enabled_state()
 
     def _on_targets_status_message(self, msg: str) -> None:
-        self._status_label.setText(msg)
+        self._set_fit_status(msg)
 
     def _on_targets_applied(self) -> None:
         self._on_fit_runtime_inputs_changed()
@@ -1773,13 +1854,13 @@ class FittingWindow(QtWidgets.QDialog):
         self._rebuild_selected_payload_lookup()
         self._request_rebuild_subtabs()
         self._refresh_sampling_validity_ui()
-        self._status_label.setText("Sampling applied")
+        self._set_fit_status("Sampling applied")
 
     def _open_add_datasets_dialog(self) -> None:
         present = {str(entry.get("id") or "").strip() for entry in (self._dataset_entries or []) if entry.get("id")}
         candidates = [ds_id for ds_id in (self._loaded_dataset_order or []) if ds_id and ds_id not in present]
         if not candidates:
-            self._status_label.setText("No additional loaded datasets to add.")
+            self._set_fit_status("No additional loaded datasets to add.")
             return
 
         dialog = QtWidgets.QDialog(self)
@@ -1794,11 +1875,16 @@ class FittingWindow(QtWidgets.QDialog):
 
         list_widget = QtWidgets.QListWidget(dialog)
         list_widget.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        list_widget.setUniformItemSizes(True)
+        list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         for ds_id in candidates:
             pool_entry = self._loaded_dataset_pool.get(ds_id) or {}
             label = str(pool_entry.get("label") or ds_id)
-            item = QtWidgets.QListWidgetItem(label, list_widget)
+            compact = compact_dataset_label(label)
+            item = QtWidgets.QListWidgetItem(compact.display, list_widget)
+            item.setToolTip(compact.full)
             item.setData(Qt.UserRole, ds_id)
+            item.setData(Qt.UserRole + 1, compact.full)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             item.setCheckState(Qt.Unchecked)
         layout.addWidget(list_widget, stretch=1)
@@ -1892,7 +1978,7 @@ class FittingWindow(QtWidgets.QDialog):
         if not added:
             return
         self._sync_after_session_dataset_change()
-        self._status_label.setText("Datasets added to session")
+        self._set_fit_status("Datasets added to session")
 
     def _remove_datasets_from_session(self, dataset_ids: Sequence[str]) -> None:
         """Remove datasets from this Global Fit session (does not delete from project)."""
@@ -1914,7 +2000,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._params_ics_tab.remove_dataset_parameter_rows(remove_set)
 
         self._sync_after_session_dataset_change()
-        self._status_label.setText("Datasets removed from session")
+        self._set_fit_status("Datasets removed from session")
 
     def _sync_after_session_dataset_change(self) -> None:
         self._populate_dataset_table()
@@ -2316,7 +2402,7 @@ class FittingWindow(QtWidgets.QDialog):
                 self._clear_failed_run_visual_state()
                 QtWidgets.QMessageBox.warning(self, "Global Fit", str(exc))
             elif hasattr(self, "_status_label"):
-                self._status_label.setText(f"Fitting runtime not ready: {exc}")
+                self._set_fit_status(f"Fitting runtime not ready: {exc}")
             return False
         except Exception as exc:
             logger.exception("Failed to refresh fit-window state before running fit.")
@@ -2328,7 +2414,7 @@ class FittingWindow(QtWidgets.QDialog):
                     f"Failed to refresh fit-window state:\n{exc}",
                 )
             elif hasattr(self, "_status_label"):
-                self._status_label.setText(f"Fitting runtime not ready: {exc}")
+                self._set_fit_status(f"Fitting runtime not ready: {exc}")
             return False
         finally:
             self._fit_window_state_refreshing = False
@@ -2871,14 +2957,14 @@ class FittingWindow(QtWidgets.QDialog):
         self._discard_fit_runtime_session(kill=True)
         self._set_running_state(False)
         if hasattr(self, "_status_label"):
-            self._status_label.setText("Fitting runtime inputs changed; fit cancelled")
+            self._set_fit_status("Fitting runtime inputs changed; fit cancelled")
 
     def _set_teardown_status_label(self, reason: str) -> None:
         status_label = getattr(self, "_status_label", None)
         if status_label is None:
             return
         try:
-            status_label.setText(str(reason))
+            self._set_fit_status(str(reason))
         except RuntimeError as exc:
             logger.debug("Failed to set teardown status label: %s", exc, exc_info=True)
             self._status_label = None
@@ -2944,7 +3030,7 @@ class FittingWindow(QtWidgets.QDialog):
             self._fit_runtime_preparation_owner.cancel_preparation(kill=True)
             try:
                 self._stop_button.setEnabled(False)
-                self._status_label.setText("Fitting runtime preparation cancelled")
+                self._set_fit_status("Fitting runtime preparation cancelled")
                 self._set_fit_controls_locked(False)
                 self._fit_runtime_preparation_owner.refresh_pending = False
                 self._refresh_run_button_enabled_state()
@@ -2965,7 +3051,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._discard_fit_runtime_session(kill=True)
         try:
             self._set_running_state(False)
-            self._status_label.setText("Fit cancelled")
+            self._set_fit_status("Fit cancelled")
             self._fit_runtime_preparation_owner.schedule_refresh()
         except Exception as exc:
             self._best_effort_failures.add("cancel_fit.status_label")
@@ -2978,7 +3064,7 @@ class FittingWindow(QtWidgets.QDialog):
                 self._paused = True
                 self._pause_button.setEnabled(False)
                 self._resume_button.setEnabled(True)
-                self._status_label.setText("Pause requested (after current evaluation)")
+                self._set_fit_status("Pause requested (after current evaluation)")
 
     def _resume_fit(self) -> None:
         if self._worker and self._worker.isRunning() and self._paused:
@@ -2987,7 +3073,7 @@ class FittingWindow(QtWidgets.QDialog):
                 self._paused = False
                 self._pause_button.setEnabled(True)
                 self._resume_button.setEnabled(False)
-                self._status_label.setText("Resuming...")
+                self._set_fit_status("Resuming...")
 
     def _set_running_state(self, running: bool) -> None:
         invalid_applied = bool(self._invalid_applied_used_dataset_ids_for_run())
@@ -3184,7 +3270,7 @@ class FittingWindow(QtWidgets.QDialog):
         if self._closing:
             return
         self._progress_bar.setValue(percent)
-        self._status_label.setText(message)
+        self._set_fit_status(message)
 
     def _handle_global_fit_complete(
         self,
@@ -3199,7 +3285,7 @@ class FittingWindow(QtWidgets.QDialog):
         result: GlobalFitResult = payload.get("result")
         if result is None:
             self._clear_failed_run_visual_state(None)
-            self._status_label.setText("Global fit failed")
+            self._set_fit_status("Global fit failed")
             return
         self._last_result = result
         self._best_cost = None
@@ -3282,7 +3368,7 @@ class FittingWindow(QtWidgets.QDialog):
         if combined_detail:
             logger.warning("%s", combined_detail)
 
-        self._status_label.setText(status)
+        self._set_fit_status(status)
         if severity != "fail":
             self._set_running_state(False)
             self._fit_runtime_preparation_owner.schedule_refresh()
@@ -3693,7 +3779,7 @@ class FittingWindow(QtWidgets.QDialog):
             self._fit_run_state_owner.mark_superseded()
             self._fit_run_state_owner.clear_active_dataset_ids()
             self._set_running_state(False)
-            self._status_label.setText("Fit cancelled")
+            self._set_fit_status("Fit cancelled")
             self._refresh_project_apply_controls(prefer_broadest=True, running=False)
             return
         self._clear_failed_run_visual_state()
@@ -3705,14 +3791,8 @@ class FittingWindow(QtWidgets.QDialog):
         if has_stack_trace:
             logger.warning("%s", stack_trace)
         if message and self.isVisible() and not self._closing:
-            dialog = QtWidgets.QMessageBox(self)
-            dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-            dialog.setWindowTitle("Fitting")
-            dialog.setText(message)
-            dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
-            dialog.setDetailedText(stack_trace if has_stack_trace else "")
-            dialog.exec()
-        self._status_label.setText(message or "Fit error")
+            self._show_diagnostic_warning("Fitting", message, details=stack_trace if has_stack_trace else "")
+        self._set_fit_status(message or "Fit error")
 
     # ------------------------------------------------------------------
     # Plot + stats helpers

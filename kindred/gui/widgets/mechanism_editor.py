@@ -224,7 +224,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_actions_layout.addWidget(self._slider_visibility_picker_btn)
         self._slider_edit_targets_label = make_bounded_label(
             "Slider edit targets: none",
-            max_width=360,
+            max_width=240,
         )
         self._slider_edit_targets_label.setToolTip("The set whose initial conditions are controlled by concentration sliders")
         target_font = self._slider_edit_targets_label.font()
@@ -452,10 +452,14 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         return self._species_sliders
 
     def set_slider_edit_targets_summary(self, text: str) -> None:
+        summary = str(text or "Slider edit targets: none")
+        base_tooltip = "The set whose initial conditions are controlled by concentration sliders"
+        tooltip = base_tooltip if summary == "Slider edit targets: none" else f"{base_tooltip}\n\n{summary}"
         set_bounded_label_text(
             self._slider_edit_targets_label,
-            str(text or "Slider edit targets: none"),
-            max_width=360,
+            summary,
+            max_width=240,
+            tooltip_text=tooltip,
         )
 
     def detach_slider_pane_for_dock(self) -> QtWidgets.QWidget:
@@ -635,11 +639,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         """
         self._current_validation_state = state
         self.validationStateChanged.emit(str(state))
-        self._run_btn.setToolTip(
-            "Run simulation for the current run target from Initial Conditions"
-            if state == "valid"
-            else "No valid mechanism \u2014 enter a valid reaction mechanism to enable"
-        )
+        if state == "valid":
+            run_tooltip = "Run simulation for the current run target from Initial Conditions"
+        elif state == "draft":
+            run_tooltip = "Mechanism edits are still a draft — lock/apply the mechanism before running."
+        elif state == "validating":
+            run_tooltip = "Mechanism validation is still running."
+        else:
+            run_tooltip = "No valid mechanism — enter a valid reaction mechanism to enable"
+        self._run_btn.setToolTip(run_tooltip)
 
         if state == "idle":
             self._set_validation_label_text("")

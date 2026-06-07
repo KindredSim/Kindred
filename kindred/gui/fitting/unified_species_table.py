@@ -18,6 +18,7 @@ from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
 from kindred.core.datasets.observation_payload import copy_observations_map, dense_view_from_observations
 from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
+from kindred.gui.display_name_policy import STATUS_ITEM_LABEL_MAX_CHARS, summarize_named_count
 
 logger = logging.getLogger(__name__)
 
@@ -1048,10 +1049,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         current = str(getattr(self, "_current_dataset_id", "") or "").strip()
         target_error: Optional[str] = None
         if current and current in invalid_pending:
-            label = self._dataset_label_getter(current)
+            label = str(self._dataset_label_getter(current) or current).strip() or current
             target_error = f"Dataset {label} has no fit targets. Select at least one series or uncheck Use."
         elif current and current in invalid_pending_weights:
-            label = self._dataset_label_getter(current)
+            label = str(self._dataset_label_getter(current) or current).strip() or current
             target_error = f"Dataset {label} has invalid target weights. Use finite values > 0."
 
         if target_error:
@@ -1062,12 +1063,23 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._footer.set_error(None)
 
         if invalid_applied:
-            labels = [self._dataset_label_getter(ds_id) for ds_id in sorted(invalid_applied)]
-            joined = ", ".join(labels)
-            message = (
-                f"Run Fit disabled: {joined} has no applied fit targets. Select targets and Apply, or uncheck Use."
+            def _identity(ds_id: str) -> str:
+                label = str(self._dataset_label_getter(ds_id) or ds_id).strip() or ds_id
+                return f"{label} [{ds_id}]" if label != ds_id else ds_id
+
+            summary = summarize_named_count(
+                [_identity(ds_id) for ds_id in sorted(invalid_applied)],
+                singular="dataset",
+                item_max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
             )
-            self._footer.set_secondary_error(message)
+            message = (
+                f"Run Fit disabled: {summary.display} has no applied fit targets. Select targets and Apply, or uncheck Use."
+            )
+            tooltip = (
+                f"Run Fit disabled: {summary.full}\n\n"
+                "No applied fit targets. Select targets and Apply, or uncheck Use."
+            )
+            self._footer.set_secondary_error(message, tooltip_text=tooltip)
         else:
             self._footer.set_secondary_error(None)
 
