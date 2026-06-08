@@ -12,6 +12,9 @@ import math
 import re
 from typing import Callable, Mapping, Tuple
 
+from kindred.core.equilibrium_rate_authority import public_text_equilibrium_role_editable
+from kindred.core.runtime_defaults import WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT
+
 from .step_constraint_authority import (
     StepConstraintAuthorityAnalysis,
     StepConstraintAuthorityError,
@@ -24,7 +27,7 @@ from .step_constraint_authority import (
 AUTHORITATIVE_PARAMETER_SIG_DIGITS = 15
 _STEP_PARAMETER_RE = re.compile(r"^(kf|kr|Keq|k)\d+$")
 _STEP_PARAMETER_FLOOR = 1e-12
-_EQUILIBRIUM_K_ALIAS_LOWER = frozenset({"keq", "k_eq"})
+_EQUILIBRIUM_K_ALIAS_LOWER = frozenset({"keq"})
 _STEP_TOKEN_CANONICAL_ALIASES = {
     "a": "A",
     "ea": "Ea",
@@ -111,9 +114,14 @@ def _normalized_step_constraint_context_values(context: Mapping[str, object] | N
             temperature_K = float(context.get("temperature_K", temperature_K))
         except (TypeError, ValueError):
             temperature_K = 298.15
-        wegscheider_enabled = bool(context.get("wegscheider_cyclicity_enabled", False))
+        wegscheider_enabled = bool(
+            context.get(
+                "wegscheider_cyclicity_enabled",
+                WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+            )
+        )
     else:
-        wegscheider_enabled = False
+        wegscheider_enabled = bool(WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT)
     return float(temperature_K), bool(wegscheider_enabled)
 
 
@@ -217,16 +225,24 @@ def _dedupe_tokens_case_insensitive(tokens: list[list[str]]) -> list[list[str]]:
 
 def _is_equilibrium_k_token(key: object) -> bool:
     key_str = str(key).strip()
-    return key_str == "K" or key_str.lower() in _EQUILIBRIUM_K_ALIAS_LOWER
+    return key_str.lower() in _EQUILIBRIUM_K_ALIAS_LOWER
+
+
+def _is_legacy_equilibrium_constant_token(key: object) -> bool:
+    key_str = str(key).strip()
+    return key_str == "K" or key_str.lower() == "k_eq"
 
 
 def _token_matches_alias(key: object, alias: str) -> bool:
+    key_str = str(key).strip()
     if str(alias) == "Keq":
         return _is_equilibrium_k_token(key)
     alias_str = str(alias)
     if _is_equilibrium_k_token(key):
         return False
-    return str(key).strip().lower() == alias_str.lower()
+    if key_str == "K" and alias_str.lower() == "k":
+        return False
+    return key_str.lower() == alias_str.lower()
 
 
 def _canonical_step_token_key_for_duplicate_check(key: object) -> str | None:
@@ -456,12 +472,11 @@ def _normalize_rate_value(value: float) -> float:
 
 
 def _derive_equilibrium_role_from_tokens(tokens: list[list[str]]) -> str:
-    if not _has_token_alias(tokens, ("Keq",)):
+    if not (
+        _has_token_alias(tokens, ("Keq",))
+        or _has_token_alias(tokens, ("dG_eq",))
+    ):
         return ""
-    user_kf_explicit = _has_token_alias(tokens, ("kf", "k"))
-    user_kr_explicit = _has_token_alias(tokens, ("kr",))
-    if user_kr_explicit and not user_kf_explicit:
-        return "kf"
     return "kr"
 
 
@@ -497,12 +512,6 @@ def _current_effective_step_value(
         kf_val = _coerce_optional_float(_get_token_float(tokens, ("kf", "k"), None))
         if kf_val is not None:
             return _normalize_rate_value(kf_val)
-        if has_explicit_k:
-            kr_val = _coerce_optional_float(_get_token_float(tokens, ("kr",), None))
-            k_val = _coerce_optional_float(_get_token_float(tokens, ("Keq",), None))
-            if kr_val is None or k_val is None:
-                return None
-            return _normalize_rate_value(kr_val * _normalize_k_value(k_val))
         return None
     if family == "kr":
         kr_val = _coerce_optional_float(_get_token_float(tokens, ("kr",), None))
@@ -710,6 +719,8 @@ def analyze_step_parameter_update(
     _raise_on_duplicate_canonical_step_tokens(tokens)
     tokens = _dedupe_tokens_case_insensitive(tokens)
     has_explicit_k = _has_token_alias(tokens, ("Keq",))
+    has_dG_eq = _has_token_alias(tokens, ("dG_eq",))
+    has_kr = _has_token_alias(tokens, ("kr",))
     derive_rate = _derive_equilibrium_role(tokens, step_index=step_index, step_metadata=step_metadata)
     current_step_constraints = current_text_context.step_constraint_reasons
     current_effective = _current_effective_step_value(family, tokens, has_explicit_k=has_explicit_k)
@@ -729,13 +740,12 @@ def analyze_step_parameter_update(
     elif non_k_block_reason:
         writable = False
         warning_reason = "target_unwritable"
-    elif family == "Keq" and not has_explicit_k:
-        writable = False
-        warning_reason = "target_unwritable"
-    elif family == "kf" and has_explicit_k and derive_rate == "kf":
-        writable = False
-        warning_reason = "target_unwritable"
-    elif family == "kr" and has_explicit_k and derive_rate == "kr":
+    elif not public_text_equilibrium_role_editable(
+        has_kr=has_kr,
+        has_Keq=has_explicit_k,
+        has_dG_eq=has_dG_eq,
+        role=family,
+    ):
         writable = False
         warning_reason = "target_unwritable"
 
@@ -809,6 +819,9 @@ def analyze_step_parameter_update(
             else:
                 _set_token_float(working_tokens, "kr", kr_value, aliases=("kr",))
             k_value = normalized_k
+        elif has_dG_eq:
+            _remove_token_aliases(working_tokens, ("kr",))
+            kr_value = None
         else:
             if not kr_valid:
                 kr_value = max(kf_value, _STEP_PARAMETER_FLOOR)
@@ -995,7 +1008,7 @@ def analyze_parameter_updates_to_dsl_text(
             continue
 
         escaped_name = re.escape(name)
-        pattern_toplevel = rf"^\s*{escaped_name}\s*=\s*(?P<value>[^\n#;]+)"
+        pattern_toplevel = rf"^\s*param\s+{escaped_name}\s*=\s*(?P<value>[^\n#;]+)"
         pattern_inline = rf"(?<=[;,])\s*{escaped_name}\s*=\s*(?P<value>[^,\n#]+)"
 
         matches_toplevel = list(re.finditer(pattern_toplevel, updated_text, re.MULTILINE))
@@ -1085,7 +1098,7 @@ def apply_parameter_updates_to_dsl_text(
             continue
 
         escaped_name = re.escape(name)
-        pattern_toplevel = rf"^\s*{escaped_name}\s*=\s*(?P<value>[^\n#;]+)"
+        pattern_toplevel = rf"^\s*param\s+{escaped_name}\s*=\s*(?P<value>[^\n#;]+)"
         pattern_inline = rf"(?<=[;,])\s*{escaped_name}\s*=\s*(?P<value>[^,\n#]+)"
 
         matches_toplevel = list(re.finditer(pattern_toplevel, updated_text, re.MULTILINE))

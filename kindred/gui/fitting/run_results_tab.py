@@ -15,7 +15,12 @@ import numpy as np
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
+from kindred.core.analysis.global_fit_projection import (
+    FitRenderDatasetProjection,
+    FitRenderProjection,
+)
 from kindred.gui.widgets.grid_plot_view import GridPlotView
+from kindred.gui.display_name_policy import TAB_LABEL_MAX_CHARS, compact_dataset_label, dataset_alias
 
 if TYPE_CHECKING:
     from kindred.core.analysis.global_fitting import GlobalFitResult
@@ -215,11 +220,6 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             return
         self.statusMessage.emit("Copied stamp JSON")
 
-
-# Keep old name importable for tests that reference it directly.
-RunStampDialog = ResultsSummaryDialog
-
-
 def _as_float_array(values: object) -> np.ndarray:
     try:
         return np.asarray(values, dtype=float).reshape(-1)
@@ -347,10 +347,9 @@ class RunResultsTab(QtWidgets.QWidget):
         self._fit_targets_by_dataset: Dict[str, List[str]] = {}
         self._dataset_plot_views: Dict[str, GridPlotView] = {}
         self._all_datasets_plot_view: Optional[GridPlotView] = None
-        self._latest_model_series_by_dataset: Dict[str, Dict[str, np.ndarray]] = {}
-        self._latest_model_x_by_dataset: Dict[str, np.ndarray] = {}
-        self._latest_dataset_stats_by_dataset: Dict[str, Dict[str, float]] = {}
+        self._render_projection: Optional[FitRenderProjection] = None
         self._stale_plot_view_keys: set[str] = set()
+        self._view_autorange_locked = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -385,9 +384,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_stats = {}
         self._last_fitted_params = {}
         self._last_dataset_fitted_params = {}
-        self._latest_model_series_by_dataset = {}
-        self._latest_model_x_by_dataset = {}
-        self._latest_dataset_stats_by_dataset = {}
+        self._render_projection = None
         self._stale_plot_view_keys.clear()
         self._tracker_panel.clear()
         self._refresh_plot_views(refresh_all=True)
@@ -405,6 +402,16 @@ class RunResultsTab(QtWidgets.QWidget):
         """Clear stored fitted params (e.g. after an invalid/failed fit)."""
         self._last_fitted_params = {}
         self._last_dataset_fitted_params = {}
+
+    def _clear_failed_run_state(
+        self,
+        dataset_entries: Sequence[Dict[str, Any]],
+        fit_targets_by_dataset: Dict[str, Sequence[str]],
+    ) -> None:
+        # Clearing the run stamp is the authoritative reset for summary, tracker,
+        # cached model payloads, and any open summary dialog state.
+        self.set_run_stamp({}, "", "")
+        self.rebuild_subtabs(dataset_entries, fit_targets_by_dataset)
 
     def _dataset_label_for_id(self, dataset_id: str) -> str:
         ds_id = str(dataset_id or "").strip()
@@ -457,8 +464,8 @@ class RunResultsTab(QtWidgets.QWidget):
         result: List[tuple] = []
         for ds_id in ids:
             lbl = raw_labels[ds_id]
-            display = f"{lbl} ({ds_id})" if label_counts[lbl] > 1 else lbl
-            result.append((display, dict(self._last_dataset_fitted_params[ds_id])))
+            display_full = f"{lbl} ({ds_id})" if label_counts[lbl] > 1 else lbl
+            result.append((display_full, dict(self._last_dataset_fitted_params[ds_id])))
         return result
 
     def update_statistics(self, stats: Dict[str, Any]) -> None:
@@ -492,16 +499,19 @@ class RunResultsTab(QtWidgets.QWidget):
         self._dataset_plot_views = {}
         self._dataset_tab_ids = []
 
-        for entry in self._dataset_entries:
+        for index, entry in enumerate(self._dataset_entries):
             ds_id = str(entry.get("id") or "").strip()
             if not ds_id:
                 continue
-            title = str(entry.get("label") or ds_id)
+            full_title = str(entry.get("label") or ds_id)
+            compact_title = compact_dataset_label(full_title, max_chars=TAB_LABEL_MAX_CHARS)
             plot_view = self._create_plot_view(f"global_fit_results_plot_{ds_id}")
             self._dataset_tab_ids.append(ds_id)
             self._dataset_plot_views[ds_id] = plot_view
             self._subtab_stack.addWidget(plot_view)
-            self._subtabs.addTab(title)
+            tab_index = self._subtabs.addTab(compact_title.display)
+            self._subtabs.setTabToolTip(tab_index, compact_title.full)
+            self._subtabs.setTabData(tab_index, {"dataset_id": ds_id, "alias": dataset_alias(index), "full_label": compact_title.full})
 
         self._all_datasets_plot_view = None
         if self._dataset_entries:
@@ -524,16 +534,25 @@ class RunResultsTab(QtWidgets.QWidget):
     ) -> None:
         if update_tracker and any(key in payload for key in ("iteration", "cost", "shared_params")):
             self._tracker_panel.update_from_best(payload)
-        plot_model_series = payload.get("plot_model_series")
-        model_series = plot_model_series if isinstance(plot_model_series, dict) and plot_model_series else (payload.get("model_series") or {})
-        plot_model_x = payload.get("plot_model_x") if isinstance(plot_model_series, dict) and plot_model_series else {}
-        dataset_stats = payload.get("dataset_stats") or {}
-        self._refresh_plot_views(
-            model_series_by_dataset=model_series if isinstance(model_series, dict) else {},
-            model_x_by_dataset=plot_model_x if isinstance(plot_model_x, dict) else {},
-            dataset_stats_by_dataset=dataset_stats if isinstance(dataset_stats, dict) else {},
-            refresh_all=bool(refresh_all),
-        )
+
+    def push_render_projection(
+        self,
+        projection: FitRenderProjection,
+        *,
+        refresh_all: bool = False,
+    ) -> None:
+        self._render_projection = projection
+        self._refresh_plot_views(refresh_all=refresh_all)
+
+    def clear_render_projection(
+        self,
+        dataset_ids: Optional[Sequence[str]] = None,
+        *,
+        refresh_all: bool = True,
+    ) -> None:
+        _ = dataset_ids
+        self._render_projection = None
+        self._refresh_plot_views(refresh_all=refresh_all)
 
     def push_final_result(self, result: "GlobalFitResult", dataset_entries: Sequence[Dict[str, Any]]) -> None:
         current_ids = [str(entry.get("id") or "").strip() for entry in self._dataset_entries]
@@ -552,27 +571,10 @@ class RunResultsTab(QtWidgets.QWidget):
             for ds_id, vals in raw_ds_params.items()
             if isinstance(vals, dict) and vals
         }
-        dataset_stats = {
-            str(info.dataset_id): {
-                "chi_squared": float(info.chi_squared),
-                "r_squared": float(info.r_squared),
-            }
-            for info in (getattr(result, "dataset_info", None) or [])
-        }
-        plot_series = getattr(result, "plot_model_series", None) or {}
-        use_plot_x = bool(isinstance(plot_series, dict) and plot_series)
-        model_series = plot_series if use_plot_x else (getattr(result, "model_series", None) or {})
-        model_x_by_dataset = (getattr(result, "plot_model_x", None) or {}) if use_plot_x else {}
         self._tracker_panel.update_final(
             iteration=int(getattr(result, "nfev", 0)),
             cost=_objective_cost_from_result(result),
             shared_params=dict(getattr(result, "shared_params", {}) or {}),
-        )
-        self._refresh_plot_views(
-            model_series_by_dataset=model_series if isinstance(model_series, dict) else {},
-            model_x_by_dataset=model_x_by_dataset if isinstance(model_x_by_dataset, dict) else {},
-            dataset_stats_by_dataset=dataset_stats,
-            refresh_all=True,
         )
 
     def clear(self) -> None:
@@ -581,9 +583,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._fit_targets_by_dataset = {}
         self._dataset_plot_views = {}
         self._all_datasets_plot_view = None
-        self._latest_model_series_by_dataset = {}
-        self._latest_model_x_by_dataset = {}
-        self._latest_dataset_stats_by_dataset = {}
+        self._render_projection = None
         self._last_fitted_params = {}
         self._last_dataset_fitted_params = {}
         self._stale_plot_view_keys.clear()
@@ -591,10 +591,11 @@ class RunResultsTab(QtWidgets.QWidget):
         self._clear_subtabs()
 
     def set_view_autorange_locked(self, running: bool) -> None:
+        self._view_autorange_locked = bool(running)
         for plot_view in list(self._dataset_plot_views.values()):
-            plot_view.set_autorange_locked(bool(running))
+            plot_view.set_autorange_locked(self._view_autorange_locked)
         if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.set_autorange_locked(bool(running))
+            self._all_datasets_plot_view.set_autorange_locked(self._view_autorange_locked)
 
     def set_dark_mode(self, enabled: bool) -> None:
         self._dark_mode = bool(enabled)
@@ -622,34 +623,14 @@ class RunResultsTab(QtWidgets.QWidget):
         plot_view.setObjectName(object_name)
         plot_view.set_controls_visible(False)
         plot_view.set_dark_mode(self._dark_mode)
+        plot_view.set_autorange_locked(self._view_autorange_locked)
         return plot_view
 
     def _refresh_plot_views(
         self,
         *,
-        model_series_by_dataset: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
-        model_x_by_dataset: Optional[Dict[str, np.ndarray]] = None,
-        dataset_stats_by_dataset: Optional[Dict[str, Dict[str, float]]] = None,
         refresh_all: bool = True,
     ) -> None:
-        self._latest_model_series_by_dataset = {
-            str(ds_id): {
-                str(name): _as_float_array(values)
-                for name, values in (series or {}).items()
-            }
-            for ds_id, series in (model_series_by_dataset or {}).items()
-            if isinstance(series, dict)
-        }
-        self._latest_model_x_by_dataset = {
-            str(ds_id): _as_float_array(values)
-            for ds_id, values in (model_x_by_dataset or {}).items()
-        }
-        self._latest_dataset_stats_by_dataset = {
-            str(ds_id): dict(stats)
-            for ds_id, stats in (dataset_stats_by_dataset or {}).items()
-            if isinstance(stats, dict)
-        }
-
         plot_keys = self._all_plot_view_keys()
         if refresh_all:
             for key in plot_keys:
@@ -720,6 +701,17 @@ class RunResultsTab(QtWidgets.QWidget):
                 return entry
         return None
 
+    def _render_projection_for_dataset(self, dataset_id: str) -> Optional[FitRenderDatasetProjection]:
+        projection = self._render_projection
+        if not isinstance(projection, FitRenderProjection):
+            return None
+        dataset_projection = projection.datasets.get(str(dataset_id or "").strip())
+        if not isinstance(dataset_projection, FitRenderDatasetProjection):
+            return None
+        if dataset_projection.status != "ok":
+            return None
+        return dataset_projection
+
     def _refresh_plot_view_for_key(self, key: str) -> None:
         if key == self._ALL_DATASETS_TAB_KEY:
             plot_view = self._all_datasets_plot_view
@@ -734,9 +726,7 @@ class RunResultsTab(QtWidgets.QWidget):
                 payload = self._build_grid_dataset_payload(
                     entry,
                     self._fit_targets_by_dataset.get(ds_id, []),
-                    model_series=self._latest_model_series_by_dataset.get(ds_id),
-                    model_x=self._latest_model_x_by_dataset.get(ds_id),
-                    dataset_stats=self._latest_dataset_stats_by_dataset.get(ds_id),
+                    dataset_projection=self._render_projection_for_dataset(ds_id),
                 )
                 if payload is None:
                     continue
@@ -753,9 +743,7 @@ class RunResultsTab(QtWidgets.QWidget):
         payload = self._build_grid_dataset_payload(
             entry,
             self._fit_targets_by_dataset.get(key, []),
-            model_series=self._latest_model_series_by_dataset.get(key),
-            model_x=self._latest_model_x_by_dataset.get(key),
-            dataset_stats=self._latest_dataset_stats_by_dataset.get(key),
+            dataset_projection=self._render_projection_for_dataset(key),
         )
         species_names = sorted((payload or {}).get("all_species", {}).keys())
         plot_view.set_datasets([payload] if payload is not None else [])
@@ -773,42 +761,47 @@ class RunResultsTab(QtWidgets.QWidget):
         entry: Dict[str, Any],
         fitted_species_list: Sequence[str],
         *,
-        model_series: Optional[Dict[str, np.ndarray]],
-        model_x: Optional[np.ndarray],
-        dataset_stats: Optional[Dict[str, float]],
+        dataset_projection: Optional[FitRenderDatasetProjection] = None,
     ) -> Optional[Dict[str, Any]]:
         species_data = entry.get("species_data") or entry.get("species") or {}
         if not isinstance(species_data, dict):
             return None
-        fitted_species = sorted(
+        requested_species = sorted(
             [
                 str(name).strip()
                 for name in fitted_species_list
                 if str(name).strip() and str(name).strip() in species_data
             ]
         )
+        if dataset_projection is not None:
+            source_species_data = dict(dataset_projection.observed_series)
+            fitted_species = [
+                name
+                for name in requested_species
+                if name in source_species_data
+            ]
+            if not fitted_species:
+                fitted_species = sorted(str(name) for name in source_species_data if str(name))
+        else:
+            source_species_data = species_data
+            fitted_species = list(requested_species)
         if not fitted_species:
             return None
-
         all_species = {
-            name: _as_float_array(species_data.get(name))
+            name: _as_float_array(source_species_data.get(name))
             for name in fitted_species
         }
         current_species = fitted_species[0]
-        data_x = _as_float_array(entry.get("x_obs", entry.get("t")))
+        data_x = (
+            dataset_projection.observed_x_for_species(current_species)
+            if dataset_projection is not None
+            else _as_float_array(entry.get("x_obs", entry.get("t")))
+        )
         data_y = all_species.get(current_species, np.asarray([], dtype=float))
-        filtered_model_series = None
-        if isinstance(model_series, dict):
-            filtered_model_series = {
-                name: _as_float_array(values)
-                for name, values in model_series.items()
-                if str(name).strip() in all_species
-            }
-            if not filtered_model_series:
-                filtered_model_series = None
         chi_squared = None
         r_squared = None
-        if isinstance(dataset_stats, dict):
+        if dataset_projection is not None:
+            dataset_stats = dict(dataset_projection.dataset_stats)
             try:
                 chi_squared = float(dataset_stats.get("chi_squared")) if dataset_stats.get("chi_squared") is not None else None
             except Exception:
@@ -818,17 +811,31 @@ class RunResultsTab(QtWidgets.QWidget):
             except Exception:
                 r_squared = None
         x_name = str(entry.get("x_name") or "t").strip() or "t"
+        x_label = (
+            dataset_projection.observed_x_label
+            if dataset_projection is not None
+            else ("Time" if x_name == "t" else x_name)
+        )
+        entry_id = str(entry.get("id") or "").strip()
+        entry_index = 0
+        try:
+            entry_index = next(
+                i for i, candidate in enumerate(self._dataset_entries)
+                if str(candidate.get("id") or "").strip() == entry_id
+            )
+        except Exception:
+            entry_index = 0
+        full_name = str(entry.get("label") or entry.get("id") or "")
         return {
-            "name": str(entry.get("label") or entry.get("id") or ""),
+            "name": dataset_alias(entry_index),
+            "full_name": full_name,
             "data_x": data_x,
             "data_y": data_y,
-            "model_x": _as_float_array(model_x) if model_x is not None else None,
-            "model_y": None if filtered_model_series is None else filtered_model_series.get(current_species),
-            "model_series": filtered_model_series,
+            "fit_render_projection": dataset_projection,
             "chi_squared": chi_squared,
             "r_squared": r_squared,
             "all_species": all_species,
             "current_species": current_species,
-            "x_label": "Time" if x_name == "t" else x_name,
+            "x_label": x_label,
             "x_units": "s" if x_name == "t" else None,
         }

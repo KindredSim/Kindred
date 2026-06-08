@@ -1,10 +1,5 @@
-"""
-Authoritative core API modules.
-
-These modules define supported import surfaces for callers that should not depend
-on deeper implementation module paths.
-"""
+"""Authoritative core API modules."""
 
 from __future__ import annotations
 
-__all__ = ["fitting", "simulation"]
+__all__ = ["simulation"]

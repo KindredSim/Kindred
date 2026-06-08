@@ -5,6 +5,7 @@ from typing import Optional, Sequence, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
+from kindred.gui.display_name_policy import STATUS_ITEM_LABEL_MAX_CHARS, compact_set_label
 
 __all__ = [
     "BatchInitialConditionsTableModel",
@@ -13,18 +14,22 @@ __all__ = [
 
 
 _INVALID_BRUSH = QtGui.QBrush(QtGui.QColor(255, 210, 210))
+_MAX_SET_NAME_COLUMN_WIDTH = 220
+_MAX_SPECIES_COLUMN_WIDTH = 160
 
 
 class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
     showMembershipChanged = QtCore.Signal()
     sliderEditTargetsChanged = QtCore.Signal()
+    canonicalInitialsChanged = QtCore.Signal(object, str, bool)
+    initialRowsEdited = QtCore.Signal(object, str, bool)
 
     def __init__(self, store: BatchInitialConditionsStore, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
         self._store = store
         self._invalid: set[Tuple[int, str]] = set()
         self._slider_edit_target_set_ids: list[str] = []
-        self._focused_effective_edit_target_set_id = ""
+        self._active_effective_edit_target_set_id = ""
 
     def store(self) -> BatchInitialConditionsStore:
         return self._store
@@ -54,7 +59,8 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 continue
             normalized.append(set_id_s)
         before_ids = self.slider_edit_target_set_ids()
-        if normalized == before_ids:
+        slider_changed = normalized != before_ids
+        if not slider_changed:
             return False
         self._slider_edit_target_set_ids = list(normalized)
         changed_ids = set(before_ids) | set(normalized)
@@ -67,20 +73,20 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         self.sliderEditTargetsChanged.emit()
         return True
 
-    def focused_effective_edit_target_set_id(self) -> str:
+    def active_effective_edit_target_set_id(self) -> str:
         valid_ids = set(self._store.set_ids())
-        focused_set_id = str(self._focused_effective_edit_target_set_id or "").strip()
-        return focused_set_id if focused_set_id in valid_ids else ""
+        active_set_id = str(self._active_effective_edit_target_set_id or "").strip()
+        return active_set_id if active_set_id in valid_ids else ""
 
-    def set_focused_effective_edit_target_set_id(self, set_id: str | None) -> bool:
+    def set_active_effective_edit_target_set_id(self, set_id: str | None) -> bool:
         valid_ids = set(self._store.set_ids())
         normalized = str(set_id or "").strip()
         if normalized not in valid_ids:
             normalized = ""
-        before = self.focused_effective_edit_target_set_id()
+        before = self.active_effective_edit_target_set_id()
         if normalized == before:
             return False
-        self._focused_effective_edit_target_set_id = normalized
+        self._active_effective_edit_target_set_id = normalized
         changed_ids = {sid for sid in (before, normalized) if sid}
         changed_rows = [
             int(row)
@@ -90,15 +96,67 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         self._emit_checkbox_column_change(self.edit_target_column(), changed_rows)
         return True
 
-    def shown_set_ids(self) -> list[str]:
-        return [str(set_id) for set_id in self._store.shown_set_ids()]
+    def _normalized_existing_set_ids(self, affected_set_ids: Sequence[str]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        valid_ids = set(self._store.set_ids())
+        for set_id in affected_set_ids or ():
+            set_id_s = str(set_id or "").strip()
+            if not set_id_s or set_id_s in seen or set_id_s not in valid_ids:
+                continue
+            seen.add(set_id_s)
+            normalized.append(set_id_s)
+        return tuple(normalized)
 
-    def set_row_shown(self, row: int, shown: bool) -> bool:
+    def emit_canonical_initials_changed(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        transition_source: str,
+        discard_dirty_preview: bool = True,
+    ) -> None:
+        normalized = self._normalized_existing_set_ids(affected_set_ids)
+        if not normalized:
+            return
+        self.canonicalInitialsChanged.emit(
+            tuple(normalized),
+            str(transition_source or "batch_initials_table_edit"),
+            bool(discard_dirty_preview),
+        )
+
+    def emit_initial_rows_edited(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        transition_source: str,
+        discard_dirty_preview: bool = True,
+    ) -> None:
+        """Emit a lightweight edit notification for user table edits.
+
+        The table model should report local data mutations; higher-level
+        controllers decide when a debounced edit becomes a runtime identity
+        transition.  ``canonicalInitialsChanged`` is retained for deliberate
+        programmatic changes that already represent a canonical-table update.
+        """
+        normalized = self._normalized_existing_set_ids(affected_set_ids)
+        if not normalized:
+            return
+        self.initialRowsEdited.emit(
+            tuple(normalized),
+            str(transition_source or "batch_initials_table_edit"),
+            bool(discard_dirty_preview),
+        )
+
+    def requested_show_set_ids(self) -> list[str]:
+        return [str(set_id) for set_id in self._store.requested_show_set_ids()]
+
+    def set_row_requested_show(self, row: int, requested_show: bool) -> bool:
         row_i = int(row)
-        shown_b = bool(shown)
-        if self._store.is_shown(row_i) == shown_b:
+        requested_show_b = bool(requested_show)
+        show_changed = self._store.is_requested_show(row_i) != requested_show_b
+        if not show_changed:
             return False
-        self._store.set_shown(row_i, shown_b)
+        self._store.set_requested_show(row_i, requested_show_b)
         self._emit_checkbox_column_change(self.show_column(), [row_i])
         self.showMembershipChanged.emit()
         return True
@@ -126,7 +184,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         if not set_id:
             return False
         return (
-            set_id == self.focused_effective_edit_target_set_id()
+            set_id == self.active_effective_edit_target_set_id()
             and set_id not in set(self.slider_edit_target_set_ids())
         )
 
@@ -152,7 +210,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             if section == self.edit_target_column():
                 return "Slider"
             if section == self.show_column():
-                return "Show"
+                return "Plot"
             return ""
         return str(section + 1)
 
@@ -174,16 +232,19 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 set_id = self._store.set_id_for_row(row)
                 return QtCore.Qt.Checked if str(set_id) in self.slider_edit_target_set_ids() else QtCore.Qt.Unchecked
             if col == self.show_column():
-                return QtCore.Qt.Checked if self._store.is_shown(row) else QtCore.Qt.Unchecked
+                return QtCore.Qt.Checked if self._store.is_requested_show(row) else QtCore.Qt.Unchecked
 
         if role in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
             if col == self.edit_target_column():
-                return "focus" if self._is_temporarily_focus_target_row(row) else ""
+                return "active" if self._is_temporarily_focus_target_row(row) else ""
             if col == self.show_column():
                 return ""
             if col == 0:
                 names = self._store.set_names()
-                return names[row] if 0 <= row < len(names) else ""
+                full_name = names[row] if 0 <= row < len(names) else ""
+                if role == QtCore.Qt.EditRole:
+                    return full_name
+                return compact_set_label(full_name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display
             species = self._store.visible_species()
             if 0 <= col - 1 < len(species):
                 return self._store.get_value(row, species[col - 1])
@@ -200,10 +261,10 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 return self.data(index, QtCore.Qt.DisplayRole)
             if col == self.edit_target_column():
                 if self._is_temporarily_focus_target_row(row):
-                    return "Focused row is temporarily included in slider edit scope."
-                return "Select which set the interactive sliders control"
+                    return "Active set is used while no slider pins are selected."
+                return "Select which set the interactive sliders control."
             if col == self.show_column():
-                return "Show or hide this set's curves on the plot"
+                return "Plot this set when cached or completed results are available."
             return None
 
         if role == QtCore.Qt.ForegroundRole and col == self.edit_target_column():
@@ -243,7 +304,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 next_ids.append(str(set_id))
             return self.set_slider_edit_target_set_ids(next_ids)
         if int(column) == self.show_column():
-            return self.set_row_shown(int(row), bool(checked))
+            return self.set_row_requested_show(int(row), bool(checked))
         return False
 
     def setData(self, index: QtCore.QModelIndex, value, role: int = QtCore.Qt.EditRole) -> bool:  # noqa: N802
@@ -270,7 +331,11 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         if not (0 <= col - 1 < len(species)):
             return False
         sp = species[col - 1]
-        self._store.set_value(row, sp, str(value))
+        current_value = self._store.get_value(row, sp)
+        next_value = str(value)
+        if current_value == next_value:
+            return True
+        self._store.set_value(row, sp, next_value)
 
         invalid_now = self._store.validate_numeric_cells(rows=[row])
         if (row, sp) in invalid_now:
@@ -278,6 +343,11 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         else:
             self._invalid.discard((row, sp))
         self.dataChanged.emit(index, index, [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole])
+        self.emit_initial_rows_edited(
+            affected_set_ids=(str(self._store.set_id_for_row(int(row)) or ""),),
+            transition_source="batch_initials_table_edit",
+            discard_dirty_preview=True,
+        )
         return True
 
     def reset_invalid(self) -> None:
@@ -292,7 +362,8 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         self.beginResetModel()
         try:
             self._store.set_species(species_names)
-            self._invalid.clear()
+            all_rows = list(range(int(self._store.row_count())))
+            self._invalid = self._store.validate_numeric_cells(rows=all_rows) if all_rows else set()
         finally:
             self.endResetModel()
 
@@ -317,6 +388,21 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             self.dataChanged.emit(top_left, bottom_right, [QtCore.Qt.BackgroundRole])
         return set(invalid_for_rows)
 
+    def notify_rows_changed(self, rows: Sequence[int]) -> None:
+        rows_int = [int(row) for row in (rows or [])]
+        rows_int = sorted({row for row in rows_int if 0 <= row < int(self.rowCount())})
+        if not rows_int:
+            return
+        if self._base_column_count() > 1:
+            self.validate_rows(rows_int)
+        top_left = self.index(min(rows_int), 0)
+        bottom_right = self.index(max(rows_int), max(0, int(self.columnCount()) - 1))
+        self.dataChanged.emit(
+            top_left,
+            bottom_right,
+            [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
+        )
+
 
 class BatchInitialConditionsTableView(QtWidgets.QTableView):
     pasteError = QtCore.Signal(str)
@@ -324,11 +410,11 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._pressed_checkbox_index = QtCore.QModelIndex()
+        self._user_current_change_depth = 0
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
-            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
             | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
         )
         self.horizontalHeader().setStretchLastSection(False)
@@ -346,6 +432,35 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             model.modelReset.connect(self._apply_column_presentation)
         self._apply_column_presentation()
 
+    def current_change_is_user_initiated(self) -> bool:
+        return self._user_current_change_depth > 0
+
+    def commit_active_editor(self) -> None:
+        """Commit an in-place editor before external actions read the store.
+
+        Run/Apply buttons live outside the table, so a click can arrive while a
+        delegate editor still owns the newest text.  This method deliberately
+        keeps that concern inside the table view instead of forcing controllers
+        to know delegate/editor details.
+        """
+        editor = QtWidgets.QApplication.focusWidget()
+        if editor is None or not self.isAncestorOf(editor):
+            return
+        try:
+            self.commitData(editor)
+        except (RuntimeError, AttributeError, TypeError):
+            return
+        try:
+            self.closeEditor(editor, QtWidgets.QAbstractItemDelegate.EndEditHint.NoHint)
+        except (RuntimeError, AttributeError, TypeError):
+            pass
+
+    def _begin_user_current_change(self) -> None:
+        self._user_current_change_depth += 1
+
+    def _end_user_current_change(self) -> None:
+        self._user_current_change_depth = max(0, self._user_current_change_depth - 1)
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
         control_index = self._control_index_at_event(event)
         if control_index is not None:
@@ -353,7 +468,11 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             event.accept()
             return
         self._pressed_checkbox_index = QtCore.QModelIndex()
-        super().mousePressEvent(event)
+        self._begin_user_current_change()
+        try:
+            super().mousePressEvent(event)
+        finally:
+            self._end_user_current_change()
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
         control_index = self._control_index_at_event(event)
@@ -375,13 +494,21 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             self._pressed_checkbox_index = QtCore.QModelIndex()
             event.accept()
             return
-        super().mouseDoubleClickEvent(event)
+        self._begin_user_current_change()
+        try:
+            super().mouseDoubleClickEvent(event)
+        finally:
+            self._end_user_current_change()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: N802
         if event.matches(QtGui.QKeySequence.Paste):
             self._handle_paste()
             return
-        super().keyPressEvent(event)
+        self._begin_user_current_change()
+        try:
+            super().keyPressEvent(event)
+        finally:
+            self._end_user_current_change()
 
     def _apply_column_presentation(self) -> None:
         model = self.model()
@@ -417,6 +544,10 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             self.resizeColumnToContents(column)
             if column == 0 and self.columnWidth(column) < set_name_min:
                 self.setColumnWidth(column, set_name_min)
+            max_width = _MAX_SET_NAME_COLUMN_WIDTH if column == 0 else _MAX_SPECIES_COLUMN_WIDTH
+            if self.columnWidth(column) > max_width:
+                self.setColumnWidth(column, max_width)
+        self.horizontalHeader().setMaximumSectionSize(_MAX_SET_NAME_COLUMN_WIDTH)
 
     def _control_index_at_event(self, event: QtGui.QMouseEvent) -> QtCore.QModelIndex | None:
         if event.button() != QtCore.Qt.LeftButton:
@@ -469,6 +600,22 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         impacted_rows = sorted({int(r) for r, _c in changed})
         model.validate_rows(impacted_rows)
 
-        top_left = model.index(min(r for r, _c in changed), min(c for _r, c in changed))
-        bottom_right = model.index(max(r for r, _c in changed), max(c for _r, c in changed))
-        model.dataChanged.emit(top_left, bottom_right, [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole])
+        affected_set_ids: list[str] = []
+        for row, column in changed:
+            changed_index = model.index(int(row), int(column))
+            if changed_index.isValid():
+                model.dataChanged.emit(
+                    changed_index,
+                    changed_index,
+                    [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
+                )
+            if int(column) == 0:
+                continue
+            set_id = str(store.set_id_for_row(int(row)) or "").strip()
+            if set_id and set_id not in affected_set_ids:
+                affected_set_ids.append(set_id)
+        model.emit_initial_rows_edited(
+            affected_set_ids=tuple(affected_set_ids),
+            transition_source="batch_initials_table_paste",
+            discard_dirty_preview=True,
+        )

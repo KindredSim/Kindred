@@ -92,29 +92,59 @@ class ImportConfigDialog(QtWidgets.QDialog):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
+        self._top_workspace = QtWidgets.QWidget(self)
+        self._top_workspace.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        top_workspace_lay = QtWidgets.QVBoxLayout(self._top_workspace)
+        top_workspace_lay.setContentsMargins(0, 0, 0, 0)
+        top_workspace_lay.setSpacing(8)
+        self._top_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical, self._top_workspace)
+        self._top_splitter.setChildrenCollapsible(False)
+        top_workspace_lay.addWidget(self._top_splitter)
+        layout.addWidget(self._top_workspace)
+
         # --- Sheet selector (Excel only) ---
-        self._sheet_section = QtWidgets.QWidget(self)
+        self._sheet_section = QtWidgets.QWidget(self._top_splitter)
         sheet_lay = QtWidgets.QVBoxLayout(self._sheet_section)
         sheet_lay.setContentsMargins(0, 0, 0, 0)
-        sheet_header = QtWidgets.QLabel("<b>Sheets</b>", self)
-        sheet_lay.addWidget(sheet_header)
-        self._sheet_list = QtWidgets.QListWidget(self)
-        self._sheet_list.setMaximumHeight(90)
+        sheet_header_row = QtWidgets.QHBoxLayout()
+        sheet_header = QtWidgets.QLabel("<b>Sheets</b>", self._sheet_section)
+        sheet_header_row.addWidget(sheet_header)
+        sheet_header_row.addStretch(1)
+        self._btn_select_all = QtWidgets.QPushButton("Select all", self._sheet_section)
+        self._btn_invert_sheets = QtWidgets.QPushButton("Invert selection", self._sheet_section)
+        self._btn_select_compatible = QtWidgets.QPushButton("Select compatible sheets", self._sheet_section)
+        sheet_header_row.addWidget(self._btn_select_all)
+        sheet_header_row.addWidget(self._btn_invert_sheets)
+        sheet_header_row.addWidget(self._btn_select_compatible)
+        sheet_lay.addLayout(sheet_header_row)
+        self._sheet_list = QtWidgets.QListWidget(self._sheet_section)
+        self._sheet_list.setMinimumHeight(90)
         sheet_lay.addWidget(self._sheet_list)
-        layout.addWidget(self._sheet_section)
         self._sheet_section.setVisible(self._file_type == "excel")
 
         # --- Preview table ---
-        preview_header = QtWidgets.QLabel("<b>Preview</b>", self)
-        layout.addWidget(preview_header)
-        self._preview_table = QtWidgets.QTableWidget(self)
+        self._preview_section = QtWidgets.QWidget(self._top_splitter)
+        preview_lay = QtWidgets.QVBoxLayout(self._preview_section)
+        preview_lay.setContentsMargins(0, 0, 0, 0)
+        preview_lay.setSpacing(8)
+        preview_header = QtWidgets.QLabel("<b>Preview</b>", self._preview_section)
+        preview_lay.addWidget(preview_header)
+        self._preview_table = QtWidgets.QTableWidget(self._preview_section)
         self._preview_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self._preview_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        layout.addWidget(self._preview_table, 1)
-        self._preview_error_label = QtWidgets.QLabel("", self)
+        preview_lay.addWidget(self._preview_table, 1)
+        self._preview_error_label = QtWidgets.QLabel("", self._preview_section)
         self._preview_error_label.setStyleSheet("QLabel { color: #c00; font-size: 11px; }")
         self._preview_error_label.hide()
-        layout.addWidget(self._preview_error_label)
+        preview_lay.addWidget(self._preview_error_label)
+        self._top_splitter.addWidget(self._sheet_section)
+        self._top_splitter.addWidget(self._preview_section)
+        self._top_splitter.setStretchFactor(0, 0)
+        self._top_splitter.setStretchFactor(1, 1)
+        self._top_splitter.setSizes([110, 240])
 
         # --- Time column ---
         time_row = QtWidgets.QHBoxLayout()
@@ -164,12 +194,16 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._species_layout = QtWidgets.QVBoxLayout(self._species_container)
         self._species_layout.setContentsMargins(0, 0, 0, 0)
         self._species_layout.setSpacing(2)
-        species_scroll = QtWidgets.QScrollArea(self)
-        species_scroll.setWidgetResizable(True)
-        species_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        species_scroll.setWidget(self._species_container)
-        species_scroll.setMaximumHeight(120)
-        layout.addWidget(species_scroll)
+        self._species_scroll = QtWidgets.QScrollArea(self)
+        self._species_scroll.setWidgetResizable(True)
+        self._species_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._species_scroll.setWidget(self._species_container)
+        self._species_scroll.setMinimumHeight(120)
+        self._species_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        layout.addWidget(self._species_scroll, 1)
         self._species_hint = QtWidgets.QLabel("", self)
         self._species_hint.setStyleSheet("QLabel { color: #c00; font-size: 11px; }")
         layout.addWidget(self._species_hint)
@@ -210,12 +244,16 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._btn_import.clicked.connect(self._on_import)
         self._btn_skip.clicked.connect(self._on_skip)
         self._btn_cancel.clicked.connect(self._on_cancel)
+        self._btn_select_all.clicked.connect(self._select_all_sheets)
+        self._btn_invert_sheets.clicked.connect(self._invert_sheet_selection)
+        self._btn_select_compatible.clicked.connect(self._select_compatible_sheets)
         self._time_combo.currentTextChanged.connect(self._on_time_column_changed)
         self._conc_unit_combo.currentTextChanged.connect(lambda _: self._refresh_species_labels())
         self._apply_remaining_cb.toggled.connect(lambda _: self._update_import_enabled())
         if self._file_type == "excel":
             self._sheet_list.itemClicked.connect(self._on_sheet_clicked)
             self._sheet_list.itemChanged.connect(lambda _: self._update_import_enabled())
+        self._update_top_workspace_bounds()
 
     # ------------------------------------------------------------------
     # Preview loading
@@ -668,6 +706,31 @@ class ImportConfigDialog(QtWidgets.QDialog):
             state = self._ensure_sheet_state(sheet_name)
         self._restore_sheet_state(sheet_name, state)
 
+    def _select_all_sheets(self) -> None:
+        self._set_checked_sheets(set(self._sheet_names))
+
+    def _invert_sheet_selection(self) -> None:
+        checked_names = set(self._get_checked_sheet_names())
+        inverted = {
+            self._sheet_list.item(index).text()
+            for index in range(self._sheet_list.count())
+            if self._sheet_list.item(index).text() not in checked_names
+        }
+        self._set_checked_sheets(inverted)
+
+    def _select_compatible_sheets(self) -> None:
+        current_state = self._current_state_from_widgets()
+        required_columns = self._required_columns_for_current_state(current_state)
+        if not required_columns:
+            self._update_import_enabled()
+            return
+        compatible = {
+            sheet_name
+            for sheet_name in self._sheet_names
+            if self._sheet_has_required_columns(sheet_name, required_columns)
+        }
+        self._set_checked_sheets(compatible)
+
     def _on_import(self) -> None:
         result = self._build_result("import")
         if result.config is None:
@@ -707,21 +770,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
             if self._apply_remaining_cb.isChecked():
                 all_sheet_configs_ok = sheets_ok and time_ok and species_ok
                 if all_sheet_configs_ok:
-                    required_time = str(current_state["time_column"])
-                    required_species = {
-                        str(col) for col, checked
-                        in dict(current_state.get("species_checked", {})).items()
-                        if checked
-                    }
-                    required_columns = {required_time} | required_species
+                    required_columns = self._required_columns_for_current_state(current_state)
                     for sheet_name in checked_sheet_names:
                         if sheet_name == self._previewed_sheet_name:
                             continue
-                        other_state = self._ensure_sheet_state(sheet_name)
-                        other_columns = {
-                            str(c) for c in other_state.get("columns", [])
-                        }
-                        missing = required_columns - other_columns
+                        missing = required_columns - self._sheet_columns(sheet_name)
                         if missing:
                             all_sheet_configs_ok = False
                             incompatible_hint = (
@@ -756,6 +809,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._species_hint.setText(incompatible_hint)
         else:
             self._species_hint.setText("")
+        self._update_bulk_sheet_buttons(time_ok=time_ok, species_ok=species_ok)
 
     # ------------------------------------------------------------------
     # Result building
@@ -921,6 +975,64 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 names.append(item.text())
         return names
 
+    def _set_checked_sheets(self, checked_names: set[str]) -> None:
+        blocker = QtCore.QSignalBlocker(self._sheet_list)
+        try:
+            for index in range(self._sheet_list.count()):
+                item = self._sheet_list.item(index)
+                desired_state = (
+                    QtCore.Qt.CheckState.Checked
+                    if item.text() in checked_names
+                    else QtCore.Qt.CheckState.Unchecked
+                )
+                if item.checkState() != desired_state:
+                    item.setCheckState(desired_state)
+        finally:
+            del blocker
+        self._update_import_enabled()
+
+    def _required_columns_for_current_state(self, state: dict) -> set[str]:
+        time_column = str(state.get("time_column", ""))
+        if not time_column:
+            return set()
+        selected_species = {
+            str(column_name)
+            for column_name, checked in dict(state.get("species_checked", {})).items()
+            if checked
+        }
+        if not selected_species:
+            return set()
+        return {time_column, *selected_species}
+
+    def _sheet_columns(self, sheet_name: str) -> set[str]:
+        state = self._ensure_sheet_state(sheet_name)
+        return {str(column) for column in state.get("columns", [])}
+
+    def _sheet_has_required_columns(self, sheet_name: str, required_columns: set[str]) -> bool:
+        return required_columns <= self._sheet_columns(sheet_name)
+
+    def _update_bulk_sheet_buttons(self, *, time_ok: bool, species_ok: bool) -> None:
+        if self._file_type != "excel":
+            return
+        has_sheets = self._sheet_list.count() > 0
+        self._btn_select_all.setEnabled(has_sheets)
+        self._btn_invert_sheets.setEnabled(has_sheets)
+        self._btn_select_compatible.setEnabled(
+            has_sheets
+            and self._apply_remaining_cb.isChecked()
+            and time_ok
+            and species_ok
+            and self._previewed_sheet_name is not None
+        )
+
+    def _top_workspace_max_height(self) -> int:
+        return min(420, max(220, self.height() // 2))
+
+    def _update_top_workspace_bounds(self) -> None:
+        self._top_workspace.setMaximumHeight(self._top_workspace_max_height())
+        self._sheet_section.setMinimumHeight(110 if self._file_type == "excel" else 0)
+        self._preview_section.setMinimumHeight(160)
+
     @staticmethod
     def _normalize_unit_for_combo(unit: Optional[str]) -> str:
         return str(unit or "").strip().replace("µ", "u").replace("μ", "u")
@@ -962,3 +1074,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         if self._result is None:
             return ImportDialogResult(config=None, action="cancel")
         return self._result
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_top_workspace_bounds()

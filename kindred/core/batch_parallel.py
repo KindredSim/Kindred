@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import traceback
 from collections import OrderedDict
 from typing import Any, Dict, Mapping, MutableMapping, Tuple
 
@@ -12,15 +13,40 @@ import numpy as np
 from kindred.core.simulation_identity import coerce_simulation_identity
 from kindred.core.simulation_failure import (
     build_simulation_failure,
-    serialize_algebra_error,
     simulation_failure_from_exception,
 )
 from kindred.core.simulation_result_payload import (
     build_secondary_simulation_success_payload,
     build_simulation_success_payload,
 )
+from kindred.core.runtime_defaults import (
+    CONTAINED_CHILD_BLAS_THREAD_ENV_VARS,
+    MAX_PARALLEL_WORKERS_CEILING,
+    USE_SPARSE_JACOBIAN_DEFAULT,
+    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _formatted_exception_stack_trace(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+
+
+def _failure_payload_with_stack_trace(payload: dict[str, Any], *, exc: BaseException) -> dict[str, Any]:
+    context = payload.get("context")
+    if isinstance(context, dict) and str(context.get("stack_trace") or "").strip():
+        return payload
+
+    stack_trace = _formatted_exception_stack_trace(exc)
+    if not stack_trace:
+        return payload
+
+    enriched_payload = dict(payload)
+    enriched_context = dict(context) if isinstance(context, dict) else {}
+    enriched_context["stack_trace"] = stack_trace
+    enriched_payload["context"] = enriched_context
+    return enriched_payload
 
 __all__ = [
     "BLAS_THREAD_ENV_VARS",
@@ -32,13 +58,7 @@ __all__ = [
     "run_batch_simulation_task",
 ]
 
-BLAS_THREAD_ENV_VARS: Tuple[str, ...] = (
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-)
+BLAS_THREAD_ENV_VARS: Tuple[str, ...] = tuple(CONTAINED_CHILD_BLAS_THREAD_ENV_VARS)
 
 _WORKER_CACHE_MAXSIZE = 8
 _WORKER_PREPARED_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
@@ -47,10 +67,13 @@ _WORKER_PREPARED_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 def compute_effective_batch_workers(*, num_sets: int, max_parallel_workers: int) -> int:
     """
     Return effective worker count using:
-    min(num_sets, max(1, cpu_count-1), max_parallel_workers).
+    min(num_sets, max(1, cpu_count-1), max_parallel_workers, MAX_PARALLEL_WORKERS_CEILING).
     """
     n_sets = max(0, int(num_sets))
-    cap = max(1, int(max_parallel_workers))
+    cap = min(
+        int(MAX_PARALLEL_WORKERS_CEILING),
+        max(1, int(max_parallel_workers)),
+    )
     cpu = os.cpu_count()
     cpu_cap = max(1, int(cpu) - 1) if isinstance(cpu, int) and cpu > 0 else 1
     if n_sets <= 0:
@@ -82,8 +105,8 @@ def batch_mechanism_signature(
     *,
     mechanism_text: str = "",
     temperature_K: float = 298.15,
-    use_sparse_jacobian: bool = False,
-    wegscheider_cyclicity_enabled: bool = False,
+    use_sparse_jacobian: bool = USE_SPARSE_JACOBIAN_DEFAULT,
+    wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
     simulation_identity: Mapping[str, Any] | object | None = None,
 ) -> str:
     """Stable signature for per-process prepared-runtime reuse."""
@@ -131,7 +154,6 @@ def _prepared_entry(
         param_names=[],
         temperature_K=float(temperature_K),
         initials={},
-        use_advanced_dsl=True,
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
     entry = {
@@ -162,6 +184,30 @@ def _prepared_payload_from_bound(bound: Any) -> Dict[str, Any]:
     }
 
 
+def _execution_request_payload_from_simulation_plan(value: Any) -> Dict[str, Any] | None:
+    if value is None:
+        return None
+    from kindred.core.simulation_plan import SimulationPlan
+
+    if isinstance(value, SimulationPlan):
+        return value.to_execution_request().to_payload()
+    if isinstance(value, Mapping):
+        return SimulationPlan.from_payload(value).to_execution_request().to_payload()
+    return None
+
+
+def _algebra_policy_from_simulation_plan(value: Any):
+    from kindred.core.simulation_algebra_policy import algebra_policy_from_simulation_plan
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy
+
+    if value is None:
+        return SimulationAlgebraPolicy.BATCH_BEST_EFFORT
+    return algebra_policy_from_simulation_plan(
+        value,
+        default=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+    )
+
+
 def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Execute one batch-set simulation in a worker process.
@@ -169,32 +215,51 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     This function is process-safe (no Qt objects) and supports per-process
     prepared-runtime reuse keyed by `mechanism_signature`.
     """
-    from kindred.core.algebra.simulation_series import evaluate_algebra_series_for_simulation
+    from kindred.core.simulation_algebra_policy import evaluate_simulation_algebra
     from kindred.core.simulation_preparation import (
         SimulationPreparationError,
         prepare_simulation_worker_run,
     )
     from kindred.core.simulator.solvers import solve_ode
 
-    execution_request = task.get("execution_request")
+    simulation_plan = task.get("simulation_plan")
+    algebra_policy = _algebra_policy_from_simulation_plan(simulation_plan)
+    plan_execution_request = _execution_request_payload_from_simulation_plan(simulation_plan)
+    has_plan_execution_request = isinstance(plan_execution_request, Mapping)
+    if not has_plan_execution_request and "execution_request" in task:
+        raise SimulationPreparationError(
+            "execution_request",
+            "Batch task execution_request payloads must be carried by simulation_plan.",
+        )
+    if not has_plan_execution_request:
+        raise SimulationPreparationError(
+            "simulation_plan",
+            "Batch task execution inputs must be carried by simulation_plan.",
+        )
+    execution_request = None
     mechanism_text = str(task.get("mechanism_text") or "")
     solver_config = dict(task.get("solver_config") or {})
     initials = dict(task.get("initials") or {})
     signature = str(task.get("mechanism_signature") or "").strip()
     simulation_identity = task.get("simulation_identity")
     include_mechanism_in_result_payload = bool(task.get("include_mechanism_in_result_payload", False))
+    if has_plan_execution_request:
+        mechanism_text = str(plan_execution_request.get("mechanism_text") or mechanism_text or "")
+        solver_config = dict(plan_execution_request.get("solver_config") or solver_config)
+        initials = dict(plan_execution_request.get("initials") or initials)
+        simulation_identity = plan_execution_request.get("simulation_identity") or simulation_identity
+        execution_request = plan_execution_request
     structured_prepared_request = isinstance(execution_request, Mapping) and execution_request.get("prepared_payload") is not None
-    if isinstance(execution_request, Mapping):
-        if structured_prepared_request:
-            mechanism_text = str(execution_request.get("mechanism_text") or "")
-        else:
-            mechanism_text = str(execution_request.get("mechanism_text") or mechanism_text or "")
-        solver_config = dict(execution_request.get("solver_config") or solver_config)
-        initials = dict(execution_request.get("initials") or initials)
-        simulation_identity = execution_request.get("simulation_identity") or simulation_identity
     temperature_K = float(solver_config.get("temperature_K") or 298.15)
-    wegscheider_enabled = bool(solver_config.get("wegscheider_cyclicity_enabled", False))
-    use_sparse_jacobian = bool(solver_config.get("use_sparse_jacobian"))
+    wegscheider_enabled = bool(
+        solver_config.get(
+            "wegscheider_cyclicity_enabled",
+            WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+        )
+    )
+    use_sparse_jacobian = bool(
+        solver_config.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
+    )
     # Structured prepared execution is authoritative and may safely reuse a
     # structural prepared-runtime key. Text-driven batch preview tasks must key
     # the worker cache by the actual mechanism text, otherwise later slider
@@ -216,7 +281,15 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
             wegscheider_cyclicity_enabled=bool(wegscheider_enabled),
         )
 
-    t_span_raw = task.get("t_span") or (0.0, float(task.get("t_end") or 0.0))
+    t_span_raw = (
+        execution_request.get("t_span")
+        if isinstance(execution_request, Mapping)
+        else (
+            plan_execution_request.get("t_span")
+            if isinstance(plan_execution_request, Mapping)
+            else None
+        )
+    ) or task.get("t_span") or (0.0, float(task.get("t_end") or 0.0))
     try:
         t_start, t_end = float(t_span_raw[0]), float(t_span_raw[1])
     except (TypeError, ValueError, IndexError) as exc:
@@ -224,12 +297,9 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         t_start, t_end = 0.0, float(task.get("t_end") or 0.0)
     t_span = (float(t_start), float(t_end))
 
-    if isinstance(execution_request, Mapping):
+    if structured_prepared_request and isinstance(execution_request, Mapping):
         prepared = prepare_simulation_worker_run(execution_request=execution_request)
-        if structured_prepared_request:
-            mechanism_text = str(execution_request.get("mechanism_text") or "")
-        else:
-            mechanism_text = str(execution_request.get("mechanism_text") or mechanism_text or "")
+        mechanism_text = str(execution_request.get("mechanism_text") or "")
     else:
         try:
             entry = _prepared_entry(
@@ -258,6 +328,7 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         prepared_payload["y0"] = np.array(prepared_payload.get("y0", bound.y0), copy=True, dtype=float)
 
         prepared = prepare_simulation_worker_run(
+            execution_request=execution_request if isinstance(execution_request, Mapping) else None,
             mechanism_text=mechanism_text,
             initials=initials,
             t_span=t_span,
@@ -272,33 +343,37 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     base_species_count = len(species_names)
     species_series = {sp: result.Y[i, :] for i, sp in enumerate(species_names)}
     initials_map = dict(prepared.initials_for_algebra or {})
-    try:
-        algebra_series, algebra_scalars = evaluate_algebra_series_for_simulation(
-            prepared.mechanism,
-            t=result.t,
-            species_series=species_series,
-            initials=initials_map,
-        )
-        if algebra_series:
-            algebra_names = list(algebra_series.keys())
-            algebra_matrix = np.vstack([algebra_series[name] for name in algebra_names])
-            extended_y = np.vstack([result.Y, algebra_matrix])
-            extended_species_names = species_names + algebra_names
-        else:
-            extended_y = result.Y
-            extended_species_names = species_names
-        algebra_errors: list[dict[str, Any]] = []
-    except Exception as exc:
-        logger.warning("Algebra evaluation failed in batch worker: %s", exc)
+    algebra_evaluation = evaluate_simulation_algebra(
+        algebra_policy,
+        prepared.mechanism,
+        t=result.t,
+        species_series=species_series,
+        initials=initials_map,
+    )
+    algebra_scalars = dict(algebra_evaluation.scalars)
+    algebra_errors: list[dict[str, Any]] = list(algebra_evaluation.errors)
+    if algebra_evaluation.series:
+        algebra_names = list(algebra_evaluation.series.keys())
+        algebra_matrix = np.vstack([algebra_evaluation.series[name] for name in algebra_names])
+        extended_y = np.vstack([result.Y, algebra_matrix])
+        extended_species_names = species_names + algebra_names
+    else:
         extended_y = result.Y
         extended_species_names = species_names
-        algebra_errors = [serialize_algebra_error(exc, name="__algebra__")]
 
     builder = (
         build_simulation_success_payload
         if include_mechanism_in_result_payload
         else build_secondary_simulation_success_payload
     )
+    prepared_warning_payloads = [
+        build_simulation_failure(
+            "preparation_warning",
+            str(message),
+            details={"stage": "prepare_run_context"},
+        )
+        for message in (getattr(prepared, "warnings", None) or [])
+    ]
     payload_kwargs: Dict[str, Any] = {
         "result": result,
         "y": extended_y,
@@ -306,7 +381,7 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         "base_species_count": int(base_species_count),
         "algebra_scalars": algebra_scalars,
         "algebra_errors": algebra_errors,
-        "warnings": [],
+        "warnings": prepared_warning_payloads,
         "solver": str(prepared.request.solver),
         "mechanism_text": mechanism_text,
         "solver_config": {
@@ -336,28 +411,36 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def run_batch_simulation_task(task: Mapping[str, Any]) -> Dict[str, Any]:
+    task_payload: Dict[str, Any] = {}
     try:
-        return _run_batch_simulation_task_impl(task)
+        task_payload = dict(task or {})
+        return _run_batch_simulation_task_impl(task_payload)
     except Exception as exc:
         from kindred.core.simulation_preparation import SimulationPreparationError
 
         if isinstance(exc, SimulationPreparationError):
             return {
                 "success": False,
-                "run_id": int(task.get("run_id") or 0),
-                "set_id": str(task.get("set_id") or ""),
-                "set_name": str(task.get("set_name") or ""),
-                "error": build_simulation_failure(
-                    "preparation_error",
-                    str(exc),
-                    details={"stage": str(exc.stage or "unknown")},
-                    exc_type=exc.__class__.__name__,
+                "run_id": int(task_payload.get("run_id") or 0),
+                "set_id": str(task_payload.get("set_id") or ""),
+                "set_name": str(task_payload.get("set_name") or ""),
+                "error": _failure_payload_with_stack_trace(
+                    build_simulation_failure(
+                        "preparation_error",
+                        str(exc),
+                        details={"stage": str(exc.stage or "unknown")},
+                        exc_type=exc.__class__.__name__,
+                    ),
+                    exc=exc,
                 ),
             }
         return {
             "success": False,
-            "run_id": int(task.get("run_id") or 0),
-            "set_id": str(task.get("set_id") or ""),
-            "set_name": str(task.get("set_name") or ""),
-            "error": simulation_failure_from_exception(exc),
+            "run_id": int(task_payload.get("run_id") or 0),
+            "set_id": str(task_payload.get("set_id") or ""),
+            "set_name": str(task_payload.get("set_name") or ""),
+            "error": _failure_payload_with_stack_trace(
+                simulation_failure_from_exception(exc),
+                exc=exc,
+            ),
         }

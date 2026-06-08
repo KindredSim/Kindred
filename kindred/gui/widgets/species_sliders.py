@@ -13,7 +13,7 @@ from PySide6.QtCore import Signal
 
 from kindred.gui.species_sliders_logic import compute_row_max, compute_slider_max_option_c, try_nonneg_finite
 from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableModel, BatchInitialConditionsTableView
-from ..ui_helpers import make_placeholder_label, make_scroll_area
+from ..ui_helpers import make_bounded_label, make_placeholder_label, make_scroll_area
 
 __all__ = ["BatchSpeciesSliders"]
 
@@ -68,6 +68,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     """
 
     speciesEdited = Signal(str, float)     # species, value
+    speciesDragStarted = Signal(str)       # species
     speciesDragFinished = Signal(str)      # species
     contentStateChanged = Signal(bool)
 
@@ -88,6 +89,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._hidden_species: set[str] = set()
         self._visible_species_signature: tuple[str, ...] = ()
         self._selected_rows_signature: tuple[int, ...] = ()
+        self._slider_target_rebuild_deferred: bool = False
         self._placeholder: QtWidgets.QLabel | None = None
         self._hidden_placeholder: QtWidgets.QLabel | None = None
 
@@ -142,24 +144,18 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._transaction_owner = owner
 
     def slider_picker_entries(self) -> list[tuple[str, str, bool]]:
-        return [(species, species, self.species_visible(species)) for species in self.slider_species_names()]
+        return [(species, species, self.species_visible(species)) for species in self._rows]
 
     def slider_species_names(self) -> list[str]:
-        if self._rows:
-            return [str(species) for species in self._rows]
-        model = self._model
-        if model is None:
-            return []
-        try:
-            return [str(species) for species in model.store().visible_species()]
-        except Exception:
-            return []
+        return [str(species) for species in self._rows]
 
     def species_visible(self, species: str) -> bool:
         return str(species) not in self._hidden_species
 
     def set_species_visible(self, species: str, visible: bool) -> None:
         species_s = str(species)
+        if species_s not in self._rows:
+            return
         if visible:
             self._hidden_species.discard(species_s)
         else:
@@ -249,8 +245,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._current_row = None
         self._selected_rows_signature = ()
 
-    def rebase_snapshots_for_rows(self, rows: list[int]) -> None:
-        _ = rows
+    def live_drag_active(self) -> bool:
+        return any(bool(entry.dragging) for entry in self._rows.values())
 
     # ---------------- internal ----------------
 
@@ -272,6 +268,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
 
     def _on_slider_edit_targets_changed(self) -> None:
         if not self._active:
+            return
+        if self.live_drag_active():
+            self._slider_target_rebuild_deferred = True
             return
         self._rebuild_if_primary_row_changed()
 
@@ -360,13 +359,32 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._sync_visibility_state()
         self.contentStateChanged.emit(True)
 
+    def refresh_current_row_from_model(self, *, recompute_ranges: bool = True) -> None:
+        if not self._active or self._table is None or self._model is None:
+            return
+        if not self._rows:
+            self.rebuild_from_current_row()
+            return
+        row = self._primary_source_row()
+        if row is None:
+            self.rebuild_from_current_row()
+            return
+        self._current_row = int(row)
+        try:
+            set_id = self._model.store().set_id_for_row(int(row))
+        except Exception:
+            set_id = ""
+        self._current_set_id = str(set_id or "") or None
+        self._refresh_from_model(recompute_ranges=bool(recompute_ranges))
+
     def _refresh_from_model(self, *, recompute_ranges: bool) -> None:
         model = self._model
         if model is None or self._current_row is None:
             return
         store = model.store()
         species = list(store.visible_species())
-        if not species:
+        if not species or tuple(str(name) for name in species) != tuple(str(name) for name in self._rows):
+            self.rebuild_from_current_row()
             return
         row = int(self._current_row)
         self._selected_rows_signature = tuple(self._target_rows_for_write())
@@ -431,6 +449,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         return [int(row) for row in rows if 0 <= int(row) < row_count]
 
     def _primary_source_row(self) -> Optional[int]:
+        if self._transaction_owner is not None:
+            target_rows = self._target_rows_for_write()
+            return int(target_rows[0]) if target_rows else None
         return self._current_table_row()
 
     def _rebuild_if_primary_row_changed(self) -> None:
@@ -441,8 +462,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 self.rebuild_from_current_row()
             return
         if self._current_row is not None and int(self._current_row) == int(row):
-            current_species = {str(species) for species in self._rows}
-            expected_species = {str(species) for species in self.slider_species_names()}
+            current_species = tuple(str(species) for species in self._rows)
+            expected_species = tuple(self._model_visible_species_names())
             if (
                 current_species == expected_species
                 and bool(self._rows)
@@ -451,26 +472,39 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 return
         self.rebuild_from_current_row()
 
+    def _model_visible_species_names(self) -> list[str]:
+        model = self._model
+        if model is None:
+            return []
+        store_getter = getattr(model, "store", None)
+        if not callable(store_getter):
+            return []
+        store = store_getter()
+        visible_species = getattr(store, "visible_species", None)
+        if not callable(visible_species):
+            return []
+        return [str(species) for species in visible_species()]
+
     def _target_rows_for_write(self) -> list[int]:
         model = self._model
         current_row = self._current_table_row()
         if model is None:
             return [int(current_row)] if current_row is not None else []
-        target_set_ids: list[str] = []
         owner = self._transaction_owner
-        if owner is not None and hasattr(owner, "effective_slider_edit_target_set_ids"):
-            try:
-                target_set_ids = [
-                    str(set_id)
-                    for set_id in (owner.effective_slider_edit_target_set_ids() or [])
-                    if str(set_id)
-                ]
-            except Exception:
-                target_set_ids = []
+        if owner is None or not hasattr(owner, "effective_slider_edit_target_set_ids"):
+            return []
+        try:
+            target_set_ids = [
+                str(set_id)
+                for set_id in (owner.effective_slider_edit_target_set_ids() or [])
+                if str(set_id)
+            ]
+        except Exception:
+            logger.debug("Failed to resolve effective slider targets from transaction owner", exc_info=True)
+            return []
         rows: list[int] = []
         seen: set[int] = set()
-        source_set_ids = target_set_ids or model.slider_edit_target_set_ids()
-        for set_id in source_set_ids:
+        for set_id in target_set_ids:
             row = model.store().row_for_set_id(str(set_id))
             if row is None:
                 continue
@@ -479,8 +513,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 continue
             rows.append(row_i)
             seen.add(row_i)
-        if (not target_set_ids) and current_row is not None and int(current_row) not in seen:
-            rows.insert(0, int(current_row))
         return rows
 
     def _show_placeholder(self) -> None:
@@ -569,7 +601,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
 
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(8)
-        name_label = QtWidgets.QLabel(str(species))
+        name_label = make_bounded_label(str(species), container, max_width=240)
         font = name_label.font()
         font.setBold(True)
         name_label.setFont(font)
@@ -582,6 +614,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         layout.addLayout(top)
 
         slider = QtWidgets.QSlider(QtCore.Qt.Horizontal, container)
+        slider.setMinimumHeight(28)
+        slider.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         slider.setMinimum(0)
         slider.setMaximum(_SLIDER_STEPS)
         slider.setSingleStep(10)
@@ -633,6 +667,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         if entry is None:
             return
         entry.dragging = True
+        entry.slider.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+        self.speciesDragStarted.emit(str(species))
 
     def _on_slider_released(self, species: str) -> None:
         entry = self._rows.get(str(species))
@@ -640,6 +676,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             return
         entry.dragging = False
         self.speciesDragFinished.emit(str(species))
+        if self._slider_target_rebuild_deferred:
+            self._slider_target_rebuild_deferred = False
+            self._rebuild_if_primary_row_changed()
 
     def _on_slider_value_changed(self, species: str, pos: int) -> None:
         if not self._active or self._table is None or self._model is None:
@@ -651,16 +690,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         value = max(0.0, float(value))
         entry.mixed = False
         entry.value_label.setText(_format_concentration(value))
-
-        target_rows = self._target_rows_for_write()
-        if not target_rows:
-            return
-        try:
-            owner = self._transaction_owner
-            if owner is not None and hasattr(owner, "stage_concentration_value_for_rows"):
-                owner.stage_concentration_value_for_rows(target_rows, species=str(species), value=float(value))
-        except Exception:
-            logger.debug("Failed to stage concentration overlay for %s", species, exc_info=True)
 
         self.speciesEdited.emit(str(species), float(value))
 

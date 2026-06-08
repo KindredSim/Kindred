@@ -16,6 +16,9 @@ from typing import Optional, Sequence
 
 from PySide6 import QtCore, QtWidgets
 
+from kindred.gui.display_name_policy import INLINE_ERROR_MAX_CHARS
+from kindred.gui.ui_helpers import set_compact_label_text
+
 
 @dataclass(frozen=True, slots=True)
 class _ButtonsSpec:
@@ -100,7 +103,7 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         messages_layout.setSpacing(6)
 
         self.error_label = QtWidgets.QLabel("")
-        self.error_label.setWordWrap(True)
+        self.error_label.setWordWrap(False)
         self.error_label.setStyleSheet("font-weight: bold; font-size: 11px;")
         if error_object_name:
             self.error_label.setObjectName(str(error_object_name))
@@ -110,7 +113,7 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         self.secondary_error_label: Optional[QtWidgets.QLabel]
         if show_secondary_error:
             secondary = QtWidgets.QLabel("")
-            secondary.setWordWrap(True)
+            secondary.setWordWrap(False)
             secondary.setStyleSheet("font-weight: bold; font-size: 11px;")
             if secondary_error_object_name:
                 secondary.setObjectName(str(secondary_error_object_name))
@@ -208,23 +211,37 @@ class ConfigPanelFooter(QtWidgets.QWidget):
             self.dirty_label.setVisible(self._dirty)
         self._refresh_buttons_enabled_state()
 
-    def set_error(self, message: Optional[str]) -> None:
+    def set_error(self, message: Optional[str], *, tooltip_text: Optional[str] = None) -> None:
         text = str(message or "")
         self._error_text = text
         if text:
-            self.error_label.setText(text)
+            set_compact_label_text(
+                self.error_label,
+                text,
+                max_chars=INLINE_ERROR_MAX_CHARS,
+                max_width=520,
+                diagnostic=True,
+                tooltip_text=tooltip_text,
+            )
             self.error_label.setVisible(True)
         else:
             self.error_label.clear()
             self.error_label.setVisible(False)
         self._refresh_buttons_enabled_state()
 
-    def set_secondary_error(self, message: Optional[str]) -> None:
+    def set_secondary_error(self, message: Optional[str], *, tooltip_text: Optional[str] = None) -> None:
         if self.secondary_error_label is None:
             return
         text = str(message or "")
         if text:
-            self.secondary_error_label.setText(text)
+            set_compact_label_text(
+                self.secondary_error_label,
+                text,
+                max_chars=INLINE_ERROR_MAX_CHARS,
+                max_width=520,
+                diagnostic=True,
+                tooltip_text=tooltip_text,
+            )
             self.secondary_error_label.setVisible(True)
         else:
             self.secondary_error_label.clear()

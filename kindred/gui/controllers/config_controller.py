@@ -9,6 +9,8 @@ from typing import Callable, List, Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 from shiboken6 import isValid
 
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["ConfigController"]
@@ -54,6 +56,8 @@ class ConfigControllerPort:
     wegscheider_cyclicity_enabled: Callable[[], bool]
     max_parallel_batch_workers: Callable[[], int]
     set_max_parallel_batch_workers: Callable[[int], None]
+    batch_runtime_lane_budget: Callable[[], int]
+    set_batch_runtime_lane_budget: Callable[[int], None]
     limit_blas_threads_per_worker: Callable[[], bool]
     set_limit_blas_threads_per_worker: Callable[[bool], None]
     result_cache_cap: Callable[[], int]
@@ -97,6 +101,11 @@ class ConfigController(QtCore.QObject):
         from kindred.gui.project_schema import QSETTINGS_KEY_MAP
         if key not in QSETTINGS_KEY_MAP:
             raise ValueError(f"Unknown user preference key: {key!r}")
+        if key in {"max_parallel_batch_workers", "batch_runtime_lane_budget"}:
+            value = min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(1, int(value)),
+            )
         self._user_preferences[key] = value
 
     def get_user_preference(self, key: str) -> object:
@@ -152,7 +161,9 @@ class ConfigController(QtCore.QObject):
 
     def load_settings(self) -> None:
         settings = self._settings()
+        from kindred.core.runtime_defaults import PREVIEW_CACHE_CAP_DEFAULT, RESULT_CACHE_CAP_DEFAULT
         from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
+        from kindred.gui.project_schema import PROJECT_DEFAULTS
 
         restore_maximized = settings.value("window/is_maximized", False, type=bool)
         self._restore_gui_state_setting(
@@ -185,7 +196,7 @@ class ConfigController(QtCore.QObject):
         self._ui.set_num_points(num_points)
         slider_preview_points = self._read_int_setting(settings, "simulation/slider_preview_points", 100)
         self._ui.set_slider_preview_points(max(50, min(20000, slider_preview_points)))
-        slider_preview_solver = str(settings.value("simulation/slider_preview_solver", "LSODA") or "LSODA").strip() or "LSODA"
+        slider_preview_solver = str(settings.value("simulation/slider_preview_solver", "BDF") or "BDF").strip() or "BDF"
         self._ui.set_slider_preview_solver(slider_preview_solver)
         explicit_solver_value = self._ui.explicit_startup_solver_name()
         explicit_rtol_value = self._ui.explicit_startup_rtol()
@@ -211,42 +222,57 @@ class ConfigController(QtCore.QObject):
             atol=atol_value,
         )
 
-        legacy_use_advanced = settings.value("simulation/use_advanced_dsl", None)
-        if legacy_use_advanced is not None:
-            logger.info("Ignoring legacy setting simulation/use_advanced_dsl (advanced DSL always enabled)")
-            settings.remove("simulation/use_advanced_dsl")
-
         self._ui.set_use_sparse_jacobian(
             settings.value(
                 "simulation/use_sparse_jacobian",
-                False,
+                bool(PROJECT_DEFAULTS["use_sparse_jacobian"]),
                 type=bool,
             )
         )
         self._ui.set_wegscheider_cyclicity_enabled(
             settings.value(
                 "simulation/wegscheider_cyclicity_enabled",
-                False,
+                bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]),
                 type=bool,
             )
         )
         self._ui.set_max_parallel_batch_workers(
-            max(
-                1,
-                self._read_int_setting(settings, "simulation/max_parallel_batch_workers", 12),
+            min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(
+                    1,
+                    self._read_int_setting(
+                        settings,
+                        "simulation/max_parallel_batch_workers",
+                        int(PROJECT_DEFAULTS["max_parallel_batch_workers"]),
+                    ),
+                ),
+            )
+        )
+        self._ui.set_batch_runtime_lane_budget(
+            min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(
+                    1,
+                    self._read_int_setting(
+                        settings,
+                        "simulation/batch_runtime_lane_budget",
+                        int(PROJECT_DEFAULTS["batch_runtime_lane_budget"]),
+                    ),
+                ),
             )
         )
 
         self._ui.set_limit_blas_threads_per_worker(
             settings.value(
                 "simulation/limit_blas_threads_per_worker",
-                True,
+                bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"]),
                 type=bool,
             )
         )
 
-        default_result_cap = self._ui.result_cache_cap()
-        default_preview_cap = self._ui.preview_cache_cap()
+        default_result_cap = int(RESULT_CACHE_CAP_DEFAULT)
+        default_preview_cap = int(PREVIEW_CACHE_CAP_DEFAULT)
         result_cap = self._read_int_setting(settings, "simulation/result_cache_cap", default_result_cap)
         preview_cap = self._read_int_setting(settings, "simulation/preview_cache_cap", default_preview_cap)
         self._ui.set_cache_caps(result_cap=result_cap, preview_cap=preview_cap, persist=False)

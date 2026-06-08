@@ -34,13 +34,19 @@ class ProfileMixin:
         if profile_manager is None or profile_indicator is None or status_label is None:
             raise RuntimeError("ProfileMixin ports are not initialized.")
 
+        settings_owner = getattr(self, "_settings_owner", None)
+        settings_set_value = getattr(settings_owner, "settings_set_value", None)
+        settings_remove = getattr(settings_owner, "settings_remove", None)
+        if not callable(settings_set_value) or not callable(settings_remove):
+            raise RuntimeError("ProfileMixin settings owner is not initialized.")
+
         return ProfileMixinPorts(
             profile_manager=profile_manager,
             profiles_menu_getter=lambda: getattr(self, "_profiles_menu", None),
             profile_indicator_setter=lambda text: profile_indicator.setText(str(text)),
             status_setter=lambda text: status_label.setText(str(text)),
-            settings_set_value=self.settings_set_value,
-            settings_remove=self.settings_remove,
+            settings_set_value=settings_set_value,
+            settings_remove=settings_remove,
             num_points_spinbox=num_points_spinbox,
             dark_mode_action=dark_mode_action,
             toggle_theme=self._toggle_theme,

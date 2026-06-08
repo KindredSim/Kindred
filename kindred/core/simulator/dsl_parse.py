@@ -35,6 +35,12 @@ from typing import Dict, List, Optional, Tuple, cast, TYPE_CHECKING
 
 import re
 
+from ..equilibrium_rate_authority import (
+    derive_generated_computational_std_ratio_from_legacy_kr,
+    effective_reverse_rate_from_keq,
+    validate_generated_computational_legacy_kr,
+    validate_equilibrium_rate_authority_flags,
+)
 from ..units import UnitsModel
 from .dsl_types import StepPreview
 from .errors import (
@@ -46,11 +52,12 @@ from .errors import (
     invalid_keyvalue_pair_error,
     invalid_boolean_error,
 )
+from .parameter_algebra_spec import classify_parameter_algebra_declaration
 
 if TYPE_CHECKING:
     from ..mechanism import Mechanism
+    from ..intervention_schedule import InterventionSchedule
     from ..temperature import TemperatureScheduleProtocol
-    from .dsl_parameter_scan import ParameterDefinition
     from .state_model import StateNetwork
 
 logger = logging.getLogger(__name__)
@@ -60,7 +67,6 @@ __all__ = [
     "DSLError",
     "StepPreview",
     "DSLResult",
-    "ParameterDefinition",
     "parse_and_preview",
     "parse_dsl",
     "parse_dsl_to_mechanism",
@@ -94,9 +100,7 @@ _KEY_ALIASES: Dict[str, str] = {
     "a": "A",
     "A": "A",
     "k": "k",
-    "K": "Keq",  # Equilibrium constant (surface alias; distinct from lowercase k)
     "keq": "Keq",
-    "k_eq": "Keq",
     "kf": "kf",
     "kr": "kr",
     "k_fast": "k_fast",
@@ -114,7 +118,7 @@ _STATE_REST_SPLIT_RE = re.compile(r"[;,]")
 _SEMI_SPLIT_RE = re.compile(r"[;]")
 
 _REACTION_KNOWN_KEYS = frozenset({"κ", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"})
-_EQUILIBRIUM_KNOWN_KEYS = frozenset({"Keq", "kf", "kr", "dG_eq", "dg_eq", "cm_id"})
+_EQUILIBRIUM_KNOWN_KEYS = frozenset({"Keq", "kf", "kr", "dG_eq", "dg_eq", "cm_id", "cm_std_ratio"})
 
 
 # ------------------------------ data models ----------------------------------
@@ -133,12 +137,15 @@ class DSLResult:
     temperature_schedule : TemperatureScheduleProtocol | None
         Temperature schedule for time-dependent temperature.
         None if no temperature schedule specified.
+    intervention_schedule : InterventionSchedule | None
+        Fixed species intervention schedule parsed from intervention directives.
     ir : DSLIR | None
         Structured intermediate representation (single source of truth for parsing).
     """
     previews: List[StepPreview] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     temperature_schedule: Optional["TemperatureScheduleProtocol"] = None
+    intervention_schedule: Optional["InterventionSchedule"] = None
     ir: Optional["DSLIR"] = None
 
 
@@ -157,6 +164,7 @@ class DSLIR:
     standard_conc_M: float
     kappa_global: float
     temperature_schedule: Optional["TemperatureScheduleProtocol"]
+    intervention_schedule: Optional["InterventionSchedule"]
     state_network: "StateNetwork"
     steps: List["ParsedStep"]
     algebra_lines: List[str]
@@ -168,9 +176,11 @@ class DSLIR:
 
 def _norm_key(k: str) -> str:
     key = k.strip()
-    # Preserve uppercase K as the equilibrium alias distinct from lowercase k.
-    if key == "K":
+    if key.lower() == "keq":
         return "Keq"
+    # Bare uppercase K is not lowercase k and is not accepted as a Keq alias.
+    if key == "K":
+        return "K"
     # Otherwise normalize to lowercase and look up
     return _KEY_ALIASES.get(key.lower(), key)
 
@@ -282,7 +292,7 @@ def _extract_numeric_value(expr: str) -> Optional[float]:
     return _float_or_none(candidate)
 
 
-def extract_parameters_from_dsl(text: str) -> List["ParameterDefinition"]:
+def extract_parameters_from_dsl(text: str) -> List[object]:
     from .dsl_parameter_scan import extract_parameters_from_dsl as _impl
 
     return _impl(text)
@@ -292,14 +302,6 @@ def extract_parameter_names_from_dsl(text: str) -> set[str]:
     from .dsl_parameter_scan import extract_parameter_names_from_dsl as _impl
 
     return _impl(text)
-
-
-def __getattr__(name: str):
-    if name == "ParameterDefinition":
-        from .dsl_parameter_scan import ParameterDefinition
-
-        return ParameterDefinition
-    raise AttributeError(name)
 
 
 def _parse_species_side(text: str) -> Dict[str, float]:
@@ -402,6 +404,36 @@ def _derive_equilibrium_rates_with_context(
         raise DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
 
 
+def _validate_equilibrium_rate_authority_for_dsl(
+    *,
+    has_kf: bool,
+    has_kr: bool,
+    has_Keq: bool,
+    has_dG_eq: bool,
+    line_number: Optional[int],
+    line_content: Optional[str],
+) -> None:
+    try:
+        validate_equilibrium_rate_authority_flags(
+            has_kf=has_kf,
+            has_kr=has_kr,
+            has_Keq=has_Keq,
+            has_dG_eq=has_dG_eq,
+        )
+    except ValueError as exc:
+        raise DSLError(
+            str(exc),
+            suggestion="Provide kf=... with either kr=... or Keq=/dG_eq=..., but not both.",
+            examples=[
+                "equilibrium: A <-> B; kf=4.0; kr=2.0",
+                "equilibrium: A <-> B; kf=10.0; Keq=5.0",
+                "equilibrium: A <-> B; kf=10.0; dG_eq=-4.0",
+            ],
+            line_number=line_number,
+            line_content=line_content,
+        ) from exc
+
+
 # ------------------------------ main parsing ---------------------------------
 
 _DSL_IR_VERSION = 1
@@ -422,6 +454,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     kappa_global = 1.0
 
     from .state_model import StateNetwork, TSDegreeError
+    from .computational_mode import GENERATED_BLOCK_END, GENERATED_BLOCK_START
 
     state_network = StateNetwork()
     steps: List[ParsedStep] = []
@@ -429,34 +462,28 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     initials_from_dsl: Dict[str, float] = {}
     notes: List[str] = []
 
-    in_algebra_section = False
-
     # Parse temperature schedule if present
     from ..temperature_dsl import parse_temperature_schedule
+    from ..intervention_schedule import parse_intervention_schedule_from_dsl
 
     temperature_schedule = parse_temperature_schedule(text)
+    intervention_schedule = parse_intervention_schedule_from_dsl(text)
 
     raw_lines = text.splitlines()
     if not any(line.strip() and not line.strip().startswith("#") for line in raw_lines):
         raise DSLError("DSL text is empty. Provide at least one reaction or directive.")
 
     lines = [ln.rstrip() for ln in raw_lines]
+    in_generated_computational_mode_block = False
     for line_no, raw in enumerate(lines, start=1):
         line = raw.strip()
         lower = line.lower()
 
-        # Check for algebra section marker
-        if lower.startswith("# algebra"):
-            in_algebra_section = True
+        if line == GENERATED_BLOCK_START:
+            in_generated_computational_mode_block = True
             continue
-
-        # Check for other section markers (exit algebra section)
-        if lower.startswith("# ") and in_algebra_section and not lower.startswith("# algebra"):
-            in_algebra_section = False
-
-        # Collect algebra lines
-        if in_algebra_section and line and not line.startswith("#"):
-            algebra_lines.append(line)
+        if line == GENERATED_BLOCK_END:
+            in_generated_computational_mode_block = False
             continue
 
         if not line or line.startswith("#"):
@@ -470,6 +497,9 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
         # Temperature schedule lines: parsed separately above
         if lower.startswith(("time:", "temp_const:", "temp_step:", "temp_response:")):
+            continue
+
+        if lower.startswith("intervention:"):
             continue
 
         # Header-like switches
@@ -562,6 +592,36 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                 raise DSLError(str(exc), line_number=line_no, line_content=raw) from exc
             continue
 
+        classification = classify_parameter_algebra_declaration(raw, line_number=line_no)
+        if classification.kind == "let":
+            algebra_lines.append(raw)
+            continue
+
+        if classification.kind == "param":
+            algebra_lines.append(raw)
+            continue
+
+        if classification.kind == "invalid_step_key_identifier":
+            target = classification.raw_name or raw.strip()
+            raise DSLError(
+                f"{target!r} is a step-local DSL key and cannot be declared as a parameter or observable.",
+                suggestion=(
+                    "Use a canonical indexed mechanism parameter such as k1, kf1, kr1, or Keq1, "
+                    "or choose a longer ordinary name."
+                ),
+                line_number=line_no,
+                line_content=raw,
+            )
+
+        if classification.kind == "unsupported_bare_assignment":
+            target = classification.raw_name or raw.strip()
+            raise DSLError(
+                f"Bare algebra assignment {target!r} is not supported.",
+                suggestion="Use 'let name = expr' or 'param name = expr'.",
+                line_number=line_no,
+                line_content=raw,
+            )
+
         # reaction: line
         if lower.startswith("reaction:"):
             _, rest = line.split(":", 1)
@@ -590,6 +650,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                     kappa_global=kappa_global,
                     line_number=line_no,
                     line_content=raw,
+                    generated_computational_mode=in_generated_computational_mode_block,
                 )
             )
             continue
@@ -619,6 +680,8 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
     if temperature_schedule is not None:
         notes.append(f"Temperature schedule detected: {temperature_schedule}")
+    if intervention_schedule is not None:
+        notes.append("Intervention schedule detected")
 
     return DSLIR(
         version=_DSL_IR_VERSION,
@@ -627,6 +690,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         standard_conc_M=float(standard_conc_M),
         kappa_global=float(kappa_global),
         temperature_schedule=temperature_schedule,
+        intervention_schedule=intervention_schedule,
         state_network=state_network,
         steps=steps,
         algebra_lines=algebra_lines,
@@ -662,6 +726,7 @@ def parse_dsl(text: str, *, units: UnitsModel | None = None) -> DSLResult:
         previews=previews,
         notes=list(ir.notes),
         temperature_schedule=ir.temperature_schedule,
+        intervention_schedule=ir.intervention_schedule,
         ir=ir,
     )
 
@@ -696,6 +761,9 @@ class ParsedStep:
     explicit_rates: List[float] = field(default_factory=list)
     user_kf_explicit: bool = False
     user_kr_explicit: bool = False
+    cm_id: Optional[str] = None
+    cm_std_ratio: Optional[float] = None
+    generated_computational_mode: bool = False
 
 
 def _parse_energy_unit_directive(line: str) -> str:
@@ -927,6 +995,16 @@ def _reject_unknown_params(
     """Reject parameter keys not in known_keys."""
     unknown = set(params) - known_keys
     if unknown:
+        legacy_keq_aliases = [
+            key for key in sorted(unknown) if key == "K" or str(key).lower() == "k_eq"
+        ]
+        if legacy_keq_aliases:
+            raw_key = legacy_keq_aliases[0]
+            raise DSLError(
+                f"Unknown {step_label} parameter '{raw_key}'. Use 'Keq=' for equilibrium constants.",
+                line_number=line_number,
+                line_content=line_content,
+            )
         raise DSLError(
             f"Unknown {step_label} parameter(s): {', '.join(sorted(unknown))}",
             line_number=line_number, line_content=line_content,
@@ -941,7 +1019,7 @@ def _resolve_Keq_from_params(
     line_number: Optional[int],
     line_content: Optional[str],
 ) -> Tuple[float, Optional[float]]:
-    """Resolve equilibrium constant Keq from explicit K/Keq input or dG_eq=.
+    """Resolve equilibrium constant Keq from explicit Keq input or dG_eq=.
 
     Precondition: at least one of "Keq" or "dG_eq" must be present in params.
     Returns (Keq, dG_eqJ_or_None). Raises DSLError on numeric/overflow/underflow issues.
@@ -1011,6 +1089,22 @@ def _parse_reaction_like_step(
 
     kf = _float_or_none(params.get("kf") or params.get("k"))
     kr = _float_or_none(params.get("kr"))
+    has_forward_authority = bool(
+        params.get("kf")
+        or params.get("k")
+        or params.get("A")
+        or params.get("Ea")
+        or params.get("dG_act")
+    )
+    if reversible:
+        _validate_equilibrium_rate_authority_for_dsl(
+            has_kf=has_forward_authority,
+            has_kr=("kr" in params),
+            has_Keq=("Keq" in params),
+            has_dG_eq=("dG_eq" in params),
+            line_number=line_number,
+            line_content=line_content,
+        )
     if params.get("kf") or params.get("k"):
         _validate_rate_or_K(kf, "kf" if "kf" in params else "k",
                             line_number=line_number, line_content=line_content)
@@ -1068,8 +1162,8 @@ def _parse_reaction_like_step(
                 Keq_input = Keq if "Keq" in params else None
             else:
                 raise DSLError(
-                    "reversible Arrhenius step needs kr or Keq/dG_eq",
-                    examples=["A <-> B ; A=1e10 ; Ea=50 ; K=2.0"],
+                    "reversible Arrhenius step needs exactly one of kr or Keq/dG_eq",
+                    examples=["A <-> B ; A=1e10 ; Ea=50 ; Keq=2.0"],
                     line_number=line_number, line_content=line_content,
                 )
     else:
@@ -1218,6 +1312,7 @@ def _parse_equilibrium_step(
     kappa_global: float,
     line_number: int,
     line_content: str,
+    generated_computational_mode: bool = False,
 ) -> ParsedStep:
     from .common import molecularity
     from .kinetics import normalize_energy_to_J_per_mol
@@ -1248,6 +1343,7 @@ def _parse_equilibrium_step(
                            line_number=line_number, line_content=line_content)
 
     has_explicit_Keq = "Keq" in params
+    has_explicit_dG_eq = "dG_eq" in params
     Keq = _float_or_none(params.get("Keq"))
     if has_explicit_Keq and Keq is None:
         raise DSLError(
@@ -1258,6 +1354,14 @@ def _parse_equilibrium_step(
     if has_explicit_Keq and Keq is not None:
         _validate_rate_or_K(Keq, "Keq", line_number=line_number, line_content=line_content)
     dG_eqJ = None
+    has_cm_generated_identity = bool(str(params.get("cm_id") or "").strip())
+    has_cm_generated_authority = bool(has_cm_generated_identity and generated_computational_mode)
+    if (has_cm_generated_identity or params.get("cm_std_ratio") is not None) and not generated_computational_mode:
+        raise DSLError(
+            "Computational Mode generated equilibrium fields are only valid inside the generated Computational Mode block",
+            line_number=line_number,
+            line_content=line_content,
+        )
 
     exp_rates: List[float] = []
     kf_explicit = None
@@ -1275,57 +1379,38 @@ def _parse_equilibrium_step(
             raise DSLError("kr must be numeric", line_number=line_number, line_content=line_content)
         _validate_rate_or_K(krv, "kr", line_number=line_number, line_content=line_content)
         kr_explicit = krv
-        exp_rates.append(krv)
+        if not has_cm_generated_authority:
+            exp_rates.append(krv)
 
-    if has_explicit_Keq and kf_explicit is None and kr_explicit is None:
-        raise DSLError(
-            "equilibrium with Keq=... requires at least one of kf or kr to anchor the rates",
-            suggestion="Provide either kf=...; Keq=... or kr=...; Keq=... (or specify both kf and kr without Keq).",
-            examples=[
-                "equilibrium: A <-> B; kf=10.0; Keq=5.0",
-                "equilibrium: A <-> B; kr=2.0; Keq=5.0",
-                "equilibrium: A <-> B; kf=4.0; kr=2.0",
-            ],
-            line_number=line_number,
-            line_content=line_content,
-        )
+    _validate_equilibrium_rate_authority_for_dsl(
+        has_kf=kf_explicit is not None,
+        has_kr=(kr_explicit is not None and not has_cm_generated_authority),
+        has_Keq=has_explicit_Keq,
+        has_dG_eq=has_explicit_dG_eq,
+        line_number=line_number,
+        line_content=line_content,
+    )
 
-    if has_explicit_Keq and kf_explicit is not None and kr_explicit is not None:
-        if abs(kr_explicit) < 1e-30:
-            raise DSLError(
-                "kr must be non-zero when validating Keq against kf/kr",
-                line_number=line_number,
-                line_content=line_content,
-            )
-        implied_K = float(kf_explicit) / float(kr_explicit)
-        tol_rel = 1e-6
-        tol_abs = 1e-12
-        diff = abs(implied_K - float(Keq))
-        scale = max(abs(implied_K), abs(float(Keq)), 1.0)
-        if diff > (tol_abs + tol_rel * scale):
-            raise DSLError(
-                f"Inconsistent equilibrium parameters: Keq={float(Keq):.6g} but kf/kr={implied_K:.6g}",
-                suggestion="Adjust Keq or kf/kr so that Keq ≈ kf/kr (within tolerance).",
-                line_number=line_number,
-                line_content=line_content,
-            )
-
-    if Keq is None and kf_explicit is not None and kr_explicit is not None and kr_explicit != 0:
+    if (
+        Keq is None
+        and not has_explicit_dG_eq
+        and kf_explicit is not None
+        and kr_explicit is not None
+        and kr_explicit != 0
+    ):
         Keq = kf_explicit / kr_explicit
 
-    if Keq is None:
+    if Keq is None and has_explicit_dG_eq:
         dG_eq = params.get("dG_eq") or params.get("dg_eq")
-        if dG_eq is None:
-            raise DSLError(
-                "equilibrium requires Keq, dG_eq, or both kf and kr. "
-                "Examples: 'Keq=2.0' or 'kf=1.5; kr=0.25' or 'dG_eq=-10 kJ/mol'",
-                line_number=line_number,
-                line_content=line_content,
-            )
         dG_eq_val = _float_or_none(dG_eq)
         if dG_eq_val is None:
             raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
         dG_eqJ = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
+    cm_std_ratio = None
+    if params.get("cm_std_ratio") is not None:
+        cm_std_ratio = _float_or_none(params.get("cm_std_ratio"))
+        if cm_std_ratio is None or cm_std_ratio <= 0.0:
+            raise DSLError("cm_std_ratio must be positive and numeric", line_number=line_number, line_content=line_content)
 
     fe = _derive_equilibrium_rates_with_context(
         Keq=Keq,
@@ -1335,8 +1420,54 @@ def _parse_equilibrium_step(
         line_number=line_number,
         line_content=line_content,
     )
+    if (
+        has_cm_generated_authority
+        and cm_std_ratio is None
+        and dG_eqJ is not None
+        and kf_explicit is not None
+        and kr_explicit is not None
+    ):
+        try:
+            cm_std_ratio = derive_generated_computational_std_ratio_from_legacy_kr(
+                kf=float(kf_explicit),
+                kr=float(kr_explicit),
+                Keq=float(fe.Keq),
+            )
+        except ValueError as exc:
+            raise DSLError(
+                str(exc),
+                line_number=line_number,
+                line_content=line_content,
+            ) from exc
+    if (
+        has_cm_generated_authority
+        and cm_std_ratio is not None
+        and dG_eqJ is not None
+        and kf_explicit is not None
+        and kr_explicit is not None
+    ):
+        try:
+            validate_generated_computational_legacy_kr(
+                kf=float(kf_explicit),
+                kr=float(kr_explicit),
+                Keq=float(fe.Keq),
+                reverse_std_ratio=float(cm_std_ratio),
+            )
+        except ValueError as exc:
+            raise DSLError(
+                str(exc),
+                line_number=line_number,
+                line_content=line_content,
+            ) from exc
     kf = fe.kf if kf_explicit is None else kf_explicit
     kr = fe.kr if kr_explicit is None else kr_explicit
+    if kr_explicit is None and (has_explicit_Keq or dG_eqJ is not None):
+        reverse_std_ratio = (
+            float(cm_std_ratio)
+            if has_cm_generated_authority and cm_std_ratio is not None and dG_eqJ is not None
+            else 1.0
+        )
+        kr = float(effective_reverse_rate_from_keq(float(kf), float(fe.Keq), reverse_std_ratio))
 
     return ParsedStep(
         reactants=react,
@@ -1353,7 +1484,10 @@ def _parse_equilibrium_step(
         Keq_input=(Keq if has_explicit_Keq else None),
         explicit_rates=exp_rates,
         user_kf_explicit=("kf" in params),
-        user_kr_explicit=("kr" in params),
+        user_kr_explicit=(("kr" in params) and not has_cm_generated_authority),
+        cm_id=(str(params.get("cm_id") or "").strip() or None),
+        cm_std_ratio=cm_std_ratio,
+        generated_computational_mode=bool(generated_computational_mode),
     )
 
 
@@ -1376,8 +1510,8 @@ def parse_dsl_to_mechanism(
         DSL content supporting all features:
         - reaction: A -> B; dG_act=80, energy=kJ/mol
         - reaction: A + B -> C; Ea=50, A=1e13, energy=kJ/mol
-        - equilibrium: A <-> B; K=4.0
-        - equilibrium: A <-> B; dG_eq=-5, energy=kJ/mol
+        - equilibrium: A <-> B; kf=1.0; Keq=4.0
+        - equilibrium: A <-> B; kf=1.0; dG_eq=-5, energy=kJ/mol
         - Global settings: T=310, energy=kJ/mol, κ=0.8, C0=1.0
         - State networks: state: A, kind=GS, energy=0
         - Edges: edge: A,TS1
@@ -1404,7 +1538,7 @@ def parse_dsl_to_mechanism(
     >>> dsl_text = '''
     ... T=310
     ... reaction: A -> B; dG_act=80, energy=kJ/mol
-    ... equilibrium: B <-> C; K=4.0
+    ... equilibrium: B <-> C; kf=1.0; Keq=4.0
     ... '''
     >>> mech = parse_dsl_to_mechanism(dsl_text, initials={'A': 1.0, 'B': 0.0, 'C': 0.0})
     >>> print(mech.species_names())

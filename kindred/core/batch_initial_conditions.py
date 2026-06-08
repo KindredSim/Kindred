@@ -7,26 +7,51 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
-import numpy as np
-
+from kindred.core.datasets.observation_payload import observations_from_payload, seeded_values_at_t0
 from .validation import validate_name
 
 __all__ = [
-    "INITIAL_CONC_STUB_LINE",
     "BatchInitialConditionsStore",
+    "InitialConditionImportEvent",
+    "ReactionInitialConditionImportExtraction",
+    "batch_initial_conditions_store_is_true_placeholder",
     "dataset_base_label",
+    "extract_reaction_dsl_initial_condition_imports",
     "migrate_reaction_dsl_initial_concentration_sets",
-    "migrate_reaction_dsl_initial_concentrations",
+    "reaction_dsl_with_initial_condition_import_provenance",
+    "reaction_dsl_with_parseable_initial_concentrations",
     "strip_named_reaction_dsl_initial_concentration_sets",
     "strip_reaction_dsl_initial_concentrations",
     "resolve_run_scope",
-    "seed_batch_set_from_dataset_first_row",
+    "seed_batch_set_from_dataset_observations",
 ]
 
 
-INITIAL_CONC_STUB_LINE = "# Initial concentrations moved to Batch Initial Conditions table ({set_name}). Edit there."
+_INITIAL_CONC_PROVENANCE_COMMENT = (
+    "# Initial Conditions moved to Batch Initial Conditions table ({set_name}): "
+    "{assignments}. Table values are authoritative."
+)
+
+
+@dataclass(frozen=True)
+class InitialConditionImportEvent:
+    import_id: str
+    source_kind: str
+    source_name: str
+    values: Dict[str, float]
+    insert_index: int
+
+    @property
+    def value_bearing(self) -> bool:
+        return bool(dict(self.values or {}))
+
+
+@dataclass(frozen=True)
+class ReactionInitialConditionImportExtraction:
+    clean_reactions_text: str
+    imports: Tuple[InitialConditionImportEvent, ...] = ()
 
 
 def _new_batch_set_id() -> str:
@@ -82,25 +107,59 @@ def _extract_initials_from_init_line(line: str) -> Dict[str, float]:
     return initials
 
 
-def _render_removed_block_stubs(
-    lines: Sequence[str],
+def _format_initial_condition_provenance_comment(set_name: str, seed: Dict[str, float]) -> str | None:
+    values = dict(seed or {})
+    if not values:
+        return None
+    assignments = ", ".join(
+        f"{species}={float(value):.6g}"
+        for species, value in values.items()
+        if str(species)
+    )
+    if not assignments:
+        return None
+    return _INITIAL_CONC_PROVENANCE_COMMENT.format(
+        set_name=validate_name(str(set_name)),
+        assignments=assignments,
+    )
+
+
+def _render_import_provenance(
+    clean_text: str,
+    imports: Sequence[InitialConditionImportEvent],
     *,
-    removed: set[int],
-    stubs_by_index: Dict[int, str],
+    destination_names: Mapping[str, str],
 ) -> str:
-    out: List[str] = []
-    for idx, raw in enumerate(lines):
-        stub = stubs_by_index.get(idx)
-        if stub is not None:
-            out.append(str(stub))
-        if idx in removed:
+    lines = str(clean_text or "").splitlines()
+    stubs_by_index: Dict[int, List[str]] = {}
+    for event in imports:
+        if not event.value_bearing:
             continue
-        out.append(raw)
+        destination = str(destination_names.get(event.import_id, event.source_name) or event.source_name)
+        stub = _format_initial_condition_provenance_comment(destination, dict(event.values))
+        if stub is None:
+            continue
+        insert_at = max(0, min(int(event.insert_index), len(lines)))
+        stubs_by_index.setdefault(insert_at, []).append(stub)
+
+    if not stubs_by_index:
+        return str(clean_text or "")
+
+    out: List[str] = []
+    for idx in range(len(lines) + 1):
+        out.extend(stubs_by_index.get(idx, []))
+        if idx < len(lines):
+            out.append(lines[idx])
     return "\n".join(out)
 
 
 _NAMED_INITIAL_SET_HEADER_RE = re.compile(
     r"^(?P<name>[^#=][^=]*?)\s*=\s*\{\s*(?:#.*)?$",
+    flags=re.IGNORECASE,
+)
+
+_NAMED_INITIAL_SET_ONE_LINE_RE = re.compile(
+    r"^(?P<name>[^#=][^=]*?)\s*=\s*\{\s*(?P<body>.*?)\s*\}\s*(?:#.*)?$",
     flags=re.IGNORECASE,
 )
 
@@ -124,6 +183,37 @@ def _match_named_initial_set_header(line: str) -> str | None:
     return name
 
 
+def _parse_initials_from_named_block_body(set_name: str, body: str) -> Dict[str, float]:
+    stripped = str(body or "").strip()
+    if not stripped:
+        return {}
+    lowered = stripped.lower()
+    if lowered.startswith("init:") or lowered.startswith("initial:"):
+        return _extract_initials_from_init_line(stripped)
+    if stripped.startswith("[") and "=" in stripped:
+        return _extract_initials_from_bracket_line(stripped)
+    raise ValueError(
+        "Unsupported inline initial-concentration line in "
+        f"{set_name!r}: {stripped!r}"
+    )
+
+
+def _strip_inline_initial_condition_comment(text: str) -> str:
+    return str(text or "").split("#", 1)[0].strip()
+
+
+def _looks_like_one_line_initial_condition_body(body: str) -> bool:
+    stripped = _strip_inline_initial_condition_comment(body)
+    if not stripped:
+        return True
+    lowered = stripped.lower()
+    return bool(
+        lowered.startswith("init:")
+        or lowered.startswith("initial:")
+        or (stripped.startswith("[") and "=" in stripped)
+    )
+
+
 def _match_unsupported_named_initial_set_header(line: str) -> str | None:
     match = _NAMED_INITIAL_SET_HEADER_RE.match(str(line or "").strip())
     if match is None:
@@ -134,24 +224,25 @@ def _match_unsupported_named_initial_set_header(line: str) -> str | None:
     return name
 
 
-def _is_inside_algebra_section(lines: Sequence[str], *, line_idx: int) -> bool:
-    in_algebra = False
-    for raw in lines[: int(line_idx)]:
-        stripped = str(raw or "").strip()
-        lower = stripped.lower()
-        if lower.startswith("# algebra"):
-            in_algebra = True
-            continue
-        if lower.startswith("# ") and in_algebra and not lower.startswith("# algebra"):
-            in_algebra = False
-    return in_algebra
-
-
 def _parse_named_initial_concentration_block(
     lines: Sequence[str],
     *,
     start_idx: int,
 ) -> tuple[str, Dict[str, float], int] | None:
+    one_line_match = _NAMED_INITIAL_SET_ONE_LINE_RE.match(str(lines[start_idx] or "").strip())
+    if one_line_match is not None:
+        set_name = validate_name(str(one_line_match.group("name") or ""))
+        if _is_unsupported_named_initial_set_name(set_name):
+            return None
+        body = str(one_line_match.group("body") or "")
+        if not _looks_like_one_line_initial_condition_body(body):
+            return None
+        block_seed = _parse_initials_from_named_block_body(
+            set_name,
+            _strip_inline_initial_condition_comment(body),
+        )
+        return set_name, block_seed, int(start_idx)
+
     set_name = _match_named_initial_set_header(lines[start_idx])
     if set_name is None:
         return None
@@ -167,9 +258,7 @@ def _parse_named_initial_concentration_block(
             continue
         if block_stripped == "}":
             if not saw_initial_assignment:
-                if not _is_inside_algebra_section(lines, line_idx=start_idx):
-                    return set_name, block_seed, cursor
-                return None
+                return set_name, block_seed, cursor
             return set_name, block_seed, cursor
         if block_stripped.startswith("[") and "=" in block_stripped:
             block_seed.update(_extract_initials_from_bracket_line(block_stripped))
@@ -214,16 +303,15 @@ def _find_named_initial_brace_block_end(lines: Sequence[str], *, start_idx: int)
     return max(int(start_idx), len(lines) - 1)
 
 
-def _migrate_named_initial_concentration_sets(
+def _extract_named_initial_concentration_sets(
     text: str,
-) -> Tuple[Dict[str, Dict[str, float]], str]:
+) -> tuple[str, Tuple[InitialConditionImportEvent, ...]]:
     lines = str(text or "").splitlines()
     if not lines:
-        return {}, str(text or "")
+        return str(text or ""), ()
 
     removed: set[int] = set()
-    stubs_by_index: Dict[int, str] = {}
-    seeds_by_name: Dict[str, Dict[str, float]] = {}
+    events: list[tuple[str, Dict[str, float], int]] = []
     idx = 0
 
     while idx < len(lines):
@@ -236,28 +324,37 @@ def _migrate_named_initial_concentration_sets(
             continue
         set_name, block_seed, cursor = parsed_block
 
-        if set_name in seeds_by_name:
-            raise ValueError(f"Duplicate inline initial-concentration set name: {set_name!r}")
-
         removed.update(range(int(idx), int(cursor) + 1))
-
-        seeds_by_name[set_name] = block_seed
-        stubs_by_index[idx] = INITIAL_CONC_STUB_LINE.format(set_name=set_name)
+        if any(existing_name == set_name for existing_name, _seed, _start in events):
+            raise ValueError(f"Duplicate inline initial-concentration set name: {set_name!r}")
+        events.append((set_name, block_seed, int(idx)))
         idx = cursor + 1
 
-    if not seeds_by_name:
-        return {}, str(text or "")
-    return seeds_by_name, _render_removed_block_stubs(lines, removed=removed, stubs_by_index=stubs_by_index)
+    if not events:
+        return str(text or ""), ()
+
+    clean_text = "\n".join(raw for idx, raw in enumerate(lines) if idx not in removed)
+    import_events = tuple(
+        InitialConditionImportEvent(
+            import_id=f"named:{index}:{set_name}",
+            source_kind="named_block",
+            source_name=str(set_name),
+            values=dict(seed),
+            insert_index=sum(1 for line_idx in range(start_idx) if line_idx not in removed),
+        )
+        for index, (set_name, seed, start_idx) in enumerate(events)
+    )
+    return clean_text, import_events
 
 
-def _migrate_legacy_initial_concentrations(
+def _extract_legacy_initial_concentrations(
     reaction_text: str,
     *,
     set_name: str,
-) -> Tuple[Dict[str, float], str]:
+) -> tuple[Dict[str, float], str, int | None, set[int]]:
     text = str(reaction_text or "")
     if not text.strip():
-        return {}, text
+        return {}, text, None, set()
 
     lines = text.splitlines()
 
@@ -300,34 +397,91 @@ def _migrate_legacy_initial_concentrations(
         idx += 1
 
     if not removed or not seed:
-        return {}, text
+        return {}, text, None, set()
 
-    rewritten = _render_removed_block_stubs(
-        lines,
-        removed=removed,
-        stubs_by_index={min(removed): INITIAL_CONC_STUB_LINE.format(set_name=set_name)},
-    )
-    return seed, rewritten
+    insert_index = sum(1 for line_idx in range(min(removed)) if line_idx not in removed)
+    rewritten = "\n".join(raw for idx, raw in enumerate(lines) if idx not in removed)
+    return seed, rewritten, insert_index, set(removed)
 
 
-def _merge_legacy_seed_into_named_seeds(
-    seeds_by_name: Dict[str, Dict[str, float]],
+def _shift_insert_index_after_removed_lines(index: int, removed: set[int]) -> int:
+    return int(index) - sum(1 for line_idx in removed if line_idx < int(index))
+
+
+def extract_reaction_dsl_initial_condition_imports(
+    reaction_text: str,
     *,
-    default_set_name: str,
-    legacy_seed: Dict[str, float],
-) -> None:
-    normalized_default = validate_name(str(default_set_name))
-    existing_seed = seeds_by_name.get(normalized_default)
-    if existing_seed is None:
-        seeds_by_name[normalized_default] = dict(legacy_seed)
-        return
-    if existing_seed:
-        raise ValueError(
-            f"Duplicate inline initial-concentration set name while importing anonymous inline initials: {normalized_default!r}"
+    default_set_name: str = "set1",
+) -> ReactionInitialConditionImportExtraction:
+    named_clean_text, named_events = _extract_named_initial_concentration_sets(str(reaction_text or ""))
+    legacy_seed, clean_text, legacy_insert_index, legacy_removed = _extract_legacy_initial_concentrations(
+        named_clean_text,
+        set_name=str(default_set_name),
+    )
+
+    events: list[InitialConditionImportEvent] = [
+        InitialConditionImportEvent(
+            import_id=event.import_id,
+            source_kind=event.source_kind,
+            source_name=event.source_name,
+            values=dict(event.values),
+            insert_index=_shift_insert_index_after_removed_lines(event.insert_index, legacy_removed),
         )
-    merged_seed = dict(existing_seed)
-    merged_seed.update(dict(legacy_seed))
-    seeds_by_name[normalized_default] = merged_seed
+        for event in named_events
+    ]
+
+    if legacy_seed:
+        normalized_default = validate_name(str(default_set_name))
+        matching_index = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.source_name == normalized_default
+            ),
+            None,
+        )
+        if matching_index is None:
+            events.append(
+                InitialConditionImportEvent(
+                    import_id=f"anonymous:{len(events)}:{normalized_default}",
+                    source_kind="anonymous_inline",
+                    source_name=normalized_default,
+                    values=dict(legacy_seed),
+                    insert_index=int(legacy_insert_index or 0),
+                )
+            )
+        else:
+            existing = events[matching_index]
+            if dict(existing.values):
+                raise ValueError(
+                    "Duplicate inline initial-concentration set name while importing anonymous inline initials: "
+                    f"{normalized_default!r}"
+                )
+            events[matching_index] = InitialConditionImportEvent(
+                import_id=existing.import_id,
+                source_kind=existing.source_kind,
+                source_name=existing.source_name,
+                values=dict(legacy_seed),
+                insert_index=existing.insert_index,
+            )
+
+    return ReactionInitialConditionImportExtraction(
+        clean_reactions_text=str(clean_text),
+        imports=tuple(events),
+    )
+
+
+def reaction_dsl_with_initial_condition_import_provenance(
+    extraction: ReactionInitialConditionImportExtraction,
+    *,
+    destination_names: Mapping[str, str] | None = None,
+) -> str:
+    destinations = dict(destination_names or {})
+    return _render_import_provenance(
+        str(extraction.clean_reactions_text or ""),
+        tuple(extraction.imports or ()),
+        destination_names=destinations,
+    )
 
 
 def migrate_reaction_dsl_initial_concentration_sets(
@@ -349,34 +503,63 @@ def migrate_reaction_dsl_initial_concentration_sets(
     if not text.strip():
         return {}, text
 
-    seeds_by_name, rewritten = _migrate_named_initial_concentration_sets(text)
-    legacy_seed, rewritten = _migrate_legacy_initial_concentrations(
-        rewritten,
-        set_name=str(default_set_name),
+    extraction = extract_reaction_dsl_initial_condition_imports(
+        text,
+        default_set_name=str(default_set_name),
     )
-    if legacy_seed:
-        _merge_legacy_seed_into_named_seeds(
-            seeds_by_name,
-            default_set_name=str(default_set_name),
-            legacy_seed=legacy_seed,
-        )
+    seeds_by_name = {
+        str(event.source_name): dict(event.values)
+        for event in extraction.imports
+        if event.value_bearing
+    }
+    rewritten = reaction_dsl_with_initial_condition_import_provenance(
+        extraction,
+        destination_names={event.import_id: event.source_name for event in extraction.imports},
+    )
     return seeds_by_name, rewritten
 
 
-def migrate_reaction_dsl_initial_concentrations(
+def reaction_dsl_with_parseable_initial_concentrations(
     reaction_text: str,
     *,
-    set_name: str = "set1",
-) -> Tuple[Dict[str, float], str]:
+    preferred_set_name: str | None = None,
+    default_set_name: str = "set1",
+) -> str:
     """
-    Compatibility wrapper for callers/tests that still expect a single-set return shape.
+    Convert authoring-time IC import syntax to parser-safe reaction DSL.
+
+    The returned text contains no named import blocks. If authoring IC seeds are
+    present, one seed set is rendered as ordinary `initial:` DSL for direct
+    parser/solver consumers that do not have a Batch Initial Conditions table.
     """
-    seeds_by_name, rewritten = migrate_reaction_dsl_initial_concentration_sets(
-        reaction_text,
-        default_set_name=str(set_name),
+    extraction = extract_reaction_dsl_initial_condition_imports(
+        str(reaction_text or ""),
+        default_set_name=str(default_set_name),
     )
-    normalized_name = validate_name(str(set_name))
-    return dict(seeds_by_name.get(normalized_name) or {}), rewritten
+    seeds_by_name = {
+        str(event.source_name): dict(event.values)
+        for event in extraction.imports
+        if event.value_bearing
+    }
+    rewritten = str(extraction.clean_reactions_text)
+    if not seeds_by_name:
+        return str(rewritten)
+
+    selected_name = str(preferred_set_name or "").strip()
+    if selected_name not in seeds_by_name:
+        selected_name = next(iter(seeds_by_name.keys()))
+    seed = dict(seeds_by_name.get(selected_name) or {})
+    if not seed:
+        return str(rewritten)
+
+    assignments = [
+        f"{species}={float(value):.6g}"
+        for species, value in seed.items()
+    ]
+    initial_line = "initial: " + ", ".join(assignments)
+    if str(rewritten).strip():
+        return str(rewritten).rstrip() + "\n" + initial_line
+    return initial_line
 
 
 def _strip_named_initial_concentration_sets(text: str) -> str:
@@ -463,7 +646,7 @@ class BatchSet:
     name: str
     values: Dict[str, str] = field(default_factory=dict)
     set_id: str = field(default_factory=_new_batch_set_id)
-    shown: bool = True
+    requested_show: bool = True
 
 
 class BatchInitialConditionsStore:
@@ -482,7 +665,7 @@ class BatchInitialConditionsStore:
                     str(s.name),
                     dict(s.values),
                     str(getattr(s, "set_id", "") or _new_batch_set_id()),
-                    bool(getattr(s, "shown", True)),
+                    bool(getattr(s, "requested_show", True)),
                 )
                 for s in sets
             ]
@@ -490,6 +673,7 @@ class BatchInitialConditionsStore:
                 self._sets = [BatchSet("set1")]
         self._normalize_set_ids()
         self._visible_species: List[str] = []
+        self._explicit_serialized_initial_conditions = False
 
     # ---------------- public API ----------------
     def row_count(self) -> int:
@@ -543,18 +727,18 @@ class BatchInitialConditionsStore:
             raise IndexError("row out of range")
         return str(self._sets[int(row)].set_id)
 
-    def is_shown(self, row: int) -> bool:
+    def is_requested_show(self, row: int) -> bool:
         if not (0 <= int(row) < len(self._sets)):
             raise IndexError("row out of range")
-        return bool(self._sets[int(row)].shown)
+        return bool(self._sets[int(row)].requested_show)
 
-    def set_shown(self, row: int, shown: bool) -> None:
+    def set_requested_show(self, row: int, requested_show: bool) -> None:
         if not (0 <= int(row) < len(self._sets)):
             raise IndexError("row out of range")
-        self._sets[int(row)].shown = bool(shown)
+        self._sets[int(row)].requested_show = bool(requested_show)
 
-    def shown_set_ids(self) -> List[str]:
-        return [str(batch.set_id) for batch in self._sets if bool(batch.shown)]
+    def requested_show_set_ids(self) -> List[str]:
+        return [str(batch.set_id) for batch in self._sets if bool(batch.requested_show)]
 
     def set_name_for_row(self, row: int) -> str:
         if not (0 <= int(row) < len(self._sets)):
@@ -698,9 +882,14 @@ class BatchInitialConditionsStore:
                 target_row = start_row + r
                 target_col = start_col + c
                 if target_col == 0:
+                    next_name = str(val or "").strip()
+                    if self._sets[target_row].name == next_name:
+                        continue
                     self.set_set_name(target_row, val)
                 else:
                     sp = self._visible_species[target_col - 1]
+                    if self.get_value(target_row, sp) == str(val):
+                        continue
                     self.set_value(target_row, sp, val)
                 changed.append((target_row, target_col))
         return changed
@@ -730,7 +919,7 @@ class BatchInitialConditionsStore:
                     "set_id": str(s.set_id),
                     "name": s.name,
                     "values": dict(s.values),
-                    "shown": bool(s.shown),
+                    "requested_show": bool(s.requested_show),
                 }
                 for s in self._sets
             ],
@@ -755,13 +944,38 @@ class BatchInitialConditionsStore:
                         name=name,
                         values={str(k): str(v) for k, v in values.items()},
                         set_id=set_id,
-                        shown=bool(entry.get("shown", True)),
+                        requested_show=bool(entry.get("requested_show", True)),
                     )
                 )
         store = cls(sets=sets)
         visible = payload.get("visible_species") if isinstance(payload, dict) else None
-        if isinstance(visible, list):
-            store.set_species([str(s) for s in visible])
+        visible_species = [str(s) for s in visible if str(s)] if isinstance(visible, list) else []
+        if not visible_species and isinstance(sets_in, list):
+            seen_species: set[str] = set()
+            for entry in sets_in:
+                if not isinstance(entry, dict):
+                    continue
+                values = entry.get("values")
+                if not isinstance(values, dict):
+                    continue
+                for key in values.keys():
+                    species = str(key)
+                    if species and species not in seen_species:
+                        visible_species.append(species)
+                        seen_species.add(species)
+        if visible_species:
+            store.set_species(visible_species)
+        explicit_visible_species = isinstance(visible, list) and any(str(s) for s in visible)
+        explicit_values = False
+        if isinstance(sets_in, list):
+            for entry in sets_in:
+                if not isinstance(entry, dict):
+                    continue
+                values = entry.get("values")
+                if isinstance(values, dict) and any(str(k) for k in values.keys()):
+                    explicit_values = True
+                    break
+        store._explicit_serialized_initial_conditions = bool(explicit_visible_species or explicit_values)
         return store
 
     def _normalize_set_ids(self) -> None:
@@ -774,12 +988,35 @@ class BatchInitialConditionsStore:
             used.add(sid)
 
 
+def batch_initial_conditions_store_is_true_placeholder(
+    store: BatchInitialConditionsStore,
+) -> bool:
+    """Return True when a store carries only the default empty table placeholder."""
+    if bool(getattr(store, "_explicit_serialized_initial_conditions", False)):
+        return False
+    if int(store.row_count()) != 1:
+        return False
+    if list(store.set_names() or []) != ["set1"]:
+        return False
+    values = dict(store.values_for_set("set1") or {})
+    for raw in values.values():
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            parsed = float(text)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(parsed) or abs(float(parsed)) > 1e-12:
+            return False
+    return True
+
+
 def resolve_run_scope(
     *,
     selected_rows: Sequence[int],
     total_rows: int,
     mode: str,
-    fallback_row: int | None = None,
 ) -> List[int]:
     total_rows = int(total_rows)
     if total_rows <= 0:
@@ -789,10 +1026,6 @@ def resolve_run_scope(
         return list(range(total_rows))
     # selected mode
     sel = [int(r) for r in (selected_rows or []) if 0 <= int(r) < total_rows]
-    if not sel:
-        if fallback_row is not None and 0 <= int(fallback_row) < total_rows:
-            return [int(fallback_row)]
-        return [0]
     return list(sel)
 
 
@@ -818,38 +1051,17 @@ def dataset_base_label(name: str) -> str:
     return base
 
 
-def seed_batch_set_from_dataset_first_row(
+def seed_batch_set_from_dataset_observations(
     dataset: Dict[str, object],
     mechanism_species: Sequence[str],
     *,
     tol: float,
 ) -> Dict[str, float]:
-    """
-    If dataset starts at ~t=0 (abs(t0)<=tol), seed species present from row 0 and
-    missing species to 0. Otherwise return empty dict.
-    """
-    try:
-        t = np.asarray((dataset or {}).get("t", []), dtype=float).reshape(-1)
-    except Exception:
-        t = np.asarray([], dtype=float)
-    if t.size == 0:
+    observations = observations_from_payload(dataset)
+    if not observations:
         return {}
-    t0 = float(t[0])
-    if not (abs(t0) <= float(tol)):
-        return {}
-    species_map = (dataset or {}).get("species") or {}
-    if not isinstance(species_map, dict):
-        species_map = {}
-
-    seeded: Dict[str, float] = {}
-    for sp in mechanism_species:
-        sp_name = str(sp)
-        if sp_name in species_map:
-            try:
-                y = np.asarray(species_map[sp_name], dtype=float).reshape(-1)
-                seeded[sp_name] = float(y[0]) if y.size else 0.0
-            except Exception:
-                seeded[sp_name] = 0.0
-        else:
-            seeded[sp_name] = 0.0
-    return seeded
+    return seeded_values_at_t0(
+        observations,
+        mechanism_species=mechanism_species,
+        tol=float(tol),
+    )

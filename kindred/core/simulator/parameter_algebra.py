@@ -1,11 +1,11 @@
 """
 Parameter algebra for rate/equilibrium constants.
 
-This adds an explicit, unambiguous syntax in the Algebra section:
+This adds an explicit, unambiguous syntax in mechanism DSL text:
 
     param k1 = 4*k2
 
-`let` (and bare `name = expr`) remain for observables only.
+`let` declares observables. Bare `name = expr` declarations are not supported.
 """
 
 from __future__ import annotations
@@ -13,8 +13,19 @@ from __future__ import annotations
 from dataclasses import replace
 import logging
 import math
-from typing import Dict, List, Optional, Set, Tuple
+import re
+from typing import Dict, Optional, Set
 
+from kindred.core.equilibrium_rate_authority import (
+    EquilibriumRateAuthorityKind,
+    authority_fields_from_step_entry,
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+    normalize_existing_equilibrium_rate_authority,
+    require_step_entry_authored_role_is_editable,
+    step_entry_authored_role_is_editable,
+)
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.rate_binding import RateBinding
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import (
@@ -28,6 +39,7 @@ from kindred.core.simulator.parameter_algebra_eval import (
 from kindred.core.simulator.parameter_algebra_spec import (
     ParameterAlgebraSpec,
     ParameterAssignment,
+    ParameterOverrideWarning,
     extract_parameter_assignments_from_algebra_lines,
     extract_parameter_assignments_from_dsl_text,
     extract_observable_names_from_algebra_lines,
@@ -39,18 +51,16 @@ from kindred.core.simulator.step_indexing import (
     iter_canonical_parameters,
     lookup_step_param_target,
 )
-from kindred.core.simulator.wegscheider import enumerate_reversible_edges, select_spanning_forest_edges
-
 logger = logging.getLogger(__name__)
 
 _MECH_PARAM_RE = mechanism_parameter_name_pattern()
 _WEGSCHEIDER_META_KEY = "wegscheider_cyclicity_enabled"
 _PARAMETER_ALGEBRA_SPEC_META_KEY = "parameter_algebra_spec"
-_WEGSCHEIDER_TOL = 1e-10
 
 _PUBLIC_REEXPORTS = (
     ParameterAssignment,
     ParameterAlgebraSpec,
+    ParameterOverrideWarning,
     extract_parameter_assignments_from_algebra_lines,
     extract_parameter_assignments_from_dsl_text,
     extract_observable_names_from_algebra_lines,
@@ -81,6 +91,10 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
 
     rxns = getattr(mechanism, "reactions", []) or []
     eqs = getattr(mechanism, "equilibria", []) or []
+    mechanism_meta = getattr(mechanism, "metadata", {}) or {}
+    temperature_K = _as_float(mechanism_meta.get(MechanismMetadataKeys.TEMPERATURE_K)) if isinstance(mechanism_meta, dict) else None
+    if temperature_K is None:
+        temperature_K = 298.15
     for name, entry, role in iter_canonical_parameters(mechanism):
         if name not in wanted:
             continue
@@ -98,11 +112,14 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
             eq = eqs[idx]
             if role in {"kf", "kr"}:
                 v = _as_float(getattr(eq, role, None))
+                if role == "kr":
+                    authority = normalize_existing_equilibrium_rate_authority(eq)
+                    if authority.kind == EquilibriumRateAuthorityKind.KEQ:
+                        v = effective_equilibrium_reverse_rate(eq, temperature_K=float(temperature_K))
                 if v is not None:
                     out[name] = v
             elif role == "Keq":
-                meta = getattr(eq, "metadata", {}) or {}
-                v = _as_float(meta.get("Keq_input"))
+                v = effective_equilibrium_keq(eq, temperature_K=float(temperature_K))
                 if v is not None:
                     out[name] = v
     return out
@@ -155,7 +172,7 @@ def _set_mechanism_param(
     target = lookup_step_param_target(mechanism, name)
     if target is None:
         raise DSLError(f"Unsupported parameter name {name!r} for parameter algebra")
-    kind, idx, role, _entry = target
+    kind, idx, role, entry = target
     if kind == "reaction" and role == "k":
         rxns = getattr(mechanism, "reactions", []) or []
         if not (0 <= idx < len(rxns)):
@@ -174,6 +191,7 @@ def _set_mechanism_param(
         eqs = getattr(mechanism, "equilibria", []) or []
         if not (0 <= idx < len(eqs)):
             raise DSLError(f"Unknown parameter {name!r} (equilibrium index out of range)")
+        require_step_entry_authored_role_is_editable(entry, role, parameter_name=name)
         eq = eqs[idx]
         if role in {"kf", "kr"}:
             current = getattr(eq, role, None)
@@ -203,7 +221,48 @@ def _set_mechanism_param(
     raise DSLError(f"Unsupported parameter target for {name!r}")
 
 
-def _apply_equilibrium_Keq_constraints_to_values(mechanism: object, base_values: Dict[str, float]) -> None:
+def _active_equilibrium_keq_names(mechanism: object, spec: ParameterAlgebraSpec) -> Set[str]:
+    active: Set[str] = set()
+    entry_by_keq_name: dict[str, dict] = {}
+    for entry in get_step_index_map(mechanism):
+        if str(entry.get("kind") or "") != "equilibrium":
+            continue
+        try:
+            name = f"Keq{int(entry.get('step_index'))}"
+        except (TypeError, ValueError):
+            continue
+        entry_by_keq_name[name] = entry
+        if not bool(step_entry_authored_role_is_editable(entry, "Keq")):
+            continue
+        active.add(name)
+    for stmt in spec.param_statements or []:
+        name = str(stmt.name)
+        if not re.match(r"^Keq\d+$", name):
+            continue
+        entry = entry_by_keq_name.get(name)
+        authority = authority_fields_from_step_entry(entry or {})
+        if authority and bool(authority.get("has_thermo_param")) and not bool(step_entry_authored_role_is_editable(entry or {}, "Keq")):
+            raise ValueError(f"{name} cannot override dG_eq equilibrium authority.")
+        active.add(name)
+    return active
+
+
+def _validate_parameter_algebra_editable_targets(mechanism: object, spec: ParameterAlgebraSpec) -> None:
+    for stmt in spec.param_statements or ():
+        target = lookup_step_param_target(mechanism, str(stmt.name))
+        if target is None:
+            continue
+        kind, _idx, role, entry = target
+        if kind == "equilibrium":
+            require_step_entry_authored_role_is_editable(entry, role, parameter_name=str(stmt.name))
+
+
+def _apply_equilibrium_Keq_constraints_to_values(
+    mechanism: object,
+    base_values: Dict[str, float],
+    *,
+    active_keq_names: Set[str],
+) -> None:
     """
     Populate derived equilibrium rate values implied by explicit Keq parameters.
 
@@ -213,207 +272,60 @@ def _apply_equilibrium_Keq_constraints_to_values(mechanism: object, base_values:
     for entry in get_step_index_map(mechanism):
         if str(entry.get("kind") or "") != "equilibrium":
             continue
-        if not bool(entry.get("has_Keq_param")):
-            continue
         try:
             n = int(entry.get("step_index"))  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
-            logger.debug("Skipping equilibrium Keq-constraint entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
-            continue
-        derive_rate = str(entry.get("derive_rate") or "kr")
+            raise ValueError(
+                f"Invalid equilibrium Keq-constraint step_index={entry.get('step_index')!r}."
+            ) from exc
+        authority = authority_fields_from_step_entry(entry)
+        if not authority:
+            raise ValueError(
+                f"Equilibrium Keq-constraint step_index={entry.get('step_index')!r} is missing equilibrium_authority."
+            )
+        derive_rate = str(authority.get("derived_role") or "")
+        if derive_rate not in {"kf", "kr"}:
+            derive_rate = "kr"
         kf_key = f"kf{n}"
         kr_key = f"kr{n}"
         keq_key = f"Keq{n}"
-        if keq_key not in base_values:
+        if keq_key not in active_keq_names:
             continue
+        if keq_key not in base_values:
+            raise ValueError(f"Active equilibrium constraint {keq_key!r} has no source value.")
         keq = float(base_values[keq_key])
         if not math.isfinite(keq) or abs(keq) < 1e-30:
-            continue
+            raise ValueError(f"Active equilibrium constraint {keq_key!r} has invalid value {keq!r}.")
         if derive_rate == "kf":
             if kr_key in base_values:
                 base_values[kf_key] = float(base_values[kr_key]) * keq
+            else:
+                raise ValueError(f"Active equilibrium constraint {keq_key!r} cannot derive missing {kf_key!r}.")
         else:
             if kf_key in base_values:
                 base_values[kr_key] = float(base_values[kf_key]) / keq
+            else:
+                raise ValueError(f"Active equilibrium constraint {keq_key!r} cannot derive missing {kr_key!r}.")
 
 
-def _apply_equilibrium_Keq_constraints_to_mechanism(mechanism: object, *, require_mutable: bool) -> Dict[str, float]:
-    """
-    Apply equilibrium constraints implied by explicit Keq parameters to the mechanism in-place.
-
-    Returns a map of derived rate updates (e.g., {'kr2': 1.23}).
-    """
-    updates: Dict[str, float] = {}
-    values = read_mechanism_parameter_values(mechanism)
-    _apply_equilibrium_Keq_constraints_to_values(mechanism, values)
-    for entry in get_step_index_map(mechanism):
-        if str(entry.get("kind") or "") != "equilibrium":
-            continue
-        if not bool(entry.get("has_Keq_param")):
-            continue
-        try:
-            n = int(entry.get("step_index"))  # type: ignore[arg-type]
-        except (TypeError, ValueError) as exc:
-            logger.debug("Skipping equilibrium Keq-constraint (mechanism) entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
-            continue
-        derive_rate = str(entry.get("derive_rate") or "kr")
-        if derive_rate == "kf":
-            nm = f"kf{n}"
-        else:
-            nm = f"kr{n}"
-        if nm not in values:
-            continue
-        v = float(values[nm])
-        _set_mechanism_param(mechanism, nm, v, require_mutable=require_mutable)
-        updates[nm] = v
-    return updates
-
-
-def _apply_wegscheider_cyclicity_constraints_to_mechanism(
+def _apply_equilibrium_Keq_constraints_to_mechanism(
     mechanism: object,
     *,
     require_mutable: bool,
-    constrained_params: Dict[str, Dict[str, object]],
+    active_keq_names: Set[str],
 ) -> Dict[str, float]:
     """
-    Enforce Wegscheider cyclicity over reversible (equilibrium) steps.
+    Validate equilibrium constraints implied by explicit Keq parameters.
 
-    Policy (hard constraints):
-    - Operates on ln(kf/kr) edge potentials over the complex graph.
-    - Builds a deterministic spanning forest; non-tree, non-fixed edges are derived.
-    - Explicit-Keq equilibria (step_index_map has_Keq_param) are treated as fixed ratios.
-    - Derived targets are recorded into constrained_params for GUI + fit-scan exclusion.
+    Derived reverse/forward rates are effective values owned by the normalized
+    equilibrium authority boundary. They are populated into evaluation values by
+    `_apply_equilibrium_Keq_constraints_to_values`, but are not written back to
+    raw rate slots or reported as applied parameter-algebra mutations here.
     """
-    meta = getattr(mechanism, "metadata", {}) or {}
-    enabled = bool(meta.get(_WEGSCHEIDER_META_KEY, False)) if isinstance(meta, dict) else False
-    if not enabled:
-        return {}
-
-    edges = enumerate_reversible_edges(mechanism)
-    if len(edges) < 2:
-        return {}
-
-    locked: Set[str] = {str(k) for k in (constrained_params or {}).keys()}
-    nodes: List[str] = sorted({e.u for e in edges} | {e.v for e in edges})
-    if len(nodes) < 2:
-        return {}
-
-    forced_anchor: Set[int] = set()
-    eligible: Set[int] = set()
-    for i, e in enumerate(edges):
-        if bool(e.has_explicit_K):
-            forced_anchor.add(i)
-            continue
-        kf_locked = str(e.kf_name) in locked
-        kr_locked = str(e.kr_name) in locked
-        if kf_locked and kr_locked:
-            forced_anchor.add(i)
-            continue
-        eligible.add(i)
-
-    forest = select_spanning_forest_edges(nodes, edges, prefer=forced_anchor)
-    anchor = set(forced_anchor) | set(forest)
-    dependent = sorted(i for i in eligible if i not in anchor)
-
-    eqs = list(getattr(mechanism, "equilibria", []) or [])
-
-    def _as_float(x: object) -> float:
-        return float(x()) if callable(x) else float(x)
-
-    def _ln_ratio_for_edge(i: int) -> float:
-        e = edges[i]
-        if not (0 <= int(e.equilibrium_index) < len(eqs)):
-            raise DSLError(f"Wegscheider cyclicity: invalid equilibrium index for step {int(e.step_index)}")
-        eq = eqs[int(e.equilibrium_index)]
-        try:
-            kf = _as_float(getattr(eq, "kf"))
-            kr = _as_float(getattr(eq, "kr"))
-        except Exception as exc:
-            raise DSLError(f"Wegscheider cyclicity: missing kf/kr values for step {int(e.step_index)}") from exc
-        if not (math.isfinite(kf) and math.isfinite(kr) and kf > 0.0 and kr > 0.0):
-            raise DSLError(
-                f"Wegscheider cyclicity requires positive finite kf/kr for step {int(e.step_index)} "
-                f"({e.kf_name}={kf!r}, {e.kr_name}={kr!r})."
-            )
-        return float(math.log(kf) - math.log(kr))
-
-    # Build adjacency over anchor edges using ln(kf/kr) values.
-    adj: Dict[str, List[Tuple[str, float, int]]] = {n: [] for n in nodes}
-    for i in sorted(anchor):
-        e = edges[i]
-        lnK = _ln_ratio_for_edge(i)
-        adj[e.u].append((e.v, lnK, i))
-        adj[e.v].append((e.u, -lnK, i))
-
-    phi: Dict[str, float] = {}
-    for root in nodes:
-        if root in phi:
-            continue
-        phi[root] = 0.0
-        stack = [root]
-        while stack:
-            cur = stack.pop()
-            cur_phi = float(phi[cur])
-            for nxt, dphi, edge_i in adj.get(cur, []):
-                expected = cur_phi + float(dphi)
-                if nxt not in phi:
-                    phi[nxt] = float(expected)
-                    stack.append(nxt)
-                    continue
-                if abs(float(phi[nxt]) - float(expected)) > float(_WEGSCHEIDER_TOL):
-                    e = edges[int(edge_i)]
-                    raise DSLError(
-                        "Wegscheider cyclicity constraints are unsatisfiable for the current fixed ratios. "
-                        f"Conflict detected while traversing step {int(e.step_index)}."
-                    )
-
-    if not dependent:
-        return {}
-
-    updates: Dict[str, float] = {}
-    for i in dependent:
-        e = edges[i]
-        desired_lnK = float(phi[e.v] - phi[e.u])
-        derive_kr = (str(e.kr_name) not in locked)
-        derive_kf = (str(e.kf_name) not in locked)
-        if derive_kr:
-            eq = eqs[int(e.equilibrium_index)]
-            kf_val = _as_float(getattr(eq, "kf"))
-            if not (math.isfinite(kf_val) and kf_val > 0.0):
-                raise DSLError(f"Wegscheider cyclicity requires positive kf for {e.kf_name}.")
-            lnkr = float(math.log(float(kf_val)) - desired_lnK)
-            kr_new = float(math.exp(lnkr))
-            if not (math.isfinite(kr_new) and kr_new > 0.0):
-                raise DSLError(f"Wegscheider cyclicity produced invalid derived value for {e.kr_name}.")
-            _set_mechanism_param(mechanism, str(e.kr_name), float(kr_new), require_mutable=require_mutable)
-            updates[str(e.kr_name)] = float(kr_new)
-            constrained_params.setdefault(
-                str(e.kr_name),
-                {"line": 0, "expr": "Wegscheider cyclicity", "constraint_reason": "wegscheider"},
-            )
-            continue
-        if derive_kf:
-            eq = eqs[int(e.equilibrium_index)]
-            kr_val = _as_float(getattr(eq, "kr"))
-            if not (math.isfinite(kr_val) and kr_val > 0.0):
-                raise DSLError(f"Wegscheider cyclicity requires positive kr for {e.kr_name}.")
-            lnkf = float(math.log(float(kr_val)) + desired_lnK)
-            kf_new = float(math.exp(lnkf))
-            if not (math.isfinite(kf_new) and kf_new > 0.0):
-                raise DSLError(f"Wegscheider cyclicity produced invalid derived value for {e.kf_name}.")
-            _set_mechanism_param(mechanism, str(e.kf_name), float(kf_new), require_mutable=require_mutable)
-            updates[str(e.kf_name)] = float(kf_new)
-            constrained_params.setdefault(
-                str(e.kf_name),
-                {"line": 0, "expr": "Wegscheider cyclicity", "constraint_reason": "wegscheider"},
-            )
-            continue
-        raise DSLError(
-            "Wegscheider cyclicity requires at least one adjustable parameter per dependent edge, but "
-            f"both {e.kf_name} and {e.kr_name} are constrained."
-        )
-
-    return updates
+    values = read_mechanism_parameter_values(mechanism)
+    _apply_equilibrium_Keq_constraints_to_values(mechanism, values, active_keq_names=active_keq_names)
+    _ = require_mutable
+    return {}
 
 
 def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebraSpec | None:
@@ -424,20 +336,81 @@ def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebra
     return spec if isinstance(spec, ParameterAlgebraSpec) else None
 
 
+def _parameter_override_warnings_for_spec(
+    spec: ParameterAlgebraSpec,
+    *,
+    mechanism: object,
+) -> tuple[ParameterOverrideWarning, ...]:
+    warnings: list[ParameterOverrideWarning] = []
+    rxns = getattr(mechanism, "reactions", []) or []
+    eqs = getattr(mechanism, "equilibria", []) or []
+
+    for stmt in spec.param_statements:
+        target = lookup_step_param_target(mechanism, stmt.name)
+        if target is None:
+            continue
+        kind, index, role, entry = target
+        step_index = int(entry.get("step_index", 0) or 0)
+        inline_name: str | None = None
+
+        if kind == "reaction" and role == "k":
+            if not (0 <= index < len(rxns)):
+                continue
+            overrides = getattr(rxns[index], "overrides", {}) or {}
+            has_energy_model_override = overrides.get("model") in {"Arrhenius", "Eyring"} and any(
+                overrides.get(key) is not None
+                for key in ("A", "Ea", "Ea_J_per_mol", "dG_act_J_per_mol")
+            )
+            if not has_energy_model_override:
+                inline_name = "k"
+        elif kind == "equilibrium":
+            if not (0 <= index < len(eqs)):
+                continue
+            if role == "kf" and bool(entry.get("user_provided_kf")):
+                inline_name = "kf"
+            elif role == "kr" and bool(entry.get("user_provided_kr")):
+                inline_name = "kr"
+            elif role == "Keq" and bool(step_entry_authored_role_is_editable(entry, "Keq")):
+                inline_name = "Keq"
+
+        if inline_name is None:
+            continue
+        warnings.append(
+            ParameterOverrideWarning(
+                param_name=str(stmt.name),
+                inline_name=str(inline_name),
+                step_index=int(step_index),
+                message=f"param {stmt.name} overrides inline {inline_name} on step {step_index}",
+            )
+        )
+
+    return tuple(warnings)
+
+
 def apply_parameter_algebra_spec_to_mechanism(
     spec: ParameterAlgebraSpec,
     *,
     mechanism: object,
     require_mutable: bool,
 ) -> Dict[str, float]:
+    spec = replace(
+        spec,
+        override_warnings=_parameter_override_warnings_for_spec(spec, mechanism=mechanism),
+    )
     meta = getattr(mechanism, "metadata", None)
     if isinstance(meta, dict):
         meta[_PARAMETER_ALGEBRA_SPEC_META_KEY] = spec
+    _validate_parameter_algebra_editable_targets(mechanism, spec)
     _ensure_scalar_param_storage(mechanism, require_mutable=require_mutable)
+    active_keq_names = _active_equilibrium_keq_names(mechanism, spec)
     base_values: Dict[str, float] = {}
     base_values.update(read_mechanism_parameter_values(mechanism, names=spec.mechanism_param_names))
     base_values.update(_read_scalar_param_values(mechanism, require_mutable=require_mutable))
-    _apply_equilibrium_Keq_constraints_to_values(mechanism, base_values)
+    _apply_equilibrium_Keq_constraints_to_values(
+        mechanism,
+        base_values,
+        active_keq_names=active_keq_names,
+    )
 
     derived: Dict[str, float] = {}
     if spec.param_statements:
@@ -531,20 +504,24 @@ def apply_parameter_algebra_spec_to_mechanism(
             _set_mechanism_param(mechanism, nm, val, require_mutable=require_mutable)
 
     # Apply Keq-implied equilibrium constraints after any parameter algebra updates.
-    eq_updates = _apply_equilibrium_Keq_constraints_to_mechanism(mechanism, require_mutable=require_mutable)
+    eq_updates = _apply_equilibrium_Keq_constraints_to_mechanism(
+        mechanism,
+        require_mutable=require_mutable,
+        active_keq_names=active_keq_names,
+    )
     if eq_updates:
         derived = dict(derived)
         derived.update(eq_updates)
 
-    # Apply Wegscheider cyclicity constraints last (after explicit-Keq implied rates).
-    cy_updates = _apply_wegscheider_cyclicity_constraints_to_mechanism(
-        mechanism,
-        require_mutable=require_mutable,
-        constrained_params=constrained,
-    )
-    if cy_updates:
-        derived = dict(derived)
-        derived.update(dict(cy_updates))
+    meta = getattr(mechanism, "metadata", {}) or {}
+    enabled = bool(meta.get(_WEGSCHEIDER_META_KEY, False)) if isinstance(meta, dict) else False
+    if enabled:
+        from kindred.core.simulator.wegscheider_symbolic import validate_wegscheider_cyclicity_resolved
+
+        validate_wegscheider_cyclicity_resolved(
+            mechanism,
+            parameter_algebra_spec=spec,
+        )
     return derived
 
 

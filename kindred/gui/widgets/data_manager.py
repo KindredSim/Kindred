@@ -21,6 +21,11 @@ from kindred.core.datasets.excel_import import (
     list_sheets,
     read_excel_sheet_rows,
 )
+from kindred.core.datasets.observation_payload import (
+    dense_view_from_observations,
+    observations_from_payload,
+    scale_payload_in_place,
+)
 from kindred.gui.widgets.import_config import (
     ImportConfig,
     ResolvedSheetPlan,
@@ -32,6 +37,13 @@ from kindred.gui.widgets.import_config import (
     resolve_import_plans,
 )
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
+from kindred.gui.controllers.dataset_registry import DatasetRecord
+from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label
+from kindred.gui.widgets.dataset_import_session import (
+    DatasetImportCompletion,
+    DatasetImportSession,
+    DatasetImportUnit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +52,10 @@ __all__ = ["DataManagerPanel"]
 class CSVLoaderWorker(QtCore.QThread):
     """Background worker for loading CSV files without blocking UI."""
 
-    finished = QtCore.Signal(str, dict)  # name, data
+    loaded = QtCore.Signal(str, dict)  # name, data
     cancelled = QtCore.Signal(str)  # dataset name
     error = QtCore.Signal(str)  # error message
     progress = QtCore.Signal(int)  # progress percentage
-    done = QtCore.Signal()
 
     def __init__(self, plan: ResolvedSheetPlan):
         super().__init__()
@@ -80,6 +91,7 @@ class CSVLoaderWorker(QtCore.QThread):
                 time_column=self._time_column,
                 species_columns=self._species_columns,
                 interruption_checker=self.isInterruptionRequested,
+                source_label=os.path.basename(self.filepath),
             )
         return data
 
@@ -113,7 +125,7 @@ class CSVLoaderWorker(QtCore.QThread):
             logger.debug(
                 "Parsed CSV dataset: time column '%s', species columns: %s",
                 data.get("metadata", {}).get("time_column"),
-                list(data['species'].keys()),
+                list((data.get("observations") or {}).keys()),
             )
 
             self.progress.emit(80)
@@ -124,16 +136,17 @@ class CSVLoaderWorker(QtCore.QThread):
             self.progress.emit(100)
 
             # Log success before emitting signal
-            species = data.get('species', {})
+            observations = data.get('observations', {})
+            total_points = sum(len(spec.get("t", [])) for spec in observations.values()) if isinstance(observations, dict) else 0
             logger.info(
                 "CSV import completed: %s (%d rows, %d species: %s)",
                 dataset_name,
-                len(data.get('t', [])),
-                len(species),
-                list(species.keys()),
+                total_points,
+                len(observations),
+                list(observations.keys()),
             )
 
-            self.finished.emit(dataset_name, data)
+            self.loaded.emit(dataset_name, data)
 
         except CsvImportInterrupted:
             self.cancelled.emit(dataset_name)
@@ -141,18 +154,15 @@ class CSVLoaderWorker(QtCore.QThread):
         except Exception as e:
             logger.error(f"CSV import failed: {dataset_name} - {type(e).__name__}: {e}", exc_info=True)
             self.error.emit(f"{type(e).__name__}: {str(e)}")
-        finally:
-            self.done.emit()
 
 
 class ExcelLoaderWorker(QtCore.QThread):
     """Background worker for loading Excel sheets without blocking UI."""
 
-    finished = QtCore.Signal(str, dict)  # name, data
+    loaded = QtCore.Signal(str, dict)  # name, data
     cancelled = QtCore.Signal(str)  # dataset name
     error = QtCore.Signal(str)  # error message
     progress = QtCore.Signal(int)  # progress percentage
-    done = QtCore.Signal()
 
     def __init__(self, filepath: str, plans: Sequence[ResolvedSheetPlan]):
         super().__init__()
@@ -175,6 +185,8 @@ class ExcelLoaderWorker(QtCore.QThread):
                 time_column=plan.time_column,
                 species_columns=list(plan.species_columns),
                 interruption_checker=self.isInterruptionRequested,
+                source_label=os.path.basename(self.filepath),
+                sheet_name=plan.sheet_name,
             )
         return f"{os.path.basename(self.filepath)}::{plan.sheet_name}", data
 
@@ -184,7 +196,6 @@ class ExcelLoaderWorker(QtCore.QThread):
 
         if total <= 0:
             self.error.emit("No Excel sheets were selected for import.")
-            self.done.emit()
             return
 
         try:
@@ -207,7 +218,7 @@ class ExcelLoaderWorker(QtCore.QThread):
                     )
                     self.error.emit(f"Sheet '{plan.sheet_name}': {type(exc).__name__}: {exc}")
                 else:
-                    self.finished.emit(loaded_name, data)
+                    self.loaded.emit(loaded_name, data)
                 self.progress.emit(int((index / total) * 100))
                 if self.isInterruptionRequested():
                     logger.info("Excel import interrupted after sheet %s: %s", plan.sheet_name, dataset_name)
@@ -216,13 +227,10 @@ class ExcelLoaderWorker(QtCore.QThread):
         except Exception as exc:
             logger.error("Excel import failed: %s - %s: %s", dataset_name, type(exc).__name__, exc, exc_info=True)
             self.error.emit(f"{type(exc).__name__}: {exc}")
-        finally:
-            self.done.emit()
-
 
 class DataManagerPanel(QtWidgets.QWidget):
     """
-    Data manager for loading/managing experimental datasets.
+    Import panel for loading and previewing committed experimental datasets.
 
     Features:
     - Load CSV and Excel files with experimental data
@@ -233,17 +241,12 @@ class DataManagerPanel(QtWidgets.QWidget):
     - Multiple dataset support
 
     Signals:
-        datasetLoaded(str, dict): Emitted when dataset is loaded
-            - name: Dataset name (filename)
-            - data: {'t': array, 'species': {name: array}}
-        datasetRemoved(str): Emitted when a dataset is removed from the panel
-        loadFinished(bool): Emitted once when a load cycle completes or is canceled
-            - canceled: True if the operation was canceled
+        importCompleted(object): Emitted with one DatasetImportCompletion when an import session ends
+        datasetRemovalRequested(str): Emitted when the user requests removal of a committed dataset
     """
 
-    datasetLoaded = QtCore.Signal(str, dict)  # name, data dict
-    datasetRemoved = QtCore.Signal(str)  # name
-    loadFinished = QtCore.Signal(bool)  # canceled flag
+    importCompleted = QtCore.Signal(object)
+    datasetRemovalRequested = QtCore.Signal(str)
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         """
@@ -263,6 +266,8 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         # Dataset list
         self._dataset_list = QtWidgets.QListWidget()
+        self._dataset_list.setUniformItemSizes(True)
+        self._dataset_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._dataset_list.currentItemChanged.connect(self._on_dataset_selected)
         layout.addWidget(self._dataset_list)
 
@@ -286,19 +291,16 @@ class DataManagerPanel(QtWidgets.QWidget):
         layout.addWidget(self._preview_label)
         self._preview_label.hide()
 
-        # Store loaded datasets {name: {t: array, species: {name: array}}}
-        self._datasets: Dict[str, Dict] = {}
+        # Rendered committed registry records for list/preview only.
+        self._visible_records_by_id: Dict[str, DatasetRecord] = {}
 
-        # Track active import workers across CSV and Excel loads.
-        self._csv_workers: List[QtCore.QThread] = []
-        self._pending_files_count = 0
-        self._completed_files_count = 0
+        # Active worker handles live in DatasetImportSession until completion.
         self._progress_dialog: Optional[QtWidgets.QProgressDialog] = None
         self._cancel_requested = False
-        self._load_finished_emitted = False
-        self._pending_import_configs: Dict[str, ImportConfig] = {}
-        self._pending_import_units_remaining: Dict[str, int] = {}
+        self._import_completion_emitted = False
         self._load_generation = 0
+        self._active_import_session: Optional[DatasetImportSession] = None
+        self._retired_import_sessions_by_worker: Dict[int, DatasetImportSession] = {}
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -308,28 +310,99 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._load_dataset()
 
     def clear_datasets(self) -> None:
-        """Clear loaded datasets and reset dataset-panel UI state."""
-        self._load_generation += 1
-        workers = list(self._csv_workers)
-        for worker in workers:
-            with suppress(RuntimeError):
-                worker.requestInterruption()
-        for worker in workers:
-            self._cleanup_worker(worker)
-        self._pending_files_count = 0
-        self._completed_files_count = 0
-        self._pending_import_configs.clear()
-        self._pending_import_units_remaining.clear()
-        self._cancel_requested = False
-        self._load_finished_emitted = False
-        self._finalize_progress_dialog()
-        self._datasets.clear()
+        """Cancel active import work and reset rendered registry state."""
+        had_active_load = self._deauthorize_active_import(
+            emit_canceled_finished=True,
+            outcome="cleared_or_reset",
+        )
+        if not had_active_load:
+            self._import_completion_emitted = False
+        self.render_registry_snapshot(())
+
+    def render_registry_snapshot(self, records: Sequence[DatasetRecord]) -> None:
+        """Render committed registry records without becoming their owner."""
+        self._visible_records_by_id = {str(record.dataset_id): record for record in records}
         self._dataset_list.clear()
+        for record in records:
+            compact = compact_dataset_label(record.display_name, max_chars=DATASET_LIST_LABEL_MAX_CHARS)
+            item = QtWidgets.QListWidgetItem(compact.display)
+            item.setToolTip(compact.full)
+            item.setData(Qt.UserRole, str(record.dataset_id))
+            item.setData(Qt.UserRole + 1, compact.full)
+            self._dataset_list.addItem(item)
         self._preview_label.setText("No dataset selected")
         self._preview_label.hide()
 
+    def _deauthorize_active_import(
+        self,
+        *,
+        emit_canceled_finished: bool,
+        outcome: str = "superseded",
+    ) -> bool:
+        """Cancel the active import generation without blocking on worker teardown."""
+        session = self._active_import_session
+        had_active_load = session is not None and not self._import_completion_emitted
+        if session is None:
+            return False
+
+        self._load_generation += 1
+        workers = session.deauthorize(str(outcome or "superseded"))
+        self._retain_deauthorized_import_session(session, workers)
+        self._cancel_requested = False
+        if not had_active_load:
+            self._import_completion_emitted = False
+        self._finalize_progress_dialog()
+        if had_active_load and emit_canceled_finished:
+            self._emit_import_completed(
+                canceled=True,
+                superseded=str(outcome) == "superseded",
+                discard_units=True,
+                outcome=str(outcome or "superseded"),
+            )
+        else:
+            self._active_import_session = None
+        return had_active_load
+
+    def _retain_deauthorized_import_session(
+        self,
+        session: DatasetImportSession,
+        workers: Sequence[QtCore.QThread],
+    ) -> None:
+        for worker in workers:
+            self._retired_import_sessions_by_worker[id(worker)] = session
+
+    def _import_session_for_worker(
+        self,
+        worker: Optional[QtCore.QThread],
+    ) -> Optional[DatasetImportSession]:
+        if worker is None:
+            return None
+        active = self._active_import_session
+        if active is not None and active.owns_worker(worker):
+            return active
+        return self._retired_import_sessions_by_worker.get(id(worker))
+
+    def _release_retired_import_worker(
+        self,
+        worker: Optional[QtCore.QThread],
+        session: Optional[DatasetImportSession],
+    ) -> None:
+        if worker is None or session is None:
+            return
+        self._retired_import_sessions_by_worker.pop(id(worker), None)
+        if not getattr(session, "_workers", None):
+            stale_worker_ids = [
+                worker_id
+                for worker_id, retired_session in self._retired_import_sessions_by_worker.items()
+                if retired_session is session
+            ]
+            for worker_id in stale_worker_ids:
+                self._retired_import_sessions_by_worker.pop(worker_id, None)
+
     def _load_dataset(self):
         """Load dataset(s) using per-file import configuration and background workers."""
+        self._deauthorize_active_import(emit_canceled_finished=True, outcome="superseded")
+
         filenames, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
             "Load Dataset(s)",
@@ -390,12 +463,12 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         self._load_generation += 1
         current_generation = self._load_generation
-        self._pending_files_count = expected_count
-        self._completed_files_count = 0
         self._cancel_requested = False
-        self._load_finished_emitted = False
-        self._pending_import_configs.clear()
-        self._pending_import_units_remaining.clear()
+        self._import_completion_emitted = False
+        self._active_import_session = DatasetImportSession(
+            session_id=current_generation,
+            expected_units=expected_count,
+        )
 
         dataset_label = f"{expected_count} dataset{'s' if expected_count != 1 else ''}"
         logger.info("User initiated dataset import: %s", dataset_label)
@@ -411,22 +484,22 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         for config in configs:
             result_units = self._expected_dataset_count_for_config(config)
-            self._pending_import_configs[config.filepath] = config
-            self._pending_import_units_remaining[config.filepath] = result_units
             if config.file_type == "excel":
                 worker: QtCore.QThread = ExcelLoaderWorker(config.filepath, list(config.plans))
-                worker.finished.connect(self._on_excel_loaded)
+                worker.loaded.connect(self._on_excel_loaded)
             else:
                 worker = CSVLoaderWorker(config.plans[0])
-                worker.finished.connect(self._on_csv_loaded)
+                worker.loaded.connect(self._on_csv_loaded)
             setattr(worker, "_expected_result_count", result_units)
             setattr(worker, "_accounted_result_count", 0)
             setattr(worker, "_load_generation", current_generation)
             worker.progress.connect(self._on_load_progress)
             worker.cancelled.connect(self._on_csv_cancelled)
             worker.error.connect(self._on_csv_error)
-            worker.done.connect(self._on_worker_done)
-            self._csv_workers.append(worker)
+            worker.finished.connect(self._on_worker_done)
+            session = self._active_import_session
+            if session is not None:
+                session.register_worker(worker, expected_units=result_units, config=config)
             worker.start()
 
     def _expected_dataset_count_for_config(self, config: ImportConfig) -> int:
@@ -536,27 +609,24 @@ class DataManagerPanel(QtWidgets.QWidget):
     def _on_load_progress(self, percent: int):
         """Handle progress updates from dataset import worker(s)."""
         if self._progress_dialog:
-            if self._pending_files_count > 0:
-                completed_fraction = self._completed_files_count / self._pending_files_count
-                current_file_fraction = (1.0 / self._pending_files_count) * (percent / 100.0)
+            session = self._active_import_session
+            expected = int(getattr(session, "expected_units", 0) or 0)
+            completed = int(getattr(session, "_completed_units", 0) or 0)
+            if expected > 0:
+                completed_fraction = completed / expected
+                current_file_fraction = (1.0 / expected) * (percent / 100.0)
                 overall_percent = int((completed_fraction + current_file_fraction) * 100)
                 self._progress_dialog.setValue(min(overall_percent, 99))
 
     def _on_load_canceled(self):
         """Handle cancel request during dataset loading."""
-        for worker in self._csv_workers:
-            if worker:
-                worker.requestInterruption()
-
         logger.info("Dataset import cancellation requested by user")
         self._cancel_requested = True
-
-        # Close progress dialog immediately
-        if self._progress_dialog:
-            self._progress_dialog.close()
-            self._progress_dialog = None
-
-        self._maybe_finalize_load_cycle()
+        self._deauthorize_active_import(
+            emit_canceled_finished=True,
+            outcome="user_canceled",
+        )
+        self._cancel_requested = False
 
     def _on_csv_cancelled(self, name: str):
         """Handle dataset import cancellation without surfacing an error dialog."""
@@ -564,15 +634,42 @@ class DataManagerPanel(QtWidgets.QWidget):
         if sender is not None and int(getattr(sender, "_load_generation", -1)) != int(self._load_generation):
             return
         logger.info("Dataset import canceled: %s", name)
-        self._note_worker_units_processed(sender, self._remaining_worker_result_count(sender))
+        session = self._active_import_session
+        if session is not None and sender is not None:
+            session.note_worker_units_processed(sender, session.remaining_worker_result_count(sender))
         self._maybe_finalize_load_cycle()
 
-    def _emit_load_finished(self, canceled: bool) -> None:
-        """Ensure overall completion/cancellation signal fires only once."""
-        if self._load_finished_emitted:
+    def _emit_import_completed(
+        self,
+        *,
+        canceled: bool,
+        superseded: bool = False,
+        discard_units: bool = False,
+        outcome: str = "completed",
+    ) -> None:
+        """Emit one completion object for the active import session."""
+        if self._import_completion_emitted:
             return
-        self._load_finished_emitted = True
-        self.loadFinished.emit(canceled)
+        self._import_completion_emitted = True
+        session = self._active_import_session
+        self._active_import_session = None
+        if session is None:
+            completion = DatasetImportCompletion(
+                session_id=int(self._load_generation),
+                units=(),
+                outcome=str(outcome or "completed"),
+                errors=(),
+                canceled=bool(canceled),
+                superseded=bool(superseded),
+            )
+        else:
+            completion = session.completion(
+                canceled=bool(canceled),
+                superseded=bool(superseded),
+                discard_units=bool(discard_units),
+                outcome=str(outcome or "completed"),
+            )
+        self.importCompleted.emit(completion)
 
     def _finalize_progress_dialog(self) -> None:
         """Close and clear the progress dialog if it exists."""
@@ -589,74 +686,35 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def _maybe_finalize_load_cycle(self):
         """Close progress UI and emit completion when all workers are gone."""
-        if (
-            self._pending_files_count > 0
-            and self._completed_files_count >= self._pending_files_count
-            and not self._csv_workers
-        ):
+        session = self._active_import_session
+        if session is not None and session.complete_ready():
             self._finalize_progress_dialog()
-            self._pending_files_count = 0
-            self._completed_files_count = 0
-            self._pending_import_configs.clear()
-            self._pending_import_units_remaining.clear()
-            self._emit_load_finished(self._cancel_requested)
+            outcome = "user_canceled" if self._cancel_requested else "completed"
+            self._emit_import_completed(
+                canceled=self._cancel_requested,
+                discard_units=bool(self._cancel_requested),
+                outcome=outcome,
+            )
             self._cancel_requested = False
 
-    def _remaining_worker_result_count(self, worker: Optional[QtCore.QThread]) -> int:
-        if worker is None:
-            return 0
-        expected = int(getattr(worker, "_expected_result_count", 0) or 0)
-        accounted = int(getattr(worker, "_accounted_result_count", 0) or 0)
-        return max(0, expected - accounted)
-
-    def _note_worker_units_processed(self, worker: Optional[QtCore.QThread], count: int) -> None:
-        if worker is None:
-            return
-        if int(getattr(worker, "_load_generation", -1)) != int(self._load_generation):
-            return
-        expected = int(getattr(worker, "_expected_result_count", 0) or 0)
-        accounted = int(getattr(worker, "_accounted_result_count", 0) or 0)
-        delta = max(0, min(int(count), max(0, expected - accounted)))
-        if delta <= 0:
-            return
-        setattr(worker, "_accounted_result_count", accounted + delta)
-        self._completed_files_count += delta
-        filepath = str(getattr(worker, "filepath", "") or "")
-        if not filepath:
-            return
-        remaining = max(0, int(self._pending_import_units_remaining.get(filepath, 0) or 0) - delta)
-        if remaining <= 0:
-            self._pending_import_units_remaining.pop(filepath, None)
-            self._pending_import_configs.pop(filepath, None)
-            return
-        self._pending_import_units_remaining[filepath] = remaining
-
-    def _cleanup_worker(self, worker: QtCore.QThread):
-        """Clean up worker thread after completion or error."""
+    def _finalize_worker(self, worker: QtCore.QThread) -> bool:
+        """Disconnect and delete a stopped import worker."""
         if not worker:
-            return
-
-        self._note_worker_units_processed(worker, self._remaining_worker_result_count(worker))
+            return False
 
         try:
-            worker.requestInterruption()
+            if worker.isRunning():
+                worker.requestInterruption()
+                return False
         except RuntimeError:
-            pass
+            return False
 
-        if worker.isRunning():
-            worker.quit()
-            worker.wait(2000)  # Wait up to 2 seconds
-        else:
-            worker.quit()
-            worker.wait(2000)
-
-        # Disconnect signals to prevent memory leaks
         for signal in (
             getattr(worker, "progress", None),
-            getattr(worker, "finished", None),
+            getattr(worker, "loaded", None),
             getattr(worker, "error", None),
             getattr(worker, "cancelled", None),
-            getattr(worker, "done", None),
+            getattr(worker, "finished", None),
         ):
             if signal is None:
                 continue
@@ -666,34 +724,39 @@ class DataManagerPanel(QtWidgets.QWidget):
                 # Already disconnected or deleted
                 pass
 
-        # Remove from workers list
-        if worker in self._csv_workers:
-            self._csv_workers.remove(worker)
-
-        # Delete worker
         worker.deleteLater()
 
-        self._maybe_finalize_load_cycle()
+        return True
 
     def _on_worker_done(self) -> None:
         """Marshal worker cleanup back onto the GUI thread."""
-        self._cleanup_worker(self.sender())
+        worker = self.sender()
+        session = self._import_session_for_worker(worker)
+        finalized = self._finalize_worker(worker)
+        if not finalized:
+            return
+        if session is not None and worker is not None:
+            session.mark_worker_terminal(worker)
+            self._release_retired_import_worker(worker, session)
+        self._maybe_finalize_load_cycle()
 
     def _apply_unit_conversion(self, data: dict, plan: ResolvedSheetPlan) -> None:
+        scale_payload_in_place(
+            data,
+            time_factor=plan.time_factor,
+            conc_factors=plan.conc_factors,
+        )
         metadata = data.setdefault("metadata", {})
-        if plan.time_factor != 1.0:
-            data["t"] = data["t"] * plan.time_factor
-        for species_name in list(data["species"].keys()):
-            factor = plan.conc_factors[species_name]
-            if factor != 1.0:
-                data["species"][species_name] = data["species"][species_name] * factor
         metadata["original_time_unit"] = plan.original_time_unit
         metadata["original_concentration_units"] = dict(plan.original_conc_units)
 
     def _finalize_loaded_dataset(self, worker: Optional[QtCore.QThread], name: str, data: dict) -> None:
         if worker is not None and int(getattr(worker, "_load_generation", -1)) != int(self._load_generation):
             return
-        config = self._pending_import_configs.get(str(getattr(worker, "filepath", "") or ""))
+        session = self._active_import_session
+        if session is None or (worker is not None and not session.owns_worker(worker)):
+            return
+        config = session.worker_config(worker) if worker is not None else None
         plan: Optional[ResolvedSheetPlan] = None
         if config is not None:
             if "::" in name:
@@ -705,7 +768,8 @@ class DataManagerPanel(QtWidgets.QWidget):
             if plan is not None:
                 self._apply_unit_conversion(data, plan)
         except Exception as exc:
-            self._note_worker_units_processed(worker, 1)
+            if worker is not None:
+                session.note_worker_units_processed(worker, 1)
             QtWidgets.QMessageBox.critical(
                 self,
                 "Load Error",
@@ -714,11 +778,15 @@ class DataManagerPanel(QtWidgets.QWidget):
             self._maybe_finalize_load_cycle()
             return
 
-        unique_name = self._make_unique_dataset_name(name)
-        self._datasets[unique_name] = data
-        self._dataset_list.addItem(unique_name)
-        self.datasetLoaded.emit(unique_name, data)
-        self._note_worker_units_processed(worker, 1)
+        session.add_unit(
+            DatasetImportUnit(
+                display_name=str(name),
+                payload=dict(data),
+                source_path=str(getattr(worker, "filepath", "") or ""),
+            )
+        )
+        if worker is not None:
+            session.note_worker_units_processed(worker, 1)
         self._maybe_finalize_load_cycle()
 
     def _on_csv_loaded(self, name: str, data: dict):
@@ -734,7 +802,12 @@ class DataManagerPanel(QtWidgets.QWidget):
         sender = self.sender()
         if sender is not None and int(getattr(sender, "_load_generation", -1)) != int(self._load_generation):
             return
-        self._note_worker_units_processed(sender, 1)
+        session = self._active_import_session
+        if session is None or (sender is not None and not session.owns_worker(sender)):
+            return
+        if sender is not None:
+            session.note_worker_units_processed(sender, 1)
+        session.add_error(str(error_msg))
 
         QtWidgets.QMessageBox.critical(
             self,
@@ -752,11 +825,9 @@ class DataManagerPanel(QtWidgets.QWidget):
         if not current:
             return
 
-        name = current.text()
-        self._dataset_list.takeItem(self._dataset_list.row(current))
-        if name in self._datasets:
-            del self._datasets[name]
-            self.datasetRemoved.emit(name)
+        dataset_id = str(current.data(Qt.UserRole) or "")
+        if dataset_id:
+            self.datasetRemovalRequested.emit(dataset_id)
 
     def _on_dataset_selected(self, current, previous):
         """Update preview when dataset is selected."""
@@ -765,15 +836,17 @@ class DataManagerPanel(QtWidgets.QWidget):
             self._preview_label.hide()
             return
 
-        name = current.text()
-        if name not in self._datasets:
+        dataset_id = str(current.data(Qt.UserRole) or "")
+        record = self._visible_records_by_id.get(dataset_id)
+        if record is None:
             self._preview_label.hide()
             return
 
-        data = self._datasets[name]
+        name = str(record.display_name)
+        data = record.payload
         self._preview_label.show()
-        t = data['t']
-        species = data['species']
+        observations = observations_from_payload(data)
+        t, species = dense_view_from_observations(observations)
 
         metadata = data.get('metadata', {})
         mapping_source = metadata.get('mapping_source', 'auto')
@@ -785,74 +858,3 @@ class DataManagerPanel(QtWidgets.QWidget):
             preview += f", ... ({len(species)-5} more)"
 
         self._preview_label.setText(preview)
-
-    def _make_unique_dataset_name(self, name: str) -> str:
-        """
-        Generate a unique dataset name by appending _1, _2, etc. if needed.
-
-        Parameters
-        ----------
-        name : str
-            Desired dataset name (usually base filename)
-
-        Returns
-        -------
-        str
-            Unique name not already in self._datasets
-        """
-        if name not in self._datasets:
-            return name
-
-        # Extract base name and extension
-        base, ext = os.path.splitext(name)
-
-        # Try name_1, name_2, etc.
-        counter = 1
-        while True:
-            candidate = f"{base}_{counter}{ext}"
-            if candidate not in self._datasets:
-                return candidate
-            counter += 1
-
-    def get_datasets(self) -> Dict[str, Dict]:
-        """
-        Get all loaded datasets.
-
-        Returns
-        -------
-        dict
-            Dictionary of {name: {'t': array, 'species': {name: array}}}
-        """
-        return self._datasets
-
-    def get_selected_dataset(self) -> Tuple[Optional[str], Optional[Dict]]:
-        """
-        Get currently selected dataset.
-
-        Returns
-        -------
-        tuple
-            (name, data) or (None, None) if no selection
-        """
-        current = self._dataset_list.currentItem()
-        if not current:
-            return None, None
-
-        name = current.text()
-        return name, self._datasets.get(name)
-
-    def get_dataset(self, name: str) -> Optional[Dict]:
-        """
-        Retrieve a dataset by name.
-
-        Parameters
-        ----------
-        name : str
-            Dataset identifier (usually filename)
-
-        Returns
-        -------
-        dict or None
-            Dataset payload or None if not loaded.
-        """
-        return self._datasets.get(name)

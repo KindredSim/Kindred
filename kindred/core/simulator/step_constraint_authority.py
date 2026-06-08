@@ -4,13 +4,14 @@ from dataclasses import dataclass
 import re
 from typing import Mapping
 
+from kindred.core.runtime_defaults import WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT
+from kindred.core.simulator.parameter_algebra_spec import classify_parameter_algebra_declaration
+from kindred.core.simulator.parameter_namespace import protected_indexed_identifier_step_index
+
 
 _DEFAULT_TEMPERATURE_K = 298.15
 _VALID_CONSTRAINT_REASONS = frozenset({"algebra", "wegscheider"})
-_TOP_LEVEL_SCALAR_ASSIGNMENT_RE = re.compile(r"^\s*[A-Za-z_]\w*\s*=\s*[^#;\n]+\s*(?:#.*)?$")
-_TOP_LEVEL_SCALAR_DIRECTIVES = frozenset({"energy", "t", "c0", "c°", "kappa", "κ"})
-_ALGEBRA_STEP_PARAM_ASSIGNMENT_RE = re.compile(r"^\s*param\s+(?:k|kf|kr|Keq)\d+\s*=", re.IGNORECASE)
-_MECHANISM_STEP_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
+_ALGEBRA_STEP_PARAM_ASSIGNMENT_RE = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -79,43 +80,24 @@ def _context_temperature_K(context: Mapping[str, object] | None) -> float:
 
 def _context_wegscheider_enabled(context: Mapping[str, object] | None) -> bool:
     if not isinstance(context, Mapping):
-        return False
-    return bool(context.get("wegscheider_cyclicity_enabled", False))
+        return bool(WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT)
+    return bool(
+        context.get(
+            "wegscheider_cyclicity_enabled",
+            WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+        )
+    )
 
 
-def _extract_top_level_scalar_assignments(source_text: str) -> tuple[str, dict[str, float]]:
-    sanitized_lines: list[str] = []
-    scalar_values: dict[str, float] = {}
-    in_algebra_section = False
-
+def _raise_if_unsupported_bare_assignment(source_text: str) -> None:
     for raw_line in str(source_text or "").splitlines():
-        stripped = raw_line.strip()
-        lower = stripped.lower()
-        if lower.startswith("# algebra"):
-            in_algebra_section = True
-            sanitized_lines.append(raw_line)
+        classification = classify_parameter_algebra_declaration(raw_line)
+        if classification.kind != "unsupported_bare_assignment":
             continue
-        if lower.startswith("# ") and in_algebra_section and not lower.startswith("# algebra"):
-            in_algebra_section = False
-        if in_algebra_section or not stripped or stripped.startswith("#"):
-            sanitized_lines.append(raw_line)
-            continue
-        match = _TOP_LEVEL_SCALAR_ASSIGNMENT_RE.match(raw_line)
-        if match is None:
-            sanitized_lines.append(raw_line)
-            continue
-        name, _, value_text = stripped.partition("=")
-        normalized_name = str(name).strip()
-        if normalized_name.lower() in _TOP_LEVEL_SCALAR_DIRECTIVES:
-            sanitized_lines.append(raw_line)
-            continue
-        try:
-            scalar_values[normalized_name] = float(value_text.split("#", 1)[0].strip())
-        except (TypeError, ValueError):
-            sanitized_lines.append(raw_line)
-            continue
-
-    return "\n".join(sanitized_lines), scalar_values
+        raise ValueError(
+            f"Bare algebra assignment {classification.raw_name!r} is not supported. "
+            "Use 'let name = expr' or 'param name = expr'."
+        )
 
 
 def _seed_scalar_params_into_mechanism(mechanism: object, scalar_values: Mapping[str, float]) -> None:
@@ -133,19 +115,13 @@ def _seed_scalar_params_into_mechanism(mechanism: object, scalar_values: Mapping
 
 
 def _text_has_potential_step_constraints(source_text: str) -> bool:
-    in_algebra_section = False
     for raw_line in str(source_text or "").splitlines():
         stripped = raw_line.strip()
-        lower = stripped.lower()
-        if lower.startswith("# algebra"):
-            in_algebra_section = True
-            continue
-        if lower.startswith("# ") and in_algebra_section and not lower.startswith("# algebra"):
-            in_algebra_section = False
-        if not in_algebra_section or not stripped or stripped.startswith("#"):
+        if not stripped or stripped.startswith("#"):
             continue
         code = raw_line.split("#", 1)[0].strip()
-        if _ALGEBRA_STEP_PARAM_ASSIGNMENT_RE.match(code):
+        match = _ALGEBRA_STEP_PARAM_ASSIGNMENT_RE.match(code)
+        if match is not None and protected_indexed_identifier_step_index(str(match.group(1))) is not None:
             return True
     return False
 
@@ -183,10 +159,7 @@ def _empty_step_constraint_authority_analysis(
 
 
 def _step_index_from_parameter_name(name: str) -> int | None:
-    match = _MECHANISM_STEP_PARAM_RE.match(str(name))
-    if match is None:
-        return None
-    return int(match.group(2))
+    return protected_indexed_identifier_step_index(name)
 
 
 def _assignment_name_from_dsl_error(assignments: tuple[object, ...], err: Exception) -> str | None:
@@ -411,20 +384,22 @@ def _build_step_constraint_authority_state_from_text(
             mechanism=None,
         )
 
-    sanitized_text, scalar_values = _extract_top_level_scalar_assignments(mechanism_text)
-    if not sanitized_text.strip():
+    try:
+        _raise_if_unsupported_bare_assignment(mechanism_text)
+    except ValueError as exc:
         return _StepConstraintAuthorityState(
             analysis=_empty_step_constraint_authority_analysis(
-                scalar_input_names=frozenset(scalar_values),
                 builtin_function_names=builtin_function_names,
                 protected_symbol_names=protected_symbol_names,
+                analysis_error=_build_step_constraint_authority_error("parse_parameter_algebra_spec", exc),
             ),
             mechanism=None,
         )
+    sanitized_text = mechanism_text
+    scalar_values: dict[str, float] = {}
     if not _text_has_potential_step_constraints(mechanism_text) and not wegscheider_enabled:
         return _StepConstraintAuthorityState(
             analysis=_empty_step_constraint_authority_analysis(
-                scalar_input_names=frozenset(scalar_values),
                 builtin_function_names=builtin_function_names,
                 protected_symbol_names=protected_symbol_names,
             ),
@@ -432,11 +407,10 @@ def _build_step_constraint_authority_state_from_text(
         )
 
     try:
-        mechanism = _fresh_mechanism(sanitized_text, scalar_values, wegscheider=wegscheider_enabled)
+        mechanism = _fresh_mechanism(mechanism_text, {}, wegscheider=wegscheider_enabled)
     except ValueError as exc:
         return _StepConstraintAuthorityState(
             analysis=_empty_step_constraint_authority_analysis(
-                scalar_input_names=frozenset(scalar_values),
                 builtin_function_names=builtin_function_names,
                 protected_symbol_names=protected_symbol_names,
                 analysis_error=_build_step_constraint_authority_error("parse_mechanism", exc),
@@ -449,13 +423,12 @@ def _build_step_constraint_authority_state_from_text(
         spec = parse_parameter_algebra_spec_from_dsl_text(
             mechanism_text,
             mechanism_namespace=mechanism_namespace,
-            scalar_input_names=set(scalar_values),
+            scalar_input_names=set(),
         )
     except ValueError as exc:
         return _StepConstraintAuthorityState(
             analysis=_empty_step_constraint_authority_analysis(
                 mechanism_param_names=frozenset(mechanism_namespace.flat_names()),
-                scalar_input_names=frozenset(scalar_values),
                 builtin_function_names=builtin_function_names,
                 protected_symbol_names=protected_symbol_names,
                 analysis_error=_build_step_constraint_authority_error("parse_parameter_algebra_spec", exc),
@@ -465,7 +438,6 @@ def _build_step_constraint_authority_state_from_text(
 
     namespace = spec.namespace_model()
     base_values = read_mechanism_parameter_values(mechanism, names=set(namespace.mechanism_param_names))
-    base_values.update({str(name): float(value) for name, value in scalar_values.items()})
 
     assignment_analyses = analyze_parameter_algebra_assignments(
         spec,

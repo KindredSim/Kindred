@@ -9,9 +9,20 @@ import numpy as np
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
+from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
-from kindred.gui.fitting.constants import DEFAULT_PARALLEL_STARTS, FITTING_DEFAULT_SOLVER, INITIAL_PREFIX
-from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
+from kindred.gui.fitting.constants import (
+    DEFAULT_PARALLEL_STARTS,
+    FITTING_DEFAULT_SOLVER,
+    FITTING_MAX_NFEV_RANGE,
+    FITTING_METHODS,
+    FITTING_SEED_RANGE,
+    FITTING_SOLVERS,
+    INITIAL_PREFIX,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +167,7 @@ class _AddFittableParameterDialog(QtWidgets.QDialog):
         self._observable_tab = QtWidgets.QWidget(self._tabs)
         observable_layout = QtWidgets.QVBoxLayout(self._observable_tab)
         header_row = QtWidgets.QHBoxLayout()
-        header_row.addWidget(QtWidgets.QLabel("Select an existing algebraic observable from # Algebra:"))
+        header_row.addWidget(QtWidgets.QLabel("Select an existing algebraic observable from the Reactions text:"))
         header_row.addStretch(1)
         self._define_new_button = QtWidgets.QPushButton("Define new…", self._observable_tab)
         header_row.addWidget(self._define_new_button)
@@ -169,7 +180,7 @@ class _AddFittableParameterDialog(QtWidgets.QDialog):
         observable_layout.addWidget(self._observable_combo)
 
         self._no_observables_label = QtWidgets.QLabel(
-            "No algebraic observables found in # Algebra. Use 'Define new…' to add one.",
+            "No algebraic observables found in the Reactions text. Use 'Define new…' to add one.",
             self._observable_tab,
         )
         self._no_observables_label.setWordWrap(True)
@@ -303,6 +314,7 @@ class _AddFittableParameterDialog(QtWidgets.QDialog):
 
 class ParametersIcsTab(QtWidgets.QWidget):
     addAlgebraicObservableRequested = Signal(dict)
+    runtimeInputsChanged = Signal()
     statusMessage = Signal(str)
 
     def __init__(
@@ -320,18 +332,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
         selected_dataset_ids_getter: Callable[[], List[str]],
         dataset_entries_getter: Callable[[], List[Dict[str, Any]]],
         worker_running_getter: Callable[[], bool],
-        dataset_manager_getter: Callable[[], Any],
-        reactions_text_getter: Callable[[], str],
+        dataset_fit_settings_store_getter: Callable[[], Any],
+        mechanism_parameter_scan_owner_getter: Callable[[], Any],
+        mechanism_text_getter: Callable[[], str],
         integration_defaults: Tuple[str, float, float],
         config_defaults: Dict[str, Any],
-        ic_panel: Optional[UnifiedSpeciesTable] = None,
+        initial_parameter_defaults_getter: Optional[Callable[[str, str], tuple[bool, dict[str, float]]]] = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        # transitional — ic_panel is passed for forwarder reach-through
-        # only. FittingWindow owns all IC signal wiring. This parameter
-        # and the associated forwarders are removed in Session 3.
-        self._ic_panel = ic_panel
         # Deep-copy transferred state
         self._parameter_state = [dict(row) for row in parameter_state]
         self._initial_parameter_snapshot = [dict(row) for row in initial_parameter_snapshot]
@@ -347,12 +356,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._prepared_param_names = list(prepared_param_names)
         self._last_fit_params: Dict[str, float] = {}
         self._staged_dataset_params: Dict[str, Dict[str, float]] = {}
+        self._last_steps_dialog: QtWidgets.QDialog | None = None
         # Callable getters
         self._selected_dataset_ids_getter = selected_dataset_ids_getter
         self._dataset_entries_getter = dataset_entries_getter
         self._worker_running_getter = worker_running_getter
-        self._dataset_manager_getter = dataset_manager_getter
-        self._reactions_text_getter = reactions_text_getter
+        self._dataset_fit_settings_store_getter = dataset_fit_settings_store_getter
+        self._mechanism_parameter_scan_owner_getter = mechanism_parameter_scan_owner_getter
+        self._mechanism_text_getter = mechanism_text_getter
+        self._initial_parameter_defaults_getter = initial_parameter_defaults_getter
         # Build UI
         self._build_ui(integration_defaults)
         self._apply_config_defaults(config_defaults)
@@ -405,9 +417,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._remove_param_button = QtWidgets.QPushButton("Remove")
         self._remove_param_button.clicked.connect(self._remove_selected_parameters)
         self._remove_param_button.setEnabled(False)
+        self._view_steps_button = QtWidgets.QPushButton("View Steps")
+        self._view_steps_button.setObjectName("global_fit_parameters_view_steps")
+        self._view_steps_button.clicked.connect(self._show_mechanism_steps_dialog)
         self._param_table.itemSelectionChanged.connect(self._update_remove_button_state)
         action_row.addWidget(self._add_param_button)
         action_row.addWidget(self._remove_param_button)
+        action_row.addWidget(self._view_steps_button)
         action_row.addStretch()
         params_layout.addLayout(action_row)
 
@@ -423,10 +439,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
         algo_form = QtWidgets.QFormLayout()
         self._method_combo = QtWidgets.QComboBox()
-        self._method_combo.addItems(["lm", "trf", "dogbox", "differential_evolution"])
+        self._method_combo.addItems(list(FITTING_METHODS))
         self._method_combo.setCurrentText("trf")
         self._max_eval_spin = QtWidgets.QSpinBox()
-        self._max_eval_spin.setRange(10, 10000)
+        self._max_eval_spin.setRange(*FITTING_MAX_NFEV_RANGE)
         self._max_eval_spin.setValue(1000)
         algo_form.addRow("Method:", self._method_combo)
         algo_form.addRow("Max evaluations:", self._max_eval_spin)
@@ -439,15 +455,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         setup_scientific_validator(self._xtol_edit)
         algo_form.addRow("xtol:", self._xtol_edit)
 
-        self._use_parallel_check = QtWidgets.QCheckBox("Parallel multi-start (DE only)")
         self._seed_check = QtWidgets.QCheckBox("Use fixed random seed")
         self._seed_check.setChecked(True)
         self._seed_spin = QtWidgets.QSpinBox()
-        self._seed_spin.setRange(0, 999_999)
+        self._seed_spin.setRange(*FITTING_SEED_RANGE)
         self._seed_spin.setValue(42)
         self._seed_spin.setEnabled(self._seed_check.isChecked())
         self._seed_check.toggled.connect(self._seed_spin.setEnabled)
-        algo_form.addRow(self._use_parallel_check)
         algo_form.addRow(self._seed_check, self._seed_spin)
         params_layout.addLayout(algo_form)
 
@@ -477,8 +491,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
         self._integration_solver_combo = QtWidgets.QComboBox(params_group)
         self._integration_solver_combo.setObjectName("global_fit_integration_solver")
-        self._integration_solver_combo.addItems(["LSODA", "Radau", "BDF"])
-        self._integration_solver_combo.setCurrentText(default_solver)
+        self._integration_solver_combo.addItems(list(FITTING_SOLVERS))
+        solver_name, _warning = normalize_solver_name(default_solver)
+        self._integration_solver_combo.setCurrentText(solver_name)
 
         self._integration_rtol_edit = QtWidgets.QLineEdit(_fmt(default_rtol), params_group)
         self._integration_rtol_edit.setObjectName("global_fit_integration_rtol")
@@ -498,20 +513,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return widget
 
     # ------------------------------------------------------------------
-    # Transitional forwarders for IC panel widgets
-    # ------------------------------------------------------------------
-
-    @property
-    def _ic_dataset_combo(self):
-        return None
-
-    # ------------------------------------------------------------------
     # IC applied handler
     # ------------------------------------------------------------------
 
     def _on_ic_applied(self, dataset_id: str, updates: dict, fit_flags_updates: dict) -> None:
         self._apply_ic_updates_to_window_state(dataset_id, updates, fit_flags_updates)
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
 
     # ------------------------------------------------------------------
     # Config defaults
@@ -535,7 +543,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return f"{base}e{sign}{digits}"
 
         method = str(defaults.get("method", "")).strip().lower()
-        if method in {"lm", "trf", "dogbox", "differential_evolution"}:
+        if method in FITTING_METHODS:
             self._method_combo.setCurrentText(method)
 
         if "max_nfev" in defaults:
@@ -561,9 +569,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 continue
             if value > 0.0:
                 widget.setText(_fmt_sci(value))
-
-        if "use_parallel" in defaults:
-            self._use_parallel_check.setChecked(bool(defaults.get("use_parallel")))
 
         if "use_seed" in defaults:
             self._seed_check.setChecked(bool(defaults.get("use_seed")))
@@ -801,14 +806,18 @@ class ParametersIcsTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self.window(), "No Datasets", "Select at least one dataset to include before adding parameters.")
             return
         available_observables: Dict[str, str] = {}
-        if callable(getattr(self, "_reactions_text_getter", None)):
+        if callable(getattr(self, "_mechanism_text_getter", None)):
             try:
                 from kindred.core.algebra.observable_introspection import extract_observables_from_algebra_text
                 from kindred.core.simulator.algebra_section import extract_algebra_section_text
 
-                reactions_text = str(self._reactions_text_getter() or "")
-                algebra_text = extract_algebra_section_text(reactions_text)
-                available_observables = extract_observables_from_algebra_text(algebra_text)
+                mechanism_text = str(self._mechanism_text_getter() or "")
+                algebra_text = extract_algebra_section_text(mechanism_text)
+                mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(mechanism_text, initials={}))
+                available_observables = extract_observables_from_algebra_text(
+                    algebra_text,
+                    mechanism_namespace=mechanism_namespace,
+                )
             except Exception:
                 available_observables = {}
         dialog = _AddFittableParameterDialog(
@@ -851,6 +860,57 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self.addAlgebraicObservableRequested.emit(request)
             return
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
+
+    def _show_mechanism_steps_dialog(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Mechanism Steps")
+        dialog.setModal(False)
+        dialog.resize(620, 420)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        text = QtWidgets.QPlainTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        text.setPlainText(self._mechanism_steps_reference_text())
+        layout.addWidget(text, stretch=1)
+
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close, dialog)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        self._last_steps_dialog = dialog
+        dialog.show()
+
+    def _mechanism_steps_reference_text(self) -> str:
+        mechanism_text = str(self._mechanism_text_getter() or "")
+        try:
+            mechanism = parse_dsl_to_mechanism(mechanism_text, initials={})
+            step_map = get_step_index_map(mechanism)
+        except Exception as exc:
+            return f"Mechanism steps are unavailable until the mechanism source parses.\n\n{exc}"
+
+        lines: list[str] = ["Mechanism Steps", ""]
+        if not step_map:
+            lines.append("No mechanism steps found.")
+        else:
+            for entry in step_map:
+                try:
+                    step_index = int(entry.get("step_index"))
+                except Exception:
+                    continue
+                context = str(entry.get("context") or "").strip()
+                if not context:
+                    context = str(entry.get("kind") or "step")
+                lines.append(f"Step {step_index}    {context}")
+
+        lines.extend(
+            [
+                "",
+                "Parameter names use the step number: kN, kfN, krN, and KeqN refer to Step N.",
+            ]
+        )
+        return "\n".join(lines)
 
     def _add_rate_parameter(self, name: str) -> None:
         present = {
@@ -1145,6 +1205,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return
         self._remove_parameter_rows(rows)
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
 
     def _remove_parameter_rows(self, rows: Sequence[int], *, update_fixed: bool = True) -> None:
         for row in sorted({int(r) for r in (rows or []) if isinstance(r, int)}, reverse=True):
@@ -1305,13 +1366,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
         ds_id = str(dataset_id or "").strip()
         if not ds_id:
             return
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is None or not hasattr(dataset_manager, "get_fit_settings"):
-            return
-        try:
-            settings = dataset_manager.get_fit_settings(ds_id)
-        except Exception:
-            return
+        settings_store = self._dataset_fit_settings_store_getter()
+        if settings_store is None:
+            raise RuntimeError("Dataset fit settings store unavailable; cannot seed fitting initial conditions.")
+        settings = settings_store.get_fit_settings(ds_id)
 
         fixed = self._global_dataset_params.setdefault(ds_id, {})
         var_specs = self._global_dataset_variable_params.get(ds_id) if isinstance(self._global_dataset_variable_params, dict) else None
@@ -1351,6 +1409,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._parameter_state = [dict(row) for row in self._initial_parameter_snapshot]
         self._fixed_shared_params = {}
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
 
     def _reset_to_last_fit(self) -> None:
         if not self._last_fit_params:
@@ -1370,44 +1429,84 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     entry["value"] = float(ds_map[param_name])
                     entry["last_fit"] = float(ds_map[param_name])
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
 
-    def _collect_parameter_config(self) -> Optional[Dict[str, Any]]:
+    def collect_parameter_config(self) -> Optional[Dict[str, Any]]:
+        bundle = self.collect_parameter_config_bundle(show_errors=True)
+        if bundle is None:
+            return None
+        config, _global_dataset_params, _global_dataset_variable_params = bundle
+        return config
+
+    def collect_parameter_config_bundle(
+        self,
+        *,
+        show_errors: bool,
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Dict[str, float]], Dict[str, Dict[str, Dict]]]]:
+        table = getattr(self, "_param_table", None)
+        if table is None:
+            return None
         parameters: Dict[str, float] = {}
         bounds: Dict[str, Tuple[float, float]] = {}
         log10_params: Dict[str, bool] = {}
-        fixed_params: Dict[str, float] = dict(self._fixed_shared_params or {})
+        fixed_params: Dict[str, float] = dict(self.get_fixed_shared_params() or {})
+        global_dataset_params = self.get_global_dataset_params()
+        global_dataset_variable_params = self.get_global_dataset_variable_params()
+        parameter_state = self.get_parameter_state()
         updated_state: List[Dict[str, Any]] = []
-        for row in range(self._param_table.rowCount()):
-            fit_flag = self._param_table.item(row, 0).checkState() == Qt.Checked
-            entry = self._parameter_state[row]
-            log10_flag = self._param_table.item(row, 1).checkState() == Qt.Checked
-            param_name = str(entry.get("param_name") or "")
+        has_live_fit_parameter = False
+
+        def _reject(title: str, message: str) -> None:
+            if show_errors:
+                QtWidgets.QMessageBox.warning(self.window(), title, message)
+
+        for row, entry in enumerate(parameter_state):
+            if row >= table.rowCount():
+                return None
             try:
-                value = float(self._param_table.item(row, 3).text())
-                min_val = float(self._param_table.item(row, 4).text())
-                max_val = float(self._param_table.item(row, 5).text())
-            except (ValueError, AttributeError):
-                QtWidgets.QMessageBox.warning(
-                    self.window(),
+                fit_item = table.item(row, 0)
+                log10_item = table.item(row, 1)
+                name_item = table.item(row, 2)
+                value_item = table.item(row, 3)
+                min_item = table.item(row, 4)
+                max_item = table.item(row, 5)
+                fit_flag = fit_item.checkState() == Qt.Checked
+                log10_flag = log10_item.checkState() == Qt.Checked
+                value = float(value_item.text())
+                min_val = float(min_item.text())
+                max_val = float(max_item.text())
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                param_label = ""
+                try:
+                    param_label = str(table.item(row, 2).text())
+                except (AttributeError, TypeError):
+                    param_label = str(entry.get("param_name") or "")
+                _reject(
                     "Invalid Parameter",
-                    f"Parameter '{self._param_table.item(row, 2).text()}' contains non-numeric values.",
+                    f"Parameter '{param_label}' contains non-numeric values.",
+                )
+                return None
+            param_name = str(entry.get("param_name") or (name_item.text() if name_item is not None else "") or "")
+            if not param_name.strip():
+                return None
+            if not np.isfinite(value):
+                _reject(
+                    "Invalid Parameter",
+                    f"Parameter '{param_name}' initial value must be finite.",
                 )
                 return None
             if not (min_val < max_val):
-                QtWidgets.QMessageBox.warning(
-                    self.window(),
+                _reject(
                     "Invalid Bounds",
-                    f"Parameter '{self._param_table.item(row, 2).text()}' bounds must satisfy min < max.",
+                    f"Parameter '{param_name}' bounds must satisfy min < max.",
                 )
                 return None
-            if log10_flag:
-                if not (value > 0.0 and min_val > 0.0 and max_val > 0.0):
-                    QtWidgets.QMessageBox.warning(
-                        self.window(),
-                        "Invalid Log10 Bounds",
-                        f"Parameter '{self._param_table.item(row, 2).text()}' requires value/min/max > 0 when Log10 is enabled.",
-                    )
-                    return None
+            if log10_flag and not (value > 0.0 and min_val > 0.0 and max_val > 0.0):
+                _reject(
+                    "Invalid Log10 Bounds",
+                    f"Parameter '{param_name}' requires value/min/max > 0 when Log10 is enabled.",
+                )
+                return None
             scope = str(entry.get("scope") or "shared")
             updated = dict(entry)
             updated["value"] = value
@@ -1418,6 +1517,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             updated_state.append(updated)
             if scope == "shared":
                 if fit_flag:
+                    has_live_fit_parameter = True
                     parameters[param_name] = value
                     bounds[param_name] = (min_val, max_val)
                     log10_params[param_name] = bool(log10_flag)
@@ -1425,28 +1525,34 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     fixed_params[param_name] = value
             elif scope == "dataset":
                 ds_id = str(entry.get("dataset_id") or "")
+                if not ds_id:
+                    return None
                 if ds_id and param_name:
                     if fit_flag:
-                        spec_map = self._global_dataset_variable_params.setdefault(ds_id, {})
+                        has_live_fit_parameter = True
+                        spec_map = global_dataset_variable_params.setdefault(ds_id, {})
                         spec_map[param_name] = {
                             "initial": value,
                             "min": min_val,
                             "max": max_val,
                             "log10": bool(log10_flag),
                         }
-                        fixed_map = self._global_dataset_params.get(ds_id)
+                        fixed_map = global_dataset_params.get(ds_id)
                         if isinstance(fixed_map, dict):
                             fixed_map.pop(param_name, None)
                     else:
-                        self._global_dataset_params.setdefault(ds_id, {})[param_name] = float(value)
-                        spec_map = self._global_dataset_variable_params.get(ds_id)
+                        global_dataset_params.setdefault(ds_id, {})[param_name] = float(value)
+                        spec_map = global_dataset_variable_params.get(ds_id)
                         if isinstance(spec_map, dict):
                             spec_map.pop(param_name, None)
                             if not spec_map:
-                                self._global_dataset_variable_params.pop(ds_id, None)
-        self._parameter_state = updated_state
-        if not parameters and not any((entry.get("scope") == "dataset" and entry.get("fit", True)) for entry in self._parameter_state):
-            QtWidgets.QMessageBox.warning(self.window(), "No Parameters", "Select at least one parameter to fit.")
+                                global_dataset_variable_params.pop(ds_id, None)
+        if show_errors:
+            self._parameter_state = updated_state
+            self._global_dataset_params = global_dataset_params
+            self._global_dataset_variable_params = global_dataset_variable_params
+        if not has_live_fit_parameter:
+            _reject("No Parameters", "Select at least one parameter to fit.")
             return None
 
         method = self._method_combo.currentText().strip().lower()
@@ -1460,10 +1566,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
             "ftol": max(safe_float_parse(self._ftol_edit.text(), 1e-10), 1e-15),
             "xtol": max(safe_float_parse(self._xtol_edit.text(), 1e-10), 1e-15),
             "seed": self._seed_spin.value() if self._seed_check.isChecked() else None,
-            "use_parallel": self._use_parallel_check.isChecked(),
             "parallel_starts": DEFAULT_PARALLEL_STARTS,
         }
-        return config
+        return config, global_dataset_params, global_dataset_variable_params
+
+    def collect_parameter_config_snapshot_for_readiness(
+        self,
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Dict[str, float]], Dict[str, Dict[str, Dict]]]]:
+        return self.collect_parameter_config_bundle(show_errors=False)
 
     def _build_parameter_state(self, definitions: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         state: List[Dict[str, Any]] = []
@@ -1545,16 +1655,19 @@ class ParametersIcsTab(QtWidgets.QWidget):
             logger.debug("Skipped %d global-fit parameter definitions without a 'name' field.", missing_name_count)
         return state
 
-    def _collect_integration_settings_for_run(self) -> Optional[Tuple[str, float, float]]:
+    def _collect_integration_settings(
+        self,
+        *,
+        show_messages: bool,
+    ) -> Optional[Tuple[str, float, float]]:
         from kindred.core.simulator.solvers import normalize_solver_name
 
-        allowed = ("LSODA", "Radau", "BDF")
         combo = getattr(self, "_integration_solver_combo", None)
         solver_label = str(combo.currentText()).strip() if combo is not None else FITTING_DEFAULT_SOLVER
-        if solver_label not in allowed:
+        if solver_label not in FITTING_SOLVERS:
             solver_label = FITTING_DEFAULT_SOLVER
         solver_method, solver_warning = normalize_solver_name(solver_label)
-        if solver_warning:
+        if solver_warning and show_messages:
             QtWidgets.QMessageBox.information(
                 self.window(),
                 "Solver Normalization",
@@ -1574,34 +1687,33 @@ class ParametersIcsTab(QtWidgets.QWidget):
             rtol = float(rtol_text)
             atol = float(atol_text)
         except Exception:
-            QtWidgets.QMessageBox.warning(
-                self.window(),
-                "Advanced Integration Settings",
-                "rtol and atol must be valid floating-point numbers (scientific notation is allowed).",
-            )
+            if show_messages:
+                QtWidgets.QMessageBox.warning(
+                    self.window(),
+                    "Advanced Integration Settings",
+                    "rtol and atol must be valid floating-point numbers (scientific notation is allowed).",
+                )
             return None
         if not (np.isfinite(rtol) and rtol > 0.0):
-            QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "rtol must be a finite value > 0.")
+            if show_messages:
+                QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "rtol must be a finite value > 0.")
             return None
         if not (np.isfinite(atol) and atol > 0.0):
-            QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "atol must be a finite value > 0.")
+            if show_messages:
+                QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "atol must be a finite value > 0.")
             return None
         return str(solver_method), float(rtol), float(atol)
+
+    def _collect_integration_settings_for_run(self) -> Optional[Tuple[str, float, float]]:
+        return self._collect_integration_settings(show_messages=True)
 
     # ------------------------------------------------------------------
     # Mechanism rebuild
     # ------------------------------------------------------------------
 
-    def _scan_parameter_definitions_for_mechanism(self, mechanism_text: str, dataset_manager: Any = None) -> list[dict[str, Any]]:
-        if dataset_manager is None:
-            dataset_manager = self._dataset_manager_getter()
-        scan_params = getattr(dataset_manager, "scan_mechanism_parameters", None)
-        if not callable(scan_params):
-            return [
-                dict(definition)
-                for definition in (getattr(self, "_shared_param_definitions", {}) or {}).values()
-                if isinstance(definition, dict)
-            ]
+    def _scan_parameter_definitions_for_mechanism(self, mechanism_text: str) -> list[dict[str, Any]]:
+        scan_owner = self._mechanism_parameter_scan_owner_getter()
+        scan_params = scan_owner.scan_mechanism_parameters
         param_defs = scan_params(str(mechanism_text or ""))
         return [dict(definition) for definition in (param_defs or []) if isinstance(definition, dict)]
 
@@ -1633,6 +1745,18 @@ class ParametersIcsTab(QtWidgets.QWidget):
             "max": float(max_val),
             "log10": bool(spec.get("log10", False)),
         }
+
+    def _initial_parameter_defaults_for_species(self, dataset_id: str, species: str) -> tuple[bool, dict[str, float]]:
+        getter = self._initial_parameter_defaults_getter
+        if callable(getter):
+            try:
+                fit_flag, default_spec = getter(str(dataset_id), str(species))
+                coerced = self._coerce_variable_spec(default_spec)
+                if coerced is not None:
+                    return bool(fit_flag), coerced
+            except Exception as exc:
+                logger.debug("Failed to read IC defaults for %s/%s: %s", dataset_id, species, exc, exc_info=True)
+        return False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
 
     def rebuild_for_mechanism(self, mechanism_text: str, dataset_entries: List[Dict[str, Any]]) -> list[str]:
         param_defs = self._scan_parameter_definitions_for_mechanism(mechanism_text)
@@ -1715,10 +1839,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 param_name = f"{INITIAL_PREFIX}{species}"
                 if param_name in fixed_map or param_name in variable_map:
                     continue
-                if self._ic_panel is not None:
-                    fit_flag, default_spec = self._ic_panel.initial_parameter_defaults_for_species(ds_id, species)
-                else:
-                    fit_flag, default_spec = False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
+                fit_flag, default_spec = self._initial_parameter_defaults_for_species(ds_id, species)
                 if fit_flag:
                     variable_map[param_name] = dict(default_spec)
                 else:
@@ -1827,9 +1948,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._initial_parameter_snapshot = [dict(row) for row in self._parameter_state]
         self._dataset_entries = list(dataset_entries)
         self._populate_parameter_table()
-        if self._ic_panel is not None:
-            self._ic_panel.set_mechanism_species(list(self._mechanism_species))
-            self._ic_panel.refresh_dataset_combo(list(self._dataset_entries))
         return list(self._prepared_param_names)
 
     # ------------------------------------------------------------------
@@ -1869,12 +1987,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def set_fixed_shared_params(self, value: Dict[str, float]) -> None:
         self._fixed_shared_params = dict(value)
 
-    def get_last_fit_params(self) -> Dict[str, float]:
-        return dict(self._last_fit_params)
-
-    def set_last_fit_params(self, value: Dict[str, float]) -> None:
-        self._last_fit_params = dict(value)
-
     def get_staged_dataset_params(self) -> Dict[str, Dict[str, float]]:
         return {k: dict(v) for k, v in self._staged_dataset_params.items()}
 
@@ -1902,6 +2014,51 @@ class ParametersIcsTab(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # Public API — state mutation from fit results
     # ------------------------------------------------------------------
+
+    def _restore_failed_fit_state(
+        self,
+        pre_run_parameter_state: Optional[List[Dict[str, Any]]],
+        pre_run_staged_dataset_params: Optional[Dict[str, Dict[str, float]]],
+    ) -> None:
+        self._last_fit_params = {}
+        has_parameter_baseline = isinstance(pre_run_parameter_state, list)
+        has_staged_baseline = isinstance(pre_run_staged_dataset_params, dict)
+        current_has_staged_params = bool(self._staged_dataset_params)
+        current_has_live_fit_values = any(
+            isinstance(entry, dict) and entry.get("last_fit") is not None
+            for entry in self._parameter_state
+        )
+
+        use_parameter_baseline = has_parameter_baseline and (
+            has_staged_baseline or not current_has_staged_params
+        )
+        use_staged_baseline = has_staged_baseline and (
+            has_parameter_baseline or not current_has_live_fit_values
+        )
+
+        if use_staged_baseline:
+            self._staged_dataset_params = {
+                str(ds_id): dict(param_map)
+                for ds_id, param_map in pre_run_staged_dataset_params.items()
+                if isinstance(param_map, dict)
+            }
+        else:
+            self._staged_dataset_params = {}
+
+        # Preserve the pre-existing failure-recovery fallback: if no baseline
+        # was captured, clear live fit markers from the current table state.
+        # Ignore a one-sided baseline only when the missing side still carries
+        # live staged/best-fit state that would produce a split restore.
+        if use_parameter_baseline:
+            parameter_state = [dict(entry) for entry in pre_run_parameter_state if isinstance(entry, dict)]
+        else:
+            parameter_state = [dict(entry) for entry in self._parameter_state if isinstance(entry, dict)]
+
+        for entry in parameter_state:
+            entry["last_fit"] = None
+
+        self._parameter_state = parameter_state
+        self._populate_parameter_table()
 
     def push_fit_results(
         self,
@@ -1963,17 +2120,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._remove_param_button.setEnabled(
                 (not running) and bool({item.row() for item in self._param_table.selectedItems()})
             )
-        if self._ic_panel is not None:
-            self._ic_panel.set_running_state(running)
 
     # ------------------------------------------------------------------
     # Public API — dataset lifecycle
     # ------------------------------------------------------------------
 
-    def refresh_ic_dataset_combo(self, dataset_entries: List[Dict[str, Any]]) -> None:
+    def refresh_dataset_entries(self, dataset_entries: List[Dict[str, Any]]) -> None:
         self._dataset_entries = list(dataset_entries)
-        if self._ic_panel is not None:
-            self._ic_panel.refresh_dataset_combo(dataset_entries)
 
     def remove_dataset_parameter_rows(self, dataset_ids: Sequence[str]) -> None:
         remove_set = {str(x) for x in dataset_ids}
@@ -2008,23 +2161,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
             scalar_scope=scalar_scope,
         )
         self._populate_parameter_table()
-
-    def mirror_staged_ic_values(self) -> int:
-        total_updates = 0
-        for dataset_id, param_map in self._staged_dataset_params.items():
-            if not isinstance(param_map, dict):
-                continue
-            for key, value in param_map.items():
-                key_str = str(key)
-                if not key_str.startswith(INITIAL_PREFIX):
-                    continue
-                self._global_dataset_params.setdefault(dataset_id, {})[key_str] = float(value)
-                if dataset_id in self._global_dataset_variable_params:
-                    spec = self._global_dataset_variable_params[dataset_id].get(key_str)
-                    if isinstance(spec, dict):
-                        spec["initial"] = float(value)
-                total_updates += 1
-        return total_updates
+        if missing_scalars:
+            self.runtimeInputsChanged.emit()
 
     def collect_integration_settings(self) -> Optional[Tuple[str, float, float]]:
         return self._collect_integration_settings_for_run()
+
+    def collect_integration_settings_silent(self) -> Optional[Tuple[str, float, float]]:
+        return self._collect_integration_settings(show_messages=False)

@@ -110,13 +110,13 @@ def test_solve_ode_scipy_path_injects_temperature_calls_progress_sets_note_and_c
 
     assert calls["progress"] == 11
     assert all(t >= 300.0 for t in calls["rhs_T"])
-    assert out.provenance["emulation_note"] == "Unknown solver name; using Radau"
+    assert out.provenance["emulation_note"] == "Unknown solver name; using BDF"
     assert out.provenance["temperature_schedule"] == "TempSchedule(str)"
     assert out.provenance["events"] == [[0.5]]
     assert float(out.Y[0, 0]) == 0.0
 
 
-def test_solve_ode_scipy_bdf_omits_jac_sparsity_for_banded_and_clamps_selected_indices(monkeypatch):
+def test_solve_ode_scipy_bdf_uses_solver_default_when_no_symbolic_jacobian(monkeypatch):
     seen = {}
 
     def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
@@ -142,11 +142,97 @@ def test_solve_ode_scipy_bdf_omits_jac_sparsity_for_banded_and_clamps_selected_i
     out = solvers.solve_ode(req)
 
     assert seen["method"] == "BDF"
-    assert "jac" in seen
+    assert "jac" not in seen
     assert "jac_sparsity" not in seen
-    jac_dense = seen["jac"](0.0, np.array([1.0]))
-    assert jac_dense.shape == (1, 1)
     assert float(out.Y[0, 0]) == 0.0
+
+
+def test_solve_ode_scipy_bdf_accepts_sparsity_hint_without_supplied_jacobian(monkeypatch):
+    seen = {}
+    sparsity = np.asarray([[True, False], [True, True]], dtype=bool)
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        seen.update(kwargs)
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        y = np.vstack([np.ones_like(t_eval), np.zeros_like(t_eval)])
+        return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    out = solvers.solve_ode(
+        solvers.SimulationRequest(
+            rhs=lambda _t, y: np.asarray([-y[0], y[0] - y[1]], dtype=float),
+            t_span=(0.0, 1.0),
+            y0=np.array([1.0, 0.0]),
+            solver="BDF",
+            t_eval=np.array([0.0, 0.5, 1.0]),
+            jac_sparsity=sparsity,
+        )
+    )
+
+    assert "jac" not in seen
+    assert seen["jac_sparsity"] is sparsity
+    assert out.provenance["jacobian_sparsity_hint"] is True
+
+
+def test_solve_ode_non_implicit_solver_does_not_claim_unused_symbolic_jacobian(monkeypatch):
+    from kindred.core.symbolic.artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR
+
+    seen = {}
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        seen.update(kwargs)
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        y = np.vstack([np.ones_like(t_eval)])
+        return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
+
+    def symbolic_jacobian(_t, _y):
+        return np.asarray([[-1.0]], dtype=float)
+
+    setattr(
+        symbolic_jacobian,
+        SYMBOLIC_JACOBIAN_IDENTITY_ATTR,
+        {
+            "kind": "jacobian",
+            "fingerprint": "symbolic-jacobian",
+            "structure_fingerprint": "structure",
+            "evaluation_snapshot_fingerprint": "snapshot",
+        },
+    )
+    sparsity = np.asarray([[True]], dtype=bool)
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+    monkeypatch.setattr(solvers, "_scipy_method_for", lambda _name: ("RK45", None))
+
+    out = solvers.solve_ode(
+        solvers.SimulationRequest(
+            rhs=lambda _t, y: -y,
+            t_span=(0.0, 1.0),
+            y0=np.array([1.0]),
+            solver="RK45",
+            t_eval=np.array([0.0, 0.5, 1.0]),
+            jacobian_func=symbolic_jacobian,
+            jac_sparsity=sparsity,
+            symbolic_jacobian_status={
+                "kind": "jacobian",
+                "state": "supported",
+                "code": "supported",
+                "reason": "Symbolic Jacobian supported.",
+            },
+        )
+    )
+
+    assert seen["method"] == "RK45"
+    assert "jac" not in seen
+    assert "jac_sparsity" not in seen
+    assert out.provenance["symbolic_jacobian"] is False
+    assert "symbolic_jacobian_identity" not in out.provenance
+    assert out.provenance["jacobian_sparsity_hint"] is False
+    assert out.provenance["symbolic_jacobian_status"] == {
+        "kind": "jacobian",
+        "state": "disabled",
+        "code": "non-implicit-solver",
+        "reason": "Symbolic Jacobian disabled because solver RK45 does not consume Jacobian callables.",
+    }
 
 
 def test_solve_ode_builds_time_grid_and_passes_solver_kwargs(monkeypatch):
@@ -207,55 +293,34 @@ def test_solve_ode_progress_callback_cancellation_propagates(monkeypatch):
         )
 
 
-def test_scipy_method_for_maps_ros_to_radau_with_note():
-    method, note = solvers._scipy_method_for("ROS3")
-    assert method == "Radau"
-    assert note and "deprecated" in note
+def test_scipy_method_for_unknown_names_fall_back_to_bdf_with_note():
+    method, note = solvers._scipy_method_for("UNKNOWN_SOLVER_A")
+    assert method == "BDF"
+    assert note == "Unknown solver name; using BDF"
 
-    method2, note2 = solvers._scipy_method_for("ROS4")
-    assert method2 == "Radau"
-    assert note2 and "deprecated" in note2
-
-
-def test_make_scipy_jac_converts_real_banded_storage_to_dense():
-    cfg = JacobianConfig(mode="banded", ml=1, mu=1)
-    jac = solvers._make_scipy_jac(
-        lambda _t, y: np.array([-2.0 * y[0] + y[1], y[0] - 3.0 * y[1]]),
-        cfg,
-    )
-    Jd = jac(0.0, np.array([1.0, 2.0]))
-    assert Jd.shape == (2, 2)
-    assert np.allclose(Jd, np.array([[-2.0, 1.0], [1.0, -3.0]]))
+    method2, note2 = solvers._scipy_method_for("UNKNOWN_SOLVER_B")
+    assert method2 == "BDF"
+    assert note2 == "Unknown solver name; using BDF"
 
 
-def test_solve_ode_lsoda_omits_jac_and_jac_sparsity_for_banded_config(monkeypatch):
-    seen = {}
-
-    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
-        seen.update(kwargs)
-        t_eval = np.asarray(kwargs["t_eval"], float)
-        y = np.vstack([np.ones_like(t_eval), np.ones_like(t_eval)])
-        return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
-
-    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
-
-    req = solvers.SimulationRequest(
-        rhs=lambda _t, y: np.array([-2.0 * y[0] + y[1], y[0] - 3.0 * y[1]]),
-        t_span=(0.0, 1.0),
-        y0=np.array([1.0, 2.0]),
-        solver="LSODA",
-        t_eval=np.array([0.0, 1.0]),
-        rosenbrock_jacobian=JacobianConfig(mode="banded", ml=1, mu=1),
-    )
-
-    solvers.solve_ode(req)
-
-    assert seen["method"] == "LSODA"
-    assert "jac" not in seen
-    assert "jac_sparsity" not in seen
+@pytest.mark.parametrize(
+    ("solver_name", "expected"),
+    [
+        ("", ("BDF", "Unknown solver name; using BDF")),
+        (None, ("BDF", "Unknown solver name; using BDF")),
+        ("   ", ("BDF", "Unknown solver name; using BDF")),
+        ("legacy_solver", ("BDF", "Unknown solver name; using BDF")),
+        ("LEGACY_SOLVER", ("BDF", "Unknown solver name; using BDF")),
+        ("Legacy_Solver", ("BDF", "Unknown solver name; using BDF")),
+        (123, ("BDF", "Unknown solver name; using BDF")),
+        ("x" * 10000, ("BDF", "Unknown solver name; using BDF")),
+    ],
+)
+def test_normalize_solver_name_handles_unknown_inputs(solver_name, expected):
+    assert solvers.normalize_solver_name(solver_name) == expected
 
 
-def test_solve_ode_temperature_schedule_is_used_for_jacobian_rhs(monkeypatch):
+def test_solve_ode_temperature_schedule_is_used_for_solver_rhs(monkeypatch):
     seen_T = []
 
     class TempSchedule:
@@ -270,7 +335,9 @@ def test_solve_ode_temperature_schedule_is_used_for_jacobian_rhs(monkeypatch):
         return -y
 
     def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
-        kwargs["jac"](t_span[0], np.asarray(y0, float))
+        assert "jac" not in kwargs
+        assert "jac_sparsity" not in kwargs
+        fun(t_span[0], np.asarray(y0, float))
         t_eval = np.asarray(kwargs["t_eval"], float)
         y = np.vstack([np.ones_like(t_eval)])
         return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
@@ -289,6 +356,391 @@ def test_solve_ode_temperature_schedule_is_used_for_jacobian_rhs(monkeypatch):
     )
 
     assert seen_T
+
+
+def test_solve_ode_intervention_interval_symbolic_jacobian_uses_scheduled_rhs(monkeypatch):
+    symbolic_jacobian_calls = []
+
+    def forbidden_symbolic_jacobian(_t: float, _y: np.ndarray):
+        symbolic_jacobian_calls.append(True)
+        raise AssertionError("base symbolic jacobian does not include intervention interval semantics")
+
+    setattr(
+        forbidden_symbolic_jacobian,
+        "_kindred_symbolic_jacobian_identity",
+        {"kind": "jacobian", "artifact_fingerprint": "test"},
+    )
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        assert "jac" not in kwargs
+        fun(t_span[0], np.asarray(y0, float))
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        y = np.vstack([np.ones_like(t_eval)])
+        return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    out = solvers.solve_ode(
+        solvers.SimulationRequest(
+            rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+            t_span=(0.0, 1.0),
+            y0=np.array([1.0]),
+            solver="BDF",
+            grid={"N": 2},
+            jacobian_func=forbidden_symbolic_jacobian,
+            species_names=("A",),
+            intervention_schedule={
+                "intervals": [{"kind": "source", "species": "A", "start": 0.0, "end": 1.0, "rate": 2.0}]
+            },
+        )
+    )
+
+    assert symbolic_jacobian_calls == []
+    assert out.provenance["has_intervention_schedule"] is True
+    assert out.provenance["intervention_symbolic_jacobian_disabled"] is True
+
+
+def test_solve_ode_empty_intervention_schedule_object_is_noop_without_species_names():
+    from kindred.core.intervention_schedule import InterventionSchedule
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+        t_span=(0.0, 1.0),
+        y0=np.array([1.0]),
+        solver="BDF",
+        grid={"N": 2},
+        intervention_schedule=InterventionSchedule(),
+    )
+
+    out = solvers.solve_ode(request)
+
+    assert out.provenance["has_intervention_schedule"] is False
+    np.testing.assert_allclose(out.Y[0], np.array([1.0, 1.0]))
+
+
+def test_solve_ode_scheduled_terminal_event_stops_later_segments_and_preserves_events():
+    def terminal_event(t: float, _y: np.ndarray) -> float:
+        return float(t) - 0.5
+
+    terminal_event.terminal = True  # type: ignore[attr-defined]
+    terminal_event.direction = 0  # type: ignore[attr-defined]
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+        t_span=(0.0, 2.0),
+        y0=np.array([1.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.5, 1.0, 1.5, 2.0]),
+        events=[terminal_event],
+        species_names=("A",),
+        intervention_schedule={
+            "instant_events": [
+                {"op": "set", "species": "A", "time": 1.0, "value": 3.0}
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.5]))
+    assert out.provenance["events"] == [[0.5]]
+    assert out.provenance["intervention_segments"] == 1
+
+
+@pytest.mark.parametrize("event_terminal", [[True], np.array([True, False])])
+def test_solve_ode_scheduled_event_terminal_flags_stop_inside_segment(event_terminal):
+    def terminal_event(t: float, _y: np.ndarray) -> float:
+        return float(t) - 0.5
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+        t_span=(0.0, 1.0),
+        y0=np.array([1.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
+        events=[terminal_event],
+        event_terminal=event_terminal,
+        species_names=("A",),
+        intervention_schedule={
+            "instant_events": [
+                {"op": "set", "species": "A", "time": 0.8, "value": 3.0}
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.25, 0.5]))
+    assert out.provenance["events"] == [[0.5]]
+    assert out.provenance["intervention_segments"] == 1
+
+
+def test_solve_ode_scheduled_terminal_before_first_requested_sample_returns_empty_truncated_output():
+    def terminal_event(t: float, _y: np.ndarray) -> float:
+        return float(t) - 0.5
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+        t_span=(0.0, 1.0),
+        y0=np.array([1.0]),
+        solver="BDF",
+        t_eval=np.array([0.75, 1.0]),
+        events=[terminal_event],
+        event_terminal=[True],
+        species_names=("A",),
+        intervention_schedule={
+            "instant_events": [
+                {"op": "set", "species": "A", "time": 0.8, "value": 3.0}
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([], dtype=float))
+    assert out.Y.shape == (1, 0)
+    assert out.provenance["events"] == [[0.5]]
+    assert out.provenance["intervention_segments"] == 1
+
+
+def test_solve_ode_state_trigger_resumes_from_event_state_between_requested_samples():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 1.0]),
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 1.0]))
+    assert out.provenance["intervention_trigger_events"] == [
+        {
+            "time": pytest.approx(0.5, abs=1e-6),
+            "trigger_species": "A",
+            "species": "A",
+            "action": "add",
+        }
+    ]
+    assert float(out.Y[0, -1]) == pytest.approx(2.0, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("min_interval", "first_step"),
+    [
+        (0.25, None),
+        (0.0, 0.1),
+    ],
+)
+def test_solve_ode_state_trigger_rearms_inside_same_segment(min_interval, first_step):
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 2.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        first_step=first_step,
+        t_eval=np.array([0.0, 2.0]),
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "set",
+                    "value": 0.0,
+                    "max_count": 2,
+                    "min_interval": min_interval,
+                }
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    assert out.provenance["intervention_trigger_events"] == [
+        {
+            "time": pytest.approx(0.5, abs=1e-6),
+            "trigger_species": "A",
+            "species": "A",
+            "action": "set",
+        },
+        {
+            "time": pytest.approx(1.0, abs=1e-6),
+            "trigger_species": "A",
+            "species": "A",
+            "action": "set",
+        },
+    ]
+    np.testing.assert_allclose(out.t, np.array([0.0, 2.0]))
+    assert float(out.Y[0, -1]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_solve_ode_state_trigger_at_requested_sample_keeps_t_eval_grid_stable():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.5, 1.0]),
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.5, 1.0]))
+    assert float(out.Y[0, 1]) == pytest.approx(1.5, abs=1e-6)
+    assert float(out.Y[0, -1]) == pytest.approx(2.0, abs=1e-6)
+
+
+def test_solve_ode_state_trigger_ignores_surplus_user_event_terminal_flags():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.75, 1.0]),
+        event_terminal=[False],
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.75, 1.0]))
+    assert float(out.Y[0, 1]) == pytest.approx(1.75, abs=1e-6)
+    assert float(out.Y[0, -1]) == pytest.approx(2.0, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("interval_end", "expected_at_trigger", "expected_final"),
+    [
+        (1.0, 0.0, 0.0),
+        (0.5, 1.0, 1.0),
+    ],
+)
+def test_solve_ode_state_trigger_applies_clamp_interval_state_at_event_sample(
+    interval_end,
+    expected_at_trigger,
+    expected_final,
+):
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([0.0, 1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0, 0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.5, 1.0]),
+        species_names=("A", "B"),
+        intervention_schedule={
+            "intervals": [
+                {"kind": "clamp", "species": "A", "start": 0.0, "end": interval_end, "value": 0.0}
+            ],
+            "trigger_events": [
+                {
+                    "trigger_species": "B",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ],
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.5, 1.0]))
+    assert float(out.Y[0, 1]) == pytest.approx(expected_at_trigger, abs=1e-7)
+    assert float(out.Y[0, -1]) == pytest.approx(expected_final, abs=1e-7)
+    assert out.provenance["intervention_trigger_events"][0]["species"] == "A"
+
+
+def test_solve_ode_state_trigger_requires_event_state_when_event_between_samples(monkeypatch):
+    def fake_solve_ivp(*, t_span, y0, **kwargs):
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        return types.SimpleNamespace(
+            success=True,
+            message="ok",
+            status=1,
+            t=t_eval[:1],
+            y=np.asarray(y0, float).reshape(-1, 1),
+            t_events=[np.array([0.5])],
+        )
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 1.0]),
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(Exception, match="did not provide an event-time state"):
+        solvers.solve_ode(request)
 
 
 def test_solve_ode_exercises_implicit_alternatives_and_raises_after_exhaustion(monkeypatch):
@@ -312,13 +764,13 @@ def test_solve_ode_exercises_implicit_alternatives_and_raises_after_exhaustion(m
                 rhs=lambda t, y: -y,
                 t_span=(0.0, 1.0),
                 y0=np.array([1.0]),
-                solver="LSODA",
+                solver="BDF",
                 grid={"N": 2},
             )
         )
 
-    assert calls == ["LSODA", "Radau", "BDF"]
-    assert "attempted methods: LSODA, Radau, BDF" in str(exc_info.value)
+    assert calls == ["BDF", "Radau"]
+    assert "attempted methods: BDF, Radau" in str(exc_info.value)
 
 
 def test_solve_ode_records_successful_fallback_provenance(monkeypatch):
@@ -336,8 +788,8 @@ def test_solve_ode_records_successful_fallback_provenance(monkeypatch):
         method = kwargs.get("method")
         calls.append(method)
         t_eval = np.asarray(kwargs["t_eval"], float)
-        if method == "LSODA":
-            return DummySolution(success=False, message="LSODA failure", t_eval=t_eval[:1])
+        if method == "BDF":
+            return DummySolution(success=False, message="BDF failure", t_eval=t_eval[:1])
         return DummySolution(success=True, message="ok", t_eval=t_eval)
 
     monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
@@ -347,17 +799,60 @@ def test_solve_ode_records_successful_fallback_provenance(monkeypatch):
             rhs=lambda t, y: -y,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),
-            solver="LSODA",
+            solver="BDF",
             grid={"N": 2},
         )
     )
 
-    assert calls == ["LSODA", "Radau"]
+    assert calls == ["BDF", "Radau"]
     assert out.fallback_occurred is True
     assert out.provenance["solver_alternative_used"] == "Radau"
-    assert out.provenance["solver_requested"] == "LSODA"
+    assert out.provenance["solver_requested"] == "BDF"
     assert out.provenance["solver_used"] == "Radau"
     assert "solver" not in out.provenance
+
+
+def test_solve_ode_records_segmented_intervention_fallback_solver_used(monkeypatch):
+    class DummySolution:
+        def __init__(self, *, success: bool, message: str, t_eval: np.ndarray):
+            self.success = success
+            self.message = message
+            self.t = np.asarray(t_eval, float)
+            self.y = np.vstack([np.ones_like(self.t)])
+            self.t_events = []
+
+    calls = []
+
+    def fake_solve_ivp(*_a, **kwargs):
+        method = kwargs.get("method")
+        calls.append(method)
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        if method == "BDF":
+            return DummySolution(success=False, message="BDF failure", t_eval=t_eval[:1])
+        return DummySolution(success=True, message="ok", t_eval=t_eval)
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    out = solvers.solve_ode(
+        solvers.SimulationRequest(
+            rhs=lambda _t, y: -y,
+            t_span=(0.0, 1.0),
+            y0=np.array([1.0]),
+            solver="BDF",
+            grid={"N": 2},
+            species_names=("A",),
+            intervention_schedule={
+                "intervals": [{"kind": "source", "species": "A", "start": 0.0, "end": 1.0, "rate": 0.0}]
+            },
+        )
+    )
+
+    assert calls == ["BDF", "Radau"]
+    assert out.fallback_occurred is True
+    assert out.provenance["solver_alternative_used"] == "Radau"
+    assert out.provenance["solver_requested"] == "BDF"
+    assert out.provenance["solver_used"] == "Radau"
+    assert out.provenance["intervention_segment_solvers"] == ["Radau"]
 
 
 def test_simulation_request_rejects_deprecated_native_solver_params():

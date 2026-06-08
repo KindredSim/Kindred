@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
+from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.dataset_parameter_overrides import (
     FitDatasetParameterOverrides,
     coerce_fit_dataset_parameter_overrides,
@@ -19,7 +21,31 @@ try:
 except Exception:  # pragma: no cover - defensive fallback
     KINDRED_VERSION = ""
 
-__all__ = ["build_global_fit_run_stamp", "hash_global_fit_run_stamp"]
+__all__ = [
+    "build_global_fit_run_stamp",
+    "finalize_global_fit_run_stamp_prepared_simulation",
+    "hash_global_fit_run_stamp",
+]
+
+_REQUIRED_PREPARED_SIMULATION_KEYS = frozenset(
+    {
+        "mechanism_text_sha256",
+        "mechanism_text_len",
+        "param_names",
+        "t_end",
+        "num_points",
+        "temperature_K",
+        "solver_requested",
+        "solver_normalized",
+        "rtol",
+        "atol",
+        "use_sparse_jacobian",
+        "wegscheider_cyclicity_enabled",
+        "initial_prefix",
+        "intervention_schedule_declarative_fingerprint",
+        "intervention_schedule_executable_fingerprint",
+    }
+)
 
 
 def _sha256_hex(text: str) -> str:
@@ -117,6 +143,58 @@ def _build_global_fit_datasets_block(
     return datasets_block
 
 
+def _array_identity_block(values: object) -> dict[str, Any]:
+    arr = np.asarray(values, dtype=float)
+    arr64 = np.ascontiguousarray(arr, dtype=np.float64)
+    return {
+        "shape": [int(x) for x in arr64.shape],
+        "sha256": hashlib.sha256(arr64.tobytes()).hexdigest(),
+    }
+
+
+def _normalize_dataset_specs_block(dataset_specs: Optional[Sequence[object]]) -> Optional[list[dict[str, Any]]]:
+    if not dataset_specs:
+        return None
+    normalized: list[dict[str, Any]] = []
+    for spec in dataset_specs:
+        if not isinstance(spec, FitDatasetSpec):
+            return None
+        observations_block = {
+            str(name): {
+                "t": _array_identity_block(values.get("t", [])),
+                "y": _array_identity_block(values.get("y", [])),
+            }
+            for name, values in sorted((spec.observations or {}).items())
+            if str(name).strip()
+        }
+        x_obs_by_species_block = {
+            str(name): _array_identity_block(values)
+            for name, values in sorted((getattr(spec, "x_obs_by_species", None) or {}).items())
+            if str(name).strip()
+        }
+        normalized.append(
+            {
+                "id": str(spec.dataset_id),
+                "species": [str(name) for name in spec.species_list],
+                "point_count": int(spec.point_count),
+                "observations": observations_block,
+                "x_name": str(spec.x_name),
+                "x_obs_by_species": x_obs_by_species_block,
+                "x_mapping_mode": str(spec.x_mode),
+                "target_weights": {
+                    str(name): _float_to_canonical_str(value)
+                    for name, value in sorted((spec.target_weights or {}).items())
+                    if str(name).strip()
+                },
+            }
+        )
+        if not observations_block:
+            normalized[-1]["t"] = _array_identity_block(spec.t_exp)
+            normalized[-1]["y"] = _array_identity_block(spec.y_matrix)
+            normalized[-1]["x_obs"] = None if spec.x_obs is None else _array_identity_block(spec.x_obs)
+    return sorted(normalized, key=lambda item: str(item["id"]))
+
+
 def _normalize_global_fit_weights_used(weights_used: Optional[Dict[str, float]]) -> Optional[dict[str, str]]:
     if weights_used is None:
         return None
@@ -139,11 +217,12 @@ def _normalize_fit_config_dict(fit_config: Dict[str, Any]) -> tuple[dict[str, An
     except Exception:
         config["max_nfev"] = 0
     config["seed"] = config.get("seed")
-    config["use_parallel"] = bool(config.get("use_parallel", False))
     try:
         config["parallel_starts"] = int(config.get("parallel_starts") or 0)
     except Exception:
         config["parallel_starts"] = 0
+    for key in ("ftol", "xtol"):
+        config[key] = _float_to_canonical_str(config.get(key, 0.0))
     return config, {"parameters": parameters, "fixed_params": fixed_params, "bounds": bounds, "log10_params": log10_params}
 
 
@@ -234,11 +313,18 @@ def _normalize_dataset_variable_params_block(
 
 
 def _normalize_prepared_simulation_block(prepared_simulation: Optional[object]) -> Optional[dict[str, Any]]:
+    if isinstance(prepared_simulation, Mapping):
+        missing = sorted(_REQUIRED_PREPARED_SIMULATION_KEYS.difference(prepared_simulation.keys()))
+        if missing:
+            raise ValueError(
+                "Incomplete prepared simulation metadata: missing "
+                + ", ".join(missing)
+            )
     prepared_meta = coerce_prepared_simulation_metadata(prepared_simulation)
     if prepared_meta is None:
         return None
     serialized = prepared_meta.to_serializable_dict()
-    return {
+    block = {
         "mechanism_text_sha256": str(serialized.get("mechanism_text_sha256") or ""),
         "mechanism_text_len": int(serialized.get("mechanism_text_len") or 0),
         "param_names": sorted({str(x) for x in (serialized.get("param_names") or []) if str(x).strip()}),
@@ -249,10 +335,23 @@ def _normalize_prepared_simulation_block(prepared_simulation: Optional[object]) 
         "solver_normalized": str(serialized.get("solver_normalized") or ""),
         "rtol": _float_to_canonical_str(serialized.get("rtol")),
         "atol": _float_to_canonical_str(serialized.get("atol")),
-        "use_sparse_jacobian": bool(serialized.get("use_sparse_jacobian", False)),
-        "wegscheider_cyclicity_enabled": bool(serialized.get("wegscheider_cyclicity_enabled", False)),
+        "use_sparse_jacobian": bool(serialized["use_sparse_jacobian"]),
+        "wegscheider_cyclicity_enabled": bool(serialized["wegscheider_cyclicity_enabled"]),
         "initial_prefix": str(serialized.get("initial_prefix") or ""),
+        "intervention_schedule_declarative_fingerprint": str(
+            serialized.get("intervention_schedule_declarative_fingerprint") or ""
+        ),
+        "intervention_schedule_executable_fingerprint": str(
+            serialized.get("intervention_schedule_executable_fingerprint") or ""
+        ),
     }
+    symbolic_jacobian_identity = serialized.get("symbolic_jacobian_identity")
+    if isinstance(symbolic_jacobian_identity, Mapping):
+        block["symbolic_jacobian_identity"] = dict(symbolic_jacobian_identity)
+    symbolic_wegscheider_identity = serialized.get("symbolic_wegscheider_identity")
+    if isinstance(symbolic_wegscheider_identity, Mapping):
+        block["symbolic_wegscheider_identity"] = dict(symbolic_wegscheider_identity)
+    return block
 
 
 def build_global_fit_run_stamp(
@@ -267,6 +366,7 @@ def build_global_fit_run_stamp(
     mechanism_text: str,
     reactions_text: str,
     prepared_simulation: Optional[object] = None,
+    dataset_specs: Optional[Sequence[object]] = None,
     dataset_overrides: Optional[Sequence[object]] = None,
     dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
     dataset_variable_params: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
@@ -286,6 +386,7 @@ def build_global_fit_run_stamp(
         applied_targets=applied_norm,
         applied_target_weights=applied_target_weights_norm,
     )
+    dataset_specs_block = _normalize_dataset_specs_block(dataset_specs)
     weights_block = _normalize_global_fit_weights_used(weights_used)
 
     config, extracted = _normalize_fit_config_dict(fit_config)
@@ -318,6 +419,7 @@ def build_global_fit_run_stamp(
         "mode": "global",
         "kindred_version": str(KINDRED_VERSION or ""),
         "datasets": datasets_block,
+        "dataset_payload_identity": dataset_specs_block,
         "fit_targets_applied": {k: applied_norm[k] for k in ordered_ids if k in applied_norm},
         "target_weights_applied": {k: applied_target_weights_norm[k] for k in ordered_ids if k in applied_target_weights_norm},
         "weight_mode": str(weight_mode or ""),
@@ -326,8 +428,9 @@ def build_global_fit_run_stamp(
             "method": str(config.get("method") or ""),
             "max_nfev": int(config.get("max_nfev") or 0),
             "seed": (int(config["seed"]) if config.get("seed") is not None else None),
-            "use_parallel": bool(config.get("use_parallel", False)),
             "parallel_starts": int(config.get("parallel_starts") or 0),
+            "ftol": str(config.get("ftol") or ""),
+            "xtol": str(config.get("xtol") or ""),
         },
         "parameters": {
             "fit": sorted({str(k) for k in parameters.keys() if str(k).strip()}),
@@ -341,6 +444,21 @@ def build_global_fit_run_stamp(
         "mechanism_sha256": _sha256_hex(mechanism_text),
         "reactions_sha256": _sha256_hex(reactions_text),
     }
+
+
+def finalize_global_fit_run_stamp_prepared_simulation(
+    stamp: Dict[str, Any],
+    prepared_simulation: Optional[object],
+) -> Dict[str, Any]:
+    prepared_block = _normalize_prepared_simulation_block(prepared_simulation)
+    finalized = deepcopy(dict(stamp or {}))
+    if prepared_block is None:
+        return finalized
+    finalized["prepared_simulation"] = prepared_block
+    for key in tuple(finalized):
+        if str(key).startswith("runtime_"):
+            finalized.pop(key, None)
+    return finalized
 
 
 def hash_global_fit_run_stamp(stamp: Dict[str, Any]) -> str:

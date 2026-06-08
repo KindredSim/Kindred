@@ -6,7 +6,6 @@ Provides methods for:
 - Fitting configuration dialogs
 - Fitting diagnostics display
 - Parameter override/update in mechanism DSL
-- Modeless fitting window management
 """
 
 from __future__ import annotations
@@ -14,17 +13,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, Optional, TYPE_CHECKING
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulator.dsl_text_update import (
     StepParameterUpdateOutcome,
     analyze_parameter_updates_to_dsl_text,
     authoritative_parameter_values_match,
 )
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
+from kindred.gui.fitting.constants import (
+    FITTING_MAX_NFEV_RANGE,
+    FITTING_METHODS,
+    FITTING_SEED_RANGE,
+    FITTING_SOLVERS,
+)
 from kindred.gui.mixins.ports import FittingMixinPorts
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 
@@ -35,7 +41,6 @@ _FITTING_KEY_TO_SHORT: dict[str, str] = {
     "fitting_max_nfev": "max_nfev",
     "fitting_ftol": "ftol",
     "fitting_xtol": "xtol",
-    "fitting_use_parallel": "use_parallel",
     "fitting_use_seed": "use_seed",
     "fitting_seed": "seed",
     "fitting_solver": "solver",
@@ -105,12 +110,6 @@ if TYPE_CHECKING:
     from kindred.gui.fitting.launch import GlobalFitLaunchContext
 
 
-def launch_global_fit_session(context):
-    from kindred.gui.fitting.launch import launch_global_fit_session as _impl
-
-    return _impl(context)
-
-
 class FittingMixin:
     """
     Mixin providing parameter fitting functionality for MainWindow.
@@ -126,25 +125,7 @@ class FittingMixin:
         ports = getattr(self, "_fitting_ports", None)
         if isinstance(ports, FittingMixinPorts):
             return ports
-
-        mechanism_editor = getattr(self, "_mechanism_editor", None)
-        dataset_manager = getattr(self, "_dataset_manager", None)
-        data_manager = getattr(getattr(self, "_right_panel", None), "_data_manager", None)
-        status_label = getattr(self, "_status_label", None)
-        temperature_spinbox = getattr(self, "_temperature_spinbox", None)
-        num_points_spinbox = getattr(self, "_num_points_spinbox", None)
-
-        if status_label is None:
-            raise RuntimeError("FittingMixin ports are not initialized.")
-
-        return FittingMixinPorts(
-            mechanism_editor=mechanism_editor,
-            dataset_manager=dataset_manager,
-            data_manager_getter=lambda: getattr(getattr(self, "_right_panel", None), "_data_manager", data_manager),
-            status_setter=lambda text: status_label.setText(str(text)),
-            temperature_getter=lambda: float(temperature_spinbox.value()) if temperature_spinbox is not None else 298.15,
-            num_points_getter=lambda: int(num_points_spinbox.value()) if num_points_spinbox is not None else 100,
-        )
+        raise RuntimeError("FittingMixin ports are not initialized.")
 
     def _set_fitting_status(self, text: str) -> None:
         self._require_fitting_ports().status_setter(str(text))
@@ -167,23 +148,6 @@ class FittingMixin:
             failures_attr="_fitting_best_effort_failures",
             counts_attr="_fitting_best_effort_failure_counts",
         )
-
-    def _register_fit_window(self, window: QtWidgets.QWidget) -> None:
-        """Track modeless fitting windows to keep them alive."""
-        if not hasattr(self, "_active_fit_windows"):
-            self._active_fit_windows: List[QtWidgets.QWidget] = []
-
-        self._active_fit_windows.append(window)
-
-        def _cleanup(*_args):
-            windows = getattr(self, "_active_fit_windows", None)
-            if isinstance(windows, list) and window in windows:
-                windows.remove(window)
-
-        window.destroyed.connect(_cleanup)
-        window.show()
-        window.raise_()
-        window.activateWindow()
 
     def _write_fit_results_to_mechanism(
         self,
@@ -234,14 +198,13 @@ class FittingMixin:
             return _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT
 
         set_with_undo = getattr(self, "set_mechanism_reactions_text_with_optional_undo", None)
-        if callable(set_with_undo):
-            set_with_undo(
-                updated_text,
-                "Global Fit: update Reactions",
-                record_undo=True,
-            )
-        else:
-            mechanism_editor.set_reactions_text(updated_text)
+        if not callable(set_with_undo):
+            raise RuntimeError("Authoritative mechanism Reactions setter is unavailable.")
+        set_with_undo(
+            updated_text,
+            "Global Fit: update Reactions",
+            record_undo=True,
+        )
 
         if str(mechanism_editor.reactions_text()) == before_text:
             logger.warning("Fitted parameter project apply did not rewrite mechanism text")
@@ -254,8 +217,8 @@ class FittingMixin:
         if callable(getattr(self, "_sync_batch_species_columns", None)):
             mechanism_initials = self._extract_mechanism_initials(updated_text)
             self._sync_batch_species_columns(list(mechanism_initials.keys()))
-        if refresh_display and callable(getattr(self, "_refresh_batch_display_from_focus_and_shown", None)):
-            self._refresh_batch_display_from_focus_and_shown()
+        if refresh_display and callable(getattr(self, "_refresh_batch_display_from_request_scope", None)):
+            self._refresh_batch_display_from_request_scope()
         logger.info("Wrote %d fitted parameter(s) to mechanism editor", len(normalized_parameters))
         return _FIT_PARAMETER_APPLY_STATUS_REWRITTEN
 
@@ -286,13 +249,15 @@ class FittingMixin:
 
     def _current_fit_step_constraint_context(self) -> Dict[str, object]:
         ports = self._require_fitting_ports()
-        solver_settings_getter = getattr(self, "_get_solver_settings", None)
-        solver_settings = solver_settings_getter() if callable(solver_settings_getter) else {}
+        wegscheider_getter = getattr(self, "_get_wegscheider_cyclicity_enabled", None)
+        if not callable(wegscheider_getter):
+            raise RuntimeError("Fitting constraint context requires an explicit Wegscheider setting provider.")
+        wegscheider_enabled = wegscheider_getter()
+        if not isinstance(wegscheider_enabled, bool):
+            raise RuntimeError("Fitting constraint context requires an explicit Wegscheider setting.")
         return {
             "temperature_K": float(ports.temperature_getter()),
-            "wegscheider_cyclicity_enabled": bool(
-                dict(solver_settings or {}).get("wegscheider_cyclicity_enabled", False)
-            ),
+            "wegscheider_cyclicity_enabled": wegscheider_enabled,
         }
 
     @staticmethod
@@ -515,14 +480,14 @@ class FittingMixin:
         algo_layout = QtWidgets.QFormLayout(algo_group)
 
         method_combo = QtWidgets.QComboBox()
-        method_combo.addItems(["lm", "trf", "dogbox", "differential_evolution"])
+        method_combo.addItems(list(FITTING_METHODS))
         method_default = defaults.get("method", "trf")
-        if method_default in {"lm", "trf", "dogbox", "differential_evolution"}:
+        if method_default in FITTING_METHODS:
             method_combo.setCurrentText(method_default)
         algo_layout.addRow("Method:", method_combo)
 
         max_nfev_spin = QtWidgets.QSpinBox()
-        max_nfev_spin.setRange(10, 10000)
+        max_nfev_spin.setRange(*FITTING_MAX_NFEV_RANGE)
         max_nfev_spin.setValue(int(defaults.get("max_nfev", 1000)))
         algo_layout.addRow("Max evaluations:", max_nfev_spin)
 
@@ -534,14 +499,10 @@ class FittingMixin:
         _xtol_val = setup_scientific_validator(xtol_edit)
         algo_layout.addRow("xtol:", xtol_edit)
 
-        use_parallel_check = QtWidgets.QCheckBox("Parallel multi-start (DE only)")
-        use_parallel_check.setChecked(bool(defaults.get("use_parallel", False)))
-        algo_layout.addRow(use_parallel_check)
-
         use_seed_check = QtWidgets.QCheckBox("Use fixed random seed")
         use_seed_check.setChecked(bool(defaults.get("use_seed", True)))
         seed_spin = QtWidgets.QSpinBox()
-        seed_spin.setRange(0, 999_999)
+        seed_spin.setRange(*FITTING_SEED_RANGE)
         seed_spin.setValue(int(defaults.get("seed", 42)))
         seed_spin.setEnabled(use_seed_check.isChecked())
         use_seed_check.toggled.connect(seed_spin.setEnabled)
@@ -553,8 +514,9 @@ class FittingMixin:
         integration_layout = QtWidgets.QFormLayout(integration_group)
 
         solver_combo = QtWidgets.QComboBox()
-        solver_combo.addItems(["LSODA", "Radau", "BDF"])
-        solver_combo.setCurrentText(str(defaults.get("solver", "LSODA")))
+        solver_combo.addItems(list(FITTING_SOLVERS))
+        solver_name, _warning = normalize_solver_name(defaults.get("solver", "BDF"))
+        solver_combo.setCurrentText(solver_name)
         integration_layout.addRow("Solver:", solver_combo)
 
         rtol_edit = QtWidgets.QLineEdit(str(defaults.get("rtol", "1e-6")))
@@ -580,7 +542,6 @@ class FittingMixin:
                 "fitting_max_nfev": int(max_nfev_spin.value()),
                 "fitting_ftol": max(safe_float_parse(ftol_edit.text(), 1e-10), 1e-15),
                 "fitting_xtol": max(safe_float_parse(xtol_edit.text(), 1e-10), 1e-15),
-                "fitting_use_parallel": bool(use_parallel_check.isChecked()),
                 "fitting_use_seed": bool(use_seed_check.isChecked()),
                 "fitting_seed": int(seed_spin.value()),
                 "fitting_solver": solver_combo.currentText(),
@@ -620,19 +581,7 @@ class FittingMixin:
             predicted = observed + residuals
 
         if observed.size == 0:
-            dataset_info = fit_result.get("dataset", {})
-            dataset_name = dataset_info.get("name")
-            if dataset_name:
-                data_manager = self._require_fitting_ports().data_manager_getter()
-                dataset_payload = data_manager.get_dataset(dataset_name) if data_manager is not None else None
-                species_map = (dataset_payload or {}).get("species", {})
-                target = dataset_info.get("target_species")
-                if target and target in species_map:
-                    observed = _array(species_map[target])
-                elif species_map:
-                    observed = _array(next(iter(species_map.values())))
-                if observed.size and residuals.size == observed.size and predicted.size == 0:
-                    predicted = observed + residuals
+            logger.debug("Fitting diagnostics payload did not include observed data; registry reconstruction is not attempted.")
 
         result_dict = {
             'parameters': fit_result.get('parameters', {}),
@@ -681,20 +630,21 @@ class FittingMixin:
         def _set_reactions_text(new_text: str) -> None:
             if reactions_widget is None:
                 raise RuntimeError("Reactions editor unavailable.")
-            if callable(getattr(self, "_set_text_with_optional_undo", None)):
-                self._set_text_with_optional_undo(
-                    reactions_widget,
-                    str(new_text or ""),
-                    "Global Fit: update Reactions",
-                    True,
-                )
-                return
-            reactions_widget.setPlainText(str(new_text or ""))
+            set_reactions = getattr(self, "set_mechanism_reactions_text_with_optional_undo", None)
+            if not callable(set_reactions):
+                raise RuntimeError("Authoritative mechanism Reactions setter is unavailable.")
+            set_reactions(
+                str(new_text or ""),
+                "Global Fit: update Reactions",
+                record_undo=True,
+            )
 
         return GlobalFitLaunchContext(
             parent=self,
-            dataset_manager=ports.dataset_manager,
-            data_manager_getter=ports.data_manager_getter,
+            dataset_registry=ports.dataset_registry,
+            dataset_fit_settings_store=ports.dataset_fit_settings_store,
+            dataset_view_publisher=ports.dataset_view_publisher,
+            mechanism_parameter_scan_owner=ports.mechanism_parameter_scan_owner,
             mechanism_text_getter=lambda: str(self._get_mechanism_text() or ""),
             reactions_text_getter=_get_reactions_text,
             reactions_text_setter=_set_reactions_text,
@@ -703,13 +653,10 @@ class FittingMixin:
             set_status=self._set_fitting_status,
             sync_batch_species_columns=self._sync_batch_species_columns,
             batch_initials_for_row=self._batch_initials_for_row,
-            get_solver_settings=self._get_solver_settings,
-            temperature_getter=ports.temperature_getter,
+            fitting_settings_getter=self._get_global_fit_launch_settings,
             num_points_getter=ports.num_points_getter,
-            register_fit_window=self._register_fit_window,
-            write_fit_results_to_mechanism=self._write_fit_results_to_mechanism,
+            register_fit_window=self._fitting_runtime_input_publisher.register_window,
             apply_fit_results_to_project=self._apply_fit_results_to_project,
-            apply_dataset_initial_updates=self._apply_dataset_initial_updates,
             load_fitting_defaults=self._get_fitting_session_defaults,
             batch_store=getattr(self, "_batch_store", None),
             batch_model=getattr(self, "_batch_model", None),
@@ -718,6 +665,8 @@ class FittingMixin:
 
     def _run_global_fit(self):
         """Delegate global-fit launch ownership to the fitting package."""
+        from kindred.gui.fitting.launch import launch_global_fit_session
+
         return launch_global_fit_session(self._build_global_fit_launch_context())
 
     @staticmethod
@@ -752,7 +701,7 @@ class FittingMixin:
         self,
         dataset_params: Dict[str, Dict[str, float]] | None,
     ) -> tuple[tuple[_FitDatasetInitialConditionApplyItem, ...], bool]:
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
+        from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 
         updates_by_dataset = self._extract_fit_initial_condition_updates(dataset_params)
         has_requested_updates = bool(updates_by_dataset)
@@ -763,15 +712,13 @@ class FittingMixin:
         if batch_store is None:
             raise RuntimeError("Initial conditions store is unavailable.")
 
-        dataset_manager = self._require_fitting_ports().dataset_manager
-        if dataset_manager is None:
-            raise RuntimeError("Dataset manager is unavailable.")
+        dataset_fit_settings_store = self._require_fitting_ports().dataset_fit_settings_store
 
         plan: list[_FitDatasetInitialConditionApplyItem] = []
         for dataset_id, species_updates in updates_by_dataset.items():
             try:
-                settings = dataset_manager.get_fit_settings(dataset_id)
-            except DatasetManagerError as exc:
+                settings = dataset_fit_settings_store.get_fit_settings(dataset_id)
+            except DatasetOwnerError as exc:
                 raise RuntimeError(f"Dataset '{dataset_id}' is no longer available.") from exc
 
             mapped_set_id = str(getattr(settings, "batch_set_id", "") or "").strip()
@@ -880,8 +827,8 @@ class FittingMixin:
     ) -> None:
         batch_store = getattr(self, "_batch_store", None)
         batch_model = getattr(self, "_batch_model", None)
-        dataset_manager = self._require_fitting_ports().dataset_manager
-        if batch_store is None or dataset_manager is None:
+        dataset_fit_settings_store = self._require_fitting_ports().dataset_fit_settings_store
+        if batch_store is None:
             raise RuntimeError("Batch initial conditions project apply is unavailable.")
 
         affected_rows: list[int] = []
@@ -892,12 +839,12 @@ class FittingMixin:
             if item.canonical_updates:
                 affected_rows.append(row)
             if item.settings_sync_updates or item.mapping_sync_needed:
-                settings = dataset_manager.get_fit_settings(item.dataset_id)
+                settings = dataset_fit_settings_store.get_fit_settings(item.dataset_id)
                 for species, value in item.settings_sync_updates.items():
                     settings.initial_conditions[str(species)] = float(value)
                 settings.batch_set_id = item.set_id
                 settings.batch_set = item.set_name
-                dataset_manager.update_fit_settings(item.dataset_id, settings)
+                dataset_fit_settings_store.update_fit_settings(item.dataset_id, settings)
 
         if batch_model is not None and affected_rows:
             for row in sorted(set(affected_rows)):
@@ -948,24 +895,28 @@ class FittingMixin:
             applied_any = bool(parameter_outcome.applied_any)
             parameter_apply_failed = bool(parameter_outcome.rewrite_failed)
         if plan.initial_condition_items:
-            self._apply_fit_initial_condition_project_updates(plan.initial_condition_items)
+            previous_suppress = bool(getattr(self, "_suppress_canonical_batch_initials_transition", False))
+            if hasattr(self, "_suppress_canonical_batch_initials_transition"):
+                setattr(self, "_suppress_canonical_batch_initials_transition", True)
+            try:
+                self._apply_fit_initial_condition_project_updates(plan.initial_condition_items)
+            finally:
+                if hasattr(self, "_suppress_canonical_batch_initials_transition"):
+                    setattr(self, "_suppress_canonical_batch_initials_transition", previous_suppress)
+            if plan.canonical_ic_affected_set_ids:
+                self._apply_canonical_batch_initials_transition(
+                    affected_set_ids=plan.canonical_ic_affected_set_ids,
+                    transition_source="fitting_project_apply_initial_conditions",
+                    discard_dirty_preview=True,
+                )
             applied_any = True
 
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-        if batch_cache is not None and active_cache_key and plan.canonical_ic_affected_set_ids:
-            merged_invalidated: list[str] = [
-                str(set_id)
-                for set_id in (getattr(batch_cache, "active_cache_invalidated_set_ids", None) or ())
-                if str(set_id)
-            ]
-            for set_id in plan.canonical_ic_affected_set_ids:
-                if set_id not in merged_invalidated:
-                    merged_invalidated.append(str(set_id))
-            batch_cache.active_cache_invalidated_set_ids = tuple(merged_invalidated) or None
-
-        if plan.needs_display_refresh and callable(getattr(self, "_refresh_batch_display_from_focus_and_shown", None)):
-            self._refresh_batch_display_from_focus_and_shown()
+        if (
+            plan.needs_display_refresh
+            and applied_any
+            and callable(getattr(self, "_refresh_batch_display_from_request_scope", None))
+        ):
+            self._refresh_batch_display_from_request_scope()
         if parameter_apply_failed and applied_any:
             parameter_warnings.append(
                 "Fitted parameter values were not written to the current mechanism text."
@@ -984,11 +935,11 @@ class FittingMixin:
 
     def _apply_dataset_initial_updates(self, dataset_id: str, updates: Dict[str, float]) -> None:
         """Persist fitted initial concentrations back to dataset settings."""
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
+        from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 
         try:
-            settings = self._require_fitting_ports().dataset_manager.get_fit_settings(dataset_id)
-        except DatasetManagerError:
+            settings = self._require_fitting_ports().dataset_fit_settings_store.get_fit_settings(dataset_id)
+        except DatasetOwnerError:
             return
         changed = False
         for species, value in updates.items():
@@ -996,4 +947,4 @@ class FittingMixin:
                 settings.initial_conditions[species] = float(value)
                 changed = True
         if changed:
-            self._require_fitting_ports().dataset_manager.update_fit_settings(dataset_id, settings)
+            self._require_fitting_ports().dataset_fit_settings_store.update_fit_settings(dataset_id, settings)

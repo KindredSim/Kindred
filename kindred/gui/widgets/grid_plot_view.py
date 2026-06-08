@@ -15,11 +15,16 @@ import math
 import numpy as np
 from PySide6 import QtCore, QtWidgets, QtGui
 
+from kindred.core.analysis.global_fit_projection import FitRenderDatasetProjection
 from kindred.gui.color_manager import ColorManager
+from kindred.gui.display_name_policy import PLOT_TITLE_LABEL_MAX_CHARS, compact_plot_title_label
 from kindred.gui.plot_config import try_import_pyqtgraph
 from kindred.gui.diagnostics import record_best_effort_failure
 
 logger = logging.getLogger(__name__)
+
+_LOCKED_LEFT_AXIS_WIDTH = 92
+_LOCKED_BOTTOM_AXIS_HEIGHT = 48
 
 __all__ = ["GridPlotView"]
 
@@ -155,15 +160,24 @@ class GridPlotView(QtWidgets.QWidget):
 
         frozen = dict(dataset or {})
         frozen["name"] = str(frozen.get("name") or "")
-        for key in ("data_x", "data_y", "model_x", "model_y"):
+        frozen.pop("model_x", None)
+        frozen.pop("model_series", None)
+        for key in ("data_x", "data_y"):
             if key in frozen and frozen.get(key) is not None:
                 frozen[key] = _freeze_1d(frozen.get(key))
-        model_series = frozen.get("model_series")
-        if isinstance(model_series, dict):
-            frozen["model_series"] = {str(k): _freeze_1d(v) for k, v in model_series.items()}
         all_species = frozen.get("all_species")
         if isinstance(all_species, dict):
             frozen["all_species"] = {str(k): _freeze_1d(v) for k, v in all_species.items()}
+        all_observations = frozen.get("all_observations")
+        if isinstance(all_observations, dict):
+            frozen["all_observations"] = {
+                str(name): {
+                    "t": _freeze_1d((spec or {}).get("t", [])),
+                    "y": _freeze_1d((spec or {}).get("y", [])),
+                }
+                for name, spec in all_observations.items()
+                if str(name)
+            }
         if "current_species" in frozen:
             frozen["current_species"] = str(frozen.get("current_species") or "")
         if "x_label" in frozen:
@@ -290,13 +304,13 @@ class GridPlotView(QtWidgets.QWidget):
 
         # Conservative defaults + headroom, clamped to avoid absurd gutters.
         if left_w <= 1.0:
-            left_w = 80.0
+            left_w = float(_LOCKED_LEFT_AXIS_WIDTH)
         else:
-            left_w = min(140.0, max(80.0, left_w + 12.0))
+            left_w = min(140.0, max(float(_LOCKED_LEFT_AXIS_WIDTH), left_w + 12.0))
         if bottom_h <= 1.0:
-            bottom_h = 45.0
+            bottom_h = float(_LOCKED_BOTTOM_AXIS_HEIGHT)
         else:
-            bottom_h = min(95.0, max(45.0, bottom_h + 8.0))
+            bottom_h = min(95.0, max(float(_LOCKED_BOTTOM_AXIS_HEIGHT), bottom_h + 8.0))
 
         self._locked_left_axis_width = int(math.ceil(left_w))
         self._locked_bottom_axis_height = int(math.ceil(bottom_h))
@@ -320,24 +334,58 @@ class GridPlotView(QtWidgets.QWidget):
                     exc=exc,
                 )
 
-        if self._locked_left_axis_width is not None:
-            try:
-                left_axis.setWidth(float(self._locked_left_axis_width))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "locked_left_axis_width",
-                    message="GridPlotView: failed to set locked left axis width",
-                    exc=exc,
-                )
-        if self._locked_bottom_axis_height is not None:
-            try:
-                bottom_axis.setHeight(float(self._locked_bottom_axis_height))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "locked_bottom_axis_height",
-                    message="GridPlotView: failed to set locked bottom axis height",
-                    exc=exc,
-                )
+        if self._locked_left_axis_width is None:
+            self._locked_left_axis_width = _LOCKED_LEFT_AXIS_WIDTH
+        if self._locked_bottom_axis_height is None:
+            self._locked_bottom_axis_height = _LOCKED_BOTTOM_AXIS_HEIGHT
+        try:
+            left_axis.setWidth(float(self._locked_left_axis_width))
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "locked_left_axis_width",
+                message="GridPlotView: failed to set locked left axis width",
+                exc=exc,
+            )
+        try:
+            bottom_axis.setHeight(float(self._locked_bottom_axis_height))
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "locked_bottom_axis_height",
+                message="GridPlotView: failed to set locked bottom axis height",
+                exc=exc,
+            )
+
+    def _set_plot_axis_labels(
+        self,
+        plot: Any,
+        *,
+        x_label: str,
+        x_units: object = None,
+        y_label: str = "Concentration",
+        y_units: object = "M",
+        dataset_name: object = "",
+    ) -> None:
+        state = (str(x_label or ""), None if x_units is None else str(x_units), str(y_label or ""), None if y_units is None else str(y_units))
+        if getattr(plot, "_kindred_axis_label_state", None) == state:
+            return
+        try:
+            if state[1]:
+                plot.setLabel("bottom", state[0], units=state[1])
+            else:
+                plot.setLabel("bottom", state[0])
+            if state[3]:
+                plot.setLabel("left", state[2], units=state[3])
+            else:
+                plot.setLabel("left", state[2])
+            setattr(plot, "_kindred_axis_label_state", state)
+            if bool(getattr(self, "_autorange_locked", False)):
+                self._apply_locked_axis_style(plot)
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "plot_labels",
+                message=f"GridPlotView: failed to update plot labels for dataset={dataset_name!r}",
+                exc=exc,
+            )
 
     def _dataset_structure_key(self, datasets: Sequence[Dict[str, Any]]) -> Tuple[Tuple[str, ...], int, int]:
         ids = tuple(str((ds or {}).get("name") or "") for ds in (datasets or []))
@@ -345,8 +393,7 @@ class GridPlotView(QtWidgets.QWidget):
         return (ids, int(n_rows), int(n_cols))
 
     def _configure_plot_static(self, plot: Any) -> None:
-        plot.setLabel("bottom", "Time", units="s")
-        plot.setLabel("left", "Concentration", units="M")
+        self._set_plot_axis_labels(plot, x_label="Time", x_units="s", y_label="Concentration", y_units="M")
         plot.showGrid(x=True, y=True, alpha=0.3)
         font = QtGui.QFont()
         font.setPointSize(7)
@@ -432,6 +479,12 @@ class GridPlotView(QtWidgets.QWidget):
         color_manager = ColorManager.instance()
         available_species = []
         for dataset in self._datasets:
+            fit_projection = dataset.get("fit_render_projection")
+            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
+                available_species.extend(str(name) for name in fit_projection.observed_series.keys() if str(name))
+                continue
+            all_observations = dataset.get("all_observations", {}) if isinstance(dataset.get("all_observations", {}), dict) else {}
+            available_species.extend(str(name) for name in all_observations.keys() if str(name))
             all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
             available_species.extend(str(name) for name in all_species.keys() if str(name))
         color_manager.seed_species(available_species)
@@ -447,50 +500,61 @@ class GridPlotView(QtWidgets.QWidget):
             chi_squared = dataset.get("chi_squared")
             r_squared = dataset.get("r_squared")
             all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
-            model_x = dataset.get("model_x")
-            model_y = dataset.get("model_y")
-            model_series = dataset.get("model_series") or {}
-            current_species = dataset.get("current_species")
+            all_observations = dataset.get("all_observations", {}) if isinstance(dataset.get("all_observations", {}), dict) else {}
+            fit_projection = dataset.get("fit_render_projection")
+            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
+                model_series = fit_projection.model_series
+            else:
+                model_series = {}
 
-            try:
-                if x_units:
-                    plot.setLabel("bottom", x_label, units=str(x_units))
-                else:
-                    plot.setLabel("bottom", x_label)
-                plot.setLabel("left", "Concentration", units="M")
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "plot_labels",
-                    message=f"GridPlotView: failed to update plot labels for dataset={name!r}",
-                    exc=exc,
-                )
+            self._set_plot_axis_labels(
+                plot,
+                x_label=x_label,
+                x_units=x_units,
+                y_label="Concentration",
+                y_units="M",
+                dataset_name=name,
+            )
 
-            # Title with fit quality.
-            title = str(name or "")
+            # Title with fit quality. Keep subplot titles short so grid cells prioritize data area.
+            # During an active fit, freeze layout-bearing title text/color as well; live metric
+            # changes belong in the tracker/details, not in geometry that can resize the plot grid.
+            full_name = str(dataset.get("full_name") or name or "")
+            compact_name = compact_plot_title_label(name or full_name, max_chars=PLOT_TITLE_LABEL_MAX_CHARS)
+            title = str(compact_name.display or "")
+            tooltip_parts = [str(full_name or compact_name.full or "").strip()]
+            locked_layout = bool(getattr(self, "_autorange_locked", False))
+            color = (51, 51, 51)
             if chi_squared is not None:
                 try:
                     chi_val = float(chi_squared)
                 except Exception:
                     chi_val = None
                 if chi_val is not None:
-                    title = f"{title} (χ² = {chi_val:.3e})"
-                    color = self._get_color_for_chi_squared(chi_val)
-                else:
-                    color = (51, 51, 51)
+                    metric_text = f"χ² = {chi_val:.3e}"
+                    tooltip_parts.append(metric_text)
+                    if not locked_layout:
+                        title = f"{title} ({metric_text})"
+                        color = self._get_color_for_chi_squared(chi_val)
             elif r_squared is not None:
                 try:
                     r2_val = float(r_squared)
                 except Exception:
                     r2_val = None
                 if r2_val is not None:
-                    title = f"{title} (R² = {r2_val:.3f})"
-                    color = self._get_color_for_r_squared(r2_val)
-                else:
-                    color = (51, 51, 51)
-            else:
-                color = (51, 51, 51)
+                    metric_text = f"R² = {r2_val:.3f}"
+                    tooltip_parts.append(metric_text)
+                    if not locked_layout:
+                        title = f"{title} ({metric_text})"
+                        color = self._get_color_for_r_squared(r2_val)
+            title_tooltip = "\n".join(part for part in tooltip_parts if part)
             try:
-                plot.setTitle(title, color=color, size="10pt")
+                title_state = (title, tuple(color), "10pt")
+                if getattr(plot, "_kindred_title_state", None) != title_state:
+                    plot.setTitle(title, color=color, size="10pt")
+                    setattr(plot, "_kindred_title_state", title_state)
+                if hasattr(plot, "setToolTip"):
+                    plot.setToolTip(str(title_tooltip or ""))
             except Exception as exc:
                 self._record_best_effort_failure(
                     "plot_title",
@@ -505,8 +569,25 @@ class GridPlotView(QtWidgets.QWidget):
                 data_key = f"{species_name}::data"
                 model_key = f"{species_name}::model"
 
-                if species_name in all_species:
+                projection_active = isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok"
+                observation_spec = all_observations.get(species_name) if isinstance(all_observations.get(species_name), dict) else None
+                if projection_active and species_name in fit_projection.observed_series:
+                    y_data = np.asarray(fit_projection.observed_series[species_name], dtype=float).reshape(-1)
+                    species_data_x = fit_projection.observed_x_for_species(species_name)
+                elif observation_spec is not None:
+                    y_data = np.asarray(observation_spec.get("y", []), dtype=float).reshape(-1)
+                    species_data_x = np.asarray(observation_spec.get("t", []), dtype=float).reshape(-1)
+                elif species_name in all_species:
                     y_data = np.asarray(all_species[species_name], dtype=float).reshape(-1)
+                    species_data_x = (
+                        fit_projection.observed_x_for_species(species_name)
+                        if projection_active
+                        else data_x
+                    )
+                else:
+                    y_data = None
+                    species_data_x = np.asarray([], dtype=float)
+                if y_data is not None:
                     data_item = self._ensure_curve_item(
                         plot,
                         idx,
@@ -521,18 +602,18 @@ class GridPlotView(QtWidgets.QWidget):
                             data_item.setSymbolSize(5)
                             data_item.setSymbolBrush(self._pg.mkBrush(*color_rgb, 150))
                             data_item.setSymbolPen(self._pg.mkPen(color=color_rgb, width=1))
-                            if data_x.size == y_data.size:
-                                data_item.setData(data_x, y_data)
+                            if species_data_x.size == y_data.size:
+                                data_item.setData(species_data_x, y_data)
                                 data_item.setVisible(True)
                             else:
-                                warn_key = (str(name or ""), data_key, int(data_x.size), int(y_data.size))
+                                warn_key = (str(name or ""), data_key, int(species_data_x.size), int(y_data.size))
                                 if warn_key not in self._warned_shape_mismatches:
                                     self._warned_shape_mismatches.add(warn_key)
                                     logger.warning(
                                         "GridPlotView: skip data curve with shape mismatch dataset=%s series=%s x_len=%d y_len=%d",
                                         name,
                                         species_name,
-                                        int(data_x.size),
+                                        int(species_data_x.size),
                                         int(y_data.size),
                                     )
                                 try:
@@ -557,12 +638,10 @@ class GridPlotView(QtWidgets.QWidget):
                             )
                     active_keys.add(data_key)
 
-                    # Model overlay (multi-series preferred, fallback to single model_y).
+                    # Model overlay from the typed multi-series projection.
                     y_model = None
                     if isinstance(model_series, dict) and species_name in model_series:
                         y_model = model_series[species_name]
-                    elif model_y is not None and (current_species == species_name or len(self._selected_species_list) == 1):
-                        y_model = model_y
 
                     if y_model is not None:
                         try:
@@ -570,11 +649,9 @@ class GridPlotView(QtWidgets.QWidget):
                         except Exception:
                             y_model_arr = None
                         if y_model_arr is not None:
-                            x_model = model_x if model_x is not None else data_x
-                            try:
-                                x_model_arr = np.asarray(x_model, dtype=float).reshape(-1)
-                            except Exception:
-                                x_model_arr = data_x
+                            x_model_arr = fit_projection.model_x_for_species(species_name) if projection_active else None
+                            if x_model_arr is None:
+                                continue
                             model_item = self._ensure_curve_item(
                                 plot,
                                 idx,
@@ -702,9 +779,6 @@ class GridPlotView(QtWidgets.QWidget):
         name: str,
         data_x: np.ndarray,
         data_y: np.ndarray,
-        model_x: Optional[np.ndarray] = None,
-        model_y: Optional[np.ndarray] = None,
-        model_series: Optional[Dict[str, np.ndarray]] = None,
         chi_squared: Optional[float] = None,
         r_squared: Optional[float] = None,
         all_species: Optional[Dict[str, np.ndarray]] = None,
@@ -719,10 +793,6 @@ class GridPlotView(QtWidgets.QWidget):
             Dataset name
         data_x, data_y : np.ndarray
             Experimental data
-        model_x, model_y : np.ndarray, optional
-            Model fit
-        model_series : dict, optional
-            Multi-series model fit {species_name: y_model_aligned_to_model_x}
         chi_squared, r_squared : float, optional
             Fit quality metrics
         all_species : dict, optional
@@ -737,9 +807,6 @@ class GridPlotView(QtWidgets.QWidget):
             'name': name,
             'data_x': np.asarray(data_x),
             'data_y': np.asarray(data_y),
-            'model_x': np.asarray(model_x) if model_x is not None else None,
-            'model_y': np.asarray(model_y) if model_y is not None else None,
-            'model_series': {k: np.asarray(v) for k, v in (model_series or {}).items()} if model_series else None,
             'chi_squared': chi_squared,
             'r_squared': r_squared,
             'all_species': all_species if all_species else {current_species or 'Data': data_y},
@@ -896,6 +963,23 @@ class GridPlotView(QtWidgets.QWidget):
                 continue
             self._locked_view_ranges[idx] = (x_range, y_range)
 
+    def _restore_locked_view_ranges(self) -> None:
+        if not bool(getattr(self, "_autorange_locked", False)):
+            return
+        for idx, plot in enumerate(list(self._plot_items)):
+            frozen = self._locked_view_ranges.get(idx)
+            if not frozen:
+                continue
+            try:
+                plot.setXRange(float(frozen[0][0]), float(frozen[0][1]), padding=0)
+                plot.setYRange(float(frozen[1][0]), float(frozen[1][1]), padding=0)
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "restore_locked_view_range",
+                    message=f"GridPlotView: failed to restore locked view range for subplot={idx}",
+                    exc=exc,
+                )
+
     def set_species_selection(self, species_names: Sequence[str]) -> None:
         """
         Update the multi-select list with the provided species names.
@@ -975,89 +1059,7 @@ class GridPlotView(QtWidgets.QWidget):
         if needs_rebuild:
             self._rebuild_structure()
         self._update_plot_data_in_place()
-
-    def _plot_dataset(self, plot: Any, dataset: Dict[str, Any], idx: int):
-        """Plot a single dataset on the given PlotItem."""
-        if self._pg is None:
-            return
-        # Extract data
-        name = dataset['name']
-        data_x = dataset['data_x']
-        chi_squared = dataset['chi_squared']
-        r_squared = dataset['r_squared']
-        all_species = dataset.get('all_species', {})
-        model_x = dataset.get('model_x')
-        model_y = dataset.get('model_y')
-        model_series = dataset.get('model_series') or {}
-        current_species = dataset.get('current_species')
-
-        color_manager = ColorManager.instance()
-        color_manager.seed_species(all_species.keys())
-
-        # Configure plot
-        plot.setLabel('bottom', 'Time', units='s')
-        plot.setLabel('left', 'Concentration', units='M')
-        plot.showGrid(x=True, y=True, alpha=0.3)
-
-        # Build title with fit quality
-        title = name
-        if chi_squared is not None:
-            title += f" (χ² = {chi_squared:.3e})"
-            color = self._get_color_for_chi_squared(chi_squared)
-        elif r_squared is not None:
-            title += f" (R² = {r_squared:.3f})"
-            color = self._get_color_for_r_squared(r_squared)
-        else:
-            color = (51, 51, 51)
-
-        # Set title with color
-        plot.setTitle(title, color=color, size='10pt')
-
-        # Plot each selected species
-        for species_name in self._selected_species_list:
-            if species_name not in all_species:
-                continue
-
-            species_data = all_species[species_name]
-            color = color_manager.get_species_rgb(species_name, known_species=tuple(all_species.keys()))
-
-            # Plot experimental data as scatter points
-            plot.plot(
-                data_x, species_data,
-                pen=None,
-                symbol='o',
-                symbolSize=5,
-                symbolBrush=self._pg.mkBrush(*color, 150),
-                symbolPen=self._pg.mkPen(color=color, width=1),
-                name=None,
-            )
-
-            # Plot model overlay (multi-series preferred, fallback to single model_y)
-            y_model = None
-            if isinstance(model_series, dict) and species_name in model_series:
-                y_model = model_series[species_name]
-            elif model_y is not None and (current_species == species_name or len(self._selected_species_list) == 1):
-                y_model = model_y
-
-            if y_model is not None:
-                x_model = model_x if model_x is not None else data_x
-                plot.plot(
-                    x_model,
-                    y_model,
-                    pen=self._pg.mkPen(color=color, width=2),
-                    name=species_name,
-                )
-
-        # Add legend if we have multiple species
-        if len(self._selected_species_list) > 1 and self._legend_visible:
-            plot.addLegend(offset=(5, 5))
-
-        # Reduce font sizes for compact display
-        font = QtGui.QFont()
-        font.setPointSize(7)
-        for axis in ['left', 'bottom']:
-            plot.getAxis(axis).setStyle(tickFont=font)
-            plot.getAxis(axis).setTickFont(font)
+        self._restore_locked_view_ranges()
 
     def _toggle_legend(self, visible: bool) -> None:
         """Toggle legend visibility and redraw grid."""
@@ -1077,6 +1079,13 @@ class GridPlotView(QtWidgets.QWidget):
         all_species_names = set()
 
         for dataset in self._datasets:
+            fit_projection = dataset.get("fit_render_projection")
+            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
+                all_species_names.update(str(name) for name in fit_projection.observed_series.keys() if str(name))
+                continue
+            all_observations = dataset.get("all_observations", {})
+            if isinstance(all_observations, dict):
+                all_species_names.update(str(name) for name in all_observations.keys() if str(name))
             all_species = dataset.get('all_species', {})
             all_species_names.update(all_species.keys())
 

@@ -1,0 +1,9 @@
+# title: Slow addition under oxygen purge
+# Interleaves syringe-pump reagent addition with oxygen removal to separate desired and oxidative pathways.
+reaction: Substrate + Reagent -> DesiredProduct; k=0.7
+reaction: Substrate + Oxygen -> OxidizedProduct; k=0.45
+intervention_set1 = {
+  initial: Substrate=1.0, Reagent=0.0, Oxygen=1.0, DesiredProduct=0.0, OxidizedProduct=0.0
+}
+intervention: op=source; species=Reagent; start=0.0; end=4.0; rate=0.15
+intervention: op=sink; species=Oxygen; start=1.5; end=5.0; rate=0.25

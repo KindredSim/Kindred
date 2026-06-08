@@ -2,9 +2,10 @@
 # Mechanism
 A -> B ; kf = 1.0
 
-# Initials
-[A] = 1.0
-[B] = 0.0
+preset_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+}
 
 # Algebra
 let total = [A] + [B]

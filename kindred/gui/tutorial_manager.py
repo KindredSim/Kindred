@@ -94,7 +94,7 @@ class TutorialManager:
                 TutorialStep(
                     title="Run the simulation",
                     instruction=(
-                        "Click <b>Run Selected</b> to solve the ODEs and plot "
+                        "Click <b>Run</b> to solve the ODEs and plot "
                         "concentration vs. time."
                     ),
                     target_widget="runSelectedButton",
@@ -145,7 +145,7 @@ class TutorialManager:
                         "Rate constants on reaction lines must be numeric values:<br>"
                         "<code>k=1.5</code>, <code>kf=1e5</code>, <code>kr=0.002</code><br><br>"
                         "Symbolic relationships between rates are handled separately "
-                        "in the <code># Algebra</code> block."
+                        "with <code>param</code> declarations in the Reactions text."
                     ),
                     target_widget="mechanismEditor",
                     arrow_direction="left",
@@ -154,9 +154,9 @@ class TutorialManager:
                     title="Equilibrium lines",
                     instruction=(
                         "Use the <code>equilibrium:</code> keyword for fast equilibria:<br>"
-                        "<code>equilibrium: A &lt;-&gt; B ; K=2.5 ; kf=10.0</code><br><br>"
-                        "A reversible arrow is required. <code>K=</code> needs at least one "
-                        "of <code>kf=</code> or <code>kr=</code> as an anchor rate."
+                        "<code>equilibrium: A &lt;-&gt; B ; Keq=2.5 ; kf=10.0</code><br><br>"
+                        "A reversible arrow is required. Provide <code>kf=</code> plus exactly one "
+                        "of <code>kr=</code>, <code>Keq=</code>, or <code>dG_eq=</code>."
                     ),
                     target_widget="mechanismEditor",
                     arrow_direction="left",
@@ -173,10 +173,10 @@ class TutorialManager:
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="The Algebra block",
+                    title="Algebra declarations",
                     instruction=(
-                        "Add a <code># Algebra</code> section for derived parameters "
-                        "and observables:<br>"
+                        "Add <code>param</code> and <code>let</code> declarations in the "
+                        "Reactions text for derived parameters and observables:<br>"
                         "<code>param scale = 2.0</code> (adjustable parameter)<br>"
                         "<code>param k2 = k1 * scale</code> (derived constraint)<br>"
                         "<code>let total = [A] + [B]</code> (observable)"
@@ -251,7 +251,7 @@ class TutorialManager:
                 TutorialStep(
                     title="Run selected sets",
                     instruction=(
-                        "Click <b>Run Selected</b> to simulate only the selected "
+                        "Click <b>Run</b> to simulate the current run target "
                         "sets. Unselected sets are not affected."
                     ),
                     target_widget="runSelectedButton",
@@ -328,7 +328,7 @@ class TutorialManager:
                         "Click it to promote the current slider values into the "
                         "canonical mechanism and update the DSL text."
                     ),
-                    target_widget="commitSliderOverridesButton",
+                    target_widget="commitRuntimeParametersButton",
                     arrow_direction="top",
                 ),
                 TutorialStep(
@@ -337,7 +337,7 @@ class TutorialManager:
                         "Click <b>Reset</b> to discard your slider adjustments "
                         "and return to the canonical mechanism values."
                     ),
-                    target_widget="resetSliderOverridesButton",
+                    target_widget="resetRuntimeParametersButton",
                     arrow_direction="top",
                 ),
                 TutorialStep(

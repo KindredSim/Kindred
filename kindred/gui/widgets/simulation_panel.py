@@ -7,6 +7,12 @@ from typing import Callable, Optional
 
 from PySide6 import QtWidgets
 
+from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.gui.project_schema import (
+    SIMULATION_NUM_POINTS_RANGE,
+    SIMULATION_TEMPERATURE_K_RANGE,
+)
+
 # Direct imports required to avoid circular dependency with widgets/__init__.py
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
@@ -64,8 +70,9 @@ class SimulationPanel(QtWidgets.QWidget):
         points_label = QtWidgets.QLabel("Points:", controls_row_widget)
 
         self.solver_method_combo = QtWidgets.QComboBox(controls_row_widget)
-        self.solver_method_combo.addItems(["LSODA", "Radau", "BDF"])
-        self.solver_method_combo.setCurrentText(str(initial_solver))
+        self.solver_method_combo.addItems(["Radau", "BDF"])
+        solver_name, _warning = normalize_solver_name(initial_solver)
+        self.solver_method_combo.setCurrentText(solver_name)
         self.solver_method_combo.setMaximumWidth(100)
         self.solver_method_combo.currentTextChanged.connect(on_solver_method_changed)
 
@@ -76,15 +83,15 @@ class SimulationPanel(QtWidgets.QWidget):
         self.sim_time_spinbox.textChanged.connect(lambda _v: on_solver_summary_refresh())
 
         self.num_points_spinbox = QtWidgets.QSpinBox(controls_row_widget)
-        self.num_points_spinbox.setRange(10, 100000)  # 10 to 100k points
+        self.num_points_spinbox.setRange(*SIMULATION_NUM_POINTS_RANGE)
         self.num_points_spinbox.setValue(100)
         self.num_points_spinbox.setToolTip("Number of points in the simulation output")
         self.num_points_spinbox.setMaximumWidth(140)
         self.num_points_spinbox.valueChanged.connect(lambda _v: on_solver_summary_refresh())
 
-        self.run_btn = QtWidgets.QPushButton("Run Selected")
+        self.run_btn = QtWidgets.QPushButton("Run")
         self.run_btn.setObjectName("runSelectedButton")
-        self.run_btn.setToolTip("Run kinetic simulation for selected sets (Ctrl+R or F5)")
+        self.run_btn.setToolTip("Run kinetic simulation for the current run target (Ctrl+R or F5)")
         self.run_btn.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         self.run_btn.clicked.connect(on_run_selected)
 
@@ -101,7 +108,7 @@ class SimulationPanel(QtWidgets.QWidget):
         self.temperature_label = QtWidgets.QLabel("T:", controls_row_widget)
         self.temperature_label.setVisible(False)
         self.temperature_spinbox = QtWidgets.QDoubleSpinBox(controls_row_widget)
-        self.temperature_spinbox.setRange(0.1, 10000.0)
+        self.temperature_spinbox.setRange(*SIMULATION_TEMPERATURE_K_RANGE)
         self.temperature_spinbox.setValue(298.15)
         self.temperature_spinbox.setDecimals(2)
         self.temperature_spinbox.setSuffix(" K")

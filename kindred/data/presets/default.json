@@ -2,7 +2,7 @@
   "name": "Default",
   "description": "Default simulation settings with balanced performance",
   "solver": {
-    "method": "LSODA",
+    "method": "BDF",
     "rtol": 1e-6,
     "atol": 1e-12
   },

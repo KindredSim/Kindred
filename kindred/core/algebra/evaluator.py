@@ -14,7 +14,7 @@ Current contract
 Out of scope
 ------------
 - ODE assembly, solver integration, plotting. This module only evaluates
-  the algebra block against provided series/initials and returns
+  a compiled internal AlgebraBlock against provided series/initials and returns
   algebra scalars and algebra time series.
 
 Constraints
@@ -459,8 +459,9 @@ def evaluate_block_partial(
     """
     Best-effort variant of evaluate_block().
 
-    Unlike evaluate_block(), this does not fail the entire algebra block when a single
-    observable fails. It returns successful outputs plus a structured error list.
+    Unlike evaluate_block(), this does not fail the entire compiled AlgebraBlock
+    when a single observable fails. It returns successful outputs plus a
+    structured error list.
     """
     # Validate basic shapes once, early (same behavior as strict mode).
     t = np.asarray(ctx.t, dtype=float)

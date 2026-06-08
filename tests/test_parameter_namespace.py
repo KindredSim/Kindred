@@ -7,17 +7,20 @@ import pytest
 from kindred.core.simulator.dsl import _parse_dsl_ir, parse_dsl_to_mechanism
 from kindred.core.simulator.parameter_namespace import (
     _namespace_policy_from_step,
-    build_flat_compat_namespace,
+    build_namespace_from_canonical_names,
     build_namespace_from_ir_steps,
     build_namespace_from_mechanism,
 )
+
+pytestmark = pytest.mark.unit
+
 
 
 @pytest.mark.parametrize(
     ("dsl", "expected"),
     [
         ("reaction: A -> B; k=1\n", {"k1"}),
-        ("equilibrium: A <-> B; kf=6; kr=2\n", {"kf1", "kr1"}),
+        ("equilibrium: A <-> B; kf=6; kr=2\n", {"kf1", "kr1", "Keq1"}),
         ("reaction: A <-> B; kf=6; Keq=3\n", {"kf1", "kr1", "Keq1"}),
     ],
 )
@@ -33,13 +36,13 @@ def test_ir_and_mechanism_namespace_builders_match_for_canonical_names(dsl, expe
     assert ir_namespace.flat_names() == mechanism_namespace.flat_names()
 
 
-def test_ir_and_mechanism_builders_omit_keq_without_explicit_keq():
+def test_ir_and_mechanism_builders_include_keq_for_every_equilibrium():
     dsl = "equilibrium: A <-> B; kf=6; kr=2\n"
     ir = _parse_dsl_ir(dsl)
     mechanism = parse_dsl_to_mechanism(dsl, initials={})
 
-    assert build_namespace_from_ir_steps(ir.steps).flat_names() == {"kf1", "kr1"}
-    assert build_namespace_from_mechanism(mechanism).flat_names() == {"kf1", "kr1"}
+    assert build_namespace_from_ir_steps(ir.steps).flat_names() == {"kf1", "kr1", "Keq1"}
+    assert build_namespace_from_mechanism(mechanism).flat_names() == {"kf1", "kr1", "Keq1"}
 
 
 def test_ir_and_mechanism_builders_include_keq_for_explicit_keq():
@@ -89,7 +92,7 @@ def test_shared_step_policy_classifies_namespace_kind_and_explicit_keq(step, exp
         ("reaction: A -> B; k=1\n", "reaction", False),
         ("reaction: A <-> B; kf=6; kr=2\n", "equilibrium", False),
         ("equilibrium: A <-> B; kf=6; kr=2\n", "equilibrium", False),
-        ("equilibrium: A <-> B; kf=6; K=3\n", "equilibrium", True),
+        ("equilibrium: A <-> B; kf=6; Keq=3\n", "equilibrium", True),
         ("reaction: A <-> B; kf=6; Keq=3\n", "equilibrium", True),
     ],
 )
@@ -103,17 +106,58 @@ def test_shared_step_policy_matches_builder_step_index_metadata(dsl, expected_ki
     assert policy.has_explicit_keq is expected_has_explicit_keq
     assert entry["kind"] == expected_kind
     if expected_kind == "equilibrium":
-        assert entry["has_Keq_param"] is expected_has_explicit_keq
+        assert entry["equilibrium_authority"]["has_explicit_keq_param"] is expected_has_explicit_keq
+        assert "has_Keq_param" not in entry
+        assert "derive_rate" not in entry
     else:
         assert "has_Keq_param" not in entry
 
 
-def test_flat_compat_namespace_rejects_noncanonical_inputs():
+def test_canonical_name_namespace_rejects_noncanonical_inputs():
     with pytest.raises(ValueError, match="already-canonical"):
-        build_flat_compat_namespace({"K1"})
+        build_namespace_from_canonical_names({"K1"})
 
     with pytest.raises(ValueError, match="already-canonical"):
-        build_flat_compat_namespace({"k01"})
+        build_namespace_from_canonical_names({"k01"})
+
+
+def test_namespace_resolver_accepts_only_direct_case_insensitive_canonical_spellings():
+    namespace = build_namespace_from_canonical_names({"k1", "kf2", "kr2", "Keq2"})
+
+    assert namespace.resolve("k1").canonical_name == "k1"
+    assert namespace.resolve("KF2").canonical_name == "kf2"
+    assert namespace.resolve("KR2").canonical_name == "kr2"
+    assert namespace.resolve("KEQ2").canonical_name == "Keq2"
+    assert namespace.resolve("keq2").canonical_name == "Keq2"
+
+
+def test_namespace_resolver_treats_K1_as_case_insensitive_k1_spelling():
+    namespace = build_namespace_from_canonical_names({"k1", "kf1", "kr1"})
+
+    resolution = namespace.resolve("K1")
+
+    assert resolution.canonical_name == "k1"
+
+
+def test_namespace_resolver_does_not_map_K1_to_Keq1():
+    namespace = build_namespace_from_canonical_names({"Keq1"})
+
+    resolution = namespace.resolve("K1")
+
+    assert resolution.canonical_name is None
+    assert namespace.resolve("KEQ1").canonical_name == "Keq1"
+
+
+def test_namespace_resolver_rejects_K1_on_reversible_step_without_irreversible_k1_and_suggests_existing_canonical_names():
+    namespace = build_namespace_from_canonical_names({"kf1", "kr1", "Keq1"})
+
+    resolution = namespace.resolve("K1")
+
+    assert resolution.canonical_name is None
+    invalid = namespace.invalid_protected_indexed_identifier("K1")
+    assert invalid is not None
+    assert invalid.raw_name == "K1"
+    assert invalid.suggested_names == ("kf1", "kr1", "Keq1")
 
 
 def test_ir_namespace_builder_rejects_malformed_steps():
@@ -132,3 +176,21 @@ def test_mechanism_namespace_builder_rejects_duplicate_step_indices():
 
     with pytest.raises(ValueError, match="unique step indices"):
         build_namespace_from_mechanism(_MechanismWithDuplicateStepIndex())
+
+
+def test_mechanism_namespace_rejects_equilibrium_step_map_without_normalized_authority():
+    class _MechanismWithTopLevelOnlyAuthority:
+        metadata = {
+            "step_index_map": [
+                {
+                    "step_index": 1,
+                    "kind": "equilibrium",
+                    "equilibrium_index": 0,
+                    "has_Keq_param": True,
+                    "derive_rate": "kr",
+                },
+            ],
+        }
+
+    with pytest.raises(ValueError, match="equilibrium_authority"):
+        build_namespace_from_mechanism(_MechanismWithTopLevelOnlyAuthority())

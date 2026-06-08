@@ -1,7 +1,8 @@
 import gc
+import logging
 import os
 import sys
-import logging
+from contextlib import suppress
 
 # Ensure Qt always runs headless before importing PySide6/pytest-qt fixtures
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -35,8 +36,26 @@ if sys.platform.startswith("linux") and multiprocessing is not None:
         pass
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _neutralize_pyqtgraph_connect_cleanup():
+    import pyqtgraph as pg
+
+    if not hasattr(pg, "_connectCleanup") or not callable(pg._connectCleanup):
+        pytest.fail("pyqtgraph._connectCleanup missing or not callable", pytrace=False)
+
+    monkeypatch = pytest.MonkeyPatch()
+    # Test-harness-only: exitCleanup=False was probed and found insufficient.
+    # Neutralize the aboutToQuit hookup before first GraphicsView construction,
+    # and do not move this private patch into product code.
+    monkeypatch.setattr(pg, "_connectCleanup", lambda: None)
+    try:
+        yield
+    finally:
+        monkeypatch.undo()
+
+
 @pytest.fixture(scope="session")
-def qt_app():
+def qt_app(_neutralize_pyqtgraph_connect_cleanup):
     """Ensure a QApplication instance exists for GUI-driven tests."""
     _disable_qdarktheme()
     from PySide6 import QtCore, QtWidgets
@@ -48,17 +67,26 @@ def qt_app():
     return app
 
 
-@pytest.fixture
-def main_window(qt_app, monkeypatch, tmp_path):
-    """
-    Provide a MainWindow with dialogs routed to temporary locations.
+@pytest.fixture(autouse=True)
+def _drain_qt_between_tests():
+    yield
+    try:
+        from PySide6 import QtCore, QtWidgets
+    except Exception:
+        return
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    for _ in range(5):
+        app.processEvents()
+    with suppress(RuntimeError, TypeError):
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+    for _ in range(5):
+        app.processEvents()
 
-    Heavy-weight dialogs are stubbed to keep GUI tests deterministic and
-    avoid filesystem side effects.
-    """
 
-    from PySide6 import QtCore, QtWidgets
-    from kindred.gui.main_window import MainWindow
+def _clear_test_qsettings() -> None:
+    from PySide6 import QtCore
 
     # Ensure per-test isolation: clear QSettings so a prior test cannot persist UI
     # state (e.g., theme) into the next MainWindow construction.
@@ -68,6 +96,15 @@ def main_window(qt_app, monkeypatch, tmp_path):
         settings.sync()
     except Exception as exc:
         logger.debug("Failed to clear QSettings for test isolation: %s", exc, exc_info=True)
+
+
+def _patch_main_window_test_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    request: pytest.FixtureRequest | None = None,
+) -> None:
+    from PySide6 import QtWidgets
+    from kindred.gui.main_window import MainWindow
 
     def _fake_templates_dir(_self):
         target = tmp_path / "templates"
@@ -79,6 +116,15 @@ def main_window(qt_app, monkeypatch, tmp_path):
         _fake_templates_dir,
     )
     monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
+    real_runtime_readiness = bool(
+        request is not None
+        and request.node.get_closest_marker("real_runtime_readiness") is not None
+    )
+    if not real_runtime_readiness:
+        # Default GUI tests should not restore the deleted readiness authority or
+        # bypass the runtime launch endpoint. Tests that need real runtime
+        # readiness can opt in with @pytest.mark.real_runtime_readiness.
+        pass
 
     def _quiet_dialog(*_args, **_kwargs):
         return QtWidgets.QMessageBox.StandardButton.Ok
@@ -86,102 +132,153 @@ def main_window(qt_app, monkeypatch, tmp_path):
     for attr in ("information", "warning", "critical"):
         monkeypatch.setattr(QtWidgets.QMessageBox, attr, _quiet_dialog)
 
-    # Prevent tutorials from launching long-lived overlays in shared tests.
     monkeypatch.setattr(
         "kindred.gui.tutorial_manager.launch_tutorial",
         lambda *args, **kwargs: None,
     )
 
+def _cleanup_main_window(window) -> None:
+    from PySide6 import QtCore, QtWidgets
+
+    try:
+        window.simulation_controller.prepare_simulation_shutdown_for_close()
+    except Exception as exc:
+        logger.debug("Failed to prepare simulation shutdown during test cleanup: %s", exc, exc_info=True)
+    # Stop preview-session timers before closing to prevent stale timer
+    # callbacks from firing during teardown.
+    try:
+        window._preview_session.reset_preview_state()
+    except Exception as exc:
+        logger.debug("Failed to reset preview state during test cleanup: %s", exc, exc_info=True)
+
+    try:
+        window.close()
+    except Exception as exc:
+        logger.debug("Failed to close MainWindow during test cleanup: %s", exc, exc_info=True)
+
+    app = QtWidgets.QApplication.instance()
+    assert app is not None
+    for _ in range(30):
+        app.processEvents()
+    try:
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    except Exception as exc:
+        logger.debug("Failed to send posted deferred-delete events: %s", exc, exc_info=True)
+    for _ in range(15):
+        app.processEvents()
+
+    # Close any stray dialogs/top-level widgets created by a test.
+    stray_widgets = []
+    for widget in list(app.topLevelWidgets()):
+        if widget is window:
+            continue
+        if not (getattr(widget, "isVisible", lambda: False)() or isinstance(widget, QtWidgets.QDialog)):
+            continue
+        try:
+            widget.close()
+        except Exception as exc:
+            logger.debug("Failed to close stray widget %r during cleanup: %s", widget, exc, exc_info=True)
+        try:
+            widget.deleteLater()
+            stray_widgets.append(widget)
+        except Exception as exc:
+            logger.debug("Failed to deleteLater stray widget %r during cleanup: %s", widget, exc, exc_info=True)
+
+    for _ in range(30):
+        app.processEvents()
+    try:
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    except Exception as exc:
+        logger.debug("Failed to send deferred-delete events for window: %s", exc, exc_info=True)
+    for widget in stray_widgets:
+        try:
+            QtCore.QCoreApplication.sendPostedEvents(widget, QtCore.QEvent.DeferredDelete)
+        except Exception as exc:
+            logger.debug(
+                "Failed to send posted deferred-delete events for stray widget %r: %s",
+                widget,
+                exc,
+                exc_info=True,
+            )
+    for _ in range(15):
+        app.processEvents()
+
+    try:
+        window.deleteLater()
+    except Exception as exc:
+        logger.debug("Failed to deleteLater MainWindow during test cleanup: %s", exc, exc_info=True)
+
+    for _ in range(15):
+        app.processEvents()
+    try:
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    except Exception as exc:
+        logger.debug("Failed to send deferred-delete events for MainWindow: %s", exc, exc_info=True)
+    for _ in range(10):
+        app.processEvents()
+
+    # Break Python-side reference cycles so the C++ side can be collected.
+    del window
+    gc.collect()
+    for _ in range(5):
+        app.processEvents()
+
+    _terminate_active_multiprocessing_children()
+
+    assert QtWidgets.QApplication.activeModalWidget() is None
+    assert QtWidgets.QApplication.activePopupWidget() is None
+    extra_visible = [
+        w
+        for w in app.topLevelWidgets()
+        if getattr(w, "isVisible", lambda: False)()
+    ]
+    assert not extra_visible, f"Visible top-level widgets leaked: {extra_visible!r}"
+
+
+def _terminate_active_multiprocessing_children(*, timeout_s: float = 0.5) -> None:
+    if multiprocessing is None:
+        return
+    for child in multiprocessing.active_children():
+        try:
+            if child.is_alive():
+                child.terminate()
+            child.join(timeout=float(timeout_s))
+            if child.is_alive() and hasattr(child, "kill"):
+                child.kill()
+                child.join(timeout=float(timeout_s))
+        except Exception as exc:
+            logger.debug(
+                "Failed to terminate multiprocessing child during GUI test cleanup: %s",
+                exc,
+                exc_info=True,
+            )
+
+@pytest.fixture
+def main_window(qt_app, monkeypatch, tmp_path, request):
+    """
+    Provide a MainWindow with dialogs routed to temporary locations.
+
+    Heavy-weight dialogs are stubbed to keep GUI tests deterministic and
+    avoid filesystem side effects.
+    """
+    from kindred.gui.main_window import MainWindow
+
+    _ = qt_app
+    _clear_test_qsettings()
+    _patch_main_window_test_environment(monkeypatch, tmp_path, request=request)
     window = MainWindow()
+    # Generic GUI tests stub startup runtime warming; keep controls usable unless
+    # the test explicitly reinstates the real readiness path.
+    real_runtime_readiness = (
+        request is not None
+        and request.node.get_closest_marker("real_runtime_readiness") is not None
+    )
+    if not real_runtime_readiness:
+        try:
+            window._render_runtime_backed_controls_available(True)
+        except Exception as exc:
+            logger.debug("Failed to mark stubbed test runtime ready: %s", exc, exc_info=True)
     try:
         yield window
     finally:
-        try:
-            window.simulation_controller.shutdown_batch_executor(force_terminate=True)
-        except Exception as exc:
-            logger.debug("Failed to shutdown batch executor during test cleanup: %s", exc, exc_info=True)
-        try:
-            window.simulation_controller.release_current_simulation_worker()
-        except Exception as exc:
-            logger.debug("Failed to release simulation worker during test cleanup: %s", exc, exc_info=True)
-
-        # Stop preview-session timers before closing to prevent stale timer
-        # callbacks from firing during teardown.
-        try:
-            window._preview_session.reset_preview_state()
-        except Exception as exc:
-            logger.debug("Failed to reset preview state during test cleanup: %s", exc, exc_info=True)
-
-        try:
-            window.close()
-        except Exception as exc:
-            logger.debug("Failed to close MainWindow during test cleanup: %s", exc, exc_info=True)
-
-        app = QtWidgets.QApplication.instance()
-        assert app is not None
-        for _ in range(30):
-            app.processEvents()
-        try:
-            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
-        except Exception as exc:
-            logger.debug("Failed to send posted deferred-delete events: %s", exc, exc_info=True)
-        for _ in range(15):
-            app.processEvents()
-
-        # Close any stray dialogs/top-level widgets created by a test.
-        stray_non_dialog_widgets = []
-        for widget in list(app.topLevelWidgets()):
-            if widget is window:
-                continue
-            if not (getattr(widget, "isVisible", lambda: False)() or isinstance(widget, QtWidgets.QDialog)):
-                continue
-            try:
-                widget.close()
-            except Exception as exc:
-                logger.debug("Failed to close stray widget %r during cleanup: %s", widget, exc, exc_info=True)
-            if isinstance(widget, QtWidgets.QDialog):
-                continue
-            try:
-                widget.deleteLater()
-                stray_non_dialog_widgets.append(widget)
-            except Exception as exc:
-                logger.debug("Failed to deleteLater stray widget %r during cleanup: %s", widget, exc, exc_info=True)
-
-        # Schedule the MainWindow itself for deletion so Qt releases all
-        # internal state (timers, signal connections, child widgets).  Without
-        # this, zombie windows accumulate across the session-scoped QApplication
-        # and eventually deadlock around test ~925.
-        try:
-            window.deleteLater()
-        except Exception as exc:
-            logger.debug("Failed to deleteLater MainWindow during test cleanup: %s", exc, exc_info=True)
-
-        for _ in range(30):
-            app.processEvents()
-        try:
-            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
-        except Exception as exc:
-            logger.debug("Failed to send deferred-delete events for window: %s", exc, exc_info=True)
-        for widget in stray_non_dialog_widgets:
-            try:
-                QtCore.QCoreApplication.sendPostedEvents(widget, QtCore.QEvent.DeferredDelete)
-            except Exception as exc:
-                logger.debug(
-                    "Failed to send posted deferred-delete events for stray widget %r: %s",
-                    widget,
-                    exc,
-                    exc_info=True,
-                )
-        for _ in range(15):
-            app.processEvents()
-
-        # Break Python-side reference cycles so the C++ side can be collected.
-        del window
-        gc.collect()
-        for _ in range(5):
-            app.processEvents()
-
-        assert QtWidgets.QApplication.activeModalWidget() is None
-        assert QtWidgets.QApplication.activePopupWidget() is None
-        extra_visible = [w for w in app.topLevelWidgets() if getattr(w, "isVisible", lambda: False)()]
-        assert not extra_visible, f"Visible top-level widgets leaked: {extra_visible!r}"
+        _cleanup_main_window(window)

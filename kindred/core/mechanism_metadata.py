@@ -6,6 +6,7 @@ from typing import Any, Mapping, MutableMapping, Optional
 
 from kindred.core.simulator.common import normalize_energy_unit
 from kindred.core.temperature import TemperatureScheduleProtocol, coerce_temperature_schedule
+from kindred.core.intervention_schedule import InterventionSchedule, coerce_intervention_schedule
 
 __all__ = [
     "MechanismMetadataKeys",
@@ -23,7 +24,9 @@ class MechanismMetadataKeys:
     STEP_INDEX_POLICY = "step_index_policy"
     ALGEBRA_TEXT = "algebra_text"
     TEMPERATURE_SCHEDULE = "temperature_schedule"
+    INTERVENTION_SCHEDULE = "intervention_schedule"
     WEGSCHEIDER_CYCLICITY_ENABLED = "wegscheider_cyclicity_enabled"
+    STATE_NETWORK = "state_network"
 
 
 class EquilibriumMetadataKeys:
@@ -83,6 +86,7 @@ class MechanismMetadataView:
     step_index_policy: str = "dsl_only"
     algebra_text: Optional[str] = None
     temperature_schedule: Optional[TemperatureScheduleProtocol] = None
+    intervention_schedule: Optional[InterventionSchedule] = None
 
     @classmethod
     def from_metadata(cls, meta: Mapping[str, Any] | None) -> "MechanismMetadataView":
@@ -116,6 +120,9 @@ class MechanismMetadataView:
             temperature_schedule=coerce_temperature_schedule(
                 meta.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE)
             ),
+            intervention_schedule=coerce_intervention_schedule(
+                meta.get(MechanismMetadataKeys.INTERVENTION_SCHEDULE)
+            ),
         )
 
     def apply_to_metadata(self, meta: MutableMapping[str, Any]) -> None:
@@ -128,6 +135,8 @@ class MechanismMetadataView:
             meta[MechanismMetadataKeys.ALGEBRA_TEXT] = str(self.algebra_text)
         if self.temperature_schedule is not None:
             meta[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = self.temperature_schedule
+        if self.intervention_schedule is not None:
+            meta[MechanismMetadataKeys.INTERVENTION_SCHEDULE] = self.intervention_schedule
 
 
 @dataclass(frozen=True)
@@ -159,7 +168,9 @@ class EquilibriumMetadataView:
             if coerced is not None:
                 explicit_rates_f.append(coerced)
         forward_model = meta.get(EquilibriumMetadataKeys.FORWARD_MODEL)
-        if not isinstance(forward_model, dict):
+        if isinstance(forward_model, Mapping):
+            forward_model = dict(forward_model)
+        else:
             forward_model = None
 
         dG = meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL)

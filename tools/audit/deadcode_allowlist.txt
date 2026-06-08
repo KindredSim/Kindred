@@ -27,3 +27,6 @@ kindred/gui/controllers/batch_simulation_cache.py
 # Retained general-purpose widget with dedicated tests (test_collapsible_section.py).
 # No current production import after removing the redundant mechanism dock wrapper.
 kindred/gui/widgets/collapsible_section.py
+
+# Intentional standalone diagnostics harness for manual fitting process-pool checks.
+tools/diagnostics/fitting_pool_leak_probe.py

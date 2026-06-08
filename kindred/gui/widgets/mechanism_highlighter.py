@@ -8,6 +8,8 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui
 
+from kindred.core.simulator.algebra_section import is_algebra_line
+
 __all__ = ["MechanismHighlighter"]
 
 
@@ -18,8 +20,8 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     Highlights:
     - Keywords (reaction, equilibrium, time, etc.) - bold purple
     - Species names (A, B, ATP, etc.) - blue
-    - Operators (->, =>, <->, <=>, <-, +) - red bold
-    - Rate constants (k=, kf=, kr=, K=, kappa=) - green
+    - Operators (->, =>, <->, <=>, +) - red bold
+    - Rate constants (k=, kf=, kr=, Keq=, kappa=) - green
     - Numbers (1.0, 1e-5, etc.) - orange
     - Comments (#...) - gray italic
     - Energy terms (Ea=, dG_act=, etc.) - cyan
@@ -28,8 +30,6 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     Example:
         highlighter = MechanismHighlighter(text_edit.document())
     """
-
-    _ALGEBRA_BLOCK_STATE = 1
 
     def __init__(self, parent: Optional[QtCore.QObject] = None):
         """
@@ -56,13 +56,13 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         species_format.setForeground(QtGui.QColor(70, 130, 180))  # Steel blue
         self.formats['species'] = species_format
 
-        # Operators (->, <->, <-, =)
+        # Operators (->, =>, <->, <=>, +)
         operator_format = QtGui.QTextCharFormat()
         operator_format.setForeground(QtGui.QColor(220, 20, 60))  # Crimson red
         operator_format.setFontWeight(QtGui.QFont.Bold)
         self.formats['operator'] = operator_format
 
-        # Rate constants (k=, kf=, kr=, K=)
+        # Rate constants (k=, kf=, kr=, Keq=)
         rate_format = QtGui.QTextCharFormat()
         rate_format.setForeground(QtGui.QColor(34, 139, 34))  # Forest green
         rate_format.setFontWeight(QtGui.QFont.Bold)
@@ -103,10 +103,11 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         number_pattern = r'\b\d+\.?\d*(?:[eE][+-]?\d+)?\b|\.\d+(?:[eE][+-]?\d+)?\b'
         self.rules.append((re.compile(number_pattern), 'number', True))
 
-        # 3. Rate constants (k=, kf=, kr=, K=, kappa=, κ=)
+        # 3. Rate constants (k=, kf=, kr=, Keq=, kappa=, κ=)
         rate_patterns = [
-            (r'\bk[fr]?\s*=', re.IGNORECASE),          # k=, kf=, kr=
-            (r'\bK(?:eq|_eq)?\s*=', re.IGNORECASE),    # K=, Keq=, K_eq=
+            (r'\bk\s*=', 0),                           # k=
+            (r'\bk[fr]\s*=', re.IGNORECASE),           # kf=, kr=
+            (r'\bKeq\s*=', re.IGNORECASE),             # Keq=
             (r'\bkappa\s*=', re.IGNORECASE),           # kappa=
             (r'\bκ\s*=', 0),                           # κ= (Unicode kappa)
         ]
@@ -126,37 +127,33 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         keywords = [
             'reaction', 'equilibrium',
             'init', 'initial', 'time',
-            'temp_const', 'temp_step', 'temp_response', 'state', 'edge',
+            'temp_const', 'temp_step', 'temp_response', 'state', 'edge', 'intervention',
         ]
         keyword_pattern = r'\b(' + '|'.join(keywords) + r')\b'
         self.rules.append((re.compile(keyword_pattern, re.IGNORECASE), 'keyword', False))
 
-        # 6. Operators (->, =>, <->, <=>, <-, +)
+        # 6. Algebra keywords (param, let)
+        algebra_keywords = ['param', 'let']
+        algebra_keyword_pattern = r'\b(' + '|'.join(algebra_keywords) + r')\b'
+        self.rules.append((re.compile(algebra_keyword_pattern, re.IGNORECASE), 'keyword', True))
+
+        # 7. Operators (->, =>, <->, <=>, +)
         # Applied after rate/energy so arrow `=` is not consumed by `A=` patterns.
         operators = [
             r'<=>',  # Reversible (alternate)
             r'<->',  # Reversible
             r'=>',   # Forward (alternate)
             r'->',   # Forward
-            r'<-',   # Backward (rare)
             r'\+',   # Addition (in reactions)
         ]
         for op in operators:
             self.rules.append((re.compile(op), 'operator', True))
 
-        # 7. Initial conditions ([Species] = value)
+        # 8. Initial conditions ([Species] = value)
         self.rules.append((re.compile(r'\[[A-Za-z_][A-Za-z0-9_]*\]\s*='), 'initial', True))
 
-        # 8. Comments (applied last — highest effective priority)
+        # 9. Comments (applied last — highest effective priority)
         self.rules.append((re.compile(r'#[^\n]*'), 'comment', True))
-
-    @staticmethod
-    def _is_algebra_header(stripped: str) -> bool:
-        return stripped.lower().startswith("# algebra")
-
-    @classmethod
-    def _is_section_boundary(cls, stripped: str) -> bool:
-        return stripped.lower().startswith("# ") and not cls._is_algebra_header(stripped)
 
     def highlightBlock(self, text: str):
         """
@@ -169,17 +166,12 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         text : str
             Text to highlight
         """
-        stripped = text.strip()
-        previous_state = self.previousBlockState()
-        starts_algebra = self._is_algebra_header(stripped)
-        ends_algebra = previous_state == self._ALGEBRA_BLOCK_STATE and self._is_section_boundary(stripped)
-        in_algebra_body = previous_state == self._ALGEBRA_BLOCK_STATE and not starts_algebra and not ends_algebra
-        next_state = self._ALGEBRA_BLOCK_STATE if (starts_algebra or in_algebra_body) else 0
-        self.setCurrentBlockState(next_state)
+        algebra_line = is_algebra_line(text)
+        self.setCurrentBlockState(0)
 
         # Apply all rules in order
         for pattern, format_name, applies_in_algebra in self.rules:
-            if in_algebra_body and not applies_in_algebra:
+            if algebra_line and not applies_in_algebra:
                 continue
             format_obj = self.formats[format_name]
 

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
 from dataclasses import dataclass
 import json
 import hashlib
@@ -15,15 +14,20 @@ import warnings
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Sequence, TYPE_CHECKING, Mapping
 from collections import OrderedDict
-from collections.abc import MutableMapping
 import math
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt
 
 from kindred import __version__ as KINDRED_VERSION
-from kindred.core.batch_simulation_cache import BatchSimulationCache
+from kindred.core.mechanism_runtime_transition import (
+    AuthoritativeMechanismSnapshot,
+    MechanismTransitionOutcome,
+    MechanismRuntimeTransitionService,
+)
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+from kindred.core.simulation_identity import canonical_initials_fingerprint
 from kindred.core.simulator.dsl_text_update import (
     analyze_step_parameter_update,
     build_current_text_step_analysis_context,
@@ -31,13 +35,16 @@ from kindred.core.simulator.dsl_text_update import (
     step_rewrite_block_reason,
 )
 from kindred.core.validation import try_parse_finite_float
-from kindred.gui.controllers.cache_contracts import BatchCacheEntryReadResult, read_batch_cache_entry
-from kindred.gui.project_schema import FITTING_DEFAULTS_KEYS, PROJECT_DEFAULTS, PROJECT_SCHEMA_VERSION
+from kindred.core.datasets.observation_payload import dense_view_from_observations, observations_from_payload
+from kindred.gui.project_schema import (
+    FITTING_DEFAULTS_KEYS,
+    PROJECT_DEFAULTS,
+    SIMULATION_TEMPERATURE_K_RANGE,
+    validate_project_payload,
+)
 
 if TYPE_CHECKING:
     from kindred.core.mechanism import Mechanism
-    from kindred.core.simulation_preparation import BoundMechanism
-    from kindred.gui.controllers.results_controller import ResolvedBatchSelectionEntry
     from kindred.gui.controllers.simulation_controller import SimulationController
     from kindred.gui.ports import SimulationUiPorts
     from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableView
@@ -48,19 +55,37 @@ from kindred.gui.app_wiring import (
     build_batch_dock_panel,
     build_mechanism_dock,
     build_profile_and_template_managers,
-    build_right_dock_and_dataset_manager,
+    build_right_dock_and_dataset_owners,
     build_settings_and_controllers,
     build_sliders_dock,
     build_simulation_plumbing,
+    build_symbolic_calculator_dock,
     build_window_shell,
     dock_default_area,
     dock_shell_specs,
     load_solver_contract,
 )
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
+from kindred.gui.fitting.runtime_inputs import (
+    FittingEvaluatorRuntimeSettings,
+    FittingRuntimeInputPublisher,
+    FittingRuntimeInputs,
+)
+from kindred.gui.initial_conditions_import_owner import (
+    InitialConditionsImportOwner,
+)
+from kindred.gui.initial_conditions_source_acceptance_owner import InitialConditionsSourceAcceptanceOwner
+from kindred.gui.ports import DisplayRefreshSource, RunAutoLockResult
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.mechanism_session_owner import MechanismSessionOwner
 from kindred.gui.main_window_preview_session import MainWindowPreviewSession
+from kindred.gui.simulation_batch_owner import SimulationBatchOwner
+from kindred.gui.simulation_dialogs import SimulationDialogs
+from kindred.gui.simulation_mechanism_owner import SimulationMechanismOwner
+from kindred.gui.simulation_provenance_owner import SimulationProvenanceOwner
+from kindred.gui.simulation_run_ui_owner import SimulationRunUiOwner
+from kindred.gui.simulation_settings_owner import SimulationSettingsOwner
+from kindred.gui.simulation_solver_owner import SimulationSolverOwner, resolve_solver_tolerance
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 from kindred.gui.mixins.ports import FittingMixinPorts, ProfileMixinPorts
 from kindred.gui.mixins.fitting_mixin import FittingMixin
@@ -79,6 +104,8 @@ _STARTUP_HEIGHT_RATIO = 0.88
 _MIN_STARTUP_WIDTH = 1280
 _MIN_STARTUP_HEIGHT = 820
 _FALLBACK_STARTUP_SIZE = QtCore.QSize(1440, 900)
+_CANONICAL_BATCH_INITIALS_TRANSITION_DEBOUNCE_MS = 220
+_INTERACTIVE_RUNTIME_READINESS_REFRESH_DEBOUNCE_MS = 80
 
 
 @dataclass(frozen=True)
@@ -145,15 +172,19 @@ class MainWindow(
     ):
         super().__init__()
         self._init_cli_args(profile=profile, solver=solver, rtol=rtol, atol=atol)
+        self._settings_owner = SimulationSettingsOwner()
         self._init_simulation_plumbing_and_state()
         self._init_batch_initial_conditions()
         self._init_settings_and_controllers()
         self._init_profile_and_template_managers()
         self._init_window_shell()
+        self._init_simulation_controller()
         self._init_mechanism_dock_and_panel()
         self._init_sliders_dock()
         self._init_batch_dock_and_panel()
+        self._init_fitting_runtime_input_publisher()
         self._init_right_dock_and_datasets()
+        self._init_symbolic_calculator_dock()
         self._init_bottom_analysis_dock()
         self._init_status_bar_widgets()
         self._finish_window_composition()
@@ -169,71 +200,187 @@ class MainWindow(
         rtol: Optional[float],
         atol: Optional[float],
     ) -> None:
+        normalized_rtol = self._normalize_startup_solver_tolerance(rtol, field_name="rtol")
+        normalized_atol = self._normalize_startup_solver_tolerance(atol, field_name="atol")
         # Store launch overrides for later use.
         self._initial_profile = profile
         self._initial_solver = solver
-        self._initial_rtol = rtol
-        self._initial_atol = atol
+        self._initial_rtol = normalized_rtol
+        self._initial_atol = normalized_atol
         self._explicit_startup_solver_value = solver
-        self._explicit_startup_rtol_value = rtol
-        self._explicit_startup_atol_value = atol
+        self._explicit_startup_rtol_value = normalized_rtol
+        self._explicit_startup_atol_value = normalized_atol
         self._explicit_startup_solver_override = solver is not None
-        self._explicit_startup_rtol_override = rtol is not None
-        self._explicit_startup_atol_override = atol is not None
+        self._explicit_startup_rtol_override = normalized_rtol is not None
+        self._explicit_startup_atol_override = normalized_atol is not None
+
+    def _normalize_startup_solver_tolerance(
+        self,
+        value: Optional[float],
+        *,
+        field_name: str,
+    ) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid startup solver tolerance %s=%r", field_name, value)
+            return None
+        if not math.isfinite(parsed) or parsed <= 0.0:
+            logger.warning("Ignoring invalid startup solver tolerance %s=%r", field_name, value)
+            return None
+        return float(parsed)
 
     def _init_simulation_plumbing_and_state(self) -> None:
         self._preview_session = MainWindowPreviewSession(self)
+        self._simulation_dialogs = SimulationDialogs(self)
+        self._simulation_run_ui_owner = SimulationRunUiOwner(
+            results_table_getter=lambda: getattr(self, "_results_table", None),
+        )
         self._variable_runtime = MainWindowVariableRuntime(self)
         self._mechanism_helpers = MainWindowMechanismHelpers(self)
-
-        # Simulation execution, batch orchestration, caching, and worker lifecycle.
-        plumbing = build_simulation_plumbing(self)
-        self._sim_ui_port: SimulationUiPorts = plumbing.ui_port
-        self._sim_controller = plumbing.controller
+        self._simulation_mechanism_owner = SimulationMechanismOwner(
+            mechanism_session_owner_getter=lambda: getattr(self, "_mechanism_session_owner", None),
+            mechanism_editor_getter=lambda: getattr(self, "_mechanism_editor", None),
+            preview_session=self._preview_session,
+            variable_runtime=self._variable_runtime,
+            mechanism_locked_getter=self.mechanism_editing_locked,
+            try_lock_mechanism_editor=self._try_lock_mechanism_editor,
+            pending_initials_for_source_set=self._pending_initials_for_source_set,
+            apply_reactions_overrides_to_text=self._apply_reactions_overrides_to_text,
+            apply_state_network_overrides_to_dsl=self._apply_state_network_overrides_to_dsl,
+            apply_wegscheider_resolution_reactions_rewrite=(
+                self._apply_wegscheider_resolution_reactions_rewrite
+            ),
+        )
+        self._simulation_solver_owner = SimulationSolverOwner(
+            initial_solver_getter=lambda: self._initial_solver,
+            initial_rtol_getter=lambda: self._initial_rtol,
+            initial_atol_getter=lambda: self._initial_atol,
+            temperature_getter=lambda: float(self._temperature_spinbox.value()),
+            num_points_getter=lambda: int(self._num_points_spinbox.value()),
+            sim_time_text_getter=lambda: str(self._sim_time_spinbox.text()),
+            parse_sim_time_seconds=self._parse_sim_time_seconds,
+            dsl_global_temperature_getter=self._dsl_global_temperature_K,
+            sparse_jacobian_getter=lambda: self._use_sparse_jacobian,
+            wegscheider_cyclicity_getter=lambda: self._wegscheider_cyclicity_enabled,
+        )
+        self._last_fit_metadata: Optional[Dict[str, Any]] = None
+        self._simulation_provenance_owner = SimulationProvenanceOwner(
+            dataset_snapshot_getter=self._snapshot_datasets,
+            fit_metadata_getter=lambda: self._last_fit_metadata,
+        )
+        self._mechanism_runtime_transition = MechanismRuntimeTransitionService()
+        self._authoritative_mechanism_runtime_refresh_defer_depth = 0
+        self._suppress_canonical_batch_initials_transition = False
+        self._pending_canonical_batch_initials_transition_set_ids: tuple[str, ...] = ()
+        self._pending_canonical_batch_initials_transition_source = "batch_initials_table_edit"
+        self._pending_canonical_batch_initials_discard_dirty_preview = True
+        self._canonical_batch_initials_transition_queued = False
+        self._canonical_batch_initials_transition_timer = QtCore.QTimer(self)
+        self._canonical_batch_initials_transition_timer.setSingleShot(True)
+        self._canonical_batch_initials_transition_timer.timeout.connect(
+            self._flush_canonical_batch_initials_transition
+        )
+        self._pending_interactive_runtime_readiness_rows: tuple[int, ...] = ()
+        self._interactive_runtime_readiness_refresh_queued = False
+        self._last_interactive_runtime_readiness_signature: tuple[tuple[int, ...], tuple[str, ...]] | None = None
+        self._interactive_runtime_readiness_refresh_timer = QtCore.QTimer(self)
+        self._interactive_runtime_readiness_refresh_timer.setSingleShot(True)
+        self._interactive_runtime_readiness_refresh_timer.timeout.connect(
+            self._flush_interactive_runtime_readiness_refresh
+        )
 
         # Fitting state.
         self._last_fit_result = None
-
-        # Provenance tracking for the last simulation.
-        self._last_simulation_provenance = {}
-        self._last_simulation_ctc = {}
-        self._last_fit_metadata: Optional[Dict[str, Any]] = None
 
         # Best-effort failure recording (GUI hardening).
         self._best_effort_failures: set[str] = set()
         self._best_effort_failure_counts: Dict[str, int] = {}
 
         # Mechanism + simulation state.
-        self._use_sparse_jacobian = False
-        self._wegscheider_cyclicity_enabled = False
+        self._use_sparse_jacobian = bool(PROJECT_DEFAULTS["use_sparse_jacobian"])
+        self._wegscheider_cyclicity_enabled = bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"])
         self._suppress_preference_updates = False  # Guard: True during document apply and settings load.
         self._pre_dsl_temperature: float | None = None  # Spinbox value before T= override.
         self._temperature_dsl_override_active = False
         self._fitting_defaults: Dict[str, object] = {}
         self._last_batch_results: List[Dict[str, Any]] = []
-        self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
+        self._simulation_runtime_preview_ready = True
 
         # Registry of actions that support customizable shortcuts.
         self._shortcut_actions: Dict[str, Dict[str, Any]] = {}
+
+    def _init_simulation_controller(self) -> None:
+        # Simulation execution, batch orchestration, caching, and worker lifecycle.
+        plumbing = build_simulation_plumbing(self)
+        self._sim_ui_port: SimulationUiPorts = plumbing.ui_port
+        self._sim_controller = plumbing.controller
+        self._sim_controller.set_preview_display_cache_invalidator(
+            self.results_controller.invalidate_workspace_preview_display_and_cache
+        )
+        self._sim_controller.runtime_readiness_render_requested.connect(
+            self._apply_simulation_runtime_readiness_render_state
+        )
 
     def _init_batch_initial_conditions(self) -> None:
         # Batch initial conditions (source-of-truth for initials after first migration).
         batch_components = build_batch_initial_conditions(self)
         self._batch_store = batch_components.store
         self._batch_model = batch_components.model
+        self._initial_conditions_import_owner = InitialConditionsImportOwner(
+            batch_store_getter=lambda: self._batch_store,
+            batch_model_getter=lambda: self._batch_model,
+            confirm_overwrite=self._confirm_initial_condition_import_overwrite,
+            notify_rows_changed=self._notify_batch_initial_rows_changed,
+            notify_canonical_rows_changed=self._notify_canonical_batch_initial_rows_changed,
+            sync_species_columns=self._sync_batch_species_columns,
+            temperature_getter=lambda: float(self._temperature_spinbox.value()),
+        )
+        self._initial_conditions_source_acceptance_owner = InitialConditionsSourceAcceptanceOwner(
+            import_owner=self._initial_conditions_import_owner,
+            show_reconciliation_error=self._show_initial_conditions_reconciliation_error,
+        )
+        self._simulation_batch_owner = SimulationBatchOwner(
+            batch_selected_rows=self._batch_selected_rows,
+            requested_show_batch_set_ids=self._requested_show_batch_set_ids,
+            slider_edit_target_set_ids=self._slider_edit_target_set_ids,
+            active_batch_set_id=self._active_batch_set_id,
+            batch_current_row=self._batch_current_row,
+            batch_set_id_for_row=self._batch_set_id_for_row,
+            batch_set_name_for_id=self._batch_set_name_for_id,
+            batch_set_id_for_name=self._batch_set_id_for_name,
+            batch_preferred_primary_set_id=self._batch_preferred_primary_set_id,
+            batch_cache_key=self._batch_cache_key,
+            batch_cache_getter=lambda: self._sim_controller.batch_cache,
+            batch_store_getter=lambda: self._batch_store,
+            batch_model_getter=lambda: self._batch_model,
+            batch_initials_for_row=self._batch_initials_for_row,
+            preview_session=self._preview_session,
+            preview_launch_pending=lambda: bool(
+                getattr(
+                    getattr(self.simulation_controller.run_state, "pending_slider_preview_launch", None),
+                    "active",
+                    False,
+                )
+            ),
+            mechanism_owner=self._simulation_mechanism_owner,
+            solver_owner=self._simulation_solver_owner,
+            update_batch_row_controls_state=self._update_batch_row_controls_state,
+            sync_batch_species_columns=self._sync_batch_species_columns,
+            sync_mechanism_controls_to_focused_batch_set=self._sync_mechanism_controls_to_focused_batch_set,
+        )
         self._batch_table: Optional[BatchInitialConditionsTableView] = None
-        self._focused_batch_set_id = ""
+        self._last_effective_slider_edit_target_set_ids: tuple[str, ...] = ()
         self._connected_batch_semantics_model = None
         self._connected_batch_selection_model = None
-        self._pending_import_batch_mapping_names: List[str] = []
         # (Batch run/caching/executor state lives in self._sim_controller.)
+        self._set_species_panel_transaction_owner()
 
     def _init_settings_and_controllers(self) -> None:
         # Theme state.
         self._dark_mode = False  # Will be loaded from settings.
-
-        # Settings manager (QSettings instance).
-        self._settings = QSettings("Kindred", "KindredGUI")
 
         # Configuration persistence + settings-driven UI application.
         controllers = build_settings_and_controllers(self)
@@ -247,15 +394,6 @@ class MainWindow(
 
         # Undo/Redo stack for high-level operations.
         self._undo_stack = controllers.undo_stack
-
-    def settings_set_value(self, key: str, value: object) -> None:
-        self._settings.setValue(str(key), value)
-
-    def settings_remove(self, key: str) -> None:
-        self._settings.remove(str(key))
-
-    def settings_sync(self) -> None:
-        self._settings.sync()
 
     def _init_profile_and_template_managers(self) -> None:
         managers = build_profile_and_template_managers()
@@ -279,7 +417,13 @@ class MainWindow(
         main_plot = getattr(plot, "_main_plot", None)
         set_copy_all_provider = getattr(main_plot, "set_copy_all_export_plan_provider", None)
         if callable(set_copy_all_provider):
-            set_copy_all_provider(self._build_main_plot_copy_all_export_plan)
+            set_copy_all_provider(self.results_controller.build_main_plot_copy_all_export_plan)
+        set_copy_status_text = getattr(main_plot, "set_copy_status_text_callback", None)
+        if callable(set_copy_status_text):
+            set_copy_status_text(self.set_status_text)
+        main_plot.referenceLayerVisibilityRequested.connect(
+            self.results_controller.set_reference_overlays_visible
+        )
 
     def _init_mechanism_dock_and_panel(self) -> None:
         mechanism_dock_components = build_mechanism_dock(self)
@@ -291,10 +435,14 @@ class MainWindow(
             topology_validator=self._mechanism_session_topology_is_valid,
         )
         self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        self._mechanism_runtime_transition.reset_current_snapshot(
+            self._authoritative_mechanism_transition_snapshot(),
+            canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
+        )
         self._force_lock_editor()
         self._sliders_panel = self._mechanism_editor.detach_slider_pane_for_dock()
         self._species_panel_available = True
-        self._slider_override_buttons_available = True
+        self._runtime_parameter_buttons_available = True
 
         self._mechanism_dock.setWidget(mechanism_dock_components.container)
         self.addDockWidget(self._default_dock_area(self._mechanism_dock), self._mechanism_dock)
@@ -320,7 +468,7 @@ class MainWindow(
             on_move_selected_batch_sets_up=self._move_selected_batch_sets_up,
             on_move_selected_batch_sets_down=self._move_selected_batch_sets_down,
             on_delete_selected_batch_sets=self._delete_selected_batch_sets,
-            on_run_selected=self._sim_controller.run_simulation,
+            on_run_selected=self._run_simulation_after_flushing_batch_initials,
             on_stop=self._sim_controller.stop_simulation,
             on_solver_method_changed=self._on_solver_method_changed,
             on_solver_summary_refresh=self._update_solver_summary_label,
@@ -334,6 +482,32 @@ class MainWindow(
         self._batch_dock.setWidget(batch_dock_components.container)
         self.addDockWidget(self._default_dock_area(self._batch_dock), self._batch_dock)
 
+    def _init_fitting_runtime_input_publisher(self) -> None:
+        self._fitting_runtime_input_publisher = FittingRuntimeInputPublisher(
+            capture_inputs=self._capture_fitting_runtime_inputs,
+            record_failure=self._record_fitting_best_effort_failure,
+        )
+
+    @property
+    def fitting_runtime_input_publisher(self) -> FittingRuntimeInputPublisher:
+        return self._fitting_runtime_input_publisher
+
+    def _capture_fitting_runtime_inputs(self) -> FittingRuntimeInputs:
+        return FittingRuntimeInputs(
+            evaluator=FittingEvaluatorRuntimeSettings(
+                temperature_K=self._require_global_fit_temperature(self._temperature_spinbox.value()),
+                use_sparse_jacobian=self._require_global_fit_bool(
+                    "_use_sparse_jacobian",
+                    "use_sparse_jacobian",
+                ),
+                wegscheider_cyclicity_enabled=self._require_global_fit_bool(
+                    "_wegscheider_cyclicity_enabled",
+                    "wegscheider_cyclicity_enabled",
+                ),
+            ),
+            batch_runtime_lane_budget=int(self._sim_controller.batch_runtime_lane_budget),
+        )
+
     def _wire_mechanism_editor_signals(self) -> None:
         sliders = self._mechanism_editor._variable_sliders
         sliders.variableChanged.connect(self._on_variable_changed)
@@ -341,19 +515,24 @@ class MainWindow(
         sliders.sliderDragFinished.connect(self._on_slider_drag_finished)
 
         try:
-            self._mechanism_editor._commit_slider_overrides_btn.clicked.connect(self._on_commit_slider_overrides_clicked)
-            self._mechanism_editor._reset_slider_overrides_btn.clicked.connect(self._on_reset_slider_overrides_clicked)
+            self._mechanism_editor._commit_runtime_parameters_btn.clicked.connect(self._on_commit_runtime_parameters_clicked)
+            self._mechanism_editor._reset_runtime_parameters_btn.clicked.connect(self._on_reset_runtime_parameters_clicked)
         except Exception:
-            logger.exception("Failed to connect slider override mode buttons")
-            self._slider_override_buttons_available = False
-            self._disable_slider_override_mode_buttons()
+            logger.exception("Failed to connect runtime parameter buttons")
+            self._runtime_parameter_buttons_available = False
+            self._disable_runtime_parameter_buttons()
 
         self._mechanism_editor.speciesResetRequested.connect(self._on_species_reset_requested)
-        self._mechanism_editor.run_btn.clicked.connect(self._sim_controller.run_simulation)
+        self._mechanism_editor.validationStateChanged.connect(
+            lambda _state: self._simulation_run_ui_owner.refresh_run_button_state()
+        )
+        self._mechanism_editor.run_btn.clicked.connect(self._run_simulation_after_flushing_batch_initials)
+        self._mechanism_editor.symbolic_calculator_btn.clicked.connect(self._open_symbolic_calculator_panel)
+        self._mechanism_editor.mechanismInspectRequested.connect(self._open_mechanism_inspector)
         self._refresh_slider_transaction_button_state()
 
-    def _set_slider_override_mode_buttons_enabled(self, enabled: bool) -> None:
-        for attr in ("_commit_slider_overrides_btn", "_reset_slider_overrides_btn"):
+    def _set_runtime_parameter_buttons_enabled(self, enabled: bool) -> None:
+        for attr in ("_commit_runtime_parameters_btn", "_reset_runtime_parameters_btn"):
             btn = getattr(self._mechanism_editor, attr, None)
             if btn is None:
                 continue
@@ -361,21 +540,21 @@ class MainWindow(
                 btn.setEnabled(bool(enabled))
             except RuntimeError as exc:
                 self._record_best_effort_failure(
-                    f"main_window.slider_override_buttons.set_enabled.{attr}",
-                    message="Failed to update slider override mode button state",
+                    f"main_window.runtime_parameter_buttons.set_enabled.{attr}",
+                    message="Failed to update runtime parameter button state",
                     exc=exc,
                 )
 
-    def _disable_slider_override_mode_buttons(self) -> None:
-        self._set_slider_override_mode_buttons_enabled(False)
+    def _disable_runtime_parameter_buttons(self) -> None:
+        self._set_runtime_parameter_buttons_enabled(False)
 
     def _refresh_slider_transaction_button_state(self) -> None:
-        if not bool(getattr(self, "_slider_override_buttons_available", False)):
-            self._disable_slider_override_mode_buttons()
+        if not bool(getattr(self, "_runtime_parameter_buttons_available", False)):
+            self._disable_runtime_parameter_buttons()
             return
         preview = getattr(self, "_preview_session", None)
         dirty = bool(preview is not None and hasattr(preview, "has_dirty_transaction") and preview.has_dirty_transaction())
-        self._set_slider_override_mode_buttons_enabled(bool(dirty))
+        self._set_runtime_parameter_buttons_enabled(bool(dirty))
 
     def mechanism_editing_locked(self) -> bool:
         owner = getattr(self, "_mechanism_session_owner", None)
@@ -403,12 +582,19 @@ class MainWindow(
         return bool(state_editor.is_valid())
 
     def _sync_mechanism_session_owner_from_widgets(self, *, authoritative: bool) -> None:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
         reactions_text, state_network_dsl = self._mechanism_session_texts_from_widgets()
         if authoritative:
-            owner.apply_authoritative_update(reactions_text, state_network_dsl)
+            owner.apply_authoritative_source(
+                MechanismAuthoringSource.from_parts(
+                    reactions_text=reactions_text,
+                    state_network_dsl=state_network_dsl,
+                )
+            )
             return
         if not owner.edit_session_active:
             raise RuntimeError("Mechanism edit session is not active.")
@@ -421,10 +607,249 @@ class MainWindow(
             raise RuntimeError("Mechanism session owner is unavailable.")
         self._sync_mechanism_session_owner_from_widgets(authoritative=not bool(owner.edit_session_active))
 
-    def _dispatch_authoritative_mechanism_consumers(self) -> None:
+    def _refresh_authoritative_mechanism_derived_ui(self) -> None:
         self._update_temperature_mode_indicator()
-        self._on_authoritative_mechanism_input_changed()
         self._refresh_overlay_swatches_for_current_mechanism()
+
+    def _authoritative_mechanism_transition_snapshot(self) -> AuthoritativeMechanismSnapshot:
+        return AuthoritativeMechanismSnapshot.from_source(self.canonical_mechanism_source())
+
+    def _authoritative_mechanism_runtime_refresh_deferred(self) -> bool:
+        return int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) > 0
+
+    def _canonical_batch_initials_identity_by_set_id(self) -> Dict[str, str]:
+        identities: Dict[str, str] = {}
+        store = getattr(self, "_batch_store", None)
+        if store is None:
+            return identities
+        try:
+            row_count = int(store.row_count())
+        except Exception:
+            return identities
+        for row in range(row_count):
+            set_id = str(self._batch_set_id_for_row(int(row)) or "").strip()
+            if not set_id:
+                continue
+            try:
+                identities[set_id] = canonical_initials_fingerprint(self.batch_initials_for_row(int(row)))
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.runtime_transition.canonical_initials_identity",
+                    message="Failed to fingerprint canonical batch initials for runtime transition",
+                    exc=exc,
+                )
+        return identities
+
+    def _canonical_batch_initials_identity_for_set_ids(
+        self,
+        set_ids: Sequence[str],
+    ) -> Dict[str, str]:
+        identities: Dict[str, str] = {}
+        requested_ids = tuple(
+            dict.fromkeys(str(set_id).strip() for set_id in (set_ids or ()) if str(set_id).strip())
+        )
+        if not requested_ids:
+            return identities
+        for set_id in requested_ids:
+            try:
+                row = self._batch_row_for_set_id(str(set_id))
+            except Exception as exc:
+                row = None
+                self._record_best_effort_failure(
+                    "main_window.runtime_transition.canonical_initials_identity.row_lookup",
+                    message="Failed to resolve batch row for scoped canonical initial fingerprint",
+                    exc=exc,
+                )
+            if row is None:
+                continue
+            try:
+                identities[str(set_id)] = canonical_initials_fingerprint(
+                    self.batch_initials_for_row(int(row))
+                )
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.runtime_transition.canonical_initials_identity.scoped",
+                    message="Failed to fingerprint scoped canonical batch initials for runtime transition",
+                    exc=exc,
+                )
+        return identities
+
+    def _apply_authoritative_mechanism_transition(
+        self,
+        *,
+        schedule_runtime_refresh: Optional[bool] = None,
+        force_runtime_invalidation: bool = False,
+        transition_source: str = "authoritative_change",
+        canonical_batch_initials_by_set_id: Optional[Mapping[str, object]] = None,
+        affected_set_ids: Sequence[str] = (),
+        canonical_batch_initials_scope_is_partial: bool = False,
+    ) -> MechanismTransitionOutcome:
+        if schedule_runtime_refresh is None:
+            schedule_runtime_refresh = not self._authoritative_mechanism_runtime_refresh_deferred()
+        owner = getattr(self, "_mechanism_session_owner", None)
+        outcome = self._mechanism_runtime_transition.apply_authoritative_transition(
+            self._authoritative_mechanism_transition_snapshot(),
+            source=str(transition_source or "authoritative_change"),
+            force_runtime_invalidation=bool(force_runtime_invalidation),
+            edit_session_active=bool(getattr(owner, "edit_session_active", False)),
+            input_suppressed=bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)),
+            schedule_runtime_refresh=bool(schedule_runtime_refresh),
+            canonical_batch_initials_by_set_id=canonical_batch_initials_by_set_id,
+            affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
+            canonical_batch_initials_scope_is_partial=bool(canonical_batch_initials_scope_is_partial),
+        )
+        if outcome.runtime_invalidation_required:
+            self._sim_controller.simulation_runtime_inputs_changed(
+                batch_runtime_pool_inputs_changed=False
+            )
+        if outcome.active_work_supersede_required:
+            if outcome.runtime_invalidation_required:
+                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+                    epoch=int(outcome.epoch),
+                )
+            else:
+                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+                    epoch=int(outcome.epoch),
+                    affected_set_ids=outcome.active_work_supersede_set_ids,
+                    close_preview_runtime_owner=False,
+                )
+        if outcome.display_cache_invalidation_allowed and self.results_controller.authoritative_result_transition_required(
+            cache_stale_scope_is_global=bool(outcome.cache_stale_scope_is_global),
+            cache_stale_set_ids=outcome.cache_stale_set_ids,
+        ):
+            self._apply_authoritative_result_truth_effects(
+                cache_stale_set_ids=outcome.cache_stale_set_ids,
+                cache_stale_scope_is_global=outcome.cache_stale_scope_is_global,
+                display_clear_set_ids=outcome.display_clear_set_ids,
+                display_clear_scope_is_global=outcome.display_clear_scope_is_global,
+                clear_cached_mechanism=bool(outcome.runtime_invalidation_required),
+            )
+        transition_suppressed_noop = (
+            str(transition_source or "authoritative_change") == "authoritative_change"
+            and bool(
+                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+            )
+            and not bool(outcome.runtime_invalidation_required)
+            and not bool(outcome.runtime_input_invalidation_required)
+        )
+        if (
+            not transition_suppressed_noop
+            and not (outcome.runtime_input_invalidation_required and not outcome.runtime_invalidation_required)
+        ):
+            self._refresh_authoritative_mechanism_derived_ui()
+        self._refresh_symbolic_calculator_state()
+        if (
+            bool(outcome.runtime_input_invalidation_required)
+            or bool(outcome.runtime_invalidation_required)
+        ):
+            self._fitting_runtime_input_publisher.publish_current(
+                reason="authoritative mechanism transition",
+                force=True,
+            )
+        return outcome
+
+    def _apply_canonical_batch_initials_transition(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        transition_source: str,
+        discard_dirty_preview: bool = True,
+    ) -> None:
+        affected_set_ids_t = tuple(
+            dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id))
+        )
+        if not affected_set_ids_t:
+            return
+        scoped_initial_identities = self._canonical_batch_initials_identity_for_set_ids(
+            affected_set_ids_t
+        )
+        outcome = self._apply_authoritative_mechanism_transition(
+            transition_source=str(transition_source or "canonical_batch_initials_change"),
+            canonical_batch_initials_by_set_id=scoped_initial_identities,
+            affected_set_ids=affected_set_ids_t,
+            canonical_batch_initials_scope_is_partial=True,
+        )
+        if bool(outcome.runtime_input_invalidation_required) or bool(outcome.runtime_invalidation_required):
+            self._last_interactive_runtime_readiness_signature = None
+            self._maybe_queue_run_target_runtime_readiness_refresh(force=True)
+        if bool(discard_dirty_preview) and (
+            bool(outcome.runtime_input_invalidation_required)
+            or bool(outcome.runtime_invalidation_required)
+        ):
+            dirty_preview_reset_set_ids = (
+                affected_set_ids_t
+                if bool(outcome.dirty_preview_reset_scope_is_global)
+                else outcome.dirty_preview_reset_set_ids
+            )
+            preview_state_changed = False
+            try:
+                preview_state_changed = bool(
+                    self._preview_session.reset_mechanism_workspaces(dirty_preview_reset_set_ids)
+                )
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.canonical_initials.reset_dirty_workspaces",
+                    message="Failed to discard dirty slider workspaces after canonical batch initial edit",
+                    exc=exc,
+                )
+            try:
+                preview_state_changed = bool(
+                    self._preview_session.discard_concentration_overlays_for_set_ids(dirty_preview_reset_set_ids)
+                ) or preview_state_changed
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.canonical_initials.discard_dirty_overlays",
+                    message="Failed to discard dirty species overlays after canonical batch initial edit",
+                    exc=exc,
+                )
+            if preview_state_changed:
+                self.results_controller.clear_display_if_workspace_previews_were_displayed(
+                    dirty_preview_reset_set_ids,
+                )
+                self._refresh_species_sliders_after_canonical_initials_transition(dirty_preview_reset_set_ids)
+
+    def _refresh_species_sliders_after_canonical_initials_transition(
+        self,
+        affected_set_ids: Sequence[str],
+    ) -> None:
+        affected = {str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)}
+        if not affected:
+            return
+        focused_set_id = str(self._preview_session.focused_mechanism_workspace_set_id() or "").strip()
+        current_set_id = ""
+        try:
+            current_row = self._batch_current_row()
+            if current_row is not None:
+                current_set_id = str(self._batch_set_id_for_row(int(current_row)) or "").strip()
+        except Exception:
+            current_set_id = ""
+        effective_slider_target_ids: set[str] = set()
+        try:
+            effective_slider_target_ids = {
+                str(set_id)
+                for set_id in (self._effective_slider_edit_target_set_ids() or ())
+                if str(set_id)
+            }
+        except Exception:
+            effective_slider_target_ids = set()
+        if (
+            focused_set_id not in affected
+            and current_set_id not in affected
+            and not bool(affected & effective_slider_target_ids)
+        ):
+            return
+        try:
+            panel = self._mechanism_editor.species_sliders_widget()
+            if panel is not None and hasattr(panel, "refresh_current_row_from_model"):
+                panel.refresh_current_row_from_model(recompute_ranges=True)
+            elif panel is not None and hasattr(panel, "rebuild_from_current_row"):
+                panel.rebuild_from_current_row()
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "main_window.canonical_initials.refresh_species_sliders",
+                message="Failed to refresh species sliders after canonical batch initial edit",
+                exc=exc,
+            )
 
     def _sync_mechanism_session_owner_after_authoritative_widget_write(
         self,
@@ -440,7 +865,7 @@ class MainWindow(
             return
         self._set_mechanism_edit_locked(True)
         if bool(dispatch_consumers):
-            self._dispatch_authoritative_mechanism_consumers()
+            self._apply_authoritative_mechanism_transition()
 
     def _restore_mechanism_widgets_from_owner_canonical(self) -> None:
         owner = getattr(self, "_mechanism_session_owner", None)
@@ -479,18 +904,21 @@ class MainWindow(
         self._sync_mechanism_session_owner_from_widget_signal()
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None or bool(owner.edit_session_active):
+            self._refresh_symbolic_calculator_state()
             return
-        self._dispatch_authoritative_mechanism_consumers()
+        self._apply_authoritative_mechanism_transition()
 
     def _on_state_network_changed_for_main_window(self) -> None:
         self._sync_mechanism_session_owner_from_widget_signal()
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None or bool(owner.edit_session_active):
+            self._refresh_symbolic_calculator_state()
             return
-        self._dispatch_authoritative_mechanism_consumers()
+        self._apply_authoritative_mechanism_transition()
 
     def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
         self._update_temperature_mode_indicator()
+        self._fitting_runtime_input_publisher.publish_if_changed(reason="temperature changed")
 
     @staticmethod
     def _state_network_dialog_info_text(*, locked: bool) -> str:
@@ -553,21 +981,93 @@ class MainWindow(
             owner.cancel_edit_session()
             self._restore_mechanism_widgets_from_owner_canonical()
         self._refresh_mechanism_edit_lock_ui()
+        validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
+        if callable(validate):
+            validate()
+        self._refresh_symbolic_calculator_state()
         return True
 
-    def _try_lock_mechanism_editor(self) -> bool:
+    def _pending_initials_for_source_set(self, source, *, set_name: str) -> dict[str, float]:
+        return self._initial_conditions_import_owner.pending_initials_for_source_set(
+            source,
+            set_name=str(set_name or ""),
+        )
+
+    def _try_lock_mechanism_editor(self, *, return_acceptance: bool = False) -> bool | RunAutoLockResult:
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
+
+        def _result(success: bool, affected_rows: tuple[int, ...] = ()) -> bool | RunAutoLockResult:
+            if bool(return_acceptance):
+                return RunAutoLockResult(bool(success), tuple(int(row) for row in affected_rows))
+            return bool(success)
+
+        def _set_reactions_widget_text(text: str) -> None:
+            widget = self._reactions_text_widget()
+            if widget is None or str(widget.toPlainText()) == str(text):
+                return
+            previous_text_signal_suppress = bool(
+                getattr(self, "_suppress_programmatic_text_change_signals", False)
+            )
+            self._suppress_programmatic_text_change_signals = True
+            try:
+                widget.setPlainText(str(text))
+            finally:
+                self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
+
         if owner.edit_session_active:
             self._sync_mechanism_session_owner_from_widgets(authoritative=False)
+            original_draft_reactions = str(owner.draft_reactions_text)
+            reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_lock(
+                owner.draft_source,
+                prompt_overwrite=True,
+            )
+            if reconciliation_plan is None:
+                self._refresh_symbolic_calculator_state()
+                return _result(False)
+            reconciled_source = reconciliation_plan.source
+            if str(reconciled_source.reactions_text) != str(owner.draft_reactions_text):
+                owner.update_draft_reactions(str(reconciled_source.reactions_text))
+                _set_reactions_widget_text(str(reconciled_source.reactions_text))
             if not owner.commit_edit_session():
-                return False
-        elif not self.is_mechanism_ready_for_run():
-            return False
-        self._dispatch_authoritative_mechanism_consumers()
+                if owner.edit_session_active and str(owner.draft_reactions_text) != original_draft_reactions:
+                    owner.update_draft_reactions(original_draft_reactions)
+                    _set_reactions_widget_text(original_draft_reactions)
+                validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
+                if callable(validate):
+                    validate()
+                self._refresh_symbolic_calculator_state()
+                return _result(False)
+            reconciliation_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
+                reconciliation_plan
+            )
+        else:
+            original_canonical_source = owner.canonical_source
+            reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_lock(
+                owner.canonical_source,
+                prompt_overwrite=True,
+            )
+            if reconciliation_plan is None:
+                return _result(False)
+            reconciled_source = reconciliation_plan.source
+            if str(reconciled_source.reactions_text) != str(owner.canonical_reactions_text):
+                owner.apply_authoritative_source(reconciled_source)
+                self._restore_mechanism_widgets_from_owner_canonical()
+            if not self._simulation_mechanism_owner.is_mechanism_ready_for_run():
+                if owner.canonical_source != original_canonical_source:
+                    owner.apply_authoritative_source(original_canonical_source)
+                    self._restore_mechanism_widgets_from_owner_canonical()
+                return _result(False)
+            reconciliation_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
+                reconciliation_plan
+            )
+        self._apply_authoritative_mechanism_transition()
         self._refresh_mechanism_edit_lock_ui()
-        return True
+        validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
+        if callable(validate):
+            validate()
+        return _result(True, tuple(getattr(reconciliation_result, "affected_rows", ()) or ()))
 
     def _set_mechanism_edit_locked(self, locked: bool) -> bool:
         if not bool(locked):
@@ -577,28 +1077,18 @@ class MainWindow(
             if not owner.edit_session_active:
                 owner.begin_edit_session()
             self._refresh_mechanism_edit_lock_ui()
+            self._refresh_symbolic_calculator_state()
             return True
         if self.mechanism_editing_locked():
             self._refresh_mechanism_edit_lock_ui()
             return True
         return self._force_lock_editor()
 
-    def auto_lock_for_run(self) -> bool:
-        if not self.mechanism_editing_locked():
-            return self._try_lock_mechanism_editor()
-        return True
-
-    def is_mechanism_ready_for_run(self) -> bool:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            return False
-        return bool(owner.is_ready_for_explicit_run())
-
     def is_mechanism_valid_for_preview(self) -> bool:
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             return False
-        return bool(owner.validate_canonical().valid)
+        return bool(owner.is_ready_for_preview())
 
     def _reactions_text_widget(self) -> Optional[QtWidgets.QPlainTextEdit]:
         editor = getattr(self, "_mechanism_editor", None)
@@ -614,6 +1104,9 @@ class MainWindow(
     def _undo_command_targets_locked_mechanism_change(self, command: object) -> bool:
         if command is None:
             return False
+        complete_source_target = getattr(command, "targets_complete_mechanism_source_change", None)
+        if callable(complete_source_target):
+            return bool(complete_source_target())
         reactions_widget = self._reactions_text_widget()
         state_editor = getattr(getattr(self, "_mechanism_editor", None), "_state_network_editor", None)
 
@@ -735,18 +1228,18 @@ class MainWindow(
             return False
 
         if decision == "commit":
-            self._on_commit_slider_overrides_clicked()
+            self._on_commit_runtime_parameters_clicked()
             if bool(preview.has_dirty_transaction()):
-                self.message_box_warning(
+                self._simulation_dialogs.message_box_warning(
                     "Pending Slider Changes",
                     f"{str(action_text)} was canceled because pending slider changes could not be applied.",
                 )
                 return False
             return True
 
-        self._discard_slider_transaction_for_invalidation()
+        self._discard_pending_slider_edits_for_invalidation()
         if bool(preview.has_dirty_transaction()):
-            self.message_box_warning(
+            self._simulation_dialogs.message_box_warning(
                 "Pending Slider Changes",
                 f"{str(action_text)} was canceled because pending slider changes could not be discarded.",
             )
@@ -778,7 +1271,7 @@ class MainWindow(
             try:
                 species_panel.attach(table=self._batch_table, model=self._batch_model)
                 if hasattr(species_panel, "activate"):
-                    self._ensure_batch_current_row_selected()
+                    self._select_initial_batch_row_if_needed()
                     species_panel.activate()
             except RuntimeError as exc:
                 logger.debug("Failed to attach species panel to batch table: %s", exc, exc_info=True)
@@ -797,7 +1290,8 @@ class MainWindow(
             for signal_name, slot in (
                 ("showMembershipChanged", self._on_batch_show_membership_changed),
                 ("sliderEditTargetsChanged", self._on_slider_edit_targets_changed),
-                ("dataChanged", self._on_batch_model_data_changed),
+                ("canonicalInitialsChanged", self._on_batch_canonical_initials_changed),
+                ("initialRowsEdited", self._on_batch_initial_rows_edited),
             ):
                 signal = getattr(model, signal_name, None)
                 if signal is None:
@@ -852,7 +1346,10 @@ class MainWindow(
             try:
                 current_model.showMembershipChanged.connect(self._on_batch_show_membership_changed)
                 current_model.sliderEditTargetsChanged.connect(self._on_slider_edit_targets_changed)
-                current_model.dataChanged.connect(self._on_batch_model_data_changed)
+                current_model.canonicalInitialsChanged.connect(self._on_batch_canonical_initials_changed)
+                initial_rows_edited = getattr(current_model, "initialRowsEdited", None)
+                if initial_rows_edited is not None:
+                    initial_rows_edited.connect(self._on_batch_initial_rows_edited)
             except RuntimeError as exc:
                 logger.debug("Failed to connect batch model semantics signals: %s", exc, exc_info=True)
         if current_selection_model is not None:
@@ -864,6 +1361,17 @@ class MainWindow(
 
         self._connected_batch_semantics_model = current_model
         self._connected_batch_selection_model = current_selection_model
+
+    def _species_panel_transaction_owner(self) -> object:
+        return getattr(self, "_simulation_batch_owner", None) or self._preview_session
+
+    def _set_species_panel_transaction_owner(self) -> None:
+        try:
+            species_panel = self._mechanism_editor.species_sliders_widget()
+        except (AttributeError, RuntimeError, TypeError):
+            return
+        if species_panel is not None and hasattr(species_panel, "set_transaction_owner"):
+            species_panel.set_transaction_owner(self._species_panel_transaction_owner())
 
     def _try_wire_species_panel(self):
         try:
@@ -879,8 +1387,9 @@ class MainWindow(
 
         try:
             if hasattr(species_panel, "set_transaction_owner"):
-                species_panel.set_transaction_owner(self._preview_session)
+                species_panel.set_transaction_owner(self._species_panel_transaction_owner())
             species_panel.speciesEdited.connect(self._on_species_slider_edited)
+            species_panel.speciesDragStarted.connect(self._on_species_slider_drag_started)
             species_panel.speciesDragFinished.connect(self._on_species_slider_drag_finished)
         except RuntimeError as exc:
             logger.debug("Failed to wire species sliders signals: %s", exc, exc_info=True)
@@ -890,12 +1399,12 @@ class MainWindow(
         return species_panel
 
     def _init_right_dock_and_datasets(self) -> None:
-        right_dock_components = build_right_dock_and_dataset_manager(
+        right_dock_components = build_right_dock_and_dataset_owners(
             self,
             plot_tabs=self._plot_tabs,
             mechanism_getter=self._get_mechanism_text,
             simulation_runner=self._run_dataset_simulation,
-            solver_settings_getter=self._get_solver_settings,
+            wegscheider_cyclicity_enabled_getter=self._get_wegscheider_cyclicity_enabled,
         )
         self._right_dock = right_dock_components.dock
         self._right_panel = right_dock_components.panel
@@ -905,12 +1414,103 @@ class MainWindow(
         self._right_dock.setWidget(right_dock_components.container)
         self.addDockWidget(self._default_dock_area(self._right_dock), self._right_dock)
 
-        # Centralize dataset/fitting coordination outside the main window.
-        self._dataset_manager = right_dock_components.dataset_manager
-        self._bootstrap_existing_datasets()
+        self._dataset_registry = right_dock_components.dataset_registry
+        self._dataset_fit_settings_store = right_dock_components.dataset_fit_settings_store
+        self._dataset_view_publisher = right_dock_components.dataset_view_publisher
+        self._mechanism_parameter_scan_owner = right_dock_components.mechanism_parameter_scan_owner
+        self._dataset_import_panel = right_dock_components.import_panel
+
+        from kindred.gui.controllers.dataset_import_coordinator import DatasetImportCoordinator
+
+        self._dataset_import_coordinator = DatasetImportCoordinator(
+            registry=self._dataset_registry,
+            fit_settings_store=self._dataset_fit_settings_store,
+            view_publisher=self._dataset_view_publisher,
+            import_panel=self._dataset_import_panel,
+            status_setter=lambda text: self._status_label.setText(str(text)),
+            overlay_sync=self._sync_overlay_catalog,
+            color_sync=self._sync_color_manager_authoritative_roster,
+            batch_store_getter=lambda: getattr(self, "_batch_store", None),
+            batch_model_getter=lambda: getattr(self, "_batch_model", None),
+            batch_table_getter=lambda: getattr(self, "_batch_table", None),
+            mechanism_text_getter=self._get_mechanism_text,
+            extract_mechanism_initials=self._extract_mechanism_initials,
+            sync_batch_species_columns=self.sync_batch_species_columns,
+            record_failure=self._record_best_effort_failure,
+            runtime_inputs_changed=lambda: self._fitting_runtime_input_publisher.publish_if_changed(
+                reason="dataset import runtime inputs changed"
+            ),
+            datasets_removed=self._fitting_runtime_input_publisher.publish_datasets_removed,
+            message_parent=self,
+        )
 
         # Reference species statistics table within plot tabs.
         self._results_table = self._plot_tabs._main_plot.stats_table()
+
+    def _init_symbolic_calculator_dock(self) -> None:
+        from kindred.gui.symbolic_calculator_owner import SymbolicCalculatorOwner
+        from kindred.gui.widgets.symbolic_calculator_panel import SymbolicCalculatorPanel
+
+        owner = SymbolicCalculatorOwner(
+            mechanism_session_owner=self._mechanism_session_owner,
+        )
+        panel = SymbolicCalculatorPanel(
+            on_evaluate=owner.evaluate,
+            on_copy_result=owner.copy_compact_text,
+            on_copy_context=owner.copy_context_text,
+            parent=self,
+        )
+        self._symbolic_calculator_owner = owner
+        components = build_symbolic_calculator_dock(self, panel=panel)
+        self._symbolic_calculator_dock = components.dock
+        self._symbolic_calculator_panel = components.panel
+        self._symbolic_calculator_dock.setWidget(components.container)
+        self.addDockWidget(self._default_dock_area(self._symbolic_calculator_dock), self._symbolic_calculator_dock)
+        self._refresh_symbolic_calculator_state()
+
+    def _refresh_symbolic_calculator_state(self) -> None:
+        panel = getattr(self, "_symbolic_calculator_panel", None)
+        action = getattr(self, "_symbolic_calculator_action", None)
+        editor = getattr(self, "_mechanism_editor", None)
+        button = getattr(editor, "symbolic_calculator_btn", None)
+        owner = getattr(self, "_symbolic_calculator_owner", None)
+        if owner is None:
+            available = False
+            reason = "Canonical mechanism unavailable."
+            state = None
+        else:
+            state = owner.refresh()
+            available = bool(state.available)
+            reason = str(state.reason or "")
+        if panel is not None:
+            if state is not None:
+                panel.render_state(state)
+            else:
+                panel.set_available(available, reason)
+        if action is not None:
+            action.setEnabled(bool(available))
+            action.setToolTip(
+                "Open Symbolic Calculator panel"
+                if bool(available)
+                else str(reason or "Symbolic calculator unavailable.")
+            )
+        if button is not None:
+            button.setEnabled(bool(available))
+            button.setToolTip(
+                "Open Symbolic Calculator panel"
+                if bool(available)
+                else str(reason or "Symbolic calculator unavailable.")
+            )
+
+    def _open_symbolic_calculator_panel(self) -> None:
+        self._refresh_symbolic_calculator_state()
+        dock = getattr(self, "_symbolic_calculator_dock", None)
+        if dock is None or not dock.isEnabled():
+            return
+        dock.show()
+        dock.raise_()
+        if dock.isFloating():
+            dock.activateWindow()
 
     def _init_bottom_analysis_dock(self) -> None:
         analysis_widget = self._plot_tabs.main_plot_analysis_widget()
@@ -936,6 +1536,14 @@ class MainWindow(
         self._algebra_status_label = QtWidgets.QLabel("")
         self._algebra_status_label.setStyleSheet("QLabel { font-size: 10px; }")
         self._status_bar.addPermanentWidget(self._algebra_status_label)
+        self._simulation_run_ui_owner.bind_widgets(
+            run_button=self._run_btn,
+            stop_button=self._stop_btn,
+            progress=self._sim_progress,
+            status_label=self._status_label,
+            algebra_status_label=self._algebra_status_label,
+            mechanism_editor=self._mechanism_editor,
+        )
 
         # Temperature mode indicator in status bar.
         self._temperature_mode_indicator = QtWidgets.QLabel("Temperature: 298.15 K (isothermal)")
@@ -962,6 +1570,7 @@ class MainWindow(
         # self._init_ribbon_host()
         self._init_mixin_ports()
         self._connect_signals()
+        self._simulation_runtime_availability_shutdown_started = False
 
     def _bootstrap_window_state(self) -> None:
         """Apply launch overrides and persisted startup state after composition prerequisites exist."""
@@ -972,13 +1581,79 @@ class MainWindow(
         finally:
             self._suppress_preference_updates = False
         self._update_temperature_mode_indicator()
+        refresh_runtime_readiness = getattr(
+            getattr(self, "_sim_controller", None),
+            "refresh_interactive_runtime_readiness",
+            None,
+        )
+        self._update_batch_row_controls_state()
+        if callable(refresh_runtime_readiness):
+            refresh_runtime_readiness()
+            self._last_interactive_runtime_readiness_signature = self._current_run_target_readiness_signature()
+
+    def _simulation_runtime_settings_snapshot(self) -> Dict[str, object]:
+        solver_contract = load_solver_contract()
+        solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip()
+        return {
+            "solver": str(solver_label or solver_contract.default_solver_name),
+            "rtol": float(self._initial_rtol or 1e-6),
+            "atol": float(self._initial_atol or 1e-12),
+            "use_sparse_jacobian": bool(self._use_sparse_jacobian),
+            "wegscheider_cyclicity_enabled": bool(self._wegscheider_cyclicity_enabled),
+            "max_parallel_batch_workers": int(self._sim_controller.parallel_batch.max_parallel_workers),
+            "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
+            "limit_blas_threads_per_worker": bool(
+                self._sim_controller.parallel_batch.limit_blas_threads_per_worker
+            ),
+            "slider_preview_solver": str(self._mechanism_editor.slider_solver_value() or "BDF"),
+            "slider_preview_points": int(self._mechanism_editor.slider_points_value()),
+        }
+
+    def _simulation_batch_runtime_pool_settings_snapshot(self) -> Dict[str, object]:
+        return {
+            "max_parallel_batch_workers": int(self._sim_controller.parallel_batch.max_parallel_workers),
+            "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
+            "limit_blas_threads_per_worker": bool(
+                self._sim_controller.parallel_batch.limit_blas_threads_per_worker
+            ),
+        }
+
+    def _refresh_simulation_runtime_after_inputs_changed(
+        self,
+        *,
+        batch_runtime_pool_inputs_changed: bool = True,
+    ) -> None:
+        if bool(batch_runtime_pool_inputs_changed):
+            self._sim_controller.simulation_runtime_inputs_changed()
+        else:
+            self._sim_controller.simulation_runtime_inputs_changed(
+                batch_runtime_pool_inputs_changed=False
+            )
+
+    def _apply_simulation_runtime_readiness_render_state(
+        self,
+        state: object,
+    ) -> None:
+        self._simulation_run_ui_owner.render_runtime_readiness(state)
+        self._render_preview_available(bool(getattr(state, "preview_available", False)))
+        preview_unavailable_status = str(getattr(state, "preview_unavailable_status", "") or "").strip()
+        if preview_unavailable_status:
+            self._preview_session.show_preview_unavailable_for_dirty_state(preview_unavailable_status)
+
+    def _render_launch_available(self, ready: bool) -> None:
+        self._simulation_run_ui_owner.render_launch_available(bool(ready))
+
+    def _render_preview_available(self, ready: bool) -> None:
+        ready_value = bool(ready)
+        self._simulation_runtime_preview_ready = ready_value
 
     def _init_mixin_ports(self) -> None:
-        data_manager = getattr(getattr(self, "_right_panel", None), "_data_manager", None)
         self._fitting_ports = FittingMixinPorts(
             mechanism_editor=self._mechanism_editor,
-            dataset_manager=self._dataset_manager,
-            data_manager_getter=lambda: getattr(getattr(self, "_right_panel", None), "_data_manager", data_manager),
+            dataset_registry=self._dataset_registry,
+            dataset_fit_settings_store=self._dataset_fit_settings_store,
+            dataset_view_publisher=self._dataset_view_publisher,
+            mechanism_parameter_scan_owner=self._mechanism_parameter_scan_owner,
             status_setter=lambda text: self._status_label.setText(str(text)),
             temperature_getter=lambda: float(self._temperature_spinbox.value()),
             num_points_getter=lambda: int(self._num_points_spinbox.value()),
@@ -988,8 +1663,8 @@ class MainWindow(
             profiles_menu_getter=lambda: None,  # Hidden: Profiles menu removed from menu bar
             profile_indicator_setter=lambda text: self._profile_indicator.setText(str(text)),
             status_setter=lambda text: self._status_label.setText(str(text)),
-            settings_set_value=self.settings_set_value,
-            settings_remove=self.settings_remove,
+            settings_set_value=self._settings_owner.settings_set_value,
+            settings_remove=self._settings_owner.settings_remove,
             num_points_spinbox=self._num_points_spinbox,
             dark_mode_action=getattr(self, "_dark_mode_action", None),
             toggle_theme=self._toggle_theme,
@@ -1005,7 +1680,7 @@ class MainWindow(
             return
         logger.warning(f"Startup profile '{self._initial_profile}' not found")
 
-    def _on_programmatic_mechanism_load(self) -> None:
+    def _on_programmatic_mechanism_load(self, *, schedule_runtime_refresh: bool = True) -> None:
         """
         Invalidate slider runtime and clear variable sliders/overrides.
 
@@ -1013,15 +1688,22 @@ class MainWindow(
         paths), so MainWindow's `textChanged`-wired invalidation is not guaranteed to run.
         """
         self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+        validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
+        if callable(validate):
+            validate()
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
         try:
             self._mechanism_editor._variable_sliders.clear()
         except Exception:
             logger.debug("Failed to clear variable sliders after programmatic mechanism load", exc_info=True)
             self._preview_session.clear_pending_slider_values()
-            self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
-        self._dispatch_authoritative_mechanism_consumers()
+        self._apply_authoritative_mechanism_transition(
+            schedule_runtime_refresh=bool(schedule_runtime_refresh),
+            force_runtime_invalidation=True,
+            transition_source="programmatic_load",
+            canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
+        )
         self._refresh_slider_transaction_button_state()
 
         try:
@@ -1030,38 +1712,27 @@ class MainWindow(
             logger.debug("Failed to update parameter table after programmatic mechanism load", exc_info=True)
             QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
 
-    def _bootstrap_existing_datasets(self):
-        """Populate dataset visualizations for any datasets already loaded."""
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
-
-        self._sync_color_manager_authoritative_roster()
-        existing = self._right_panel._data_manager.get_datasets()
-        if not existing:
-            return
-
-        for name, payload in existing.items():
-            try:
-                self._dataset_manager.register_dataset(name, payload)
-            except DatasetManagerError as exc:
-                logger.warning("Skipping dataset '%s' during bootstrap: %s", name, exc)
-                continue
-
-        self._sync_overlay_catalog()
-
     def _current_mechanism_species_roster_for_colors(self) -> tuple[str, ...] | None:
         """Best-effort current mechanism species roster for color canonicalization."""
         from kindred.core.batch_initial_conditions import (
             strip_named_reaction_dsl_initial_concentration_sets,
         )
+        from kindred.core.mechanism_source import MechanismAuthoringSource
 
-        mechanism_text = str(self._get_mechanism_text() or "")
-        if not mechanism_text.strip():
+        reactions_text = str(self.mechanism_reactions_text_raw() or "")
+        state_network_text = str(self.mechanism_state_network_dsl_raw() or "")
+        if not reactions_text.strip() and not state_network_text.strip():
             return ()
         try:
-            mechanism_text = strip_named_reaction_dsl_initial_concentration_sets(mechanism_text)
+            reactions_text = strip_named_reaction_dsl_initial_concentration_sets(reactions_text)
         except Exception:
             logger.debug("Failed to parse current mechanism species roster for color sync", exc_info=True)
             return None
+        source = MechanismAuthoringSource.from_parts(
+            reactions_text=reactions_text,
+            state_network_dsl=state_network_text,
+        )
+        mechanism_text = source.full_dsl
 
         def _clean(names: Any) -> tuple[str, ...]:
             return tuple(str(name).strip() for name in (names or ()) if str(name).strip())
@@ -1076,10 +1747,34 @@ class MainWindow(
 
         try:
             from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+            from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
             from kindred.core.units import UnitsModel
 
-            units = UnitsModel(temperature_K=float(self._temperature_spinbox.value()))
-            mechanism = parse_dsl_to_mechanism(mechanism_text, initials={}, units=units)
+            temperature_k = float(self._temperature_spinbox.value())
+            units = UnitsModel(temperature_K=temperature_k)
+            wegscheider_enabled = bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled())
+
+            def _build_structure_snapshot(full_dsl: str) -> object:
+                mechanism_obj = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
+                if isinstance(getattr(mechanism_obj, "metadata", None), dict):
+                    mechanism_obj.metadata["wegscheider_cyclicity_enabled"] = wegscheider_enabled
+                _ = apply_parameter_algebra_to_mechanism(
+                    full_dsl,
+                    mechanism=mechanism_obj,
+                    require_mutable=False,
+                )
+                return mechanism_obj
+
+            mechanism = self._mechanism_helpers.authoritative_structure_snapshot(
+                source=source,
+                units_identity=(
+                    "temperature_K",
+                    f"{temperature_k:.17g}",
+                    "wegscheider",
+                    str(wegscheider_enabled),
+                ),
+                builder=_build_structure_snapshot,
+            ).mechanism
             return _clean(mechanism.species_names())
         except Exception:
             logger.debug("Failed to parse current mechanism species roster for color sync", exc_info=True)
@@ -1112,28 +1807,28 @@ class MainWindow(
     def _sync_overlay_catalog(self):
         """Propagate loaded datasets into the simulation overlay controls."""
         plot = getattr(self._plot_tabs, "_main_plot", None)
-        data_manager = getattr(self._right_panel, "_data_manager", None)
-        if plot is None or data_manager is None:
+        dataset_registry = getattr(self, "_dataset_registry", None)
+        if plot is None or dataset_registry is None:
             return
         if not hasattr(plot, "set_overlay_catalog"):
             return
         self._sync_color_manager_authoritative_roster()
-        plot.set_overlay_catalog(data_manager.get_datasets())
+        plot.set_overlay_catalog(dataset_registry.presentation_payloads_by_display_name())
 
     def _snapshot_datasets(self) -> Dict[str, Dict[str, Any]]:
         """Capture lightweight metadata about loaded datasets."""
-        data_manager = getattr(self._right_panel, "_data_manager", None)
-        if data_manager is None:
+        dataset_registry = getattr(self, "_dataset_registry", None)
+        if dataset_registry is None:
             return {}
 
         snapshot: Dict[str, Dict[str, Any]] = {}
-        for name, dataset in data_manager.get_datasets().items():
-            t = dataset.get("t")
-            species = dataset.get("species") or {}
-            num_points = int(len(np.asarray(t).reshape(-1))) if t is not None else 0
+        for name, dataset in dataset_registry.presentation_payloads_by_display_name().items():
+            observations = observations_from_payload(dataset)
+            t_values, _species_data = dense_view_from_observations(observations)
+            num_points = int(t_values.size)
             snapshot[name] = {
                 "num_points": num_points,
-                "species": list(species.keys()),
+                "species": list(observations.keys()),
             }
         return snapshot
 
@@ -1165,6 +1860,7 @@ class MainWindow(
         """Create the menu bar and shortcut customization registry."""
         self._shortcut_actions = {}
         menubar = self.menuBar()
+        self._menu_bar = menubar
 
         def add_items(menu: QtWidgets.QMenu, items: Sequence[Any]) -> None:
             for item in items:
@@ -1309,10 +2005,27 @@ class MainWindow(
         # menubar.addMenu(self._profiles_menu)
         # self._update_profiles_menu()
 
-        examples_menu = menubar.addMenu("E&xamples")
-        presets_submenu = examples_menu.addMenu("Preset Mechanisms")
+        examples_menu = QtWidgets.QMenu("E&xamples", self)
+        menubar.addMenu(examples_menu)
+        self._examples_menu = examples_menu
+        presets_submenu = QtWidgets.QMenu("Preset Mechanisms", examples_menu)
+        examples_menu.addMenu(presets_submenu)
+        self._preset_examples_menu = presets_submenu
         for preset_id in self._available_preset_ids():
             presets_submenu.addAction(preset_id, lambda pid=preset_id: self._load_preset_mechanism(pid))
+        intervention_examples_submenu = QtWidgets.QMenu("Intervention Examples", examples_menu)
+        examples_menu.addMenu(intervention_examples_submenu)
+        self._intervention_examples_menu = intervention_examples_submenu
+        for spec in self._available_intervention_example_specs():
+            example_id = str(spec["id"])
+            title = str(spec.get("title", "")).strip()
+            action_text = f"{example_id}: {title}" if title and title != example_id else example_id
+            action = intervention_examples_submenu.addAction(
+                action_text,
+                lambda _checked=False, eid=example_id: self._load_intervention_example(eid),
+            )
+            action.setData(example_id)
+            action.setObjectName(f"loadInterventionExample{example_id}Action")
         examples_menu.addSeparator()
         add_items(
             examples_menu,
@@ -1323,12 +2036,14 @@ class MainWindow(
         add_items(
             sim_menu,
             [
-                ("&Run", self._sim_controller.run_simulation, None, "runSimulationAction", "Run kinetic simulation with current mechanism (Ctrl+R or F5)", {"shortcuts": ["Ctrl+R", "F5"]}),
+                ("&Run", self._run_simulation_after_flushing_batch_initials, None, "runSimulationAction", "Run kinetic simulation with current mechanism (Ctrl+R or F5)", {"shortcuts": ["Ctrl+R", "F5"], "store_as": "_run_simulation_action"}),
                 ("&Stop", self._sim_controller.stop_simulation, "Esc", "stopSimulationAction", "Stop running simulation (Esc)"),
+                ("Symbolic Calculator...", self._open_symbolic_calculator_panel, None, "openSymbolicCalculatorAction", "Open Symbolic Calculator panel", {"store_as": "_symbolic_calculator_action"}),
                 None,
                 ("Simulation &Settings...", self._open_solver_settings, None, "simulationSettingsAction", "Configure solver tolerances and advanced simulation settings"),
             ],
         )
+        self._refresh_symbolic_calculator_state()
 
         fit_menu = menubar.addMenu("&Fitting")
         add_items(
@@ -1430,6 +2145,8 @@ class MainWindow(
 
         if store_as:
             setattr(self, store_as, action)
+        if object_name == "runSimulationAction":
+            self._simulation_run_ui_owner.bind_run_action(action)
         return action
 
     def _init_ribbon_host(self) -> None:
@@ -1503,10 +2220,13 @@ class MainWindow(
 
     def _connect_signals(self):
         """Connect signals between components."""
-        # Data manager signals
-        self._right_panel._data_manager.datasetLoaded.connect(self._on_dataset_loaded)
-        self._right_panel._data_manager.datasetRemoved.connect(self._on_dataset_removed)
-        self._right_panel._data_manager.loadFinished.connect(self._on_dataset_load_finished)
+        # Dataset import panel signals
+        self._dataset_import_panel.importCompleted.connect(
+            self._dataset_import_coordinator.handle_completion
+        )
+        self._dataset_import_panel.datasetRemovalRequested.connect(
+            self._dataset_import_coordinator.remove_dataset_by_id
+        )
 
         # Temperature mode indicator and authoritative mechanism consumers.
         reactions_widget = getattr(self._mechanism_editor, "_reactions_text", None)
@@ -1538,62 +2258,9 @@ class MainWindow(
             max_logs=int(max_logs),
         )
 
-    def _invalidate_slider_runtime(self):
-        """Mark the cached slider runtime as stale."""
-        self._variable_runtime.invalidate_slider_runtime()
-
-    @staticmethod
-    def _normalized_mechanism_text_for_invalidation_guard(text: str) -> str:
-        return "\n".join(" ".join(str(line).split()) for line in str(text or "").splitlines()).strip()
-
     def _on_authoritative_mechanism_input_changed(self) -> None:
-        """Invalidate stale displayed results when the authoritative mechanism changes."""
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is not None and bool(owner.edit_session_active):
-            return
-        if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
-            return
-        # Pending-init rewrite normalizes the DSL after a successful explicit run;
-        # it should not be treated like a new authoritative mechanism edit that
-        # evicts the result that just produced the rewrite.
-        if self._variable_runtime.suppress_slider_runtime_invalidation():
-            return
-        pending_init_rewrite = getattr(self, "_pending_init_migration_rewrite_for_invalidation", None)
-        pending_init_state_network = getattr(
-            self,
-            "_pending_init_migration_state_network_for_invalidation",
-            None,
-        )
-        if pending_init_rewrite is not None or pending_init_state_network is not None:
-            self._pending_init_migration_rewrite_for_invalidation = None
-            self._pending_init_migration_state_network_for_invalidation = None
-            if (
-                self._normalized_mechanism_text_for_invalidation_guard(self.mechanism_reactions_text_raw())
-                == self._normalized_mechanism_text_for_invalidation_guard(str(pending_init_rewrite))
-                and self._normalized_mechanism_text_for_invalidation_guard(self.mechanism_state_network_dsl_raw())
-                == self._normalized_mechanism_text_for_invalidation_guard(str(pending_init_state_network))
-            ):
-                return
-        self._invalidate_slider_runtime()
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        has_active_cache = bool(
-            batch_cache is not None
-            and (
-                str(batch_cache.active_cache_key or "").strip()
-                or str(batch_cache.active_preview_cache_key or "").strip()
-            )
-        )
-        has_displayed_selection = bool(
-            batch_cache is not None
-            and (
-                str(batch_cache.active_batch_set_id or "").strip()
-                or str(batch_cache.active_batch_set or "").strip()
-                or batch_cache.last_display_selection
-            )
-        )
-        if not (has_active_cache or has_displayed_selection or self.main_plot_has_data()):
-            return
-        self._invalidate_active_results_after_authoritative_mechanism_change()
+        """Apply the ordered lifecycle for an authoritative mechanism transition."""
+        self._apply_authoritative_mechanism_transition()
 
     def _parse_sim_time_seconds(self) -> float:
         raw = ""
@@ -1619,21 +2286,31 @@ class MainWindow(
         *,
         field_name: str,
         current_value: Optional[float],
-        default_value: float,
-    ) -> Optional[float]:
-        if value is None:
-            return None
+    ) -> float:
+        resolved = resolve_solver_tolerance(
+            value,
+            field_name=field_name,
+            current_value=current_value,
+            default_value=PROJECT_DEFAULTS[field_name],
+        )
         try:
             parsed = float(value)
         except (TypeError, ValueError):
-            fallback = current_value if current_value is not None else default_value
-            logger.warning("Invalid solver tolerance %s=%r; keeping %s", field_name, value, fallback)
-            return current_value
-        if not math.isfinite(parsed) or parsed <= 0.0:
-            fallback = current_value if current_value is not None else default_value
-            logger.warning("Invalid solver tolerance %s=%r; keeping %s", field_name, value, fallback)
-            return current_value
-        return float(parsed)
+            parsed = float("nan")
+        if (
+            value is None
+            or isinstance(value, bool)
+            or not math.isfinite(parsed)
+            or parsed <= 0.0
+            or parsed != resolved
+        ):
+            logger.warning(
+                "Invalid solver tolerance %s=%r; using resolved value %s",
+                field_name,
+                value,
+                resolved,
+            )
+        return resolved
 
     def _apply_solver_runtime_state(
         self,
@@ -1641,48 +2318,45 @@ class MainWindow(
         solver: object = _SOLVER_STATE_UNSET,
         rtol: object = _SOLVER_STATE_UNSET,
         atol: object = _SOLVER_STATE_UNSET,
-        sync_combo: bool = True,
     ) -> None:
         solver_contract = load_solver_contract()
 
         if solver is not _SOLVER_STATE_UNSET:
             solver_label = str(solver or "").strip() or solver_contract.default_solver_name
-            self._initial_solver = str(solver_label)
+            solver_method, _warning = solver_contract.normalize_solver_name(solver_label)
+            self._initial_solver = str(solver_method)
         if rtol is not _SOLVER_STATE_UNSET:
             self._initial_rtol = self._coerce_solver_tolerance(
                 rtol,
                 field_name="rtol",
                 current_value=self._initial_rtol,
-                default_value=1e-6,
             )
         if atol is not _SOLVER_STATE_UNSET:
             self._initial_atol = self._coerce_solver_tolerance(
                 atol,
                 field_name="atol",
                 current_value=self._initial_atol,
-                default_value=1e-12,
             )
 
-        if bool(sync_combo):
-            combo = getattr(self, "_solver_method_combo", None)
-            if combo is not None:
-                solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
-                combo.blockSignals(True)
-                try:
-                    idx = int(combo.findText(str(solver_label)))
-                    if idx >= 0:
-                        combo.setCurrentIndex(idx)
-                    else:
-                        default_idx = int(combo.findText(str(solver_contract.default_solver_name)))
-                        if default_idx >= 0:
-                            combo.setCurrentIndex(default_idx)
-                finally:
-                    combo.blockSignals(False)
+        combo = getattr(self, "_solver_method_combo", None)
+        if combo is not None:
+            solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
+            combo.blockSignals(True)
+            try:
+                idx = int(combo.findText(str(solver_label)))
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                else:
+                    default_idx = int(combo.findText(str(solver_contract.default_solver_name)))
+                    if default_idx >= 0:
+                        combo.setCurrentIndex(default_idx)
+            finally:
+                combo.blockSignals(False)
 
         self._update_solver_summary_label()
 
     def _on_solver_method_changed(self, v: str) -> None:
-        self._apply_solver_runtime_state(solver=str(v), sync_combo=False)
+        self._apply_solver_runtime_state(solver=str(v))
         if not self._suppress_preference_updates:
             self.config_controller.update_user_preference("solver", self._initial_solver)
 
@@ -1715,7 +2389,7 @@ class MainWindow(
         time_part = f"{sim_time:g} s" if isinstance(sim_time, float) else f"{sim_time_raw or '?'} s"
         summary = f"Solver: {solver_display} • rtol={rtol:.1e} • atol={atol:.1e} • Points: {points:,} • Time: {time_part}"
         if self._use_sparse_jacobian and str(solver_method).upper() in {"RADAU", "BDF"}:
-            summary += " • Sparse J"
+            summary += " • Symbolic J"
         self._solver_summary_label.setText(summary)
 
     def _on_temperature_user_edit(self, value: float) -> None:
@@ -1898,222 +2572,7 @@ class MainWindow(
 
     def _load_data_via_action(self) -> None:
         """Invoke the Data panel's Load dialog from the File menu."""
-        data_manager = getattr(self._right_panel, "_data_manager", None)
-        if data_manager is None:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Data Panel Unavailable",
-                "The Data panel is not available in the current layout."
-            )
-            return
-        data_manager.trigger_load_dialog()
-
-    def _on_dataset_loaded(self, name: str, data: dict):
-        """Handle dataset loaded from data manager."""
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
-
-        logger.info(f"Dataset loaded: {name}")
-
-        self._sync_color_manager_authoritative_roster()
-        try:
-            self._dataset_manager.register_dataset(name, data)
-        except DatasetManagerError as exc:
-            logger.warning(f"Dataset '{name}' missing usable species: {exc}")
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Dataset Skipped",
-                f"Dataset '{name}' cannot be visualized:\n\n{exc}"
-            )
-            return
-
-        self._status_label.setText(f"Dataset '{name}' loaded ({len(data['t'])} points)")
-        self._sync_overlay_catalog()
-        self._pending_import_batch_mapping_names.append(str(name))
-
-    def _on_dataset_load_finished(self, canceled: bool) -> None:
-        """Resolve post-import batch mapping after a dataset load cycle completes."""
-        if not self._pending_import_batch_mapping_names:
-            return
-        batch_store = getattr(self, "_batch_store", None)
-        batch_model = getattr(self, "_batch_model", None)
-        batch_store_rows = int(batch_store.row_count()) if batch_store is not None else 0
-        batch_model_rows = int(batch_model.rowCount()) if batch_model is not None else 0
-        if not (batch_store_rows > 0 or batch_model_rows > 0):
-            self._pending_import_batch_mapping_names.clear()
-            return
-
-        mechanism_species: List[str] = []
-        try:
-            mechanism_species = list((self._extract_mechanism_initials(self._get_mechanism_text()) or {}).keys())
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "main_window.import_batch_mapping.extract_mechanism_initials",
-                message="Failed to extract mechanism initials while preparing import-time batch mapping",
-                exc=exc,
-            )
-        try:
-            self.sync_batch_species_columns(mechanism_species)
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "main_window.import_batch_mapping.sync_batch_species_columns",
-                message="Failed to sync batch species columns while preparing import-time batch mapping",
-                exc=exc,
-            )
-
-        data_panel = getattr(self._right_panel, "_data_manager", None)
-        pending_names = list(dict.fromkeys(self._pending_import_batch_mapping_names))
-        self._pending_import_batch_mapping_names.clear()
-        for dataset_name in pending_names:
-            if data_panel is None:
-                break
-            dataset_payload = data_panel.get_dataset(str(dataset_name))
-            if dataset_payload is None:
-                continue
-            self._maybe_prompt_for_import_batch_mapping(str(dataset_name), dataset_payload, mechanism_species)
-
-    def _maybe_prompt_for_import_batch_mapping(
-        self,
-        dataset_name: str,
-        dataset_payload: Dict[str, Any],
-        mechanism_species: Sequence[str],
-    ) -> None:
-        from kindred.gui.fitting.batch_mapping import (
-            T0_SEED_TOL_S,
-            apply_batch_mapping_to_settings,
-            create_and_seed_batch_set,
-            default_batch_set_name_for_dataset,
-            pick_existing_batch_set,
-            prompt_dataset_batch_mapping_choice,
-            resolve_saved_batch_mapping,
-            select_batch_set,
-            unique_batch_set_name,
-        )
-
-        batch_store = getattr(self, "_batch_store", None)
-        batch_model = getattr(self, "_batch_model", None)
-        if batch_store is None or batch_model is None:
-            return
-        try:
-            self.sync_batch_species_columns(list(mechanism_species))
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "main_window.import_batch_mapping.sync_batch_species_columns",
-                message="Failed to sync batch species columns while preparing import-time batch mapping",
-                exc=exc,
-            )
-
-        settings = self._dataset_manager.get_fit_settings(str(dataset_name))
-        resolved = resolve_saved_batch_mapping(settings, batch_store)
-        if resolved.status == "mapped":
-            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-            return
-
-        batch_set_names = list(batch_store.set_names() or [])
-        if not batch_set_names:
-            return
-
-        create_set_name = unique_batch_set_name(
-            batch_set_names,
-            default_batch_set_name_for_dataset(str(dataset_name)) or str(dataset_name),
-        )
-        running_under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
-        action = prompt_dataset_batch_mapping_choice(
-            self,
-            str(dataset_name),
-            create_set_name,
-            title="Import Set Mapping",
-            skip_label="Skip",
-            skip_description="Leave this dataset unmapped",
-            running_under_pytest=running_under_pytest,
-            pytest_default_action="skip",
-        )
-        if action == "skip":
-            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-            return
-        if action == "map":
-            target_set = pick_existing_batch_set(
-                self,
-                str(dataset_name),
-                batch_set_names,
-                title="Map Dataset to Set",
-                empty_message_title="Import Set Mapping",
-                empty_message_text="No sets exist to map to. Create a set first.",
-            )
-            if not target_set:
-                self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-                return
-            apply_batch_mapping_to_settings(settings, batch_store, target_set)
-            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-            return
-
-        _row_idx, created, seeded = create_and_seed_batch_set(
-            dataset_name=str(dataset_name),
-            dataset_payload=dataset_payload,
-            mechanism_species=mechanism_species,
-            batch_store=batch_store,
-            batch_model=batch_model,
-            set_name=create_set_name,
-            record_failure=self._record_best_effort_failure,
-            failure_key_prefix="main_window.import_batch_mapping",
-        )
-        if created and not seeded and not mechanism_species:
-            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-            return
-        if created and batch_store is not None and not seeded:
-            try:
-                t_arr = np.asarray((dataset_payload or {}).get("t", []), dtype=float).reshape(-1)
-                t0 = float(t_arr[0]) if t_arr.size else float("nan")
-            except Exception:
-                t0 = float("nan")
-            if not (abs(t0) <= T0_SEED_TOL_S):
-                if running_under_pytest:
-                    response = QtWidgets.QMessageBox.StandardButton.Cancel
-                else:
-                    response = QtWidgets.QMessageBox.warning(
-                        self,
-                        "Import Set Mapping",
-                        (
-                            f"Dataset '{dataset_name}' does not start at t\u22480 "
-                            f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
-                            "OK: Map this dataset to the new zeroed set\n"
-                            "Cancel: Leave this dataset unmapped and edit the new set manually"
-                        ),
-                        QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
-                        QtWidgets.QMessageBox.StandardButton.Cancel,
-                    )
-                if response == QtWidgets.QMessageBox.StandardButton.Cancel:
-                    select_batch_set(
-                        batch_store,
-                        batch_model,
-                        getattr(self, "_batch_table", None),
-                        create_set_name,
-                        record_failure=self._record_best_effort_failure,
-                        failure_key_prefix="main_window.import_batch_mapping",
-                    )
-                    if not running_under_pytest:
-                        QtWidgets.QMessageBox.information(
-                            self,
-                            "Import Set Mapping",
-                            (
-                                f"Set '{create_set_name}' was created.\n\n"
-                                "Edit its initial concentrations in the Initial Conditions table, "
-                                "then map the dataset when it is ready."
-                            ),
-                        )
-                    self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-                    return
-        apply_batch_mapping_to_settings(settings, batch_store, create_set_name)
-        self._dataset_manager.update_fit_settings(str(dataset_name), settings)
-
-    def _on_dataset_removed(self, name: str):
-        """Handle dataset removal from the data manager."""
-        logger.info(f"Dataset removed: {name}")
-
-        removed_entry = self._dataset_manager.remove_dataset(name)
-
-        if removed_entry:
-            self._status_label.setText(f"Dataset '{name}' removed")
-        self._sync_overlay_catalog()
+        self._dataset_import_panel.trigger_load_dialog()
 
     def _scan_mechanism_parameters(self):
         """
@@ -2122,7 +2581,7 @@ class MainWindow(
         P2 ENHANCEMENT: Now uses caching to avoid re-scanning unchanged mechanisms.
         This improves performance, especially for large mechanisms.
         """
-        from kindred.gui.controllers.dataset_manager import DatasetManagerError
+        from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 
         mechanism_text = self._get_mechanism_text()
 
@@ -2135,8 +2594,8 @@ class MainWindow(
             return
 
         try:
-            self._dataset_manager.scan_mechanism_parameters(mechanism_text)
-        except DatasetManagerError as exc:
+            self._mechanism_parameter_scan_owner.scan_mechanism_parameters(mechanism_text)
+        except DatasetOwnerError as exc:
             QtWidgets.QMessageBox.information(
                 self,
                 "No Parameters Found",
@@ -2191,22 +2650,40 @@ class MainWindow(
     def _load_preset_mechanism(self, preset_id: str):
         """Load a bundled preset mechanism into the mechanism editor."""
         try:
-            from kindred.io.resources import get_preset_mechanism
-            from kindred.gui.undo_commands import SetMechanismTextCommand
+            from kindred.io.resources import get_preset_mechanism_source
 
-            mechanism_text = get_preset_mechanism(preset_id)
+            source = get_preset_mechanism_source(preset_id)
             if not self._guard_slider_transaction_invalidation(action_text=f"Loading preset {preset_id}"):
                 self._status_label.setText("Canceled preset load")
                 return
-            old_text = self._mechanism_editor._reactions_text.toPlainText()
-            command = SetMechanismTextCommand(
-                self._mechanism_editor._reactions_text,
-                mechanism_text,
-                old_text,
-                f"Load preset {preset_id}"
+            reconciled = self._initial_conditions_source_acceptance_owner.accept_importable_source(
+                source,
+                prompt_overwrite=True,
             )
-            self._undo_stack.push(command)
-            self._on_programmatic_mechanism_load()
+            if reconciled is None:
+                self._status_label.setText("Canceled preset load")
+                return
+            source = reconciled
+            previous_text_signal_suppress = bool(
+                getattr(self, "_suppress_programmatic_text_change_signals", False)
+            )
+            self._suppress_programmatic_text_change_signals = True
+            try:
+                self._mechanism_editor._set_validation_state("validating")
+            except Exception:
+                logger.debug("Failed to mark preset mechanism validation as pending", exc_info=True)
+            try:
+                self._set_authoritative_mechanism_editor_source(
+                    source,
+                    description=f"Load preset {preset_id}",
+                    apply_transition=False,
+                    transition_source="preset_load",
+                )
+                self._on_programmatic_mechanism_load()
+                if getattr(self._mechanism_editor, "_current_validation_state", "") == "validating":
+                    self._mechanism_editor._validate_dsl()
+            finally:
+                self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
             self._status_label.setText(f"Loaded preset mechanism: {preset_id}")
             logger.info(f"Loaded preset mechanism: {preset_id}")
 
@@ -2218,16 +2695,62 @@ class MainWindow(
                 f"Failed to load preset mechanism {preset_id}:\n\n{e}"
             )
 
+    def _load_intervention_example(self, example_id: str):
+        """Load a bundled intervention example into the mechanism editor."""
+        try:
+            from kindred.io.resources import get_intervention_example_source
+
+            source = get_intervention_example_source(example_id)
+            if not self._guard_slider_transaction_invalidation(action_text=f"Loading intervention example {example_id}"):
+                self._status_label.setText("Canceled intervention example load")
+                return
+            reconciled = self._initial_conditions_source_acceptance_owner.accept_importable_source(
+                source,
+                prompt_overwrite=True,
+            )
+            if reconciled is None:
+                self._status_label.setText("Canceled intervention example load")
+                return
+            source = reconciled
+            previous_text_signal_suppress = bool(
+                getattr(self, "_suppress_programmatic_text_change_signals", False)
+            )
+            self._suppress_programmatic_text_change_signals = True
+            try:
+                self._mechanism_editor._set_validation_state("validating")
+            except Exception:
+                logger.debug("Failed to mark intervention example validation as pending", exc_info=True)
+            try:
+                self._set_authoritative_mechanism_editor_source(
+                    source,
+                    description=f"Load intervention example {example_id}",
+                    apply_transition=False,
+                    transition_source="intervention_example_load",
+                )
+                self._on_programmatic_mechanism_load()
+                if getattr(self._mechanism_editor, "_current_validation_state", "") == "validating":
+                    self._mechanism_editor._validate_dsl()
+            finally:
+                self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
+            self._status_label.setText(f"Loaded intervention example: {example_id}")
+            logger.info("Loaded intervention example: %s", example_id)
+
+        except Exception as e:
+            logger.error("Failed to load intervention example %s: %s", example_id, e, exc_info=True)
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Load Error",
+                f"Failed to load intervention example {example_id}:\n\n{e}",
+            )
+
     def _open_template_manager(self):
         """Open template manager dialog."""
         from kindred.gui.widgets.template_manager_dialog import TemplateManagerDialog
 
-        current_text = self._mechanism_editor._reactions_text.toPlainText()
-
         dialog = TemplateManagerDialog(
             parent=self,
             template_manager=self._template_manager,
-            current_mechanism_text=current_text
+            current_mechanism_source=self._current_visible_mechanism_source(),
         )
 
         # Connect signal to load template
@@ -2235,28 +2758,137 @@ class MainWindow(
 
         dialog.exec()
 
-    def _load_template_from_manager(self, mechanism_text: str):
+    def _open_mechanism_inspector(self) -> None:
+        """Open a read-only inspector for the current mechanism text."""
+        from kindred.gui.widgets.mechanism_inspector import MechanismInspectorDialog
+
+        text = self._current_mechanism_inspector_source()
+        dialog = MechanismInspectorDialog(text, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._mechanism_inspector_dialog = dialog
+        dialog.show()
+
+    def _current_mechanism_inspector_source(self) -> str:
+        return str(self._current_visible_mechanism_source().full_dsl)
+
+    def _current_visible_mechanism_source(self):
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        if bool(owner.edit_session_active):
+            self._sync_mechanism_session_owner_from_widgets(authoritative=False)
+            return owner.draft_source
+        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        return owner.canonical_source
+
+    def _load_template_from_manager(self, source):
         """Load template from template manager."""
-        from kindred.gui.undo_commands import SetMechanismTextCommand
+        from kindred.core.mechanism_source import MechanismAuthoringSource
 
         if not self._guard_slider_transaction_invalidation(action_text="Loading this template"):
             self._status_label.setText("Canceled template load")
             return
 
-        old_text = self._mechanism_editor._reactions_text.toPlainText()
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("Template load requires a complete mechanism source.")
 
-        # Create undo command
-        command = SetMechanismTextCommand(
-            self._mechanism_editor._reactions_text,
-            mechanism_text,
-            old_text,
-            "Load template"
+        previous_text_signal_suppress = bool(
+            getattr(self, "_suppress_programmatic_text_change_signals", False)
         )
-        self._undo_stack.push(command)
-        self._on_programmatic_mechanism_load()
+        self._suppress_programmatic_text_change_signals = True
+        try:
+            reconciled = self._initial_conditions_source_acceptance_owner.accept_importable_source(
+                source,
+                prompt_overwrite=True,
+            )
+            if reconciled is None:
+                self._status_label.setText("Canceled template load")
+                return
+            source = reconciled
+            self._set_authoritative_mechanism_editor_source(
+                source,
+                description="Load template",
+                apply_transition=False,
+                transition_source="template_load",
+            )
+            self._on_programmatic_mechanism_load()
+        finally:
+            self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
 
         self._status_label.setText("Loaded template from Template Manager")
         logger.info("Loaded template from Template Manager")
+
+    def _confirm_initial_condition_import_overwrite(self, set_names: Sequence[str]) -> bool:
+        names = ", ".join(str(name) for name in set_names if str(name))
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("Overwrite Initial Conditions?")
+        box.setText(f"Apply mechanism-text Initial Conditions to: {names}")
+        box.setInformativeText(
+            "Existing values in those set(s) will be overwritten. Other Initial Conditions sets are preserved."
+        )
+        cancel_button = box.addButton(QtWidgets.QMessageBox.Cancel)
+        apply_button = box.addButton("Apply", QtWidgets.QMessageBox.AcceptRole)
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is apply_button
+
+    def _show_initial_conditions_reconciliation_error(self, message: str) -> None:
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Initial Conditions Import Error",
+            str(message or "Initial Conditions could not be reconciled."),
+        )
+
+    def _notify_batch_initial_rows_changed(self, rows: Sequence[int]) -> None:
+        batch_model = getattr(self, "_batch_model", None)
+        batch_store = getattr(self, "_batch_store", None)
+        if batch_model is None or batch_store is None:
+            return
+        store = getattr(batch_model, "store", None)
+        if callable(store):
+            try:
+                if store() is not batch_store:
+                    return
+            except Exception:
+                return
+        notify_rows_changed = getattr(batch_model, "notify_rows_changed", None)
+        if not callable(notify_rows_changed):
+            return
+        try:
+            notify_rows_changed([int(row) for row in rows])
+        except Exception:
+            logger.debug("Failed to notify batch model after migrated initial concentration rows changed", exc_info=True)
+
+    def _notify_canonical_batch_initial_rows_changed(
+        self,
+        rows: Sequence[int],
+        transition_source: str,
+        discard_dirty_preview: bool,
+    ) -> None:
+        batch_model = getattr(self, "_batch_model", None)
+        if batch_model is None or not hasattr(batch_model, "emit_canonical_initials_changed"):
+            return
+        affected_set_ids = tuple(
+            dict.fromkeys(
+                str(self._batch_set_id_for_row(int(row)) or "").strip()
+                for row in rows or ()
+                if str(self._batch_set_id_for_row(int(row)) or "").strip()
+            )
+        )
+        if not affected_set_ids:
+            return
+        try:
+            batch_model.emit_canonical_initials_changed(
+                affected_set_ids=affected_set_ids,
+                transition_source=str(transition_source or "initial_conditions_import_reconciliation"),
+                discard_dirty_preview=bool(discard_dirty_preview),
+            )
+        except Exception:
+            logger.debug(
+                "Failed to emit canonical batch initials transition after migrated rows changed",
+                exc_info=True,
+            )
 
     def _load_custom_shortcuts(self, shortcuts_dict: dict):
         """
@@ -2364,6 +2996,7 @@ class MainWindow(
         from kindred.core.batch_initial_conditions import (
             strip_named_reaction_dsl_initial_concentration_sets,
         )
+        from kindred.core.simulator.algebra_section import is_algebra_line
 
         text = self._mechanism_editor._reactions_text.toPlainText()
         if not text.strip():
@@ -2375,22 +3008,15 @@ class MainWindow(
             logger.warning("Failed to preprocess DSL for species registry: %s", exc, exc_info=True)
             return [], f"DSL parse error: {exc}"
 
-        algebra_guard = False
         invalid_line: Optional[str] = None
         for raw in parse_text.splitlines():
             stripped = raw.strip()
             if not stripped:
                 continue
             lower = stripped.lower()
-            if lower.startswith("# algebra"):
-                algebra_guard = True
-                continue
             if stripped.startswith("#"):
-                if algebra_guard:
-                    algebra_guard = False
                 continue
-            if algebra_guard:
-                # Allow arbitrary algebra expressions
+            if is_algebra_line(raw):
                 continue
             if lower.startswith(
                 (
@@ -2717,7 +3343,7 @@ class MainWindow(
         QtWidgets.QMessageBox.information(
             self,
             "Panel Layout Tips",
-            "Use View > Panels to show or hide the Mechanism, Interactive Sliders, Initial Conditions, Data, and Analysis panels.\n\n"
+            "Use View > Panels to show or hide the Mechanism, Symbolic Calculator, Interactive Sliders, Initial Conditions, Data, and Analysis panels.\n\n"
             "To place panels together on the same side, drag a panel by its title bar and pause over an occupied "
             "dock area until Qt shows an inner drop guide. Dropping there lets that side share space with the "
             "existing panel.\n\n"
@@ -2765,7 +3391,8 @@ class MainWindow(
         batch_dock = getattr(self, "_batch_dock", None)
         data_dock = getattr(self, "_right_dock", None)
         analysis_dock = getattr(self, "_analysis_dock", None)
-        if not all(dock is not None for dock in (mechanism_dock, sliders_dock, batch_dock, data_dock, analysis_dock)):
+        symbolic_dock = getattr(self, "_symbolic_calculator_dock", None)
+        if not all(dock is not None for dock in (mechanism_dock, sliders_dock, batch_dock, data_dock, analysis_dock, symbolic_dock)):
             return
 
         # Left column: Mechanism (top), Interactive Sliders (bottom).
@@ -2774,6 +3401,7 @@ class MainWindow(
         # Right column: Initial Conditions (top), Data and Analysis tabified (bottom).
         self.splitDockWidget(batch_dock, data_dock, Qt.Vertical)
         self.tabifyDockWidget(data_dock, analysis_dock)
+        self.tabifyDockWidget(data_dock, symbolic_dock)
         data_dock.raise_()
 
     def schedule_restored_floating_dock_recovery(self) -> None:
@@ -2927,13 +3555,10 @@ class MainWindow(
 
     def _get_mechanism_text(self) -> str:
         """Get the canonical mechanism DSL text."""
-        reactions_text = self.mechanism_reactions_text_raw()
-        state_network_dsl = self.mechanism_state_network_dsl_raw()
-        full_dsl = reactions_text
-        if state_network_dsl.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_dsl
-
-        return full_dsl
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        return str(owner.canonical_full_dsl)
 
     def _remember_last_mechanism(
         self,
@@ -2950,632 +3575,72 @@ class MainWindow(
         """Drop cached mechanism so exports cannot use stale results."""
         self._mechanism_helpers.clear_last_mechanism()
 
-    def _clear_main_plot_display_state(self) -> None:
-        """Clear the visible simulation plot while leaving mechanism controls untouched."""
-        plot = self.main_plot()
-        setattr(plot, "_workspace_preview_display_provenance_by_set_id", {})
-        if hasattr(plot, "clear"):
-            plot.clear()
-        if hasattr(plot, "set_statistics_results"):
-            plot.set_statistics_results({}, prefer="")
-
-    def _clear_main_plot_project_apply_state(self) -> None:
-        """Clear simulation-plot state that is not serialized into project files."""
-        self._clear_main_plot_display_state()
-
-    def _clear_batch_selection_display_state(self) -> None:
-        """Drop the active displayed batch selection without discarding cache ownership state."""
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        if batch_cache is not None:
-            clear_display = getattr(batch_cache, "clear_display_selection_state", None)
-            if callable(clear_display):
-                clear_display()
-            else:
-                batch_cache.last_display_selection = []
-                batch_cache.active_batch_set = None
-                batch_cache.active_batch_set_id = None
-        self._clear_main_plot_display_state()
-        self.show_simulation_tab()
-        self.refresh_simulation_plot_views()
-
-    def _batch_cache_entry_matches_plot_payload(
+    def _apply_authoritative_result_truth_effects(
         self,
         *,
-        entry: Optional[Mapping[str, Any]],
-        t: np.ndarray,
-        series: Mapping[str, Any],
-    ) -> bool:
-        if not isinstance(entry, Mapping):
-            return False
-        entry_t_payload = entry.get("t")
-        entry_t = np.asarray(entry_t_payload if entry_t_payload is not None else [], dtype=float).reshape(-1)
-        plot_t = np.asarray(t, dtype=float).reshape(-1)
-        if entry_t.size <= 0 or entry_t.shape != plot_t.shape:
-            return False
-        if not np.allclose(entry_t, plot_t, rtol=1e-9, atol=1e-12):
-            return False
-        entry_series_raw = entry.get("series") or {}
-        if not isinstance(entry_series_raw, Mapping):
-            return False
-        plot_series = {
-            str(species_name): np.asarray(values, dtype=float).reshape(-1)
-            for species_name, values in dict(series or {}).items()
-        }
-        entry_series = {
-            str(species_name): np.asarray(values, dtype=float).reshape(-1)
-            for species_name, values in dict(entry_series_raw).items()
-        }
-        if set(entry_series.keys()) != set(plot_series.keys()):
-            return False
-        for species_name, plot_values in plot_series.items():
-            entry_values = entry_series.get(str(species_name))
-            if entry_values is None or entry_values.shape != plot_values.shape:
-                return False
-            if not np.allclose(entry_values, plot_values, rtol=1e-9, atol=1e-12):
-                return False
-        return True
-
-    def _active_explicit_cache_entry_for_set(self, *, set_id: str) -> BatchCacheEntryReadResult:
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-        if batch_cache is None or not active_cache_key:
-            return BatchCacheEntryReadResult("missing")
-        sid = str(set_id or "").strip()
-        if not sid:
-            return BatchCacheEntryReadResult("missing")
-        store_data = getattr(batch_cache.result_cache, "_data", batch_cache.result_cache)
-        direct = read_batch_cache_entry(
-            (store_data or {}).get(BatchSimulationCache.entry_key(active_cache_key, sid))
-        )
-        if direct.entry is not None:
-            return direct
-        set_name = self.batch_set_name_for_id(sid)
-        by_name = BatchCacheEntryReadResult("missing")
-        if set_name:
-            by_name = read_batch_cache_entry(
-                (store_data or {}).get(BatchSimulationCache.entry_key(active_cache_key, str(set_name)))
-            )
-            if by_name.entry is not None:
-                return by_name
-        if direct.state == "invalid" or by_name.state == "invalid":
-            return BatchCacheEntryReadResult("invalid")
-        return BatchCacheEntryReadResult("missing")
-
-    def _current_workspace_preview_identity_payload(self, *, set_id: str) -> Optional[Dict[str, Any]]:
-        sid = str(set_id or "").strip()
-        if not sid:
-            return None
-        try:
-            identity = self._current_workspace_preview_identity(set_id=sid)
-        except Exception:
-            return None
-        try:
-            return dict(identity.to_payload())
-        except Exception:
-            return None
-
-    def _main_plot_workspace_preview_provenance(self) -> Dict[str, Dict[str, Any]]:
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        raw = getattr(plot, "_workspace_preview_display_provenance_by_set_id", None) if plot is not None else None
-        if not isinstance(raw, Mapping):
-            return {}
-        cleaned: Dict[str, Dict[str, Any]] = {}
-        for raw_set_id, raw_payload in dict(raw).items():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id or not isinstance(raw_payload, Mapping):
-                continue
-            cleaned[set_id] = dict(raw_payload)
-        return cleaned
-
-    def _set_main_plot_workspace_preview_provenance(
-        self,
-        provenance_by_set_id: Mapping[str, Mapping[str, Any]],
+        cache_stale_set_ids: Sequence[str] = (),
+        cache_stale_scope_is_global: bool = True,
+        display_clear_set_ids: Sequence[str] = (),
+        display_clear_scope_is_global: bool = True,
+        clear_cached_mechanism: bool = True,
     ) -> None:
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return
-        cleaned: Dict[str, Dict[str, Any]] = {}
-        for raw_set_id, raw_payload in dict(provenance_by_set_id or {}).items():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id or not isinstance(raw_payload, Mapping):
-                continue
-            cleaned[set_id] = dict(raw_payload)
-        setattr(plot, "_workspace_preview_display_provenance_by_set_id", cleaned)
-
-    def _displayed_workspace_preview_provenance_matches_current_workspace(self, *, set_id: str) -> bool:
-        sid = str(set_id or "").strip()
-        if not sid:
-            return False
-        current_payload = self._current_workspace_preview_identity_payload(set_id=sid)
-        if not isinstance(current_payload, dict):
-            return False
-        stored_payload = self._main_plot_workspace_preview_provenance().get(sid)
-        return isinstance(stored_payload, dict) and stored_payload == current_payload
-
-    def _record_current_main_plot_workspace_preview_provenance(
-        self,
-        *,
-        selected_set_ids: Sequence[str],
-    ) -> None:
-        selected_ids = [str(set_id) for set_id in (selected_set_ids or ()) if str(set_id)]
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None or not selected_ids:
-            self._set_main_plot_workspace_preview_provenance({})
-            return
-
-        active_set_id = str(self.active_batch_selection()[0] or "").strip()
-        if (not active_set_id) and selected_ids:
-            active_set_id = selected_ids[0]
-        if not active_set_id:
-            self._set_main_plot_workspace_preview_provenance({})
-            return
-
-        current_t_raw = getattr(plot, "_t", None)
-        current_t = np.asarray(current_t_raw if current_t_raw is not None else [], dtype=float).reshape(-1)
-        current_series = dict(getattr(plot, "_series", {}) or {})
-        if current_t.size <= 0 or not current_series:
-            self._set_main_plot_workspace_preview_provenance({})
-            return
-
-        selected_local_workspace_ids = {
-            set_id for set_id in selected_ids if self._preview_session.has_local_mechanism_workspace(set_id)
-        }
-        selected_overlay_dirty_ids: set[str] = set()
-        for set_id in selected_ids:
-            try:
-                row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-            except Exception:
-                row = None
-            if row is not None:
-                try:
-                    if bool(self._preview_session.preview_batch_cache_token([int(row)])):
-                        selected_overlay_dirty_ids.add(str(set_id))
-                except Exception:
-                    continue
-
-        selected_dirty_overlay_ids = {
-            str(set_id)
-            for set_id in selected_ids
-            if str(set_id)
-            and (
-                str(set_id) in selected_local_workspace_ids
-                or str(set_id) in selected_overlay_dirty_ids
-            )
-        }
-        provenance_by_set_id: Dict[str, Dict[str, Any]] = {}
-        active_requires_truthful_dirty_preview = bool(
-            active_set_id in selected_local_workspace_ids or active_set_id in selected_overlay_dirty_ids
-        )
-        if active_requires_truthful_dirty_preview:
-            active_preview_entry = self._matching_preview_entry_for_workspace_set(set_id=active_set_id)
-            if self._batch_cache_entry_matches_plot_payload(
-                entry=active_preview_entry.entry,
-                t=current_t,
-                series=current_series,
-            ):
-                active_payload = self._current_workspace_preview_identity_payload(set_id=active_set_id)
-                if isinstance(active_payload, dict):
-                    provenance_by_set_id[active_set_id] = active_payload
-
-        overlay_label_to_set_id: Dict[str, str] = {}
-        for set_id in selected_ids:
-            set_id_s = str(set_id or "").strip()
-            if not set_id_s:
-                continue
-            overlay_label_to_set_id[set_id_s] = set_id_s
-            set_name = str(self.batch_set_name_for_id(set_id_s) or "").strip()
-            if set_name:
-                overlay_label_to_set_id[set_name] = set_id_s
-        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-            if not isinstance(entry, dict):
-                continue
-            overlay_label = str(entry.get("label") or "").strip()
-            overlay_set_id = str(entry.get("set_id") or "").strip() or overlay_label_to_set_id.get(overlay_label, "")
-            if not overlay_set_id or overlay_set_id not in selected_dirty_overlay_ids:
-                continue
-            overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
-            overlay_series_raw = entry.get("series") or {}
-            if overlay_t.size <= 0 or not isinstance(overlay_series_raw, dict):
-                continue
-            overlay_series: Dict[str, np.ndarray] = {}
-            for species_name, values in overlay_series_raw.items():
-                overlay_arr = np.asarray(values, dtype=float).reshape(-1)
-                if overlay_arr.size <= 0:
-                    continue
-                overlay_series[str(species_name)] = overlay_arr
-            if not overlay_series:
-                continue
-            overlay_preview_entry = self._matching_preview_entry_for_workspace_set(set_id=overlay_set_id)
-            if not self._batch_cache_entry_matches_plot_payload(
-                entry=overlay_preview_entry.entry,
-                t=overlay_t,
-                series=overlay_series,
-            ):
-                continue
-            overlay_payload = self._current_workspace_preview_identity_payload(set_id=overlay_set_id)
-            if isinstance(overlay_payload, dict):
-                provenance_by_set_id[overlay_set_id] = overlay_payload
-
-        self._set_main_plot_workspace_preview_provenance(provenance_by_set_id)
-
-    def _active_workspace_preview_display_snapshot(self) -> Optional[Dict[str, Any]]:
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        if batch_cache is None or not self.main_plot_has_data():
-            return None
-
-        active_set_id = str(batch_cache.active_batch_set_id or "").strip()
-        if not active_set_id:
-            return None
-
-        selected_ids = [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)]
-        if not selected_ids:
-            selected_ids = [str(set_id) for set_id in (self._shown_batch_set_ids() or []) if str(set_id)]
-        if active_set_id not in selected_ids:
-            selected_ids = [active_set_id, *[set_id for set_id in selected_ids if set_id != active_set_id]]
-
-        selected_local_workspace_ids = {
-            set_id for set_id in selected_ids if self._preview_session.has_local_mechanism_workspace(set_id)
-        }
-        selected_overlay_dirty_ids: set[str] = set()
-        row_for_set_id = getattr(getattr(self, "_batch_store", None), "row_for_set_id", None)
-        if callable(row_for_set_id):
-            for set_id in selected_ids:
-                try:
-                    row = row_for_set_id(str(set_id))
-                except Exception:
-                    row = None
-                if row is None:
-                    continue
-                try:
-                    if bool(self._preview_session.preview_batch_cache_token([int(row)])):
-                        selected_overlay_dirty_ids.add(str(set_id))
-                except Exception:
-                    continue
-
-        active_has_local_mechanism_workspace = active_set_id in selected_local_workspace_ids
-        active_has_dirty_overlay = active_set_id in selected_overlay_dirty_ids
-        if not (active_has_local_mechanism_workspace or selected_overlay_dirty_ids):
-            return None
-
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return None
-
-        run_state = getattr(getattr(self, "_sim_controller", None), "run_state", None)
-        if bool(getattr(run_state, "pending_slider_simulation", False)):
-            return None
-
-        current_t_raw = getattr(plot, "_t", None)
-        current_t = np.asarray(current_t_raw if current_t_raw is not None else [], dtype=float).reshape(-1)
-        if current_t.size <= 0:
-            return None
-
-        current_series = dict(getattr(plot, "_series", {}) or {})
-        if not current_series:
-            return None
-
-        active_plot_is_truthful_dirty_preview = False
-        active_requires_truthful_dirty_preview = (
-            active_has_local_mechanism_workspace or active_has_dirty_overlay
-        )
-        if active_requires_truthful_dirty_preview:
-            active_preview_entry = self._matching_preview_entry_for_workspace_set(set_id=active_set_id)
-            active_plot_is_truthful_dirty_preview = self._batch_cache_entry_matches_plot_payload(
-                entry=active_preview_entry.entry,
-                t=current_t,
-                series=current_series,
-            )
-            if not active_plot_is_truthful_dirty_preview:
-                active_plot_is_truthful_dirty_preview = self._displayed_workspace_preview_provenance_matches_current_workspace(
-                    set_id=active_set_id,
-                )
-
-        selected_dirty_overlay_ids = {
-            str(set_id)
-            for set_id in selected_ids
-            if str(set_id)
-            and str(set_id) != active_set_id
-            and (
-                str(set_id) in selected_local_workspace_ids
-                or str(set_id) in selected_overlay_dirty_ids
-            )
-        }
-        preserved_overlays: list[Dict[str, object]] = []
-        if selected_ids and selected_dirty_overlay_ids:
-            overlay_label_to_set_id: Dict[str, str] = {}
-            truthful_preserved_preview_set_ids: set[str] = set()
-            for set_id in selected_ids:
-                set_id_s = str(set_id or "").strip()
-                if not set_id_s:
-                    continue
-                overlay_label_to_set_id[set_id_s] = set_id_s
-                set_name = str(self.batch_set_name_for_id(set_id_s) or "").strip()
-                if set_name:
-                    overlay_label_to_set_id[set_name] = set_id_s
-            for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-                if not isinstance(entry, dict):
-                    continue
-                overlay_label = str(entry.get("label") or "").strip()
-                overlay_set_id = str(entry.get("set_id") or "").strip() or overlay_label_to_set_id.get(overlay_label, "")
-                overlay_curve_role = str(entry.get("curve_role") or "").strip()
-                if not overlay_label or not overlay_set_id or overlay_set_id not in selected_dirty_overlay_ids:
-                    continue
-                overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
-                overlay_series_raw = entry.get("series") or {}
-                if overlay_t.size <= 0 or not isinstance(overlay_series_raw, dict):
-                    continue
-                overlay_series: Dict[str, np.ndarray] = {}
-                for species_name, values in overlay_series_raw.items():
-                    overlay_arr = np.asarray(values, dtype=float).reshape(-1)
-                    if overlay_arr.size <= 0:
-                        continue
-                    overlay_series[str(species_name)] = overlay_arr
-                if not overlay_series:
-                    continue
-                explicit_overlay_entry = self._active_explicit_cache_entry_for_set(set_id=overlay_set_id)
-                overlay_matches_explicit = self._batch_cache_entry_matches_plot_payload(
-                    entry=explicit_overlay_entry.entry,
-                    t=overlay_t,
-                    series=overlay_series,
-                )
-                if overlay_curve_role == "canonical_ghost":
-                    if (
-                        overlay_set_id == active_set_id
-                        or not overlay_matches_explicit
-                        or overlay_set_id not in truthful_preserved_preview_set_ids
-                    ):
-                        continue
-                else:
-                    overlay_preview_entry = self._matching_preview_entry_for_workspace_set(set_id=overlay_set_id)
-                    overlay_is_truthful_dirty_preview = self._batch_cache_entry_matches_plot_payload(
-                        entry=overlay_preview_entry.entry,
-                        t=overlay_t,
-                        series=overlay_series,
-                    )
-                    if not overlay_is_truthful_dirty_preview:
-                        overlay_is_truthful_dirty_preview = self._displayed_workspace_preview_provenance_matches_current_workspace(
-                            set_id=overlay_set_id,
-                        )
-                    if not overlay_is_truthful_dirty_preview or overlay_matches_explicit:
-                        continue
-                    truthful_preserved_preview_set_ids.add(overlay_set_id)
-                preserved_entry = {
-                    "label": overlay_label,
-                    "t": overlay_t,
-                    "series": overlay_series,
-                    "set_id": overlay_set_id,
-                }
-                if overlay_curve_role:
-                    preserved_entry["curve_role"] = overlay_curve_role
-                preserved_overlays.append(preserved_entry)
-
-        active_canonical_ghost: Dict[str, object] | None = None
-        if active_plot_is_truthful_dirty_preview:
-            explicit_active_entry = self._active_explicit_cache_entry_for_set(set_id=active_set_id)
-            for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-                if not isinstance(entry, dict):
-                    continue
-                if str(entry.get("curve_role") or "").strip() != "canonical_ghost":
-                    continue
-                if str(entry.get("set_id") or "").strip() != active_set_id:
-                    continue
-                overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
-                overlay_series_raw = entry.get("series") or {}
-                if overlay_t.size <= 0 or not isinstance(overlay_series_raw, dict):
-                    continue
-                overlay_series: Dict[str, np.ndarray] = {}
-                for species_name, values in overlay_series_raw.items():
-                    overlay_arr = np.asarray(values, dtype=float).reshape(-1)
-                    if overlay_arr.size <= 0:
-                        continue
-                    overlay_series[str(species_name)] = overlay_arr
-                if not overlay_series:
-                    continue
-                if not self._batch_cache_entry_matches_plot_payload(
-                    entry=explicit_active_entry.entry,
-                    t=overlay_t,
-                    series=overlay_series,
-                ):
-                    continue
-                active_canonical_ghost = {
-                    "label": str(entry.get("label") or "").strip(),
-                    "t": overlay_t,
-                    "series": overlay_series,
-                    "set_id": active_set_id,
-                    "curve_role": "canonical_ghost",
-                }
-                break
-
-        if active_canonical_ghost is not None:
-            preserved_overlays.append(active_canonical_ghost)
-
-        if active_requires_truthful_dirty_preview and (not active_plot_is_truthful_dirty_preview):
-            return None
-        if (not active_plot_is_truthful_dirty_preview) and (not preserved_overlays):
-            return None
-
-        return {
-            "set_id": active_set_id,
-            "set_name": str(batch_cache.active_batch_set or self.batch_set_name_for_id(active_set_id) or active_set_id),
-            "selected_ids": selected_ids,
-            "preserved_overlays": preserved_overlays,
-        }
-
-    def _invalidate_active_results_after_authoritative_mechanism_change(
-        self,
-        *,
-        preserve_current_display: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Drop stale displayed results after the authoritative mechanism changes."""
-        self._clear_last_mechanism()
-        self._sim_controller.invalidate_active_explicit_simulation_for_authoritative_change()
-        self._sim_controller.invalidate_slider_preview_work()
-
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        if batch_cache is None:
-            return
-
-        active_cache_key = str(batch_cache.active_cache_key or "").strip()
-        selected_ids = [str(set_id) for set_id in (self._shown_batch_set_ids() or []) if str(set_id)]
+        if bool(clear_cached_mechanism):
+            self._clear_last_mechanism()
+        active_cache_key = self._simulation_batch_owner.active_cache_key()
         if active_cache_key:
-            fallback_scope = ()
-            cached_scope_ids: list[str] = []
-            try:
-                for raw_key in batch_cache.result_cache:
-                    key_s = str(raw_key or "")
-                    prefix = f"{active_cache_key}::"
-                    if not key_s.startswith(prefix):
-                        continue
-                    set_id = str(key_s[len(prefix):] or "").strip()
-                    if set_id and set_id not in cached_scope_ids:
-                        cached_scope_ids.append(set_id)
-            except Exception:
-                cached_scope_ids = []
-            active_valid_ids = tuple(str(set_id) for set_id in (batch_cache.active_cache_valid_set_ids or ()) if str(set_id))
-            if cached_scope_ids:
-                fallback_scope = tuple(cached_scope_ids)
-            elif active_valid_ids:
-                fallback_scope = active_valid_ids
-            elif selected_ids:
-                fallback_scope = tuple(selected_ids)
-            elif batch_cache.last_display_selection:
-                fallback_scope = tuple(str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id))
-            else:
-                active_batch_set_id = str(batch_cache.active_batch_set_id or "").strip()
-                fallback_scope = (active_batch_set_id,) if active_batch_set_id else ()
-            batch_cache.active_cache_invalidated_set_ids = fallback_scope or None
-            clear_display = getattr(batch_cache, "clear_display_selection_state", None)
-            if callable(clear_display):
-                clear_display()
-            else:
-                batch_cache.last_display_selection = []
-                batch_cache.active_batch_set = None
-                batch_cache.active_batch_set_id = None
-        if preserve_current_display and self.main_plot_has_data():
-            preserved_set_id = str(preserve_current_display.get("set_id") or "").strip()
-            preserved_set_name = str(preserve_current_display.get("set_name") or "").strip()
-            preserved_selected_ids = [
-                str(set_id) for set_id in (preserve_current_display.get("selected_ids") or ()) if str(set_id)
-            ]
-            preserved_overlays = [
-                dict(entry)
-                for entry in (preserve_current_display.get("preserved_overlays") or ())
-                if isinstance(entry, dict)
-            ]
-            plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-            plot_t = np.asarray(getattr(plot, "_t", None) if plot is not None else [], dtype=float).reshape(-1)
-            plot_series = dict(getattr(plot, "_series", {}) or {}) if plot is not None else {}
-            plot_owned_species = getattr(plot, "_owned_species", None) if plot is not None else None
-            plot_has_overlays = bool(getattr(plot, "_simulation_overlays", []) or []) if plot is not None else False
-            preserve_multiselect_overlays = bool(preserved_overlays)
-            if preserved_set_id:
-                batch_cache.active_batch_set_id = preserved_set_id
-                batch_cache.active_batch_set = preserved_set_name or str(
-                    self.batch_set_name_for_id(preserved_set_id) or preserved_set_id
-                )
-                if preserve_multiselect_overlays and preserved_selected_ids:
-                    batch_cache.last_display_selection = preserved_selected_ids
-                else:
-                    batch_cache.last_display_selection = [preserved_set_id]
-            elif preserved_selected_ids:
-                batch_cache.last_display_selection = preserved_selected_ids
-            if plot is not None and plot_t.size > 0 and plot_series and (plot_has_overlays or preserve_multiselect_overlays):
-                plot_label = preserved_set_name or preserved_set_id or "Results"
-                plot.set_data(
-                    plot_t,
-                    plot_series,
-                    label=plot_label,
-                    overlays=preserved_overlays if preserve_multiselect_overlays else [],
-                    owned_species=plot_owned_species,
-                )
-                self.sync_main_plot_copy_labels(
-                    preserved_set_id,
-                    preserved_selected_ids or ([preserved_set_id] if preserved_set_id else []),
-                )
-                plot_results_map: Dict[str, Dict[str, object]] = {
-                    plot_label: {
-                        "t": plot_t,
-                        "series": plot_series,
-                    }
-                }
-                for overlay_entry in preserved_overlays if preserve_multiselect_overlays else ():
-                    overlay_label = str(overlay_entry.get("label") or "").strip()
-                    if str(overlay_entry.get("curve_role") or "") == "canonical_ghost":
-                        continue
-                    overlay_t = np.asarray(
-                        overlay_entry.get("t") if overlay_entry.get("t") is not None else [],
-                        dtype=float,
-                    ).reshape(-1)
-                    overlay_series = dict(overlay_entry.get("series") or {})
-                    if not overlay_label or overlay_t.size <= 0 or not overlay_series:
-                        continue
-                    plot_results_map[overlay_label] = {
-                        "t": overlay_t,
-                        "series": overlay_series,
-                    }
-                plot.set_statistics_results(
-                    plot_results_map,
-                    prefer=plot_label,
-                )
-                replay_selected_ids = preserved_selected_ids or ([preserved_set_id] if preserved_set_id else [])
-                self._record_current_main_plot_workspace_preview_provenance(
-                    selected_set_ids=replay_selected_ids
-                )
-                self.show_simulation_tab()
-                self.refresh_simulation_plot_views()
-            label = getattr(self, "_status_label", None)
-            if label is not None:
-                try:
-                    if str(label.text()) in (
-                        "Result not cached (evicted). Press Run to compute.",
-                        "Cached result invalid. Press Run to compute.",
-                        "Preview pending for current selection.",
-                    ):
-                        label.setText("Ready")
-                except RuntimeError:
-                    self._status_label = None
-            return
-        if active_cache_key and batch_cache.active_cache_invalidated_set_ids:
-            self._clear_batch_selection_display_state()
-            label = getattr(self, "_status_label", None)
-            if label is not None:
-                try:
-                    label.setText("Result not cached (evicted). Press Run to compute.")
-                except RuntimeError:
-                    self._status_label = None
-            return
-        if selected_ids:
-            self._refresh_batch_display_from_focus_and_shown()
-            return
-        self._clear_batch_selection_display_state()
+            self._simulation_batch_owner.record_active_result_cache_staleness(
+                set_ids=cache_stale_set_ids,
+                is_global=bool(cache_stale_scope_is_global),
+            )
+        transition = self.results_controller.apply_authoritative_result_display_transition(
+            active_cache_key=active_cache_key,
+            display_scope_ids=self._simulation_batch_owner.effective_display_request_set_ids(),
+            active_cache_invalidated_set_ids=self._simulation_batch_owner.active_cache_invalidated_set_ids() or (),
+            display_clear_set_ids=display_clear_set_ids,
+            display_clear_scope_is_global=display_clear_scope_is_global,
+        )
+        if transition.refresh_requested:
+            self._refresh_batch_display_from_request_scope()
+
+    def _invalidate_active_results_for_global_authoritative_change(self) -> None:
+        self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+            epoch=int(self._mechanism_runtime_transition.current_epoch)
+        )
+        self._apply_authoritative_result_truth_effects(
+            cache_stale_scope_is_global=True,
+            display_clear_scope_is_global=True,
+        )
 
     def _reset_project_apply_dirty_session_state(self) -> None:
         """Clear non-serialized session state before applying a project payload."""
+        symbolic_calculator_owner = getattr(self, "_symbolic_calculator_owner", None)
+        reset_symbolic_calculator = getattr(symbolic_calculator_owner, "reset_project_session_state", None)
+        if callable(reset_symbolic_calculator):
+            reset_symbolic_calculator()
+            self._refresh_symbolic_calculator_state()
+
         if not self._prepare_fit_window_shutdown_for_close():
             logger.warning("Project apply requested while one or more fit windows remained open after close request")
+        runtime_epoch = max(
+            int(getattr(self._mechanism_runtime_transition, "current_epoch", 0) or 0),
+            int(getattr(self._sim_controller, "_authoritative_runtime_input_epoch", 0) or 0),
+            int(getattr(self._sim_controller, "_authoritative_runtime_input_global_epoch", 0) or 0),
+        ) + 1
+        self._sim_controller.prepare_runtime_work_for_project_apply(epoch=int(runtime_epoch))
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
-        self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
-        dataset_manager = getattr(self, "_dataset_manager", None)
-        if dataset_manager is not None and hasattr(dataset_manager, "clear_all_datasets"):
-            dataset_manager.clear_all_datasets()
-
-        data_manager = getattr(getattr(self, "_right_panel", None), "_data_manager", None)
-        if data_manager is not None and hasattr(data_manager, "clear_datasets"):
-            data_manager.clear_datasets()
+        dataset_import_coordinator = getattr(self, "_dataset_import_coordinator", None)
+        if dataset_import_coordinator is not None:
+            dataset_import_coordinator.clear_all_datasets()
 
         self._pre_dsl_temperature = None
         self._temperature_dsl_override_active = False
 
-        self._clear_main_plot_project_apply_state()
+        self.results_controller.clear_active_display_transaction()
         self._sync_overlay_catalog()
 
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        if batch_cache is not None and hasattr(batch_cache, "reset_runtime_state"):
-            batch_cache.reset_runtime_state()
+        self._simulation_batch_owner.reset_runtime_state()
 
         self._refresh_slider_transaction_button_state()
-        self.show_simulation_tab()
-        self.refresh_simulation_plot_views()
 
     def _rebind_species_panel_after_batch_model_replacement(self) -> None:
         """Reattach Species mode to the replacement batch model/selection model."""
@@ -3594,7 +3659,7 @@ class MainWindow(
 
         try:
             if hasattr(panel, "set_transaction_owner"):
-                panel.set_transaction_owner(self._preview_session)
+                panel.set_transaction_owner(self._species_panel_transaction_owner())
             panel.attach(table=table, model=model)
         except RuntimeError as exc:
             logger.debug("Failed to reattach species panel after project apply: %s", exc, exc_info=True)
@@ -3602,7 +3667,7 @@ class MainWindow(
             return
 
         if hasattr(panel, "activate"):
-            self._ensure_batch_current_row_selected()
+            self._select_initial_batch_row_if_needed()
             try:
                 panel.activate()
             except RuntimeError as exc:
@@ -3623,20 +3688,93 @@ class MainWindow(
             'use_sparse_jacobian': bool(self._use_sparse_jacobian),
             'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
+            'batch_runtime_lane_budget': int(self._sim_controller.batch_runtime_lane_budget),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
         }
 
+    def _get_wegscheider_cyclicity_enabled(self) -> bool:
+        value = getattr(self, "_wegscheider_cyclicity_enabled", None)
+        if not isinstance(value, bool):
+            raise RuntimeError("Wegscheider setting is not available.")
+        return value
+
+    def _get_global_fit_launch_settings(self) -> object:
+        from kindred.gui.fitting.launch import GlobalFitLaunchSettings
+
+        solver_contract = load_solver_contract()
+        solver_label = str(self._initial_solver or "").strip()
+        if not solver_label:
+            raise RuntimeError("Global Fit launch settings require explicit solver.")
+        solver_method, _solver_warning = solver_contract.normalize_solver_name(solver_label)
+        rtol = self._require_global_fit_tolerance("_initial_rtol", "rtol")
+        atol = self._require_global_fit_tolerance("_initial_atol", "atol")
+        return GlobalFitLaunchSettings(
+            solver=str(solver_method),
+            rtol=float(rtol),
+            atol=float(atol),
+            runtime_inputs=self._fitting_runtime_input_publisher.current_inputs(),
+        )
+
+    def _require_global_fit_tolerance(self, attr_name: str, label: str) -> float:
+        value = getattr(self, attr_name, None)
+        if value is None:
+            raise RuntimeError(f"Global Fit launch settings require explicit {label}.")
+        try:
+            numeric = float(value)
+        except Exception as exc:
+            raise RuntimeError(f"Global Fit launch settings require numeric {label}.") from exc
+        if not math.isfinite(numeric) or numeric <= 0.0:
+            raise RuntimeError(f"Global Fit launch settings require positive finite {label}.")
+        return numeric
+
+    def _require_global_fit_bool(self, attr_name: str, label: str) -> bool:
+        value = getattr(self, attr_name, None)
+        if not isinstance(value, bool):
+            raise RuntimeError(f"Global Fit launch settings require explicit {label}.")
+        return value
+
+    def _require_global_fit_temperature(self, value: object) -> float:
+        if isinstance(value, bool):
+            raise RuntimeError("Global Fit launch settings require numeric temperature_K.")
+        try:
+            numeric = float(value)
+        except Exception as exc:
+            raise RuntimeError("Global Fit launch settings require numeric temperature_K.") from exc
+        min_temperature, max_temperature = SIMULATION_TEMPERATURE_K_RANGE
+        if (
+            not math.isfinite(numeric)
+            or numeric < float(min_temperature)
+            or numeric > float(max_temperature)
+        ):
+            raise RuntimeError(
+                "Global Fit launch settings require temperature_K within the simulation temperature range."
+            )
+        return numeric
+
     def _serialize_project_state(self) -> Dict[str, Any]:
-        """Create a versioned snapshot of the current project."""
+        """Create a snapshot of the current project."""
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         solver_contract = load_solver_contract()
         solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
         solver_method, solver_warning = solver_contract.normalize_solver_name(solver_label)
+        mechanism_source = MechanismAuthoringSource.from_parts(
+            reactions_text=self.mechanism_reactions_text_raw(),
+            state_network_dsl=self.mechanism_state_network_dsl_raw(),
+        )
+        _pref = self.config_controller.get_user_preference
+        fitting_defaults = {
+            key: (
+                self._fitting_defaults[key]
+                if key in self._fitting_defaults
+                else _pref(key)
+            )
+            for key in FITTING_DEFAULTS_KEYS
+        }
         return {
-            'project_schema_version': PROJECT_SCHEMA_VERSION,
             'version': KINDRED_VERSION,
-            'mechanism': self.mechanism_reactions_text_raw(),
+            'mechanism_source': mechanism_source.to_payload(),
             'notes': self._mechanism_editor._notes_text.toPlainText(),
-            'state_network': self.mechanism_state_network_dsl_raw(),
             "solver": str(solver_label),
             "solver_method": str(solver_method),
             "solver_warning": str(solver_warning) if solver_warning else None,
@@ -3645,6 +3783,7 @@ class MainWindow(
             'use_sparse_jacobian': bool(self._use_sparse_jacobian),
             'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
+            'batch_runtime_lane_budget': int(self._sim_controller.batch_runtime_lane_budget),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
             'temperature_K': (
                 self._pre_dsl_temperature
@@ -3654,15 +3793,14 @@ class MainWindow(
             'simulation_time': str(self._sim_time_spinbox.text()).strip(),
             'num_points': int(self._num_points_spinbox.value()),
             'batch_initial_conditions': self._batch_store.as_serializable(),
-            **{key: self._fitting_defaults[key] for key in self._fitting_defaults
-               if key in FITTING_DEFAULTS_KEYS},
+            **fitting_defaults,
         }
 
     def serialize_project_state(self) -> Dict[str, Any]:
         """Public project snapshot API for controllers (avoid reaching into `_` helpers)."""
         return self._serialize_project_state()
 
-    def _set_text_with_optional_undo(
+    def _set_plain_text_widget_with_optional_undo(
         self,
         widget: QtWidgets.QPlainTextEdit,
         new_text: str,
@@ -3670,7 +3808,7 @@ class MainWindow(
         record_undo: bool,
     ) -> None:
         """Set text on a QPlainTextEdit, optionally recording the change on the undo stack."""
-        from kindred.gui.undo_commands import SetMechanismTextCommand
+        from kindred.gui.undo_commands import SetPlainTextCommand
 
         current_text = widget.toPlainText()
         if new_text is None:
@@ -3680,8 +3818,21 @@ class MainWindow(
             return
 
         if record_undo:
-            command = SetMechanismTextCommand(widget, new_text, current_text, description)
-            self._undo_stack.push(command)
+            command = SetPlainTextCommand(widget, new_text, current_text, description)
+            if bool(
+                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+                and getattr(self, "_suppress_programmatic_text_change_signals", False)
+            ):
+                document = widget.document()
+                previous_widget_block = widget.blockSignals(True)
+                previous_document_block = document.blockSignals(True)
+                try:
+                    self._undo_stack.push(command)
+                finally:
+                    document.blockSignals(previous_document_block)
+                    widget.blockSignals(previous_widget_block)
+            else:
+                self._undo_stack.push(command)
         else:
             widget.blockSignals(True)
             try:
@@ -3693,102 +3844,92 @@ class MainWindow(
     def _apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         """Populate the UI from serialized project data."""
         self._suppress_preference_updates = True
+        simulation_runtime_settings_changed = False
+        batch_runtime_pool_settings_changed = False
+        self._authoritative_mechanism_runtime_refresh_defer_depth = (
+            int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) + 1
+        )
         try:
-            self._apply_project_payload_inner(data, record_undo=record_undo)
+            with self._fitting_runtime_input_publisher.transaction(reason="project apply"):
+                (
+                    simulation_runtime_settings_changed,
+                    batch_runtime_pool_settings_changed,
+                ) = self._apply_project_payload_inner(data, record_undo=record_undo)
         finally:
+            self._authoritative_mechanism_runtime_refresh_defer_depth = max(
+                0,
+                int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) - 1,
+            )
             self._suppress_preference_updates = False
-
-    def _apply_project_payload_inner(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
+        if simulation_runtime_settings_changed:
+            self._refresh_simulation_runtime_after_inputs_changed(
+                batch_runtime_pool_inputs_changed=bool(batch_runtime_pool_settings_changed),
+            )
+    def _apply_project_payload_inner(
+        self,
+        data: Dict[str, Any],
+        *,
+        record_undo: bool = True,
+    ) -> tuple[bool, bool]:
         from kindred.core.batch_initial_conditions import (
             BatchInitialConditionsStore,
-            migrate_reaction_dsl_initial_concentration_sets,
         )
         from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableModel
 
-        project_version = int(data.get('project_schema_version', 1))
-        if project_version > PROJECT_SCHEMA_VERSION:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Unsupported Project Version",
-                "This project was saved with a newer version of Kindred. "
-                "Some settings may not load correctly."
+        previous_runtime_settings = self._simulation_runtime_settings_snapshot()
+        previous_batch_runtime_pool_settings = (
+            self._simulation_batch_runtime_pool_settings_snapshot()
+        )
+        source = validate_project_payload(data)
+        batch_payload = data.get("batch_initial_conditions")
+        try:
+            batch_store = (
+                BatchInitialConditionsStore.from_serializable(dict(batch_payload))
+                if batch_payload is not None
+                else BatchInitialConditionsStore()
             )
-            logger.warning(
-                "Loading newer project schema version (%s > %s)",
-                project_version,
-                PROJECT_SCHEMA_VERSION
-            )
+        except Exception as exc:
+            raise ValueError("project payload field 'batch_initial_conditions' is invalid.") from exc
+
+        notes_text = data.get('notes', "")
 
         self._reset_project_apply_dirty_session_state()
         self._clear_last_mechanism()
 
-        mechanism_text = data.get('mechanism', "")
-        batch_payload = data.get("batch_initial_conditions")
-        seed_sets: Dict[str, Dict[str, float]]
-        rewritten = mechanism_text
-        if isinstance(batch_payload, dict):
-            seed_sets = {}
-        else:
-            try:
-                seed_sets, rewritten = migrate_reaction_dsl_initial_concentration_sets(
-                    mechanism_text,
-                    default_set_name="set1",
-                )
-            except Exception:
-                seed_sets, rewritten = ({}, mechanism_text)
-        notes_text = data.get('notes', "")
-        self._set_text_with_optional_undo(
-            self._mechanism_editor._reactions_text,
-            mechanism_text,
-            "Load project (reactions)",
-            record_undo,
-        )
-
-        # Batch initial conditions (schema v3+). For older projects, migrate any
-        # inline initial concentrations into set1 and rewrite the block stub.
-        if isinstance(batch_payload, dict):
-            try:
-                self._batch_store = BatchInitialConditionsStore.from_serializable(batch_payload)
-            except Exception:
-                self._batch_store = BatchInitialConditionsStore()
-        else:
-            self._batch_store = BatchInitialConditionsStore()
-            if seed_sets:
-                self._materialize_migrated_initial_concentration_sets(seed_sets=seed_sets)
-                self._set_text_with_optional_undo(
-                    self._mechanism_editor._reactions_text,
-                    rewritten,
-                    "Migrate initial concentrations to set table",
-                    record_undo,
-                )
-
+        self._batch_store = batch_store
         self._batch_model = BatchInitialConditionsTableModel(self._batch_store, parent=self)
         if self._batch_table is not None:
             self._batch_table.setModel(self._batch_model)
             self._rebind_batch_semantics_signal_bindings()
+        reconciled = self._initial_conditions_source_acceptance_owner.accept_project_source_after_batch_load(
+            source,
+            batch_store=self._batch_store,
+            batch_payload_present=batch_payload is not None,
+        )
+        if reconciled is not None:
+            source = reconciled
+
+        self._set_authoritative_mechanism_editor_source(
+            source,
+            description="Load project mechanism source",
+            apply_transition=False,
+            transition_source="project_load",
+            record_undo=record_undo,
+        )
+
         self._rebind_species_panel_after_batch_model_replacement()
         self._update_batch_row_controls_state()
         self._on_batch_current_changed()
 
-        self._set_text_with_optional_undo(
+        self._set_plain_text_widget_with_optional_undo(
             self._mechanism_editor._notes_text,
             notes_text,
             "Load project (notes)",
             record_undo,
         )
 
-        state_network_text = data.get('state_network') or ""
-        state_editor = self._mechanism_editor._state_network_editor
-        current_state_network = state_editor.get_state_network_dsl()
-        if state_network_text.strip():
-            if state_network_text.strip() != current_state_network.strip():
-                state_editor.set_state_network_dsl(state_network_text)
-        else:
-            if current_state_network.strip():
-                state_editor.clear()
-        self._on_programmatic_mechanism_load()
+        self._on_programmatic_mechanism_load(schedule_runtime_refresh=False)
 
-        # Fall back to user preference when key absent from payload.
         _pref = self.config_controller.get_user_preference
         solver_value = data.get('solver', _pref('solver'))
         rtol_value = data.get('rtol', _pref('rtol'))
@@ -3800,36 +3941,29 @@ class MainWindow(
         self._wegscheider_cyclicity_enabled = bool(
             data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
         )
-        previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
-        previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
         try:
-            self._sim_controller.parallel_batch.max_parallel_workers = max(
-                1, int(data.get('max_parallel_batch_workers', _pref('max_parallel_batch_workers')))
+            self._sim_controller.parallel_batch.max_parallel_workers = min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(1, int(data.get('max_parallel_batch_workers', _pref('max_parallel_batch_workers')))),
             )
         except Exception:
             self._sim_controller.parallel_batch.max_parallel_workers = int(PROJECT_DEFAULTS['max_parallel_batch_workers'])
+        try:
+            self._sim_controller.batch_runtime_lane_budget = min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(1, int(data.get('batch_runtime_lane_budget', _pref('batch_runtime_lane_budget')))),
+            )
+        except Exception:
+            self._sim_controller.batch_runtime_lane_budget = int(PROJECT_DEFAULTS['batch_runtime_lane_budget'])
         self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
             data.get('limit_blas_threads_per_worker', _pref('limit_blas_threads_per_worker'))
         )
-        if (
-            previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
-            or previous_limit_blas_threads
-            != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
-        ):
-            self._sim_controller.parallel_batch_pool_settings_changed()
-        if 'use_advanced_dsl' in data:
-            logger.info(
-                "Loaded legacy project flag use_advanced_dsl=%s (ignored; advanced DSL always enabled)",
-                data['use_advanced_dsl'],
-            )
         self._temperature_spinbox.setValue(
             data.get('temperature_K', _pref('temperature_K'))
         )
         # Update stash when project loads while T= override is active.
         if getattr(self, "_temperature_dsl_override_active", False):
-            self._pre_dsl_temperature = data.get(
-                'temperature_K', _pref('temperature_K')
-            )
+            self._pre_dsl_temperature = data.get('temperature_K', _pref('temperature_K'))
         sim_time = data.get('simulation_time', _pref('simulation_time'))
         if isinstance(sim_time, (int, float)):
             sim_time_text = f"{float(sim_time):g}"
@@ -3846,15 +3980,22 @@ class MainWindow(
             atol=atol_value,
         )
 
-        # Document-override-only dict -- non-overridden keys read live from tier 2
+        # Loaded project files carry a complete fitting-default snapshot.
         self._fitting_defaults = {
             key: data[key]
             for key in FITTING_DEFAULTS_KEYS
-            if key in data and data[key] is not None
+            if data[key] is not None
         }
+        runtime_settings_changed = self._simulation_runtime_settings_snapshot() != previous_runtime_settings
+        batch_runtime_pool_settings_changed = (
+            self._simulation_batch_runtime_pool_settings_snapshot()
+            != previous_batch_runtime_pool_settings
+        )
+        return runtime_settings_changed, batch_runtime_pool_settings_changed
 
     def apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> bool:
         """Public project apply API for controllers (avoid reaching into `_` helpers)."""
+        validate_project_payload(data)
         if not self._guard_slider_transaction_invalidation(action_text="Loading this project"):
             return False
         self._apply_project_payload(data, record_undo=record_undo)
@@ -3866,13 +4007,11 @@ class MainWindow(
         solver: object = _SOLVER_STATE_UNSET,
         rtol: object = _SOLVER_STATE_UNSET,
         atol: object = _SOLVER_STATE_UNSET,
-        sync_combo: bool = True,
     ) -> None:
         self._apply_solver_runtime_state(
             solver=solver,
             rtol=rtol,
             atol=atol,
-            sync_combo=bool(sync_combo),
         )
 
     def add_to_recent_files(self, filepath: str) -> None:
@@ -3881,137 +4020,20 @@ class MainWindow(
 
     def set_status_text(self, text: str) -> None:
         """Public API used by controllers (avoid reaching into `_` widget fields)."""
-        self._status_label.setText(str(text))
+        self._simulation_run_ui_owner.set_status_text(str(text))
 
-    def main_plot_has_data(self) -> bool:
-        plot = self.main_plot()
-        return bool(getattr(plot, "_series", {})) and getattr(plot, "_t", None) is not None
-
-    def main_plot_selected_series(self) -> List[str]:
-        return list(self.main_plot().selected_series())
-
-    def set_main_plot_selected_series(self, series_names: Sequence[str]) -> None:
-        self.main_plot().set_selected_series(list(series_names))
-
-    def run_button_is_enabled(self) -> bool:
-        return bool(self._run_btn.isEnabled())
-
-    def set_run_button_enabled(self, enabled: bool) -> None:
-        self._run_btn.setEnabled(bool(enabled))
-        editor = getattr(self, "_mechanism_editor", None)
-        if editor is not None:
-            if hasattr(editor, "set_run_gated"):
-                editor.set_run_gated(not bool(enabled))
-            elif enabled:
-                editor.run_btn.setEnabled(editor.is_mechanism_valid())
-            else:
-                editor.run_btn.setEnabled(False)
-
-    def set_stop_button_enabled(self, enabled: bool) -> None:
-        self._stop_btn.setEnabled(bool(enabled))
-
-    def set_sim_progress_value(self, value: int) -> None:
-        self._sim_progress.setValue(int(value))
-
-    def repaint_simulation_widgets(self) -> None:
-        with suppress(RuntimeError):
-            self._sim_progress.update()
-        with suppress(RuntimeError):
-            self._status_label.update()
-        table = getattr(self, "_results_table", None)
-        if table is not None:
-            with suppress(RuntimeError):
-                viewport = table.viewport()
-                viewport.update()
-
-    def set_algebra_status_text(self, text: str) -> None:
-        self._algebra_status_label.setText(str(text))
-
-    def message_box_warning(self, title: str, message: str) -> None:
-        QtWidgets.QMessageBox.warning(self, str(title), str(message))
-
-    def message_box_critical(self, title: str, message: str, *, details: Optional[str] = None) -> None:
-        full_message = str(message)
-        if details:
-            full_message = f"{full_message}\n\nDetails:\n{details}"
-        QtWidgets.QMessageBox.critical(self, str(title), full_message)
+    def _status_text_value(self) -> str:
+        label = getattr(self, "_status_label", None)
+        if label is None:
+            return ""
+        try:
+            return str(label.text())
+        except RuntimeError:
+            self._status_label = None
+            return ""
 
     def main_plot(self) -> object:
         return self._plot_tabs._main_plot
-
-    def set_main_plot_data(
-        self,
-        t: np.ndarray,
-        series: Dict[str, np.ndarray],
-        *,
-        label: Optional[str] = None,
-        overlays: Optional[Sequence[Dict[str, object]]] = None,
-        owned_species: Optional[Sequence[str]] = None,
-    ) -> None:
-        self.main_plot().set_data(t, series, label=label, overlays=overlays, owned_species=owned_species)
-
-    def sync_main_plot_copy_labels(self, primary_set_id: str, selected_set_ids: Sequence[str]) -> None:
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return
-        primary_set_id_s = str(primary_set_id or "").strip()
-        selected_ids: list[str] = []
-        for raw_set_id in selected_set_ids or ():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id or set_id in selected_ids:
-                continue
-            selected_ids.append(set_id)
-        if primary_set_id_s and primary_set_id_s not in selected_ids:
-            selected_ids.append(primary_set_id_s)
-        popup_labels = self._copy_all_popup_labels_by_set_id(selected_ids)
-        primary_label = str(getattr(plot, "_simulation_set_label", "") or "").strip()
-        setattr(plot, "_simulation_set_popup_label", str(popup_labels.get(primary_set_id_s, primary_label)))
-        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-            if not isinstance(entry, dict):
-                continue
-            entry_set_id = str(entry.get("set_id") or "").strip()
-            popup_label = str(popup_labels.get(entry_set_id, "")).strip()
-            if popup_label:
-                entry["popup_label"] = popup_label
-            else:
-                entry.pop("popup_label", None)
-
-    def _sync_main_plot_copy_labels_for_cached_batch_selection(self) -> None:
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        if batch_cache is None:
-            return
-        active_set_id = str(self.active_batch_selection()[0] or "").strip()
-        selected_ids = [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)]
-        if active_set_id or selected_ids:
-            self.sync_main_plot_copy_labels(active_set_id, selected_ids)
-
-    def show_simulation_tab(self) -> None:
-        self._plot_tabs._tabs.setCurrentIndex(0)
-
-    def refresh_simulation_plot_views(self) -> None:
-        self.main_plot().update()
-        self._plot_tabs.update()
-        self.update()
-
-    def schedule_main_plot_refresh(self, delays_ms: Sequence[int]) -> None:
-        plot = self.main_plot()
-
-        def _safe_plot_update(plot_widget=plot) -> None:
-            with suppress(RuntimeError):
-                plot_widget.update()
-
-        for delay_ms in delays_ms:
-            QtCore.QTimer.singleShot(int(delay_ms), _safe_plot_update)
-
-    def set_main_plot_scalar_values(self, scalars: Dict[str, object]) -> None:
-        plot = self.main_plot()
-        if hasattr(plot, "set_scalar_values"):
-            plot.set_scalar_values(scalars)
-
-    def update_main_plot_parameter_summary(self, parameters: Dict[str, tuple[float, str]]) -> None:
-        plot = self.main_plot()
-        if hasattr(plot, "update_parameters"):
-            plot.update_parameters(dict(parameters))
 
     def integrate_ctc(
         self,
@@ -4030,50 +4052,17 @@ class MainWindow(
             tail_strategy=str(tail_strategy),
         )
 
-    def update_main_plot_statistics(
-        self,
-        *,
-        stats_results_map: Dict[str, Dict[str, object]],
-        prefer: str,
-        t: np.ndarray,
-        series: Dict[str, np.ndarray],
-    ) -> None:
-        plot = self.main_plot()
-        if hasattr(plot, "set_statistics_results"):
-            plot.set_statistics_results(stats_results_map, prefer=prefer)
-            return
-        plot.update_statistics(t, series)
-
-    def main_plot_stats_table(self) -> object:
-        return self.main_plot().stats_table()
-
-    def set_results_table(self, table: object) -> None:
-        self._results_table = table
-
     def mechanism_reactions_text_raw(self) -> str:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        return str(owner.canonical_reactions_text)
+        return self._simulation_mechanism_owner.mechanism_reactions_text_raw()
 
     def mechanism_state_network_dsl_raw(self) -> str:
+        return self._simulation_mechanism_owner.mechanism_state_network_dsl_raw()
+
+    def canonical_mechanism_source(self):
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
-        return str(owner.canonical_state_network_dsl or "")
-
-    def mechanism_slider_points_value(self) -> Optional[int]:
-        try:
-            return int(self._mechanism_editor.slider_points_value())
-        except Exception:
-            return None
-
-    def mechanism_slider_solver_value(self) -> Optional[str]:
-        try:
-            value = self._mechanism_editor.slider_solver_value()
-        except Exception:
-            return None
-        return str(value) if value is not None else None
+        return owner.canonical_source
 
     def set_variable_sliders(
         self,
@@ -4083,42 +4072,24 @@ class MainWindow(
         preserve_visibility: bool = False,
         visibility_scope_signature: object | None = None,
     ) -> None:
-        self._mechanism_editor._variable_sliders.set_variables(
-            dict(variables),
-            metadata=dict(metadata or {}),
-            preserve_visibility=bool(preserve_visibility),
+        self._simulation_mechanism_owner.set_variable_sliders(
+            variables,
+            metadata=metadata,
+            preserve_visibility=preserve_visibility,
             visibility_scope_signature=visibility_scope_signature,
         )
 
     def variable_slider_values(self) -> Dict[str, float]:
-        sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
-        if sliders is None or not hasattr(sliders, "get_variables"):
-            return {}
-        values = sliders.get_variables() or {}
-        return {str(name): float(value) for name, value in values.items()}
+        return self._simulation_mechanism_owner.variable_slider_values()
 
     def clear_variable_sliders(self) -> None:
-        sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
-        if sliders is not None and hasattr(sliders, "clear"):
-            sliders.clear()
+        self._simulation_mechanism_owner.clear_variable_sliders()
 
     def temperature_spinbox_value(self) -> float:
-        return float(self._temperature_spinbox.value())
-
-    def num_points_spinbox_value(self) -> int:
-        return int(self._num_points_spinbox.value())
-
-    def sim_time_spinbox_text(self) -> str:
-        return str(self._sim_time_spinbox.text())
+        return self._simulation_solver_owner.temperature_spinbox_value()
 
     def parse_sim_time_seconds(self) -> float:
-        return float(self._parse_sim_time_seconds())
-
-    def use_sparse_jacobian(self) -> bool:
-        return bool(self._use_sparse_jacobian)
-
-    def wegscheider_cyclicity_enabled(self) -> bool:
-        return bool(self._wegscheider_cyclicity_enabled)
+        return self._simulation_solver_owner.parse_sim_time_seconds()
 
     def set_mechanism_reactions_text_with_optional_undo(
         self,
@@ -4127,11 +4098,28 @@ class MainWindow(
         *,
         record_undo: bool,
     ) -> None:
-        self._set_text_with_optional_undo(
-            self._mechanism_editor._reactions_text,
-            str(new_text),
-            str(description),
-            bool(record_undo),
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        self._set_authoritative_mechanism_editor_source(
+            MechanismAuthoringSource.from_parts(
+                reactions_text=str(new_text),
+                state_network_dsl=str(self.mechanism_state_network_dsl_raw() or ""),
+            ),
+            description=str(description),
+            record_undo=bool(record_undo),
+        )
+
+    def _apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> None:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        self._set_authoritative_mechanism_editor_source(
+            MechanismAuthoringSource.from_parts(
+                reactions_text=str(reactions_text),
+                state_network_dsl=str(self.mechanism_state_network_dsl_raw() or ""),
+            ),
+            description="Resolve Wegscheider cyclicity",
+            apply_transition=True,
+            transition_source="wegscheider_resolution",
         )
 
     def finalize_authoritative_mechanism_widget_write(self, *, dispatch_consumers: bool) -> None:
@@ -4146,13 +4134,19 @@ class MainWindow(
         self._temperature_mode_indicator.setText(str(text))
 
     def batch_rows_for_scope(self, scope: str) -> List[int]:
-        return [int(r) for r in (self._batch_rows_for_scope(str(scope)) or [])]
+        return self._simulation_batch_owner.batch_rows_for_scope(str(scope))
 
     def batch_set_ids_for_scope(self, scope: str) -> List[str]:
-        return [str(s) for s in (self._batch_set_ids_for_scope(str(scope)) or [])]
+        return self._simulation_batch_owner.batch_set_ids_for_scope(str(scope))
 
-    def shown_batch_set_ids(self) -> List[str]:
-        return [str(s) for s in (self._shown_batch_set_ids() or [])]
+    def run_target_ui_state(self) -> object:
+        return self._simulation_batch_owner.run_target_ui_state()
+
+    def requested_show_batch_set_ids(self) -> List[str]:
+        return [str(s) for s in (self._requested_show_batch_set_ids() or [])]
+
+    def effective_display_request_set_ids(self) -> List[str]:
+        return self._simulation_batch_owner.effective_display_request_set_ids()
 
     def slider_edit_target_set_ids(self) -> List[str]:
         return [str(s) for s in (self._slider_edit_target_set_ids() or [])]
@@ -4165,7 +4159,7 @@ class MainWindow(
         return int(row) if row is not None else None
 
     def focused_batch_set_id(self) -> Optional[str]:
-        value = self._focused_batch_set_id_value()
+        value = self._active_batch_set_id()
         return str(value) if value else None
 
     def batch_set_id_for_row(self, row: int) -> Optional[str]:
@@ -4202,28 +4196,7 @@ class MainWindow(
         )
 
     def active_batch_cache_key(self) -> str:
-        return str(self._sim_controller.batch_cache.active_cache_key or "")
-
-    def active_batch_selection(self) -> tuple[str, str]:
-        batch_cache = self._sim_controller.batch_cache
-        return (
-            str(batch_cache.active_batch_set_id or ""),
-            str(batch_cache.active_batch_set or ""),
-        )
-
-    def set_active_batch_selection(self, set_id: str, set_name: str, selected_ids: Sequence[str]) -> None:
-        batch_cache = self._sim_controller.batch_cache
-        batch_cache.active_batch_set_id = str(set_id)
-        batch_cache.active_batch_set = str(set_name)
-        batch_cache.last_display_selection = [str(item) for item in (selected_ids or []) if str(item)]
-
-    def clear_display_selection_state(self) -> None:
-        clear_display = getattr(self._sim_controller.batch_cache, "clear_display_selection_state", None)
-        if callable(clear_display):
-            clear_display()
-
-    def batch_result_cache_store(self) -> MutableMapping[str, Dict[str, Any]]:
-        return self._sim_controller.batch_cache.result_cache
+        return self._simulation_batch_owner.active_cache_key()
 
     def batch_store_row_count(self) -> int:
         return int(self._batch_store.row_count())
@@ -4248,199 +4221,6 @@ class MainWindow(
             return {str(key): float(value) for key, value in initials.items()}
         return dict(initials)
 
-    def display_cached_batch_selection(
-        self,
-        *,
-        cache_key: str,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-        cache_store: Optional[object] = None,
-        valid_set_ids: Optional[Sequence[str]] = None,
-        invalidated_set_ids: Optional[Sequence[str]] = None,
-        allow_fallback: bool = True,
-    ) -> bool:
-        batch_cache = self._sim_controller.batch_cache
-        normalized_selected_sets = [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
-        if cache_store is batch_cache.preview_cache and normalized_selected_sets:
-            workspace_displayed = self._display_workspace_aware_preview_batch_selection(
-                selected_sets=normalized_selected_sets,
-                prefer_set=prefer_set,
-                preview_cache_key=str(cache_key or ""),
-            )
-            if workspace_displayed:
-                return True
-            if len(normalized_selected_sets) > 1:
-                return False
-            if not bool(allow_fallback):
-                single_set_id = str(normalized_selected_sets[0] or "")
-                if single_set_id and self._preview_session.has_dirty_state_for_set(single_set_id):
-                    preview_entry = self._matching_preview_entry_for_workspace_set(
-                        set_id=single_set_id,
-                        preview_cache_key=str(cache_key or ""),
-                    )
-                    if preview_entry.entry is None:
-                        return False
-        resolved_invalidated_set_ids = invalidated_set_ids
-        if (
-            resolved_invalidated_set_ids is None
-            and str(batch_cache.active_cache_key or "") == str(cache_key)
-        ):
-            resolved_invalidated_set_ids = batch_cache.active_cache_invalidated_set_ids
-        displayed = self.results_controller.display_cached_batch_selection(
-            cache_key=str(cache_key),
-            selected_sets=normalized_selected_sets,
-            prefer_set=str(prefer_set) if prefer_set is not None else None,
-            cache_store=cache_store,
-            valid_set_ids=(
-                tuple(str(set_id) for set_id in valid_set_ids)
-                if valid_set_ids is not None
-                else None
-            ),
-            invalidated_set_ids=(
-                tuple(str(set_id) for set_id in resolved_invalidated_set_ids)
-                if resolved_invalidated_set_ids is not None
-                else None
-            ),
-            allow_fallback=bool(allow_fallback),
-        )
-        if displayed:
-            self._record_current_main_plot_workspace_preview_provenance(selected_set_ids=normalized_selected_sets)
-        return displayed
-
-    def _focused_batch_selection_is_dirty(
-        self,
-        *,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-    ) -> bool:
-        focused_set_id = str(prefer_set or (selected_sets[0] if selected_sets else "") or "").strip()
-        if not focused_set_id:
-            return False
-        try:
-            return bool(self._preview_session.has_dirty_state_for_set(focused_set_id))
-        except Exception:
-            return False
-
-    def _selection_uses_fresh_explicit_cache_after_post_run_sync(
-        self,
-        *,
-        selected_sets: Sequence[str],
-    ) -> bool:
-        normalized_selected_sets = [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
-        if not normalized_selected_sets:
-            return False
-        batch_cache = self._sim_controller.batch_cache
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-        active_preview_token = str(getattr(batch_cache, "active_cache_preview_token", "") or "").strip()
-        if not active_cache_key or not active_preview_token:
-            return False
-        active_valid_set_ids = {
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_valid_set_ids", None) or ()) if str(set_id)
-        }
-        if active_valid_set_ids and any(set_id not in active_valid_set_ids for set_id in normalized_selected_sets):
-            return False
-        active_preview_scope_ids = {
-            str(set_id)
-            for set_id in (getattr(batch_cache, "active_cache_preview_scope_set_ids", None) or ())
-            if str(set_id)
-        }
-        if active_preview_scope_ids and any(set_id not in active_preview_scope_ids for set_id in normalized_selected_sets):
-            return False
-        scope_rows: list[int] = []
-        row_for_set_id = getattr(getattr(self, "_batch_store", None), "row_for_set_id", None)
-        if not callable(row_for_set_id):
-            return False
-        for set_id in normalized_selected_sets:
-            try:
-                row = row_for_set_id(str(set_id))
-            except Exception:
-                row = None
-            if row is None:
-                return False
-            scope_rows.append(int(row))
-        try:
-            current_preview_token = str(self._preview_session.preview_batch_cache_token(scope_rows) or "").strip()
-        except Exception:
-            return False
-        return bool(current_preview_token) and current_preview_token == active_preview_token
-
-    def _display_workspace_aware_preview_batch_selection(
-        self,
-        *,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-        preview_cache_key: Optional[str] = None,
-    ) -> bool:
-        normalized_selected_sets = [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
-        if not normalized_selected_sets:
-            return False
-        focused_selection_is_dirty = self._focused_batch_selection_is_dirty(
-            selected_sets=normalized_selected_sets,
-            prefer_set=prefer_set,
-        )
-        (
-            resolved_entries,
-            outcome_reason,
-            all_selected_sets_resolved,
-            has_workspace_selection,
-            has_resolved_workspace_preview,
-            focused_selection_uses_workspace_controls,
-            focused_selection_has_resolved_entry,
-        ) = self._resolve_workspace_aware_batch_selection(
-            selected_sets=normalized_selected_sets,
-            preview_cache_key=preview_cache_key,
-        )
-        if not has_workspace_selection:
-            return False
-        if all_selected_sets_resolved and resolved_entries:
-            outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                resolved_entries=resolved_entries,
-                prefer_set=prefer_set,
-            )
-            if outcome.displayed:
-                self._record_current_main_plot_workspace_preview_provenance(
-                    selected_set_ids=normalized_selected_sets
-                )
-            return bool(outcome.displayed)
-        if (
-            resolved_entries
-            and outcome_reason in {"preview_pending", "no_cached_results"}
-            and has_resolved_workspace_preview
-            and (
-                bool(focused_selection_uses_workspace_controls)
-                or ((not bool(focused_selection_is_dirty)) and bool(focused_selection_has_resolved_entry))
-            )
-        ):
-            outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                resolved_entries=resolved_entries,
-                prefer_set=prefer_set,
-            )
-            if outcome.displayed:
-                self._record_current_main_plot_workspace_preview_provenance(
-                    selected_set_ids=normalized_selected_sets
-                )
-                if outcome_reason == "preview_pending":
-                    self.set_status_text("Preview pending for current selection.")
-                else:
-                    self.set_status_text("Result not cached (evicted). Press Run to compute.")
-            return bool(outcome.displayed)
-        return False
-
-    def display_workspace_aware_batch_selection(
-        self,
-        *,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-        preview_cache_key: Optional[str] = None,
-    ) -> bool:
-        return bool(
-            self._display_workspace_aware_preview_batch_selection(
-                selected_sets=selected_sets,
-                prefer_set=prefer_set,
-                preview_cache_key=preview_cache_key,
-            )
-        )
-
     def update_batch_row_controls_state(self) -> None:
         self._update_batch_row_controls_state()
 
@@ -4448,130 +4228,42 @@ class MainWindow(
         self,
         species_names: Sequence[str],
         *,
-        preserve_active_cache: bool = False,
+        retain_active_cache_identity: bool = False,
     ) -> None:
-        self._sync_batch_species_columns(list(species_names), preserve_active_cache=bool(preserve_active_cache))
+        self._sync_batch_species_columns(
+            list(species_names),
+            retain_active_cache_identity=bool(retain_active_cache_identity),
+        )
 
-    def has_slider_overrides(self) -> bool:
-        return bool(self._preview_session.has_local_mechanism_workspaces())
+    def has_local_runtime_parameter_values(self) -> bool:
+        return self._simulation_mechanism_owner.has_local_runtime_parameter_values()
 
     def _simulation_schema_text(self) -> str:
-        reactions_text = self.mechanism_reactions_text_raw()
-        state_network_dsl = self.mechanism_state_network_dsl_raw()
-        full_dsl = reactions_text
-        if state_network_dsl.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_dsl
-        return str(full_dsl)
+        return self._simulation_mechanism_owner.get_mechanism_text()
 
-    def simulation_schema_id(self) -> str:
-        param_store = self._preview_session.param_store
-        schema_text = self._simulation_schema_text()
-        if str(param_store.schema_text or "") != schema_text:
-            param_store.set_schema(schema_text)
-        return str(param_store.schema_id or "")
+    def simulation_schema_id(self, *, fast_mode: bool = False) -> str:
+        return self._simulation_mechanism_owner.simulation_schema_id(fast_mode=bool(fast_mode))
 
-    def simulation_param_fingerprint(self, set_id: Optional[str] = None) -> str:
-        self.simulation_schema_id()
-        target_set_id = str(set_id or "").strip()
-        if not self._preview_session.param_store.has_local_overrides_for_set(target_set_id):
-            return ""
-        return str(self._preview_session.param_store.param_fingerprint(target_set_id) or "")
-
-    def _batch_store_is_pristine_default_placeholder(self) -> bool:
-        if int(self._batch_store.row_count()) != 1:
-            return False
-        names = list(self._batch_store.set_names() or [])
-        if names != ["set1"]:
-            return False
-        values = dict(self._batch_store.values_for_set("set1") or {})
-        for raw in values.values():
-            text = str(raw).strip()
-            if not text:
-                continue
-            parsed, ok = try_parse_finite_float(text)
-            if not ok or abs(float(parsed)) > 1e-12:
-                return False
-        return True
-
-    def _materialize_migrated_initial_concentration_sets(
-        self,
-        *,
-        seed_sets: Mapping[str, Mapping[str, object]],
-    ) -> List[int]:
-        rows: List[int] = []
-        ordered_names = [str(name) for name in seed_sets.keys() if str(name).strip()]
-        if not ordered_names:
-            return rows
-
-        reuse_default_row = bool(
-            self._batch_store_is_pristine_default_placeholder()
-            and str(ordered_names[0]) != "set1"
+    def runtime_parameter_fingerprint_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> str:
+        return self._simulation_mechanism_owner.runtime_parameter_fingerprint_for_set(
+            set_id=set_id,
+            fast_mode=bool(fast_mode),
         )
-        batch_model = getattr(self, "_batch_model", None)
-        batch_model_attached = bool(
-            batch_model is not None
-            and hasattr(batch_model, "store")
-            and callable(getattr(batch_model, "store"))
-            and batch_model.store() is self._batch_store
+
+    def runtime_parameter_names_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> Sequence[str]:
+        return self._simulation_mechanism_owner.runtime_parameter_names_for_set(
+            set_id=set_id,
+            fast_mode=bool(fast_mode),
         )
-        row_by_name: Dict[str, int] = {}
-        if reuse_default_row:
-            self._batch_store.set_set_name(0, str(ordered_names[0]))
-            row_by_name[str(ordered_names[0])] = 0
 
-        seen_rows: set[int] = set()
-        for set_name in ordered_names:
-            seed = seed_sets.get(str(set_name)) or {}
-            row_idx = row_by_name.get(str(set_name))
-            if row_idx is None:
-                existing_row = self._batch_store.row_for_set(str(set_name))
-                if existing_row is None:
-                    insert_at = int(self._batch_store.row_count())
-                    if batch_model_attached:
-                        batch_model.beginInsertRows(QtCore.QModelIndex(), insert_at, insert_at)
-                    try:
-                        row_idx = int(self._batch_store.ensure_set(str(set_name)))
-                    finally:
-                        if batch_model_attached:
-                            batch_model.endInsertRows()
-                else:
-                    row_idx = int(existing_row)
-                row_by_name[str(set_name)] = int(row_idx)
-            for species, value in dict(seed).items():
-                parsed, ok = try_parse_finite_float(value)
-                if not ok:
-                    continue
-                self._batch_store.set_value(int(row_idx), str(species), f"{float(parsed):.6g}")
-            if int(row_idx) not in seen_rows:
-                rows.append(int(row_idx))
-                seen_rows.add(int(row_idx))
-        return rows
-
-    def slider_overrides(self, set_id: Optional[str] = None) -> Dict[str, float]:
-        raw = self._preview_session.slider_overrides(set_id=set_id)
-        overrides: Dict[str, float] = {}
-        for key, value in raw.items():
-            parsed, ok = try_parse_finite_float(value)
-            if not ok:
-                continue
-            overrides[str(key)] = float(parsed)
-        return overrides
-
-    def apply_overrides_to_text(self, base_text: str, *, set_id: Optional[str] = None) -> str:
-        return str(self._apply_overrides_to_text(str(base_text), set_id=set_id))
-
-    def apply_overrides_to_state_network_dsl(self, base_text: str, *, set_id: Optional[str] = None) -> str:
-        return str(self._apply_overrides_to_state_network_dsl(str(base_text), set_id=set_id))
-
-    def apply_parameter_overrides_to_dsl(self, mechanism_text: str, parameters: Dict[str, float]) -> str:
-        return str(self._apply_parameter_overrides_to_dsl(str(mechanism_text), dict(parameters)))
+    def runtime_parameter_values_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> Dict[str, float]:
+        return self._simulation_mechanism_owner.runtime_parameter_values_for_set(
+            set_id=set_id,
+            fast_mode=bool(fast_mode),
+        )
 
     def get_mechanism_text(self) -> str:
-        return str(self._get_mechanism_text())
-
-    def initial_solver_name(self) -> Optional[str]:
-        solver = self._initial_solver
-        return str(solver) if solver is not None else None
+        return self._simulation_mechanism_owner.get_mechanism_text()
 
     def explicit_startup_solver_name(self) -> Optional[str]:
         solver = getattr(self, "_explicit_startup_solver_value", None)
@@ -4586,47 +4278,22 @@ class MainWindow(
     def has_explicit_startup_atol_override(self) -> bool:
         return bool(getattr(self, "_explicit_startup_atol_override", False))
 
-    def initial_rtol(self) -> Optional[float]:
-        value = self._initial_rtol
-        return float(value) if value is not None else None
-
     def explicit_startup_rtol(self) -> Optional[float]:
         value = getattr(self, "_explicit_startup_rtol_value", None)
-        return float(value) if value is not None else None
-
-    def initial_atol(self) -> Optional[float]:
-        value = self._initial_atol
         return float(value) if value is not None else None
 
     def explicit_startup_atol(self) -> Optional[float]:
         value = getattr(self, "_explicit_startup_atol_value", None)
         return float(value) if value is not None else None
 
-    def dsl_global_temperature_K(self, dsl_text: str) -> Optional[float]:
-        value = self._dsl_global_temperature_K(str(dsl_text))
-        return float(value) if value is not None else None
-
     def variable_metadata(self) -> Dict[str, Dict[str, object]]:
-        return self._variable_runtime.variable_metadata()
+        return self._simulation_mechanism_owner.variable_metadata()
 
     def set_variable_metadata(self, metadata: Dict[str, Dict[str, object]] | None) -> None:
         self._variable_runtime.set_variable_metadata(metadata)
 
     def _mutable_variable_metadata(self) -> Dict[str, Dict[str, object]]:
         return self._variable_runtime.mutable_variable_metadata()
-
-    def snapshot_datasets(self) -> Dict[str, Any]:
-        return dict(self._snapshot_datasets() or {})
-
-    def last_fit_metadata(self) -> Optional[Dict[str, Any]]:
-        value = self._last_fit_metadata
-        return dict(value) if isinstance(value, dict) else None
-
-    def set_last_simulation_provenance(self, provenance: Dict[str, Any]) -> None:
-        self._last_simulation_provenance = dict(provenance)
-
-    def set_last_simulation_ctc(self, ctc: Dict[str, float]) -> None:
-        self._last_simulation_ctc = {str(key): float(value) for key, value in (ctc or {}).items()}
 
     def update_temperature_mode_indicator(self) -> None:
         self._update_temperature_mode_indicator()
@@ -4644,160 +4311,6 @@ class MainWindow(
             preserve_visibility=bool(preserve_visibility),
         )
 
-    def apply_pending_init_migration(
-        self,
-        *,
-        seed_sets: Mapping[str, Mapping[str, object]] | None = None,
-        seed: Mapping[str, object] | None = None,
-        rewrite: str,
-    ) -> bool:
-        if seed_sets is None and seed is not None:
-            seed_sets = {"set1": dict(seed)}
-        if not seed_sets or not rewrite:
-            return False
-        try:
-            migrated_rows = self._materialize_migrated_initial_concentration_sets(seed_sets=seed_sets)
-            for row_idx in migrated_rows:
-                try:
-                    top_left = self._batch_model.index(int(row_idx), 0)
-                    bottom_right = self._batch_model.index(
-                        int(row_idx),
-                        max(0, int(self._batch_model.columnCount()) - 1),
-                    )
-                    self._batch_model.dataChanged.emit(
-                        top_left,
-                        bottom_right,
-                        [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to emit batch model dataChanged after migrating pending init seed row %s: %s",
-                        int(row_idx),
-                        exc,
-                        exc_info=True,
-                    )
-            previous_suppress = self._variable_runtime.suppress_slider_runtime_invalidation()
-            previous_authoritative_suppress = bool(
-                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
-            )
-            self._variable_runtime.set_suppress_slider_runtime_invalidation(True)
-            self._suppress_authoritative_mechanism_input_change = True
-            restore_deferred = False
-            try:
-                self.set_mechanism_reactions_text_with_optional_undo(
-                    str(rewrite),
-                    "Migrate initial concentrations to set table",
-                    record_undo=True,
-                )
-                self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
-                self._pending_init_migration_rewrite_for_invalidation = str(rewrite)
-                self._pending_init_migration_state_network_for_invalidation = self.mechanism_state_network_dsl_raw()
-                self._set_mechanism_edit_locked(True)
-                self._dispatch_authoritative_mechanism_consumers()
-                restore_deferred = True
-                def _restore_pending_init_rewrite_suppression() -> None:
-                    self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
-                    self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-
-                QtCore.QTimer.singleShot(0, _restore_pending_init_rewrite_suppression)
-            finally:
-                if not restore_deferred:
-                    self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
-                    self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-            return True
-        except Exception:
-            logger.debug("Failed to apply initial concentration migration to editor/store", exc_info=True)
-            return False
-
-    def arm_pending_init_result_invalidation_guard(self, *, rewrite: str | None = None) -> None:
-        rewrite_text = str(self.mechanism_reactions_text_raw() or "") if rewrite is None else str(rewrite or "")
-        self._pending_init_migration_rewrite_for_invalidation = rewrite_text
-        self._pending_init_migration_state_network_for_invalidation = self.mechanism_state_network_dsl_raw()
-
-    def invalidate_pending_init_preserved_results_after_failed_run(self) -> None:
-        pending_init_rewrite = getattr(self, "_pending_init_migration_rewrite_for_invalidation", None)
-        pending_init_state_network = getattr(
-            self,
-            "_pending_init_migration_state_network_for_invalidation",
-            None,
-        )
-        self._pending_init_migration_rewrite_for_invalidation = None
-        self._pending_init_migration_state_network_for_invalidation = None
-        if pending_init_rewrite is None and pending_init_state_network is None:
-            return
-        self._invalidate_slider_runtime()
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        has_active_cache = bool(
-            batch_cache is not None
-            and (
-                str(batch_cache.active_cache_key or "").strip()
-                or str(batch_cache.active_preview_cache_key or "").strip()
-            )
-        )
-        has_displayed_selection = bool(
-            batch_cache is not None
-            and (
-                str(batch_cache.active_batch_set_id or "").strip()
-                or str(batch_cache.active_batch_set or "").strip()
-                or batch_cache.last_display_selection
-            )
-        )
-        if not (has_active_cache or has_displayed_selection or self.main_plot_has_data()):
-            return
-        self._invalidate_active_results_after_authoritative_mechanism_change()
-
-    def _apply_parameter_overrides_to_dsl(
-        self,
-        mechanism_text: str,
-        parameters: Dict[str, float],
-    ) -> str:
-        """Return DSL text with parameter values replaced."""
-        updated_text = mechanism_text
-        step_analysis_context = None
-        step_constraint_context = {
-            "temperature_K": float(self._temperature_spinbox.value()),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
-        }
-        for name, value in parameters.items():
-            name_str = str(name)
-            if re.match(r"^(kf|kr|Keq|k)\d+$", name_str) and hasattr(self, "_update_variable_in_mechanism"):
-                if re.match(r"^(kf|kr|Keq)\d+$", name_str) and (
-                    step_analysis_context is None or step_analysis_context.source_text != updated_text
-                ):
-                    step_analysis_context = build_current_text_step_analysis_context(
-                        updated_text,
-                        step_constraint_context=step_constraint_context,
-                    )
-                previous_text = updated_text
-                updated_text = self._update_variable_in_mechanism(
-                    name_str,
-                    float(value),
-                    source_text=updated_text,
-                    commit=False,
-                    step_analysis_context=step_analysis_context,
-                )
-                if updated_text != previous_text:
-                    step_analysis_context = None
-                continue
-
-            escaped_name = re.escape(name_str)
-            pattern_assignment = rf"(?<![\w]){escaped_name}\s*=\s*(?P<value>[^\n#;,]+)"
-
-            def _replace(match: re.Match) -> str:
-                old_value = match.group("value").strip()
-                return match.group(0).replace(old_value, f"{float(value):.6g}", 1)
-
-            updated_text, replacements = re.subn(
-                pattern_assignment,
-                _replace,
-                updated_text,
-                count=1,
-                flags=re.MULTILINE,
-            )
-            if replacements == 0:
-                logger.debug("Parameter '%s' not found while applying overrides", name)
-        return updated_text
-
     def _simulate_mechanism(
         self,
         mechanism_text: str,
@@ -4808,61 +4321,29 @@ class MainWindow(
     ) -> Dict[str, Any]:
         """Simulate a mechanism synchronously and return the time-series payload."""
         from kindred.core.exceptions import SimulationError
-        from kindred.core.ode_builder import build_ode_rhs_from_mechanism
-        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-        from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
-        from kindred.core.simulator.solvers import SimulationRequest, solve_ode
-        from kindred.core.units import UnitsModel
+        from kindred.core.simulation_preparation import prepare_simulation_worker_run
+        from kindred.core.simulator.solvers import solve_ode
 
         solver_cfg = self._get_solver_settings()
         temperature = self._temperature_spinbox.value()
-
-        units = UnitsModel(temperature_K=temperature)
-        mechanism = parse_dsl_to_mechanism(mechanism_text, initials=initials or {}, units=units)
-        _ = apply_parameter_algebra_to_mechanism(mechanism_text, mechanism=mechanism, require_mutable=False)
-        species_names = mechanism.species_names()
-        y0 = np.array([mechanism.species[sp].initial_conc for sp in species_names])
-        rhs = build_ode_rhs_from_mechanism(mechanism)
-
-        temperature_schedule = None
-        try:
-            meta = getattr(mechanism, "metadata", {}) or {}
-            if isinstance(meta, dict):
-                temperature_schedule = meta.get("temperature_schedule")
-        except Exception:
-            temperature_schedule = None
-
-        jacobian_func = None
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
-
-        solver_name = str(solver_cfg.get("solver") or DEFAULT_SOLVER_NAME).upper()
-        if solver_cfg.get("use_sparse_jacobian") and solver_name in {"RADAU", "BDF"}:
-            try:
-                from kindred.core.sparse_jacobian import build_sparse_jacobian
-
-                jacobian_func = build_sparse_jacobian(mechanism)
-                logger.info("Sparse Jacobian enabled for helper simulation (%s)", solver_name)
-            except Exception as exc:
-                logger.warning("Sparse Jacobian unavailable: %s", exc)
-                jacobian_func = None
-                solver_cfg["use_sparse_jacobian"] = False
-
-        request = SimulationRequest(
-            rhs=rhs,
+        solver_cfg = {
+            **dict(solver_cfg or {}),
+            "temperature_K": float(temperature),
+            "grid": {"N": max(2, int(num_points))},
+        }
+        prepared = prepare_simulation_worker_run(
+            mechanism_text=str(mechanism_text or ""),
+            initials=dict(initials or {}),
             t_span=(0.0, float(t_end)),
-            y0=y0,
-            solver=solver_cfg["solver"],
-            rtol=solver_cfg["rtol"],
-            atol=solver_cfg["atol"],
-            grid={"N": max(2, int(num_points))},
-            jacobian_func=jacobian_func,
-            temperature_schedule=temperature_schedule,
+            solver_config=solver_cfg,
         )
         try:
-            result = solve_ode(request)
+            result = solve_ode(prepared.request)
         except SimulationError as exc:
             logger.error("Synchronous simulation failed: %s", exc)
             raise
+        mechanism = prepared.mechanism
+        species_names = list(prepared.species_names)
         species_data = {name: result.Y[idx, :].copy() for idx, name in enumerate(species_names)}
         algebra_scalars: Dict[str, float] = {}
         try:
@@ -4887,6 +4368,7 @@ class MainWindow(
             "algebra_scalars": dict(algebra_scalars),
             "mechanism": mechanism,
             "solver_config": solver_cfg,
+            "solver_provenance": dict(getattr(result, "provenance", {}) or {}),
         }
 
     def _run_dataset_simulation(self, dsl_text: str) -> Dict[str, Any]:
@@ -4948,12 +4430,10 @@ class MainWindow(
     def _batch_set_id_for_row(self, row: int) -> Optional[str]:
         try:
             if hasattr(self._batch_store, "set_id_for_row"):
-                return str(self._batch_store.set_id_for_row(int(row)))
+                set_id = self._batch_store.set_id_for_row(int(row))
+                return str(set_id) if set_id is not None else None
         except Exception:
             return None
-        names = list(self._batch_store.set_names())
-        if 0 <= int(row) < len(names):
-            return str(names[int(row)])
         return None
 
     def _batch_set_id_for_name(self, set_name: str) -> Optional[str]:
@@ -4988,11 +4468,11 @@ class MainWindow(
                 ids.append(str(sid))
         return ids
 
-    def _shown_batch_set_ids(self) -> List[str]:
+    def _requested_show_batch_set_ids(self) -> List[str]:
         model = getattr(self, "_batch_model", None)
-        if model is None or not hasattr(model, "shown_set_ids"):
+        if model is None or not hasattr(model, "requested_show_set_ids"):
             return []
-        return [str(set_id) for set_id in model.shown_set_ids() if str(set_id)]
+        return [str(set_id) for set_id in model.requested_show_set_ids() if str(set_id)]
 
     def _slider_edit_target_set_ids(self) -> List[str]:
         model = getattr(self, "_batch_model", None)
@@ -5007,33 +4487,73 @@ class MainWindow(
         return bool(model.set_slider_edit_target_set_ids(set_ids))
 
     def _effective_slider_edit_target_set_ids(self) -> List[str]:
-        focused_set_id = self._focused_batch_set_id_value()
-        effective_ids: list[str] = []
-        seen: set[str] = set()
-        if focused_set_id:
-            effective_ids.append(focused_set_id)
-            seen.add(focused_set_id)
-        for set_id in self._slider_edit_target_set_ids():
-            set_id_s = str(set_id or "").strip()
-            if not set_id_s or set_id_s in seen:
-                continue
-            effective_ids.append(set_id_s)
-            seen.add(set_id_s)
-        return effective_ids
+        owner = getattr(self, "_simulation_batch_owner", None)
+        if owner is not None and hasattr(owner, "effective_slider_edit_target_set_ids"):
+            try:
+                return [
+                    str(set_id)
+                    for set_id in owner.effective_slider_edit_target_set_ids()
+                    if str(set_id)
+                ]
+            except Exception as exc:
+                logger.debug("Failed to resolve slider edit targets from batch owner: %s", exc, exc_info=True)
+        return []
 
-    def _focused_batch_set_id_value(self) -> str:
+    def _effective_slider_edit_target_rows(self) -> tuple[int, ...]:
+        rows: list[int] = []
+        seen: set[int] = set()
+        for set_id in self._effective_slider_edit_target_set_ids():
+            row = self._batch_row_for_set_id(str(set_id))
+            if row is None:
+                continue
+            row_i = int(row)
+            if row_i in seen:
+                continue
+            rows.append(row_i)
+            seen.add(row_i)
+        return tuple(rows)
+
+    @staticmethod
+    def _normalized_slider_target_set_ids(set_ids: Sequence[str]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_set_id in set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if not set_id or set_id in seen:
+                continue
+            seen.add(set_id)
+            normalized.append(set_id)
+        return tuple(normalized)
+
+    def _reconcile_slider_target_membership_change(self) -> None:
+        current_target_ids = self._normalized_slider_target_set_ids(
+            self._effective_slider_edit_target_set_ids()
+        )
+        self._last_effective_slider_edit_target_set_ids = current_target_ids
+        try:
+            preview_removed = self._preview_session.reconcile_slider_target_membership(current_target_ids)
+        except RuntimeError as exc:
+            logger.debug("Failed to prune slider preview state after target membership change: %s", exc, exc_info=True)
+            preview_removed = ()
+        if not preview_removed:
+            return
+        try:
+            intersects = True
+            inspector = getattr(self._sim_controller, "slider_preview_work_intersects_target_scope", None)
+            if callable(inspector):
+                intersects = bool(inspector(tuple(preview_removed)))
+            if intersects:
+                self._sim_controller.invalidate_slider_preview_work()
+        except RuntimeError as exc:
+            logger.debug("Failed to invalidate stale slider preview targets: %s", exc, exc_info=True)
+
+    def _active_batch_set_id(self) -> str:
         current_row = self._batch_current_row()
-        if current_row is not None:
-            current_set_id = str(self._batch_set_id_for_row(int(current_row)) or "").strip()
-            if current_set_id:
-                return current_set_id
-        focused_set_id = str(getattr(self, "_focused_batch_set_id", "") or "").strip()
-        if focused_set_id and self._batch_store.row_for_set_id(focused_set_id) is not None:
-            return focused_set_id
-        if int(self._batch_store.row_count()) > 0:
-            fallback = str(self._batch_set_id_for_row(0) or "").strip()
-            if fallback:
-                return fallback
+        if current_row is None:
+            return ""
+        active_set_id = str(self._batch_set_id_for_row(int(current_row)) or "").strip()
+        if active_set_id and self._batch_row_for_set_id(active_set_id) is not None:
+            return active_set_id
         return ""
 
     def _batch_row_for_set_id(self, set_id: str) -> Optional[int]:
@@ -5041,288 +4561,6 @@ class MainWindow(
             return self._batch_store.row_for_set_id(str(set_id or ""))
         except Exception:
             return None
-
-    def _copy_all_popup_labels_by_set_id(self, set_ids: Sequence[str]) -> Dict[str, str]:
-        labels_by_id: Dict[str, str] = {}
-        label_counts: Dict[str, int] = {}
-        for raw_set_id in set_ids or ():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id:
-                continue
-            label = str(self.batch_set_name_for_id(set_id) or set_id)
-            labels_by_id[set_id] = label
-            label_counts[label] = int(label_counts.get(label, 0)) + 1
-
-        popup_labels: Dict[str, str] = {}
-        for set_id, label in labels_by_id.items():
-            popup_label = str(label)
-            if int(label_counts.get(label, 0)) > 1:
-                row = self._batch_row_for_set_id(set_id)
-                if row is not None:
-                    popup_label = f"{label} (row {int(row) + 1})"
-            popup_labels[set_id] = popup_label
-        return popup_labels
-
-    def _copy_all_shown_block_from_entry(
-        self,
-        *,
-        set_id: str,
-        label: str,
-        entry: Mapping[str, Any],
-    ):
-        from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllShownBlock
-
-        return CopyAllShownBlock(
-            set_id=str(set_id),
-            label=str(label),
-            t=np.asarray(entry.get("t"), dtype=float).reshape(-1),
-            series={
-                str(name): np.asarray(values, dtype=float).reshape(-1)
-                for name, values in dict(entry.get("series") or {}).items()
-            },
-        )
-
-    def _copy_all_clean_shown_block(
-        self,
-        *,
-        set_id: str,
-        label: str,
-        cache_key: str,
-        valid_set_ids: Optional[Sequence[str]],
-        invalidated_set_ids: Optional[Sequence[str]],
-    ):
-        if not cache_key:
-            return None, "no_cached_results"
-        coverage = self.results_controller.cached_batch_selection_coverage(
-            cache_key=str(cache_key),
-            selected_sets=[str(set_id)],
-            cache_store=self._sim_controller.batch_cache.result_cache,
-            valid_set_ids=valid_set_ids,
-            invalidated_set_ids=invalidated_set_ids,
-            allow_fallback=False,
-        )
-        if not coverage.available_ids:
-            return None, str(coverage.reason or "no_cached_results")
-        entry_result = self._cache_entry_for_set_id_from_store(
-            store=self._sim_controller.batch_cache.result_cache,
-            cache_key=str(cache_key),
-            set_id=str(set_id),
-        )
-        if entry_result.entry is None:
-            return None, "invalid_cache_entry" if entry_result.state == "invalid" else "no_cached_results"
-        return self._copy_all_shown_block_from_entry(set_id=str(set_id), label=label, entry=entry_result.entry), None
-
-    def _copy_all_live_primary_block(
-        self,
-        *,
-        set_id: str,
-        label: str,
-    ):
-        sid = str(set_id or "").strip()
-        if not self.main_plot_has_data():
-            return None
-        if sid:
-            active_set_id = str(self.active_batch_selection()[0] or "").strip()
-            if active_set_id != sid:
-                return None
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return None
-        plot_t = np.asarray(
-            getattr(plot, "_t", None) if getattr(plot, "_t", None) is not None else [],
-            dtype=float,
-        ).reshape(-1)
-        plot_series_raw = getattr(plot, "_series", {}) or {}
-        if plot_t.size <= 0 or not isinstance(plot_series_raw, Mapping):
-            return None
-        plot_series = {
-            str(name): np.asarray(values, dtype=float).reshape(-1)
-            for name, values in dict(plot_series_raw).items()
-            if np.asarray(values, dtype=float).reshape(-1).size > 0
-        }
-        if not plot_series:
-            return None
-        return self._copy_all_shown_block_from_entry(
-            set_id=sid,
-            label=label,
-            entry={"t": plot_t, "series": plot_series},
-        )
-
-    def _copy_all_live_plot_shown_block(
-        self,
-        *,
-        set_id: str,
-        label: str,
-        invalidated_set_ids: Optional[Sequence[str]],
-        allow_clean_missing_cache: bool = False,
-    ):
-        sid = str(set_id or "").strip()
-        if not sid:
-            return None
-        invalidated = {str(raw_id) for raw_id in (invalidated_set_ids or ()) if str(raw_id)}
-        if sid not in invalidated and not bool(allow_clean_missing_cache):
-            return None
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return None
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        active_set_id = str(batch_cache.active_batch_set_id or "").strip() if batch_cache is not None else ""
-
-        if active_set_id == sid:
-            block = self._copy_all_live_primary_block(set_id=sid, label=label)
-            if block is not None:
-                return block
-
-        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-            if not isinstance(entry, Mapping):
-                continue
-            if str(entry.get("curve_role") or "").strip() == "canonical_ghost":
-                continue
-            if str(entry.get("set_id") or "").strip() != sid:
-                continue
-            overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
-            overlay_series_raw = entry.get("series") or {}
-            if overlay_t.size <= 0 or not isinstance(overlay_series_raw, Mapping):
-                continue
-            overlay_series = {
-                str(name): np.asarray(values, dtype=float).reshape(-1)
-                for name, values in dict(overlay_series_raw).items()
-                if np.asarray(values, dtype=float).reshape(-1).size > 0
-            }
-            if not overlay_series:
-                continue
-            return self._copy_all_shown_block_from_entry(
-                set_id=sid,
-                label=label,
-                entry={"t": overlay_t, "series": overlay_series},
-            )
-        return None
-
-    def _copy_all_dirty_shown_block(self, *, set_id: str, label: str):
-        resolved_entries, reason, _, _, _, _, _ = self._resolve_workspace_aware_batch_selection(
-            selected_sets=[str(set_id)]
-        )
-        resolved = next((entry for entry in resolved_entries if str(entry.set_id) == str(set_id)), None)
-        if resolved is None or resolved.entry is None:
-            return None, str(reason or "preview_pending")
-        return self._copy_all_shown_block_from_entry(
-            set_id=str(resolved.set_id),
-            label=str(label),
-            entry=resolved.entry,
-        ), None
-
-    def _build_main_plot_copy_all_export_plan(self):
-        from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllExportPlan, CopyAllMissingItem
-
-        shown_set_ids = [str(set_id) for set_id in (self.shown_batch_set_ids() or []) if str(set_id)]
-        live_primary_fallback_set_id = ""
-        non_batch_live_primary_label = ""
-        if not shown_set_ids and self.main_plot_has_data():
-            active_set_id = str(self.active_batch_selection()[0] or "").strip()
-            if active_set_id:
-                shown_set_ids = [active_set_id]
-                live_primary_fallback_set_id = active_set_id
-            else:
-                plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-                non_batch_live_primary_label = str(
-                    getattr(plot, "_simulation_set_label", "") if plot is not None else ""
-                ).strip() or "Results"
-        popup_labels = self._copy_all_popup_labels_by_set_id(shown_set_ids)
-        batch_cache = self._sim_controller.batch_cache
-        cache_key = str(batch_cache.active_cache_key or "")
-        valid_set_ids = tuple(str(set_id) for set_id in (batch_cache.active_cache_valid_set_ids or ()) if str(set_id))
-        invalidated_set_ids = tuple(
-            str(set_id) for set_id in (batch_cache.active_cache_invalidated_set_ids or ()) if str(set_id)
-        )
-
-        shown_blocks = []
-        missing_items = []
-        for set_id in shown_set_ids:
-            label = str(self.batch_set_name_for_id(set_id) or set_id)
-            export_label = str(popup_labels.get(str(set_id), label))
-            if self._preview_session.has_dirty_state_for_set(str(set_id)):
-                block, reason = self._copy_all_dirty_shown_block(set_id=str(set_id), label=export_label)
-            else:
-                block, reason = self._copy_all_clean_shown_block(
-                    set_id=str(set_id),
-                    label=export_label,
-                    cache_key=cache_key,
-                    valid_set_ids=valid_set_ids or None,
-                    invalidated_set_ids=invalidated_set_ids or None,
-                )
-                if block is None:
-                    allow_clean_missing_cache = (
-                        str(reason or "") == "no_cached_results" and str(set_id) not in invalidated_set_ids
-                    )
-                    block = self._copy_all_live_plot_shown_block(
-                        set_id=str(set_id),
-                        label=export_label,
-                        invalidated_set_ids=invalidated_set_ids or None,
-                        allow_clean_missing_cache=allow_clean_missing_cache,
-                    )
-                if block is None and str(set_id) == live_primary_fallback_set_id:
-                    block = self._copy_all_live_primary_block(
-                        set_id=str(set_id),
-                        label=export_label,
-                    )
-            if block is not None:
-                shown_blocks.append(block)
-                continue
-            missing_items.append(
-                CopyAllMissingItem(
-                    set_id=str(set_id),
-                    label=label,
-                    popup_label=str(popup_labels.get(str(set_id), label)),
-                    reason=str(reason or "no_cached_results"),
-                )
-            )
-        if non_batch_live_primary_label:
-            block = self._copy_all_live_primary_block(
-                set_id="",
-                label=non_batch_live_primary_label,
-            )
-            if block is not None:
-                shown_blocks.append(block)
-            else:
-                missing_items.append(
-                    CopyAllMissingItem(
-                        set_id="",
-                        label=non_batch_live_primary_label,
-                        popup_label=non_batch_live_primary_label,
-                        reason="no_simulation_data",
-                    )
-                )
-        return CopyAllExportPlan(shown_blocks=shown_blocks, missing_items=missing_items)
-
-    def _set_cached_focused_batch_set_id(self, set_id: str) -> str:
-        focused_set_id = str(set_id or "").strip()
-        if focused_set_id and self._batch_row_for_set_id(focused_set_id) is None:
-            focused_set_id = ""
-        self._focused_batch_set_id = focused_set_id
-        return focused_set_id
-
-    def _update_focused_batch_set_id(self, *, row: Optional[int] = None) -> str:
-        target_row = self._batch_current_row() if row is None else int(row)
-        focused_set_id = ""
-        if target_row is not None:
-            focused_set_id = str(self._batch_set_id_for_row(int(target_row)) or "").strip()
-        if not focused_set_id:
-            focused_set_id = str(getattr(self, "_focused_batch_set_id", "") or "").strip()
-            if focused_set_id and self._batch_row_for_set_id(focused_set_id) is None:
-                focused_set_id = ""
-        if (not focused_set_id) and int(self._batch_store.row_count()) > 0:
-            focused_set_id = str(self._batch_set_id_for_row(0) or "").strip()
-        return self._set_cached_focused_batch_set_id(focused_set_id)
-
-    def _ensure_focused_batch_set_visible(self) -> None:
-        focused_set_id = self._focused_batch_set_id_value()
-        if not focused_set_id:
-            return
-        row = self._batch_row_for_set_id(focused_set_id)
-        model = getattr(self, "_batch_model", None)
-        if row is None or model is None or not hasattr(model, "set_row_shown"):
-            return
-        model.set_row_shown(int(row), True)
 
     def _next_default_batch_set_name(self) -> str:
         existing = {str(n) for n in (self._batch_store.set_names() or [])}
@@ -5348,7 +4586,6 @@ class MainWindow(
             return
         idx = self._batch_model.index(int(row_idx), 0)
         table.setCurrentIndex(idx)
-        self._update_focused_batch_set_id(row=int(row_idx))
         sel = table.selectionModel()
         if sel is not None:
             signals_blocked = False
@@ -5417,12 +4654,6 @@ class MainWindow(
         except RuntimeError as exc:
             logger.debug("Failed to block batch selection signals: %s", exc, exc_info=True)
             signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
-            signals_blocked = False
         try:
             sel.clearSelection()
             for r in new_rows:
@@ -5430,7 +4661,6 @@ class MainWindow(
                 sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
             if new_rows:
                 table.setCurrentIndex(self._batch_model.index(int(new_rows[0]), 0))
-                self._update_focused_batch_set_id(row=int(new_rows[0]))
         finally:
             if signals_blocked:
                 try:
@@ -5438,12 +4668,7 @@ class MainWindow(
                 except RuntimeError as exc:
                     logger.debug("Failed to unblock batch selection signals: %s", exc, exc_info=True)
                     signals_blocked = False
-                    signals_blocked = False
-                    signals_blocked = False
-                    signals_blocked = False
-                    signals_blocked = False
         self._update_batch_row_controls_state()
-        self._sync_main_plot_copy_labels_for_cached_batch_selection()
 
     def _batch_delete_target_rows(self) -> List[int]:
         rows = self._batch_selected_rows()
@@ -5458,33 +4683,13 @@ class MainWindow(
             return [0]
         return []
 
-    def _batch_cache_contains_set(self, *, set_id: str, set_name: str) -> bool:
-        sid = str(set_id or "")
-        sname = str(set_name or "")
-        for store in (
-            self._sim_controller.batch_cache.result_cache,
-            self._sim_controller.batch_cache.preview_cache,
-        ):
-            suffixes = []
-            if sid:
-                suffixes.append(f"::{sid}")
-            if sname:
-                suffixes.append(f"::{sname}")
-            if not suffixes:
-                continue
-            for k in (store or {}).keys():
-                token = str(k or "")
-                if any(token.endswith(suf) for suf in suffixes):
-                    return True
-        return False
-
     def _datasets_mapped_to_batch_sets(self, *, set_ids: Sequence[str], set_names: Sequence[str]) -> List[str]:
-        manager = getattr(self, "_dataset_manager", None)
-        if manager is None:
-            return []
-        if hasattr(manager, "datasets_mapped_to_batch_sets"):
-            return list(manager.datasets_mapped_to_batch_sets(set_ids=set_ids, set_names=set_names))
-        return []
+        return list(
+            self._dataset_fit_settings_store.datasets_mapped_to_batch_sets(
+                set_ids=set_ids,
+                set_names=set_names,
+            )
+        )
 
     def _confirm_delete_batch_sets(
         self,
@@ -5534,40 +4739,18 @@ class MainWindow(
         return response == QtWidgets.QMessageBox.StandardButton.Yes
 
     def _unmap_datasets_for_deleted_batch_sets(self, *, set_ids: Sequence[str], set_names: Sequence[str]) -> List[str]:
-        manager = getattr(self, "_dataset_manager", None)
-        if manager is None:
-            return []
-        if hasattr(manager, "unmap_batch_sets"):
-            return list(manager.unmap_batch_sets(set_ids=set_ids, set_names=set_names))
-        return []
-
-    def _purge_batch_cache_for_deleted_sets(self, *, set_ids: Sequence[str], set_names: Sequence[str]) -> None:
-        id_targets = {str(v) for v in (set_ids or []) if str(v)}
-        name_targets = {str(v) for v in (set_names or []) if str(v)}
-        for store in (
-            self._sim_controller.batch_cache.result_cache,
-            self._sim_controller.batch_cache.preview_cache,
-        ):
-            for composite_key in list((store or {}).keys()):
-                token = str(composite_key or "")
-                if "::" not in token:
-                    continue
-                _prefix, sid = token.rsplit("::", 1)
-                if sid in id_targets or sid in name_targets:
-                    try:
-                        store.pop(composite_key, None)  # type: ignore[union-attr]
-                    except Exception as exc:
-                        try:
-                            del store[composite_key]  # type: ignore[union-attr]
-                        except Exception as exc2:
-                            logger.debug(
-                                "Failed to purge cache key %s: %s / %s",
-                                composite_key,
-                                exc,
-                                exc2,
-                                exc_info=True,
-                            )
-                            continue
+        affected = list(
+            self._dataset_fit_settings_store.unmap_batch_sets(
+                set_ids=set_ids,
+                set_names=set_names,
+            )
+        )
+        if affected:
+            self._fitting_runtime_input_publisher.publish_current(
+                reason="batch set dataset mapping changed",
+                force=True,
+            )
+        return affected
 
     def _select_single_batch_row(self, row: int) -> None:
         table = getattr(self, "_batch_table", None)
@@ -5577,7 +4760,6 @@ class MainWindow(
             return
         idx = self._batch_model.index(int(row), 0)
         table.setCurrentIndex(idx)
-        self._update_focused_batch_set_id(row=int(row))
         sel = table.selectionModel()
         if sel is None:
             return
@@ -5597,7 +4779,6 @@ class MainWindow(
                     sel.blockSignals(False)
                 except RuntimeError as exc:
                     logger.debug("Failed to unblock batch selection signals: %s", exc, exc_info=True)
-                    signals_blocked = False
                     signals_blocked = False
         self._update_batch_row_controls_state()
 
@@ -5622,7 +4803,7 @@ class MainWindow(
 
         mapped_datasets = self._datasets_mapped_to_batch_sets(set_ids=delete_ids, set_names=delete_names)
         has_cached_results = any(
-            self._batch_cache_contains_set(set_id=sid, set_name=name)
+            self._simulation_batch_owner.batch_cache_contains_set(set_id=sid, set_name=name)
             for sid, name in zip(delete_ids, delete_names)
         )
         deleting_last_remaining = len(delete_ids) >= int(self._batch_store.row_count())
@@ -5647,67 +4828,21 @@ class MainWindow(
         self._batch_model.reset_invalid()
 
         self._unmap_datasets_for_deleted_batch_sets(set_ids=delete_ids, set_names=delete_names)
-        self._purge_batch_cache_for_deleted_sets(set_ids=delete_ids, set_names=delete_names)
-
-        if str(self._sim_controller.batch_cache.active_batch_set_id or "") in set(delete_ids):
-            self._sim_controller.batch_cache.active_batch_set_id = None
-        if str(self._sim_controller.batch_cache.active_batch_set or "") in set(delete_names):
-            self._sim_controller.batch_cache.active_batch_set = None
+        self._simulation_batch_owner.purge_batch_cache_for_deleted_sets(set_ids=delete_ids, set_names=delete_names)
+        self.results_controller.deauthorize_display_for_deleted_sets(set_ids=delete_ids)
 
         target_row = min(rows[0], max(0, int(self._batch_store.row_count()) - 1))
         self._select_single_batch_row(target_row)
         self._update_batch_row_controls_state()
-        self.results_controller.refresh_batch_plot_after_set_mutation()
+        self._refresh_batch_display_from_request_scope()
 
-    def _batch_set_names_for_scope(self, scope: str) -> List[str]:
-        from kindred.core.batch_initial_conditions import resolve_run_scope
-
-        names = list(self._batch_store.set_names())
-        if not names:
-            return []
-        scope = str(scope or "").strip().lower()
-        if scope == "all":
-            return names
-        rows = resolve_run_scope(
-            selected_rows=self._batch_selected_rows(),
-            total_rows=len(names),
-            mode="selected",
-            fallback_row=self._batch_current_row(),
-        )
-        return [names[r] for r in rows if 0 <= int(r) < len(names)]
-
-    def _batch_set_ids_for_scope(self, scope: str) -> List[str]:
-        names = self._batch_set_names_for_scope(scope)
-        ids: List[str] = []
-        for name in names:
-            sid = self._batch_set_id_for_name(name)
-            if sid:
-                ids.append(str(sid))
-        return ids
-
-    def _shown_batch_rows(self) -> List[int]:
+    def _requested_show_batch_rows(self) -> List[int]:
         rows: List[int] = []
-        for set_id in self._shown_batch_set_ids():
+        for set_id in self._requested_show_batch_set_ids():
             row = self._batch_row_for_set_id(set_id)
             if row is not None:
                 rows.append(int(row))
         return rows
-
-    def _batch_rows_for_scope(self, scope: str) -> List[int]:
-        from kindred.core.batch_initial_conditions import resolve_run_scope
-
-        total = int(self._batch_store.row_count())
-        if total <= 0:
-            return []
-        scope = str(scope or "").strip().lower()
-        if scope == "all":
-            return list(range(total))
-        return resolve_run_scope(
-            selected_rows=self._batch_selected_rows(),
-            total_rows=total,
-            mode="selected",
-            fallback_row=self._batch_current_row(),
-        )
 
     def _update_batch_row_controls_state(self) -> None:
         selected_rows = self._batch_selected_rows()
@@ -5717,8 +4852,196 @@ class MainWindow(
         if hasattr(self, "_move_batch_down_btn"):
             self._move_batch_down_btn.setEnabled(bool(allow_reorder))
         model = getattr(self, "_batch_model", None)
-        if model is not None and hasattr(model, "set_focused_effective_edit_target_set_id"):
-            model.set_focused_effective_edit_target_set_id(self._focused_batch_set_id_value())
+        if model is not None and hasattr(model, "set_active_effective_edit_target_set_id"):
+            active_target_set_id = ""
+            owner = getattr(self, "_simulation_batch_owner", None)
+            if owner is not None and hasattr(owner, "focused_effective_slider_target_set_id"):
+                try:
+                    active_target_set_id = owner.focused_effective_slider_target_set_id()
+                except Exception as exc:
+                    logger.debug("Failed to resolve focused slider target from batch owner: %s", exc, exc_info=True)
+            model.set_active_effective_edit_target_set_id(active_target_set_id)
+        self._refresh_run_target_ui_from_batch_scope()
+
+    def _current_run_target_readiness_signature(self) -> tuple[tuple[int, ...], tuple[str, ...]]:
+        owner = getattr(self, "_simulation_batch_owner", None)
+        if owner is None or not hasattr(owner, "run_target_ui_state"):
+            return ((), ())
+        try:
+            state = owner.run_target_ui_state()
+        except Exception as exc:
+            logger.debug("Failed to resolve run-target readiness signature: %s", exc, exc_info=True)
+            return ((), ())
+        rows = tuple(
+            dict.fromkeys(
+                int(row)
+                for row in (getattr(state, "target_rows", ()) or ())
+                if int(row) >= 0
+            )
+        )
+        set_ids = tuple(
+            dict.fromkeys(
+                str(set_id).strip()
+                for set_id in (getattr(state, "target_set_ids", ()) or ())
+                if str(set_id).strip()
+            )
+        )
+        return (rows, set_ids)
+
+    def _mark_launch_readiness_stale(self) -> None:
+        ui_owner = getattr(self, "_simulation_run_ui_owner", None)
+        mark_stale = getattr(ui_owner, "mark_launch_readiness_stale", None)
+        if callable(mark_stale):
+            mark_stale()
+
+    def _maybe_queue_run_target_runtime_readiness_refresh(self, *, force: bool = False) -> None:
+        signature = self._current_run_target_readiness_signature()
+        rows, set_ids = signature
+        previous = getattr(self, "_last_interactive_runtime_readiness_signature", None)
+        if not rows or not set_ids:
+            self._last_interactive_runtime_readiness_signature = signature
+            self._mark_launch_readiness_stale()
+            return
+        if not bool(force) and previous == signature:
+            return
+        self._last_interactive_runtime_readiness_signature = signature
+        self._mark_launch_readiness_stale()
+        self._queue_interactive_runtime_readiness_refresh(rows)
+
+    def _commit_active_batch_table_editor(self) -> None:
+        table = getattr(self, "_batch_table", None)
+        commit = getattr(table, "commit_active_editor", None)
+        if callable(commit):
+            try:
+                commit()
+            except Exception as exc:
+                logger.debug("Failed to commit active batch table editor before run: %s", exc, exc_info=True)
+
+    def _refresh_interactive_runtime_readiness_for_rows(self, rows: Sequence[int] | None) -> None:
+        refresh_runtime_readiness = getattr(
+            getattr(self, "_sim_controller", None),
+            "refresh_interactive_runtime_readiness",
+            None,
+        )
+        if callable(refresh_runtime_readiness):
+            if rows is None:
+                refresh_runtime_readiness(rows=None, fast_mode=True)
+            else:
+                normalized_rows = tuple(int(row) for row in rows or ())
+                refresh_runtime_readiness(rows=normalized_rows, fast_mode=True)
+
+    def _queue_interactive_runtime_readiness_refresh(self, rows: Sequence[int]) -> None:
+        normalized = tuple(dict.fromkeys(int(row) for row in (rows or ())))
+        self._pending_interactive_runtime_readiness_rows = normalized
+        self._interactive_runtime_readiness_refresh_queued = True
+        if QtCore.QCoreApplication.instance() is None:
+            self._flush_interactive_runtime_readiness_refresh()
+            return
+        timer = getattr(self, "_interactive_runtime_readiness_refresh_timer", None)
+        if isinstance(timer, QtCore.QTimer):
+            timer.start(_INTERACTIVE_RUNTIME_READINESS_REFRESH_DEBOUNCE_MS)
+        else:
+            QtCore.QTimer.singleShot(
+                _INTERACTIVE_RUNTIME_READINESS_REFRESH_DEBOUNCE_MS,
+                self._flush_interactive_runtime_readiness_refresh,
+            )
+
+    def _flush_interactive_runtime_readiness_refresh(self) -> None:
+        timer = getattr(self, "_interactive_runtime_readiness_refresh_timer", None)
+        if isinstance(timer, QtCore.QTimer) and timer.isActive():
+            timer.stop()
+        rows = tuple(getattr(self, "_pending_interactive_runtime_readiness_rows", ()) or ())
+        self._pending_interactive_runtime_readiness_rows = ()
+        self._interactive_runtime_readiness_refresh_queued = False
+        self._refresh_interactive_runtime_readiness_for_rows(rows)
+
+    def _queue_canonical_batch_initials_transition(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        transition_source: str,
+        discard_dirty_preview: bool,
+        debounce_ms: int = _CANONICAL_BATCH_INITIALS_TRANSITION_DEBOUNCE_MS,
+    ) -> None:
+        normalized = tuple(
+            dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id))
+        )
+        if not normalized:
+            return
+        pending = list(getattr(self, "_pending_canonical_batch_initials_transition_set_ids", ()) or ())
+        for set_id in normalized:
+            if set_id not in pending:
+                pending.append(set_id)
+        self._pending_canonical_batch_initials_transition_set_ids = tuple(pending)
+        self._pending_canonical_batch_initials_transition_source = str(
+            transition_source or "batch_initials_table_edit"
+        )
+        self._pending_canonical_batch_initials_discard_dirty_preview = bool(discard_dirty_preview)
+        self._canonical_batch_initials_transition_queued = True
+        if QtCore.QCoreApplication.instance() is None:
+            self._flush_canonical_batch_initials_transition()
+            return
+        timer = getattr(self, "_canonical_batch_initials_transition_timer", None)
+        delay_ms = max(0, int(debounce_ms))
+        if isinstance(timer, QtCore.QTimer):
+            timer.start(delay_ms)
+        else:
+            QtCore.QTimer.singleShot(
+                delay_ms,
+                self._flush_canonical_batch_initials_transition,
+            )
+
+    def _flush_canonical_batch_initials_transition(self) -> None:
+        timer = getattr(self, "_canonical_batch_initials_transition_timer", None)
+        if isinstance(timer, QtCore.QTimer) and timer.isActive():
+            timer.stop()
+        affected_set_ids = tuple(
+            getattr(self, "_pending_canonical_batch_initials_transition_set_ids", ()) or ()
+        )
+        transition_source = str(
+            getattr(
+                self,
+                "_pending_canonical_batch_initials_transition_source",
+                "batch_initials_table_edit",
+            )
+            or "batch_initials_table_edit"
+        )
+        discard_dirty_preview = bool(
+            getattr(self, "_pending_canonical_batch_initials_discard_dirty_preview", True)
+        )
+        self._pending_canonical_batch_initials_transition_set_ids = ()
+        self._canonical_batch_initials_transition_queued = False
+        if not affected_set_ids:
+            return
+        self._apply_canonical_batch_initials_transition(
+            affected_set_ids=affected_set_ids,
+            transition_source=transition_source,
+            discard_dirty_preview=discard_dirty_preview,
+        )
+
+    def _run_simulation_after_flushing_batch_initials(self) -> None:
+        self._commit_active_batch_table_editor()
+        self._flush_canonical_batch_initials_transition()
+        self._sim_controller.run_simulation()
+
+    def _refresh_run_target_ui_from_batch_scope(self) -> None:
+        owner = getattr(self, "_simulation_batch_owner", None)
+        ui_owner = getattr(self, "_simulation_run_ui_owner", None)
+        if owner is None or ui_owner is None or not hasattr(owner, "run_target_ui_state"):
+            return
+        try:
+            state = owner.run_target_ui_state()
+        except Exception as exc:
+            logger.debug("Failed to resolve run-target UI state: %s", exc, exc_info=True)
+            return
+        render = getattr(ui_owner, "render_run_target_state", None)
+        if callable(render):
+            render(
+                button_text=str(getattr(state, "button_text", "Run") or "Run"),
+                target_available=bool(getattr(state, "enabled", False)),
+                tooltip=str(getattr(state, "empty_reason", "") or ""),
+            )
+        self._maybe_queue_run_target_runtime_readiness_refresh()
 
     def _batch_cache_key(
         self,
@@ -5762,198 +5085,60 @@ class MainWindow(
         total = int(self._batch_store.row_count())
         if total <= 0:
             return None
-        focused_set_id = self._focused_batch_set_id_value()
+        active_set_id = self._active_batch_set_id()
         row_ids = {
             str(self._batch_set_id_for_row(int(row)) or "").strip()
             for row in rows or ()
             if 0 <= int(row) < total
         }
-        if focused_set_id and focused_set_id in row_ids:
-            return focused_set_id
+        if active_set_id and active_set_id in row_ids:
+            return active_set_id
         for r in rows:
             rr = int(r)
             if 0 <= rr < total:
                 sid = self._batch_set_id_for_row(int(rr))
                 if sid:
                     return sid
-        return self._batch_set_id_for_row(0)
+        return None
 
     def _sync_batch_species_columns(
         self,
         species_names: Sequence[str],
         *,
-        preserve_active_cache: bool = False,
+        retain_active_cache_identity: bool = False,
     ) -> None:
         """Update batch table columns to match the parsed mechanism species (no data loss)."""
         new_species = [str(s) for s in (species_names or []) if str(s)]
         if new_species == list(self._batch_store.visible_species()):
             return
 
-        selected_sets = self._batch_set_names_for_scope("selected")
-        current_row = self._batch_current_row()
-        current_set = None
-        if current_row is not None:
-            names = list(self._batch_store.set_names())
-            if 0 <= int(current_row) < len(names):
-                current_set = str(names[int(current_row)])
-
-        preview = getattr(self, "_preview_session", None)
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-        active_preview_token = str(getattr(batch_cache, "active_cache_preview_token", "") or "").strip()
-        active_preview_scope_ids = tuple(
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_preview_scope_set_ids", None) or ())
-        )
-        active_valid_set_ids = tuple(
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_valid_set_ids", None) or ())
-        )
-
-        def _active_scope_overlay_token() -> str:
-            if preview is None or (not active_preview_token):
-                return ""
-            if active_preview_scope_ids:
-                scope_rows: list[int] = []
-                for set_id in active_preview_scope_ids:
-                    try:
-                        row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-                    except Exception:
-                        row = None
-                    if row is not None:
-                        scope_rows.append(int(row))
-                if scope_rows:
-                    return str(preview.preview_batch_cache_token(scope_rows) or "")
-                return ""
-            if not bool(preview.has_staged_concentration_overlays()):
-                return ""
-            try:
-                row_count = int(getattr(self, "_batch_store", None).row_count())
-            except Exception:
-                row_count = 0
-            if row_count > 0:
-                return str(preview.preview_batch_cache_token(list(range(int(row_count)))) or "")
-            return ""
-
-        def _overlay_tokens_for_set_ids(set_ids: Sequence[str]) -> dict[str, str]:
-            tokens: dict[str, str] = {}
-            if preview is None:
-                return tokens
-            for set_id in set_ids or ():
-                try:
-                    row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-                except Exception:
-                    row = None
-                if row is None:
-                    tokens[str(set_id)] = ""
-                    continue
-                tokens[str(set_id)] = str(preview.preview_batch_cache_token([int(row)]) or "")
-            return tokens
-
-        def _overlay_token_for_set_ids(set_ids: Sequence[str]) -> Optional[str]:
-            if preview is None:
-                return None
-            scope_rows: list[int] = []
-            for set_id in set_ids or ():
-                try:
-                    row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-                except Exception:
-                    row = None
-                if row is not None:
-                    scope_rows.append(int(row))
-            if not scope_rows:
-                return None
-            token = str(preview.preview_batch_cache_token(scope_rows) or "")
-            return token or None
-
-        scope_tokens_before = _overlay_tokens_for_set_ids(active_preview_scope_ids)
+        selection_snapshot = self._simulation_batch_owner.batch_selection_state_snapshot()
+        species_sync_snapshot = self._simulation_batch_owner.batch_species_column_sync_snapshot()
 
         self._batch_model.set_species(new_species)
         prune_changed = False
         try:
-            if preview is not None and hasattr(preview, "prune_staged_concentration_overlays_to_species"):
-                prune_changed = bool(preview.prune_staged_concentration_overlays_to_species(new_species))
+            if hasattr(self._preview_session, "prune_staged_concentration_overlays_to_species"):
+                prune_changed = bool(self._preview_session.prune_staged_concentration_overlays_to_species(new_species))
         except RuntimeError as exc:
             logger.debug("Failed to prune staged concentration overlays after batch species sync: %s", exc, exc_info=True)
         if prune_changed:
             try:
-                preview.stop_species_slider_update_timer()
+                self._preview_session.stop_species_slider_update_timer()
             except RuntimeError as exc:
                 logger.debug("Failed to stop species slider timer after pruning overlays: %s", exc, exc_info=True)
             try:
                 self._sim_controller.invalidate_slider_preview_work()
             except RuntimeError as exc:
                 logger.debug("Failed to invalidate stale slider preview work after pruning overlays: %s", exc, exc_info=True)
-        if batch_cache is not None and active_cache_key and (not bool(preserve_active_cache)):
-            batch_cache.clear_active_selection_state()
-        elif batch_cache is not None and active_cache_key and bool(preserve_active_cache) and active_preview_token:
-            if _active_scope_overlay_token() != active_preview_token:
-                scope_tokens_after = _overlay_tokens_for_set_ids(active_preview_scope_ids)
-                invalidated_set_ids = {
-                    str(set_id)
-                    for set_id, before_token in scope_tokens_before.items()
-                    if str(before_token) != str(scope_tokens_after.get(str(set_id), ""))
-                }
-                if invalidated_set_ids:
-                    valid_ids = active_valid_set_ids or active_preview_scope_ids
-                    narrowed_valid_ids = tuple(str(set_id) for set_id in valid_ids if str(set_id) not in invalidated_set_ids)
-                    if not narrowed_valid_ids:
-                        batch_cache.clear_active_selection_state()
-                    else:
-                        narrowed_valid_set = set(narrowed_valid_ids)
-                        batch_cache.active_cache_valid_set_ids = narrowed_valid_ids
-                        batch_cache.active_cache_invalidated_set_ids = tuple(
-                            str(set_id) for set_id in invalidated_set_ids if str(set_id)
-                        )
-                        narrowed_scope_ids = tuple(
-                            str(set_id) for set_id in active_preview_scope_ids if str(set_id) in narrowed_valid_set
-                        )
-                        batch_cache.active_cache_preview_scope_set_ids = narrowed_scope_ids or None
-                        batch_cache.active_cache_preview_token = _overlay_token_for_set_ids(narrowed_scope_ids)
-                        batch_cache.last_display_selection = [
-                            str(set_id)
-                            for set_id in (batch_cache.last_display_selection or [])
-                            if str(set_id) in narrowed_valid_set
-                        ]
-                        if str(batch_cache.active_batch_set_id or "") not in narrowed_valid_set:
-                            batch_cache.active_batch_set_id = None
-                            batch_cache.active_batch_set = None
-                else:
-                    batch_cache.clear_active_selection_state()
-
-        table = getattr(self, "_batch_table", None)
-        if table is None:
-            return
-        sel = table.selectionModel()
-        if sel is None:
-            return
-        signals_blocked = False
-        try:
-            sel.blockSignals(True)
-            signals_blocked = True
-        except RuntimeError as exc:
-            logger.debug("Failed to block batch selection signals: %s", exc, exc_info=True)
-            signals_blocked = False
-        restored_focus_row: Optional[int] = None
-        try:
-            sel.clearSelection()
-            for name in selected_sets:
-                row = self._batch_store.row_for_set(name)
-                if row is None:
-                    continue
-                idx = self._batch_model.index(int(row), 0)
-                sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-            if current_set:
-                row = self._batch_store.row_for_set(current_set)
-                if row is not None:
-                    table.setCurrentIndex(self._batch_model.index(int(row), 0))
-                    restored_focus_row = int(row)
-        finally:
-            if signals_blocked:
-                try:
-                    sel.blockSignals(False)
-                except RuntimeError as exc:
-                    logger.debug("Failed to unblock batch selection signals: %s", exc, exc_info=True)
-                    signals_blocked = False
-        self._update_focused_batch_set_id(row=restored_focus_row)
+        self._simulation_batch_owner.reconcile_active_cache_after_species_column_sync(
+            species_sync_snapshot,
+            retain_active_cache_identity=bool(retain_active_cache_identity),
+        )
+        selection_resolution = self._simulation_batch_owner.resolve_batch_selection_state_snapshot(
+            selection_snapshot
+        )
+        self._apply_batch_selection_state_resolution(selection_resolution)
 
         try:
             panel = self._mechanism_editor.species_sliders_widget()
@@ -5963,51 +5148,152 @@ class MainWindow(
             logger.debug("Failed to rebuild species panel after batch species sync: %s", exc, exc_info=True)
             self._species_panel_available = False
 
+    def _apply_batch_selection_state_resolution(self, resolution: object) -> None:
+        table = getattr(self, "_batch_table", None)
+        if table is None:
+            return
+        sel = table.selectionModel()
+        if sel is None:
+            return
+        rows = tuple(int(row) for row in (getattr(resolution, "selected_rows", ()) or ()))
+        focused_row_raw = getattr(resolution, "focused_row", None)
+        focused_row = int(focused_row_raw) if focused_row_raw is not None else None
+        signals_blocked = False
+        try:
+            sel.blockSignals(True)
+            signals_blocked = True
+        except RuntimeError as exc:
+            logger.debug("Failed to block batch selection signals: %s", exc, exc_info=True)
+            signals_blocked = False
+        try:
+            sel.clearSelection()
+            for row in rows:
+                idx = self._batch_model.index(int(row), 0)
+                sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+            if focused_row is not None:
+                table.setCurrentIndex(self._batch_model.index(int(focused_row), 0))
+        finally:
+            if signals_blocked:
+                try:
+                    sel.blockSignals(False)
+                except RuntimeError as exc:
+                    logger.debug("Failed to unblock batch selection signals: %s", exc, exc_info=True)
+
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
 
-    def _on_batch_model_data_changed(
+    def _batch_current_change_display_source(self) -> DisplayRefreshSource:
+        return DisplayRefreshSource.PROGRAMMATIC_SHOW_REQUEST
+
+    def _on_batch_canonical_initials_changed(
         self,
-        top_left: QtCore.QModelIndex,
-        bottom_right: QtCore.QModelIndex,
-        roles: Sequence[int] | None = None,
+        affected_set_ids: object,
+        transition_source: str,
+        discard_dirty_preview: bool,
     ) -> None:
-        if not top_left.isValid() or not bottom_right.isValid():
-            return
-        if not (int(top_left.column()) <= 0 <= int(bottom_right.column())):
-            return
-        display_role = int(getattr(QtCore.Qt.DisplayRole, "value", QtCore.Qt.DisplayRole))
-        normalized_roles = {int(getattr(role, "value", role)) for role in (roles or ())}
-        if normalized_roles and display_role not in normalized_roles:
-            return
-        self._sync_main_plot_copy_labels_for_cached_batch_selection()
+        self._queue_canonical_batch_initials_transition(
+            affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
+            transition_source=str(transition_source or "batch_initials_table_edit"),
+            discard_dirty_preview=bool(discard_dirty_preview),
+            debounce_ms=0,
+        )
 
-    def _on_batch_current_changed(self, *_args) -> None:
-        focused_set_id = self._update_focused_batch_set_id()
-        if not focused_set_id:
+    def _on_batch_initial_rows_edited(
+        self,
+        affected_set_ids: object,
+        transition_source: str,
+        discard_dirty_preview: bool,
+    ) -> None:
+        self._queue_canonical_batch_initials_transition(
+            affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
+            transition_source=str(transition_source or "batch_initials_table_edit"),
+            discard_dirty_preview=bool(discard_dirty_preview),
+            debounce_ms=_CANONICAL_BATCH_INITIALS_TRANSITION_DEBOUNCE_MS,
+        )
+
+    @staticmethod
+    def _row_from_model_index(index: object) -> Optional[int]:
+        if index is None or not hasattr(index, "isValid") or not index.isValid():
+            return None
+        try:
+            return int(index.row())
+        except Exception:
+            return None
+
+    def _on_batch_current_changed(self, current: object = None, previous: object = None) -> None:
+        self._update_batch_row_controls_state()
+        current_row = self._row_from_model_index(current)
+        if current_row is None:
+            current_row = self._batch_current_row()
+        previous_row = self._row_from_model_index(previous)
+        if previous_row is not None and current_row == previous_row:
             return
-        self._ensure_focused_batch_set_visible()
-        self._refresh_slider_edit_targets_summary()
-        self._refresh_batch_display_from_focus_and_shown()
-
-    def _on_batch_show_membership_changed(self) -> None:
-        focused_set_id = self._focused_batch_set_id_value()
-        if focused_set_id:
-            row = self._batch_row_for_set_id(focused_set_id)
-            if row is not None and not self._batch_store.is_shown(int(row)):
-                self._batch_model.set_row_shown(int(row), True)
-                return
-        self._refresh_batch_display_from_focus_and_shown()
-
-    def _on_slider_edit_targets_changed(self) -> None:
-        self._refresh_slider_edit_targets_summary()
+        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
+            gesture="row_body_click",
+            row=current_row,
+        )
+        try:
+            self._refresh_slider_edit_targets_summary()
+            self._reconcile_slider_target_membership_change()
+        except Exception as exc:
+            logger.debug("Failed to refresh slider target membership after row activation: %s", exc, exc_info=True)
         try:
             panel = self._mechanism_editor.species_sliders_widget()
-            if panel is not None and hasattr(panel, "rebuild_from_current_row"):
+            if panel is not None and hasattr(panel, "refresh_current_row_from_model"):
+                panel.refresh_current_row_from_model(recompute_ranges=True)
+            elif panel is not None and hasattr(panel, "rebuild_from_current_row"):
                 panel.rebuild_from_current_row()
         except RuntimeError as exc:
-            logger.debug("Failed to rebuild species panel after slider target change: %s", exc, exc_info=True)
+            logger.debug("Failed to refresh species panel after row activation: %s", exc, exc_info=True)
             self._species_panel_available = False
+        if transaction.display_refresh_needed:
+            self._refresh_batch_display_from_request_scope(
+                display_source=self._batch_current_change_display_source(),
+                rebuild_species_sliders=False,
+            )
+
+    def _on_batch_show_membership_changed(self) -> None:
+        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
+            gesture="show_membership_change",
+            row=self._batch_current_row(),
+        )
+        if transaction.slider_rebuild_needed:
+            self._reconcile_slider_target_membership_change()
+        if transaction.display_refresh_needed:
+            self._refresh_batch_display_from_request_scope(
+                display_source=DisplayRefreshSource.EXPLICIT_SHOW_REQUEST,
+            )
+
+    def _on_slider_edit_targets_changed(self) -> None:
+        try:
+            panel = self._mechanism_editor.species_sliders_widget()
+            if (
+                panel is not None
+                and hasattr(panel, "live_drag_active")
+                and bool(panel.live_drag_active())
+            ):
+                self._slider_edit_targets_changed_deferred_during_species_drag = True
+                self._refresh_slider_edit_targets_summary()
+                return
+        except RuntimeError as exc:
+            logger.debug("Failed to inspect species panel during slider target change: %s", exc, exc_info=True)
+            self._species_panel_available = False
+        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
+            gesture="slider_target_change",
+            row=self._batch_current_row(),
+        )
+        self._reconcile_slider_target_membership_change()
+        self._refresh_slider_edit_targets_summary()
+        if transaction.slider_rebuild_needed:
+            try:
+                panel = self._mechanism_editor.species_sliders_widget()
+                if panel is not None and hasattr(panel, "refresh_current_row_from_model"):
+                    panel.refresh_current_row_from_model(recompute_ranges=True)
+                elif panel is not None and hasattr(panel, "rebuild_from_current_row"):
+                    panel.rebuild_from_current_row()
+            except RuntimeError as exc:
+                logger.debug("Failed to rebuild species panel after slider target change: %s", exc, exc_info=True)
+                self._species_panel_available = False
 
     def _refresh_slider_edit_targets_summary(self) -> None:
         editor = getattr(self, "_mechanism_editor", None)
@@ -6035,550 +5321,32 @@ class MainWindow(
             summary = f"Slider edit targets: {primary_label} + {explicit_extra_count} explicit"
         editor.set_slider_edit_targets_summary(summary)
 
-    def _refresh_batch_display_from_focus_and_shown(self) -> None:
-        self._update_batch_row_controls_state()
-        batch_cache = self._sim_controller.batch_cache
-        shown_sets = self._shown_batch_set_ids()
-        if not shown_sets:
-            self._clear_batch_selection_display_state()
+    def _refresh_batch_display_from_request_scope(
+        self,
+        *,
+        display_source: object | None = None,
+        rebuild_species_sliders: bool = True,
+    ) -> None:
+        outcome = self.results_controller.refresh_display_from_request_scope(
+            display_source=display_source,
+        )
+        if outcome.focused_controls_use_workspace is not None:
             self._sync_mechanism_controls_to_focused_batch_set(
-                use_workspace=bool(
-                    self._preview_session.has_dirty_state_for_set(self._focused_batch_set_id_value())
-                )
+                use_workspace=bool(outcome.focused_controls_use_workspace),
+                rebuild_species_sliders=bool(rebuild_species_sliders),
             )
-            return
-        prefer = None
-        focused_set_id = self._focused_batch_set_id_value()
-        if focused_set_id:
-            prefer = focused_set_id
-        focused_selection_is_dirty = self._focused_batch_selection_is_dirty(
-            selected_sets=shown_sets,
-            prefer_set=prefer,
-        )
-        active_cache_key = str(batch_cache.active_cache_key or "").strip()
 
-        outcome = None
-        outcome_reason = None
-        miss_msg = "Result not cached (evicted). Press Run to compute."
-        invalid_msg = "Cached result invalid. Press Run to compute."
-        preview_pending_msg = "Preview pending for current selection."
-
-        def _reset_stale_cache_warning_status() -> None:
-            label = getattr(self, "_status_label", None)
-            if label is None:
-                return
-            try:
-                if str(label.text()) in (miss_msg, invalid_msg, preview_pending_msg):
-                    label.setText("Ready")
-            except RuntimeError as exc:
-                logger.debug("Failed to update status label: %s", exc, exc_info=True)
-                self._status_label = None
-
-        def _set_selection_status(text: str) -> None:
-            label = getattr(self, "_status_label", None)
-            if label is None:
-                return
-            try:
-                label.setText(str(text))
-            except RuntimeError as exc:
-                logger.debug("Failed to update status label: %s", exc, exc_info=True)
-                self._status_label = None
-
-        def _clear_non_displayed_selection_state() -> None:
-            self._clear_batch_selection_display_state()
-
-        def _finalize_displayed_selection_change() -> None:
-            self._record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
-            _reset_stale_cache_warning_status()
-
-        if focused_selection_is_dirty and self._selection_uses_fresh_explicit_cache_after_post_run_sync(
-            selected_sets=shown_sets
-        ):
-            valid_set_ids = None
-            if batch_cache.active_cache_valid_set_ids is not None:
-                valid_set_ids = tuple(str(set_id) for set_id in batch_cache.active_cache_valid_set_ids if str(set_id))
-            invalidated_set_ids = None
-            if batch_cache.active_cache_invalidated_set_ids is not None:
-                invalidated_set_ids = tuple(
-                    str(set_id) for set_id in batch_cache.active_cache_invalidated_set_ids if str(set_id)
-                )
-            outcome = self.results_controller.display_cached_batch_selection_outcome(
-                cache_key=active_cache_key,
-                selected_sets=shown_sets,
-                prefer_set=prefer,
-                valid_set_ids=valid_set_ids,
-                invalidated_set_ids=invalidated_set_ids,
-                allow_fallback=False,
-            )
-            if outcome.displayed:
-                self._sync_mechanism_controls_to_focused_batch_set(use_workspace=True)
-                _reset_stale_cache_warning_status()
-                return
-            if outcome.reason == "invalid_cache_entry":
-                _set_selection_status(invalid_msg)
-                return
-            _set_selection_status(miss_msg)
-            return
-
-        (
-            resolved_entries,
-            outcome_reason,
-            all_selected_sets_resolved,
-            has_workspace_selection,
-            has_resolved_workspace_preview,
-            focused_selection_uses_workspace_controls,
-            focused_selection_has_resolved_entry,
-        ) = (
-            self._resolve_workspace_aware_batch_selection(selected_sets=shown_sets)
-        )
-        if all_selected_sets_resolved and resolved_entries:
-            outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                resolved_entries=resolved_entries,
-                prefer_set=prefer,
-            )
-            outcome_reason = outcome.reason
-            if outcome.displayed:
-                self._sync_mechanism_controls_to_focused_batch_set(
-                    use_workspace=bool(focused_selection_uses_workspace_controls)
-                )
-                _finalize_displayed_selection_change()
-                return
-
-        if resolved_entries and has_workspace_selection:
-            if (
-                outcome_reason == "preview_pending"
-                and has_resolved_workspace_preview
-                and (
-                    bool(focused_selection_uses_workspace_controls)
-                    or ((not bool(focused_selection_is_dirty)) and bool(focused_selection_has_resolved_entry))
-                )
-            ):
-                outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                    resolved_entries=resolved_entries,
-                    prefer_set=prefer,
-                )
-                if outcome.displayed:
-                    self._record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
-                    self._sync_mechanism_controls_to_focused_batch_set(
-                        use_workspace=bool(focused_selection_uses_workspace_controls)
-                    )
-                    _set_selection_status(preview_pending_msg)
-                    return
-                _clear_non_displayed_selection_state()
-                self._sync_mechanism_controls_to_focused_batch_set(
-                    use_workspace=bool(focused_selection_is_dirty)
-                )
-                _set_selection_status(preview_pending_msg)
-                return
-            if (
-                outcome_reason == "no_cached_results"
-                and has_resolved_workspace_preview
-                and (
-                    bool(focused_selection_uses_workspace_controls)
-                    or ((not bool(focused_selection_is_dirty)) and bool(focused_selection_has_resolved_entry))
-                )
-            ):
-                outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                    resolved_entries=resolved_entries,
-                    prefer_set=prefer,
-                )
-                if outcome.displayed:
-                    self._sync_mechanism_controls_to_focused_batch_set(
-                        use_workspace=bool(focused_selection_uses_workspace_controls)
-                    )
-                    _finalize_displayed_selection_change()
-                    if not bool(focused_selection_uses_workspace_controls):
-                        _set_selection_status(miss_msg)
-                    return
-            if outcome_reason == "no_cached_results":
-                _clear_non_displayed_selection_state()
-                self._sync_mechanism_controls_to_focused_batch_set(
-                    use_workspace=bool(focused_selection_is_dirty)
-                )
-                _set_selection_status(miss_msg)
-                return
-
-        if (not has_workspace_selection) and outcome_reason in {"preview_pending", "no_cached_results"} and active_cache_key:
-            valid_set_ids = None
-            if batch_cache.active_cache_valid_set_ids is not None:
-                valid_set_ids = tuple(str(set_id) for set_id in batch_cache.active_cache_valid_set_ids if str(set_id))
-            invalidated_set_ids = None
-            if batch_cache.active_cache_invalidated_set_ids is not None:
-                invalidated_set_ids = tuple(
-                    str(set_id) for set_id in batch_cache.active_cache_invalidated_set_ids if str(set_id)
-                )
-            outcome = self.results_controller.display_cached_batch_selection_outcome(
-                cache_key=active_cache_key,
-                selected_sets=shown_sets,
-                prefer_set=prefer,
-                valid_set_ids=valid_set_ids,
-                invalidated_set_ids=invalidated_set_ids,
-                allow_fallback=False,
-            )
-            if outcome.displayed:
-                self._sync_mechanism_controls_to_focused_batch_set(use_workspace=False)
-                _finalize_displayed_selection_change()
-                return
-            if outcome_reason != "invalid_cache_entry" and outcome.reason == "invalid_cache_entry":
-                outcome_reason = "invalid_cache_entry"
-
-        if (not has_workspace_selection) and (not active_cache_key):
-            _clear_non_displayed_selection_state()
-            self._sync_mechanism_controls_to_focused_batch_set(use_workspace=False)
-            _reset_stale_cache_warning_status()
-            return
-
-        if outcome_reason == "invalid_cache_entry":
-            _clear_non_displayed_selection_state()
-            self._sync_mechanism_controls_to_focused_batch_set(
-                use_workspace=bool(focused_selection_is_dirty)
-            )
-            _set_selection_status(invalid_msg)
-            return
-        if outcome_reason == "preview_pending":
-            _clear_non_displayed_selection_state()
-            self._sync_mechanism_controls_to_focused_batch_set(
-                use_workspace=bool(focused_selection_is_dirty)
-            )
-            _set_selection_status(preview_pending_msg)
-            return
-        _clear_non_displayed_selection_state()
-        self._sync_mechanism_controls_to_focused_batch_set(
-            use_workspace=bool(focused_selection_is_dirty)
-        )
-        _set_selection_status(miss_msg)
-
-    def _cache_entry_for_set_id_from_store(
-        self,
-        *,
-        store: MutableMapping[str, Dict[str, Any]],
-        cache_key: str,
-        set_id: str,
-    ) -> BatchCacheEntryReadResult:
-        sid = str(set_id or "").strip()
-        if not sid or not cache_key:
-            return BatchCacheEntryReadResult("missing")
-        direct = read_batch_cache_entry((store or {}).get(BatchSimulationCache.entry_key(cache_key, sid)))
-        if direct.entry is not None:
-            return direct
-        name = self.batch_set_name_for_id(sid)
-        by_name = BatchCacheEntryReadResult("missing")
-        if name:
-            by_name = read_batch_cache_entry((store or {}).get(BatchSimulationCache.entry_key(cache_key, str(name))))
-            if by_name.entry is not None:
-                return by_name
-        if direct.state == "invalid" or by_name.state == "invalid":
-            return BatchCacheEntryReadResult("invalid")
-        return BatchCacheEntryReadResult("missing")
-
-    def _mechanism_text_for_workspace_selection(self, *, set_id: str) -> str:
-        from kindred.core.batch_initial_conditions import (
-            strip_reaction_dsl_initial_concentrations,
-        )
-
-        reactions_text = self.mechanism_reactions_text_raw()
-        if self.has_slider_overrides():
-            reactions_text = self._apply_overrides_to_text(reactions_text, set_id=str(set_id))
-        reactions_text = strip_reaction_dsl_initial_concentrations(reactions_text)
-
-        state_network_dsl = self.mechanism_state_network_dsl_raw()
-        if self.has_slider_overrides():
-            state_network_dsl = self._apply_overrides_to_state_network_dsl(state_network_dsl, set_id=str(set_id))
-
-        full_dsl = reactions_text
-        if state_network_dsl.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_dsl
-        if self.has_slider_overrides():
-            full_dsl = self._apply_parameter_overrides_to_dsl(
-                full_dsl,
-                self._normalized_slider_overrides(set_id=str(set_id)),
-            )
-        return str(full_dsl)
-
-    def _current_workspace_preview_context(
-        self,
-        *,
-        set_id: str,
-        mechanism_text: str,
-    ) -> tuple[Dict[str, Any], float, str]:
-        from kindred.gui.controllers.simulation_controller import build_fast_preview_solver_grid_context
-
-        solver_grid_context = build_fast_preview_solver_grid_context(
-            initial_solver_name=self._initial_solver,
-            num_points=int(self.num_points_spinbox_value()),
-            fast_mode=True,
-            slider_points_override=self.mechanism_slider_points_value(),
-            slider_solver_override=self.mechanism_slider_solver_value(),
-            slider_drag_active=bool(self._preview_session.slider_drag_active()),
-            last_slider_change_name=str(self._preview_session.last_slider_change_name() or ""),
-        )
-        temperature_k = float(self.temperature_spinbox_value())
-        t_override = self.dsl_global_temperature_K(str(mechanism_text))
-        if t_override is not None:
-            temperature_k = float(t_override)
-        solver_config = {
-            "solver": str(solver_grid_context.get("solver") or ""),
-            "solver_label": str(solver_grid_context.get("solver_label") or ""),
-            "solver_warning": (
-                str(solver_grid_context.get("solver_warning"))
-                if solver_grid_context.get("solver_warning")
-                else None
-            ),
-            "rtol": self._initial_rtol or 1e-6,
-            "atol": self._initial_atol or 1e-12,
-            "grid": dict(solver_grid_context.get("grid") or {"N": int(self.num_points_spinbox_value())}),
-            "temperature_K": float(temperature_k),
-            "use_sparse_jacobian": bool(self.use_sparse_jacobian()),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
-        }
-        overlay_token = ""
-        try:
-            row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-        except Exception:
-            row = None
-        if row is not None:
-            overlay_token = str(self._preview_session.preview_batch_cache_token([int(row)]) or "")
-        return solver_config, float(self.parse_sim_time_seconds()), overlay_token
-
-    def _current_workspace_preview_identity(self, *, set_id: str):
-        from kindred.core.simulation_identity import SimulationIdentity
-
-        expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
-            set_id=str(set_id),
-            mechanism_text=self._mechanism_text_for_workspace_selection(set_id=str(set_id)),
-        )
-        return SimulationIdentity.build(
-            schema_id=self.simulation_schema_id(),
-            param_fingerprint=self.simulation_param_fingerprint(set_id=str(set_id)),
-            solver_config=expected_solver_config,
-            t_end=expected_t_end,
-            preview_batch_cache_token=expected_overlay_token,
-            execution_flags=("fast_mode",),
-        )
-
-    def _matching_preview_entry_for_workspace_set(
-        self,
-        *,
-        set_id: str,
-        preview_cache_key: Optional[str] = None,
-    ) -> BatchCacheEntryReadResult:
-        from kindred.core.simulation_identity import coerce_simulation_identity
-
-        preview_store = self._sim_controller.batch_cache.preview_cache
-        expected_mechanism_text = self._mechanism_text_for_workspace_selection(set_id=str(set_id))
-        resolved_preview_cache_key = str(
-            preview_cache_key
-            if preview_cache_key is not None
-            else (self._sim_controller.batch_cache.active_preview_cache_key or "")
-        ).strip()
-
-        try:
-            expected_identity = self._current_workspace_preview_identity(set_id=str(set_id))
-            expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
-                set_id=str(set_id),
-                mechanism_text=str(expected_mechanism_text),
-            )
-        except Exception:
-            return BatchCacheEntryReadResult("missing")
-
-        def _entry_matches_expected(result: BatchCacheEntryReadResult) -> bool:
-            if result.entry is None:
-                return False
-            entry_identity = coerce_simulation_identity(result.entry.get("simulation_identity"))
-            if entry_identity is not None:
-                if entry_identity != expected_identity:
-                    return False
-            else:
-                if str(result.entry.get("mechanism_text") or "") != str(expected_mechanism_text):
-                    return False
-                if dict(result.entry.get("solver_config") or {}) != dict(expected_solver_config):
-                    return False
-                if str(result.entry.get("preview_batch_cache_token") or "") != str(expected_overlay_token):
-                    return False
-            entry_t_payload = result.entry.get("t")
-            entry_t = np.asarray(entry_t_payload if entry_t_payload is not None else [], dtype=float).reshape(-1)
-            expected_grid_n = int((expected_solver_config.get("grid") or {}).get("N") or 0)
-            if expected_grid_n > 0 and int(entry_t.size) != expected_grid_n:
-                return False
-            if entry_t.size <= 0:
-                return False
-            return math.isclose(float(entry_t[-1]), float(expected_t_end), rel_tol=1e-9, abs_tol=1e-12)
-
-        invalid_found = False
-        direct = self._cache_entry_for_set_id_from_store(
-            store=preview_store,
-            cache_key=resolved_preview_cache_key,
-            set_id=str(set_id),
-        )
-        if _entry_matches_expected(direct):
-            return direct
-        if direct.state == "invalid":
-            invalid_found = True
-
-        candidate_suffixes = {f"::{str(set_id)}"}
-        set_name = self.batch_set_name_for_id(str(set_id))
-        if set_name:
-            candidate_suffixes.add(f"::{str(set_name)}")
-
-        preview_data = getattr(preview_store, "_data", None)
-        if hasattr(preview_data, "items"):
-            preview_items = list(preview_data.items())
-        else:
-            preview_items = list((preview_store or {}).items())
-
-        for key, payload in reversed(preview_items):
-            key_s = str(key)
-            if not any(key_s.endswith(suffix) for suffix in candidate_suffixes):
-                continue
-            if resolved_preview_cache_key and key_s.startswith(f"{resolved_preview_cache_key}::"):
-                continue
-            result = read_batch_cache_entry(payload)
-            if _entry_matches_expected(result):
-                return result
-            invalid_found = invalid_found or result.state == "invalid"
-
-        return BatchCacheEntryReadResult("invalid" if invalid_found else "missing")
-
-    def _resolve_workspace_aware_batch_selection(
-        self,
-        *,
-        selected_sets: Sequence[str],
-        preview_cache_key: Optional[str] = None,
-    ) -> Tuple[List[ResolvedBatchSelectionEntry], Optional[str], bool, bool, bool, bool, bool]:
-        from kindred.gui.controllers.results_controller import ResolvedBatchSelectionEntry
-
-        batch_cache = self._sim_controller.batch_cache
-        active_cache_key = str(batch_cache.active_cache_key or "").strip()
-        invalidated_set_ids = {
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_invalidated_set_ids", None) or ()) if str(set_id)
-        }
-        focused_set_id = str(self._focused_batch_set_id_value() or "").strip()
-        if (not focused_set_id) and selected_sets:
-            focused_set_id = str(selected_sets[0] or "").strip()
-
-        resolved_entries: List[ResolvedBatchSelectionEntry] = []
-        has_workspace_selection = False
-        has_resolved_workspace_preview = False
-        focused_selection_uses_workspace_controls = False
-        focused_selection_has_resolved_entry = False
-        missing_workspace_entry = False
-        missing_explicit_entry = False
-        invalid_entry = False
-
-        for raw_set_id in selected_sets or ():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id:
-                continue
-            label = self.batch_set_name_for_id(set_id) or set_id
-            if self._preview_session.has_dirty_state_for_set(set_id):
-                has_workspace_selection = True
-                preview_entry = self._matching_preview_entry_for_workspace_set(
-                    set_id=set_id,
-                    preview_cache_key=preview_cache_key,
-                )
-                if preview_entry.entry is not None:
-                    has_resolved_workspace_preview = True
-                    canonical_entry = None
-                    if active_cache_key and set_id not in invalidated_set_ids:
-                        explicit_entry = self._cache_entry_for_set_id_from_store(
-                            store=batch_cache.result_cache,
-                            cache_key=active_cache_key,
-                            set_id=set_id,
-                        )
-                        canonical_entry = explicit_entry.entry
-                    resolved_entries.append(
-                        ResolvedBatchSelectionEntry(
-                            set_id=str(set_id),
-                            label=str(label),
-                            entry=preview_entry.entry,
-                            canonical_entry=canonical_entry,
-                        )
-                    )
-                    if set_id == focused_set_id:
-                        focused_selection_uses_workspace_controls = True
-                        focused_selection_has_resolved_entry = True
-                elif preview_entry.state == "invalid":
-                    invalid_entry = True
-                else:
-                    missing_workspace_entry = True
-                continue
-
-            if not active_cache_key:
-                missing_explicit_entry = True
-                continue
-            explicit_entry = self._cache_entry_for_set_id_from_store(
-                store=batch_cache.result_cache,
-                cache_key=active_cache_key,
-                set_id=set_id,
-            )
-            if set_id in invalidated_set_ids:
-                if explicit_entry.state == "invalid":
-                    invalid_entry = True
-                else:
-                    missing_explicit_entry = True
-                continue
-            if explicit_entry.entry is not None:
-                resolved_entries.append(
-                    ResolvedBatchSelectionEntry(set_id=str(set_id), label=str(label), entry=explicit_entry.entry)
-                )
-                if set_id == focused_set_id:
-                    focused_selection_uses_workspace_controls = False
-                    focused_selection_has_resolved_entry = True
-            elif explicit_entry.state == "invalid":
-                invalid_entry = True
-            else:
-                missing_explicit_entry = True
-
-        all_selected_sets_resolved = len(resolved_entries) == len(
-            [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
-        )
-        if invalid_entry:
-            return (
-                resolved_entries,
-                "invalid_cache_entry",
-                all_selected_sets_resolved,
-                has_workspace_selection,
-                has_resolved_workspace_preview,
-                focused_selection_uses_workspace_controls,
-                focused_selection_has_resolved_entry,
-            )
-        if missing_workspace_entry:
-            return (
-                resolved_entries,
-                "preview_pending",
-                all_selected_sets_resolved,
-                has_workspace_selection,
-                has_resolved_workspace_preview,
-                focused_selection_uses_workspace_controls,
-                focused_selection_has_resolved_entry,
-            )
-        if missing_explicit_entry:
-            return (
-                resolved_entries,
-                "no_cached_results",
-                all_selected_sets_resolved,
-                has_workspace_selection,
-                has_resolved_workspace_preview,
-                focused_selection_uses_workspace_controls,
-                focused_selection_has_resolved_entry,
-            )
-        return (
-            resolved_entries,
-            None,
-            all_selected_sets_resolved,
-            has_workspace_selection,
-            has_resolved_workspace_preview,
-            focused_selection_uses_workspace_controls,
-            focused_selection_has_resolved_entry,
-        )
-
-    def _normalized_slider_overrides(
+    def _runtime_parameter_values_for_materialization(
         self,
         *,
         set_id: Optional[str] = None,
         overrides: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
-        raw = self.slider_overrides(set_id=set_id) if overrides is None else dict(overrides or {})
+        raw = (
+            self.runtime_parameter_values_for_set(set_id=set_id, fast_mode=True)
+            if overrides is None
+            else dict(overrides or {})
+        )
         normalized: Dict[str, float] = {}
         for key, value in raw.items():
             parsed, ok = try_parse_finite_float(value)
@@ -6587,26 +5355,26 @@ class MainWindow(
             normalized[str(key)] = float(parsed)
         return normalized
 
-    def _apply_overrides_to_text(
+    def _apply_reactions_overrides_to_text(
         self,
         base_text: str,
         *,
         set_id: Optional[str] = None,
         overrides: Optional[Dict[str, float]] = None,
     ) -> str:
-        """Return mechanism DSL with slider overrides applied."""
+        """Return Reactions-layer DSL with slider overrides applied."""
         drag_baseline_text = self._preview_session.drag_baseline_text()
         if self._preview_session.slider_drag_active() and drag_baseline_text is not None:
             text = drag_baseline_text
         else:
             text = base_text
-        override_map = self._normalized_slider_overrides(set_id=set_id, overrides=overrides)
+        override_map = self._runtime_parameter_values_for_materialization(set_id=set_id, overrides=overrides)
         has_energy_overrides = False
         metadata = self.variable_metadata() or {}
         step_analysis_context = None
         step_constraint_context = {
             "temperature_K": float(self._temperature_spinbox.value()),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
+            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
         }
         for var_name, var_value in override_map.items():
             meta = metadata.get(var_name, {})
@@ -6615,7 +5383,7 @@ class MainWindow(
             if isinstance(meta, dict) and meta.get("type") == "energy":
                 has_energy_overrides = True
                 continue
-            if re.match(r"^(kf|kr|Keq)\d+$", str(var_name)):
+            if isinstance(meta, dict) and meta.get("type") == "equilibrium" and meta.get("role") in {"kf", "kr", "Keq"}:
                 if step_analysis_context is None or step_analysis_context.source_text != text:
                     step_analysis_context = build_current_text_step_analysis_context(
                         text,
@@ -6626,7 +5394,6 @@ class MainWindow(
                 var_name,
                 var_value,
                 source_text=text,
-                commit=False,
                 metadata=metadata,
                 step_analysis_context=step_analysis_context,
             )
@@ -6644,7 +5411,7 @@ class MainWindow(
         overrides: Optional[Dict[str, float]] = None,
     ) -> list[tuple[str, float, dict]]:
         meta_map = self.variable_metadata() or {}
-        override_map = self._normalized_slider_overrides(set_id=set_id, overrides=overrides)
+        override_map = self._runtime_parameter_values_for_materialization(set_id=set_id, overrides=overrides)
         energy_overrides: list[tuple[str, float, dict]] = []
         for name, value in override_map.items():
             meta = meta_map.get(name)
@@ -6883,6 +5650,10 @@ class MainWindow(
                 return
         tokens.append([str(key), str(value)])
 
+    @staticmethod
+    def _remove_semicolon_kv(tokens: list[list[str]], key: str) -> None:
+        tokens[:] = [pair for pair in tokens if str(pair[0]).strip() != key]
+
     def _apply_energy_overrides_to_inline_state_network(
         self,
         base_text: str,
@@ -6952,8 +5723,8 @@ class MainWindow(
         """
         Apply energy-mode ΔG° overrides to Computational Mode fast equilibria inside the generated block.
 
-        These fast equilibria are emitted as explicit `equilibrium:` lines (kf/kr) and are updated by
-        rewriting `dG_eq=` and `kr=` while keeping `kf=` fixed.
+        These generated fast equilibria keep `kf=` fixed and rewrite `dG_eq=`.
+        The effective reverse rate is derived from ΔG° plus the generated standard-state ratio.
         """
         energy_overrides = [
             o
@@ -7000,7 +5771,7 @@ class MainWindow(
         from kindred.core.units import UnitsModel
         step_constraint_context = {
             "temperature_K": float(T),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
+            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
         }
         step_analysis_context = build_current_text_step_analysis_context(
             str(base_text or ""),
@@ -7062,31 +5833,20 @@ class MainWindow(
                 continue
             if not (math.isfinite(K) and K > 0.0):
                 continue
-            try:
-                kr_new = float(kf_fixed / (K * std_ratio))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.computational_mode_fast_eq.compute_kr",
-                    message=f"Failed to compute kr from Computational Mode fast-equilibrium override (cm_id='{cm_id}')",
-                    exc=exc,
-                )
-                continue
-            if not (math.isfinite(kr_new) and kr_new > 0.0):
-                continue
             step_index = equilibrium_step_by_line_index.get(int(absolute_line_index))
             if step_index is None:
                 continue
-            warning_reason = step_rewrite_block_reason(
+            if step_rewrite_block_reason(
                 step_index=int(step_index),
-                affected_parameter_names=(f"kr{int(step_index)}",),
+                affected_parameter_names=(f"kf{int(step_index)}", f"kr{int(step_index)}", f"Keq{int(step_index)}"),
                 step_analysis_context=step_analysis_context,
-            )
-            if warning_reason is not None:
+            ) is not None:
                 continue
 
             self._set_semicolon_kv(tokens, "dG_eq", f"{float(new_dG):.12g}")
             self._set_semicolon_kv(tokens, "kf", f"{float(kf_fixed):.17g}")
-            self._set_semicolon_kv(tokens, "kr", f"{float(kr_new):.17g}")
+            self._set_semicolon_kv(tokens, "cm_std_ratio", f"{float(std_ratio):.17g}")
+            self._remove_semicolon_kv(tokens, "kr")
 
             serialized = prefix
             if tokens:
@@ -7149,7 +5909,7 @@ class MainWindow(
                 return
         tokens.append([str(key), str(value)])
 
-    def _apply_overrides_to_state_network_dsl(
+    def _apply_state_network_overrides_to_dsl(
         self,
         base_dsl: str,
         *,
@@ -7241,22 +6001,18 @@ class MainWindow(
         return "\n".join(lines)
 
     def _updated_reactions_text_with_scalar_param(self, reactions_text: str, name: str, value: float) -> str:
+        from kindred.core.simulator.algebra_section import (
+            is_param_algebra_line,
+            upsert_lines_into_algebra_section,
+        )
+
         formatted_value = format_authoritative_parameter_value(value)
         reactions_lines = str(reactions_text or "").splitlines()
 
         updated = False
-        in_algebra = False
         for i, raw in enumerate(reactions_lines):
             stripped = raw.strip()
-            lower = stripped.lower()
-            if lower.startswith("# algebra"):
-                in_algebra = True
-                continue
-            if lower.startswith("# ") and in_algebra and not lower.startswith("# algebra"):
-                in_algebra = False
-            if not in_algebra:
-                continue
-            if not stripped or stripped.startswith("#"):
+            if not stripped or stripped.startswith("#") or not is_param_algebra_line(raw):
                 continue
             before_comment, sep, comment = raw.partition("#")
             code = before_comment.strip()
@@ -7275,13 +6031,9 @@ class MainWindow(
 
         if updated:
             return "\n".join(reactions_lines).rstrip("\n") + "\n"
-
-        from kindred.core.simulator.algebra_section import upsert_lines_into_algebra_section
-
         return upsert_lines_into_algebra_section(
             "\n".join(reactions_lines).rstrip("\n") + "\n",
             [f"param {name} = {formatted_value}"],
-            header="# Algebra",
         )
 
     def _apply_scalar_param_overrides_to_reactions_text(
@@ -7300,7 +6052,7 @@ class MainWindow(
 
     def _update_scalar_param_in_algebra(self, name: str, value: float) -> None:
         """
-        Update `param <name> = ...` inside the Reactions DSL `# Algebra` section.
+        Update `param <name> = ...` inside the Reactions DSL text.
 
         Notes are persisted separately and are never parsed or injected into the DSL.
         """
@@ -7311,26 +6063,26 @@ class MainWindow(
             float(value),
         )
 
-        if callable(getattr(self, "_set_text_with_optional_undo", None)):
-            self._set_text_with_optional_undo(
-                reactions_widget,
-                new_text,
-                f"Update param {name} in # Algebra",
-                True,
-            )
-        else:
-            reactions_widget.setPlainText(new_text)
+        self.set_mechanism_reactions_text_with_optional_undo(
+            new_text,
+            f"Update param {name} in Reactions DSL",
+            record_undo=True,
+        )
 
-    def _parameter_algebra_spec_for_ui(self, *, mechanism_param_names: set[str]):
+    def _parameter_algebra_spec_for_ui(self):
         from kindred.core.simulator.algebra_section import extract_algebra_section_text
-        from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
 
         reactions_text = self._mechanism_editor._reactions_text.toPlainText()
         if not extract_algebra_section_text(reactions_text).strip():
             return None
-        from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
+        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+        from kindred.core.simulator.parameter_algebra import (
+            mechanism_parameter_namespace,
+            parse_parameter_algebra_spec_from_dsl_text,
+        )
 
-        mechanism_namespace = build_flat_compat_namespace(mechanism_param_names)
+        mechanism = parse_dsl_to_mechanism(str(reactions_text or ""), initials={})
+        mechanism_namespace = mechanism_parameter_namespace(mechanism)
         return parse_parameter_algebra_spec_from_dsl_text(
             str(reactions_text or ""),
             mechanism_namespace=mechanism_namespace,
@@ -7341,10 +6093,9 @@ class MainWindow(
         current = sliders.get_variables()
         if not current:
             return
-        mechanism_param_names = {k for k in current.keys() if re.match(r"^(k|kf|kr|Keq)\d+$", str(k))}
         spec = None
         try:
-            spec = self._parameter_algebra_spec_for_ui(mechanism_param_names=mechanism_param_names)
+            spec = self._parameter_algebra_spec_for_ui()
         except Exception as exc:
             logger.debug("Parameter algebra not applied to sliders: %s", exc)
             spec = None
@@ -7372,83 +6123,26 @@ class MainWindow(
         # Refresh snapshot after any derived updates.
         current = sliders.get_variables()
 
-        # Apply Keq-implied equilibrium constraints (canonical step indexing) so derived
-        # rates update immediately when Keq changes.
+        # Apply authority-implied readout updates (canonical step indexing) so
+        # derived rates update immediately when their authority inputs change.
         step_map = getattr(self, "_step_index_map", None) or []
         if isinstance(step_map, list) and step_map:
+            from kindred.core.equilibrium_rate_authority import authority_readout_updates_from_step_entry
+
             for entry in step_map:
                 if not isinstance(entry, dict):
                     continue
                 if str(entry.get("kind") or "") != "equilibrium":
                     continue
-                if not bool(entry.get("has_Keq_param")):
-                    continue
-                try:
-                    n = int(entry.get("step_index"))  # type: ignore[arg-type]
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "main_window.derived_Keq_constraints.step_index",
-                        message="Invalid step_index while applying Keq-implied constraints",
-                        exc=exc,
-                    )
-                    continue
-                K_key = f"Keq{n}"
-                kf_key = f"kf{n}"
-                kr_key = f"kr{n}"
-                if K_key not in current:
-                    continue
-                try:
-                    K_val = float(current[K_key])
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "main_window.derived_Keq_constraints.K_val",
-                        message=f"Invalid Keq value for {K_key} while applying Keq-implied constraints",
-                        exc=exc,
-                    )
-                    continue
-                if not math.isfinite(K_val) or abs(K_val) < 1e-30:
-                    continue
-                derive_rate = str(entry.get("derive_rate") or "kr")
-                if derive_rate == "kf":
-                    if kr_key not in current:
-                        continue
-                    try:
-                        kr_val = float(current[kr_key])
-                    except Exception as exc:
-                        self._record_best_effort_failure(
-                            "main_window.derived_Keq_constraints.kr_val",
-                            message=f"Invalid kr value for {kr_key} while deriving kf",
-                            exc=exc,
-                        )
-                        continue
-                    kf_val = kr_val * K_val
-                    sliders.update_variable_readout(kf_key, float(kf_val))
+                for update in authority_readout_updates_from_step_entry(entry, current):
+                    current[update.name] = float(update.value)
+                    sliders.update_variable_readout(update.name, float(update.value))
                     meta_map = self._mutable_variable_metadata()
-                    meta = dict(meta_map.get(kf_key) or {})
-                    meta["editable"] = False
-                    meta["derived"] = True
-                    meta_map[kf_key] = meta
-                    sliders.update_metadata(kf_key, meta)
-                else:
-                    if kf_key not in current:
-                        continue
-                    try:
-                        kf_val = float(current[kf_key])
-                    except Exception as exc:
-                        self._record_best_effort_failure(
-                            "main_window.derived_Keq_constraints.kf_val",
-                            message=f"Invalid kf value for {kf_key} while deriving kr",
-                            exc=exc,
-                        )
-                        continue
-                    kr_val = kf_val / K_val
-                    sliders.update_variable_readout(kr_key, float(kr_val))
-                    meta_map = self._mutable_variable_metadata()
-                    meta = dict(meta_map.get(kr_key) or {})
-                    meta["editable"] = False
-                    meta["derived"] = True
-                    meta_map[kr_key] = meta
-                    sliders.update_metadata(kr_key, meta)
+                    meta = dict(meta_map.get(update.name) or {})
+                    meta["editable"] = bool(update.editable)
+                    meta["derived"] = bool(update.derived)
+                    meta_map[update.name] = meta
+                    sliders.update_metadata(update.name, meta)
 
     def _energy_mode_energy_unit_from_metadata(self) -> str:
         meta_map = self.variable_metadata() or {}
@@ -7458,12 +6152,14 @@ class MainWindow(
         return "kJ/mol"
 
     def _energy_mode_full_dsl_from_editor(self) -> str:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         reactions_text = self._mechanism_editor._reactions_text.toPlainText()
         state_network_dsl = self._mechanism_editor._state_network_editor.get_state_network_dsl()
-        full_dsl = reactions_text
-        if str(state_network_dsl or "").strip():
-            full_dsl += "\n\n# State Network\n" + str(state_network_dsl)
-        return str(full_dsl)
+        return MechanismAuthoringSource.from_parts(
+            reactions_text=reactions_text,
+            state_network_dsl=state_network_dsl,
+        ).full_dsl
 
     def _energy_mode_temperature_K(self, full_dsl: str) -> float | None:
         T_override = self._dsl_global_temperature_K(full_dsl)
@@ -7492,7 +6188,9 @@ class MainWindow(
             slug = re.sub(r"[^A-Za-z0-9_]+", "_", cm_id).strip("_") or "fast_eq"
             var_eq = f"dG_eq_fast__{slug}"
         try:
-            dG_eq = float(self.slider_overrides().get(var_eq, ch.get("dG_eq")))
+            dG_eq = float(
+                self.runtime_parameter_values_for_set(fast_mode=True).get(var_eq, ch.get("dG_eq"))
+            )
         except Exception as exc:
             self._record_best_effort_failure(
                 "main_window.energy_table.fast_eq.dG_eq",
@@ -7581,7 +6279,7 @@ class MainWindow(
         var_act = f"dGact_fwd__{ts}__{reactant}__{product}"
         var_eq = f"dG_eq__{ts}__{reactant}__{product}"
         try:
-            overrides = self.slider_overrides()
+            overrides = self.runtime_parameter_values_for_set(fast_mode=True)
             dG_act = float(overrides.get(var_act, ch.get("dG_act_fwd")))
             dG_eq = float(overrides.get(var_eq, ch.get("dG_eq")))
         except Exception as exc:
@@ -7725,22 +6423,6 @@ class MainWindow(
                 logger.debug("Failed to update plot parameter summary: %s", exc, exc_info=True)
                 self._plot_parameter_summary_stale = True
 
-    def _prepare_slider_runtime(
-        self,
-        param_names: Optional[List[str]] = None,
-        *,
-        set_id: Optional[str] = None,
-    ) -> Optional[BoundMechanism]:
-        return self._variable_runtime.prepare_slider_runtime(param_names=param_names, set_id=set_id)
-
-    def _apply_slider_overrides_to_bindings(
-        self,
-        runtime: Optional[BoundMechanism],
-        *,
-        set_id: Optional[str] = None,
-    ) -> bool:
-        return bool(self._variable_runtime.apply_slider_overrides_to_bindings(runtime, set_id=set_id))
-
     def _on_variable_changed(self, name: str, value: float):
         self._preview_session.on_variable_changed(name, value)
         self._refresh_slider_transaction_button_state()
@@ -7748,11 +6430,10 @@ class MainWindow(
     def _commit_slider_value(self, name: str, value: float) -> None:
         self._preview_session.commit_slider_value(name, value)
         self._sim_controller.invalidate_slider_preview_work()
-        self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._preview_session.stop_variable_update_timer()
         self._preview_session.stop_slider_release_commit_timer()
         self._materialize_direct_slider_commit_to_authoritative_editors(name, value)
-        self._preview_session.commit_current_mechanism_workspace()
+        self._preview_session.commit_current_mechanism_workspace(invalidate_preview_work=False)
         self._sync_after_authoritative_slider_materialization()
 
     def _on_slider_drag_started(self, name: str) -> None:
@@ -7775,35 +6456,39 @@ class MainWindow(
         except Exception:
             return False
 
-    def _commit_species_slider_values_to_selected_batch_rows(self) -> None:
+    def _commit_species_slider_values_to_selected_batch_rows(self) -> tuple[str, ...]:
         model = getattr(self, "_batch_model", None)
         if model is None:
-            return
+            return ()
+        previous_suppress = bool(getattr(self, "_suppress_canonical_batch_initials_transition", False))
+        self._suppress_canonical_batch_initials_transition = True
         try:
-            self._preview_session.apply_staged_concentration_overlays(model)
+            result = self._preview_session.apply_staged_concentration_overlays(model)
+            return tuple(str(set_id) for set_id in getattr(result, "touched_set_ids", ()) if str(set_id))
         except Exception as exc:
             self._record_best_effort_failure(
                 "main_window.species_mode.commit_species.apply",
                 message="Failed to apply staged species-mode concentration overlays",
                 exc=exc,
             )
+        finally:
+            self._suppress_canonical_batch_initials_transition = previous_suppress
+        return ()
 
-    def _materialized_mechanism_editor_texts_for_effective_slider_values(
+    def _materialized_mechanism_editor_source_for_runtime_parameter_values(
         self,
         values: Dict[str, float],
-    ) -> tuple[str, str]:
+    ):
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         non_scalar_values, scalar_values, state_network_values = (
             self._partition_effective_slider_commit_values(values)
         )
         reactions_text = self.mechanism_reactions_text_raw()
         if non_scalar_values:
-            reactions_text = self._apply_overrides_to_text(
+            reactions_text = self._apply_reactions_overrides_to_text(
                 reactions_text,
                 overrides=non_scalar_values,
-            )
-            reactions_text = self._apply_parameter_overrides_to_dsl(
-                reactions_text,
-                non_scalar_values,
             )
         if scalar_values:
             reactions_text = self._apply_scalar_param_overrides_to_reactions_text(
@@ -7813,11 +6498,14 @@ class MainWindow(
 
         state_network_dsl = self.mechanism_state_network_dsl_raw()
         if state_network_dsl.strip() and state_network_values:
-            state_network_dsl = self._apply_overrides_to_state_network_dsl(
+            state_network_dsl = self._apply_state_network_overrides_to_dsl(
                 state_network_dsl,
                 overrides=state_network_values,
             )
-        return str(reactions_text), str(state_network_dsl)
+        return MechanismAuthoringSource.from_parts(
+            reactions_text=reactions_text,
+            state_network_dsl=state_network_dsl,
+        )
 
     def _partition_effective_slider_commit_values(
         self,
@@ -7842,23 +6530,28 @@ class MainWindow(
                 state_network_values[name_s] = value_f
         return non_scalar_values, scalar_values, state_network_values
 
-    def _set_authoritative_mechanism_editor_texts(
+    def _set_authoritative_mechanism_editor_source(
         self,
+        source,
         *,
-        reactions_text: str,
-        state_network_dsl: str,
         description: str,
+        apply_transition: bool = True,
+        transition_source: str = "authoritative_editor_rewrite",
+        record_undo: bool = True,
     ) -> None:
-        from kindred.gui.undo_commands import SetMechanismEditorTextsCommand
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+        from kindred.gui.undo_commands import SetMechanismSourceCommand
 
-        previous_suppress = self._variable_runtime.suppress_slider_runtime_invalidation()
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be a MechanismAuthoringSource.")
+        transition_required = False
         previous_authoritative_suppress = bool(
             getattr(self, "_suppress_authoritative_mechanism_input_change", False)
         )
-        self._variable_runtime.set_suppress_slider_runtime_invalidation(True)
         self._suppress_authoritative_mechanism_input_change = True
         try:
-            current_reactions = str(self.mechanism_reactions_text_raw() or "")
+            reactions_widget = self._mechanism_editor._reactions_text
+            current_reactions = str(reactions_widget.toPlainText() or "")
             state_editor = getattr(getattr(self, "_mechanism_editor", None), "_state_network_editor", None)
             state_editor_available = (
                 state_editor is not None
@@ -7870,81 +6563,155 @@ class MainWindow(
                 if state_editor_available
                 else ""
             )
-            reactions_text_s = str(reactions_text)
-            state_network_dsl_s = str(state_network_dsl)
+            reactions_text_s = str(source.reactions_text)
+            state_network_dsl_s = str(source.state_network_dsl)
             reactions_changed = reactions_text_s != current_reactions
             state_changed = state_editor_available and state_network_dsl_s != current_state
             if not reactions_changed and not state_changed:
                 return
-            command = SetMechanismEditorTextsCommand(
-                self._mechanism_editor._reactions_text,
-                state_editor if state_editor_available else None,
-                new_reactions_text=reactions_text_s,
-                old_reactions_text=current_reactions,
-                new_state_network_dsl=state_network_dsl_s,
-                old_state_network_dsl=current_state,
-                description=str(description),
+            old_source = MechanismAuthoringSource.from_parts(
+                reactions_text=current_reactions,
+                state_network_dsl=current_state,
             )
-            self._undo_stack.push(command)
-            self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+            if bool(record_undo):
+                command = SetMechanismSourceCommand(
+                    new_source=source,
+                    old_source=old_source,
+                    apply_source=self._apply_mechanism_source_undo_stack_replacement,
+                    description=str(description),
+                )
+                self._undo_stack.push(command)
+            else:
+                self._write_complete_authoritative_mechanism_source_to_editor(source)
+            transition_required = True
         finally:
-            self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
             self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
+        if bool(apply_transition) and bool(transition_required):
+            self._apply_authoritative_mechanism_transition(
+                transition_source=str(transition_source or "authoritative_editor_rewrite")
+            )
+
+    def _write_complete_authoritative_mechanism_source_to_editor(self, source) -> bool:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be a MechanismAuthoringSource.")
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is None:
+            raise RuntimeError("Mechanism editor is unavailable.")
+        reactions_widget = getattr(editor, "_reactions_text", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if reactions_widget is None:
+            raise RuntimeError("Mechanism Reactions editor is unavailable.")
+        state_editor_available = (
+            state_editor is not None
+            and hasattr(state_editor, "get_state_network_dsl")
+            and hasattr(state_editor, "set_state_network_dsl")
+        )
+        current_reactions = str(reactions_widget.toPlainText() or "")
+        current_state = (
+            str(state_editor.get_state_network_dsl() or "")
+            if state_editor_available
+            else ""
+        )
+        reactions_text = str(source.reactions_text)
+        state_network_dsl = str(source.state_network_dsl)
+        reactions_changed = reactions_text != current_reactions
+        state_changed = state_editor_available and state_network_dsl != current_state
+        if not reactions_changed and not state_changed:
+            return False
+
+        previous_reactions_block = reactions_widget.blockSignals(True)
+        previous_state_block = None
+        if state_editor_available:
+            previous_state_block = state_editor.blockSignals(True)
+        try:
+            if reactions_changed:
+                reactions_widget.setPlainText(reactions_text)
+            if state_changed:
+                state_editor.set_state_network_dsl(state_network_dsl)
+        finally:
+            if state_editor_available:
+                state_editor.blockSignals(bool(previous_state_block))
+            reactions_widget.blockSignals(bool(previous_reactions_block))
+
+        self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+        validate = getattr(editor, "_validate_dsl", None)
+        if callable(validate):
+            validate()
+        return True
+
+    def _apply_mechanism_source_undo_stack_replacement(self, source) -> None:
+        changed = self._write_complete_authoritative_mechanism_source_to_editor(source)
+        if not bool(changed):
+            return
+        if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
+            return
+        self._apply_authoritative_mechanism_transition(
+            transition_source="mechanism_source_undo_redo",
+        )
 
     def _materialize_direct_slider_commit_to_authoritative_editors(self, name: str, value: float) -> None:
         focused_set_id = str(self._preview_session.focused_mechanism_workspace_set_id() or "")
         effective_values = (
-            self._preview_session.effective_slider_values_for_set(focused_set_id)
+            self._preview_session.runtime_parameter_values_for_set(focused_set_id)
             if focused_set_id
             else {}
         )
-        normalized_values = self._normalized_slider_overrides(
+        normalized_values = self._runtime_parameter_values_for_materialization(
             overrides=effective_values or {str(name): float(value)}
         )
         if str(name) not in normalized_values:
             parsed, ok = try_parse_finite_float(value)
             if ok:
                 normalized_values[str(name)] = float(parsed)
-        self._apply_effective_slider_values_to_mechanism_editors(
+        self._apply_runtime_parameter_values_to_mechanism_editors(
             normalized_values,
             description=f"Apply slider {name}",
         )
 
-    def _apply_effective_slider_values_to_mechanism_editors(
+    def _apply_runtime_parameter_values_to_mechanism_editors(
         self,
         values: Dict[str, float],
         *,
         description: str = "Apply slider overrides",
     ) -> None:
-        reactions_text, state_network_dsl = self._materialized_mechanism_editor_texts_for_effective_slider_values(
-            values
-        )
-        self._set_authoritative_mechanism_editor_texts(
-            reactions_text=reactions_text,
-            state_network_dsl=state_network_dsl,
+        source = self._materialized_mechanism_editor_source_for_runtime_parameter_values(values)
+        self._set_authoritative_mechanism_editor_source(
+            source,
             description=str(description),
+            apply_transition=False,
         )
 
     def _sync_after_authoritative_slider_materialization(
         self,
         *,
-        preserve_current_display: Optional[Dict[str, Any]] = None,
+        affected_canonical_initial_set_ids: Sequence[str] = (),
     ) -> None:
-        self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
+        affected_set_ids_t = tuple(
+            dict.fromkeys(str(set_id) for set_id in (affected_canonical_initial_set_ids or ()) if str(set_id))
+        )
+        canonical_initials_identity = (
+            self._canonical_batch_initials_identity_for_set_ids(affected_set_ids_t)
+            if affected_set_ids_t
+            else None
+        )
+        self._apply_authoritative_mechanism_transition(
+            transition_source="slider_materialization",
+            canonical_batch_initials_by_set_id=canonical_initials_identity,
+            affected_set_ids=affected_set_ids_t,
+            canonical_batch_initials_scope_is_partial=bool(affected_set_ids_t),
+        )
         try:
             self._extract_and_populate_variables(preserve_visibility=True)
         except Exception:
             logger.exception("Failed to refresh sliders after authoritative slider materialization")
-            self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
         try:
             panel = self._mechanism_editor.species_sliders_widget()
             if panel is not None and hasattr(panel, "rebuild_from_current_row"):
                 panel.rebuild_from_current_row()
         except Exception:
             logger.exception("Failed to rebuild species panel after slider materialization")
-        self._invalidate_active_results_after_authoritative_mechanism_change(
-            preserve_current_display=preserve_current_display
-        )
         self._refresh_slider_transaction_button_state()
 
     def _finalize_authoritative_slider_materialization(
@@ -7954,30 +6721,34 @@ class MainWindow(
         description: str,
         apply_species_overlays: bool,
     ) -> None:
-        preserve_current_display = self._active_workspace_preview_display_snapshot()
-        self._sim_controller.invalidate_slider_preview_work()
-        self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
+        self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
         self._preview_session.stop_variable_update_timer()
         self._preview_session.stop_slider_release_commit_timer()
-        self._apply_effective_slider_values_to_mechanism_editors(
+        self._apply_runtime_parameter_values_to_mechanism_editors(
             effective_values,
             description=str(description),
         )
+        affected_canonical_initial_set_ids: tuple[str, ...] = ()
         if bool(apply_species_overlays):
-            self._commit_species_slider_values_to_selected_batch_rows()
-        self._preview_session.commit_current_mechanism_workspace()
+            affected_canonical_initial_set_ids = self._commit_species_slider_values_to_selected_batch_rows()
+        self._preview_session.commit_current_mechanism_workspace(invalidate_preview_work=False)
         self._sync_after_authoritative_slider_materialization(
-            preserve_current_display=preserve_current_display
+            affected_canonical_initial_set_ids=affected_canonical_initial_set_ids,
         )
 
-    def _sync_mechanism_controls_to_focused_batch_set(self, *, use_workspace: bool = True) -> None:
+    def _sync_mechanism_controls_to_focused_batch_set(
+        self,
+        *,
+        use_workspace: bool = True,
+        rebuild_species_sliders: bool = True,
+    ) -> None:
         sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
         if sliders is not None and hasattr(sliders, "get_variables"):
             current_values = sliders.get_variables() or {}
             if current_values:
                 focused_set_id = self._preview_session.focused_mechanism_workspace_set_id()
                 if bool(use_workspace):
-                    effective_values = self._preview_session.effective_slider_values(set_id=focused_set_id)
+                    effective_values = self._preview_session.runtime_parameter_values(set_id=focused_set_id)
                 else:
                     effective_values = dict(self._preview_session.param_store.shared_params)
                 metadata = self.variable_metadata() or {}
@@ -8007,38 +6778,53 @@ class MainWindow(
                 else:
                     self._update_parameter_table_from_sliders()
 
-        try:
-            panel = self._mechanism_editor.species_sliders_widget()
-            if panel is not None and hasattr(panel, "rebuild_from_current_row"):
-                panel.rebuild_from_current_row()
-        except Exception:
-            logger.exception("Failed to rebuild species panel while syncing focused mechanism controls")
+        if bool(rebuild_species_sliders):
+            try:
+                panel = self._mechanism_editor.species_sliders_widget()
+                if (
+                    panel is not None
+                    and hasattr(panel, "live_drag_active")
+                    and bool(panel.live_drag_active())
+                ):
+                    return
+                if panel is not None and hasattr(panel, "rebuild_from_current_row"):
+                    panel.rebuild_from_current_row()
+            except Exception:
+                logger.exception("Failed to rebuild species panel while syncing focused mechanism controls")
 
-    def _on_commit_slider_overrides_clicked(self) -> None:
+    def _on_commit_runtime_parameters_clicked(self) -> None:
         """
         Commit current slider values into the DSL editor.
 
-        In override mode, sliders update preview simulations via bound overrides without rewriting
-        the mechanism text. "Commit" applies the current editable slider values to the DSL.
+        Runtime parameter sliders update preview simulations without rewriting
+        the mechanism text. "Commit" applies the current finite parameter values to the DSL.
         """
         focused_set_id = self._preview_session.focused_mechanism_workspace_set_id()
-        effective_values = self._preview_session.effective_slider_values(set_id=focused_set_id)
+        effective_values = self._preview_session.runtime_parameter_values(set_id=focused_set_id)
         self._finalize_authoritative_slider_materialization(
             effective_values,
-            description="Apply slider overrides",
+            description="Apply runtime parameters",
             apply_species_overlays=True,
         )
 
-    def _on_reset_slider_overrides_clicked(self) -> None:
-        """Reset slider overrides back to the baseline DSL values and refresh slider widgets."""
+    def _on_reset_runtime_parameters_clicked(self) -> None:
+        """Reset staged runtime parameter values back to the baseline DSL values."""
+        target_set_ids = self._effective_slider_edit_target_set_ids()
         if bool(self._preview_session.has_staged_concentration_overlays()):
-            self._discard_slider_transaction_for_invalidation()
+            replay_intent = self._preview_session.capture_reset_slider_replay_intent()
+            invalidation_target_set_ids = (
+                list(replay_intent.target_set_ids)
+                if replay_intent is not None and getattr(replay_intent, "target_set_ids", ())
+                else target_set_ids
+            )
+            self._discard_pending_slider_edits_for_invalidation(
+                target_set_ids=invalidation_target_set_ids,
+            )
         else:
-            self._sim_controller.invalidate_slider_preview_work()
-            self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
-            target_set_ids = self._effective_slider_edit_target_set_ids()
+            self._sim_controller.discard_slider_preview_work_preserving_runtime_owner(
+                target_set_ids=target_set_ids,
+            )
             self._preview_session.reset_mechanism_workspaces(target_set_ids)
-            self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
             sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
             if sliders is not None and hasattr(sliders, "end_live_drag"):
@@ -8048,7 +6834,6 @@ class MainWindow(
                 self._extract_and_populate_variables(preserve_visibility=True)
             except Exception:
                 logger.exception("Failed to refresh sliders after override reset")
-                self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
             try:
                 self._update_parameter_table_from_sliders()
             except Exception:
@@ -8056,7 +6841,7 @@ class MainWindow(
                 QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
 
             try:
-                self._ensure_batch_current_row_selected()
+                self._sync_cached_focus_to_current_batch_row()
                 panel = self._mechanism_editor.species_sliders_widget()
                 if panel is not None and hasattr(panel, "rebuild_from_current_row"):
                     panel.rebuild_from_current_row()
@@ -8064,41 +6849,28 @@ class MainWindow(
                 logger.exception("Failed to reset species row")
                 self._species_panel_available = False
             self._refresh_slider_transaction_button_state()
-            self._refresh_batch_display_from_focus_and_shown()
+            self._refresh_batch_display_from_request_scope()
             return
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
-        self._sim_controller.run_simulation_from_slider()
+        if replay_intent is not None:
+            self._preview_session.submit_slider_replay_intent(replay_intent)
+            self._sim_controller.launch_pending_slider_preview_replay()
+            if self.results_controller.active_display_transaction() is None:
+                self._refresh_batch_display_from_request_scope()
+        else:
+            self._refresh_batch_display_from_request_scope()
 
-    def _discard_slider_transaction_for_invalidation(self) -> None:
-        """Clear the staged transaction without scheduling a preview rerun."""
-        batch_cache = self._sim_controller.batch_cache
-        active_overlay_token = str(batch_cache.active_cache_preview_token or "").strip()
-        active_overlay_scope_ids = tuple(str(set_id) for set_id in (batch_cache.active_cache_preview_scope_set_ids or ()))
-        current_overlay_token = None
-        if active_overlay_token and active_overlay_scope_ids:
-            scope_rows = []
-            for set_id in active_overlay_scope_ids:
-                try:
-                    row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-                except Exception:
-                    row = None
-                if row is not None:
-                    scope_rows.append(int(row))
-            if scope_rows:
-                current_overlay_token = self._preview_session.preview_batch_cache_token(scope_rows) or None
-        elif active_overlay_token and bool(self._preview_session.has_staged_concentration_overlays()):
-            try:
-                row_count = int(getattr(self, "_batch_store", None).row_count())
-            except Exception:
-                row_count = 0
-            if row_count > 0:
-                current_overlay_token = self._preview_session.preview_batch_cache_token(list(range(int(row_count)))) or None
-        self._sim_controller.invalidate_slider_preview_work()
-        self._preview_session.clear_working_transaction()
-        if current_overlay_token and active_overlay_token == str(current_overlay_token):
-            batch_cache.clear_active_selection_state()
-        self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
-        self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
+    def _discard_pending_slider_edits_for_invalidation(
+        self,
+        *,
+        target_set_ids: Sequence[str] | None = None,
+    ) -> bool:
+        """Discard staged slider edits and leave the visible display recoverable."""
+        targets = target_set_ids or self._effective_slider_edit_target_set_ids()
+        self._sim_controller.invalidate_slider_preview_work(
+            target_set_ids=targets,
+        )
+        self._preview_session.clear_working_transaction(invalidate_preview_work=False)
 
         sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
         if sliders is not None and hasattr(sliders, "end_live_drag"):
@@ -8108,7 +6880,6 @@ class MainWindow(
             self._extract_and_populate_variables(preserve_visibility=True)
         except Exception:
             logger.exception("Failed to refresh sliders after override reset")
-            self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
         try:
             self._update_parameter_table_from_sliders()
         except Exception:
@@ -8116,7 +6887,7 @@ class MainWindow(
             QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
 
         try:
-            self._ensure_batch_current_row_selected()
+            self._sync_cached_focus_to_current_batch_row()
             panel = self._mechanism_editor.species_sliders_widget()
             if panel is not None and hasattr(panel, "rebuild_from_current_row"):
                 panel.rebuild_from_current_row()
@@ -8124,31 +6895,32 @@ class MainWindow(
             logger.exception("Failed to reset species row")
             self._species_panel_available = False
         self._refresh_slider_transaction_button_state()
+        return True
 
     # ------------------------------------------------------------------
     # Species mode (Batch Initial Conditions sliders)
     # ------------------------------------------------------------------
 
-    def _ensure_batch_current_row_selected(self) -> None:
+    def _sync_cached_focus_to_current_batch_row(self) -> None:
+        return
+
+    def _select_initial_batch_row_if_needed(self) -> None:
         table = getattr(self, "_batch_table", None)
         model = getattr(self, "_batch_model", None)
         if table is None or model is None:
             return
-        if model.rowCount() <= 0:
+        if int(model.rowCount()) <= 0:
             return
-        current = table.currentIndex()
-        if current.isValid():
+        if table.currentIndex().isValid() or self._batch_selected_rows():
+            self._sync_cached_focus_to_current_batch_row()
             return
-        idx = model.index(0, 0)
-        if not idx.isValid():
+        transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
+            gesture="initial_default_selection",
+            row=0,
+        )
+        if not (transaction.focus_change or transaction.selection_change):
             return
-        table.setCurrentIndex(idx)
-        self._update_focused_batch_set_id(row=0)
-        sel = table.selectionModel()
-        if sel is None:
-            return
-        sel.clearSelection()
-        sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+        self._select_single_batch_row(0)
 
     def _on_species_mode_changed(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -8168,7 +6940,7 @@ class MainWindow(
             self._preview_session.deactivate_species_preview_timer()
             return
 
-        self._ensure_batch_current_row_selected()
+        self._sync_cached_focus_to_current_batch_row()
         if panel is not None:
             if hasattr(panel, "activate"):
                 try:
@@ -8185,9 +6957,10 @@ class MainWindow(
             panel = None
         if panel is None:
             return
+        target_set_ids = self._effective_slider_edit_target_set_ids()
         try:
             rows = []
-            for set_id in self._effective_slider_edit_target_set_ids():
+            for set_id in target_set_ids:
                 row = self._batch_row_for_set_id(set_id)
                 if row is not None:
                     rows.append(int(row))
@@ -8200,16 +6973,29 @@ class MainWindow(
         except Exception:
             changed = False
         if changed:
+            self.results_controller.clear_display_if_workspace_previews_were_displayed(
+                target_set_ids,
+                clear_plot=False,
+            )
             self._refresh_slider_transaction_button_state()
+            if self.results_controller.active_display_transaction() is None:
+                self._refresh_batch_display_from_request_scope()
             self._queue_species_slider_simulation(label="init:reset", delay_ms=0)
 
     def _on_species_slider_edited(self, species: str, value: float) -> None:
-        _ = float(value)  # ensure numeric for callers; no side effects
+        changed = self._preview_session.on_species_slider_value_changed(species, float(value))
         self._refresh_slider_transaction_button_state()
-        self._preview_session.queue_species_slider_simulation(label=f"init:{species}", delay_ms=80)
+        if changed:
+            self._preview_session.queue_species_slider_simulation(label=f"init:{species}", delay_ms=80)
+
+    def _on_species_slider_drag_started(self, species: str) -> None:
+        self._preview_session.on_species_slider_drag_started(species)
 
     def _on_species_slider_drag_finished(self, species: str) -> None:
-        self._preview_session.queue_species_slider_simulation(label=f"init:{species}", delay_ms=0)
+        self._preview_session.on_species_slider_drag_finished(species)
+        if bool(getattr(self, "_slider_edit_targets_changed_deferred_during_species_drag", False)):
+            self._slider_edit_targets_changed_deferred_during_species_drag = False
+            self._on_slider_edit_targets_changed()
 
     def _queue_species_slider_simulation(self, *, label: str, delay_ms: int) -> None:
         self._preview_session.queue_species_slider_simulation(label=label, delay_ms=delay_ms)
@@ -8222,7 +7008,7 @@ class MainWindow(
             return "kf"
         if isinstance(kr_meta, dict) and (kr_meta.get("derived") is True or kr_meta.get("editable") is False):
             return "kr"
-        # Default policy matches core: derive kr unless only kr was explicitly provided.
+        # Default policy matches core: thermodynamic authority derives kr.
         return "kr"
 
     @staticmethod
@@ -8259,7 +7045,7 @@ class MainWindow(
         value: float,
         *,
         source_text: Optional[str] = None,
-        commit: bool = True,
+        strict: bool = False,
         metadata: Optional[Dict[str, Dict[str, object]]] = None,
         step_analysis_context: object | None = None,
     ) -> str:
@@ -8274,8 +7060,6 @@ class MainWindow(
             New value
         source_text : str | None
             Optional mechanism DSL to apply the change to. If None, use editor text.
-        commit : bool, default True
-            When True, apply updates to the editor and slider widgets.
 
         Returns
         -------
@@ -8289,11 +7073,9 @@ class MainWindow(
 
         if metadata is None:
             metadata = dict(self.variable_metadata())
-        slider_updates: list[tuple[str, float, Dict[str, object]]] = []
-        sliders = getattr(self._mechanism_editor, "_variable_sliders", None) if commit else None
         step_constraint_context = {
             "temperature_K": float(self._temperature_spinbox.value()),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
+            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
         }
         try:
             outcome = analyze_step_parameter_update(
@@ -8303,11 +7085,17 @@ class MainWindow(
                 step_constraint_context=step_constraint_context,
                 step_analysis_context=step_analysis_context,
             )
-        except ValueError:
+        except ValueError as exc:
+            if strict:
+                raise ValueError(f"Invalid request parameter override {name!r}: {exc}") from exc
             logger.warning("Ignoring invalid step parameter update for %r", name)
             return mechanism_text
 
-        if not outcome.found_target or not outcome.writable or not outcome.would_change_text:
+        if not outcome.found_target or not outcome.writable:
+            if strict:
+                raise ValueError(f"Invalid request parameter override {name!r}.")
+            return mechanism_text
+        if not outcome.would_change_text:
             return mechanism_text
 
         family = str(outcome.parameter_family)
@@ -8321,9 +7109,6 @@ class MainWindow(
         new_text = str(outcome.updated_text)
 
         if family == "Keq":
-            K_val = float(resolved_values[f"Keq{step_index}"])
-            kf_val = float(resolved_values[f"kf{step_index}"])
-            kr_val = float(resolved_values[f"kr{step_index}"])
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             K_meta = dict(metadata.get(f"Keq{step_index}") or {})
             K_meta.update(
@@ -8358,13 +7143,7 @@ class MainWindow(
                 }
             )
             metadata[f"kr{step_index}"] = kr_meta
-            if commit:
-                slider_updates.append((f"Keq{step_index}", float(f"{K_val:.6g}"), metadata[f"Keq{step_index}"]))
-                slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
-                slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
         elif family == "kf":
-            kf_val = float(resolved_values[f"kf{step_index}"])
-            kr_val = float(resolved_values[f"kr{step_index}"])
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             kf_meta = dict(metadata.get(f"kf{step_index}") or {})
             kf_meta.update(
@@ -8377,19 +7156,19 @@ class MainWindow(
                 }
             )
             metadata[f"kf{step_index}"] = kf_meta
-            kr_meta = dict(metadata.get(f"kr{step_index}") or {})
-            kr_meta.update(
-                {
-                    "type": "equilibrium",
-                    "index": step_index,
-                    "label": kr_meta.get("label") or label_text,
-                    "line": line_index,
-                    "role": "kr",
-                }
-            )
-            metadata[f"kr{step_index}"] = kr_meta
+            if f"kr{step_index}" in resolved_values:
+                kr_meta = dict(metadata.get(f"kr{step_index}") or {})
+                kr_meta.update(
+                    {
+                        "type": "equilibrium",
+                        "index": step_index,
+                        "label": kr_meta.get("label") or label_text,
+                        "line": line_index,
+                        "role": "kr",
+                    }
+                )
+                metadata[f"kr{step_index}"] = kr_meta
             if f"Keq{step_index}" in resolved_values:
-                K_val = float(resolved_values[f"Keq{step_index}"])
                 K_meta = dict(metadata.get(f"Keq{step_index}") or {})
                 K_meta.update(
                     {
@@ -8401,14 +7180,7 @@ class MainWindow(
                     }
                 )
                 metadata[f"Keq{step_index}"] = K_meta
-            if commit:
-                slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
-                slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
-                if f"Keq{step_index}" in resolved_values:
-                    slider_updates.append((f"Keq{step_index}", float(f"{resolved_values[f'Keq{step_index}']:.6g}"), metadata[f"Keq{step_index}"]))
         elif family == "kr":
-            kr_val = float(resolved_values[f"kr{step_index}"])
-            kf_val = float(resolved_values[f"kf{step_index}"])
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             kr_meta = dict(metadata.get(f"kr{step_index}") or {})
             kr_meta.update(
@@ -8433,7 +7205,6 @@ class MainWindow(
             )
             metadata[f"kf{step_index}"] = kf_meta
             if f"Keq{step_index}" in resolved_values:
-                K_val = float(resolved_values[f"Keq{step_index}"])
                 K_meta = dict(metadata.get(f"Keq{step_index}") or {})
                 K_meta.update(
                     {
@@ -8445,11 +7216,6 @@ class MainWindow(
                     }
                 )
                 metadata[f"Keq{step_index}"] = K_meta
-            if commit:
-                slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
-                slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
-                if f"Keq{step_index}" in resolved_values:
-                    slider_updates.append((f"Keq{step_index}", float(f"{resolved_values[f'Keq{step_index}']:.6g}"), metadata[f"Keq{step_index}"]))
         elif family == "k":
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             metadata[name] = {
@@ -8459,29 +7225,6 @@ class MainWindow(
                 "line": line_index,
                 "role": "k",
             }
-            if commit:
-                slider_updates.append((name, float(f"{resolved_values[name]:.6g}"), metadata[name]))
-
-        if not commit:
-            return new_text
-
-        self.set_variable_metadata(metadata)
-
-        self._mechanism_editor.set_reactions_text(new_text, block_signals=True)
-
-        for slider_name, slider_value, meta in slider_updates:
-            if sliders is not None and sliders.has_variable(slider_name):
-                sliders.update_variable(slider_name, slider_value)
-                sliders.update_metadata(slider_name, meta)
-                # Only persist user-editable slider values as overrides; derived/read-only
-                # sliders (e.g., kf/kr implied by explicit Keq, or param-algebra constraints)
-                # must never be rewritten back into the DSL.
-                if not (isinstance(meta, dict) and meta.get("editable") is False):
-                    self._preview_session.stage_slider_value(slider_name, slider_value)
-
-        timer = getattr(self._mechanism_editor, "_network_update_timer", None)
-        if timer is not None:
-            timer.start()
 
         return new_text
 
@@ -8541,8 +7284,6 @@ class MainWindow(
             refresh_sliders=bool(refresh_sliders),
             preserve_visibility=bool(preserve_visibility),
         )
-
-    # ===== Public API for setting data (compatibility) =====
 
     def _open_docs(self):
         """
@@ -8618,6 +7359,29 @@ class MainWindow(
 
         MainWindow._CACHED_PRESET_IDS = [path.stem for path in preset_files]
         return MainWindow._CACHED_PRESET_IDS
+
+    def _available_intervention_example_specs(self) -> List[Dict[str, str]]:
+        """Return bundled intervention examples discovered under kindred/data/interventions."""
+        try:
+            from kindred.io.resources import get_all_intervention_example_specs
+        except Exception as exc:  # pragma: no cover - defensive import
+            logger.warning("Intervention example resources unavailable: %s", exc)
+            return []
+
+        specs = []
+        for spec in get_all_intervention_example_specs():
+            example_id = str(spec.get("id", "")).strip()
+            if not example_id:
+                continue
+            specs.append(
+                {
+                    "id": example_id,
+                    "type": str(spec.get("type", "intervention")),
+                    "path": str(spec.get("path", "")),
+                    "title": str(spec.get("title", "")),
+                }
+            )
+        return specs
 
     @staticmethod
     def _preset_sort_key(path: Path) -> Tuple[int, str]:
@@ -8749,7 +7513,7 @@ class MainWindow(
             self._preview_session.variable_preview_debounce_ms("Keq1")
         )
         current_slider_preview_points = int(self._mechanism_editor.slider_points_value())
-        current_slider_preview_solver = str(self._mechanism_editor.slider_solver_value() or "LSODA")
+        current_slider_preview_solver = str(self._mechanism_editor.slider_solver_value() or "BDF")
 
         # Populate dialog with current settings
         current_settings = {
@@ -8759,18 +7523,23 @@ class MainWindow(
             'use_sparse_jacobian': self._use_sparse_jacobian,
             'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
+            'batch_runtime_lane_budget': int(self._sim_controller.batch_runtime_lane_budget),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
             'slider_preview_solver': str(current_slider_preview_solver),
             'slider_preview_points': int(current_slider_preview_points),
             'parameter_preview_debounce_ms': int(current_parameter_preview_debounce_ms),
             'equilibrium_preview_debounce_ms': int(current_equilibrium_preview_debounce_ms),
-            'result_cache_cap': int(self._sim_controller.batch_cache.result_cache.max_entries()),
-            'preview_cache_cap': int(self._sim_controller.batch_cache.preview_cache.max_entries()),
+            'result_cache_cap': int(self._sim_controller.batch_cache.result_cache_max_entries()),
+            'preview_cache_cap': int(self._sim_controller.batch_cache.preview_cache_max_entries()),
         }
         dialog.set_settings(current_settings)
 
         if dialog.exec():
             settings = dialog.get_settings()
+            previous_simulation_runtime_settings = self._simulation_runtime_settings_snapshot()
+            previous_batch_runtime_pool_settings = (
+                self._simulation_batch_runtime_pool_settings_snapshot()
+            )
             current_solver = str(self._initial_solver or solver_contract.default_solver_name)
             current_rtol = float(self._initial_rtol or 1e-6)
             current_atol = float(self._initial_atol or 1e-12)
@@ -8829,55 +7598,65 @@ class MainWindow(
                 self._use_sparse_jacobian = bool(settings['use_sparse_jacobian'])
             if 'wegscheider_cyclicity_enabled' in settings:
                 self._wegscheider_cyclicity_enabled = bool(settings['wegscheider_cyclicity_enabled'])
-            previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
-            previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
             if 'max_parallel_batch_workers' in settings:
                 try:
-                    self._sim_controller.parallel_batch.max_parallel_workers = max(
-                        1,
-                        int(settings['max_parallel_batch_workers']),
+                    self._sim_controller.parallel_batch.max_parallel_workers = min(
+                        int(MAX_PARALLEL_WORKERS_CEILING),
+                        max(
+                            1,
+                            int(settings['max_parallel_batch_workers']),
+                        ),
                     )
                 except Exception:
-                    self._sim_controller.parallel_batch.max_parallel_workers = 12
+                    self._sim_controller.parallel_batch.max_parallel_workers = int(
+                        PROJECT_DEFAULTS["max_parallel_batch_workers"]
+                    )
+            if 'batch_runtime_lane_budget' in settings:
+                try:
+                    self._sim_controller.batch_runtime_lane_budget = min(
+                        int(MAX_PARALLEL_WORKERS_CEILING),
+                        max(
+                            1,
+                            int(settings['batch_runtime_lane_budget']),
+                        ),
+                    )
+                except Exception:
+                    self._sim_controller.batch_runtime_lane_budget = int(
+                        PROJECT_DEFAULTS["batch_runtime_lane_budget"]
+                    )
             if 'limit_blas_threads_per_worker' in settings:
                 self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
                     settings['limit_blas_threads_per_worker']
                 )
-            if (
-                previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
-                or previous_limit_blas_threads
-                != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
-            ):
-                self._sim_controller.parallel_batch_pool_settings_changed()
             if 'result_cache_cap' in settings or 'preview_cache_cap' in settings:
                 self.set_simulation_cache_caps(
                     result_cap=int(
                         settings.get(
                             'result_cache_cap',
-                            self._sim_controller.batch_cache.result_cache.max_entries(),
+                            self._sim_controller.batch_cache.result_cache_max_entries(),
                         )
                     ),
                     preview_cap=int(
                         settings.get(
                             'preview_cache_cap',
-                            self._sim_controller.batch_cache.preview_cache.max_entries(),
+                            self._sim_controller.batch_cache.preview_cache_max_entries(),
                         )
                     ),
                     persist=True,
                 )
-            self.settings_set_value(
+            self._settings_owner.settings_set_value(
                 "simulation/slider_preview_solver",
                 str(next_runtime_settings["slider_preview_solver"]),
             )
-            self.settings_set_value(
+            self._settings_owner.settings_set_value(
                 "simulation/slider_preview_points",
                 int(next_runtime_settings["slider_preview_points"]),
             )
-            self.settings_set_value(
+            self._settings_owner.settings_set_value(
                 "simulation/parameter_preview_debounce_ms",
                 int(next_runtime_settings["parameter_preview_debounce_ms"]),
             )
-            self.settings_set_value(
+            self._settings_owner.settings_set_value(
                 "simulation/equilibrium_preview_debounce_ms",
                 int(next_runtime_settings["equilibrium_preview_debounce_ms"]),
             )
@@ -8902,21 +7681,24 @@ class MainWindow(
                 self._sim_controller.parallel_batch.max_parallel_workers,
             )
             self.config_controller.update_user_preference(
+                "batch_runtime_lane_budget",
+                self._sim_controller.batch_runtime_lane_budget,
+            )
+            self.config_controller.update_user_preference(
                 "limit_blas_threads_per_worker",
                 self._sim_controller.parallel_batch.limit_blas_threads_per_worker,
             )
+            self._fitting_runtime_input_publisher.publish_if_changed(reason="solver settings applied")
             slider_schema_refresh_needed = bool(
                 current_runtime_settings["wegscheider_cyclicity_enabled"]
                 != next_runtime_settings["wegscheider_cyclicity_enabled"]
             )
             if slider_schema_refresh_needed:
-                self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
                 try:
                     self._extract_and_populate_variables(preserve_visibility=True)
                     self._sync_mechanism_controls_to_focused_batch_set()
                 except Exception:
                     logger.exception("Failed to refresh variables after solver settings update")
-                    self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
                     bar = getattr(self, "_status_bar", None)
                     if bar is not None:
                         try:
@@ -8924,6 +7706,14 @@ class MainWindow(
                         except RuntimeError as exc:
                             logger.debug("Failed to show solver settings refresh error in status bar: %s", exc, exc_info=True)
                             self._status_bar = None
+            if self._simulation_runtime_settings_snapshot() != previous_simulation_runtime_settings:
+                batch_runtime_pool_settings_changed = (
+                    self._simulation_batch_runtime_pool_settings_snapshot()
+                    != previous_batch_runtime_pool_settings
+                )
+                self._refresh_simulation_runtime_after_inputs_changed(
+                    batch_runtime_pool_inputs_changed=bool(batch_runtime_pool_settings_changed)
+                )
 
     def _open_temperature_schedule_editor(self):
         """Open temperature schedule editor dialog."""
@@ -8965,11 +7755,21 @@ class MainWindow(
         P3 ENHANCEMENT: Save user preferences before closing.
         """
         logger.info("Window close event - cleaning up")
+        self._simulation_runtime_availability_shutdown_started = True
 
         # P3 ENHANCEMENT: Save user preferences
         self._save_settings()
 
-        close_ready = self._sim_controller.prepare_simulation_shutdown_for_close()
+        prepared_close_ready = getattr(
+            self,
+            "_simulation_close_prepared_before_close_event",
+            None,
+        )
+        self._simulation_close_prepared_before_close_event = None
+        if prepared_close_ready is None:
+            close_ready = self._sim_controller.prepare_simulation_shutdown_for_close()
+        else:
+            close_ready = bool(prepared_close_ready)
         if not close_ready:
             logger.warning("Deferring close event while simulation worker shutdown is still in progress")
             event.ignore()
@@ -8984,8 +7784,23 @@ class MainWindow(
         logger.info("Cleanup complete, accepting close event")
         event.accept()
 
+    def close(self) -> bool:
+        if not self.isVisible():
+            self._simulation_runtime_availability_shutdown_started = True
+            try:
+                self._simulation_close_prepared_before_close_event = (
+                    self._sim_controller.prepare_simulation_shutdown_for_close()
+                )
+            except Exception:
+                self._simulation_close_prepared_before_close_event = None
+                logger.debug("Failed to prepare simulation shutdown for hidden close", exc_info=True)
+        return bool(super().close())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+
     def _prepare_fit_window_shutdown_for_close(self) -> bool:
-        tracked_windows = list(getattr(self, "_active_fit_windows", []) or [])
+        tracked_windows = list(self._fitting_runtime_input_publisher.active_windows())
         all_closed = True
 
         for window in tracked_windows:
@@ -9005,7 +7820,8 @@ class MainWindow(
                 continue
 
             try:
-                if bool(window.isVisible()):
+                is_visible = getattr(window, "isVisible", None)
+                if callable(is_visible) and bool(is_visible()):
                     all_closed = False
             except RuntimeError:
                 continue
@@ -9015,14 +7831,3 @@ class MainWindow(
     # ========================================================================
     # PROFILE MANAGEMENT
     # ========================================================================
-
-    def set_data(
-        self,
-        t: np.ndarray,
-        series: Dict[str, np.ndarray],
-        *,
-        label: Optional[str] = None,
-        overlays: Optional[Sequence[Dict[str, object]]] = None,
-        owned_species: Optional[Sequence[str]] = None,
-    ) -> None:
-        self.results_controller.set_data(t, series, label=label, overlays=overlays, owned_species=owned_species)

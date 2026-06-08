@@ -1,9 +1,4 @@
-"""
-Data analysis tools for chemical kinetics.
-
-Modules:
-- global_fitting: Global fitting across multiple datasets
-"""
+"""Data analysis tools for chemical kinetics."""
 
 from __future__ import annotations
 
@@ -13,9 +8,14 @@ __all__ = [
     "DatasetFitInfo",
 ]
 
-# Lazy imports to avoid circular dependencies
+
 def __getattr__(name: str):
-    if name in ["fit_global", "GlobalFitResult", "DatasetFitInfo"]:
-        from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult, fit_global  # noqa: F401
-        return locals()[name]
+    if name in {"fit_global", "GlobalFitResult", "DatasetFitInfo"}:
+        from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult, fit_global
+
+        return {"fit_global": fit_global, "GlobalFitResult": GlobalFitResult, "DatasetFitInfo": DatasetFitInfo}[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

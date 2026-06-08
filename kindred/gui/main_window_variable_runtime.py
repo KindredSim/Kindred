@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping as MappingABC
 import logging
 import math
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Tuple
 
-from kindred.core.api.simulation import prepare_bound_mechanism
+from kindred.core.equilibrium_rate_authority import (
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+)
 from kindred.core.simulator.dsl_text_update import (
     _dedupe_tokens_case_insensitive,
     _duplicate_canonical_step_token,
     _get_token_float,
     _is_equilibrium_k_token,
+    _is_legacy_equilibrium_constant_token,
     _parse_mechanism_semicolon_kv,
     _remove_token_aliases,
     _serialize_mechanism_semicolon_kv,
@@ -19,21 +24,17 @@ from kindred.core.simulator.dsl_text_update import (
 )
 
 if TYPE_CHECKING:
-    from kindred.core.simulation_preparation import BoundMechanism
     from kindred.gui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
 
 
 class MainWindowVariableRuntime:
-    """Owns MainWindow's prepared preview runtime and slider-variable metadata pipeline."""
+    """Owns MainWindow's slider-variable metadata and energy-mode UI pipeline."""
 
     def __init__(self, main_window: "MainWindow") -> None:
         self._mw = main_window
         self._variable_metadata: Dict[str, Dict[str, object]] = {}
-        self._slider_runtime: Optional[BoundMechanism] = None
-        self._slider_runtime_dirty = True
-        self._suppress_slider_runtime_invalidation = False
 
     def variable_metadata(self) -> Dict[str, Dict[str, object]]:
         return {str(name): dict(meta or {}) for name, meta in self._variable_metadata.items()}
@@ -49,22 +50,6 @@ class MainWindowVariableRuntime:
 
     def clear_variable_metadata(self) -> None:
         self._variable_metadata = {}
-
-    def slider_runtime_dirty(self) -> bool:
-        return bool(self._slider_runtime_dirty)
-
-    def set_slider_runtime_dirty(self, value: bool) -> None:
-        self._slider_runtime_dirty = bool(value)
-
-    def suppress_slider_runtime_invalidation(self) -> bool:
-        return bool(self._suppress_slider_runtime_invalidation)
-
-    def set_suppress_slider_runtime_invalidation(self, value: bool) -> None:
-        self._suppress_slider_runtime_invalidation = bool(value)
-
-    def clear_prepared_slider_runtime(self, *, dirty: bool = True) -> None:
-        self._slider_runtime = None
-        self._slider_runtime_dirty = bool(dirty)
 
     def _normalize_visibility_scope_value(self, value: object) -> object:
         if value is None or isinstance(value, (bool, int, str)):
@@ -115,11 +100,6 @@ class MainWindowVariableRuntime:
             signature.append((str(name), scope_meta))
         return tuple(signature)
 
-    def invalidate_slider_runtime(self) -> None:
-        if self.suppress_slider_runtime_invalidation():
-            return
-        self.clear_prepared_slider_runtime(dirty=True)
-
     def sanitize_mechanism_parameter_conflicts(
         self,
         text: str,
@@ -143,6 +123,8 @@ class MainWindowVariableRuntime:
             original_line = line
 
             if "<->" in lower or "<=>" in lower:
+                if any(_is_legacy_equilibrium_constant_token(key) for key, _ in tokens):
+                    continue
                 if sum(1 for key, _ in tokens if _is_equilibrium_k_token(key)) > 1:
                     continue
                 k_explicit = any(_is_equilibrium_k_token(key) for key, _ in tokens)
@@ -198,8 +180,9 @@ class MainWindowVariableRuntime:
             )
             from kindred.core.units import UnitsModel
 
-            mechanism_text = mw.mechanism_reactions_text_raw()
-            if not mechanism_text.strip():
+            source = mw.canonical_mechanism_source()
+            mechanism_text = source.reactions_text
+            if not source.full_dsl.strip():
                 return
 
             sanitized_text, baseline_variables, baseline_metadata = self.sanitize_mechanism_parameter_conflicts(
@@ -233,30 +216,71 @@ class MainWindowVariableRuntime:
                 finally:
                     setattr(mw, "_suppress_authoritative_mechanism_input_change", previous_authoritative_suppress)
                 mechanism_text = sanitized_text
-                self.set_slider_runtime_dirty(True)
 
             temperature_k = mw.temperature_spinbox_value()
             units = UnitsModel(temperature_K=temperature_k)
 
-            state_network_dsl = mw.mechanism_state_network_dsl_raw()
-            parse_mechanism_text = strip_named_reaction_dsl_initial_concentration_sets(mechanism_text)
-            full_dsl = parse_mechanism_text
-            if state_network_dsl.strip():
-                full_dsl += "\n\n# State Network\n" + state_network_dsl.strip("\n")
+            parse_source = source.with_reactions_text(
+                strip_named_reaction_dsl_initial_concentration_sets(mechanism_text)
+            )
             try:
-                mechanism = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
-                if isinstance(getattr(mechanism, "metadata", None), dict):
-                    mechanism.metadata["wegscheider_cyclicity_enabled"] = bool(mw.wegscheider_cyclicity_enabled())
-                _ = apply_parameter_algebra_to_mechanism(full_dsl, mechanism=mechanism, require_mutable=False)
+                solver_owner = getattr(mw, "_simulation_solver_owner", None)
+                if solver_owner is not None and callable(getattr(solver_owner, "wegscheider_cyclicity_enabled", None)):
+                    wegscheider_enabled = bool(solver_owner.wegscheider_cyclicity_enabled())
+                else:
+                    wegscheider_enabled = bool(mw.wegscheider_cyclicity_enabled())
+
+                def _build_structure_snapshot(full_dsl: str) -> object:
+                    mechanism_obj = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
+                    if isinstance(getattr(mechanism_obj, "metadata", None), dict):
+                        mechanism_obj.metadata["wegscheider_cyclicity_enabled"] = wegscheider_enabled
+                    _ = apply_parameter_algebra_to_mechanism(
+                        full_dsl,
+                        mechanism=mechanism_obj,
+                        require_mutable=False,
+                    )
+                    return mechanism_obj
+
+                mechanism_helpers = getattr(mw, "_mechanism_helpers", None)
+                authoritative_structure_snapshot = getattr(
+                    mechanism_helpers,
+                    "authoritative_structure_snapshot",
+                    None,
+                )
+                if callable(authoritative_structure_snapshot):
+                    structure_snapshot = authoritative_structure_snapshot(
+                        source=parse_source,
+                        units_identity=(
+                            "temperature_K",
+                            f"{float(temperature_k):.17g}",
+                            "wegscheider",
+                            str(wegscheider_enabled),
+                        ),
+                        builder=_build_structure_snapshot,
+                    )
+                    mechanism = structure_snapshot.mechanism
+                else:
+                    mechanism = _build_structure_snapshot(parse_source.full_dsl)
             except Exception as exc:
                 logger.warning("Could not parse mechanism for variable extraction: %s", exc)
                 return
 
-            mw._sim_controller.ensure_parallel_batch_pool_eagerly_created()
+            variables, metadata = enumerate_step_parameters_for_gui(mechanism)
+            current_metadata = self.variable_metadata()
+            has_current_energy_sliders = any(
+                isinstance(meta, dict) and meta.get("type") == "energy"
+                for meta in dict(current_metadata or {}).values()
+            )
+            if self.is_energy_mode_mechanism(mechanism) and (not variables or has_current_energy_sliders):
+                self.populate_energy_mode_variables_from_mechanism(
+                    mechanism,
+                    refresh_sliders=True,
+                    preserve_visibility=bool(preserve_visibility),
+                )
+                return
 
             unit_map = solver_parameter_units_from_mechanism(mechanism)
 
-            variables, metadata = enumerate_step_parameters_for_gui(mechanism)
             for name, meta in list(metadata.items()):
                 if isinstance(meta, dict) and meta.get("value_valid") is False:
                     mw._record_best_effort_failure(
@@ -334,13 +358,14 @@ class MainWindowVariableRuntime:
                 )
                 logger.info("Populated %s variable sliders", len(variables))
                 mw._preview_session.sync_committed_slider_values(
-                    {k: v for k, v in variables.items() if metadata.get(k, {}).get("editable") is not False}
+                    {k: v for k, v in variables.items() if metadata.get(k, {}).get("editable") is not False},
+                    schema_text=parse_source.full_dsl,
                 )
                 self.update_parameter_table_from_sliders()
             else:
                 logger.info("No variables found to populate sliders")
                 mw.clear_variable_sliders()
-                mw._preview_session.sync_committed_slider_values({})
+                mw._preview_session.sync_committed_slider_values({}, schema_text=parse_source.full_dsl)
                 self.clear_variable_metadata()
                 self.update_parameter_table_from_sliders()
             self.set_variable_metadata(metadata)
@@ -350,10 +375,8 @@ class MainWindowVariableRuntime:
                 mw.clear_variable_sliders()
             except RuntimeError as clear_exc:
                 logger.debug("Failed to clear sliders after extraction failure: %s", clear_exc, exc_info=True)
-                self.clear_prepared_slider_runtime(dirty=True)
             mw._preview_session.sync_committed_slider_values({})
             self.clear_variable_metadata()
-            self.clear_prepared_slider_runtime(dirty=True)
 
     def update_parameter_table_from_sliders(self) -> None:
         mw = self._mw
@@ -375,106 +398,22 @@ class MainWindowVariableRuntime:
                 )
                 continue
         try:
-            mw.update_main_plot_parameter_summary(params)
+            plot = mw.main_plot()
+            updater = getattr(plot, "update_parameters", None)
+            if callable(updater):
+                updater(dict(params))
         except Exception:
             return
 
-    def prepare_slider_runtime(
-        self,
-        param_names: Optional[List[str]] = None,
-        *,
-        set_id: Optional[str] = None,
-    ) -> Optional[BoundMechanism]:
-        mw = self._mw
-
-        if param_names is None or not param_names:
-            param_names = list(mw.slider_overrides(set_id=set_id).keys())
-        if not param_names:
-            return None
-        meta_map = self._variable_metadata or {}
-
-        # Ensure constrained mechanism parameters are bound even if the user isn't directly editing them.
-        try:
-            mechanism_param_names = {k for k in meta_map.keys() if re.match(r"^(k|kf|kr|Keq)\d+$", str(k))}
-            spec = mw._parameter_algebra_spec_for_ui(mechanism_param_names=mechanism_param_names)
-            if spec is not None and getattr(spec, "param_statements", None):
-                constrained = {p.name for p in spec.param_statements if re.match(r"^(k|kf|kr|Keq)\d+$", str(p.name))}
-                if constrained:
-                    param_names = sorted(set(param_names) | constrained)
-        except Exception as exc:
-            logger.debug("Failed to expand slider runtime params from algebra spec: %s", exc, exc_info=True)
-            self.clear_prepared_slider_runtime(dirty=True)
-
-        if self._slider_runtime is not None and not self._slider_runtime_dirty:
-            current_params = set(self._slider_runtime.param_names)
-            requested_params = set(param_names)
-            if requested_params == current_params:
-                return self._slider_runtime
-
-        reactions_text = str(mw.mechanism_reactions_text_raw() or "")
-        state_network_dsl = str(mw.mechanism_state_network_dsl_raw() or "")
-        mechanism_text = reactions_text
-        if state_network_dsl.strip():
-            mechanism_text = (
-                f"{mechanism_text}\n\n# State Network\n{state_network_dsl}"
-                if mechanism_text.strip()
-                else f"# State Network\n{state_network_dsl}"
-            )
-        temperature_K = mw._temperature_spinbox.value()
-
-        try:
-            runtime = prepare_bound_mechanism(
-                mechanism_text=mechanism_text,
-                param_names=list(param_names),
-                temperature_K=temperature_K,
-                initials={},
-                use_advanced_dsl=True,
-                wegscheider_cyclicity_enabled=bool(mw._wegscheider_cyclicity_enabled),
-            )
-        except Exception as exc:
-            logger.error("Failed to prepare slider runtime: %s", exc)
-            return None
-
-        self._slider_runtime = runtime
-        self._slider_runtime_dirty = False
-        return runtime
-
-    def apply_slider_overrides_to_bindings(
-        self,
-        runtime: Optional[BoundMechanism],
-        *,
-        set_id: Optional[str] = None,
-    ) -> bool:
-        mw = self._mw
-
-        if runtime is None or not runtime.bindings:
-            return False
-
-        all_applied = True
-        for name, value in mw.slider_overrides(set_id=set_id).items():
-            binding = runtime.bindings.get(name)
-            if binding is None:
-                all_applied = False
-                continue
-            try:
-                binding.set(float(value))
-            except Exception as exc:
-                all_applied = False
-                logger.warning("Failed to update binding for %s: %s", name, exc)
-
-        if not all_applied:
-            logger.debug("Not all slider bindings could be updated; will re-parse on next run")
-        return all_applied
-
     def is_energy_mode_mechanism(self, mechanism: object) -> bool:
         meta = getattr(mechanism, "metadata", {}) or {}
-        if not isinstance(meta, dict):
+        if not isinstance(meta, MappingABC):
             return False
         sn = meta.get("state_network")
-        if not isinstance(sn, dict):
+        if not isinstance(sn, MappingABC):
             return False
-        states = sn.get("states") if isinstance(sn, dict) else None
-        edges = sn.get("edges") if isinstance(sn, dict) else None
+        states = sn.get("states")
+        edges = sn.get("edges")
         return bool(states or edges)
 
     def dsl_has_computational_mode_generated_block(self, dsl_text: str) -> bool:
@@ -509,7 +448,7 @@ class MainWindowVariableRuntime:
     def sync_energy_mode_temperature_from_mechanism(self, mechanism: object) -> None:
         mw = self._mw
         meta = getattr(mechanism, "metadata", {}) or {}
-        if not isinstance(meta, dict):
+        if not isinstance(meta, MappingABC):
             return
         try:
             temperature_k = float(meta.get("temperature_K"))
@@ -533,21 +472,22 @@ class MainWindowVariableRuntime:
         mw = self._mw
 
         def _equilibrium_value(eq_obj: object, role: str) -> float:
+            effective_temperature = float(temperature_k) if temperature_k is not None else 298.15
+            if role == "Keq":
+                value = effective_equilibrium_keq(eq_obj, temperature_K=effective_temperature)
+                return float(value) if value is not None else float("nan")
+            if role == "kr":
+                value = effective_equilibrium_reverse_rate(eq_obj, temperature_K=effective_temperature)
+                return float(value) if value is not None else float("nan")
             raw_value = getattr(eq_obj, role, None)
             try:
                 return float(raw_value() if callable(raw_value) else raw_value)
             except Exception:
-                if role == "Keq":
-                    meta_value = (getattr(eq_obj, "metadata", {}) or {}).get("Keq_input")
-                    try:
-                        return float(meta_value() if callable(meta_value) else meta_value)
-                    except Exception:
-                        return float("nan")
                 return float("nan")
 
         meta = getattr(mechanism, "metadata", {}) or {}
         energy_unit = "kJ/mol"
-        if isinstance(meta, dict) and meta.get("energy_unit"):
+        if isinstance(meta, MappingABC) and meta.get("energy_unit"):
             energy_unit = str(meta.get("energy_unit"))
 
         from kindred.core.constants import R as r_j_per_mol_k
@@ -562,7 +502,7 @@ class MainWindowVariableRuntime:
         unit_conv = UnitsModel(energy_unit=energy_unit) if UnitsModel is not None else None  # type: ignore[call-arg]
 
         temperature_k: float | None = None
-        if isinstance(meta, dict) and meta.get("temperature_K") is not None:
+        if isinstance(meta, MappingABC) and meta.get("temperature_K") is not None:
             try:
                 temperature_k = float(meta.get("temperature_K"))
             except Exception:
@@ -576,7 +516,7 @@ class MainWindowVariableRuntime:
         ts_channels: list[dict[str, object]] = []
         for eq in list(getattr(mechanism, "equilibria", []) or []):
             eq_meta = getattr(eq, "metadata", {}) or {}
-            if not isinstance(eq_meta, dict):
+            if not isinstance(eq_meta, MappingABC):
                 continue
             if str(eq_meta.get("source") or "") != "state_network":
                 continue
@@ -689,7 +629,7 @@ class MainWindowVariableRuntime:
             GENERATED_BLOCK_START = ""
             GENERATED_BLOCK_END = ""
 
-        reactions_text = mw.mechanism_reactions_text_raw()
+        reactions_text = mw.canonical_mechanism_source().reactions_text
 
         generated_body = None
         try:
@@ -746,16 +686,21 @@ class MainWindowVariableRuntime:
 
                 try:
                     kf = float(tokens.get("kf") or "")
-                    kr = float(tokens.get("kr") or "")
                 except Exception as exc:
                     mw._record_best_effort_failure(
                         "main_window.energy_channels.fast_eq.read_k",
-                        message="Skipping fast-equilibrium entry with invalid kf/kr tokens",
+                        message="Skipping fast-equilibrium entry with invalid kf token",
                         exc=exc,
                     )
                     continue
-                if not (math.isfinite(kf) and kf > 0.0 and math.isfinite(kr) and kr > 0.0):
+                if not (math.isfinite(kf) and kf > 0.0):
                     continue
+                kr_token = None
+                try:
+                    if tokens.get("kr") is not None:
+                        kr_token = float(tokens.get("kr") or "")
+                except Exception:
+                    kr_token = None
 
                 try:
                     if "<=>" in eqn:
@@ -795,6 +740,11 @@ class MainWindowVariableRuntime:
                     dg_eq_val = None
 
                 std_ratio = 1.0
+                try:
+                    if tokens.get("cm_std_ratio") is not None:
+                        std_ratio = float(tokens.get("cm_std_ratio") or "1.0")
+                except Exception:
+                    std_ratio = 1.0
                 k_thermo = float("nan")
                 if dg_eq_val is not None and temperature_k is not None and math.isfinite(float(temperature_k)) and float(temperature_k) > 0.0:
                     try:
@@ -804,15 +754,29 @@ class MainWindowVariableRuntime:
                             else float(dg_eq_val) * 1000.0
                         )
                         k_thermo = float(math.exp(-float(dg_eq_j) / (float(r_j_per_mol_k) * float(temperature_k))))
-                        if math.isfinite(k_thermo) and k_thermo > 0.0:
-                            kc = float(kf / kr)
+                        if (
+                            tokens.get("cm_std_ratio") is None
+                            and kr_token is not None
+                            and math.isfinite(k_thermo)
+                            and k_thermo > 0.0
+                            and math.isfinite(kr_token)
+                            and kr_token > 0.0
+                        ):
+                            kc = float(kf / kr_token)
                             std_ratio = float(kc / k_thermo)
                     except Exception:
                         std_ratio = 1.0
                         k_thermo = float("nan")
-                elif temperature_k is not None and math.isfinite(float(temperature_k)) and float(temperature_k) > 0.0:
+                elif (
+                    kr_token is not None
+                    and math.isfinite(kr_token)
+                    and kr_token > 0.0
+                    and temperature_k is not None
+                    and math.isfinite(float(temperature_k))
+                    and float(temperature_k) > 0.0
+                ):
                     try:
-                        kc = float(kf / kr)
+                        kc = float(kf / kr_token)
                         dg_eq_j = -float(r_j_per_mol_k) * float(temperature_k) * math.log(kc)
                         dg_eq_val = (
                             float(unit_conv.from_jmol(float(dg_eq_j)))
@@ -833,6 +797,13 @@ class MainWindowVariableRuntime:
                     continue
                 if not (math.isfinite(float(std_ratio)) and float(std_ratio) > 0.0):
                     std_ratio = 1.0
+                kr = float("nan")
+                if math.isfinite(k_thermo) and k_thermo > 0.0:
+                    kr = float(kf / (k_thermo * max(1e-300, float(std_ratio))))
+                elif kr_token is not None and math.isfinite(kr_token) and kr_token > 0.0:
+                    kr = float(kr_token)
+                if not (math.isfinite(kr) and kr > 0.0):
+                    continue
 
                 fast_eq_channels.append(
                     {
@@ -857,11 +828,17 @@ class MainWindowVariableRuntime:
 
         if not all_channels:
             mw.clear_variable_sliders()
-            mw._preview_session.sync_committed_slider_values({})
+            mw._preview_session.sync_committed_slider_values(
+                {},
+                schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
+            )
             self.clear_variable_metadata()
             mw._energy_mode_channels = []
             try:
-                mw.update_main_plot_parameter_summary({})
+                plot = mw.main_plot()
+                updater = getattr(plot, "update_parameters", None)
+                if callable(updater):
+                    updater({})
             except Exception as exc:
                 logger.debug("Failed to clear plot parameter summary: %s", exc, exc_info=True)
                 mw._plot_parameter_summary_stale = True
@@ -984,10 +961,16 @@ class MainWindowVariableRuntime:
                 preserve_visibility=bool(preserve_visibility),
                 visibility_scope_signature=visibility_scope_signature,
             )
-            mw._preview_session.sync_committed_slider_values(dict(variables))
+            mw._preview_session.sync_committed_slider_values(
+                dict(variables),
+                schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
+            )
 
         try:
-            mw.update_main_plot_parameter_summary(params)
+            plot = mw.main_plot()
+            updater = getattr(plot, "update_parameters", None)
+            if callable(updater):
+                updater(dict(params))
         except Exception as exc:
             logger.debug("Failed to update plot parameter summary: %s", exc, exc_info=True)
             mw._plot_parameter_summary_stale = True

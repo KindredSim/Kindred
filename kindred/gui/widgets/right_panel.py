@@ -23,7 +23,12 @@ class RightPanelTabbed(QtWidgets.QWidget):
     data manager.
     """
 
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget] = None,
+        *,
+        data_panel: Optional[DataManagerPanel] = None,
+    ):
         """
         Initialize right panel with tabs.
 
@@ -41,15 +46,10 @@ class RightPanelTabbed(QtWidgets.QWidget):
         layout.addWidget(self._tabs)
 
         # Data tab
-        self._data_manager = DataManagerPanel()
+        self._data_manager = data_panel if data_panel is not None else DataManagerPanel()
         self._data_manager.setObjectName("dataPanel")
         self._tabs.addTab(self._data_manager, "Data")
 
     def add_tab(self, widget: QtWidgets.QWidget, label: str) -> int:
         """Add an external widget as a new tab. Returns the tab index."""
         return self._tabs.addTab(widget, label)
-
-    def get_dataset(self, name: str):
-        """Resolve a dataset through the public data-manager boundary."""
-        return self._data_manager.get_dataset(str(name))
-

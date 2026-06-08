@@ -4,12 +4,18 @@ import csv
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from kindred.gui.project_schema import get_default_project_payload, QSETTINGS_KEY_MAP
+from kindred.core.datasets.observation_payload import export_rows_from_observations
+from kindred.gui.project_schema import (
+    QSETTINGS_KEY_MAP,
+    get_default_project_payload,
+    validate_project_payload,
+)
 from kindred.gui.utils import BusyCursor
 from kindred.gui.widgets.export_dialog import ExportDialog
 
@@ -19,6 +25,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = ["ProjectController"]
+
+
+@dataclass(frozen=True, slots=True)
+class ExportPrecondition:
+    active_display_transaction: bool = False
+    payload: Optional[Dict[str, object]] = None
 
 
 class ProjectController(QtCore.QObject):
@@ -109,6 +121,7 @@ class ProjectController(QtCore.QObject):
         try:
             with BusyCursor():
                 data = self._serialize_project_state()
+                validate_project_payload(data)
                 with open(filepath, "w") as handle:
                     json.dump(data, handle, indent=2)
         except Exception as exc:
@@ -156,12 +169,20 @@ class ProjectController(QtCore.QObject):
             if not self.save_project():
                 return
 
-        empty_payload = get_default_project_payload()
-        # Strip dual-persisted keys so _apply_project_payload falls through
-        # to user preferences for them instead of using factory defaults.
+        payload = self._serialize_project_state()
+        defaults = get_default_project_payload()
+        payload["mechanism_source"] = defaults["mechanism_source"]
+        payload["notes"] = defaults["notes"]
+        payload["batch_initial_conditions"] = defaults["batch_initial_conditions"]
+        get_user_preference = self.mw.config_controller.get_user_preference
         for key in QSETTINGS_KEY_MAP:
-            empty_payload.pop(key, None)
-        applied = self._apply_project_payload(empty_payload, record_undo=False)
+            payload[key] = get_user_preference(key)
+        from kindred.core.simulator.solvers import normalize_solver_name
+
+        solver_method, solver_warning = normalize_solver_name(payload["solver"])
+        payload["solver_method"] = str(solver_method)
+        payload["solver_warning"] = str(solver_warning) if solver_warning else None
+        applied = self._apply_project_payload(payload, record_undo=False)
         if not applied:
             return
         self._clear_app_undo_history()
@@ -177,10 +198,10 @@ class ProjectController(QtCore.QObject):
                 "File Not Found",
                 f"File no longer exists:\n{filepath}",
             )
-            recent_files = self.mw._settings.value("recent_files", [])
+            recent_files = self.mw._settings_owner.qsettings.value("recent_files", [])
             if filepath in recent_files:
                 recent_files.remove(filepath)
-                self.mw._settings.setValue("recent_files", recent_files)
+                self.mw._settings_owner.qsettings.setValue("recent_files", recent_files)
                 self.mw.config_controller.update_recent_files_menu()
             return
 
@@ -252,14 +273,20 @@ class ProjectController(QtCore.QObject):
         self._export_dialog.open()
 
     def _warn_no_export_target(self, message: str) -> None:
-        QtWidgets.QMessageBox.warning(self.mw, "Export Unavailable", message)
         self.mw.set_status_text(message)
 
-    def _validate_export_preconditions(self, export_type: str):
+    def _validate_export_preconditions(self, export_type: str) -> ExportPrecondition | None:
         if export_type != "data":
             raise ValueError(f"Unknown export type: {export_type}")
 
         current_plot = self.mw._plot_tabs.get_current_plot()
+        if self._active_transaction_export_available(current_plot):
+            return ExportPrecondition(active_display_transaction=True)
+        if self._is_results_main_plot(current_plot):
+            self._warn_no_export_target(
+                "No active simulation display transaction is available to export."
+            )
+            return None
         payload = self._resolve_export_payload(current_plot)
         if payload is None:
             self._warn_no_export_target(
@@ -267,24 +294,43 @@ class ProjectController(QtCore.QObject):
                 "Please run a simulation (Simulation → Run) or load a dataset (Data → Load Dataset)."
             )
             return None
-        return payload
+        return ExportPrecondition(payload=payload)
+
+    def _active_transaction_export_available(self, plot_widget) -> bool:
+        if not self._is_results_main_plot(plot_widget):
+            return False
+        results_controller = getattr(self.mw, "results_controller", None)
+        if results_controller is None:
+            return False
+        return results_controller.active_display_transaction() is not None
+
+    def _is_results_main_plot(self, plot_widget) -> bool:
+        main_plot_getter = getattr(self.mw, "main_plot", None)
+        if not callable(main_plot_getter):
+            return False
+        return plot_widget is main_plot_getter()
 
     def _resolve_export_payload(self, plot_widget) -> Optional[Dict[str, object]]:
         if plot_widget is None:
             return None
 
-        try:
-            payload = plot_widget.export_payload()
-        except Exception:
-            payload = None
-        if isinstance(payload, dict) and payload:
-            normalized = self._normalize_export_payload(payload)
-            if normalized is not None:
-                return normalized
+        export_payload = getattr(plot_widget, "export_payload", None)
+        if callable(export_payload):
+            try:
+                payload = export_payload()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and payload:
+                normalized = self._normalize_export_payload(payload)
+                if normalized is not None:
+                    return normalized
 
+        get_dataset_data = getattr(plot_widget, "get_dataset_data", None)
+        if not callable(get_dataset_data):
+            return None
         try:
-            data = plot_widget.get_dataset_data()
-        except Exception:
+            data = get_dataset_data()
+        except ValueError:
             data = None
         if isinstance(data, dict) and data:
             t_raw = data.get("t")
@@ -304,6 +350,12 @@ class ProjectController(QtCore.QObject):
 
     @staticmethod
     def _normalize_export_payload(payload: Dict[str, object]) -> Optional[Dict[str, object]]:
+        observations = payload.get("observations")
+        if isinstance(observations, dict) and observations:
+            normalized: Dict[str, object] = {"observations": dict(observations)}
+            if payload.get("x_header") is not None:
+                normalized["x_header"] = str(payload.get("x_header"))
+            return normalized
         t_raw = payload.get("t")
         if t_raw is None:
             return None
@@ -315,19 +367,14 @@ class ProjectController(QtCore.QObject):
     def handle_export_config(self, config: dict) -> None:
         try:
             path = config["path"]
-            mode = config.get("mode", "default")
             scope = config.get("scope", "axis")
 
             current_plot = self.mw._plot_tabs.get_current_plot()
-            payload = self._resolve_export_payload(current_plot)
-            if payload is None:
-                self._warn_no_export_target("Simulation data is no longer available for export.")
+            precondition = self._validate_export_preconditions("data")
+            if precondition is None:
                 return
 
-            if mode == "legacy":
-                header, rows = self._prepare_legacy_export_rows(current_plot)
-            else:
-                header, rows = self._prepare_default_export_rows(current_plot, scope)
+            header, rows = self._prepare_default_export_rows(current_plot, scope)
 
             with BusyCursor():
                 with open(path, "w", newline="") as handle:
@@ -336,9 +383,8 @@ class ProjectController(QtCore.QObject):
                     for row in rows:
                         writer.writerow(row)
 
-                scope_desc = f"{mode} mode" if mode == "legacy" else f"{mode} mode, scope={scope}"
-                self.mw.set_status_text(f"Exported CSV ({scope_desc}): {path}")
-            logger.info("Exported CSV to %s (mode=%s, scope=%s)", path, mode, scope)
+                self.mw.set_status_text(f"Exported CSV (scope={scope}): {path}")
+            logger.info("Exported CSV to %s (scope=%s)", path, scope)
 
         except ValueError as exc:
             logger.warning("CSV export aborted: %s", exc)
@@ -347,51 +393,16 @@ class ProjectController(QtCore.QObject):
             logger.error("Failed to export CSV: %s", exc, exc_info=True)
             QtWidgets.QMessageBox.critical(self.mw, "Export Error", f"Failed to export CSV:\n\n{exc}")
 
-    def _prepare_legacy_export_rows(self, plot) -> Tuple[List[str], List[List[object]]]:
-        payload = self._resolve_export_payload(plot)
-        if not payload:
-            try:
-                raw = plot.export_payload()
-            except Exception:
-                raw = None
-            if isinstance(raw, dict) and raw.get("t") is not None:
-                series = raw.get("series")
-                if isinstance(series, dict) and not series:
-                    raise ValueError("No series data available to export.")
-            raise ValueError("No data available to export.")
-        time_array = np.asarray(payload.get("t"), dtype=float).reshape(-1)
-        series = payload.get("series") or {}
-
-        if time_array.size == 0:
-            raise ValueError("Time axis has no points to export.")
-
-        series_names = list(series.keys())
-        if not series_names:
-            raise ValueError("No series data available to export.")
-
-        data_arrays = []
-        for name in series_names:
-            arr = np.asarray(series[name], dtype=float).reshape(-1)
-            if arr.shape[0] != time_array.shape[0]:
-                raise ValueError(
-                    f"Series '{name}' length ({arr.shape[0]}) does not match time grid ({time_array.shape[0]})."
-                )
-            data_arrays.append(arr)
-
-        header = ["t"] + [f"[{sp}]" for sp in series_names]
-
-        def row_iter():
-            for idx in range(time_array.shape[0]):
-                yield [f"{time_array[idx]:.6f}"] + [f"{arr[idx]:.6f}" for arr in data_arrays]
-
-        return header, row_iter()
-
     def _prepare_default_export_rows(self, plot, scope: str) -> Tuple[List[str], List[List[object]]]:
-        try:
-            export = plot.build_visible_export(scope)
-        except AttributeError:
-            pass
-        else:
+        active_transaction_rows = self._prepare_active_transaction_export_rows(plot, scope)
+        if active_transaction_rows is not None:
+            return active_transaction_rows
+        if self._is_results_main_plot(plot):
+            raise ValueError("No active simulation display transaction is available to export.")
+
+        build_visible_export = getattr(plot, "build_visible_export", None)
+        if callable(build_visible_export):
+            export = build_visible_export(scope)
             if isinstance(export, tuple) and len(export) == 2:
                 return export
 
@@ -403,6 +414,15 @@ class ProjectController(QtCore.QObject):
             "Current plot does not implement the export interface (expected build_visible_export() or export_payload())."
         )
 
+    def _prepare_active_transaction_export_rows(
+        self,
+        plot,
+        scope: str,
+    ) -> Optional[Tuple[List[str], List[List[object]]]]:
+        if self._is_results_main_plot(plot):
+            return self.mw.results_controller.build_main_plot_csv_export(scope)
+        return None
+
     @staticmethod
     def _prepare_payload_export_rows(
         payload: Dict[str, object],
@@ -410,11 +430,17 @@ class ProjectController(QtCore.QObject):
         plot,
         scope: str,
     ) -> Tuple[List[str], List[List[object]]]:
-        # Payload-based export is a legacy fallback for plot widgets that do not
+        # Payload-based export is a generic fallback for plot widgets that do not
         # implement the public `build_visible_export(scope)` interface. This code
         # must not reach into plot-private UI state.
         _ = plot
         scope = str(scope or "")
+        observations = payload.get("observations")
+        if isinstance(observations, dict) and observations:
+            header, rows = export_rows_from_observations(observations)
+            if header:
+                header[0] = str(payload.get("x_header") or "Time")
+            return header, rows
         t_values = np.asarray(payload.get("t"), dtype=float).reshape(-1)
         if t_values.size == 0:
             raise ValueError("Time axis has no points to export.")
@@ -428,9 +454,9 @@ class ProjectController(QtCore.QObject):
         arrays: List[np.ndarray] = []
         for name in species_names:
             arr = np.asarray(series[name], dtype=float).reshape(-1)
-            if arr.shape[0] != t_values.shape[0]:
+            if arr.size != t_values.size:
                 raise ValueError(
-                    f"Series '{name}' length ({arr.shape[0]}) does not match time grid ({t_values.shape[0]})."
+                    f"Series '{name}' length ({arr.size}) does not match time axis length ({t_values.size})."
                 )
             arrays.append(arr)
 

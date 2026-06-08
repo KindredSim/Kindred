@@ -6,6 +6,7 @@ from typing import Callable
 from kindred.core.batch_initial_conditions import (
     _strip_named_initial_concentration_sets,
 )
+from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.errors import DSLError
 
@@ -23,48 +24,46 @@ class ValidationResult:
 
 class MechanismSessionOwner:
     def __init__(self, topology_validator: Callable[[], bool] | None = None) -> None:
-        self._canonical_reactions_text = ""
-        self._canonical_state_network_dsl = ""
-        self._draft_reactions_text = ""
-        self._draft_state_network_dsl = ""
+        self._canonical_source = MechanismAuthoringSource()
+        self._draft_source = MechanismAuthoringSource()
         self._edit_session_active = False
         self._topology_validator = topology_validator
         self._canonical_validation: ValidationResult | None = None
         self._draft_validation: ValidationResult | None = None
 
     @property
+    def canonical_source(self) -> MechanismAuthoringSource:
+        return self._canonical_source
+
+    @property
     def canonical_reactions_text(self) -> str:
-        return self._canonical_reactions_text
+        return self._canonical_source.reactions_text
 
     @property
     def canonical_state_network_dsl(self) -> str:
-        return self._canonical_state_network_dsl
+        return self._canonical_source.state_network_dsl
 
     @property
     def canonical_full_dsl(self) -> str:
-        return self._build_full_dsl(
-            reactions_text=self._canonical_reactions_text,
-            state_network_dsl=self._canonical_state_network_dsl,
-        )
+        return self._canonical_source.full_dsl
+
+    @property
+    def draft_source(self) -> MechanismAuthoringSource:
+        if not self._edit_session_active:
+            return MechanismAuthoringSource()
+        return self._draft_source
 
     @property
     def draft_reactions_text(self) -> str:
-        if not self._edit_session_active:
-            return ""
-        return self._draft_reactions_text
+        return self.draft_source.reactions_text
 
     @property
     def draft_state_network_dsl(self) -> str:
-        if not self._edit_session_active:
-            return ""
-        return self._draft_state_network_dsl
+        return self.draft_source.state_network_dsl
 
     @property
     def draft_full_dsl(self) -> str:
-        return self._build_full_dsl(
-            reactions_text=self.draft_reactions_text,
-            state_network_dsl=self.draft_state_network_dsl,
-        )
+        return self.draft_source.full_dsl
 
     @property
     def edit_session_active(self) -> bool:
@@ -73,19 +72,24 @@ class MechanismSessionOwner:
     def begin_edit_session(self) -> None:
         if self._edit_session_active:
             raise RuntimeError("Mechanism edit session is already active.")
-        self._draft_reactions_text = self._canonical_reactions_text
-        self._draft_state_network_dsl = self._canonical_state_network_dsl
+        self._draft_source = self._canonical_source
         self._edit_session_active = True
         self._draft_validation = None
 
     def update_draft_reactions(self, text: str) -> None:
         self._require_active_edit_session()
-        self._draft_reactions_text = self._require_text(text, field_name="text")
+        self._draft_source = MechanismAuthoringSource.from_parts(
+            reactions_text=self._require_text(text, field_name="text"),
+            state_network_dsl=self._draft_source.state_network_dsl,
+        )
         self._draft_validation = None
 
     def update_draft_state_network(self, dsl: str) -> None:
         self._require_active_edit_session()
-        self._draft_state_network_dsl = self._require_text(dsl, field_name="dsl")
+        self._draft_source = MechanismAuthoringSource.from_parts(
+            reactions_text=self._draft_source.reactions_text,
+            state_network_dsl=self._require_text(dsl, field_name="dsl"),
+        )
         self._draft_validation = None
 
     def commit_edit_session(self) -> bool:
@@ -93,10 +97,9 @@ class MechanismSessionOwner:
         validation = self.validate_draft()
         if not validation.valid:
             return False
-        if self._draft_state_network_dsl.strip() and not self._topology_is_valid():
+        if self._draft_source.state_network_dsl.strip() and not self._topology_is_valid():
             return False
-        self._canonical_reactions_text = self._draft_reactions_text
-        self._canonical_state_network_dsl = self._draft_state_network_dsl
+        self._canonical_source = self._draft_source
         self._canonical_validation = validation
         self._end_edit_session()
         return True
@@ -105,17 +108,10 @@ class MechanismSessionOwner:
         self._require_active_edit_session()
         self._end_edit_session()
 
-    def apply_authoritative_update(self, reactions_text: str, state_network_dsl: str) -> None:
-        canonical_reactions_text = self._require_text(
-            reactions_text,
-            field_name="reactions_text",
-        )
-        canonical_state_network_dsl = self._require_text(
-            state_network_dsl,
-            field_name="state_network_dsl",
-        )
-        self._canonical_reactions_text = canonical_reactions_text
-        self._canonical_state_network_dsl = canonical_state_network_dsl
+    def apply_authoritative_source(self, source: MechanismAuthoringSource) -> None:
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be a MechanismAuthoringSource.")
+        self._canonical_source = source
         self._canonical_validation = None
         if self._edit_session_active:
             self._end_edit_session()
@@ -130,70 +126,51 @@ class MechanismSessionOwner:
                 equilibria_count=0,
             )
         if self._draft_validation is None:
-            self._draft_validation = self._validate_source(
-                reactions_text=self.draft_reactions_text,
-                state_network_dsl=self.draft_state_network_dsl,
-            )
+            self._draft_validation = self._validate_source(self.draft_source)
         return self._draft_validation
 
     def validate_canonical(self) -> ValidationResult:
         if self._canonical_validation is None:
-            self._canonical_validation = self._validate_source(
-                reactions_text=self._canonical_reactions_text,
-                state_network_dsl=self._canonical_state_network_dsl,
-            )
+            self._canonical_validation = self._validate_source(self._canonical_source)
         return self._canonical_validation
 
     def is_ready_for_explicit_run(self) -> bool:
         validation = self.validate_canonical()
         if not validation.valid:
             return False
-        if self._canonical_state_network_dsl.strip() and not self._topology_is_valid():
+        if self._canonical_source.state_network_dsl.strip() and not self._topology_is_valid():
             return False
         return True
 
     def is_ready_for_preview(self) -> bool:
         if self._edit_session_active:
-            return self.validate_draft().valid
+            validation = self.validate_draft()
+            if not validation.valid:
+                return False
+            if self._draft_source.state_network_dsl.strip() and not self._topology_is_valid():
+                return False
+            return True
         return self.is_ready_for_explicit_run()
 
-    def explicit_run_source(self) -> str:
+    def explicit_run_source(self) -> MechanismAuthoringSource:
         if not self.is_ready_for_explicit_run():
             raise RuntimeError("Canonical mechanism is not ready for an explicit run.")
-        return self._build_simulation_source(
-            reactions_text=self._canonical_reactions_text,
-            state_network_dsl=self._canonical_state_network_dsl,
-        )
+        return self._canonical_source
 
-    def preview_source(self) -> str:
+    def preview_source(self) -> MechanismAuthoringSource:
         if not self.is_ready_for_preview():
             raise RuntimeError("Mechanism source is not ready for preview.")
         if self._edit_session_active:
-            return self._build_simulation_source(
-                reactions_text=self._draft_reactions_text,
-                state_network_dsl=self._draft_state_network_dsl,
-            )
-        return self._build_simulation_source(
-            reactions_text=self._canonical_reactions_text,
-            state_network_dsl=self._canonical_state_network_dsl,
-        )
+            return self._draft_source
+        return self._canonical_source
 
-    @staticmethod
-    def _build_full_dsl(*, reactions_text: str, state_network_dsl: str) -> str:
-        full_dsl = reactions_text
-        state_network_dsl_s = state_network_dsl
-        if state_network_dsl_s.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_dsl_s
-        return full_dsl
-
-    def _validate_source(self, *, reactions_text: str, state_network_dsl: str) -> ValidationResult:
-        validation_reactions = _strip_named_initial_concentration_sets(reactions_text)
-        validation_dsl = self._build_full_dsl(
-            reactions_text=validation_reactions,
-            state_network_dsl=state_network_dsl,
+    def _validate_source(self, source: MechanismAuthoringSource) -> ValidationResult:
+        validation_source = MechanismAuthoringSource.from_parts(
+            reactions_text=_strip_named_initial_concentration_sets(source.reactions_text),
+            state_network_dsl=source.state_network_dsl,
         )
         try:
-            mechanism = parse_dsl_to_mechanism(validation_dsl, initials={})
+            mechanism = parse_dsl_to_mechanism(validation_source.full_dsl, initials={})
         except DSLError as exc:
             return ValidationResult(False, str(exc), 0, 0, 0)
         return ValidationResult(
@@ -202,12 +179,6 @@ class MechanismSessionOwner:
             species_count=len(mechanism.species),
             reaction_count=len(mechanism.reactions),
             equilibria_count=len(mechanism.equilibria),
-        )
-
-    def _build_simulation_source(self, *, reactions_text: str, state_network_dsl: str) -> str:
-        return self._build_full_dsl(
-            reactions_text=reactions_text,
-            state_network_dsl=state_network_dsl,
         )
 
     def _require_active_edit_session(self) -> None:
@@ -226,7 +197,6 @@ class MechanismSessionOwner:
         return value
 
     def _end_edit_session(self) -> None:
-        self._draft_reactions_text = ""
-        self._draft_state_network_dsl = ""
+        self._draft_source = MechanismAuthoringSource()
         self._draft_validation = None
         self._edit_session_active = False

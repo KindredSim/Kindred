@@ -15,7 +15,7 @@ import math
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Signal
 
-from ..ui_helpers import make_placeholder_label, make_scroll_area
+from ..ui_helpers import make_bounded_label, make_placeholder_label, make_scroll_area, set_bounded_label_text
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class VariableSliders(QtWidgets.QWidget):
 
     Features:
     - Sliders for rate constants (k1, k2, ...)
-    - Sliders for equilibrium constants (K1, kf1, kr1, ...)
+    - Sliders for equilibrium constants (Keq1, kf1, kr1, ...)
     - Sliders for scalar parameters defined in mechanism
     - Logarithmic scale for wide range of values
     - Real-time value display
@@ -144,7 +144,7 @@ class VariableSliders(QtWidgets.QWidget):
         ----------
         variables : dict
             Dictionary of {variable_name: value}
-            Examples: {'k1': 0.5, 'k2': 1.0, 'K1': 10.0, 'kf1': 2.0, 'kr1': 0.2}
+            Examples: {'k1': 0.5, 'k2': 1.0, 'Keq1': 10.0, 'kf1': 2.0, 'kr1': 0.2}
         """
         logger.info(f"Setting {len(variables)} variables")
 
@@ -215,7 +215,7 @@ class VariableSliders(QtWidgets.QWidget):
         Parameters
         ----------
         name : str
-            Variable name (e.g., 'k1', 'K1', 'kf1')
+            Variable name (e.g., 'k1', 'Keq1', 'kf1')
         value : float
             Current value
         """
@@ -229,7 +229,7 @@ class VariableSliders(QtWidgets.QWidget):
         top_row = QtWidgets.QHBoxLayout()
         top_row.setSpacing(8)
 
-        name_label = QtWidgets.QLabel(self._format_label_text(name))
+        name_label = make_bounded_label(self._format_label_text(name), max_width=260)
         name_font = name_label.font()
         name_font.setBold(True)
         name_label.setFont(name_font)
@@ -423,7 +423,7 @@ class VariableSliders(QtWidgets.QWidget):
 
         # Update display
         if name in self._labels:
-            self._labels[name].setText(self._format_label_text(name))
+            set_bounded_label_text(self._labels[name], self._format_label_text(name), max_width=260)
         if name in self._value_labels:
             self._value_labels[name].setText(self._format_value(value))
 
@@ -470,7 +470,7 @@ class VariableSliders(QtWidgets.QWidget):
     def update_metadata(self, name: str, meta: Dict[str, object]) -> None:
         self._metadata[name] = dict(meta)
         if name in self._labels:
-            self._labels[name].setText(self._format_label_text(name))
+            set_bounded_label_text(self._labels[name], self._format_label_text(name), max_width=260)
 
     def update_variable(self, name: str, value: float) -> None:
         """
@@ -581,6 +581,8 @@ class VariableSliders(QtWidgets.QWidget):
 
     def set_variable_visible(self, name: str, visible: bool) -> None:
         name_s = str(name)
+        if name_s not in self._containers:
+            return
         if visible:
             self._hidden_names.discard(name_s)
         else:

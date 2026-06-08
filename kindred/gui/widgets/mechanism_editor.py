@@ -8,7 +8,8 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
 
-from kindred.gui.ui_helpers import make_scroll_area
+from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
+from kindred.gui.ui_helpers import make_bounded_label, make_scroll_area, set_bounded_label_text
 
 # Direct imports required to avoid circular dependency with widgets/__init__.py
 from kindred.gui.widgets.state_network_editor import StateNetworkEditor
@@ -22,9 +23,35 @@ __all__ = ["MechanismEditorTabbed"]
 class _PersistentToggleMenu(QtWidgets.QMenu):
     """Keep checkable actions open so users can toggle multiple sliders in one pass."""
 
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._pressed_checkable_action: Optional[QtGui.QAction] = None
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        action = self.actionAt(event.position().toPoint())
+        if (
+            event.button() == QtCore.Qt.MouseButton.LeftButton
+            and action is not None
+            and action.isEnabled()
+            and action.isCheckable()
+        ):
+            self._pressed_checkable_action = action
+            event.accept()
+            return
+        self._pressed_checkable_action = None
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         action = self.actionAt(event.position().toPoint())
-        if action is not None and action.isEnabled() and action.isCheckable():
+        pressed_action = self._pressed_checkable_action
+        self._pressed_checkable_action = None
+        if (
+            event.button() == QtCore.Qt.MouseButton.LeftButton
+            and pressed_action is not None
+            and action is pressed_action
+            and action.isEnabled()
+            and action.isCheckable()
+        ):
             action.trigger()
             event.accept()
             return
@@ -34,12 +61,14 @@ class _PersistentToggleMenu(QtWidgets.QMenu):
 class MechanismEditorTabbed(QtWidgets.QWidget):
     speciesModeChanged = Signal(bool)
     speciesResetRequested = Signal()
+    mechanismInspectRequested = Signal()
+    validationStateChanged = Signal(str)
 
     """
     Mechanism editor with Reactions and Notes tabs.
 
     Features:
-    - Reactions tab: DSL text editor (includes `# Algebra` sections for algebraic content)
+    - Reactions tab: DSL text editor for reactions, algebra declarations, and computational-mode content
     - Notes tab: persisted free-form text (never parsed or injected)
 
     Advanced features (Species Registry and State Network) are accessible via Edit menu.
@@ -60,7 +89,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         super().__init__(parent)
 
         self._current_validation_state = "idle"
-        self._run_gated = False
         self._reactions_edit_action: Optional[QtGui.QAction] = None
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -82,6 +110,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_edit_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
         self._reactions_edit_btn.hide()
         reactions_header_row.addWidget(self._reactions_edit_btn)
+        self.inspect_mechanism_btn = QtWidgets.QPushButton("Inspect...", self)
+        self.inspect_mechanism_btn.setObjectName("mechanismInspectorOpenButton")
+        self.inspect_mechanism_btn.setToolTip("Open a read-only Mechanism Inspector")
+        self.inspect_mechanism_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
+        self.inspect_mechanism_btn.clicked.connect(lambda _checked=False: self.mechanismInspectRequested.emit())
+        reactions_header_row.addWidget(self.inspect_mechanism_btn)
         reactions_header_row.addStretch()
         self._run_btn = QtWidgets.QPushButton("\u25b6 Run")
         run_font = self._run_btn.font()
@@ -89,6 +123,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._run_btn.setFont(run_font)
         self._run_btn.setStyleSheet("QPushButton { padding: 6px 18px; }")
         self._run_btn.setEnabled(False)
+        self.symbolic_calculator_btn = QtWidgets.QPushButton("Σ", self)
+        self.symbolic_calculator_btn.setObjectName("symbolicCalculatorOpenButton")
+        self.symbolic_calculator_btn.setToolTip("Open the Symbolic Calculator panel")
+        self.symbolic_calculator_btn.setStyleSheet("QPushButton { padding: 6px 12px; }")
+        self.symbolic_calculator_btn.setEnabled(False)
+        reactions_header_row.addWidget(self.symbolic_calculator_btn)
         reactions_header_row.addWidget(self._run_btn)
         reactions_layout.addLayout(reactions_header_row)
 
@@ -103,17 +143,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_text.setPlaceholderText(
             "Example:\n"
             "reaction: 2A + B => C ; kf=1e5\n"
-            "equilibrium: C <=> D ; K=2.5 ; kf=10.0\n"
+            "equilibrium: C <=> D ; Keq=2.5 ; kf=10.0\n"
             "reaction: C + E -> F ; k=0.5\n"
-            "reaction: A -> A_Side ; kf=0.01\n"
-            "\n"
-            "# algebra\n"
             "param scale = 2.0\n"
-            "param k_base = 1.5e3\n"
-            "param k_derived = k_base * scale\n"
-            "\n"
+            "reaction: A -> A_Side ; kf=0.01\n"
             "let total_A = [A] + [A_Side]\n"
+            "param k_base = 1.5e3\n"
             "let conversion = 1.0 - ([A] / max([A]_0, 1e-18))\n"
+            "\n"
+            "param k_derived = k_base * scale\n"
             "\n"
             "# === Computational Mode ===\n"
             "comp: species C G=-450.12\n"
@@ -164,15 +202,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_actions_layout.addWidget(self._fine_btn)
 
         # Override mode controls (Commit/Reset)
-        self._commit_slider_overrides_btn = QtWidgets.QPushButton("Apply")
-        self._commit_slider_overrides_btn.setObjectName("commitSliderOverridesButton")
-        self._commit_slider_overrides_btn.setToolTip("Apply current slider values to the canonical mechanism")
-        slider_actions_layout.addWidget(self._commit_slider_overrides_btn)
+        self._commit_runtime_parameters_btn = QtWidgets.QPushButton("Apply")
+        self._commit_runtime_parameters_btn.setObjectName("commitRuntimeParametersButton")
+        self._commit_runtime_parameters_btn.setToolTip("Apply current slider values to the canonical mechanism")
+        slider_actions_layout.addWidget(self._commit_runtime_parameters_btn)
 
-        self._reset_slider_overrides_btn = QtWidgets.QPushButton("Reset")
-        self._reset_slider_overrides_btn.setObjectName("resetSliderOverridesButton")
-        self._reset_slider_overrides_btn.setToolTip("Revert sliders to canonical mechanism values")
-        slider_actions_layout.addWidget(self._reset_slider_overrides_btn)
+        self._reset_runtime_parameters_btn = QtWidgets.QPushButton("Reset")
+        self._reset_runtime_parameters_btn.setObjectName("resetRuntimeParametersButton")
+        self._reset_runtime_parameters_btn.setToolTip("Revert sliders to canonical mechanism values")
+        slider_actions_layout.addWidget(self._reset_runtime_parameters_btn)
 
         # Visibility picker for the unified slider surface.
         self._slider_visibility_picker_btn = QtWidgets.QToolButton()
@@ -184,7 +222,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_visibility_menu.aboutToShow.connect(self._rebuild_slider_visibility_menu)
         self._slider_visibility_picker_btn.setMenu(self._slider_visibility_menu)
         slider_actions_layout.addWidget(self._slider_visibility_picker_btn)
-        self._slider_edit_targets_label = QtWidgets.QLabel("Slider edit targets: none")
+        self._slider_edit_targets_label = make_bounded_label(
+            "Slider edit targets: none",
+            max_width=240,
+        )
         self._slider_edit_targets_label.setToolTip("The set whose initial conditions are controlled by concentration sliders")
         target_font = self._slider_edit_targets_label.font()
         target_font.setPointSize(max(1, target_font.pointSize() - 1))
@@ -208,8 +249,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         # Slider solver
         slider_runtime_layout.addWidget(QtWidgets.QLabel("Solver:"))
         self._slider_solver_combo = QtWidgets.QComboBox()
-        self._slider_solver_combo.addItems(["LSODA", "Radau", "BDF"])
-        self._slider_solver_combo.setCurrentText("LSODA")
+        self._slider_solver_combo.addItems(["Radau", "BDF"])
+        self._slider_solver_combo.setCurrentText("BDF")
         self._slider_solver_combo.setToolTip("ODE solver used for slider preview simulations")
         slider_runtime_layout.addWidget(self._slider_solver_combo)
         slider_runtime_layout.addStretch()
@@ -276,16 +317,16 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "\n"
             "<b>Reaction Parameters</b>\n"
             "k= or kf=  (forward rate)    kr=  (reverse rate)\n"
-            "K=          (equilibrium constant; also Keq=, K_eq=)\n"
+            "Keq=        (equilibrium constant)\n"
             "dG_act=     (Eyring activation free energy)\n"
             "dG_eq=      (equilibrium free energy)\n"
             "A=, Ea=     (Arrhenius pre-exponential and activation energy)\n"
             "Per-step: κ= overrides global kappa for Eyring computation.\n"
             "\n"
             "<b>Equilibrium Lines</b>\n"
-            "equilibrium: A &lt;=&gt; B ; K=2.5 ; kf=10\n"
-            "Requires K=, dG_eq=, or both kf= and kr=.\n"
-            "K= alone is rejected; at least one of kf= or kr= is needed.\n"
+            "equilibrium: A &lt;=&gt; B ; Keq=2.5 ; kf=10\n"
+            "Requires kf= plus exactly one of kr=, Keq=, or dG_eq=.\n"
+            "Keq= without kf=, kr= plus Keq=, and all-three rate forms are rejected.\n"
             "\n"
             "<b>State Network</b>\n"
             "state: GS1 ; kind=GS ; energy=0.0\n"
@@ -297,11 +338,46 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "temp_step: t=[0,50,100], T=[298,320]\n"
             "temp_response: t=[0,50,100], T=[298,320], tau=10\n"
             "\n"
-            "<b>Algebra and Observables (# algebra)</b>\n"
-            "Use 'param name = expr' for static kinetic parameters (e.g., param k2 = k1 * 2).\n"
-            "Use 'let name = expr' for observables using species data (e.g., let total = [A] + [B]_0).\n"
-            "Math ops: +, -, *, /, ^, min(), max(), exp(), ln(), sin(), piecewise logic, and constants (R, T, N_A).\n"
-            "*Note: Bracketed species [A] can ONLY be used in 'let', never in 'param'.*\n"
+            "<b>Species Intervention Schedules</b>\n"
+            "intervention: op=set; species=A; time=1.0; value=2.0\n"
+            "intervention: op=add; species=A; time=2.0; amount=0.5\n"
+            "intervention: op=remove; species=A; time=3.0; amount=0.25\n"
+            "intervention: op=clear; species=A; time=4.0\n"
+            "intervention: op=pulse; species=A; start=1.0; every=0.5; count=4; amount=0.2\n"
+            "intervention: op=source; species=B; start=0.0; end=5.0; rate=0.1\n"
+            "intervention: op=sink; species=B; start=0.0; end=5.0; rate=0.1\n"
+            "intervention: op=reservoir; species=O2; start=0.0; end=10.0; value=1.0\n"
+            "intervention: op=clamp; species=light; start=0.0; end=10.0; value=1.0\n"
+            "intervention: op=repeated_interval; kind=source; species=A; start=0.0; every=2.0; duration=0.5; count=3; rate=0.25\n"
+            "intervention: op=protocol; kind=repeat; name=light_cycle; start=0.0; every=2.0; duration=1.0; count=3; during=reservoir:light:value=1.0; after=clear:light\n"
+            "intervention: op=trigger; trigger_species=A; threshold=0.8; direction=falling; action=add; species=B; amount=0.1; max_count=1; min_interval=0.0\n"
+            "Fittable fields: instant time_param/value_param/amount_param; pulse start_param/every_param/amount_param; interval start_param/end_param/value_param/rate_param; repeated interval start_param/every_param/duration_param/value_param/rate_param; protocol start_param/every_param/duration_param and phase value_param/rate_param/amount_param; trigger threshold_param/value_param/amount_param.\n"
+            "Protected indexed names such as K1, k1, kf1, kr1, and Keq1 resolve through the mechanism parameter namespace; use a longer ordinary name such as K1_test for an independent schedule parameter.\n"
+            "Use Examples &gt; Intervention Examples for runnable current examples, including repeated intervals and repeat protocol cycles built from primitive operations.\n"
+            "Use Inspect... to open the Mechanism Inspector for read-only step numbers, symbolic RHS equations, and compiled intervention schedule payloads from core authorities.\n"
+            "Solved schedule events and intervals can be shown as optional main-plot annotations from solver provenance; they are off by default and controlled from the plot context menu.\n"
+            "\n"
+            "<b>Algebra Declarations and Observables</b>\n"
+            "Write algebra declarations directly in the Reactions text. They may appear before, after, or between reaction lines.\n"
+            "param name = expr      Scalar solver parameter. Use for rate constants, energies, and other fittable inputs.\n"
+            "let name = expr        Algebraic observable. Use for derived quantities to plot or fit against data.\n"
+            "Bare name = expr       Not supported. Use let or param explicitly.\n"
+            "Bracketed species like [A] and [A]_0 are valid in observables, not in param declarations.\n"
+            "'observable' is not a keyword. Use let for observables.\n"
+            "\n"
+            "<b>Built-in Functions</b>\n"
+            "Math: sqrt(x), ln(x), log10(x), log1p(x), exp(x), expm1(x), pow(x, y), abs(x)\n"
+            "Trigonometry: sin(x), cos(x), tan(x)\n"
+            "Aggregation: min(...), max(...)\n"
+            "Special: erf(x), heaviside(x), clip(x, lo, hi), ifelse(cond, a, b)\n"
+            "\n"
+            "<b>Protected Constants</b>\n"
+            "k_B   Boltzmann constant (read-only)\n"
+            "h     Planck constant (read-only)\n"
+            "N_A   Avogadro constant (read-only)\n"
+            "R     Gas constant in J/mol/K (read-only)\n"
+            "Rkcal Gas constant in kcal/mol/K (read-only)\n"
+            "T     Current temperature in K from the mechanism T directive (read-only)\n"
             "\n"
             "<b>Computational Mode (# === Computational Mode ===)</b>\n"
             "Define advanced species thermodynamics (e.g., comp: species A G=-100).\n"
@@ -309,19 +385,28 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "\n"
             "Note: Kindred normalizes all energies internally to J/mol.\n"
             "\n"
-            "<b>Example</b>\n"
+            "<b>Examples</b>\n"
+            "Grouped declarations:\n"
             "reaction: 2A + B =&gt; C ; kf=1e5\n"
-            "equilibrium: C &lt;=&gt; D ; K=2.5 ; kf=10.0\n"
+            "equilibrium: C &lt;=&gt; D ; Keq=2.5 ; kf=10.0\n"
             "reaction: C + E -&gt; F ; k=0.5\n"
             "reaction: A -&gt; A_Side ; kf=0.01\n"
             "\n"
-            "# algebra\n"
             "param scale = 2.0\n"
             "param k_base = 1.5e3\n"
             "param k_derived = k_base * scale\n"
-            "\n"
             "let total_A = [A] + [A_Side]\n"
             "let conversion = 1.0 - ([A] / max([A]_0, 1e-18))\n"
+            "\n"
+            "Interleaved declarations:\n"
+            "reaction: A -&gt; B ; k=1.0\n"
+            "param scale = 2.0\n"
+            "reaction: B -&gt; C ; k=0.5\n"
+            "let yield_C = [C] / max([A]_0, 1e-18)\n"
+            "equilibrium: C &lt;=&gt; D ; Keq=2.5 ; kf=10.0\n"
+            "let total_CD = [C] + [D]\n"
+            "\n"
+            "Reaction arrows: -&gt; for irreversible, &lt;-&gt; or &lt;=&gt; for reversible. &lt;- is not accepted.\n"
             "\n"
             "# === Computational Mode ===\n"
             "comp: species C G=-450.12</pre>"
@@ -346,7 +431,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._notes_text.setPlaceholderText(
             "Free-form notes about this mechanism.\n\n"
             "Important: algebraic scalars and algebraic observables must be defined in the\n"
-            "Reactions editor inside a '# Algebra' section. Notes are never parsed or injected."
+            "Reactions text. Notes are never parsed or injected."
         )
         self._notes_text.setFont(QtGui.QFont("Courier New", 10))
         self._notes_text.setUndoRedoEnabled(True)
@@ -367,7 +452,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         return self._species_sliders
 
     def set_slider_edit_targets_summary(self, text: str) -> None:
-        self._slider_edit_targets_label.setText(str(text or "Slider edit targets: none"))
+        summary = str(text or "Slider edit targets: none")
+        base_tooltip = "The set whose initial conditions are controlled by concentration sliders"
+        tooltip = base_tooltip if summary == "Slider edit targets: none" else f"{base_tooltip}\n\n{summary}"
+        set_bounded_label_text(
+            self._slider_edit_targets_label,
+            summary,
+            max_width=240,
+            tooltip_text=tooltip,
+        )
 
     def detach_slider_pane_for_dock(self) -> QtWidgets.QWidget:
         if bool(self._slider_workspace_detached):
@@ -467,20 +560,21 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             self._species_sliders.set_species_visible(str(item_name), bool(visible))
 
     def _on_text_changed(self):
-        """Handle text change event - trigger debounced validation."""
+        """Handle text change event."""
         if bool(getattr(self, "_reactions_read_only", self._reactions_text.isReadOnly())):
             self._validation_timer.stop()
             self._validate_dsl()
             return
-        self._validation_timer.start()
-        self._set_validation_state("validating")
+        self._validation_timer.stop()
+        self._set_validation_state("draft")
 
     def _validate_dsl(self):
         """Validate DSL text and update validation indicator."""
         text = self._reactions_text.toPlainText()
+        state_network_dsl = self._state_network_editor.get_state_network_dsl()
 
         # Skip validation if text is empty
-        if not text.strip():
+        if not text.strip() and not str(state_network_dsl or "").strip():
             self._set_validation_state("idle")
             return
 
@@ -490,11 +584,27 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
                 strip_named_reaction_dsl_initial_concentration_sets,
             )
             from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+            from kindred.core.simulator.parameter_algebra import (
+                apply_parameter_algebra_to_mechanism,
+                parameter_algebra_spec_from_mechanism,
+            )
+            from kindred.core.mechanism_source import MechanismAuthoringSource
 
             parse_text = strip_named_reaction_dsl_initial_concentration_sets(text)
+            if str(state_network_dsl or "").strip() and not self._state_network_editor.is_valid():
+                raise ValueError("Invalid State Network")
+            validation_text = MechanismAuthoringSource.from_parts(
+                reactions_text=parse_text,
+                state_network_dsl=state_network_dsl,
+            ).full_dsl
 
             # Parse with empty initials (will be populated from DSL)
-            mechanism = parse_dsl_to_mechanism(parse_text, initials={})
+            mechanism = parse_dsl_to_mechanism(validation_text, initials={})
+            _ = apply_parameter_algebra_to_mechanism(
+                validation_text,
+                mechanism=mechanism,
+                require_mutable=False,
+            )
 
             # Success - show green check
             n_reactions = len(mechanism.reactions)
@@ -502,6 +612,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             n_species = len(mechanism.species)
 
             msg = f"✓ Valid: {n_species} species, {n_reactions} reactions, {n_equilibria} equilibria"
+            spec = parameter_algebra_spec_from_mechanism(mechanism)
+            for warning in getattr(spec, "override_warnings", ()) or ():
+                msg += f"\nWarning: {warning.message}"
             self._set_validation_state("valid", msg)
 
         except Exception as e:
@@ -520,39 +633,61 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         Parameters
         ----------
         state : str
-            One of: "idle", "validating", "valid", "invalid"
+            One of: "idle", "draft", "validating", "valid", "invalid"
         message : str
             Status message to display
         """
         self._current_validation_state = state
-        self._run_btn.setEnabled(state == "valid" and not self._run_gated)
-        self._run_btn.setToolTip(
-            "Run simulation for all selected sets (same as Run Selected in Initial Conditions)"
-            if state == "valid"
-            else "No valid mechanism \u2014 enter a valid reaction mechanism to enable"
-        )
+        self.validationStateChanged.emit(str(state))
+        if state == "valid":
+            run_tooltip = "Run simulation for the current run target from Initial Conditions"
+        elif state == "draft":
+            run_tooltip = "Mechanism edits are still a draft — lock/apply the mechanism before running."
+        elif state == "validating":
+            run_tooltip = "Mechanism validation is still running."
+        else:
+            run_tooltip = "No valid mechanism — enter a valid reaction mechanism to enable"
+        self._run_btn.setToolTip(run_tooltip)
 
         if state == "idle":
-            self._validation_label.setText("")
+            self._set_validation_label_text("")
             self._validation_label.setStyleSheet("QLabel { padding: 4px; }")
 
         elif state == "validating":
-            self._validation_label.setText("\u23f3 Validating...")
+            self._set_validation_label_text("\u23f3 Validating...")
+            self._validation_label.setStyleSheet(
+                "QLabel { padding: 4px; border-radius: 3px; }"
+            )
+
+        elif state == "draft":
+            self._set_validation_label_text("Editing draft")
             self._validation_label.setStyleSheet(
                 "QLabel { padding: 4px; border-radius: 3px; }"
             )
 
         elif state == "valid":
-            self._validation_label.setText(message)
+            self._set_validation_label_text(message)
             self._validation_label.setStyleSheet(
                 "QLabel { padding: 4px; border-radius: 3px; }"
             )
 
         elif state == "invalid":
-            self._validation_label.setText(message)
+            self._set_validation_label_text(message)
             self._validation_label.setStyleSheet(
                 "QLabel { font-weight: bold; padding: 4px; border-radius: 3px; }"
             )
+
+    def _set_validation_label_text(self, text: str) -> None:
+        full_text = str(text or "")
+        self._validation_label.setMaximumWidth(520)
+        self._validation_label.setMaximumHeight(96)
+        self._validation_label.setWordWrap(True)
+        self._validation_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        self._validation_label.setText(full_text)
+        self._validation_label.setToolTip(full_text if full_text else "")
 
     def slider_points_value(self) -> int:
         """Get the current slider simulation points setting."""
@@ -568,19 +703,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def set_slider_solver_value(self, s: str) -> None:
         """Set the slider solver value."""
-        idx = self._slider_solver_combo.findText(s)
+        solver_name, _warning = normalize_solver_name(s)
+        idx = self._slider_solver_combo.findText(solver_name)
+        if idx < 0:
+            idx = self._slider_solver_combo.findText(DEFAULT_SOLVER_NAME)
         self._slider_solver_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
     @property
     def run_btn(self) -> QtWidgets.QPushButton:
         return self._run_btn
-
-    def set_run_gated(self, gated: bool) -> None:
-        self._run_gated = bool(gated)
-        if self._run_gated:
-            self._run_btn.setEnabled(False)
-        elif self._current_validation_state == "valid":
-            self._run_btn.setEnabled(True)
 
     def is_mechanism_valid(self) -> bool:
         return self._current_validation_state == "valid"

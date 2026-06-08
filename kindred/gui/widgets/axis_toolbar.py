@@ -38,6 +38,9 @@ set_auto_range(enabled: bool) -> None
 get_manual_ranges() -> tuple[float|None, float|None, float|None, float|None]
 set_manual_ranges(x_min, x_max, y_min, y_max) -> None
 
+Programmatic projection setters update widget state without emitting command
+signals; user edits and explicit actions emit the signals above.
+
 No filesystem, no network, no cwd usage.
 """
 
@@ -99,7 +102,11 @@ class AxisToolbar(QtWidgets.QWidget):
         y_popup_layout.setSpacing(4)
 
         self._y_popup_label = QtWidgets.QLabel("Visible series", self._y_popup_container)
+        self._invert_y_selection_btn = QtWidgets.QPushButton("Invert selection", self._y_popup_container)
+        self._invert_y_selection_btn.setObjectName("axisToolbarInvertYSelectionButton")
+        self._invert_y_selection_btn.setToolTip("Invert the selected Y series")
         y_popup_layout.addWidget(self._y_popup_label)
+        y_popup_layout.addWidget(self._invert_y_selection_btn)
         y_popup_layout.addWidget(self._y_list)
 
         self._y_menu_action = QtWidgets.QWidgetAction(self._y_menu)
@@ -171,6 +178,7 @@ class AxisToolbar(QtWidgets.QWidget):
         self._x_combo.currentTextChanged.connect(self._on_x_changed)
         self._parametric.toggled.connect(self._on_parametric_toggled)
         self._y_list.itemChanged.connect(self._on_y_item_changed)
+        self._invert_y_selection_btn.clicked.connect(self.invert_y_selection)
 
         self._action_downsampling.toggled.connect(
             lambda on: self._emit_option("sampling", "coarse" if on else "dense")
@@ -212,11 +220,13 @@ class AxisToolbar(QtWidgets.QWidget):
         elif names:
             self._x_combo.setCurrentIndex(0)
         self._x_combo.blockSignals(False)
-        # Emit if changed
-        if self._x_combo.currentText() != prev:
-            self.xChanged.emit(self._x_combo.currentText())
 
-    def set_y_candidates(self, series: Sequence[Tuple[str, bool]], *, disabled: Sequence[str] = ()) -> None:
+    def set_y_candidates(
+        self,
+        series: Sequence[Tuple[str, bool]],
+        *,
+        disabled: Sequence[str] = (),
+    ) -> None:
         """
         Populate Y list.
 
@@ -228,7 +238,6 @@ class AxisToolbar(QtWidgets.QWidget):
             Items that must be visible but not selectable (e.g., scalars).
         """
         disabled_set = set(map(str, disabled))
-        current = set(self.selected_y())
 
         self._y_list.blockSignals(True)
         self._y_list.clear()
@@ -241,13 +250,10 @@ class AxisToolbar(QtWidgets.QWidget):
                 it.setToolTip("Scalar values cannot be plotted as Y; use 'Add Guide from Scalar' in Options.")
                 it.setCheckState(Qt.CheckState.Unchecked)
             else:
-                # preserve existing selection if possible
-                it.setCheckState(Qt.CheckState.Checked if (str(name) in current or checked) else Qt.CheckState.Unchecked)
+                it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             self._y_list.addItem(it)
         self._y_list.blockSignals(False)
-        # Emit a consolidated signal after repopulation
         self._update_y_selector_text()
-        self.ySelectionChanged.emit(self.selected_y())
 
     def select_y(self, names: Iterable[str]) -> None:
         target = set(map(str, names))
@@ -258,13 +264,33 @@ class AxisToolbar(QtWidgets.QWidget):
                 it.setCheckState(Qt.CheckState.Checked if it.text() in target else Qt.CheckState.Unchecked)
         self._y_list.blockSignals(False)
         self._update_y_selector_text()
+
+    def invert_y_selection(self) -> None:
+        """Invert enabled Y-series rows while leaving disabled scalar rows unchecked."""
+        self._y_list.blockSignals(True)
+        for i in range(self._y_list.count()):
+            it = self._y_list.item(i)
+            if not (it.flags() & Qt.ItemFlag.ItemIsEnabled):
+                it.setCheckState(Qt.CheckState.Unchecked)
+                continue
+            next_state = (
+                Qt.CheckState.Unchecked
+                if it.checkState() == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+            it.setCheckState(next_state)
+        self._y_list.blockSignals(False)
+        self._update_y_selector_text()
         self.ySelectionChanged.emit(self.selected_y())
 
     def selected_y(self) -> List[str]:
         out: List[str] = []
         for i in range(self._y_list.count()):
             it = self._y_list.item(i)
-            if it.checkState() == Qt.CheckState.Checked:
+            if (
+                it.flags() & Qt.ItemFlag.ItemIsEnabled
+                and it.checkState() == Qt.CheckState.Checked
+            ):
                 out.append(it.text())
         return out
 
@@ -285,8 +311,16 @@ class AxisToolbar(QtWidgets.QWidget):
 
     def set_auto_range(self, enabled: bool) -> None:
         """Enable or disable auto range mode."""
-        if self._auto_range.isChecked() != enabled:
-            self._auto_range.setChecked(enabled)
+        checked = bool(enabled)
+        if self._auto_range.isChecked() == checked:
+            self._sync_manual_range_controls(checked)
+            return
+        self._auto_range.blockSignals(True)
+        try:
+            self._auto_range.setChecked(checked)
+        finally:
+            self._auto_range.blockSignals(False)
+        self._sync_manual_range_controls(checked)
 
     def get_manual_ranges(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         """
@@ -320,10 +354,13 @@ class AxisToolbar(QtWidgets.QWidget):
         x_min, x_max, y_min, y_max : float or None
             Axis limits. None means leave field empty.
         """
-        self._x_min.setText(f"{x_min:.6g}" if x_min is not None else "")
-        self._x_max.setText(f"{x_max:.6g}" if x_max is not None else "")
-        self._y_min.setText(f"{y_min:.6g}" if y_min is not None else "")
-        self._y_max.setText(f"{y_max:.6g}" if y_max is not None else "")
+        def _format(value: Optional[float]) -> str:
+            return format(float(value), ".17g") if value is not None else ""
+
+        self._x_min.setText(_format(x_min))
+        self._x_max.setText(_format(x_max))
+        self._y_min.setText(_format(y_min))
+        self._y_max.setText(_format(y_max))
 
     # ----------------------- layout helpers -----------------------
 
@@ -446,11 +483,8 @@ class AxisToolbar(QtWidgets.QWidget):
         self._update_y_selector_text()
         self.ySelectionChanged.emit(self.selected_y())
 
-    def _on_auto_range_toggled(self, checked: bool) -> None:
-        """Enable/disable manual range controls based on auto range checkbox."""
-        # When auto is checked, disable manual controls
-        # When auto is unchecked, enable manual controls
-        enabled = not checked
+    def _sync_manual_range_controls(self, auto_checked: bool) -> None:
+        enabled = not bool(auto_checked)
         self._x_min.setEnabled(enabled)
         self._x_max.setEnabled(enabled)
         self._y_min.setEnabled(enabled)
@@ -458,6 +492,10 @@ class AxisToolbar(QtWidgets.QWidget):
         if self._orientation == "horizontal":
             self._manual_range_row.setVisible(enabled)
             self.updateGeometry()
+
+    def _on_auto_range_toggled(self, checked: bool) -> None:
+        """Enable/disable manual range controls based on auto range checkbox."""
+        self._sync_manual_range_controls(bool(checked))
         # Emit signal to update plot
         self.axisRangeChanged.emit()
 

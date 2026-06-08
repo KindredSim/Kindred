@@ -12,16 +12,19 @@ Current contract
   - name: str
   - initial_conc: float  (standard state basis)
 - Reaction:
-  - stoich: dict[str, float]  negative for reactants, positive for products
-  - order: int  derived molecularity (sum of reactant stoich magnitudes)
+  - reactants/products: immutable Mapping[str, float] positive physical side maps
+  - rate_orders: immutable Mapping[str, float] positive kinetic exponents;
+                 None defaults to reactants, {} is explicit zero-order
+  - net_stoich: immutable Mapping[str, float] products - reactants, zeros omitted
+  - order: int  derived molecularity from rate_orders
   - rate: StructuredRate | Callable    (opaque holder here; evaluated upstream)
   - overrides: {"model": "Eyring" | "Arrhenius" | None,
                 "kappa": float | None, "A": float | None, "Ea": float | None,
                 "Ea_J_per_mol": float | None, "dG_act_J_per_mol": float | None,
                 "standard_conc_M": float | None}
 - Equilibrium:
-  - stoich_forward: dict[str, float]
-  - stoich_back: dict[str, float]
+  - stoich_forward: immutable Mapping[str, float] positive physical forward side
+  - stoich_back: immutable Mapping[str, float] positive physical reverse side
   - Keq: float | Expr | None
   - kf: float | Expr | None
   - kr: float | Expr | None
@@ -41,11 +44,24 @@ from __future__ import annotations
 
 import copy
 from collections import OrderedDict
+from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Tuple, Union, Protocol, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Tuple, Union, Protocol, Optional
 
 from .species import Species, coerce_float
 from .validation import validate_name
+from .equilibrium_rate_authority import (
+    EquilibriumRateAuthorityKind,
+    EquilibriumRateInputContext,
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+    effective_reverse_rate_from_keq,
+    normalize_equilibrium_rate_authority,
+    plain_finite_float_or_none,
+    validate_equilibrium_rate_authority_values,
+)
+from .kinetics import K_from_deltaG_eq
+from .mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
 
 class StructuredRate(Protocol):
     pass
@@ -62,28 +78,45 @@ __all__ = [
 # --------------------------------- helpers ----------------------------------
 
 
-def _validate_stoich(stoich: Mapping[str, float]) -> Dict[str, float]:
-    """
-    Validate a stoichiometry mapping and coerce values to floats.
+class FrozenDict(MappingABC):
+    """Small immutable, pickleable mapping used for mechanism semantic fields."""
 
-    Returns a new plain dict with stripped names and float values.
-    """
-    if not isinstance(stoich, Mapping):
-        raise TypeError("stoichiometry must be a mapping of name -> coefficient")
-    out: Dict[str, float] = {}
-    for k, v in stoich.items():
-        n = validate_name(k)
-        try:
-            fv = float(v)
-        except (ValueError, TypeError) as e:
-            raise TypeError(f"stoichiometry for {n!r} must be numeric, got {v!r}") from e
-        if fv == 0.0:
-            # omit true zeros to keep the representation clean and deterministic
-            continue
-        out[n] = fv
-    if not out:
-        raise ValueError("stoichiometry cannot be empty (all-zero is not allowed)")
-    return out
+    __slots__ = ("_data",)
+
+    def __init__(self, values: Mapping[str, Any] | None = None) -> None:
+        self._data = {key: _freeze_value(value) for key, value in dict(values or {}).items()}
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return repr(self._data)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, MappingABC):
+            return dict(self.items()) == dict(other.items())
+        return NotImplemented
+
+    def __reduce__(self) -> tuple[type["FrozenDict"], tuple[Dict[str, Any]]]:
+        return (type(self), (self._data,))
+
+
+def _freeze_value(value: Any) -> Any:
+    if isinstance(value, FrozenDict):
+        return value
+    if isinstance(value, MappingABC):
+        return FrozenDict(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(item) for item in value)
+    return value
 
 
 def _ensure_species_exist(stoich: Mapping[str, float], declared: Mapping[str, Species]) -> None:
@@ -99,18 +132,47 @@ def _close_to_int(x: float, tol: float = 1e-9) -> int:
     raise ValueError(f"value {x} not within {tol} of an integer")
 
 
-def derive_molecularity(stoich: Mapping[str, float]) -> int:
+def derive_molecularity(rate_orders: Mapping[str, float]) -> int:
     """
-    Derive reaction molecularity (order) as the sum of magnitudes
-    of negative stoichiometric coefficients (reactants).
+    Derive reaction molecularity (order) as the sum of kinetic exponents.
 
     Coefficients like 2A + B -> ... yield order 3.
     """
-    total = sum(-v for v in stoich.values() if v < 0.0)
+    total = sum(float(v) for v in rate_orders.values())
     if total < 0:
         # shouldn't happen, defensive
         total = 0.0
     return _close_to_int(total, tol=1e-9)
+
+
+def _validate_positive_side(side: Mapping[str, float] | None, *, label: str) -> Dict[str, float]:
+    """Validate a physical reaction side with positive coefficients."""
+    if side is None:
+        return {}
+    if not isinstance(side, Mapping):
+        raise TypeError(f"{label} must be a mapping of name -> positive coefficient")
+    out: Dict[str, float] = {}
+    for k, v in side.items():
+        n = validate_name(k)
+        try:
+            fv = float(v)
+        except (ValueError, TypeError) as e:
+            raise TypeError(f"{label} coefficient for {n!r} must be numeric, got {v!r}") from e
+        if fv == 0.0:
+            continue
+        if fv < 0.0:
+            raise ValueError(f"{label} coefficient for {n!r} must be positive")
+        out[n] = fv
+    return out
+
+
+def _derive_net_stoich(reactants: Mapping[str, float], products: Mapping[str, float]) -> Dict[str, float]:
+    net: Dict[str, float] = {}
+    for sp, coef in reactants.items():
+        net[sp] = net.get(sp, 0.0) - float(coef)
+    for sp, coef in products.items():
+        net[sp] = net.get(sp, 0.0) + float(coef)
+    return {sp: coef for sp, coef in net.items() if coef != 0.0}
 
 
 def _normalize_overrides(overrides: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -151,37 +213,61 @@ def _normalize_overrides(overrides: Optional[Mapping[str, Any]]) -> Dict[str, An
 # --------------------------------- models -----------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Reaction:
     """
-    Reaction step with general stoichiometry.
+    Reaction step with physical sides and explicit kinetic order.
 
     Fields
     ------
-    stoich : dict[str, float]
-        Negative for reactants, positive for products, zeros omitted.
+    reactants : Mapping[str, float]
+        Positive reactant-side coefficients.
+    products : Mapping[str, float]
+        Positive product-side coefficients.
+    rate_orders : Mapping[str, float]
+        Positive kinetic exponents; defaults to the reactant side.
+    net_stoich : Mapping[str, float]
+        Derived products - reactants mapping, zeros omitted.
     rate : Any
         Either a StructuredRate object or a Callable resolved upstream.
         Stored opaquely here.
-    overrides : dict
+    overrides : Mapping[str, Any]
         Optional per-step overrides for model parameters.
     order : int
-        Derived molecularity based on reactant stoichiometry.
+        Derived molecularity based on rate_orders.
     """
-    stoich: Dict[str, float]
+    reactants: Mapping[str, float]
+    products: Mapping[str, float]
     rate: Union[StructuredRate, Callable[[], float]]
-    overrides: Dict[str, Any] = field(default_factory=dict)
+    rate_orders: Mapping[str, float] | None = None
+    overrides: Mapping[str, Any] = field(default_factory=dict)
+    net_stoich: Mapping[str, float] = field(init=False)
     order: int = field(init=False)
 
     def __post_init__(self) -> None:
         # dataclass with frozen=True; use object.__setattr__
-        object.__setattr__(self, "stoich", dict(self.stoich))
-        object.__setattr__(self, "overrides", dict(self.overrides))
-        object.__setattr__(self, "order", derive_molecularity(self.stoich))
+        reactants = _validate_positive_side(self.reactants, label="reactants")
+        products = _validate_positive_side(self.products, label="products")
+        if not reactants and not products:
+            raise ValueError("reaction requires reactants or products")
+        rate_orders = (
+            dict(reactants)
+            if self.rate_orders is None
+            else _validate_positive_side(self.rate_orders, label="rate_orders")
+        )
+        net_stoich = _derive_net_stoich(reactants, products)
+        if not net_stoich:
+            raise ValueError("reaction net stoichiometry cannot be empty")
+        object.__setattr__(self, "reactants", FrozenDict(reactants))
+        object.__setattr__(self, "products", FrozenDict(products))
+        object.__setattr__(self, "rate_orders", FrozenDict(rate_orders))
+        object.__setattr__(self, "net_stoich", FrozenDict(net_stoich))
+        object.__setattr__(self, "overrides", FrozenDict(self.overrides))
+        object.__setattr__(self, "order", derive_molecularity(rate_orders))
 
-    def stoich_vector(self, species_order: Iterable[str]) -> List[float]:
-        """Vectorize stoichiometry against a given species order."""
-        s = self.stoich
+    def net_stoich_vector(self, species_order: Iterable[str]) -> List[float]:
+        """Vectorize net stoichiometry against a given species order."""
+        s = self.net_stoich
         return [float(s.get(n, 0.0)) for n in species_order]
 
 
@@ -190,26 +276,41 @@ class Equilibrium:
     """
     Reversible equilibrium description.
 
-    Either Keq or kf/kr may be provided (or both). If only Keq is provided,
-    kf/kr may be derived later based on a fast-equilibrium policy.
+    A forward rate kf is required. Exactly one reverse-side authority is selected:
+    explicit kr, or thermodynamic Keq/dG_eq metadata. Backend consumers may carry
+    derived values for display, but provenance must not become a second authority.
     Equilibria stay reversible single steps; the ODE builder consumes them as
     one column with forward/reverse power-law terms rather than duplicating
     into two reactions.
 
     fast=True marks an entry that originated from `equilibrium:` in the DSL.
     """
-    stoich_forward: Dict[str, float]
-    stoich_back: Dict[str, float]
+    stoich_forward: Mapping[str, float]
+    stoich_back: Mapping[str, float]
     Keq: Union[float, Expr, None] = None
     kf: Union[float, Expr, None] = None
     kr: Union[float, Expr, None] = None
     fast: bool = False
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "stoich_forward", dict(self.stoich_forward))
-        object.__setattr__(self, "stoich_back", dict(self.stoich_back))
-        object.__setattr__(self, "metadata", dict(self.metadata))
+        stoich_forward = _validate_positive_side(self.stoich_forward, label="stoich_forward")
+        stoich_back = _validate_positive_side(self.stoich_back, label="stoich_back")
+        if not stoich_forward:
+            raise ValueError("stoich_forward cannot be empty")
+        if not stoich_back:
+            raise ValueError("stoich_back cannot be empty")
+        object.__setattr__(
+            self,
+            "stoich_forward",
+            FrozenDict(stoich_forward),
+        )
+        object.__setattr__(
+            self,
+            "stoich_back",
+            FrozenDict(stoich_back),
+        )
+        object.__setattr__(self, "metadata", FrozenDict(self.metadata))
 
     def forward_vector(self, species_order: Iterable[str]) -> List[float]:
         return [float(self.stoich_forward.get(n, 0.0)) for n in species_order]
@@ -250,7 +351,14 @@ class Mechanism:
         cloned = copy.copy(self)
         cloned.species = OrderedDict(self.species)
         cloned.reactions = [
-            replace(r, stoich=dict(r.stoich), overrides=dict(r.overrides)) for r in self.reactions
+            replace(
+                r,
+                reactants=dict(r.reactants),
+                products=dict(r.products),
+                rate_orders=dict(r.rate_orders),
+                overrides=dict(r.overrides),
+            )
+            for r in self.reactions
         ]
         cloned.equilibria = [
             replace(
@@ -305,7 +413,13 @@ class Mechanism:
             raise KeyError(f"unknown species {n!r}")
         # Removing a species invalidates any steps that reference it
         # Do the conservative thing and block removal if referenced.
-        if any(n in r.stoich for r in self.reactions):
+        if any(
+            n in r.reactants
+            or n in r.products
+            or n in r.rate_orders
+            or n in r.net_stoich
+            for r in self.reactions
+        ):
             raise ValueError(f"cannot remove species {n!r}: referenced by a reaction")
         if any(n in e.stoich_forward or n in e.stoich_back for e in self.equilibria):
             raise ValueError(f"cannot remove species {n!r}: referenced by an equilibrium")
@@ -318,24 +432,48 @@ class Mechanism:
     def _sync_metadata_order(self) -> None:
         self.metadata["declaration_order"] = self.species_names()
 
+    def _append_step_index_map_entry(self, entry: Mapping[str, Any]) -> None:
+        raw_mapping = self.metadata.get("step_index_map")
+        step_index_map = raw_mapping if isinstance(raw_mapping, list) else []
+        step_index = len(step_index_map) + 1
+        mapped_entry = {"step_index": int(step_index), **dict(entry)}
+        step_index_map.append(mapped_entry)
+        self.metadata["step_index_map"] = step_index_map
+
     # ---------- step additions ----------
 
     def add_reaction(
         self,
-        stoich: Mapping[str, float],
+        *,
+        reactants: Mapping[str, float],
+        products: Mapping[str, float],
         rate: Any,
+        rate_orders: Optional[Mapping[str, float]] = None,
         overrides: Optional[Mapping[str, Any]] = None,
+        record_step_index: bool = True,
     ) -> Reaction:
         """
         Add a reaction step.
 
-        Validates stoichiometry and ensures all species are declared.
+        Validates physical sides and ensures all species are declared.
         """
-        s = _validate_stoich(stoich)
-        _ensure_species_exist(s, self.species)
+        r = _validate_positive_side(reactants, label="reactants")
+        p = _validate_positive_side(products, label="products")
+        ro = dict(r) if rate_orders is None else _validate_positive_side(rate_orders, label="rate_orders")
+        net = _derive_net_stoich(r, p)
+        if not net:
+            raise ValueError("reaction net stoichiometry cannot be empty")
+        _ensure_species_exist({**r, **p, **ro}, self.species)
         ov = _normalize_overrides(overrides)
-        rxn = Reaction(stoich=s, rate=rate, overrides=ov)
+        rxn = Reaction(reactants=r, products=p, rate=rate, rate_orders=ro, overrides=ov)
         self.reactions.append(rxn)
+        if bool(record_step_index):
+            self._append_step_index_map_entry(
+                {
+                    "kind": "reaction",
+                    "reaction_index": len(self.reactions) - 1,
+                }
+            )
         return rxn
 
     def add_equilibrium(
@@ -348,22 +486,88 @@ class Mechanism:
         kr: Any | None = None,
         fast: bool = False,
         metadata: Optional[Mapping[str, Any]] = None,
+        record_step_index: bool = True,
     ) -> Equilibrium:
         """
         Add an equilibrium pair.
 
-        At least one of {Keq, (kf and kr)} must be provided. Validation is structural;
-        numeric sanity (positivity, units) is the responsibility of the simulator layer.
+        kf is required, plus exactly one reverse-side authority: kr or thermodynamic
+        Keq/dG_eq metadata. Numeric sanity (positivity, units) is the responsibility
+        of the simulator layer.
         """
-        sf = _validate_stoich(stoich_forward)
-        sb = _validate_stoich(stoich_back)
+        return self._add_equilibrium_with_authority_context(
+            stoich_forward,
+            stoich_back,
+            Keq=Keq,
+            kf=kf,
+            kr=kr,
+            fast=fast,
+            metadata=metadata,
+            record_step_index=record_step_index,
+            authority_context=EquilibriumRateInputContext.PUBLIC,
+        )
+
+    def _add_equilibrium_with_authority_context(
+        self,
+        stoich_forward: Mapping[str, float],
+        stoich_back: Mapping[str, float],
+        *,
+        Keq: Any | None = None,
+        kf: Any | None = None,
+        kr: Any | None = None,
+        fast: bool = False,
+        metadata: Optional[Mapping[str, Any]] = None,
+        record_step_index: bool = True,
+        authority_context: EquilibriumRateInputContext | str | None = None,
+    ) -> Equilibrium:
+        sf = _validate_positive_side(stoich_forward, label="stoich_forward")
+        sb = _validate_positive_side(stoich_back, label="stoich_back")
+        if not sf:
+            raise ValueError("stoich_forward cannot be empty")
+        if not sb:
+            raise ValueError("stoich_back cannot be empty")
         _ensure_species_exist(sf, self.species)
         _ensure_species_exist(sb, self.species)
 
-        if Keq is None and (kf is None or kr is None):
-            raise ValueError("equilibrium requires Keq or both kf and kr")
-
         meta = dict(metadata) if metadata else {}
+        meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KF, bool(kf is not None))
+        meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KR, bool(kr is not None))
+        validate_equilibrium_rate_authority_values(
+            kf=kf,
+            kr=kr,
+            Keq=Keq,
+            metadata=meta,
+            context=authority_context,
+        )
+        authority = normalize_equilibrium_rate_authority(
+            kf=kf,
+            kr=kr,
+            Keq=Keq,
+            metadata=meta,
+            context=authority_context,
+        )
+        if authority.kind == EquilibriumRateAuthorityKind.KEQ:
+            effective_keq = Keq
+            if effective_keq is None and meta.get(EquilibriumMetadataKeys.KEQ_INPUT) is not None:
+                effective_keq = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+            if effective_keq is None and meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None:
+                temperature = plain_finite_float_or_none(self.metadata.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15))
+                dg_value = plain_finite_float_or_none(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
+                if temperature is not None and dg_value is not None:
+                    effective_keq = float(K_from_deltaG_eq(float(dg_value), float(temperature)))
+            scalar_keq = plain_finite_float_or_none(effective_keq)
+            if Keq is None and scalar_keq is not None:
+                Keq = scalar_keq
+            scalar_kf = plain_finite_float_or_none(kf)
+            scalar_std_ratio = plain_finite_float_or_none(authority.reverse_std_ratio)
+            if (
+                kr is None
+                and scalar_kf is not None
+                and scalar_keq is not None
+                and scalar_std_ratio is not None
+                and abs(float(scalar_keq)) > 1e-30
+            ):
+                kr = effective_reverse_rate_from_keq(scalar_kf, scalar_keq, scalar_std_ratio)
 
         eq = Equilibrium(
             stoich_forward=sf,
@@ -375,6 +579,13 @@ class Mechanism:
             metadata=meta,
         )
         self.equilibria.append(eq)
+        if bool(record_step_index):
+            entry: Dict[str, object] = {
+                "kind": "equilibrium",
+                "equilibrium_index": len(self.equilibria) - 1,
+            }
+            entry.update(authority.step_map_fields())
+            self._append_step_index_map_entry(entry)
         return eq
 
     # ---------- vectorization helpers ----------
@@ -386,7 +597,7 @@ class Mechanism:
         Each column corresponds to a reaction's stoichiometric vector.
         """
         names = self.species_names()
-        cols: List[List[float]] = [r.stoich_vector(names) for r in self.reactions]
+        cols: List[List[float]] = [r.net_stoich_vector(names) for r in self.reactions]
         # transpose to species-major rows
         if not cols:
             return [[] for _ in names]
@@ -415,21 +626,36 @@ class Mechanism:
         species_block = OrderedDict((n, {"initial_conc": sp.initial_conc}) for n, sp in self.species.items())
         reactions_block = [
             {
-                "stoich": OrderedDict(sorted(r.stoich.items(), key=lambda kv: order_map[kv[0]])),
+                "reactants": OrderedDict(sorted(r.reactants.items(), key=lambda kv: order_map[kv[0]])),
+                "products": OrderedDict(sorted(r.products.items(), key=lambda kv: order_map[kv[0]])),
+                "rate_orders": OrderedDict(sorted(r.rate_orders.items(), key=lambda kv: order_map[kv[0]])),
+                "net_stoich": OrderedDict(sorted(r.net_stoich.items(), key=lambda kv: order_map[kv[0]])),
                 "order": r.order,
-                "overrides": r.overrides,
+                "overrides": OrderedDict(sorted(r.overrides.items())),
                 "rate": r.rate,
             }
             for r in self.reactions
         ]
-        equilibria_block = [
-            {
+        try:
+            temperature_K = float(self.metadata.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15))
+        except (TypeError, ValueError, OverflowError):
+            temperature_K = 298.15
+
+        equilibria_block = []
+        for e in self.equilibria:
+            effective_keq = effective_equilibrium_keq(e, temperature_K=temperature_K)
+            effective_kr = effective_equilibrium_reverse_rate(e, temperature_K=temperature_K)
+            equilibria_block.append(
+                {
                 "stoich_forward": OrderedDict(sorted(e.stoich_forward.items(), key=lambda kv: order_map[kv[0]])),
                 "stoich_back":   OrderedDict(sorted(e.stoich_back.items(),   key=lambda kv: order_map[kv[0]])),
-                "Keq": e.Keq, "kf": e.kf, "kr": e.kr, "fast": e.fast,
+                "Keq": effective_keq if effective_keq is not None else e.Keq,
+                "kf": e.kf,
+                "kr": effective_kr if effective_kr is not None else e.kr,
+                "fast": e.fast,
+                "metadata": OrderedDict(sorted(dict(e.metadata).items())),
             }
-            for e in self.equilibria
-        ]
+            )
         return {
             "species": species_block,
             "reactions": reactions_block,

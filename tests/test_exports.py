@@ -1,22 +1,42 @@
-import os
+import csv
+
 import numpy as np
 import pytest
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtWidgets
 
-from kindred.gui.main_window import MainWindow
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+from kindred.gui.ports import (
+    CompletedRunDisplayIntent,
+    CompletedRunDisplayTransaction,
+    CompletionDisplayEntry,
+    DisplayTransitionOutcomeKind,
+)
+from tests.workflow_helpers import completion_provenance_payload
 
 pytestmark = pytest.mark.gui
 
 
-@pytest.fixture(scope="module")
-def qt_app():
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    QtCore.QStandardPaths.setTestModeEnabled(True)
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        app = QtWidgets.QApplication([])
-    return app
+def _display_payload(*, t, series, mechanism_text: str, owned_species=None) -> dict:
+    payload = {
+        "t": t,
+        "series": series,
+        "algebra_scalars": {},
+        "solver_provenance": {},
+        "mechanism_text": str(mechanism_text),
+        "solver_config": {},
+        "warnings": [],
+        "completion_provenance": completion_provenance_payload(
+            t=t,
+            series=series,
+            mechanism_text=str(mechanism_text),
+        ),
+    }
+    if owned_species is None:
+        owned_species = tuple(str(name) for name in dict(series or {}) if str(name))
+    owned_species_t = tuple(str(name) for name in (owned_species or ()) if str(name))
+    if owned_species_t:
+        payload["owned_species"] = owned_species_t
+    return payload
 
 
 @pytest.fixture(autouse=True)
@@ -28,25 +48,6 @@ def suppress_message_boxes(monkeypatch):
 
     for attr in ("information", "warning", "critical"):
         monkeypatch.setattr(QtWidgets.QMessageBox, attr, _silent)
-
-
-@pytest.fixture
-def main_window(qt_app, monkeypatch, tmp_path):
-    """Provide a MainWindow with filesystem use redirected to tmp_path."""
-
-    def _fake_templates_dir(_self):
-        target = tmp_path / "templates"
-        target.mkdir(parents=True, exist_ok=True)
-        return target
-
-    monkeypatch.setattr(
-        "kindred.config.templates.TemplateManager._get_templates_directory",
-        _fake_templates_dir,
-    )
-    monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
-    window = MainWindow()
-    yield window
-    window.close()
 
 
 @pytest.fixture
@@ -71,7 +72,46 @@ def prepared_window(main_window, monkeypatch):
         lambda *args, **kwargs: (0.5, "mock", True, 1e-6, "tail"),
     )
     series_map = {name: Y[idx] for idx, name in enumerate(species_names)}
-    main_window.set_data(t, series_map, label="Results", overlays=[])
+    owned_species = tuple(str(name) for name in species_names)
+    set_id = "export-set"
+    intent = CompletedRunDisplayIntent(
+        requested_show_set_ids=(set_id,),
+        labels_by_set_id={set_id: "Export Set"},
+        primary_set_id=set_id,
+        cache_key="export-fixture-cache",
+        run_id=1,
+        request_id=1,
+        owned_species_by_set_id={set_id: owned_species},
+    )
+    entry = CompletionDisplayEntry(
+        set_id=set_id,
+        label="Export Set",
+        t=t,
+        series=series_map,
+        algebra_scalars={},
+        solver_provenance=None,
+        mechanism_text=dsl,
+        solver_config={},
+        warnings=(),
+        completion_provenance=completion_provenance_payload(
+            t=t,
+            series=series_map,
+            mechanism_text=dsl,
+        ),
+        owned_species=owned_species,
+        display_species=tuple(str(name) for name in species_names),
+    )
+    outcome = main_window.results_controller.publish_completed_run_display_transaction(
+        CompletedRunDisplayTransaction(
+            intent=intent,
+            completion_entries=(entry,),
+            display_set_ids=(set_id,),
+            display_primary_set_id=set_id,
+            failed_set_ids=(),
+        )
+    )
+    assert outcome.transition_outcome is not None
+    assert outcome.transition_outcome.kind is DisplayTransitionOutcomeKind.PUBLISHED
     dataset_panel = main_window._plot_tabs.add_dataset_tab("Dataset 1")
     first_species = species_names[0]
     dataset_panel.set_data(
@@ -81,21 +121,24 @@ def prepared_window(main_window, monkeypatch):
         ylabel=first_species,
         all_species=series_map,
     )
-    return main_window, dataset_panel
+    return main_window, dataset_panel, tuple(species_names), series_map, t
 
 
 def test_csv_export_from_simulation_tab(tmp_path, prepared_window):
-    window, _dataset_panel = prepared_window
+    window, _dataset_panel, species_names, series_map, t = prepared_window
     csv_path = tmp_path / "simulation.csv"
     window._plot_tabs._tabs.setCurrentIndex(0)
     window.project_controller.handle_export_config(
         {"path": str(csv_path), "mode": "default", "scope": "all"}
     )
     assert csv_path.exists()
-
+    with csv_path.open(newline="") as handle:
+        rows = list(csv.reader(handle))
+    assert rows[0] == ["Time (s)"] + [f"[{name}]" for name in species_names]
+    assert rows[1] == [str(t[0])] + [str(series_map[name][0]) for name in species_names]
 
 def test_dataset_tab_csv_export(tmp_path, prepared_window):
-    window, dataset_panel = prepared_window
+    window, dataset_panel, _species_names, _series_map, _t = prepared_window
     csv_path = tmp_path / "dataset.csv"
     window._plot_tabs._tabs.setCurrentWidget(dataset_panel)
     window.project_controller.handle_export_config({"path": str(csv_path), "mode": "default", "scope": "all"})

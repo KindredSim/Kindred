@@ -15,8 +15,10 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
 
+from kindred.core.datasets.observation_payload import copy_observations_map, dense_view_from_observations
 from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
+from kindred.gui.display_name_policy import STATUS_ITEM_LABEL_MAX_CHARS, summarize_named_count
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +96,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         dataset_label_getter: Callable[[str], str],
         dataset_weight_getter: Callable[[str], float],
         persist_dataset_weight_callback: Callable[[str, float], None],
-        dataset_manager_getter: Callable[[], Any],
+        dataset_fit_settings_store_getter: Callable[[], Any],
         worker_running_getter: Callable[[], bool],
         modeled_series_getter: Optional[Callable[[], set[str]]] = None,
         parent: QtWidgets.QWidget | None = None,
@@ -106,7 +108,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._dataset_label_getter = dataset_label_getter
         self._dataset_weight_getter = dataset_weight_getter
         self._persist_dataset_weight_callback = persist_dataset_weight_callback
-        self._dataset_manager_getter = dataset_manager_getter
+        self._dataset_fit_settings_store_getter = dataset_fit_settings_store_getter
         self._worker_running_getter = worker_running_getter
 
         self._mechanism_species: list[str] = list(mechanism_species)
@@ -129,7 +131,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._ic_pending: Dict[str, Dict[str, dict[str, object]]] = {}
         self._ic_applied: Dict[str, Dict[str, dict[str, object]]] = {}
         self._ic_error_text: Optional[str] = None
-        self._seed_all_ic_state_from_dataset_manager()
+        self._seed_all_ic_state_from_fit_settings_store()
 
         self._ic_editor_dirty = False
         self._ic_editor_is_refreshing = False
@@ -212,10 +214,18 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             ds_id = str(entry.get("id") or "").strip()
             if not ds_id:
                 continue
-            t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1)
+            observations = (
+                copy_observations_map(entry.get("observations"))
+                if isinstance(entry.get("observations"), dict)
+                else {}
+            )
+            if observations:
+                t_values, raw_series = dense_view_from_observations(observations)
+            else:
+                t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1)
+                raw_series = entry.get("species_data") or entry.get("species") or {}
             if t_values.size == 0:
                 continue
-            raw_series = entry.get("species_data") or entry.get("species") or {}
             series_map: Dict[str, np.ndarray] = {}
             parse_failures: List[str] = []
             if isinstance(raw_series, dict):
@@ -232,8 +242,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                                 "Skipping invalid fit-target series '%s' for dataset '%s': %s",
                                 key, ds_id, exc, exc_info=True,
                             )
-                        continue
-                    if arr.size != t_values.size:
                         continue
                     series_map[key] = arr
 
@@ -262,7 +270,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._fit_target_weights_pending_invalid: Dict[str, Dict[str, str]] = {}
         self._fit_targets_dirty = False
 
-    def _seed_all_ic_state_from_dataset_manager(self) -> None:
+    def _seed_all_ic_state_from_fit_settings_store(self) -> None:
         self._ic_pending = {}
         self._ic_applied = {}
         for ds_id in self._fit_targets_available_by_dataset.keys():
@@ -313,17 +321,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         ds_id = str(dataset_id or "").strip()
         if not ds_id:
             return
-        settings = None
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is not None and hasattr(dataset_manager, "get_fit_settings"):
-            try:
-                settings = dataset_manager.get_fit_settings(ds_id)
-            except Exception:
-                settings = None
-        initials = dict(getattr(settings, "initial_conditions", {}) or {}) if settings is not None else {}
-        fit_flags = dict(getattr(settings, "fit_flags", {}) or {}) if settings is not None else {}
-        log10_flags = dict(getattr(settings, "log10_flags", {}) or {}) if settings is not None else {}
-        bounds_map = dict(getattr(settings, "bounds", {}) or {}) if settings is not None else {}
+        settings_store = self._dataset_fit_settings_store_getter()
+        if settings_store is None:
+            raise RuntimeError("Dataset fit settings store unavailable; cannot seed fitting initial conditions.")
+        settings = settings_store.get_fit_settings(ds_id)
+        initials = dict(getattr(settings, "initial_conditions", {}) or {})
+        fit_flags = dict(getattr(settings, "fit_flags", {}) or {})
+        log10_flags = dict(getattr(settings, "log10_flags", {}) or {})
+        bounds_map = dict(getattr(settings, "bounds", {}) or {})
 
         seeded = {
             str(species): self._ic_entry_from_settings_maps(
@@ -560,9 +565,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._bulk_invert_button = QtWidgets.QPushButton("Invert", group)
         self._bulk_invert_button.setObjectName("global_fit_fit_targets_bulk_invert")
         self._bulk_invert_button.clicked.connect(lambda: self._apply_bulk_action("invert"))
+        self._copy_targets_button = QtWidgets.QPushButton("Copy Targets to Compatible", group)
+        self._copy_targets_button.setObjectName("global_fit_fit_targets_copy_compatible")
+        self._copy_targets_button.clicked.connect(self._copy_targets_to_compatible_datasets)
         bulk_row.addWidget(self._bulk_all_button)
         bulk_row.addWidget(self._bulk_none_button)
         bulk_row.addWidget(self._bulk_invert_button)
+        bulk_row.addWidget(self._copy_targets_button)
         bulk_row.addStretch(1)
         self._footer.body_layout.addLayout(bulk_row)
 
@@ -678,6 +687,53 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._fit_targets_selection_pending[ds_id] = updated
         self._sync_visible_include_states()
         self._update_combined_dirty_state()
+
+    def _copy_targets_to_compatible_datasets(self) -> None:
+        source_id = str(self._current_dataset_id or "").strip()
+        if not source_id:
+            return
+        selected = {
+            str(name)
+            for name in self._fit_targets_selection_pending.get(source_id, set())
+            if str(name).strip()
+        }
+        if not selected:
+            self.statusMessage.emit("No targets selected to copy")
+            return
+
+        included_ids = [
+            str(ds_id)
+            for ds_id in (self._included_dataset_ids_getter() or [])
+            if str(ds_id).strip() and str(ds_id) != source_id
+        ]
+        copied: list[str] = []
+        skipped: dict[str, list[str]] = {}
+        for ds_id in included_ids:
+            available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
+            missing = sorted(selected - available)
+            if missing:
+                skipped[ds_id] = missing
+                continue
+            self._fit_targets_selection_pending[str(ds_id)] = set(selected)
+            copied.append(str(ds_id))
+
+        self._sync_visible_include_states()
+        self._update_combined_dirty_state()
+        self.statusMessage.emit(self._copy_targets_status_message(copied, skipped))
+
+    @staticmethod
+    def _copy_targets_status_message(copied: Sequence[str], skipped: Dict[str, list[str]]) -> str:
+        copied_count = len(list(copied or ()))
+        skipped_count = len(dict(skipped or {}))
+        dataset_word = "dataset" if copied_count == 1 else "datasets"
+        message = f"Copied targets to {copied_count} {dataset_word}"
+        if skipped_count:
+            first_missing = next(iter(dict(skipped).values()), [])
+            first = ", ".join(str(name) for name in first_missing[:2])
+            extra = len(first_missing) - min(len(first_missing), 2)
+            missing_summary = first + (f" + {extra} more" if extra > 0 else "")
+            message += f"; skipped {skipped_count} missing {missing_summary}"
+        return message
 
     # ------------------------------------------------------------------
     # Table population
@@ -993,10 +1049,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         current = str(getattr(self, "_current_dataset_id", "") or "").strip()
         target_error: Optional[str] = None
         if current and current in invalid_pending:
-            label = self._dataset_label_getter(current)
+            label = str(self._dataset_label_getter(current) or current).strip() or current
             target_error = f"Dataset {label} has no fit targets. Select at least one series or uncheck Use."
         elif current and current in invalid_pending_weights:
-            label = self._dataset_label_getter(current)
+            label = str(self._dataset_label_getter(current) or current).strip() or current
             target_error = f"Dataset {label} has invalid target weights. Use finite values > 0."
 
         if target_error:
@@ -1007,12 +1063,23 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._footer.set_error(None)
 
         if invalid_applied:
-            labels = [self._dataset_label_getter(ds_id) for ds_id in sorted(invalid_applied)]
-            joined = ", ".join(labels)
-            message = (
-                f"Run Fit disabled: {joined} has no applied fit targets. Select targets and Apply, or uncheck Use."
+            def _identity(ds_id: str) -> str:
+                label = str(self._dataset_label_getter(ds_id) or ds_id).strip() or ds_id
+                return f"{label} [{ds_id}]" if label != ds_id else ds_id
+
+            summary = summarize_named_count(
+                [_identity(ds_id) for ds_id in sorted(invalid_applied)],
+                singular="dataset",
+                item_max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
             )
-            self._footer.set_secondary_error(message)
+            message = (
+                f"Run Fit disabled: {summary.display} has no applied fit targets. Select targets and Apply, or uncheck Use."
+            )
+            tooltip = (
+                f"Run Fit disabled: {summary.full}\n\n"
+                "No applied fit targets. Select targets and Apply, or uncheck Use."
+            )
+            self._footer.set_secondary_error(message, tooltip_text=tooltip)
         else:
             self._footer.set_secondary_error(None)
 
@@ -1097,14 +1164,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             if hasattr(self, "_footer"):
                 self._footer.set_error(self._ic_error_text)
             return "failed"
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is None or not hasattr(dataset_manager, "get_fit_settings") or not hasattr(dataset_manager, "update_fit_settings"):
-            self._ic_error_text = "Dataset manager unavailable; cannot persist Initial Conditions."
+        settings_store = self._dataset_fit_settings_store_getter()
+        if settings_store is None:
+            self._ic_error_text = "Dataset fit settings store unavailable; cannot persist Initial Conditions."
             if hasattr(self, "_footer"):
                 self._footer.set_error(self._ic_error_text)
             return "failed"
         try:
-            settings = dataset_manager.get_fit_settings(ds_id)
+            settings = settings_store.get_fit_settings(ds_id)
         except Exception:
             self._ic_error_text = f"Failed to load fit settings for dataset {ds_id}."
             if hasattr(self, "_footer"):
@@ -1137,7 +1204,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         settings.log10_flags = log10_flags
         settings.bounds = bounds_map
         try:
-            dataset_manager.update_fit_settings(ds_id, settings)
+            settings_store.update_fit_settings(ds_id, settings)
         except Exception:
             self._ic_error_text = f"Failed to persist fit settings for dataset {ds_id}."
             if hasattr(self, "_footer"):
@@ -1195,7 +1262,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             }
             self._fit_target_weights_pending_invalid = {}
 
-        self._seed_all_ic_state_from_dataset_manager()
+        self._seed_all_ic_state_from_fit_settings_store()
         self._ic_editor_dirty = False
         self._clear_ic_error()
         self._populate_table()
@@ -1225,17 +1292,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     def _initial_parameter_defaults_for_species(self, dataset_id: str, species: str):
         ds_id = str(dataset_id or "").strip()
-        settings = None
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is not None and hasattr(dataset_manager, "get_fit_settings"):
-            try:
-                settings = dataset_manager.get_fit_settings(ds_id)
-            except Exception:
-                settings = None
-        initials = dict(getattr(settings, "initial_conditions", {}) or {}) if settings is not None else {}
-        fit_flags = dict(getattr(settings, "fit_flags", {}) or {}) if settings is not None else {}
-        log10_flags = dict(getattr(settings, "log10_flags", {}) or {}) if settings is not None else {}
-        bounds_map = dict(getattr(settings, "bounds", {}) or {}) if settings is not None else {}
+        settings_store = self._dataset_fit_settings_store_getter()
+        if settings_store is None:
+            raise RuntimeError("Dataset fit settings store unavailable; cannot read fitting initial conditions.")
+        settings = settings_store.get_fit_settings(ds_id)
+        initials = dict(getattr(settings, "initial_conditions", {}) or {})
+        fit_flags = dict(getattr(settings, "fit_flags", {}) or {})
+        log10_flags = dict(getattr(settings, "log10_flags", {}) or {})
+        bounds_map = dict(getattr(settings, "bounds", {}) or {})
 
         state = self._ic_entry_from_settings_maps(
             str(species),
@@ -1403,7 +1467,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         if mechanism_changed:
             self._mechanism_species = list(species)
-            self._seed_all_ic_state_from_dataset_manager()
+            self._seed_all_ic_state_from_fit_settings_store()
             self._ic_editor_dirty = False
             self._clear_ic_error()
 
@@ -1413,7 +1477,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._populate_table()
         self._update_combined_dirty_state()
 
-    def refresh_dataset_combo(self, dataset_entries: list) -> None:
+    def refresh_dataset_entries(self, dataset_entries: list) -> None:
         self._dataset_entries = list(dataset_entries)
 
     def initial_parameter_defaults_for_species(self, dataset_id: str, species: str) -> tuple[bool, dict[str, float]]:
@@ -1433,6 +1497,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._footer.setEnabled(not running)
         for btn in (getattr(self, "_bulk_all_button", None),
                     getattr(self, "_bulk_none_button", None),
-                    getattr(self, "_bulk_invert_button", None)):
+                    getattr(self, "_bulk_invert_button", None),
+                    getattr(self, "_copy_targets_button", None)):
             if btn is not None:
                 btn.setEnabled(not running)

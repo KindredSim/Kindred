@@ -685,7 +685,7 @@ def compile_comp_spec(spec: CompSpec, *, output_energy_unit: str = "kJ/mol") -> 
             if not (math.isfinite(Kc) and Kc > 0.0):
                 raise ValueError("computed concentration-form equilibrium constant must be positive and finite")
 
-            kr = float(kf / Kc)
+            std_ratio = float(std_prod / std_react)
 
             def _fmt_side(sto: Dict[str, float]) -> str:
                 out: List[str] = []
@@ -702,7 +702,7 @@ def compile_comp_spec(spec: CompSpec, *, output_energy_unit: str = "kJ/mol") -> 
             equilibrium_lines.append(
                 "equilibrium: "
                 + f"{_fmt_side(rxn.reactants)} <-> {_fmt_side(rxn.products)}"
-                + f"; kf={kf:.17g}; kr={kr:.17g}; dG_eq={dG_eq_out:.12g}; cm_id={cm_id}"
+                + f"; kf={kf:.17g}; dG_eq={dG_eq_out:.12g}; cm_id={cm_id}; cm_std_ratio={std_ratio:.17g}"
             )
 
     # Build state definitions for TS channels (if any).
@@ -737,7 +737,7 @@ def compile_comp_spec(spec: CompSpec, *, output_energy_unit: str = "kJ/mol") -> 
 
     # Fast equilibria first (human-readable) then state network.
     if equilibrium_lines:
-        generated_lines.append("# Fast equilibria (no TS): explicit kf/kr satisfying detailed balance")
+        generated_lines.append("# Fast equilibria (no TS): kf + dG_eq + cm_std_ratio authority")
         generated_lines.extend(equilibrium_lines)
         generated_lines.append("")
 

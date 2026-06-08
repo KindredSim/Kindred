@@ -7,9 +7,9 @@ import math
 import logging
 from typing import List, Optional, Tuple, Dict, Any, Sequence
 
-import numpy as np
 from PySide6 import QtWidgets
 
+from kindred.core.analysis.global_fit_projection import FitRenderDatasetProjection
 from kindred.gui.plot_config import get_plot_panel_class
 # Direct imports required to avoid circular dependency with widgets/__init__.py
 from kindred.gui.widgets.grid_plot_view import GridPlotView
@@ -72,7 +72,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
             embed_analysis_tabs=bool(main_plot_embed_analysis_tabs),
             workspace_splitter_object_name="mainPlotWorkspaceSplitter",
             enable_axis_inversion_actions=True,
-            enable_canonical_ghost_toggle_action=True,
+            enable_reference_layer_toggle_action=True,
             enable_copy_visible_data_action=True,
         )
         self._main_plot.setObjectName("plotPanel")
@@ -204,13 +204,13 @@ class PlotTabsWidget(QtWidgets.QWidget):
         *,
         t,
         data_y,
-        model_x=None,
-        model_y=None,
         ylabel: str = "Concentration",
+        xlabel: str = "Time",
         all_species: Optional[Dict[str, Any]] = None,
+        observations: Optional[Dict[str, Any]] = None,
         chi_squared: Optional[float] = None,
         r_squared: Optional[float] = None,
-        model_series: Optional[Dict[str, Any]] = None,
+        fit_render_projection: Optional[FitRenderDatasetProjection] = None,
     ) -> DatasetPlotPanel:
         """
         Create or update a dataset tab using PlotTabsWidget-owned tab lookup and index bookkeeping.
@@ -219,30 +219,16 @@ class PlotTabsWidget(QtWidgets.QWidget):
         if panel is None:
             panel = self.add_dataset_tab(name, chi_squared=chi_squared, r_squared=r_squared)
 
-        if isinstance(model_series, dict) and model_series and model_x is not None:
-            panel.set_data(
-                t,
-                data_y,
-                model_x=None,
-                model_y=None,
-                xlabel="Time",
-                ylabel=ylabel,
-                all_species=all_species,
-            )
-            panel.plot_simulation_results(
-                np.asarray(model_x, dtype=float),
-                {str(k): np.asarray(v) for k, v in model_series.items()},
-            )
-        else:
-            panel.set_data(
-                t,
-                data_y,
-                model_x=model_x,
-                model_y=model_y,
-                xlabel="Time",
-                ylabel=ylabel,
-                all_species=all_species,
-            )
+        panel.set_data(
+            t,
+            data_y,
+            xlabel=xlabel,
+            ylabel=ylabel,
+            all_species=all_species,
+            observations=observations,
+        )
+        if fit_render_projection is not None:
+            panel.apply_fit_render_projection(fit_render_projection)
 
         tab_index = self._tabs.indexOf(panel)
         if tab_index != -1:

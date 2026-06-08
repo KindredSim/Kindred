@@ -1,0 +1,7 @@
+# title: Repeated oxidant aliquots
+# Adds small oxidant aliquots to reveal stepwise reagent-limited product formation.
+reaction: Substrate + Oxidant -> Product; k=0.6
+intervention_set1 = {
+  initial: Substrate=1.0, Oxidant=0.0, Product=0.0
+}
+intervention: op=pulse; species=Oxidant; start=0.5; every=1.25; count=4; amount=0.2

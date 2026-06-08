@@ -10,13 +10,17 @@ from __future__ import annotations
 import logging
 import math
 import numbers
-import re
 from typing import Dict, List, Optional
 
+from ..equilibrium_rate_authority import (
+    EquilibriumRateInputContext,
+    normalize_equilibrium_rate_authority,
+)
 from ..mechanism import Mechanism
 from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .errors import DSLError
+from .common import K_from_deltaG_eq
 from .parameter_namespace import _namespace_policy_from_step
 
 logger = logging.getLogger(__name__)
@@ -55,6 +59,7 @@ def build_mechanism_from_ir(
     steps = list(getattr(ir, "steps", []) or [])
     algebra_lines = list(getattr(ir, "algebra_lines", []) or [])
     temperature_schedule = getattr(ir, "temperature_schedule", None)
+    intervention_schedule = getattr(ir, "intervention_schedule", None)
 
     mechanism = Mechanism()
     MechanismMetadataView(
@@ -88,13 +93,6 @@ def build_mechanism_from_ir(
     for step_no, step in enumerate(steps, start=1):
         reactants = dict(getattr(step, "reactants", {}) or {})
         products = dict(getattr(step, "products", {}) or {})
-
-        # Build stoichiometry (products - reactants)
-        stoich: Dict[str, float] = {}
-        for sp, coef in reactants.items():
-            stoich[sp] = -float(coef)
-        for sp, coef in products.items():
-            stoich[sp] = stoich.get(sp, 0.0) + float(coef)
 
         model = str(getattr(step, "model", "Eyring") or "Eyring")
 
@@ -131,21 +129,21 @@ def build_mechanism_from_ir(
             user_kf_explicit = bool(getattr(step, "user_kf_explicit", False))
             user_kr_explicit = bool(getattr(step, "user_kr_explicit", False))
 
-            if Keq_input is not None and kr_val is not None and (user_kr_explicit ^ user_kf_explicit):
+            if Keq_input is not None and kr_val is not None and user_kf_explicit and not user_kr_explicit:
                 try:
                     Keq_in = float(Keq_input)
                 except Exception:
                     Keq_in = float("nan")
                 if math.isfinite(Keq_in) and abs(Keq_in) > 1e-30:
-                    # Deterministic policy so explicit Keq always has semantics:
-                    # - if only kr was explicitly provided, derive kf from kr and Keq
-                    # - otherwise derive kr from kf and Keq
-                    if user_kr_explicit and not user_kf_explicit:
-                        kf_val = kr_val * Keq_in
-                    else:
-                        kr_val = kf_val / Keq_in
+                    kr_val = kf_val / Keq_in
 
-            Keq = kf_val / kr_val if kr_val and kr_val != 0 else None
+            dG_eq_J = getattr(step, "dG_eq_J_per_mol", None)
+            if Keq_input is not None:
+                Keq_model_value = Keq_input
+            elif dG_eq_J is not None:
+                Keq_model_value = float(K_from_deltaG_eq(float(dG_eq_J), float(getattr(ir, "temperature_K"))))
+            else:
+                Keq_model_value = None
 
             forward_model: Optional[Dict[str, object]] = None
             if model == "Arrhenius" and getattr(step, "arrhenius_A", None) is not None and getattr(
@@ -178,36 +176,48 @@ def build_mechanism_from_ir(
                 if getattr(step, "standard_conc_M", None) is not None
                 else None,
             ).to_metadata()
+            if getattr(step, "cm_id", None) is not None:
+                eq_metadata["cm_id"] = str(getattr(step, "cm_id"))
+                if bool(getattr(step, "generated_computational_mode", False)):
+                    eq_metadata["authority_source"] = EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
+            if getattr(step, "cm_std_ratio", None) is not None:
+                eq_metadata["std_ratio"] = float(getattr(step, "cm_std_ratio"))
+            authority_context = (
+                EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE
+                if bool(getattr(step, "generated_computational_mode", False))
+                else EquilibriumRateInputContext.NORMALIZED_PUBLIC
+            )
+            authority = normalize_equilibrium_rate_authority(
+                kf=kf_val,
+                kr=kr_val,
+                Keq=Keq_model_value,
+                metadata=eq_metadata,
+                context=authority_context,
+            )
 
             eq_index = len(mechanism.equilibria)
-            mechanism.add_equilibrium(
+            mechanism._add_equilibrium_with_authority_context(
                 stoich_forward=reactants,
                 stoich_back=products,
-                Keq=Keq,
+                Keq=Keq_model_value,
                 kf=kf_val,
                 kr=kr_val,
                 fast=is_equilibrium,  # Mark "equilibrium:" lines as fast
                 metadata=eq_metadata,
+                authority_context=authority_context,
             )
         else:
             rxn_index = len(mechanism.reactions)
-            mechanism.add_reaction(stoich, rate=float(getattr(step, "kf")), overrides=rxn_overrides or None)
+            mechanism.add_reaction(
+                reactants=reactants,
+                products=products,
+                rate=float(getattr(step, "kf")),
+                overrides=rxn_overrides or None,
+            )
 
         # Record canonical step-index mapping for downstream layers (GUI/algebra/fitting).
         arrow = "<->" if is_equilibrium_step else "->"
         context = f"{_fmt_side(reactants)} {arrow} {_fmt_side(products)}"
-        has_Keq_param = namespace_policy.has_explicit_keq
-        derive_rate = None
-        if is_equilibrium_step and has_Keq_param:
-            user_kf_explicit = bool(getattr(step, "user_kf_explicit", False))
-            user_kr_explicit = bool(getattr(step, "user_kr_explicit", False))
-            if user_kf_explicit and user_kr_explicit:
-                derive_rate = None
-            elif user_kr_explicit and not user_kf_explicit:
-                derive_rate = "kf"
-            else:
-                derive_rate = "kr"
-
         entry: Dict[str, object] = {
             "step_index": int(step_no),
             "kind": namespace_policy.step_kind,
@@ -215,8 +225,7 @@ def build_mechanism_from_ir(
         }
         if is_equilibrium_step:
             entry["equilibrium_index"] = int(eq_index)
-            entry["has_Keq_param"] = bool(has_Keq_param)
-            entry["derive_rate"] = derive_rate
+            entry.update(authority.step_map_fields())
             entry["user_provided_kf"] = bool(getattr(step, "user_kf_explicit", False))
             entry["user_provided_kr"] = bool(getattr(step, "user_kr_explicit", False))
         else:
@@ -225,7 +234,7 @@ def build_mechanism_from_ir(
 
     mechanism.metadata["step_index_map"] = step_index_map
 
-    logger.info(
+    logger.debug(
         "Built mechanism from DSL reactions: %s species, %s reactions, %s equilibria",
         len(mechanism.species),
         len(mechanism.reactions),
@@ -234,7 +243,7 @@ def build_mechanism_from_ir(
 
     # Convert state network to additional reactions if present
     if getattr(net, "states")() or getattr(net, "edges")():
-        logger.info("Converting state network to reactions...")
+        logger.debug("Converting state network to reactions...")
         from .state_network_converter import convert_state_network_to_mechanism
 
         rxn_start = len(mechanism.reactions)
@@ -254,10 +263,17 @@ def build_mechanism_from_ir(
                 mechanism.add_species(sp_name, init_conc)
 
         for rxn in state_mechanism.reactions:
-            mechanism.add_reaction(rxn.stoich, rate=rxn.rate)
+            mechanism.add_reaction(
+                reactants=rxn.reactants,
+                products=rxn.products,
+                rate=rxn.rate,
+                rate_orders=rxn.rate_orders,
+                overrides=rxn.overrides,
+                record_step_index=False,
+            )
 
         for eq in state_mechanism.equilibria:
-            mechanism.add_equilibrium(
+            mechanism._add_equilibrium_with_authority_context(
                 stoich_forward=eq.stoich_forward,
                 stoich_back=eq.stoich_back,
                 Keq=eq.Keq,
@@ -265,10 +281,12 @@ def build_mechanism_from_ir(
                 kr=eq.kr,
                 fast=eq.fast,
                 metadata=getattr(eq, "metadata", None) or None,
+                record_step_index=False,
+                authority_context=EquilibriumRateInputContext.GENERATED_STATE_NETWORK,
             )
 
         # Safety guard: state-network generated steps do not participate in canonical step indexing
-        _CANON = re.compile(r"^(k|kf|kr|Keq)\d+$")
+        from kindred.core.simulator.parameter_namespace import is_protected_indexed_identifier
 
         def _fail(reason: str) -> None:
             raise DSLError(
@@ -282,7 +300,7 @@ def build_mechanism_from_ir(
             if val is None:
                 return
             nm = getattr(val, "name", None)
-            if nm is not None and _CANON.match(str(nm)):
+            if nm is not None and is_protected_indexed_identifier(str(nm)):
                 _fail(f"{where} introduced a canonical-looking parameter name {nm!r}.")
             if callable(val):
                 _fail(f"{where} introduced a non-numeric binding/callable ({type(val).__name__}).")
@@ -302,7 +320,7 @@ def build_mechanism_from_ir(
             _check_value(getattr(eq, "kr", None), where=f"State-network equilibrium[{i}].kr")
             _check_value(getattr(eq, "Keq", None), where=f"State-network equilibrium[{i}].Keq")
 
-        logger.info(
+        logger.debug(
             "After state network integration: %s species, %s reactions, %s equilibria",
             len(mechanism.species),
             len(mechanism.reactions),
@@ -310,9 +328,27 @@ def build_mechanism_from_ir(
         )
 
     if algebra_lines:
-        mechanism.metadata[MechanismMetadataKeys.ALGEBRA_TEXT] = "\n".join(algebra_lines)
+        algebra_text = "\n".join(algebra_lines)
+        from kindred.core.algebra.simulation_series import compile_algebra_observables
+        from kindred.core.simulator.parameter_algebra import (
+            mechanism_parameter_namespace,
+            parse_parameter_algebra_spec_from_dsl_text,
+        )
+
+        mechanism_namespace = mechanism_parameter_namespace(mechanism)
+        parse_parameter_algebra_spec_from_dsl_text(
+            algebra_text,
+            mechanism_namespace=mechanism_namespace,
+        )
+        try:
+            compile_algebra_observables(algebra_text, mechanism_namespace=mechanism_namespace)
+        except ValueError as exc:
+            raise DSLError(str(exc)) from exc
+        mechanism.metadata[MechanismMetadataKeys.ALGEBRA_TEXT] = algebra_text
 
     if temperature_schedule is not None:
         mechanism.metadata[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = temperature_schedule
+    if intervention_schedule is not None:
+        mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE] = intervention_schedule
 
     return mechanism

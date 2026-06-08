@@ -46,9 +46,9 @@ reaction: S10 + S15 -> S23; k=0.1
 reaction: S16 + S19 -> S24; k=0.1
 
 # Reversible reactions
-equilibrium: S2 <-> S6; kf=1.0; K=1.5
-equilibrium: S3 <-> S11; kf=1.0; K=2.0
-equilibrium: S17 <-> S20; kf=1.0; K=1.2
+equilibrium: S2 <-> S6; kf=1.0; Keq=1.5
+equilibrium: S3 <-> S11; kf=1.0; Keq=2.0
+equilibrium: S17 <-> S20; kf=1.0; Keq=1.2
 
 # Bimolecular reactions
 reaction: S6 + S11 -> S16; k=0.5

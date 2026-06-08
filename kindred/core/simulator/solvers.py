@@ -12,7 +12,7 @@ SciPy is a hard dependency; all integration routes through `scipy.integrate.solv
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, fields
+from dataclasses import fields
 from typing import (
     Any,
     Callable,
@@ -21,15 +21,18 @@ from typing import (
     List,
     Mapping,
     Optional,
-    Protocol,
+    Sequence,
     Tuple,
     cast,
 )
 
 import numpy as np
 from kindred.core.scipy_integrate import load_scipy_integrate
+from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 
 from kindred.core.temperature import TemperatureScheduleDictProtocol, TemperatureScheduleProtocol
+from kindred.core.intervention_schedule import coerce_intervention_schedule
+from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 from kindred.core.exceptions import (
     InitialConditionError,
     SimulationCancelled,
@@ -37,29 +40,26 @@ from kindred.core.exceptions import (
     create_solver_error,
 )
 from kindred.core.time_grid import build_time_grid
-from .jacobian import JacobianConfig, compute_jacobian
+from .intervention_schedule_execution import (
+    InterventionScheduleExecutionOwner,
+    ScheduleExecutionRequest,
+    SegmentExecutionRequest,
+    SegmentRunResult,
+)
+from .solver_types import (
+    DEFAULT_SOLVER_NAME,
+    ODERhsNoTemp,
+    ODERhsWithTemp,
+    Rhs2,
+    SimulationOutput,
+    SimulationRequest,
+)
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_SOLVER_NAME = "Radau"
-
 
 def _solve_ivp(*, fun: Callable[[float, np.ndarray], np.ndarray], t_span: Tuple[float, float], y0: np.ndarray, **kwargs: Any):
     solve_ivp = load_scipy_integrate()
     return solve_ivp(fun=fun, t_span=t_span, y0=y0, **kwargs)
-
-
-class ODERhsNoTemp(Protocol):
-    def __call__(self, t: float, y: np.ndarray) -> np.ndarray: ...
-
-
-class ODERhsWithTemp(Protocol):
-    def __call__(self, t: float, y: np.ndarray, *, T: float) -> np.ndarray: ...
-
-
-ODERhs = ODERhsNoTemp | ODERhsWithTemp
-
-Rhs2 = Callable[[float, np.ndarray], np.ndarray]
 
 
 __all__ = [
@@ -72,84 +72,68 @@ __all__ = [
 ]
 
 
-@dataclass(frozen=True)
-class SimulationRequest:
-    rhs: ODERhs
-    t_span: Tuple[float, float]
-    y0: np.ndarray
-    solver: str = DEFAULT_SOLVER_NAME
-    rtol: float = 1e-6
-    atol: float = 1e-12
-    max_step: Optional[float] = None
-    first_step: Optional[float] = None
-    t_eval: Optional[np.ndarray] = None
-    grid: Optional[Mapping[str, float | int]] = None
-    rosenbrock_jacobian: JacobianConfig = JacobianConfig()
-    jacobian_func: Optional[Callable[[float, np.ndarray], np.ndarray]] = None
-    events: Optional[Iterable[Callable[[float, np.ndarray], float]]] = None
-    event_terminal: Optional[Iterable[bool]] = None
-    positivity: Optional[str] = None
-    pos_indices: Optional[Iterable[int]] = None
-
-    progress_callback: Optional[Callable[[float, float, float], None]] = None
-    temperature_schedule: TemperatureScheduleProtocol | None = None
-
-
-@dataclass(frozen=True)
-class SimulationOutput:
-    t: np.ndarray
-    Y: np.ndarray
-    provenance: Dict[str, object]
-    fallback_occurred: bool = False
-    fallback_message: Optional[str] = None
+def _normal_event_states(raw_states: object, *, count: int, species_count: int) -> list[list[np.ndarray]]:
+    states: list[list[np.ndarray]] = [[] for _ in range(max(0, int(count)))]
+    if raw_states is None or count <= 0:
+        return states
+    if not isinstance(raw_states, Sequence):
+        return states
+    for idx in range(min(int(count), len(raw_states))):
+        raw = raw_states[idx]
+        arr = np.asarray(raw, dtype=float)
+        if arr.size == 0:
+            continue
+        if arr.ndim == 1:
+            if int(species_count) == 1:
+                arr = arr.reshape(-1, 1)
+            elif arr.size == int(species_count):
+                arr = arr.reshape(1, int(species_count))
+            else:
+                continue
+        elif arr.ndim != 2:
+            try:
+                arr = arr.reshape(-1, int(species_count))
+            except Exception:
+                continue
+        states[idx] = [np.asarray(row, dtype=float).reshape(-1) for row in arr]
+    return states
 
 
-def _scipy_method_for(name: str) -> Tuple[str, Optional[str]]:
+def _attach_event_states(
+    output: SimulationOutput,
+    *,
+    raw_states: object,
+    count: int,
+    species_count: int,
+) -> SimulationOutput:
+    object.__setattr__(
+        output,
+        "_kindred_event_states",
+        _normal_event_states(raw_states, count=count, species_count=species_count),
+    )
+    return output
+
+
+def _scipy_method_for(name: object) -> Tuple[str, Optional[str]]:
     """Map solver name to SciPy method name with correct capitalization."""
-    n = name.upper()
+    n = str(name or "").strip().upper()
     scipy_methods = {
-        "LSODA": "LSODA",
         "RADAU": "Radau",
         "BDF": "BDF",
     }
     if n in scipy_methods:
         return scipy_methods[n], None
-    if n in ("ROS3", "ROS4"):
-        return DEFAULT_SOLVER_NAME, f"{n} deprecated; using {DEFAULT_SOLVER_NAME}"
     return DEFAULT_SOLVER_NAME, f"Unknown solver name; using {DEFAULT_SOLVER_NAME}"
 
 
-def normalize_solver_name(name: str) -> Tuple[str, Optional[str]]:
+def normalize_solver_name(name: object) -> Tuple[str, Optional[str]]:
     """
     Normalize a user-specified solver name to a SciPy `solve_ivp` method name.
 
-    Returns (method, warning). The warning is non-empty when a deprecated/unknown
+    Returns (method, warning). The warning is non-empty when an unknown
     name is mapped to a supported solver.
     """
     return _scipy_method_for(name)
-
-
-def _unpack_banded_jacobian(J: np.ndarray, *, ml: int, mu: int) -> np.ndarray:
-    n = J.shape[1]
-    Jd = np.zeros((n, n), float)
-    for j in range(n):
-        i_min = max(0, j - mu)
-        i_max = min(n - 1, j + ml)
-        band_rows = slice(mu + i_min - j, mu + i_max - j + 1)
-        Jd[i_min : i_max + 1, j] = J[band_rows, j]
-    return Jd
-
-
-def _make_scipy_jac(rhs: Callable[[float, np.ndarray], np.ndarray], cfg: "JacobianConfig"):
-    def jac(t: float, y: np.ndarray) -> np.ndarray:
-        J, kind = compute_jacobian(rhs, t, y, cfg=cfg)
-        J_arr = np.asarray(J, dtype=float)
-        if kind.startswith("banded("):
-            ml, mu = cfg.validate_for(J_arr.shape[1])
-            return _unpack_banded_jacobian(J_arr, ml=ml, mu=mu)
-        return J_arr
-
-    return jac
 
 
 class _TemperatureInjectedRhs:
@@ -225,6 +209,11 @@ def _prepare_rhs(req: SimulationRequest, *, t0: float, t1: float) -> tuple[Rhs2,
 
 
 def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
+    symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+        jacobian_func=req.jacobian_func,
+        jac_sparsity=req.jac_sparsity,
+        status=req.symbolic_jacobian_status,
+    )
     prov: Dict[str, object] = {
         "solver_requested": req.solver,
         "rtol": float(req.rtol),
@@ -238,11 +227,35 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
             "ml": getattr(req.rosenbrock_jacobian, "ml", None),
             "mu": getattr(req.rosenbrock_jacobian, "mu", None),
         },
-        "custom_jacobian": bool(req.jacobian_func),
         "positivity": (req.positivity or None),
         "pos_indices": (list(req.pos_indices) if req.pos_indices is not None else None),
         "has_temperature_schedule": req.temperature_schedule is not None,
     }
+    prov.update(symbolic_jacobian.provenance_fields())
+    prov["jacobian_sparsity_hint"] = req.jac_sparsity is not None
+    if isinstance(req.symbolic_wegscheider_identity, Mapping) and req.symbolic_wegscheider_identity:
+        prov["symbolic_wegscheider_identity"] = dict(req.symbolic_wegscheider_identity)
+    schedule = coerce_intervention_schedule(req.intervention_schedule)
+    prov["has_intervention_schedule"] = schedule is not None
+    if schedule is not None:
+        compiled_schedule = compile_intervention_schedule(schedule)
+        prov["intervention_schedule_declarative"] = compiled_schedule.normalized_declarative_payload
+        prov["intervention_schedule_declarative_fingerprint"] = compiled_schedule.declarative_fingerprint
+        prov["intervention_schedule_executable"] = compiled_schedule.executable_payload
+        prov["intervention_schedule_executable_fingerprint"] = compiled_schedule.executable_fingerprint
+        if compiled_schedule.lineage:
+            prov["intervention_schedule_lineage"] = [dict(item) for item in compiled_schedule.lineage]
+        metadata = compiled_schedule.provenance.get("metadata")
+        if isinstance(metadata, Mapping):
+            prov["intervention_schedule_metadata"] = dict(metadata)
+        primitive_metadata = compiled_schedule.provenance.get("primitive_metadata")
+        if isinstance(primitive_metadata, Sequence) and not isinstance(primitive_metadata, (str, bytes)):
+            entries = [dict(item) for item in primitive_metadata if isinstance(item, Mapping)]
+            if entries:
+                prov["intervention_schedule_primitive_metadata"] = entries
+        prov["intervention_schedule_metadata_uses_internal_numeric_values"] = bool(
+            compiled_schedule.provenance.get("metadata_uses_internal_numeric_values")
+        )
 
     if req.temperature_schedule is not None:
         if isinstance(req.temperature_schedule, TemperatureScheduleDictProtocol):
@@ -256,11 +269,31 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
     return prov
 
 
+def _scrub_unused_jacobian_provenance(
+    prov: Dict[str, object],
+    *,
+    method: str,
+    req: SimulationRequest,
+) -> None:
+    if str(method) in {"Radau", "BDF"}:
+        return
+    disabled_symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+        jacobian_func=req.jacobian_func,
+        jac_sparsity=req.jac_sparsity,
+        status=req.symbolic_jacobian_status,
+    ).with_runtime_disabled(
+        partially=False,
+        code="non-implicit-solver",
+        reason=f"Symbolic Jacobian disabled because solver {method} does not consume Jacobian callables.",
+    )
+    prov.pop("symbolic_jacobian_identity", None)
+    prov.update(disabled_symbolic_jacobian.provenance_fields())
+
+
 def _implicit_scipy_alternatives(primary: str) -> List[str]:
     order = {
-        "LSODA": ["Radau", "BDF"],
-        "Radau": ["BDF"],
         "BDF": ["Radau"],
+        "Radau": ["BDF"],
     }
     return [m for m in order.get(primary, []) if m != primary]
 
@@ -281,6 +314,21 @@ def _apply_positivity_to_trajectory(
         if 0 <= jj < Y2.shape[0]:
             Y2[jj, :] = np.maximum(Y2[jj, :], 0.0)
     return Y2
+
+
+def _solver_trajectory_array(sol_y: object, *, y0: np.ndarray, t_out: np.ndarray) -> np.ndarray:
+    sample_count = int(np.asarray(t_out, dtype=float).reshape(-1).size)
+    species_count = int(np.asarray(y0, dtype=float).reshape(-1).size)
+    Y = np.asarray(sol_y, dtype=float)
+    if Y.ndim == 2:
+        return Y
+    if sample_count == 0:
+        return np.empty((species_count, 0), dtype=float)
+    if Y.ndim == 1 and species_count == 1 and Y.size == sample_count:
+        return Y.reshape(1, sample_count)
+    if Y.ndim == 1 and sample_count == 1 and Y.size == species_count:
+        return Y.reshape(species_count, 1)
+    return Y.reshape(species_count, sample_count)
 
 
 def _execute_scipy(
@@ -304,13 +352,15 @@ def _execute_scipy(
         base_kwargs["max_step"] = float(req.max_step)
     if req.first_step is not None:
         base_kwargs["first_step"] = float(req.first_step)
-    events_list: Optional[List[Callable[[float, np.ndarray], float]]] = None
-    if req.events is not None:
-        events_list = list(req.events)
+    events_list = _event_callables_for_request(req)
+    if events_list is not None:
         base_kwargs["events"] = events_list
 
-    jac_callable = req.jacobian_func or _make_scipy_jac(rhs_for_jac, req.rosenbrock_jacobian)
+    jac_callable = req.jacobian_func
+    jac_sparsity = req.jac_sparsity
     banded_jacobian_active = (
+        jac_callable is not None
+        and
         getattr(req.rosenbrock_jacobian, "mode", None) == "banded"
         and req.rosenbrock_jacobian.ml is not None
         and req.rosenbrock_jacobian.mu is not None
@@ -319,12 +369,14 @@ def _execute_scipy(
     def _kwargs_for_method(method_name: str) -> Dict[str, Any]:
         kwargs = dict(base_kwargs)
         kwargs["method"] = method_name
-        if method_name in ("Radau", "BDF"):
+        if method_name in ("Radau", "BDF") and jac_callable is not None:
             kwargs["jac"] = jac_callable
             if banded_jacobian_active:
                 # SciPy implicit solvers expect an n x n Jacobian when a jac
                 # callable is supplied; jac_sparsity is ignored in that case.
                 kwargs.pop("jac_sparsity", None)
+        elif method_name in ("Radau", "BDF") and jac_sparsity is not None:
+            kwargs["jac_sparsity"] = jac_sparsity
         else:
             kwargs.pop("jac", None)
             kwargs.pop("jac_sparsity", None)
@@ -395,19 +447,118 @@ def _execute_scipy(
     prov["solver_used"] = method
     t_out = np.asarray(sol.t, float)
     Y_out = _apply_positivity_to_trajectory(
-        np.asarray(sol.y, float),
+        _solver_trajectory_array(sol.y, y0=y0, t_out=t_out),
         mode=req.positivity,
         indices=(list(req.pos_indices) if req.pos_indices is not None else None),
     )
     if hasattr(sol, "t_events") and sol.t_events:
         prov["events"] = [list(te) for te in sol.t_events]
-    return SimulationOutput(
+    output = SimulationOutput(
         t=t_out,
         Y=Y_out,
         provenance=prov,
         fallback_occurred=fallback_occurred,
         fallback_message=fallback_message,
     )
+    return _attach_event_states(
+        output,
+        raw_states=getattr(sol, "y_events", None),
+        count=len(events_list or ()),
+        species_count=int(np.asarray(y0, dtype=float).reshape(-1).size),
+    )
+
+
+def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
+    output = _execute_scipy(
+        request.request,
+        rhs=request.rhs,
+        rhs_for_jac=request.rhs_for_jac,
+        t0=request.t0,
+        t1=request.t1,
+        y0=request.y0,
+        t_eval=request.t_eval,
+        prov=request.provenance,
+        method=request.method,
+        note=request.note,
+    )
+    events = output.provenance.get("events")
+    return SegmentRunResult(
+        output=output,
+        event_times=_normal_event_provenance(events, count=len(_event_callables_for_request(request.request) or ())),
+        event_states=_normal_event_states(
+            getattr(output, "_kindred_event_states", None),
+            count=len(_event_callables_for_request(request.request) or ()),
+            species_count=int(np.asarray(request.y0, dtype=float).reshape(-1).size),
+        ),
+        solver_used=str(output.provenance.get("solver_used") or request.method),
+        solver_alternative_used=(
+            str(output.provenance["solver_alternative_used"])
+            if output.provenance.get("solver_alternative_used")
+            else None
+        ),
+        fallback_occurred=bool(output.fallback_occurred),
+        fallback_message=output.fallback_message,
+        symbolic_jacobian_used=bool(output.provenance.get("symbolic_jacobian")),
+        jacobian_sparsity_hint=bool(output.provenance.get("jacobian_sparsity_hint")),
+    )
+
+
+def _event_terminal_flags(
+    req: SimulationRequest,
+    events: Sequence[Callable[[float, np.ndarray], float]],
+) -> list[bool]:
+    explicit = [] if req.event_terminal is None else list(req.event_terminal)
+    flags: list[bool] = []
+    for idx, event in enumerate(events):
+        if idx < len(explicit):
+            flags.append(bool(explicit[idx]))
+        else:
+            flags.append(bool(getattr(event, "terminal", False)))
+    return flags
+
+
+def _event_callables_for_request(req: SimulationRequest) -> Optional[List[Callable[[float, np.ndarray], float]]]:
+    if req.events is None:
+        return None
+    raw_events = list(req.events)
+    terminal_flags = _event_terminal_flags(req, raw_events)
+    event_callables: List[Callable[[float, np.ndarray], float]] = []
+    for idx, event in enumerate(raw_events):
+        terminal = bool(terminal_flags[idx]) if idx < len(terminal_flags) else bool(getattr(event, "terminal", False))
+
+        def _wrapped_event(t: float, y: np.ndarray, _event=event) -> float:
+            return float(_event(t, y))
+
+        _wrapped_event.terminal = terminal  # type: ignore[attr-defined]
+        if hasattr(event, "direction"):
+            _wrapped_event.direction = getattr(event, "direction")  # type: ignore[attr-defined]
+        if bool(getattr(event, "_kindred_cancel_event", False)):
+            _wrapped_event._kindred_cancel_event = True  # type: ignore[attr-defined]
+            cancelled_cb = getattr(event, "_kindred_cancelled", None)
+            if callable(cancelled_cb):
+                _wrapped_event._kindred_cancelled = cancelled_cb  # type: ignore[attr-defined]
+        event_callables.append(_wrapped_event)
+    return event_callables
+
+
+def _normal_event_provenance(
+    events: object,
+    *,
+    count: int,
+) -> list[list[float]]:
+    out = [[] for _ in range(max(0, int(count)))]
+    if not isinstance(events, Sequence):
+        return out
+    for idx, raw in enumerate(events):
+        if idx >= len(out):
+            break
+        try:
+            out[idx].extend(float(value) for value in raw)  # type: ignore[union-attr]
+        except TypeError:
+            continue
+    return out
+
+
 
 def _request_from_mapping(payload: Mapping[str, Any], *, allow_unknown_keys: bool) -> SimulationRequest:
     field_names = {f.name for f in fields(SimulationRequest)}
@@ -437,6 +588,26 @@ def solve_ode(req: SimulationRequest | Mapping[str, Any], *, allow_unknown_keys:
     prov = _build_provenance(req, t_eval=t_eval)
 
     method, note = _scipy_method_for(req.solver)
+    _scrub_unused_jacobian_provenance(prov, method=method, req=req)
+    schedule = coerce_intervention_schedule(req.intervention_schedule)
+    if schedule is not None:
+        compiled_schedule = compile_intervention_schedule(schedule)
+        if not compiled_schedule.executable_schedule.is_empty():
+            return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
+                ScheduleExecutionRequest(
+                    request=req,
+                    rhs=rhs,
+                    rhs_for_jac=rhs_for_jac,
+                    t0=t0,
+                    t1=t1,
+                    y0=y0,
+                    t_eval=t_eval,
+                    provenance=prov,
+                    method=method,
+                    note=note,
+                    schedule=compiled_schedule.executable_schedule,
+                )
+            )
     return _execute_scipy(
         req,
         rhs=rhs,

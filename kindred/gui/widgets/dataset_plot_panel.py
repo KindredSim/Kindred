@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal
 
+from kindred.core.analysis.global_fit_projection import FitRenderDatasetProjection
+from kindred.core.datasets.observation_payload import export_rows_from_observations
 from kindred.gui.plot_config import get_plot_panel_class
 
 logger = logging.getLogger(__name__)
@@ -59,8 +61,11 @@ class DatasetPlotPanel(QWidget):
 
         self._dataset_name = dataset_name
         self._dataset_data: Dict[str, np.ndarray] = {}
+        self._dataset_observations: Dict[str, Dict[str, np.ndarray]] = {}
+        self._projection_observations: Dict[str, Dict[str, np.ndarray]] = {}
         self._species_checkboxes: Dict[str, QCheckBox] = {}
         self._model_t: Optional[np.ndarray] = None
+        self._model_t_by_species: Dict[str, np.ndarray] = {}
         self._model_series: Dict[str, np.ndarray] = {}
         self._x_label = "Time"
         self._y_label = "Concentration"
@@ -153,13 +158,12 @@ class DatasetPlotPanel(QWidget):
         self,
         data_x: np.ndarray,
         data_y: np.ndarray,
-        model_x: Optional[np.ndarray] = None,
-        model_y: Optional[np.ndarray] = None,
         confidence_upper: Optional[np.ndarray] = None,
         confidence_lower: Optional[np.ndarray] = None,
         xlabel: str = "Time",
         ylabel: str = "Concentration",
         all_species: Optional[Dict[str, np.ndarray]] = None,
+        observations: Optional[Dict[str, object]] = None,
     ):
         """
         Set dataset data for visualization and simulation overlays.
@@ -168,8 +172,6 @@ class DatasetPlotPanel(QWidget):
         ----------
         data_x, data_y : np.ndarray
             Experimental data points
-        model_x, model_y : np.ndarray, optional
-            Model prediction (from fitting)
         confidence_upper, confidence_lower : np.ndarray, optional
             Confidence interval bands
         xlabel, ylabel : str
@@ -179,8 +181,19 @@ class DatasetPlotPanel(QWidget):
         """
         # Store the dataset data
         self._dataset_data = {"t": np.asarray(data_x, dtype=float)}
+        self._dataset_observations = {}
+        self._projection_observations = {}
         self._x_label = str(xlabel or "Time")
         self._y_label = "Concentration"
+
+        if observations:
+            for species_name, spec in observations.items():
+                if not isinstance(spec, dict):
+                    continue
+                self._dataset_observations[str(species_name)] = {
+                    "t": np.asarray(spec.get("t", []), dtype=float),
+                    "y": np.asarray(spec.get("y", []), dtype=float),
+                }
 
         if all_species:
             # Multi-species dataset
@@ -189,12 +202,15 @@ class DatasetPlotPanel(QWidget):
         else:
             # Single species dataset
             self._dataset_data[str(ylabel)] = np.asarray(data_y, dtype=float)
+            if not self._dataset_observations:
+                self._dataset_observations[str(ylabel)] = {
+                    "t": np.asarray(data_x, dtype=float),
+                    "y": np.asarray(data_y, dtype=float),
+                }
 
         self._model_t = None
+        self._model_t_by_species = {}
         self._model_series = {}
-        if model_x is not None and model_y is not None:
-            self._model_t = np.asarray(model_x, dtype=float)
-            self._model_series = {str(ylabel): np.asarray(model_y, dtype=float)}
 
         # Create species checkboxes
         self._create_species_checkboxes()
@@ -204,7 +220,10 @@ class DatasetPlotPanel(QWidget):
     def reset_for_tab_close(self) -> None:
         """Clear panel-owned and backend-owned state before tab removal."""
         self._dataset_data = {}
+        self._dataset_observations = {}
+        self._projection_observations = {}
         self._model_t = None
+        self._model_t_by_species = {}
         self._model_series = {}
         self._clear_species_checkboxes()
         self._status_label.setText("Ready")
@@ -224,7 +243,10 @@ class DatasetPlotPanel(QWidget):
         self._clear_species_checkboxes()
 
         # Create checkbox for each species
-        species_names = [k for k in self._dataset_data.keys() if k != 't']
+        if self._dataset_observations:
+            species_names = list(self._dataset_observations.keys())
+        else:
+            species_names = [k for k in self._dataset_data.keys() if k != 't']
 
         for species_name in species_names:
             checkbox = QCheckBox(species_name)
@@ -243,21 +265,60 @@ class DatasetPlotPanel(QWidget):
             if bool(getattr(checkbox, "isChecked", lambda: False)())
         ]
 
+    def apply_fit_render_projection(self, projection: FitRenderDatasetProjection) -> None:
+        """Apply a typed fitting render projection as the dataset-tab fit overlay."""
+        if not isinstance(projection, FitRenderDatasetProjection):
+            return
+        if projection.status != "ok":
+            return
+        self._projection_observations = {
+            str(name): {
+                "t": projection.observed_x_for_species(str(name)),
+                "y": np.asarray(values, dtype=float).reshape(-1),
+            }
+            for name, values in projection.observed_series.items()
+            if str(name)
+        }
+        self._model_t = np.asarray(projection.model_x, dtype=float)
+        self._model_t_by_species = {
+            str(name): projection.model_x_for_species(str(name))
+            for name in projection.model_series.keys()
+            if str(name)
+        }
+        self._model_series = {
+            str(name): np.asarray(values, dtype=float)
+            for name, values in projection.model_series.items()
+        }
+        self._render_dataset_layers()
+
     def _render_dataset_layers(self) -> None:
         """Delegate dataset-tab rendering to the backend public contract."""
         if not self._dataset_data:
             return
-        t = np.asarray(self._dataset_data.get("t"), dtype=float).reshape(-1)
-        dataset_series = {
-            str(name): np.asarray(values, dtype=float).reshape(-1)
-            for name, values in self._dataset_data.items()
-            if name != "t"
-        }
+        active_observations = self._projection_observations or self._dataset_observations
+        if active_observations:
+            t = {
+                str(name): np.asarray(spec.get("t", []), dtype=float).reshape(-1)
+                for name, spec in active_observations.items()
+                if str(name)
+            }
+            dataset_series = {
+                str(name): np.asarray(spec.get("y", []), dtype=float).reshape(-1)
+                for name, spec in active_observations.items()
+                if str(name)
+            }
+        else:
+            t = np.asarray(self._dataset_data.get("t"), dtype=float).reshape(-1)
+            dataset_series = {
+                str(name): np.asarray(values, dtype=float).reshape(-1)
+                for name, values in self._dataset_data.items()
+                if name != "t"
+            }
         try:
             self._plot_panel.render_dataset_layers(
                 data_t=t,
                 dataset_series=dataset_series,
-                model_t=self._model_t,
+                model_t=self._model_t_by_species if self._model_t_by_species else self._model_t,
                 model_series=dict(self._model_series) if self._model_series else None,
                 visible_species=self._visible_species_names(),
                 xlabel=self._x_label,
@@ -283,6 +344,11 @@ class DatasetPlotPanel(QWidget):
     def _plot_simulation_results(self, t: np.ndarray, species_data: Dict[str, np.ndarray]):
         """Plot simulation results as lines for all species."""
         self._model_t = np.asarray(t, dtype=float)
+        self._model_t_by_species = {
+            str(name): np.asarray(t, dtype=float).reshape(-1)
+            for name in (species_data or {}).keys()
+            if str(name)
+        }
         self._model_series = {
             str(name): np.asarray(values, dtype=float)
             for name, values in (species_data or {}).items()
@@ -308,6 +374,10 @@ class DatasetPlotPanel(QWidget):
         dict or None
             {'t': np.ndarray, 'series': Dict[str, np.ndarray]}
         """
+        if self._projection_observations:
+            return {"observations": self._projection_observations, "x_header": self._x_label}
+        if self._dataset_observations:
+            return {"observations": self._dataset_observations, "x_header": "Time"}
         if not self._dataset_data or 't' not in self._dataset_data:
             return None
         t = np.asarray(self._dataset_data.get('t'))
@@ -324,6 +394,23 @@ class DatasetPlotPanel(QWidget):
         payload = self.export_payload()
         if not payload:
             raise ValueError("No dataset data available to export.")
+
+        if isinstance(payload.get("observations"), dict):
+            species_names = list(payload["observations"].keys())
+            if str(scope or "") == "axis":
+                visible = [
+                    name
+                    for name, cb in (self._species_checkboxes or {}).items()
+                    if bool(getattr(cb, "isChecked", lambda: False)())
+                ]
+                species_names = [name for name in species_names if name in visible]
+            header, rows = export_rows_from_observations(
+                payload["observations"],
+                species_names=species_names,
+            )
+            if header:
+                header[0] = str(payload.get("x_header") or self._x_label or "Time")
+            return header, rows
 
         t_values = np.asarray(payload.get("t"), dtype=float).reshape(-1)
         series = payload.get("series") or {}
@@ -345,9 +432,9 @@ class DatasetPlotPanel(QWidget):
         arrays = []
         for name in species_names:
             arr = np.asarray(series[name], dtype=float).reshape(-1)
-            if arr.shape[0] != t_values.shape[0]:
+            if arr.size != t_values.size:
                 raise ValueError(
-                    f"Series '{name}' length ({arr.shape[0]}) does not match time grid ({t_values.shape[0]})."
+                    f"Series '{name}' length ({arr.size}) does not match time axis length ({t_values.size})."
                 )
             arrays.append(arr)
 

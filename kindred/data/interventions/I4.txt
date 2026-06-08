@@ -1,0 +1,7 @@
+# title: Pseudo-first-order reagent reservoir
+# Holds an excess reagent constant so substrate decay reports pseudo-first-order kinetics.
+reaction: Substrate + Reagent -> Product; k=0.8
+intervention_set1 = {
+  initial: Substrate=1.0, Reagent=0.0, Product=0.0
+}
+intervention: op=reservoir; species=Reagent; start=0.0; end=4.0; value=10.0

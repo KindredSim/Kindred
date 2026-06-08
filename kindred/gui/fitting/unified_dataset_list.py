@@ -7,6 +7,8 @@ from typing import Optional
 from PySide6 import QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 
+from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label
+
 
 class _ValidationForegroundDelegate(QtWidgets.QStyledItemDelegate):
     """Paints item text using ForegroundRole color, bypassing stylesheet overrides."""
@@ -58,6 +60,8 @@ class UnifiedDatasetList(QtWidgets.QWidget):
 
         self._list = QtWidgets.QListWidget(self)
         self._list.setObjectName("global_fit_unified_dataset_list")
+        self._list.setUniformItemSizes(True)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._list.setItemDelegate(_ValidationForegroundDelegate(self._list))
         self._list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self._list.currentItemChanged.connect(self._on_current_item_changed)
@@ -93,9 +97,12 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         for entry in dataset_entries:
             ds_id = str(entry.get("id") or "").strip()
             label = str(entry.get("label", "") or "").strip() or str(ds_id)
+            compact = compact_dataset_label(label, max_chars=DATASET_LIST_LABEL_MAX_CHARS)
             include = entry.get("include", True)
-            item = QtWidgets.QListWidgetItem(label)
+            item = QtWidgets.QListWidgetItem(compact.display)
+            item.setToolTip(compact.full)
             item.setData(Qt.UserRole, ds_id)
+            item.setData(Qt.UserRole + 1, compact.full)
             item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             item.setCheckState(Qt.Checked if include else Qt.Unchecked)
             self._list.addItem(item)
