@@ -8,7 +8,6 @@ from PySide6.QtGui import QDoubleValidator
 
 from kindred.gui.display_name_policy import (
     DATASET_LIST_LABEL_MAX_CHARS,
-    DIAGNOSTIC_LABEL_MAX_CHARS,
     CompactText,
     compact_diagnostic_text,
     compact_text,

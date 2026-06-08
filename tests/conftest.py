@@ -141,9 +141,9 @@ def _cleanup_main_window(window) -> None:
     from PySide6 import QtCore, QtWidgets
 
     try:
-        window.simulation_controller.shutdown_batch_lane_pool(force_terminate=True)
+        window.simulation_controller.prepare_simulation_shutdown_for_close()
     except Exception as exc:
-        logger.debug("Failed to shutdown batch lane pool during test cleanup: %s", exc, exc_info=True)
+        logger.debug("Failed to prepare simulation shutdown during test cleanup: %s", exc, exc_info=True)
     # Stop preview-session timers before closing to prevent stale timer
     # callbacks from firing during teardown.
     try:
@@ -223,6 +223,8 @@ def _cleanup_main_window(window) -> None:
     for _ in range(5):
         app.processEvents()
 
+    _terminate_active_multiprocessing_children()
+
     assert QtWidgets.QApplication.activeModalWidget() is None
     assert QtWidgets.QApplication.activePopupWidget() is None
     extra_visible = [
@@ -231,6 +233,25 @@ def _cleanup_main_window(window) -> None:
         if getattr(w, "isVisible", lambda: False)()
     ]
     assert not extra_visible, f"Visible top-level widgets leaked: {extra_visible!r}"
+
+
+def _terminate_active_multiprocessing_children(*, timeout_s: float = 0.5) -> None:
+    if multiprocessing is None:
+        return
+    for child in multiprocessing.active_children():
+        try:
+            if child.is_alive():
+                child.terminate()
+            child.join(timeout=float(timeout_s))
+            if child.is_alive() and hasattr(child, "kill"):
+                child.kill()
+                child.join(timeout=float(timeout_s))
+        except Exception as exc:
+            logger.debug(
+                "Failed to terminate multiprocessing child during GUI test cleanup: %s",
+                exc,
+                exc_info=True,
+            )
 
 @pytest.fixture
 def main_window(qt_app, monkeypatch, tmp_path, request):
