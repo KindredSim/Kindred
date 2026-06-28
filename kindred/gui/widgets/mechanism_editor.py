@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import contextlib
+from typing import Callable, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
@@ -58,10 +59,139 @@ class _PersistentToggleMenu(QtWidgets.QMenu):
         super().mouseReleaseEvent(event)
 
 
+class _DraftAwarePlainTextEdit(QtWidgets.QPlainTextEdit):
+    """QPlainTextEdit that asks before user-originated mutations."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._mutation_intent_callback: Optional[Callable[[], bool]] = None
+
+    def set_mutation_intent_callback(self, callback: Optional[Callable[[], bool]]) -> None:
+        self._mutation_intent_callback = callback if callable(callback) else None
+
+    def _mutation_allowed(self) -> bool:
+        callback = self._mutation_intent_callback
+        if callback is None:
+            return True
+        return bool(callback())
+
+    def _document_undo_available(self) -> bool:
+        with contextlib.suppress(AttributeError, RuntimeError):
+            return bool(self.document().isUndoAvailable())
+        return False
+
+    def _document_redo_available(self) -> bool:
+        with contextlib.suppress(AttributeError, RuntimeError):
+            return bool(self.document().isRedoAvailable())
+        return False
+
+    def _key_event_may_edit(self, event: QtGui.QKeyEvent) -> bool:
+        if event.matches(QtGui.QKeySequence.StandardKey.Paste):
+            return bool(self.canPaste())
+        if event.matches(QtGui.QKeySequence.StandardKey.Cut):
+            return bool(self.textCursor().hasSelection())
+        with contextlib.suppress(AttributeError):
+            if event.matches(QtGui.QKeySequence.StandardKey.Delete):
+                return self._delete_key_can_mutate()
+        key = int(event.key())
+        if key == int(QtCore.Qt.Key.Key_Backspace):
+            return self._backspace_key_can_mutate()
+        if key == int(QtCore.Qt.Key.Key_Delete):
+            return self._delete_key_can_mutate()
+        if key in (
+            int(QtCore.Qt.Key.Key_Return),
+            int(QtCore.Qt.Key.Key_Enter),
+            int(QtCore.Qt.Key.Key_Tab),
+        ):
+            return True
+        modifiers = event.modifiers()
+        if modifiers & (
+            QtCore.Qt.KeyboardModifier.ControlModifier
+            | QtCore.Qt.KeyboardModifier.AltModifier
+        ):
+            return False
+        return bool(str(event.text() or ""))
+
+    def _backspace_key_can_mutate(self) -> bool:
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return True
+        return int(cursor.position()) > 0
+
+    def _delete_key_can_mutate(self) -> bool:
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return True
+        return int(cursor.position()) < len(str(self.toPlainText()))
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.matches(QtGui.QKeySequence.StandardKey.Undo):
+            if self._document_undo_available() and not self._mutation_allowed():
+                event.accept()
+                return
+            super().keyPressEvent(event)
+            return
+        if event.matches(QtGui.QKeySequence.StandardKey.Redo):
+            if self._document_redo_available() and not self._mutation_allowed():
+                event.accept()
+                return
+            super().keyPressEvent(event)
+            return
+        if self._key_event_may_edit(event) and not self._mutation_allowed():
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def undo(self) -> None:
+        if self._document_undo_available() and not self._mutation_allowed():
+            return
+        super().undo()
+
+    def redo(self) -> None:
+        if self._document_redo_available() and not self._mutation_allowed():
+            return
+        super().redo()
+
+    def inputMethodEvent(self, event: QtGui.QInputMethodEvent) -> None:
+        replacement_length = int(event.replacementLength())
+        mutates = (
+            bool(str(event.commitString() or ""))
+            or replacement_length > 0
+            or bool(self.textCursor().hasSelection())
+        )
+        if mutates and not self._mutation_allowed():
+            event.accept()
+            return
+        super().inputMethodEvent(event)
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        if event.mimeData() is not None and event.mimeData().hasText() and not self._mutation_allowed():
+            event.ignore()
+            return
+        super().dropEvent(event)
+
+    def insertFromMimeData(self, source: QtCore.QMimeData) -> None:
+        if source is not None and source.hasText() and not self._mutation_allowed():
+            return
+        super().insertFromMimeData(source)
+
+    def cut(self) -> None:
+        if self.textCursor().hasSelection() and not self._mutation_allowed():
+            return
+        super().cut()
+
+    def paste(self) -> None:
+        if self.canPaste() and not self._mutation_allowed():
+            return
+        super().paste()
+
+
 class MechanismEditorTabbed(QtWidgets.QWidget):
     speciesModeChanged = Signal(bool)
     speciesResetRequested = Signal()
     mechanismInspectRequested = Signal()
+    reactionsApplyRequested = Signal()
+    reactionsDiscardRequested = Signal()
     validationStateChanged = Signal(str)
 
     """
@@ -73,8 +203,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     Advanced features (Species Registry and State Network) are accessible via Edit menu.
 
-    The reaction text editor supports debounced updates (500ms) to prevent
-    lag during typing while maintaining live preview.
+    The reaction text editor is directly editable. MainWindow owns the
+    draft/apply/discard flow and validates only when changes are applied.
     """
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
@@ -89,7 +219,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         super().__init__(parent)
 
         self._current_validation_state = "idle"
-        self._reactions_edit_action: Optional[QtGui.QAction] = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -104,42 +233,43 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         # Text editor for DSL
         reactions_header_row = QtWidgets.QHBoxLayout()
-        self._reactions_edit_btn = QtWidgets.QPushButton()
-        self._reactions_edit_btn.setObjectName("reactionsEditGuardButton")
-        self._reactions_edit_btn.setCheckable(True)
-        self._reactions_edit_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
-        self._reactions_edit_btn.hide()
-        reactions_header_row.addWidget(self._reactions_edit_btn)
-        self.inspect_mechanism_btn = QtWidgets.QPushButton("Inspect...", self)
-        self.inspect_mechanism_btn.setObjectName("mechanismInspectorOpenButton")
-        self.inspect_mechanism_btn.setToolTip("Open a read-only Mechanism Inspector")
-        self.inspect_mechanism_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
-        self.inspect_mechanism_btn.clicked.connect(lambda _checked=False: self.mechanismInspectRequested.emit())
-        reactions_header_row.addWidget(self.inspect_mechanism_btn)
+        self._apply_reactions_btn = QtWidgets.QPushButton("Apply Changes", self)
+        self._apply_reactions_btn.setObjectName("reactionsApplyChangesButton")
+        self._apply_reactions_btn.setToolTip("Apply the Reactions draft to the authoritative mechanism")
+        self._apply_reactions_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
+        self._apply_reactions_btn.setEnabled(False)
+        self._apply_reactions_btn.clicked.connect(lambda _checked=False: self.reactionsApplyRequested.emit())
+        reactions_header_row.addWidget(self._apply_reactions_btn)
+        self._discard_reactions_btn = QtWidgets.QPushButton("Discard Changes", self)
+        self._discard_reactions_btn.setObjectName("reactionsDiscardChangesButton")
+        self._discard_reactions_btn.setToolTip("Restore Reactions text from the last applied mechanism")
+        self._discard_reactions_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
+        self._discard_reactions_btn.setEnabled(False)
+        self._discard_reactions_btn.clicked.connect(lambda _checked=False: self.reactionsDiscardRequested.emit())
+        reactions_header_row.addWidget(self._discard_reactions_btn)
         reactions_header_row.addStretch()
-        self._run_btn = QtWidgets.QPushButton("\u25b6 Run")
-        run_font = self._run_btn.font()
-        run_font.setPointSize(run_font.pointSize() + 2)
-        self._run_btn.setFont(run_font)
-        self._run_btn.setStyleSheet("QPushButton { padding: 6px 18px; }")
-        self._run_btn.setEnabled(False)
         self.symbolic_calculator_btn = QtWidgets.QPushButton("Σ", self)
         self.symbolic_calculator_btn.setObjectName("symbolicCalculatorOpenButton")
         self.symbolic_calculator_btn.setToolTip("Open the Symbolic Calculator panel")
         self.symbolic_calculator_btn.setStyleSheet("QPushButton { padding: 6px 12px; }")
         self.symbolic_calculator_btn.setEnabled(False)
         reactions_header_row.addWidget(self.symbolic_calculator_btn)
+        self.inspect_mechanism_btn = QtWidgets.QPushButton("Inspect...", self)
+        self.inspect_mechanism_btn.setObjectName("mechanismInspectorOpenButton")
+        self.inspect_mechanism_btn.setToolTip("Open a read-only Mechanism Inspector")
+        self.inspect_mechanism_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
+        self.inspect_mechanism_btn.clicked.connect(lambda _checked=False: self.mechanismInspectRequested.emit())
+        reactions_header_row.addWidget(self.inspect_mechanism_btn)
+        self._run_btn = QtWidgets.QPushButton("Run")
+        run_font = self._run_btn.font()
+        run_font.setPointSize(run_font.pointSize() + 2)
+        self._run_btn.setFont(run_font)
+        self._run_btn.setStyleSheet("QPushButton { padding: 6px 18px; }")
+        self._run_btn.setEnabled(False)
         reactions_header_row.addWidget(self._run_btn)
         reactions_layout.addLayout(reactions_header_row)
 
-        self._reactions_edit_status_label = QtWidgets.QLabel("")
-        self._reactions_edit_status_label.setWordWrap(True)
-        status_font = self._reactions_edit_status_label.font()
-        status_font.setPointSize(max(1, status_font.pointSize() - 1))
-        self._reactions_edit_status_label.setFont(status_font)
-        reactions_layout.addWidget(self._reactions_edit_status_label)
-
-        self._reactions_text = QtWidgets.QPlainTextEdit()
+        self._reactions_text = _DraftAwarePlainTextEdit()
         self._reactions_text.setPlaceholderText(
             "Example:\n"
             "reaction: 2A + B => C ; kf=1e5\n"
@@ -285,13 +415,13 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_splitter.setStretchFactor(1, 2)
         reactions_layout.addWidget(self._reactions_splitter, stretch=1)
 
-        # Debounce timer for DSL validation (prevents lag during typing)
+        # Reserved for explicit validation requests; text edits do not parse drafts.
         self._validation_timer = QtCore.QTimer()
         self._validation_timer.setSingleShot(True)
-        self._validation_timer.setInterval(500)  # 500ms delay after last keystroke
+        self._validation_timer.setInterval(100)
         self._validation_timer.timeout.connect(self._validate_dsl)
 
-        # Connect text editor to validation (debounced updates)
+        # Text changes mark drafts only. MainWindow owns dirty equality refresh.
         self._reactions_text.textChanged.connect(self._on_text_changed)
 
         self._tabs.addTab(self._reactions_tab, "Reactions")
@@ -561,10 +691,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def _on_text_changed(self):
         """Handle text change event."""
-        if bool(getattr(self, "_reactions_read_only", self._reactions_text.isReadOnly())):
-            self._validation_timer.stop()
-            self._validate_dsl()
-            return
         self._validation_timer.stop()
         self._set_validation_state("draft")
 
@@ -642,7 +768,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         if state == "valid":
             run_tooltip = "Run simulation for the current run target from Initial Conditions"
         elif state == "draft":
-            run_tooltip = "Mechanism edits are still a draft — lock/apply the mechanism before running."
+            run_tooltip = "Run may apply a valid Reactions draft before launch."
         elif state == "validating":
             run_tooltip = "Mechanism validation is still running."
         else:
@@ -660,7 +786,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             )
 
         elif state == "draft":
-            self._set_validation_label_text("Editing draft")
+            self._set_validation_label_text(
+                message or "• Draft changes not applied\nAnalysis uses the applied mechanism; Run may apply a valid draft first."
+            )
             self._validation_label.setStyleSheet(
                 "QLabel { padding: 4px; border-radius: 3px; }"
             )
@@ -716,46 +844,18 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     def is_mechanism_valid(self) -> bool:
         return self._current_validation_state == "valid"
 
-    def set_reactions_edit_action(self, action: Optional[QtGui.QAction]) -> None:
-        if action is None:
-            self._reactions_edit_btn.hide()
-            return
-        btn = self._reactions_edit_btn
-        btn.setText(action.text())
-        btn.setToolTip(action.toolTip())
-        btn.setChecked(action.isChecked())
-        if self._reactions_edit_action is not None:
-            try:
-                btn.toggled.disconnect()
-            except (RuntimeError, TypeError):
-                pass
-            try:
-                self._reactions_edit_action.changed.disconnect()
-            except (RuntimeError, TypeError):
-                pass
-        self._reactions_edit_action = action
-        btn.toggled.connect(action.trigger)
+    def set_reactions_draft_actions_enabled(self, enabled: bool) -> None:
+        enabled_b = bool(enabled)
+        self._apply_reactions_btn.setEnabled(enabled_b)
+        self._discard_reactions_btn.setEnabled(enabled_b)
 
-        def _sync_from_action():
-            prev = btn.blockSignals(True)
-            try:
-                btn.setText(action.text())
-                btn.setToolTip(action.toolTip())
-                btn.setChecked(action.isChecked())
-            finally:
-                btn.blockSignals(prev)
+    def set_reactions_status_text(self, text: str, *, state: str) -> None:
+        self._set_validation_state(str(state or "idle"), str(text or ""))
 
-        action.changed.connect(_sync_from_action)
-        btn.show()
-
-    def set_reactions_edit_status_text(self, text: str) -> None:
-        text_s = str(text)
-        self._reactions_edit_status_label.setText(text_s)
-        self._reactions_edit_status_label.setVisible(bool(text_s.strip()))
-
-    def set_reactions_read_only(self, read_only: bool) -> None:
-        self._reactions_read_only = bool(read_only)
-        self._reactions_text.setReadOnly(self._reactions_read_only)
+    def set_reactions_user_mutation_guard(self, guard: Optional[Callable[[], bool]]) -> None:
+        set_guard = getattr(self._reactions_text, "set_mutation_intent_callback", None)
+        if callable(set_guard):
+            set_guard(guard)
 
     def reactions_text(self) -> str:
         """Return the current Reaction DSL text."""

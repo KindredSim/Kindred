@@ -587,9 +587,8 @@ class ComputationalModeDialog(QtWidgets.QDialog):
     def apply(self) -> bool:
         self._clear_error()
 
-        get_reactions_text = getattr(self._main_window, "mechanism_reactions_text_raw", None)
-        set_reactions_text = getattr(self._main_window, "set_mechanism_reactions_text_with_optional_undo", None)
-        if not callable(get_reactions_text) or not callable(set_reactions_text):
+        rewrite_reactions_text = getattr(self._main_window, "rewrite_authoritative_reactions_text", None)
+        if not callable(rewrite_reactions_text):
             self._show_error("Mechanism editor is unavailable.")
             return False
 
@@ -614,23 +613,24 @@ class ComputationalModeDialog(QtWidgets.QDialog):
             self._show_error(str(exc))
             return False
 
-        current_text = str(get_reactions_text() or "")
-        updated = upsert_computational_mode_blocks(
-            current_text,
-            comp_body=comp_body.strip("\n"),
-            generated_body=compiled.generated_reaction_dsl.strip("\n"),
-        )
-
-        set_reactions_text(updated, "Apply Computational Mode", record_undo=True)
-        sync_authoritative_write = getattr(
-            self._main_window,
-            "finalize_authoritative_mechanism_widget_write",
-            None,
-        )
-        if not callable(sync_authoritative_write):
-            self._show_error("Mechanism authoritative write finalizer is unavailable.")
+        try:
+            ok = rewrite_reactions_text(
+                action_label="Applying Computational Mode",
+                description="Apply Computational Mode",
+                rewrite_text=lambda current_text: upsert_computational_mode_blocks(
+                    str(current_text or ""),
+                    comp_body=comp_body.strip("\n"),
+                    generated_body=compiled.generated_reaction_dsl.strip("\n"),
+                ),
+                record_undo=True,
+                apply_transition=True,
+                transition_source="computational_mode",
+            )
+        except Exception as exc:
+            self._show_error(str(exc))
             return False
-        sync_authoritative_write(dispatch_consumers=True)
+        if not ok:
+            return False
 
         # Re-parse and refresh energy-mode sliders without running an ODE solve.
         with suppress(ImportError, RuntimeError, TypeError, ValueError):

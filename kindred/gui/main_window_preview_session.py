@@ -1093,8 +1093,8 @@ class MainWindowPreviewSession:
         mw = self._mw
         self._slider_drag_active = True
         self._capture_slider_gesture_target_snapshot()
-        self._drag_baseline_text = mw._mechanism_editor._reactions_text.toPlainText()
-        self._drag_baseline_state_network_dsl = mw._mechanism_editor._state_network_editor.get_state_network_dsl()
+        self._drag_baseline_text = mw.mechanism_reactions_text_raw()
+        self._drag_baseline_state_network_dsl = mw.mechanism_state_network_dsl_raw()
         self._suppress_slider_refresh = True
         mw._mechanism_editor._variable_sliders.begin_live_drag()
 

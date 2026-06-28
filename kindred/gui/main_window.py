@@ -12,7 +12,7 @@ import platform
 import re
 import warnings
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Callable, Sequence, TYPE_CHECKING, Mapping
+from typing import Dict, Any, Optional, List, Tuple, Callable, Sequence, TYPE_CHECKING, Mapping, Literal
 from collections import OrderedDict
 import math
 
@@ -75,7 +75,7 @@ from kindred.gui.initial_conditions_import_owner import (
     InitialConditionsImportOwner,
 )
 from kindred.gui.initial_conditions_source_acceptance_owner import InitialConditionsSourceAcceptanceOwner
-from kindred.gui.ports import DisplayRefreshSource, RunAutoLockResult
+from kindred.gui.ports import DisplayRefreshSource, ReactionsDraftApplyResult
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.mechanism_session_owner import MechanismSessionOwner
 from kindred.gui.main_window_preview_session import MainWindowPreviewSession
@@ -106,6 +106,19 @@ _MIN_STARTUP_HEIGHT = 820
 _FALLBACK_STARTUP_SIZE = QtCore.QSize(1440, 900)
 _CANONICAL_BATCH_INITIALS_TRANSITION_DEBOUNCE_MS = 220
 _INTERACTIVE_RUNTIME_READINESS_REFRESH_DEBOUNCE_MS = 80
+_REACTIONS_DRAFT_DIRTY_REFRESH_MS = 100
+_DRAFT_EDIT_WARNING_SETTINGS_KEY = "mechanism_editor/suppress_draft_edit_warning"
+
+
+@dataclass(frozen=True)
+class ReactionsDraftResolution:
+    status: Literal["clean", "discarded", "applied", "cancelled", "failed"]
+    canonical_changed: bool = False
+    error: str = ""
+
+    @property
+    def may_continue(self) -> bool:
+        return self.status in {"clean", "discarded", "applied"}
 
 
 @dataclass(frozen=True)
@@ -245,8 +258,7 @@ class MainWindow(
             mechanism_editor_getter=lambda: getattr(self, "_mechanism_editor", None),
             preview_session=self._preview_session,
             variable_runtime=self._variable_runtime,
-            mechanism_locked_getter=self.mechanism_editing_locked,
-            try_lock_mechanism_editor=self._try_lock_mechanism_editor,
+            apply_dirty_reactions_for_run=self._apply_dirty_reactions_for_run,
             pending_initials_for_source_set=self._pending_initials_for_source_set,
             apply_reactions_overrides_to_text=self._apply_reactions_overrides_to_text,
             apply_state_network_overrides_to_dsl=self._apply_state_network_overrides_to_dsl,
@@ -267,6 +279,12 @@ class MainWindow(
             wegscheider_cyclicity_getter=lambda: self._wegscheider_cyclicity_enabled,
         )
         self._last_fit_metadata: Optional[Dict[str, Any]] = None
+        self._reactions_draft_apply_failed = False
+        self._reactions_draft_warning_prompted = False
+        self._reactions_draft_refresh_timer = QtCore.QTimer(self)
+        self._reactions_draft_refresh_timer.setSingleShot(True)
+        self._reactions_draft_refresh_timer.setInterval(_REACTIONS_DRAFT_DIRTY_REFRESH_MS)
+        self._reactions_draft_refresh_timer.timeout.connect(self._refresh_reactions_draft_state)
         self._simulation_provenance_owner = SimulationProvenanceOwner(
             dataset_snapshot_getter=self._snapshot_datasets,
             fit_metadata_getter=lambda: self._last_fit_metadata,
@@ -389,8 +407,6 @@ class MainWindow(
 
         # Menu/UI objects that controllers may reference.
         self._recent_menu = None
-        self._mechanism_edit_unlock_warning_shown = False
-        self._mechanism_edit_lock_action = None
 
         # Undo/Redo stack for high-level operations.
         self._undo_stack = controllers.undo_stack
@@ -439,7 +455,7 @@ class MainWindow(
             self._authoritative_mechanism_transition_snapshot(),
             canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
         )
-        self._force_lock_editor()
+        self._refresh_reactions_draft_state()
         self._sliders_panel = self._mechanism_editor.detach_slider_pane_for_dock()
         self._species_panel_available = True
         self._runtime_parameter_buttons_available = True
@@ -468,7 +484,7 @@ class MainWindow(
             on_move_selected_batch_sets_up=self._move_selected_batch_sets_up,
             on_move_selected_batch_sets_down=self._move_selected_batch_sets_down,
             on_delete_selected_batch_sets=self._delete_selected_batch_sets,
-            on_run_selected=self._run_simulation_after_flushing_batch_initials,
+            on_run_selected=self._run_simulation_after_committing_batch_initials,
             on_stop=self._sim_controller.stop_simulation,
             on_solver_method_changed=self._on_solver_method_changed,
             on_solver_summary_refresh=self._update_solver_summary_label,
@@ -526,7 +542,12 @@ class MainWindow(
         self._mechanism_editor.validationStateChanged.connect(
             lambda _state: self._simulation_run_ui_owner.refresh_run_button_state()
         )
-        self._mechanism_editor.run_btn.clicked.connect(self._run_simulation_after_flushing_batch_initials)
+        set_reactions_guard = getattr(self._mechanism_editor, "set_reactions_user_mutation_guard", None)
+        if callable(set_reactions_guard):
+            set_reactions_guard(self._reactions_user_mutation_allowed)
+        self._mechanism_editor.reactionsApplyRequested.connect(self._apply_reactions_draft)
+        self._mechanism_editor.reactionsDiscardRequested.connect(self._discard_reactions_draft)
+        self._mechanism_editor.run_btn.clicked.connect(self._run_simulation_after_committing_batch_initials)
         self._mechanism_editor.symbolic_calculator_btn.clicked.connect(self._open_symbolic_calculator_panel)
         self._mechanism_editor.mechanismInspectRequested.connect(self._open_mechanism_inspector)
         self._refresh_slider_transaction_button_state()
@@ -556,12 +577,6 @@ class MainWindow(
         dirty = bool(preview is not None and hasattr(preview, "has_dirty_transaction") and preview.has_dirty_transaction())
         self._set_runtime_parameter_buttons_enabled(bool(dirty))
 
-    def mechanism_editing_locked(self) -> bool:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            return True
-        return not bool(owner.edit_session_active)
-
     def _mechanism_session_texts_from_widgets(self) -> tuple[str, str]:
         editor = getattr(self, "_mechanism_editor", None)
         if editor is None:
@@ -587,25 +602,29 @@ class MainWindow(
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
+        if not bool(authoritative):
+            raise RuntimeError("Reactions drafts are editor text until Apply Changes.")
         reactions_text, state_network_dsl = self._mechanism_session_texts_from_widgets()
-        if authoritative:
-            owner.apply_authoritative_source(
-                MechanismAuthoringSource.from_parts(
-                    reactions_text=reactions_text,
-                    state_network_dsl=state_network_dsl,
-                )
+        owner.apply_authoritative_source(
+            MechanismAuthoringSource.from_parts(
+                reactions_text=reactions_text,
+                state_network_dsl=state_network_dsl,
             )
-            return
-        if not owner.edit_session_active:
-            raise RuntimeError("Mechanism edit session is not active.")
-        owner.update_draft_reactions(reactions_text)
-        owner.update_draft_state_network(state_network_dsl)
+        )
 
-    def _sync_mechanism_session_owner_from_widget_signal(self) -> None:
+    def _sync_canonical_state_network_from_widget(self) -> None:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
-        self._sync_mechanism_session_owner_from_widgets(authoritative=not bool(owner.edit_session_active))
+        _reactions_text, state_network_dsl = self._mechanism_session_texts_from_widgets()
+        owner.apply_authoritative_source(
+            MechanismAuthoringSource.from_parts(
+                reactions_text=str(owner.canonical_reactions_text),
+                state_network_dsl=state_network_dsl,
+            )
+        )
 
     def _refresh_authoritative_mechanism_derived_ui(self) -> None:
         self._update_temperature_mode_indicator()
@@ -616,6 +635,9 @@ class MainWindow(
 
     def _authoritative_mechanism_runtime_refresh_deferred(self) -> bool:
         return int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) > 0
+
+    def _consume_pending_authoritative_mechanism_runtime_refresh(self) -> bool:
+        return self._mechanism_runtime_transition.consume_pending_readiness_epoch() is not None
 
     def _canonical_batch_initials_identity_by_set_id(self) -> Dict[str, str]:
         identities: Dict[str, str] = {}
@@ -686,33 +708,17 @@ class MainWindow(
     ) -> MechanismTransitionOutcome:
         if schedule_runtime_refresh is None:
             schedule_runtime_refresh = not self._authoritative_mechanism_runtime_refresh_deferred()
-        owner = getattr(self, "_mechanism_session_owner", None)
         outcome = self._mechanism_runtime_transition.apply_authoritative_transition(
             self._authoritative_mechanism_transition_snapshot(),
             source=str(transition_source or "authoritative_change"),
             force_runtime_invalidation=bool(force_runtime_invalidation),
-            edit_session_active=bool(getattr(owner, "edit_session_active", False)),
             input_suppressed=bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)),
             schedule_runtime_refresh=bool(schedule_runtime_refresh),
             canonical_batch_initials_by_set_id=canonical_batch_initials_by_set_id,
             affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
             canonical_batch_initials_scope_is_partial=bool(canonical_batch_initials_scope_is_partial),
         )
-        if outcome.runtime_invalidation_required:
-            self._sim_controller.simulation_runtime_inputs_changed(
-                batch_runtime_pool_inputs_changed=False
-            )
-        if outcome.active_work_supersede_required:
-            if outcome.runtime_invalidation_required:
-                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
-                    epoch=int(outcome.epoch),
-                )
-            else:
-                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
-                    epoch=int(outcome.epoch),
-                    affected_set_ids=outcome.active_work_supersede_set_ids,
-                    close_preview_runtime_owner=False,
-                )
+        self._apply_authoritative_runtime_transition_lifecycle(outcome)
         if outcome.display_cache_invalidation_allowed and self.results_controller.authoritative_result_transition_required(
             cache_stale_scope_is_global=bool(outcome.cache_stale_scope_is_global),
             cache_stale_set_ids=outcome.cache_stale_set_ids,
@@ -747,6 +753,29 @@ class MainWindow(
                 force=True,
             )
         return outcome
+
+    def _apply_authoritative_runtime_transition_lifecycle(
+        self,
+        outcome: MechanismTransitionOutcome,
+    ) -> None:
+        """Publish runtime identity before scheduling readiness against that identity."""
+        if outcome.active_work_supersede_required:
+            if outcome.runtime_invalidation_required:
+                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+                    epoch=int(outcome.epoch),
+                )
+            else:
+                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+                    epoch=int(outcome.epoch),
+                    affected_set_ids=outcome.active_work_supersede_set_ids,
+                    close_preview_runtime_owner=False,
+                )
+        if outcome.runtime_invalidation_required and outcome.readiness_schedule_required:
+            self._sim_controller.simulation_runtime_inputs_changed(
+                batch_runtime_pool_inputs_changed=False
+            )
+        elif outcome.runtime_invalidation_required and outcome.readiness_schedule_deferred:
+            self._mark_launch_readiness_stale()
 
     def _apply_canonical_batch_initials_transition(
         self,
@@ -859,11 +888,8 @@ class MainWindow(
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
-        session_was_active = bool(owner.edit_session_active)
         self._sync_mechanism_session_owner_from_widgets(authoritative=True)
-        if not session_was_active:
-            return
-        self._set_mechanism_edit_locked(True)
+        self._refresh_reactions_draft_state()
         if bool(dispatch_consumers):
             self._apply_authoritative_mechanism_transition()
 
@@ -896,96 +922,30 @@ class MainWindow(
             finally:
                 state_editor.blockSignals(False)
 
-        validate = getattr(editor, "_validate_dsl", None)
-        if callable(validate):
-            validate()
+        self._refresh_reactions_draft_state()
 
     def _on_reactions_text_changed_for_main_window(self) -> None:
-        self._sync_mechanism_session_owner_from_widget_signal()
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None or bool(owner.edit_session_active):
-            self._refresh_symbolic_calculator_state()
+        if bool(getattr(self, "_suppress_programmatic_text_change_signals", False)):
+            self._queue_reactions_draft_refresh()
             return
-        self._apply_authoritative_mechanism_transition()
+        self._reactions_draft_apply_failed = False
+        self._queue_reactions_draft_refresh()
 
     def _on_state_network_changed_for_main_window(self) -> None:
-        self._sync_mechanism_session_owner_from_widget_signal()
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None or bool(owner.edit_session_active):
-            self._refresh_symbolic_calculator_state()
-            return
+        self._sync_canonical_state_network_from_widget()
         self._apply_authoritative_mechanism_transition()
+        self._refresh_reactions_draft_state()
 
     def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
         self._update_temperature_mode_indicator()
         self._fitting_runtime_input_publisher.publish_if_changed(reason="temperature changed")
 
     @staticmethod
-    def _state_network_dialog_info_text(*, locked: bool) -> str:
-        if bool(locked):
-            return (
-                "State network is read-only while Reactions editing is locked. "
-                "Use Allow Editing to make deliberate changes."
-            )
-        return "Edit the state network with full validation. Changes are staged as a draft until the editor is locked."
-
-    def _refresh_mechanism_edit_lock_ui(self) -> None:
-        locked = self.mechanism_editing_locked()
-        button_text = "Allow Editing"
-        tooltip = (
-            "Toggle to enable editing of the reaction mechanism"
-            if locked
-            else "Toggle to return the reaction mechanism to read-only mode"
+    def _state_network_dialog_info_text() -> str:
+        return (
+            "Edit the state network with full validation. State Network edits apply immediately; "
+            "Reactions drafts are applied separately."
         )
-        status_text = ""
-        editor = getattr(self, "_mechanism_editor", None)
-        if editor is not None:
-            set_read_only = getattr(editor, "set_reactions_read_only", None)
-            if callable(set_read_only):
-                set_read_only(locked)
-            state_editor = getattr(editor, "_state_network_editor", None)
-            set_state_read_only = getattr(state_editor, "set_read_only", None)
-            if callable(set_state_read_only):
-                set_state_read_only(locked)
-            set_status_text = getattr(editor, "set_reactions_edit_status_text", None)
-            if callable(set_status_text):
-                set_status_text(status_text)
-            action = getattr(self, "_mechanism_edit_lock_action", None)
-            if action is not None:
-                action.setText(button_text)
-                action.setToolTip(tooltip)
-            bind_action = getattr(editor, "set_reactions_edit_action", None)
-            if action is not None and callable(bind_action):
-                bind_action(action)
-            if action is not None:
-                action.setChecked(not locked)
-        dialog = getattr(self, "_state_network_dialog", None)
-        if dialog is not None:
-            try:
-                info_label = dialog.findChild(QtWidgets.QLabel, "stateNetworkDialogInfoLabel")
-            except RuntimeError as exc:
-                self._record_best_effort_failure(
-                    "main_window.state_network_dialog.info_label.find",
-                    message="Failed to refresh state network dialog lock banner",
-                    exc=exc,
-                )
-            else:
-                if info_label is not None:
-                    info_label.setText(self._state_network_dialog_info_text(locked=locked))
-
-    def _force_lock_editor(self) -> bool:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        if owner.edit_session_active:
-            owner.cancel_edit_session()
-            self._restore_mechanism_widgets_from_owner_canonical()
-        self._refresh_mechanism_edit_lock_ui()
-        validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
-        if callable(validate):
-            validate()
-        self._refresh_symbolic_calculator_state()
-        return True
 
     def _pending_initials_for_source_set(self, source, *, set_name: str) -> dict[str, float]:
         return self._initial_conditions_import_owner.pending_initials_for_source_set(
@@ -993,96 +953,322 @@ class MainWindow(
             set_name=str(set_name or ""),
         )
 
-    def _try_lock_mechanism_editor(self, *, return_acceptance: bool = False) -> bool | RunAutoLockResult:
+    def _canonical_reactions_text(self) -> str:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        return str(owner.canonical_reactions_text)
+
+    def _editor_reactions_text(self) -> str:
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is None:
+            return ""
+        return str(editor.reactions_text())
+
+    def _reactions_draft_dirty(self) -> bool:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        editor = getattr(self, "_mechanism_editor", None)
+        if owner is None or editor is None:
+            return False
+        return str(editor.reactions_text()) != str(owner.canonical_reactions_text)
+
+    def _queue_reactions_draft_refresh(self) -> None:
+        timer = getattr(self, "_reactions_draft_refresh_timer", None)
+        if timer is not None:
+            timer.start()
+            return
+        self._refresh_reactions_draft_state()
+
+    def _format_reactions_applied_status(self, validation) -> str:
+        return (
+            "✓ Applied: "
+            f"{int(getattr(validation, 'species_count', 0) or 0)} species, "
+            f"{int(getattr(validation, 'reaction_count', 0) or 0)} reactions, "
+            f"{int(getattr(validation, 'equilibria_count', 0) or 0)} equilibria\n"
+            "Runs use this mechanism."
+        )
+
+    def _refresh_mechanism_run_launch_readiness(self, *, dirty: Optional[bool] = None) -> None:
+        run_ui = getattr(self, "_simulation_run_ui_owner", None)
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if run_ui is None or owner is None:
+            return
+        dirty_b = self._reactions_draft_dirty() if dirty is None else bool(dirty)
+        if dirty_b:
+            if hasattr(run_ui, "render_draft_run_preflight_available"):
+                run_ui.render_draft_run_preflight_available(True)
+            run_ui.render_mechanism_launch_available(True, tooltip="")
+            return
+        if hasattr(run_ui, "render_draft_run_preflight_available"):
+            run_ui.render_draft_run_preflight_available(False)
+        ready = bool(owner.is_ready_for_explicit_run())
+        tooltip = "" if ready else "Cannot run: mechanism has errors. Fix and try again."
+        run_ui.render_mechanism_launch_available(ready, tooltip=tooltip)
+
+    def _refresh_reactions_draft_state(self) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        editor = getattr(self, "_mechanism_editor", None)
+        if owner is None or editor is None:
+            return
+        dirty = self._reactions_draft_dirty()
+        was_dirty = bool(getattr(self, "_reactions_draft_last_dirty", False))
+        set_actions = getattr(editor, "set_reactions_draft_actions_enabled", None)
+        if callable(set_actions):
+            set_actions(bool(dirty))
+        if bool(dirty):
+            self._reactions_draft_last_dirty = True
+            if not bool(getattr(self, "_reactions_draft_apply_failed", False)):
+                editor.set_reactions_status_text(
+                    "• Draft changes not applied\nAnalysis uses the applied mechanism; Run may apply a valid draft first.",
+                    state="draft",
+                )
+            self._refresh_mechanism_run_launch_readiness(dirty=True)
+            return
+        self._reactions_draft_last_dirty = False
+        self._reactions_draft_apply_failed = False
+        validation = owner.validate_canonical()
+        if validation.valid:
+            editor.set_reactions_status_text(
+                self._format_reactions_applied_status(validation),
+                state="valid",
+            )
+        else:
+            detail = str(validation.error_message or "Canonical mechanism is invalid.")
+            editor.set_reactions_status_text(f"! Draft not applied: {detail}", state="invalid")
+        self._refresh_mechanism_run_launch_readiness(dirty=False)
+        self._refresh_symbolic_calculator_state()
+        if was_dirty and not bool(
+            getattr(self, "_suppress_dirty_to_clean_runtime_readiness_refresh", False)
+        ):
+            self._maybe_queue_run_target_runtime_readiness_refresh(force=True)
+
+    def _set_reactions_widget_text_from_canonical(self) -> None:
+        self._set_reactions_widget_text(self._canonical_reactions_text())
+
+    def _set_reactions_widget_text(self, text: str) -> None:
+        widget = self._reactions_text_widget()
+        if widget is None or str(widget.toPlainText()) == str(text):
+            return
+        previous_text_signal_suppress = bool(
+            getattr(self, "_suppress_programmatic_text_change_signals", False)
+        )
+        self._suppress_programmatic_text_change_signals = True
+        try:
+            widget.setPlainText(str(text))
+        finally:
+            self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
+
+    def _reactions_user_mutation_allowed(self) -> bool:
+        if bool(getattr(self, "_reactions_draft_warning_prompted", False)):
+            return True
+        settings = QtCore.QSettings("Kindred", "KindredGUI")
+        if settings.value(_DRAFT_EDIT_WARNING_SETTINGS_KEY, False, type=bool):
+            return True
+        accepted, suppress = self._prompt_reactions_draft_edit_warning()
+        if bool(accepted) and bool(suppress):
+            settings.setValue(_DRAFT_EDIT_WARNING_SETTINGS_KEY, True)
+        if not bool(accepted):
+            self._reactions_draft_apply_failed = False
+            self._refresh_reactions_draft_state()
+            return False
+        self._reactions_draft_warning_prompted = True
+        return True
+
+    def _prompt_reactions_draft_edit_warning(self) -> tuple[bool, bool]:
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Reactions Draft")
+        box.setText(
+            "You are editing a draft. Analysis uses the applied mechanism until changes are applied; Run may apply a valid draft before launch."
+        )
+        checkbox = QtWidgets.QCheckBox("Don't show this again", box)
+        box.setCheckBox(checkbox)
+        start_btn = box.addButton("Start Editing", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(start_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        return box.clickedButton() is start_btn, bool(checkbox.isChecked())
+
+    def _set_reactions_apply_failure(self, message: str) -> None:
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is None:
+            return
+        detail = str(message or "Mechanism draft could not be applied.").strip()
+        self._reactions_draft_apply_failed = True
+        editor.set_reactions_draft_actions_enabled(True)
+        editor.set_reactions_status_text(f"! Draft not applied: {detail}", state="invalid")
+        self._refresh_mechanism_run_launch_readiness(dirty=True)
+        self._refresh_symbolic_calculator_state()
+
+    def _apply_reactions_draft(self) -> bool:
+        result = self._apply_reactions_draft_for_run()
+        self._flush_reactions_draft_apply_side_effects(result)
+        return bool(result)
+
+    def _flush_reactions_draft_apply_side_effects(
+        self,
+        result: ReactionsDraftApplyResult,
+    ) -> None:
+        if not bool(result):
+            return
+        if (
+            tuple(getattr(result, "affected_rows", ()) or ())
+            or bool(getattr(self, "_canonical_batch_initials_transition_queued", False))
+        ):
+            self._flush_canonical_batch_initials_transition()
+
+    def _apply_reactions_draft_for_run(self) -> ReactionsDraftApplyResult:
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
 
-        def _result(success: bool, affected_rows: tuple[int, ...] = ()) -> bool | RunAutoLockResult:
-            if bool(return_acceptance):
-                return RunAutoLockResult(bool(success), tuple(int(row) for row in affected_rows))
-            return bool(success)
+        def _result(success: bool, affected_rows: tuple[int, ...] = ()) -> ReactionsDraftApplyResult:
+            return ReactionsDraftApplyResult(
+                bool(success),
+                tuple(int(row) for row in affected_rows),
+            )
 
-        def _set_reactions_widget_text(text: str) -> None:
-            widget = self._reactions_text_widget()
-            if widget is None or str(widget.toPlainText()) == str(text):
-                return
-            previous_text_signal_suppress = bool(
-                getattr(self, "_suppress_programmatic_text_change_signals", False)
-            )
-            self._suppress_programmatic_text_change_signals = True
-            try:
-                widget.setPlainText(str(text))
-            finally:
-                self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
+        if not self._reactions_draft_dirty():
+            self._refresh_reactions_draft_state()
+            return _result(True)
 
-        if owner.edit_session_active:
-            self._sync_mechanism_session_owner_from_widgets(authoritative=False)
-            original_draft_reactions = str(owner.draft_reactions_text)
-            reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_lock(
-                owner.draft_source,
-                prompt_overwrite=True,
-            )
-            if reconciliation_plan is None:
-                self._refresh_symbolic_calculator_state()
-                return _result(False)
-            reconciled_source = reconciliation_plan.source
-            if str(reconciled_source.reactions_text) != str(owner.draft_reactions_text):
-                owner.update_draft_reactions(str(reconciled_source.reactions_text))
-                _set_reactions_widget_text(str(reconciled_source.reactions_text))
-            if not owner.commit_edit_session():
-                if owner.edit_session_active and str(owner.draft_reactions_text) != original_draft_reactions:
-                    owner.update_draft_reactions(original_draft_reactions)
-                    _set_reactions_widget_text(original_draft_reactions)
-                validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
-                if callable(validate):
-                    validate()
-                self._refresh_symbolic_calculator_state()
-                return _result(False)
-            reconciliation_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
-                reconciliation_plan
-            )
-        else:
-            original_canonical_source = owner.canonical_source
-            reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_lock(
-                owner.canonical_source,
-                prompt_overwrite=True,
-            )
-            if reconciliation_plan is None:
-                return _result(False)
-            reconciled_source = reconciliation_plan.source
-            if str(reconciled_source.reactions_text) != str(owner.canonical_reactions_text):
-                owner.apply_authoritative_source(reconciled_source)
-                self._restore_mechanism_widgets_from_owner_canonical()
-            if not self._simulation_mechanism_owner.is_mechanism_ready_for_run():
-                if owner.canonical_source != original_canonical_source:
-                    owner.apply_authoritative_source(original_canonical_source)
-                    self._restore_mechanism_widgets_from_owner_canonical()
-                return _result(False)
-            reconciliation_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
-                reconciliation_plan
-            )
-        self._apply_authoritative_mechanism_transition()
-        self._refresh_mechanism_edit_lock_ui()
-        validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
-        if callable(validate):
-            validate()
+        candidate_source = owner.source_for_reactions_text(self._editor_reactions_text())
+        candidate_validation = owner.validate_source(candidate_source)
+        if not candidate_validation.valid:
+            self._set_reactions_apply_failure(candidate_validation.error_message)
+            return _result(False)
+        if str(candidate_source.state_network_dsl or "").strip() and not owner.source_is_ready_for_explicit_run(
+            candidate_source
+        ):
+            self._set_reactions_apply_failure("State network topology is invalid.")
+            return _result(False)
+
+        reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_apply(
+            candidate_source,
+            prompt_overwrite=True,
+        )
+        if reconciliation_plan is None:
+            self._set_reactions_apply_failure("Initial Conditions could not be reconciled.")
+            return _result(False)
+
+        reconciled_source = reconciliation_plan.source
+        validation = owner.validate_source(reconciled_source)
+        if not validation.valid:
+            self._set_reactions_apply_failure(validation.error_message)
+            return _result(False)
+        if str(reconciled_source.state_network_dsl or "").strip() and not owner.source_is_ready_for_explicit_run(
+            reconciled_source
+        ):
+            self._set_reactions_apply_failure("State network topology is invalid.")
+            return _result(False)
+
+        reconciliation_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
+            reconciliation_plan
+        )
+        owner.apply_authoritative_source(reconciled_source)
+        self._write_complete_authoritative_mechanism_source_to_editor(reconciled_source)
+        previous_authoritative_suppress = bool(
+            getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+        )
+        previous_clean_readiness_suppress = bool(
+            getattr(self, "_suppress_dirty_to_clean_runtime_readiness_refresh", False)
+        )
+        self._suppress_authoritative_mechanism_input_change = False
+        self._suppress_dirty_to_clean_runtime_readiness_refresh = True
+        try:
+            self._apply_authoritative_mechanism_transition()
+            self._reactions_draft_apply_failed = False
+            self._refresh_reactions_draft_state()
+        finally:
+            self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
+            self._suppress_dirty_to_clean_runtime_readiness_refresh = previous_clean_readiness_suppress
         return _result(True, tuple(getattr(reconciliation_result, "affected_rows", ()) or ()))
 
-    def _set_mechanism_edit_locked(self, locked: bool) -> bool:
-        if not bool(locked):
-            owner = getattr(self, "_mechanism_session_owner", None)
-            if owner is None:
-                raise RuntimeError("Mechanism session owner is unavailable.")
-            if not owner.edit_session_active:
-                owner.begin_edit_session()
-            self._refresh_mechanism_edit_lock_ui()
-            self._refresh_symbolic_calculator_state()
-            return True
-        if self.mechanism_editing_locked():
-            self._refresh_mechanism_edit_lock_ui()
-            return True
-        return self._force_lock_editor()
+    def _discard_reactions_draft(self) -> None:
+        self._set_reactions_widget_text_from_canonical()
+        self._reactions_draft_apply_failed = False
+        self._refresh_reactions_draft_state()
+
+    def _apply_dirty_reactions_for_run(self) -> ReactionsDraftApplyResult:
+        result = self._apply_reactions_draft_for_run()
+        self._flush_reactions_draft_apply_side_effects(result)
+        return result
+
+    def _prompt_reactions_draft_before_authoritative_change(
+        self,
+        action_label: str,
+        *,
+        continue_label: str,
+        apply_label: str | None = None,
+        discard_label: str | None = None,
+        informative_text: str | None = None,
+    ) -> str:
+        continue_label_s = str(continue_label or "Continue").strip() or "Continue"
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setWindowTitle("Unapplied Reactions Draft")
+        box.setText(f"{str(action_label)} while Reactions draft changes are not applied.")
+        box.setInformativeText(
+            str(informative_text or "Choose how to handle the draft before continuing.")
+        )
+        apply_label_s = str(apply_label or f"Apply Draft Then {continue_label_s}")
+        discard_label_s = str(discard_label or f"Discard Draft and {continue_label_s}")
+        apply_btn = box.addButton(
+            apply_label_s,
+            QtWidgets.QMessageBox.ButtonRole.AcceptRole,
+        )
+        discard_btn = box.addButton(
+            discard_label_s,
+            QtWidgets.QMessageBox.ButtonRole.DestructiveRole,
+        )
+        cancel_btn = box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is apply_btn:
+            return "apply"
+        if clicked is discard_btn:
+            return "discard"
+        return "cancel"
+
+    def _resolve_reactions_draft_before_authoritative_change(
+        self,
+        action_label: str,
+        *,
+        continue_label: str = "Continue",
+        apply_label: str | None = None,
+        discard_label: str | None = None,
+        informative_text: str | None = None,
+    ) -> ReactionsDraftResolution:
+        if not self._reactions_draft_dirty():
+            return ReactionsDraftResolution("clean")
+        decision = str(
+            self._prompt_reactions_draft_before_authoritative_change(
+                action_label,
+                continue_label=str(continue_label or "Continue"),
+                apply_label=apply_label,
+                discard_label=discard_label,
+                informative_text=informative_text,
+            )
+            or "cancel"
+        ).strip().lower()
+        if decision == "cancel":
+            return ReactionsDraftResolution("cancelled")
+        if decision == "discard":
+            self._discard_reactions_draft()
+            return ReactionsDraftResolution("discarded")
+        if decision == "apply":
+            if bool(self._apply_reactions_draft()):
+                return ReactionsDraftResolution("applied", canonical_changed=True)
+            error = ""
+            editor = getattr(self, "_mechanism_editor", None)
+            label = getattr(editor, "_validation_label", None)
+            if label is not None and hasattr(label, "text"):
+                error = str(label.text() or "")
+            return ReactionsDraftResolution("failed", error=error)
+        return ReactionsDraftResolution("cancelled")
 
     def is_mechanism_valid_for_preview(self) -> bool:
         owner = getattr(self, "_mechanism_session_owner", None)
@@ -1094,92 +1280,6 @@ class MainWindow(
         editor = getattr(self, "_mechanism_editor", None)
         widget = getattr(editor, "_reactions_text", None)
         return widget if isinstance(widget, QtWidgets.QPlainTextEdit) else None
-
-    def _focused_widget_targets_reactions_text(self, widget: Optional[QtWidgets.QWidget]) -> bool:
-        reactions_widget = self._reactions_text_widget()
-        if reactions_widget is None or widget is None:
-            return False
-        return bool(widget is reactions_widget or reactions_widget.isAncestorOf(widget))
-
-    def _undo_command_targets_locked_mechanism_change(self, command: object) -> bool:
-        if command is None:
-            return False
-        complete_source_target = getattr(command, "targets_complete_mechanism_source_change", None)
-        if callable(complete_source_target):
-            return bool(complete_source_target())
-        reactions_widget = self._reactions_text_widget()
-        state_editor = getattr(getattr(self, "_mechanism_editor", None), "_state_network_editor", None)
-
-        if reactions_widget is not None and getattr(command, "_text_widget", None) is reactions_widget:
-            return True
-        if getattr(command, "_reactions_widget", None) is reactions_widget:
-            old_text = str(getattr(command, "_old_reactions_text", "") or "")
-            new_text = str(getattr(command, "_new_reactions_text", "") or "")
-            old_state = str(getattr(command, "_old_state_network_dsl", "") or "")
-            new_state = str(getattr(command, "_new_state_network_dsl", "") or "")
-            return old_text != new_text or old_state != new_state
-        if state_editor is not None and getattr(command, "_state_network_editor", None) is state_editor:
-            old_state = str(getattr(command, "_old_state_network_dsl", "") or "")
-            new_state = str(getattr(command, "_new_state_network_dsl", "") or "")
-            return old_state != new_state
-        child_count = int(command.childCount()) if hasattr(command, "childCount") else 0
-        for child_index in range(child_count):
-            child_command = command.child(child_index)
-            if self._undo_command_targets_locked_mechanism_change(child_command):
-                return True
-        return False
-
-    def _next_undo_redo_targets_locked_mechanism_change(self, *, redo: bool) -> bool:
-        if not self.mechanism_editing_locked():
-            return False
-        stack = getattr(self, "_undo_stack", None)
-        if stack is None:
-            return False
-        available = bool(stack.canRedo()) if redo else bool(stack.canUndo())
-        if not available:
-            return False
-        index = int(stack.index()) if redo else int(stack.index()) - 1
-        if index < 0 or index >= int(stack.count()):
-            return False
-        command = stack.command(index)
-        return self._undo_command_targets_locked_mechanism_change(command)
-
-    def _report_locked_reactions_undo_redo_block(self, *, redo: bool) -> None:
-        action_text = "redo" if redo else "undo"
-        self._status_label.setText(f"Allow Editing to {action_text} mechanism changes")
-        logger.debug("Blocked %s while reactions editing is locked", action_text)
-
-    def _prompt_mechanism_edit_unlock_warning(self) -> bool:
-        box = QtWidgets.QMessageBox(self)
-        box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setWindowTitle("Allow Editing")
-        box.setText("Edits in the Reactions editor are staged as a draft.")
-        box.setInformativeText(
-            "Draft edits take effect when you lock the editor. Save/load and migration rewrites can still update the editor while it remains locked."
-        )
-        unlock_btn = box.addButton("Unlock", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        cancel_btn = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(cancel_btn)
-        box.setEscapeButton(cancel_btn)
-        box.exec()
-        return box.clickedButton() is unlock_btn
-
-    def _on_mechanism_edit_lock_action_triggered(self, checked: bool) -> None:
-        if bool(checked):
-            if not bool(getattr(self, "_mechanism_edit_unlock_warning_shown", False)):
-                if not self._prompt_mechanism_edit_unlock_warning():
-                    self._refresh_mechanism_edit_lock_ui()
-                    self._status_label.setText("Reactions editing remains locked")
-                    return
-                self._mechanism_edit_unlock_warning_shown = True
-            self._set_mechanism_edit_locked(False)
-            self._status_label.setText("Reactions editing unlocked")
-            return
-        if not self._try_lock_mechanism_editor():
-            self._refresh_mechanism_edit_lock_ui()
-            self._status_label.setText("Cannot lock reactions editing: fix mechanism errors")
-            return
-        self._status_label.setText("Reactions editing locked")
 
     def _prompt_slider_transaction_invalidation(self, action_text: str) -> str:
         box = QtWidgets.QMessageBox(self)
@@ -1688,9 +1788,6 @@ class MainWindow(
         paths), so MainWindow's `textChanged`-wired invalidation is not guaranteed to run.
         """
         self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
-        validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
-        if callable(validate):
-            validate()
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
         try:
             self._mechanism_editor._variable_sliders.clear()
@@ -1704,6 +1801,8 @@ class MainWindow(
             transition_source="programmatic_load",
             canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
         )
+        if bool(schedule_runtime_refresh):
+            self._update_batch_row_controls_state()
         self._refresh_slider_transaction_button_state()
 
         try:
@@ -1789,9 +1888,6 @@ class MainWindow(
         ColorManager.instance().set_current_species_roster(roster)
 
     def _refresh_overlay_swatches_for_current_mechanism(self) -> None:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is not None and bool(owner.edit_session_active):
-            return
         self._sync_color_manager_authoritative_roster()
         plot = getattr(self._plot_tabs, "_main_plot", None)
         refresh_overlay_presentation = getattr(plot, "refresh_overlay_presentation_for_current_roster", None)
@@ -1914,8 +2010,6 @@ class MainWindow(
             [
                 ("&Undo", self._undo, QtGui.QKeySequence.Undo, "undoAction", "Undo last edit in mechanism editor"),
                 ("&Redo", self._redo, QtGui.QKeySequence.Redo, "redoAction", "Redo previously undone edit"),
-                ("Allow Editing", self._on_mechanism_edit_lock_action_triggered, None, "mechanismEditLockAction", "Temporarily enable deliberate edits in the Reactions editor", {"checkable": True, "checked": False, "store_as": "_mechanism_edit_lock_action"}),
-                None,
                 # ──────────────────────────────────────────────────────────────
                 # HIDDEN FEATURE: Species Registry
                 # Status: Hidden from users — NOT dead code
@@ -1950,9 +2044,6 @@ class MainWindow(
                 ("Customize &Keyboard Shortcuts...", self._open_shortcuts_dialog, "Ctrl+K", "customizeShortcutsAction", "Customize keyboard shortcuts for actions"),
             ],
         )
-
-        self._refresh_mechanism_edit_lock_ui()
-
         view_menu = menubar.addMenu("&View")
         self._view_menu = view_menu
         panels_menu = view_menu.addMenu("Panels")
@@ -2036,7 +2127,7 @@ class MainWindow(
         add_items(
             sim_menu,
             [
-                ("&Run", self._run_simulation_after_flushing_batch_initials, None, "runSimulationAction", "Run kinetic simulation with current mechanism (Ctrl+R or F5)", {"shortcuts": ["Ctrl+R", "F5"], "store_as": "_run_simulation_action"}),
+                ("&Run", self._run_simulation_after_committing_batch_initials, None, "runSimulationAction", "Run kinetic simulation with current mechanism (Ctrl+R or F5)", {"shortcuts": ["Ctrl+R", "F5"], "store_as": "_run_simulation_action"}),
                 ("&Stop", self._sim_controller.stop_simulation, "Esc", "stopSimulationAction", "Stop running simulation (Esc)"),
                 ("Symbolic Calculator...", self._open_symbolic_calculator_panel, None, "openSymbolicCalculatorAction", "Open Symbolic Calculator panel", {"store_as": "_symbolic_calculator_action"}),
                 None,
@@ -2494,10 +2585,6 @@ class MainWindow(
             state_network_text=state_network_text,
         )
 
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is not None and bool(owner.edit_session_active):
-            return
-
         was_override_active = getattr(self, "_temperature_dsl_override_active", False)
 
         if state.t_override_k is not None:
@@ -2653,6 +2740,12 @@ class MainWindow(
             from kindred.io.resources import get_preset_mechanism_source
 
             source = get_preset_mechanism_source(preset_id)
+            if not self._resolve_reactions_draft_before_authoritative_change(
+                f"Loading preset {preset_id}",
+                continue_label="Load",
+            ).may_continue:
+                self._status_label.setText("Canceled preset load")
+                return
             if not self._guard_slider_transaction_invalidation(action_text=f"Loading preset {preset_id}"):
                 self._status_label.setText("Canceled preset load")
                 return
@@ -2669,10 +2762,6 @@ class MainWindow(
             )
             self._suppress_programmatic_text_change_signals = True
             try:
-                self._mechanism_editor._set_validation_state("validating")
-            except Exception:
-                logger.debug("Failed to mark preset mechanism validation as pending", exc_info=True)
-            try:
                 self._set_authoritative_mechanism_editor_source(
                     source,
                     description=f"Load preset {preset_id}",
@@ -2680,8 +2769,6 @@ class MainWindow(
                     transition_source="preset_load",
                 )
                 self._on_programmatic_mechanism_load()
-                if getattr(self._mechanism_editor, "_current_validation_state", "") == "validating":
-                    self._mechanism_editor._validate_dsl()
             finally:
                 self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
             self._status_label.setText(f"Loaded preset mechanism: {preset_id}")
@@ -2701,6 +2788,12 @@ class MainWindow(
             from kindred.io.resources import get_intervention_example_source
 
             source = get_intervention_example_source(example_id)
+            if not self._resolve_reactions_draft_before_authoritative_change(
+                f"Loading intervention example {example_id}",
+                continue_label="Load",
+            ).may_continue:
+                self._status_label.setText("Canceled intervention example load")
+                return
             if not self._guard_slider_transaction_invalidation(action_text=f"Loading intervention example {example_id}"):
                 self._status_label.setText("Canceled intervention example load")
                 return
@@ -2717,10 +2810,6 @@ class MainWindow(
             )
             self._suppress_programmatic_text_change_signals = True
             try:
-                self._mechanism_editor._set_validation_state("validating")
-            except Exception:
-                logger.debug("Failed to mark intervention example validation as pending", exc_info=True)
-            try:
                 self._set_authoritative_mechanism_editor_source(
                     source,
                     description=f"Load intervention example {example_id}",
@@ -2728,8 +2817,6 @@ class MainWindow(
                     transition_source="intervention_example_load",
                 )
                 self._on_programmatic_mechanism_load()
-                if getattr(self._mechanism_editor, "_current_validation_state", "") == "validating":
-                    self._mechanism_editor._validate_dsl()
             finally:
                 self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
             self._status_label.setText(f"Loaded intervention example: {example_id}")
@@ -2775,16 +2862,18 @@ class MainWindow(
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
-        if bool(owner.edit_session_active):
-            self._sync_mechanism_session_owner_from_widgets(authoritative=False)
-            return owner.draft_source
-        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
         return owner.canonical_source
 
     def _load_template_from_manager(self, source):
         """Load template from template manager."""
         from kindred.core.mechanism_source import MechanismAuthoringSource
 
+        if not self._resolve_reactions_draft_before_authoritative_change(
+            "Loading this template",
+            continue_label="Load",
+        ).may_continue:
+            self._status_label.setText("Canceled template load")
+            return
         if not self._guard_slider_transaction_invalidation(action_text="Loading this template"):
             self._status_label.setText("Canceled template load")
             return
@@ -2998,7 +3087,7 @@ class MainWindow(
         )
         from kindred.core.simulator.algebra_section import is_algebra_line
 
-        text = self._mechanism_editor._reactions_text.toPlainText()
+        text = self.mechanism_reactions_text_raw()
         if not text.strip():
             logger.info("Species registry requested with empty mechanism editor")
             return [], "Mechanism editor is empty. Enter reactions to detect species."
@@ -3100,16 +3189,12 @@ class MainWindow(
 
         layout = QtWidgets.QVBoxLayout(dialog)
 
-        locked = self.mechanism_editing_locked()
-        info_label = QtWidgets.QLabel(self._state_network_dialog_info_text(locked=locked))
+        info_label = QtWidgets.QLabel(self._state_network_dialog_info_text())
         info_label.setObjectName("stateNetworkDialogInfoLabel")
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
         base_editor = self._mechanism_editor._state_network_editor
-        set_read_only = getattr(base_editor, "set_read_only", None)
-        if callable(set_read_only):
-            set_read_only(locked)
         previous_parent = base_editor.parent()
         previous_visibility = base_editor.isVisible()
 
@@ -3177,11 +3262,8 @@ class MainWindow(
 
             QtCore.QTimer.singleShot(0, _diag_0ms)
 
-        # Button box
-        button_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
-        )
-        button_box.accepted.connect(dialog.accept)
+        # This hidden editor is live: edits publish immediately through stateNetworkChanged.
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
         button_box.rejected.connect(dialog.reject)
         layout.addWidget(button_box)
 
@@ -3209,8 +3291,7 @@ class MainWindow(
                 logger.debug("Failed to restore state network editor visibility: %s", exc, exc_info=True)
                 restore_failed = True
 
-            if int(result) == int(QtWidgets.QDialog.Accepted):
-                self._status_label.setText("State network updated")
+            self._status_label.setText("State network editor closed")
 
             if getattr(self, "_state_network_dialog", None) is dialog:
                 self._state_network_dialog = None
@@ -3280,12 +3361,23 @@ class MainWindow(
         Tries high-level undo stack first (for operations like Load Preset),
         then falls back to text editor undo for character-level edits.
         """
-        if self._next_undo_redo_targets_locked_mechanism_change(redo=False):
-            self._report_locked_reactions_undo_redo_block(redo=False)
-            return
-
         # Try high-level undo stack first
         if self._undo_stack.canUndo():
+            resolution = self._resolve_reactions_draft_before_authoritative_change(
+                "Undoing an authoritative mechanism change",
+                continue_label="Continue",
+                apply_label="Apply Draft; Do Not Undo",
+                discard_label="Discard Draft and Undo",
+                informative_text=(
+                    "Applying the draft changes the mechanism source, so the current Undo command will not run."
+                ),
+            )
+            if not resolution.may_continue:
+                self._status_label.setText("Canceled undo")
+                return
+            if resolution.status == "applied":
+                self._status_label.setText("Draft applied; undo command was not run.")
+                return
             self._undo_stack.undo()
             self._status_label.setText(f"Undo: {self._undo_stack.undoText()}")
             logger.debug(f"Undo: {self._undo_stack.undoText()}")
@@ -3294,9 +3386,6 @@ class MainWindow(
         # Fall back to text editor undo
         focused_widget = QtWidgets.QApplication.focusWidget()
         if isinstance(focused_widget, (QtWidgets.QPlainTextEdit, QtWidgets.QTextEdit)):
-            if self.mechanism_editing_locked() and self._focused_widget_targets_reactions_text(focused_widget):
-                self._report_locked_reactions_undo_redo_block(redo=False)
-                return
             if focused_widget.document().isUndoAvailable():
                 focused_widget.undo()
                 self._status_label.setText("Undo (text edit)")
@@ -3313,12 +3402,23 @@ class MainWindow(
         Tries high-level undo stack first (for operations like Load Preset),
         then falls back to text editor redo for character-level edits.
         """
-        if self._next_undo_redo_targets_locked_mechanism_change(redo=True):
-            self._report_locked_reactions_undo_redo_block(redo=True)
-            return
-
         # Try high-level undo stack first
         if self._undo_stack.canRedo():
+            resolution = self._resolve_reactions_draft_before_authoritative_change(
+                "Redoing an authoritative mechanism change",
+                continue_label="Continue",
+                apply_label="Apply Draft; Do Not Redo",
+                discard_label="Discard Draft and Redo",
+                informative_text=(
+                    "Applying the draft changes the mechanism source, so the current Redo command will not run."
+                ),
+            )
+            if not resolution.may_continue:
+                self._status_label.setText("Canceled redo")
+                return
+            if resolution.status == "applied":
+                self._status_label.setText("Draft applied; redo command was not run.")
+                return
             self._undo_stack.redo()
             self._status_label.setText(f"Redo: {self._undo_stack.redoText()}")
             logger.debug(f"Redo: {self._undo_stack.redoText()}")
@@ -3327,9 +3427,6 @@ class MainWindow(
         # Fall back to text editor redo
         focused_widget = QtWidgets.QApplication.focusWidget()
         if isinstance(focused_widget, (QtWidgets.QPlainTextEdit, QtWidgets.QTextEdit)):
-            if self.mechanism_editing_locked() and self._focused_widget_targets_reactions_text(focused_widget):
-                self._report_locked_reactions_undo_redo_block(redo=True)
-                return
             if focused_widget.document().isRedoAvailable():
                 focused_widget.redo()
                 self._status_label.setText("Redo (text edit)")
@@ -3861,10 +3958,14 @@ class MainWindow(
                 int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) - 1,
             )
             self._suppress_preference_updates = False
-        if simulation_runtime_settings_changed:
+        pending_mechanism_runtime_refresh = (
+            self._consume_pending_authoritative_mechanism_runtime_refresh()
+        )
+        if simulation_runtime_settings_changed or pending_mechanism_runtime_refresh:
             self._refresh_simulation_runtime_after_inputs_changed(
                 batch_runtime_pool_inputs_changed=bool(batch_runtime_pool_settings_changed),
             )
+
     def _apply_project_payload_inner(
         self,
         data: Dict[str, Any],
@@ -3996,6 +4097,11 @@ class MainWindow(
     def apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> bool:
         """Public project apply API for controllers (avoid reaching into `_` helpers)."""
         validate_project_payload(data)
+        if not self._resolve_reactions_draft_before_authoritative_change(
+            "Loading this project",
+            continue_label="Load",
+        ).may_continue:
+            return False
         if not self._guard_slider_transaction_invalidation(action_text="Loading this project"):
             return False
         self._apply_project_payload(data, record_undo=record_undo)
@@ -4064,6 +4170,68 @@ class MainWindow(
             raise RuntimeError("Mechanism session owner is unavailable.")
         return owner.canonical_source
 
+    def rewrite_authoritative_mechanism_source(
+        self,
+        *,
+        action_label: str,
+        description: str,
+        build_source: Callable[[object], object | None],
+        record_undo: bool = True,
+        apply_transition: bool = True,
+        transition_source: str = "authoritative_editor_rewrite",
+    ) -> bool:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        if not callable(build_source):
+            raise TypeError("build_source must be callable.")
+        resolution = self._resolve_reactions_draft_before_authoritative_change(
+            str(action_label or description or "Changing the mechanism source"),
+            continue_label="Continue",
+        )
+        if not resolution.may_continue:
+            return False
+        base_source = self.canonical_mechanism_source()
+        new_source = build_source(base_source)
+        if new_source is None:
+            return False
+        if not isinstance(new_source, MechanismAuthoringSource):
+            raise TypeError("build_source must return a MechanismAuthoringSource.")
+        return self._set_authoritative_mechanism_editor_source(
+            new_source,
+            description=str(description or action_label or "Rewrite mechanism source"),
+            apply_transition=bool(apply_transition),
+            transition_source=str(transition_source or "authoritative_editor_rewrite"),
+            record_undo=bool(record_undo),
+        )
+
+    def rewrite_authoritative_reactions_text(
+        self,
+        *,
+        action_label: str,
+        description: str,
+        rewrite_text: Callable[[str], str | None],
+        record_undo: bool = True,
+        apply_transition: bool = True,
+        transition_source: str = "authoritative_reactions_rewrite",
+    ) -> bool:
+        if not callable(rewrite_text):
+            raise TypeError("rewrite_text must be callable.")
+
+        def _build_source(source):
+            next_reactions = rewrite_text(str(source.reactions_text))
+            if next_reactions is None:
+                return None
+            return source.with_reactions_text(str(next_reactions))
+
+        return self.rewrite_authoritative_mechanism_source(
+            action_label=str(action_label or description or "Changing Reactions"),
+            description=str(description or action_label or "Rewrite Reactions"),
+            build_source=_build_source,
+            record_undo=bool(record_undo),
+            apply_transition=bool(apply_transition),
+            transition_source=str(transition_source or "authoritative_reactions_rewrite"),
+        )
+
     def set_variable_sliders(
         self,
         variables: Dict[str, float],
@@ -4091,33 +4259,11 @@ class MainWindow(
     def parse_sim_time_seconds(self) -> float:
         return self._simulation_solver_owner.parse_sim_time_seconds()
 
-    def set_mechanism_reactions_text_with_optional_undo(
-        self,
-        new_text: str,
-        description: str,
-        *,
-        record_undo: bool,
-    ) -> None:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        self._set_authoritative_mechanism_editor_source(
-            MechanismAuthoringSource.from_parts(
-                reactions_text=str(new_text),
-                state_network_dsl=str(self.mechanism_state_network_dsl_raw() or ""),
-            ),
-            description=str(description),
-            record_undo=bool(record_undo),
-        )
-
     def _apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> None:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        self._set_authoritative_mechanism_editor_source(
-            MechanismAuthoringSource.from_parts(
-                reactions_text=str(reactions_text),
-                state_network_dsl=str(self.mechanism_state_network_dsl_raw() or ""),
-            ),
+        self.rewrite_authoritative_reactions_text(
+            action_label="Resolving Wegscheider cyclicity",
             description="Resolve Wegscheider cyclicity",
+            rewrite_text=lambda _current: str(reactions_text),
             apply_transition=True,
             transition_source="wegscheider_resolution",
         )
@@ -5019,9 +5165,8 @@ class MainWindow(
             discard_dirty_preview=discard_dirty_preview,
         )
 
-    def _run_simulation_after_flushing_batch_initials(self) -> None:
+    def _run_simulation_after_committing_batch_initials(self) -> None:
         self._commit_active_batch_table_editor()
-        self._flush_canonical_batch_initials_transition()
         self._sim_controller.run_simulation()
 
     def _refresh_run_target_ui_from_batch_scope(self) -> None:
@@ -6056,23 +6201,23 @@ class MainWindow(
 
         Notes are persisted separately and are never parsed or injected into the DSL.
         """
-        reactions_widget = self._mechanism_editor._reactions_text
-        new_text = self._updated_reactions_text_with_scalar_param(
-            reactions_widget.toPlainText(),
-            str(name),
-            float(value),
-        )
-
-        self.set_mechanism_reactions_text_with_optional_undo(
-            new_text,
-            f"Update param {name} in Reactions DSL",
+        self.rewrite_authoritative_reactions_text(
+            action_label=f"Updating param {name} in Reactions DSL",
+            description=f"Update param {name} in Reactions DSL",
+            rewrite_text=lambda current_text: self._updated_reactions_text_with_scalar_param(
+                str(current_text or ""),
+                str(name),
+                float(value),
+            ),
             record_undo=True,
+            apply_transition=True,
+            transition_source="scalar_param_rewrite",
         )
 
     def _parameter_algebra_spec_for_ui(self):
         from kindred.core.simulator.algebra_section import extract_algebra_section_text
 
-        reactions_text = self._mechanism_editor._reactions_text.toPlainText()
+        reactions_text = self.mechanism_reactions_text_raw()
         if not extract_algebra_section_text(reactions_text).strip():
             return None
         from kindred.core.simulator.dsl import parse_dsl_to_mechanism
@@ -6152,14 +6297,7 @@ class MainWindow(
         return "kJ/mol"
 
     def _energy_mode_full_dsl_from_editor(self) -> str:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        reactions_text = self._mechanism_editor._reactions_text.toPlainText()
-        state_network_dsl = self._mechanism_editor._state_network_editor.get_state_network_dsl()
-        return MechanismAuthoringSource.from_parts(
-            reactions_text=reactions_text,
-            state_network_dsl=state_network_dsl,
-        ).full_dsl
+        return self.canonical_mechanism_source().full_dsl
 
     def _energy_mode_temperature_K(self, full_dsl: str) -> float | None:
         T_override = self._dsl_global_temperature_K(full_dsl)
@@ -6428,11 +6566,12 @@ class MainWindow(
         self._refresh_slider_transaction_button_state()
 
     def _commit_slider_value(self, name: str, value: float) -> None:
+        if not self._materialize_direct_slider_commit_to_authoritative_editors(name, value):
+            return
         self._preview_session.commit_slider_value(name, value)
         self._sim_controller.invalidate_slider_preview_work()
         self._preview_session.stop_variable_update_timer()
         self._preview_session.stop_slider_release_commit_timer()
-        self._materialize_direct_slider_commit_to_authoritative_editors(name, value)
         self._preview_session.commit_current_mechanism_workspace(invalidate_preview_work=False)
         self._sync_after_authoritative_slider_materialization()
 
@@ -6478,13 +6617,18 @@ class MainWindow(
     def _materialized_mechanism_editor_source_for_runtime_parameter_values(
         self,
         values: Dict[str, float],
+        *,
+        base_source=None,
     ):
         from kindred.core.mechanism_source import MechanismAuthoringSource
 
+        source = base_source if base_source is not None else self.canonical_mechanism_source()
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("base_source must be a MechanismAuthoringSource.")
         non_scalar_values, scalar_values, state_network_values = (
             self._partition_effective_slider_commit_values(values)
         )
-        reactions_text = self.mechanism_reactions_text_raw()
+        reactions_text = str(source.reactions_text)
         if non_scalar_values:
             reactions_text = self._apply_reactions_overrides_to_text(
                 reactions_text,
@@ -6496,7 +6640,7 @@ class MainWindow(
                 scalar_values,
             )
 
-        state_network_dsl = self.mechanism_state_network_dsl_raw()
+        state_network_dsl = str(source.state_network_dsl)
         if state_network_dsl.strip() and state_network_values:
             state_network_dsl = self._apply_state_network_overrides_to_dsl(
                 state_network_dsl,
@@ -6538,12 +6682,21 @@ class MainWindow(
         apply_transition: bool = True,
         transition_source: str = "authoritative_editor_rewrite",
         record_undo: bool = True,
-    ) -> None:
+    ) -> bool:
         from kindred.core.mechanism_source import MechanismAuthoringSource
         from kindred.gui.undo_commands import SetMechanismSourceCommand
 
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be a MechanismAuthoringSource.")
+        if self._reactions_draft_dirty():
+            resolution = self._resolve_reactions_draft_before_authoritative_change(
+                str(description or "Changing the mechanism source"),
+                continue_label="Continue",
+            )
+            if not resolution.may_continue:
+                return False
+            if resolution.status == "applied":
+                return False
         transition_required = False
         previous_authoritative_suppress = bool(
             getattr(self, "_suppress_authoritative_mechanism_input_change", False)
@@ -6568,10 +6721,15 @@ class MainWindow(
             reactions_changed = reactions_text_s != current_reactions
             state_changed = state_editor_available and state_network_dsl_s != current_state
             if not reactions_changed and not state_changed:
-                return
-            old_source = MechanismAuthoringSource.from_parts(
-                reactions_text=current_reactions,
-                state_network_dsl=current_state,
+                return False
+            owner = getattr(self, "_mechanism_session_owner", None)
+            old_source = (
+                owner.canonical_source
+                if owner is not None
+                else MechanismAuthoringSource.from_parts(
+                    reactions_text=current_reactions,
+                    state_network_dsl=current_state,
+                )
             )
             if bool(record_undo):
                 command = SetMechanismSourceCommand(
@@ -6590,6 +6748,7 @@ class MainWindow(
             self._apply_authoritative_mechanism_transition(
                 transition_source=str(transition_source or "authoritative_editor_rewrite")
             )
+        return bool(transition_required)
 
     def _write_complete_authoritative_mechanism_source_to_editor(self, source) -> bool:
         from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -6636,9 +6795,7 @@ class MainWindow(
             reactions_widget.blockSignals(bool(previous_reactions_block))
 
         self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
-        validate = getattr(editor, "_validate_dsl", None)
-        if callable(validate):
-            validate()
+        self._refresh_reactions_draft_state()
         return True
 
     def _apply_mechanism_source_undo_stack_replacement(self, source) -> None:
@@ -6651,7 +6808,16 @@ class MainWindow(
             transition_source="mechanism_source_undo_redo",
         )
 
-    def _materialize_direct_slider_commit_to_authoritative_editors(self, name: str, value: float) -> None:
+    def _materialize_direct_slider_commit_to_authoritative_editors(self, name: str, value: float) -> bool:
+        return self._apply_runtime_parameter_values_to_mechanism_editors(
+            description=f"Apply slider {name}",
+            values_provider=lambda: self._direct_slider_commit_values_for_materialization(
+                name,
+                value,
+            ),
+        )
+
+    def _direct_slider_commit_values_for_materialization(self, name: str, value: float) -> Dict[str, float]:
         focused_set_id = str(self._preview_session.focused_mechanism_workspace_set_id() or "")
         effective_values = (
             self._preview_session.runtime_parameter_values_for_set(focused_set_id)
@@ -6665,23 +6831,34 @@ class MainWindow(
             parsed, ok = try_parse_finite_float(value)
             if ok:
                 normalized_values[str(name)] = float(parsed)
-        self._apply_runtime_parameter_values_to_mechanism_editors(
-            normalized_values,
-            description=f"Apply slider {name}",
-        )
+        return normalized_values
 
     def _apply_runtime_parameter_values_to_mechanism_editors(
         self,
-        values: Dict[str, float],
+        values: Optional[Dict[str, float]] = None,
         *,
         description: str = "Apply slider overrides",
-    ) -> None:
-        source = self._materialized_mechanism_editor_source_for_runtime_parameter_values(values)
-        self._set_authoritative_mechanism_editor_source(
-            source,
+        values_provider: Optional[Callable[[], Dict[str, float]]] = None,
+    ) -> bool:
+        def _values_for_builder() -> Dict[str, float]:
+            if callable(values_provider):
+                return dict(values_provider() or {})
+            return dict(values or {})
+
+        ok = self.rewrite_authoritative_mechanism_source(
+            action_label=str(description),
             description=str(description),
+            build_source=lambda source: self._materialized_mechanism_editor_source_for_runtime_parameter_values(
+                _values_for_builder(),
+                base_source=source,
+            ),
             apply_transition=False,
+            transition_source="slider_materialization",
         )
+        if not ok:
+            self._status_label.setText("Canceled slider commit")
+            return False
+        return True
 
     def _sync_after_authoritative_slider_materialization(
         self,
@@ -6721,13 +6898,14 @@ class MainWindow(
         description: str,
         apply_species_overlays: bool,
     ) -> None:
+        if not self._apply_runtime_parameter_values_to_mechanism_editors(
+            effective_values,
+            description=str(description),
+        ):
+            return
         self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
         self._preview_session.stop_variable_update_timer()
         self._preview_session.stop_slider_release_commit_timer()
-        self._apply_runtime_parameter_values_to_mechanism_editors(
-            effective_values,
-            description=str(description),
-        )
         affected_canonical_initial_set_ids: tuple[str, ...] = ()
         if bool(apply_species_overlays):
             affected_canonical_initial_set_ids = self._commit_species_slider_values_to_selected_batch_rows()
@@ -7059,7 +7237,7 @@ class MainWindow(
         value : float
             New value
         source_text : str | None
-            Optional mechanism DSL to apply the change to. If None, use editor text.
+            Optional mechanism DSL to apply the change to. If None, use canonical Reactions text.
 
         Returns
         -------
@@ -7067,7 +7245,7 @@ class MainWindow(
             Mechanism DSL with the updated value applied.
         """
         if source_text is None:
-            mechanism_text = self._mechanism_editor.reactions_text()
+            mechanism_text = str(self.canonical_mechanism_source().reactions_text)
         else:
             mechanism_text = source_text
 
@@ -7723,6 +7901,8 @@ class MainWindow(
 
         # Connect signal to insert DSL into mechanism editor
         def on_schedule_created(dsl_text: str):
+            if not self._reactions_user_mutation_allowed():
+                return
             # Get current mechanism text
             current_text = self._mechanism_editor._reactions_text.toPlainText()
 

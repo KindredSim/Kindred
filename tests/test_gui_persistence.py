@@ -26,78 +26,6 @@ def qt_app():
     return app
 
 
-def test_project_round_trip_includes_all_dsl(tmp_path, monkeypatch, qt_app):
-    """Saving then loading restores reactions/algebra and migrates inline initials to batch sets."""
-    reactions_text = "\n".join(
-        [
-            "reaction: A -> B; k=0.2",
-            "initial: A=1.0",
-            "initial: B=0.0",
-            "# Algebra",
-            "let rate_ratio = [B] / max([A], 1e-6)",
-        ]
-    )
-    notes_text = "These are free-form notes (never parsed).\n"
-    state_network_text = "\n".join([
-        "state: S1, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
-        "state: TS1, kind=TS, energy=10, energy_unit=kJ/mol, degeneracy=1",
-        "edge: S1,TS1",
-    ])
-
-    templates_dir = tmp_path / "templates"
-
-    def _fake_templates_dir(_self):
-        return templates_dir
-
-    monkeypatch.setattr(
-        "kindred.config.templates.TemplateManager._get_templates_directory",
-        _fake_templates_dir,
-    )
-    monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
-
-    window = MainWindow()
-    try:
-        window._mechanism_editor._reactions_text.setPlainText(reactions_text)
-        window._mechanism_editor._notes_text.setPlainText(notes_text)
-        window._mechanism_editor._state_network_editor.set_state_network_dsl(state_network_text)
-
-        project_path = tmp_path / "round_trip.kin"
-        monkeypatch.setattr(
-            QtWidgets.QFileDialog,
-            "getSaveFileName",
-            lambda *args, **kwargs: (str(project_path), "Kindred Project (*.kin)")
-        )
-        window.project_controller.save_project()
-    finally:
-        window.close()
-
-    loader = MainWindow()
-    try:
-        monkeypatch.setattr(
-            QtWidgets.QFileDialog,
-            "getOpenFileName",
-            lambda *args, **kwargs: (str(project_path), "Kindred Project (*.kin)")
-        )
-        loader.project_controller.load_project()
-
-        expected_reactions_text = "\n".join(
-            [
-                "reaction: A -> B; k=0.2",
-                "# Initial Conditions moved to Batch Initial Conditions table (set1): A=1, B=0. Table values are authoritative.",
-                "# Algebra",
-                "let rate_ratio = [B] / max([A], 1e-6)",
-            ]
-        )
-        assert loader._mechanism_editor._reactions_text.toPlainText() == expected_reactions_text
-        assert loader._mechanism_editor._reactions_text.isReadOnly() is True
-        assert loader._mechanism_editor._notes_text.toPlainText() == notes_text
-        assert loader._mechanism_editor._state_network_editor.get_state_network_dsl() == state_network_text
-        assert loader._batch_store.set_names()[:1] == ["set1"]
-        assert loader._batch_store.values_for_set("set1") == {"A": "1", "B": "0"}
-    finally:
-        loader.close()
-
-
 def test_project_payload_without_state_network_clears_existing_state_network(main_window, qt_app):
     stale_state_network_text = "\n".join(
         [
@@ -130,6 +58,77 @@ def test_project_payload_without_state_network_clears_existing_state_network(mai
     assert main_window.mechanism_state_network_dsl_raw() == ""
     assert "# State Network" not in main_window.get_mechanism_text()
     assert stale_state_network_text not in main_window.get_mechanism_text()
+
+
+def test_project_round_trip_includes_all_dsl(tmp_path, monkeypatch, qt_app):
+    """Saving then loading restores the full project source and migrates inline initials."""
+    reactions_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "# Algebra",
+            "let rate_ratio = [B] / max([A], 1e-6)",
+        ]
+    )
+    notes_text = "These are free-form notes (never parsed).\n"
+    state_network_text = "\n".join(
+        [
+            "state: S1, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "state: TS1, kind=TS, energy=10, energy_unit=kJ/mol, degeneracy=1",
+            "edge: S1,TS1",
+        ]
+    )
+
+    monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
+
+    window = MainWindow()
+    try:
+        window._set_authoritative_mechanism_editor_source(
+            MechanismAuthoringSource.from_parts(
+                reactions_text=reactions_text,
+                state_network_dsl=state_network_text,
+            ),
+            description="Seed full project source",
+            apply_transition=False,
+            record_undo=False,
+        )
+        window._mechanism_editor._notes_text.setPlainText(notes_text)
+
+        project_path = tmp_path / "round_trip.kin"
+        monkeypatch.setattr(
+            QtWidgets.QFileDialog,
+            "getSaveFileName",
+            lambda *args, **kwargs: (str(project_path), "Kindred Project (*.kin)"),
+        )
+        window.project_controller.save_project()
+    finally:
+        window.close()
+
+    loader = MainWindow()
+    try:
+        monkeypatch.setattr(
+            QtWidgets.QFileDialog,
+            "getOpenFileName",
+            lambda *args, **kwargs: (str(project_path), "Kindred Project (*.kin)"),
+        )
+        loader.project_controller.load_project()
+
+        expected_reactions_text = "\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "# Initial Conditions moved to Batch Initial Conditions table (set1): A=1, B=0. Table values are authoritative.",
+                "# Algebra",
+                "let rate_ratio = [B] / max([A], 1e-6)",
+            ]
+        )
+        assert loader._mechanism_editor._reactions_text.toPlainText() == expected_reactions_text
+        assert loader._mechanism_editor._notes_text.toPlainText() == notes_text
+        assert loader._mechanism_editor._state_network_editor.get_state_network_dsl() == state_network_text
+        assert loader._batch_store.set_names()[:1] == ["set1"]
+        assert loader._batch_store.values_for_set("set1") == {"A": "1", "B": "0"}
+    finally:
+        loader.close()
 
 
 def test_project_load_with_saved_batch_initials_strips_mechanism_text_initials(main_window, qt_app):

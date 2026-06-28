@@ -4,7 +4,7 @@ from typing import Callable, Dict, Optional
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.validation import try_parse_finite_float
-from kindred.gui.ports import RunAutoLockResult
+from kindred.gui.ports import ReactionsDraftApplyResult
 
 
 class SimulationMechanismOwner:
@@ -17,8 +17,7 @@ class SimulationMechanismOwner:
         mechanism_editor_getter: Callable[[], object | None],
         preview_session: object,
         variable_runtime: object,
-        mechanism_locked_getter: Callable[[], bool],
-        try_lock_mechanism_editor: Callable[..., object],
+        apply_dirty_reactions_for_run: Callable[[], ReactionsDraftApplyResult],
         apply_reactions_overrides_to_text: Callable[..., str],
         apply_state_network_overrides_to_dsl: Callable[..., str],
         pending_initials_for_source_set: Callable[..., dict[str, float]] | None = None,
@@ -28,20 +27,17 @@ class SimulationMechanismOwner:
         self._mechanism_editor_getter = mechanism_editor_getter
         self._preview_session = preview_session
         self._variable_runtime = variable_runtime
-        self._mechanism_locked_getter = mechanism_locked_getter
-        self._try_lock_mechanism_editor = try_lock_mechanism_editor
+        self._apply_dirty_reactions_for_run = apply_dirty_reactions_for_run
         self._pending_initials_for_source_set = pending_initials_for_source_set
         self._apply_reactions_overrides_to_text = apply_reactions_overrides_to_text
         self._apply_state_network_overrides_to_dsl = apply_state_network_overrides_to_dsl
         self._apply_wegscheider_resolution_reactions_rewrite = apply_wegscheider_resolution_reactions_rewrite
 
-    def auto_lock_for_run(self) -> RunAutoLockResult:
-        if not bool(self._mechanism_locked_getter()):
-            result = self._try_lock_mechanism_editor(return_acceptance=True)
-            if isinstance(result, RunAutoLockResult):
-                return result
-            return RunAutoLockResult(bool(result))
-        return RunAutoLockResult(True)
+    def apply_dirty_reactions_for_run(self) -> ReactionsDraftApplyResult:
+        result = self._apply_dirty_reactions_for_run()
+        if isinstance(result, ReactionsDraftApplyResult):
+            return result
+        raise TypeError("apply_dirty_reactions_for_run must return ReactionsDraftApplyResult.")
 
     def is_mechanism_ready_for_run(self) -> bool:
         owner = self._mechanism_session_owner()

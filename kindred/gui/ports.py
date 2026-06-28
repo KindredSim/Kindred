@@ -10,7 +10,7 @@ from kindred.gui.controllers.preview_target_identity import normalize_preview_ta
 
 
 @dataclass(frozen=True, slots=True)
-class RunAutoLockResult:
+class ReactionsDraftApplyResult:
     success: bool
     affected_rows: tuple[int, ...] = ()
 
@@ -1005,7 +1005,7 @@ class SimulationBatchPort(Protocol):
 
 
 class SimulationMechanismPort(Protocol):
-    def auto_lock_for_run(self) -> RunAutoLockResult: ...
+    def apply_dirty_reactions_for_run(self) -> ReactionsDraftApplyResult: ...
 
     def is_mechanism_ready_for_run(self) -> bool: ...
 

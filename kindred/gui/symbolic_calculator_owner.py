@@ -169,8 +169,6 @@ class SymbolicCalculatorOwner:
         owner = self._mechanism_session_owner
         if owner is None:
             return None, False, "Canonical mechanism unavailable."
-        if bool(getattr(owner, "edit_session_active", False)):
-            return None, False, "Symbolic calculator is disabled while mechanism editing is active."
         validate = getattr(owner, "validate_canonical", None)
         if not callable(validate):
             return None, False, "Canonical mechanism validation is unavailable."

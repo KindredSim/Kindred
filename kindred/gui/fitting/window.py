@@ -108,6 +108,10 @@ from kindred.gui.ui_helpers import set_compact_label_text
 logger = logging.getLogger(__name__)
 
 
+class _ObservableRewriteAborted(RuntimeError):
+    pass
+
+
 class _EvaluateSeriesEvaluatorLike(Protocol):
     def evaluate_series(self, params: Mapping[str, float]) -> Dict[str, Any]:
         ...
@@ -301,7 +305,7 @@ class FittingWindow(QtWidgets.QDialog):
         mechanism_species: Optional[Sequence[str]] = None,
         mechanism_text_getter: Optional[Callable[[], str]] = None,
         reactions_text_getter: Optional[Callable[[], str]] = None,
-        reactions_text_setter: Optional[Callable[[str], None]] = None,
+        reactions_text_rewriter: Optional[Callable[..., bool]] = None,
         simulation_builder: Optional[SimulationBuilder] = None,
         runtime_inputs: Optional[FittingRuntimeInputs] = None,
         dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
@@ -337,7 +341,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._mechanism_species = [str(x) for x in (mechanism_species or []) if str(x).strip()]
         self._mechanism_text_getter = mechanism_text_getter
         self._reactions_text_getter = reactions_text_getter
-        self._reactions_text_setter = reactions_text_setter
+        self._reactions_text_rewriter = reactions_text_rewriter
         self._simulation_builder = (
             coerce_simulation_builder(simulation_builder)
             if callable(simulation_builder)
@@ -2037,18 +2041,10 @@ class FittingWindow(QtWidgets.QDialog):
         scalar_scope: str,
         persist_observable: bool,
     ) -> None:
-        from kindred.core.algebra.observable_introspection import (
-            analyze_observable_expression,
-            detect_unknown_scalar_identifiers,
-            extract_observables_from_algebra_text,
-        )
         from kindred.core.algebra.symbols import SymbolTable
-        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
         from kindred.core.simulator.algebra_section import (
-            extract_algebra_section_text,
             upsert_lines_into_algebra_section,
         )
-        from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
         from kindred.core.validation import validate_name
 
         if not self._observable_dsl_edit_available():
@@ -2059,67 +2055,17 @@ class FittingWindow(QtWidgets.QDialog):
             return
         obs_name, obs_expr = normalized
 
-        mechanism_species = {str(x) for x in (self._params_ics_tab.get_mechanism_species() or []) if str(x).strip()}
-        if not self._validate_observable_name_rules(obs_name, mechanism_species=mechanism_species, symbol_table=SymbolTable()):
+        if not self._validate_observable_name_rules(obs_name, mechanism_species=set(), symbol_table=SymbolTable()):
             return
-
-        reactions_text = str(self._reactions_text_getter() or "")
-        mechanism_text = str(self._mechanism_text_getter() or "")
-        algebra_text = extract_algebra_section_text(reactions_text)
-        try:
-            mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(mechanism_text, initials={}))
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Mechanism source is invalid:\n\n{exc}")
-            return
-        existing_obs_map = extract_observables_from_algebra_text(
-            algebra_text,
-            mechanism_namespace=mechanism_namespace,
-        )
-        existing_observables = {str(x) for x in (existing_obs_map or {}).keys() if str(x).strip()}
-        if not self._validate_observable_existence(obs_name, existing_observables=existing_observables, persist_observable=persist_observable):
-            return
-
-        try:
-            analysis = analyze_observable_expression(obs_expr)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Invalid expression:\n\n{exc}")
-            return
-        if not self._validate_observable_expression_analysis(analysis, obs_expr=obs_expr, mechanism_species=mechanism_species):
-            return
-
-        known_identifiers = self._known_identifiers_for_observable(existing_observables=existing_observables)
-        if obs_name in known_identifiers:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                f"Name '{obs_name}' is already used by a fit/solver parameter. Choose a different observable name.",
-            )
-            return
-        known_identifiers |= {obs_name}
-
-        try:
-            missing_scalars = sorted(
-                detect_unknown_scalar_identifiers(
-                    obs_expr,
-                    observable_name=obs_name,
-                    known_identifiers=known_identifiers,
-                    mechanism_species=mechanism_species,
-                    mechanism_namespace=mechanism_namespace,
-                )
-            )
-        except ValueError as exc:
-            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Invalid expression:\n\n{exc}")
-            return
-        updated_reactions_text = self._persist_observable_updates(
-            reactions_text=reactions_text,
+        persisted = self._persist_observable_updates(
             obs_name=obs_name,
             obs_expr=obs_expr,
-            missing_scalars=missing_scalars,
             persist_observable=persist_observable,
             upsert_lines_into_algebra_section=upsert_lines_into_algebra_section,
         )
-        if updated_reactions_text is None:
+        if persisted is None:
             return
+        _updated_reactions_text, missing_scalars = persisted
 
         if not self._refresh_simulation_after_reactions_update():
             return
@@ -2131,7 +2077,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _observable_dsl_edit_available(self) -> bool:
-        if not callable(getattr(self, "_reactions_text_getter", None)) or not callable(getattr(self, "_reactions_text_setter", None)):
+        if not callable(getattr(self, "_reactions_text_getter", None)) or not callable(getattr(self, "_reactions_text_rewriter", None)):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Add Observable",
@@ -2291,31 +2237,122 @@ class FittingWindow(QtWidgets.QDialog):
     def _persist_observable_updates(
         self,
         *,
-        reactions_text: str,
         obs_name: str,
         obs_expr: str,
-        missing_scalars: Sequence[str],
         persist_observable: bool,
         upsert_lines_into_algebra_section,
-    ) -> Optional[str]:
-        updated_reactions_text = reactions_text
-        if missing_scalars or persist_observable:
+    ) -> Optional[tuple[str, tuple[str, ...]]]:
+        from kindred.core.algebra.observable_introspection import (
+            analyze_observable_expression,
+            detect_unknown_scalar_identifiers,
+            extract_observables_from_algebra_text,
+        )
+        from kindred.core.algebra.symbols import SymbolTable
+        from kindred.core.simulator.algebra_section import extract_algebra_section_text
+        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+        from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+
+        rewriter = getattr(self, "_reactions_text_rewriter", None)
+        if not callable(rewriter):
+            QtWidgets.QMessageBox.warning(self, "Add Observable", "Mechanism Reactions editor is unavailable.")
+            return None
+
+        updated_holder: dict[str, object] = {"text": "", "missing_scalars": tuple()}
+
+        def _rewrite(current_reactions_text: str) -> str:
+            current_text = str(current_reactions_text or "")
+            try:
+                mechanism_text = str(self._mechanism_text_getter() or "")
+                mechanism = parse_dsl_to_mechanism(mechanism_text, initials={})
+                mechanism_namespace = build_namespace_from_mechanism(mechanism)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Add Observable", f"Mechanism source is invalid:\n\n{exc}")
+                raise _ObservableRewriteAborted() from exc
+            mechanism_species = {str(x) for x in (mechanism.species_names() or []) if str(x).strip()}
+            algebra_text = extract_algebra_section_text(current_text)
+            existing_obs_map = extract_observables_from_algebra_text(
+                algebra_text,
+                mechanism_namespace=mechanism_namespace,
+            )
+            existing_observables = {str(x) for x in (existing_obs_map or {}).keys() if str(x).strip()}
+            if not self._validate_observable_name_rules(
+                obs_name,
+                mechanism_species=mechanism_species,
+                symbol_table=SymbolTable(),
+            ):
+                raise _ObservableRewriteAborted()
+            if not self._validate_observable_existence(
+                obs_name,
+                existing_observables=existing_observables,
+                persist_observable=persist_observable,
+            ):
+                raise _ObservableRewriteAborted()
+            try:
+                analysis = analyze_observable_expression(obs_expr)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Add Observable", f"Invalid expression:\n\n{exc}")
+                raise _ObservableRewriteAborted() from exc
+            if not self._validate_observable_expression_analysis(
+                analysis,
+                obs_expr=obs_expr,
+                mechanism_species=mechanism_species,
+            ):
+                raise _ObservableRewriteAborted()
+            known_identifiers = self._known_identifiers_for_observable(existing_observables=existing_observables)
+            if obs_name in known_identifiers:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Add Observable",
+                    f"Name '{obs_name}' is already used by a fit/solver parameter. Choose a different observable name.",
+                )
+                raise _ObservableRewriteAborted()
+            known_identifiers |= {obs_name}
+            try:
+                missing_scalars = tuple(
+                    sorted(
+                        detect_unknown_scalar_identifiers(
+                            obs_expr,
+                            observable_name=obs_name,
+                            known_identifiers=known_identifiers,
+                            mechanism_species=mechanism_species,
+                            mechanism_namespace=mechanism_namespace,
+                        )
+                    )
+                )
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "Add Observable", f"Invalid expression:\n\n{exc}")
+                raise _ObservableRewriteAborted() from exc
+            updated_reactions_text = current_text
             to_add: list[str] = []
             for scalar in missing_scalars:
-                if self._reactions_text_has_param_decl(reactions_text, str(scalar)):
+                if self._reactions_text_has_param_decl(current_text, str(scalar)):
                     continue
                 to_add.append(f"param {scalar} = 1.0")
             if persist_observable:
                 to_add.append(f"let {obs_name} = {obs_expr}")
             if to_add:
-                updated_reactions_text = upsert_lines_into_algebra_section(reactions_text, to_add)
-        if updated_reactions_text != reactions_text:
-            try:
-                self._reactions_text_setter(updated_reactions_text)
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, "Add Observable", f"Failed to update Reactions DSL:\n\n{exc}")
-                return None
-        return str(updated_reactions_text)
+                updated_reactions_text = upsert_lines_into_algebra_section(current_text, to_add)
+            updated_holder["text"] = str(updated_reactions_text)
+            updated_holder["missing_scalars"] = tuple(str(scalar) for scalar in missing_scalars)
+            return str(updated_reactions_text)
+
+        try:
+            ok = rewriter(
+                action_label="Updating Global Fit Reactions",
+                description="Global Fit: update Reactions",
+                rewrite_text=_rewrite,
+                record_undo=True,
+                apply_transition=True,
+                transition_source="global_fit_observable",
+            )
+        except _ObservableRewriteAborted:
+            return None
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Failed to update Reactions DSL:\n\n{exc}")
+            return None
+        if not ok:
+            return None
+        return str(updated_holder["text"]), tuple(updated_holder["missing_scalars"])
 
     def _refresh_simulation_after_reactions_update(self) -> bool:
         try:

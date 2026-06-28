@@ -17,8 +17,11 @@ class SimulationRunUiOwner:
         self._results_table_getter = results_table_getter
         self._run_button_requested_enabled = True
         self._runtime_launch_available = False
+        self._draft_run_preflight_available = False
         self._launch_readiness_stale = False
         self._run_target_available = False
+        self._mechanism_launch_available = True
+        self._mechanism_unavailable_tooltip = ""
         self._run_button_text = "Run"
         self._run_button_tooltip = ""
         self._run_button = None
@@ -86,6 +89,15 @@ class SimulationRunUiOwner:
         self._run_target_available = bool(target_available)
         self._run_button_text = str(button_text or "Run")
         self._run_button_tooltip = str(tooltip or "")
+        self._apply_run_button_state()
+
+    def render_mechanism_launch_available(self, available: bool, *, tooltip: str = "") -> None:
+        self._mechanism_launch_available = bool(available)
+        self._mechanism_unavailable_tooltip = str(tooltip or "")
+        self._apply_run_button_state()
+
+    def render_draft_run_preflight_available(self, available: bool) -> None:
+        self._draft_run_preflight_available = bool(available)
         self._apply_run_button_state()
 
     def render_launch_available(self, available: bool) -> None:
@@ -162,37 +174,40 @@ class SimulationRunUiOwner:
             set_bounded_label_text(self._algebra_status_label, str(text), max_width=420)
             self._algebra_status_label.setToolTip(str(details or ""))
 
-    def _mechanism_run_target_is_valid(self) -> bool:
-        editor = self._mechanism_editor
-        if editor is None or not hasattr(editor, "is_mechanism_valid"):
-            return True
-        try:
-            return bool(editor.is_mechanism_valid())
-        except (RuntimeError, AttributeError):
-            return False
-
     def _apply_run_button_state(self) -> None:
         button = self._run_button
         if button is None:
             return
         button.setText(self._run_button_text)
-        button.setToolTip(self._run_button_tooltip)
-        mechanism_valid = self._mechanism_run_target_is_valid()
+        tooltip = self._run_button_tooltip
+        if (
+            not bool(self._mechanism_launch_available)
+            and self._run_button_requested_enabled
+            and self._effective_runtime_launch_available()
+            and self._run_target_available
+        ):
+            tooltip = self._mechanism_unavailable_tooltip or tooltip
+        button.setToolTip(tooltip)
         effective_enabled = bool(
             self._run_button_requested_enabled
-            and self._runtime_launch_available
-            and not self._launch_readiness_stale
+            and self._effective_runtime_launch_available()
             and self._run_target_available
-            and mechanism_valid
+            and self._mechanism_launch_available
         )
         button.setEnabled(effective_enabled)
         if self._run_action is not None:
             self._run_action.setEnabled(effective_enabled)
             self._run_action.setText(self._run_button_text)
-            self._run_action.setToolTip(self._run_button_tooltip)
+            self._run_action.setToolTip(tooltip)
         editor = self._mechanism_editor
         if editor is None:
             return
-        editor.run_btn.setText(self._run_button_text)
-        editor.run_btn.setToolTip(self._run_button_tooltip)
+        editor.run_btn.setText("Run")
+        editor.run_btn.setToolTip(tooltip)
         editor.run_btn.setEnabled(effective_enabled)
+
+    def _effective_runtime_launch_available(self) -> bool:
+        return bool(
+            self._draft_run_preflight_available
+            or (self._runtime_launch_available and not self._launch_readiness_stale)
+        )

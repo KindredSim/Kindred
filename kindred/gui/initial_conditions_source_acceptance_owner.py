@@ -27,7 +27,7 @@ class InitialConditionsSourceAcceptanceOwner:
         self._import_owner = import_owner
         self._show_reconciliation_error = show_reconciliation_error
 
-    def prepare_for_authoritative_lock(
+    def prepare_for_authoritative_apply(
         self,
         source: MechanismAuthoringSource,
         *,

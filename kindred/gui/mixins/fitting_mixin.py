@@ -51,6 +51,7 @@ _FITTING_KEY_TO_SHORT: dict[str, str] = {
 _FIT_PARAMETER_APPLY_STATUS_REWRITTEN = "rewritten"
 _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT = "already_current"
 _FIT_PARAMETER_APPLY_STATUS_FAILED = "failed"
+_FIT_PARAMETER_APPLY_STATUS_CANCELED = "canceled"
 _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE = "unappliable"
 _FIT_PARAMETER_APPLY_OUTCOME_REWRITE_INTENDED = "rewrite_intended"
 
@@ -78,6 +79,12 @@ class _FitParameterApplyOutcome:
     rewrite_performed: bool
     rewrite_failed: bool
     applied_any: bool
+
+
+@dataclass(frozen=True)
+class _FitParameterApplyWriteResult:
+    status: str
+    delta: _FitParameterApplyDelta
 
 
 @dataclass(frozen=True)
@@ -155,7 +162,7 @@ class FittingMixin:
         *,
         parameter_delta: Optional[_FitParameterApplyDelta] = None,
         refresh_display: bool = True,
-    ) -> str:
+    ) -> _FitParameterApplyWriteResult:
         """
         Update mechanism DSL text with fitted parameter values.
 
@@ -169,12 +176,57 @@ class FittingMixin:
             for name, value in dict(parameters or {}).items()
         }
         delta = parameter_delta or self._build_fit_parameter_apply_delta(normalized_parameters)
-        updated_text = str(delta.updated_text or "")
-        mechanism_editor = self._require_fitting_ports().mechanism_editor
-        before_text = str(mechanism_editor.reactions_text())
+        get_canonical_reactions = getattr(self, "mechanism_reactions_text_raw", None)
+        if not callable(get_canonical_reactions):
+            raise RuntimeError("Canonical mechanism Reactions getter is unavailable.")
+        before_text = str(get_canonical_reactions() or "")
         preview_outcome = self._build_fit_parameter_apply_outcome(delta, before_text=before_text)
-        missing = [str(name) for name in delta.missing]
-        update_errors = [dict(error) for error in delta.update_errors]
+        force_fresh_boundary = bool(
+            callable(getattr(self, "_reactions_draft_dirty", None))
+            and self._reactions_draft_dirty()
+        )
+        if not force_fresh_boundary and preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE:
+            logger.info("Fitted parameter project apply found unappliable requested targets; no rewrite will be performed")
+            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE, delta)
+        if not force_fresh_boundary and preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT and not delta.has_real_change:
+            logger.info("Fitted parameter project apply made no authoritative numeric change")
+            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT, delta)
+        if not force_fresh_boundary and preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT and before_text == str(delta.updated_text or ""):
+            logger.info("Fitted parameter project apply found the mechanism text already current")
+            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT, delta)
+        if not force_fresh_boundary and preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT:
+            logger.info("Fitted parameter project apply found no authoritative DSL rewrite to perform")
+            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT, delta)
+
+        rewrite = getattr(self, "rewrite_authoritative_reactions_text", None)
+        if not callable(rewrite):
+            raise RuntimeError("Authoritative mechanism Reactions rewriter is unavailable.")
+
+        applied_delta = delta
+
+        def _rewrite(current_text: str) -> str:
+            nonlocal applied_delta
+            applied_delta = self._build_fit_parameter_apply_delta(
+                normalized_parameters,
+                source_text=str(current_text or ""),
+            )
+            return str(applied_delta.updated_text or "")
+
+        ok = bool(
+            rewrite(
+                action_label="Applying fitted parameters to the project",
+                description="Global Fit: update Reactions",
+                rewrite_text=_rewrite,
+                record_undo=True,
+                apply_transition=True,
+                transition_source="global_fit_project_apply",
+            )
+        )
+        if not ok:
+            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_CANCELED, applied_delta)
+
+        missing = [str(name) for name in applied_delta.missing]
+        update_errors = [dict(error) for error in applied_delta.update_errors]
         for name in missing:
             logger.warning("Parameter %r not updated (missing/invalid)", name)
         for error in update_errors:
@@ -184,47 +236,48 @@ class FittingMixin:
                 error.get("exc_type", "Exception"),
                 error.get("message", ""),
             )
-        if preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE:
-            logger.info("Fitted parameter project apply found unappliable requested targets; no rewrite will be performed")
-            return _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE
-        if preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT and not delta.has_real_change:
-            logger.info("Fitted parameter project apply made no authoritative numeric change")
-            return _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT
-        if preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT and before_text == updated_text:
-            logger.info("Fitted parameter project apply found the mechanism text already current")
-            return _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT
-        if preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT:
-            logger.info("Fitted parameter project apply found no authoritative DSL rewrite to perform")
-            return _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT
-
-        set_with_undo = getattr(self, "set_mechanism_reactions_text_with_optional_undo", None)
-        if not callable(set_with_undo):
-            raise RuntimeError("Authoritative mechanism Reactions setter is unavailable.")
-        set_with_undo(
-            updated_text,
-            "Global Fit: update Reactions",
-            record_undo=True,
+        applied_outcome = self._build_fit_parameter_apply_outcome(
+            applied_delta,
+            before_text=str(applied_delta.current_text or ""),
         )
+        if applied_outcome.status == _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE:
+            logger.info("Fitted parameter project apply found unappliable requested targets after draft resolution")
+            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE, applied_delta)
+        if applied_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT:
+            logger.info("Fitted parameter project apply found no authoritative DSL rewrite after draft resolution")
+            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT, applied_delta)
 
-        if str(mechanism_editor.reactions_text()) == before_text:
+        after_text = str(get_canonical_reactions() or "")
+        if after_text == str(applied_delta.current_text or ""):
             logger.warning("Fitted parameter project apply did not rewrite mechanism text")
-            return _FIT_PARAMETER_APPLY_STATUS_FAILED
+            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_FAILED, applied_delta)
 
         if callable(getattr(self, "_on_programmatic_mechanism_load", None)):
             self._on_programmatic_mechanism_load()
         if callable(getattr(self, "_extract_and_populate_variables", None)):
             self._extract_and_populate_variables(preserve_visibility=True)
         if callable(getattr(self, "_sync_batch_species_columns", None)):
-            mechanism_initials = self._extract_mechanism_initials(updated_text)
+            mechanism_initials = self._extract_mechanism_initials(str(applied_delta.updated_text or ""))
             self._sync_batch_species_columns(list(mechanism_initials.keys()))
         if refresh_display and callable(getattr(self, "_refresh_batch_display_from_request_scope", None)):
             self._refresh_batch_display_from_request_scope()
         logger.info("Wrote %d fitted parameter(s) to mechanism editor", len(normalized_parameters))
-        return _FIT_PARAMETER_APPLY_STATUS_REWRITTEN
+        return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_REWRITTEN, applied_delta)
 
-    def _prepare_fit_parameter_project_text(self, parameters: dict) -> Dict[str, object]:
-        ports = self._require_fitting_ports()
-        current_text = ports.mechanism_editor.reactions_text()
+    def _prepare_fit_parameter_project_text(
+        self,
+        parameters: dict,
+        *,
+        source_text: str | None = None,
+    ) -> Dict[str, object]:
+        get_canonical_reactions = getattr(self, "mechanism_reactions_text_raw", None)
+        if source_text is None and not callable(get_canonical_reactions):
+            raise RuntimeError("Canonical mechanism Reactions getter is unavailable.")
+        current_text = (
+            str(source_text or "")
+            if source_text is not None
+            else str(get_canonical_reactions() or "")
+        )
         analysis = analyze_parameter_updates_to_dsl_text(
             current_text,
             parameters,
@@ -338,6 +391,15 @@ class FittingMixin:
                 rewrite_failed=True,
                 applied_any=False,
             )
+        if write_status == _FIT_PARAMETER_APPLY_STATUS_CANCELED:
+            return _FitParameterApplyOutcome(
+                status=_FIT_PARAMETER_APPLY_STATUS_CANCELED,
+                warning_messages=warning_messages,
+                rewrite_intended=rewrite_intended,
+                rewrite_performed=False,
+                rewrite_failed=True,
+                applied_any=False,
+            )
         if write_status == _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE:
             return _FitParameterApplyOutcome(
                 status=_FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE,
@@ -387,13 +449,21 @@ class FittingMixin:
             abs_tol=1e-12,
         )
 
-    def _build_fit_parameter_apply_delta(self, parameters: Dict[str, float]) -> _FitParameterApplyDelta:
+    def _build_fit_parameter_apply_delta(
+        self,
+        parameters: Dict[str, float],
+        *,
+        source_text: str | None = None,
+    ) -> _FitParameterApplyDelta:
         normalized_parameters = {
             str(name): float(value)
             for name, value in dict(parameters or {}).items()
         }
         authoritative_values = self._current_fit_authoritative_parameter_values()
-        update = self._prepare_fit_parameter_project_text(normalized_parameters)
+        update = self._prepare_fit_parameter_project_text(
+            normalized_parameters,
+            source_text=source_text,
+        )
         current_text = str(update["current_text"] or "")
         updated_text = str(update["updated_text"] or "")
         step_outcomes = tuple(update.get("step_outcomes") or ())
@@ -617,27 +687,21 @@ class FittingMixin:
         from kindred.gui.fitting.launch import GlobalFitLaunchContext
 
         ports = self._require_fitting_ports()
-        reactions_widget = getattr(ports.mechanism_editor, "_reactions_text", None)
 
         def _get_reactions_text() -> str:
-            if reactions_widget is None:
+            get_canonical_reactions = getattr(self, "mechanism_reactions_text_raw", None)
+            if not callable(get_canonical_reactions):
                 return ""
             try:
-                return str(reactions_widget.toPlainText() or "")
+                return str(get_canonical_reactions() or "")
             except Exception:
                 return ""
 
-        def _set_reactions_text(new_text: str) -> None:
-            if reactions_widget is None:
-                raise RuntimeError("Reactions editor unavailable.")
-            set_reactions = getattr(self, "set_mechanism_reactions_text_with_optional_undo", None)
-            if not callable(set_reactions):
-                raise RuntimeError("Authoritative mechanism Reactions setter is unavailable.")
-            set_reactions(
-                str(new_text or ""),
-                "Global Fit: update Reactions",
-                record_undo=True,
-            )
+        def _rewrite_reactions_text(**kwargs) -> bool:
+            rewrite = getattr(self, "rewrite_authoritative_reactions_text", None)
+            if not callable(rewrite):
+                raise RuntimeError("Authoritative mechanism Reactions rewriter is unavailable.")
+            return bool(rewrite(**kwargs))
 
         return GlobalFitLaunchContext(
             parent=self,
@@ -647,7 +711,7 @@ class FittingMixin:
             mechanism_parameter_scan_owner=ports.mechanism_parameter_scan_owner,
             mechanism_text_getter=lambda: str(self._get_mechanism_text() or ""),
             reactions_text_getter=_get_reactions_text,
-            reactions_text_setter=_set_reactions_text,
+            reactions_text_rewriter=_rewrite_reactions_text,
             extract_mechanism_initials=self._extract_mechanism_initials,
             record_best_effort_failure=self._record_fitting_best_effort_failure,
             set_status=self._set_fitting_status,
@@ -865,12 +929,18 @@ class FittingMixin:
         dataset_params: Dict[str, Dict[str, float]],
     ) -> bool | str:
         plan = self._build_fit_project_apply_plan(scope, parameters, dataset_params)
-        if plan.is_true_noop:
+        needs_fresh_parameter_boundary = bool(
+            plan.parameter_delta is not None
+            and parameters
+            and callable(getattr(self, "_reactions_draft_dirty", None))
+            and self._reactions_draft_dirty()
+        )
+        if plan.is_true_noop and not needs_fresh_parameter_boundary:
             if plan.parameter_outcome is not None and plan.parameter_outcome.warning_messages:
                 return "\n".join(str(message) for message in plan.parameter_outcome.warning_messages)
             return True
 
-        if plan.needs_slider_guard:
+        if plan.needs_slider_guard or needs_fresh_parameter_boundary:
             guard = getattr(self, "_guard_slider_transaction_invalidation", None)
             if callable(guard):
                 if not guard(action_text="Applying fitted parameters to the project"):
@@ -880,15 +950,17 @@ class FittingMixin:
         parameter_outcome = plan.parameter_outcome
         parameter_warnings = list(parameter_outcome.warning_messages) if parameter_outcome is not None else []
         parameter_apply_failed = False
-        if plan.parameter_delta is not None and plan.can_execute_parameter_apply:
-            parameter_apply_status = self._write_fit_results_to_mechanism(
+        if plan.parameter_delta is not None and (plan.can_execute_parameter_apply or needs_fresh_parameter_boundary):
+            parameter_write_result = self._write_fit_results_to_mechanism(
                 dict(parameters),
                 parameter_delta=plan.parameter_delta,
                 refresh_display=False,
             )
+            if parameter_write_result.status == _FIT_PARAMETER_APPLY_STATUS_CANCELED:
+                return False
             parameter_outcome = self._build_fit_parameter_apply_outcome(
-                plan.parameter_delta,
-                write_status=parameter_apply_status,
+                parameter_write_result.delta,
+                write_status=parameter_write_result.status,
             )
         if parameter_outcome is not None:
             parameter_warnings = list(parameter_outcome.warning_messages)

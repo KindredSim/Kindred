@@ -213,7 +213,6 @@ class MechanismRuntimeTransitionService:
         *,
         source: str,
         force_runtime_invalidation: bool = False,
-        edit_session_active: bool = False,
         input_suppressed: bool = False,
         runtime_invalidation_suppressed: bool = False,
         schedule_runtime_refresh: bool = True,
@@ -275,12 +274,8 @@ class MechanismRuntimeTransitionService:
             runtime_invalidation_required = True
         else:
             runtime_invalidation_required = not snapshot.matches(self._current_snapshot)
-            edit_session_blocks_transition = bool(edit_session_active) and (
-                runtime_invalidation_required or not runtime_input_invalidation_required
-            )
             if (
-                edit_session_blocks_transition
-                or bool(input_suppressed)
+                bool(input_suppressed)
                 or bool(runtime_invalidation_suppressed)
             ):
                 return MechanismTransitionOutcome(

@@ -178,7 +178,7 @@ class GlobalFitLaunchContext:
     mechanism_parameter_scan_owner: Any
     mechanism_text_getter: Callable[[], str]
     reactions_text_getter: Callable[[], str]
-    reactions_text_setter: Callable[[str], None]
+    reactions_text_rewriter: Callable[..., bool]
     extract_mechanism_initials: Callable[[str], Dict[str, float]]
     record_best_effort_failure: Callable[..., None]
     set_status: Callable[[str], None]
@@ -653,7 +653,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         mechanism_species=mechanism_species,
         mechanism_text_getter=context.mechanism_text_getter,
         reactions_text_getter=context.reactions_text_getter,
-        reactions_text_setter=context.reactions_text_setter,
+        reactions_text_rewriter=context.reactions_text_rewriter,
         simulation_builder=_build_simulation,
         runtime_inputs=launch_settings.runtime_inputs,
         dataset_params=dataset_params,

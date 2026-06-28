@@ -2741,30 +2741,49 @@ class SimulationController(QtCore.QObject):
         )
 
     def _run_selected_rows_or_abort(self) -> list[int] | None:
+        def read_run_target_state() -> tuple[list[int], tuple[str, ...], str]:
+            try:
+                run_target_state = self.ui.batch.run_target_ui_state()
+                target_rows = [
+                    int(row)
+                    for row in (getattr(run_target_state, "target_rows", ()) or ())
+                ]
+                target_set_ids = tuple(
+                    str(set_id)
+                    for set_id in (getattr(run_target_state, "target_set_ids", ()) or ())
+                    if str(set_id)
+                )
+                empty_reason_s = str(getattr(run_target_state, "empty_reason", "") or "")
+                return target_rows, target_set_ids, empty_reason_s
+            except Exception:
+                target_rows = list(self.ui.batch.batch_rows_for_scope("selected"))
+                target_set_ids = self._run_target_set_ids_for_rows(target_rows)
+                empty_reason_s = self.ui.batch.run_selected_empty_target_reason()
+                return target_rows, target_set_ids, empty_reason_s
+
+        preliminary_rows, preliminary_target_set_ids, preliminary_empty_reason = (
+            read_run_target_state()
+        )
+        if not preliminary_rows and not preliminary_target_set_ids:
+            reason = preliminary_empty_reason or self.ui.batch.run_selected_empty_target_reason()
+            self.ui.dialogs.message_box_warning("No Sets", reason)
+            return None
+
         try:
-            run_target_state = self.ui.batch.run_target_ui_state()
-            selected_rows = [int(row) for row in (getattr(run_target_state, "target_rows", ()) or ())]
-            selected_target_set_ids = tuple(
-                str(set_id)
-                for set_id in (getattr(run_target_state, "target_set_ids", ()) or ())
-                if str(set_id)
-            )
-            empty_reason = str(getattr(run_target_state, "empty_reason", "") or "")
-        except Exception:
-            selected_rows = list(self.ui.batch.batch_rows_for_scope("selected"))
-            selected_target_set_ids = self._run_target_set_ids_for_rows(selected_rows)
-            empty_reason = self.ui.batch.run_selected_empty_target_reason()
-        auto_lock_result = self.ui.mechanism.auto_lock_for_run()
-        if not auto_lock_result:
+            self.ui.solver.parse_sim_time_seconds()
+        except ValueError as exc:
+            self.ui.dialogs.message_box_warning("Invalid t_end", f"Fix t_end before running:\n\n{exc}")
+            return None
+
+        apply_draft_result = self.ui.mechanism.apply_dirty_reactions_for_run()
+        if not apply_draft_result:
             self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
             return None
         if not self.ui.mechanism.is_mechanism_ready_for_run():
             self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
             return None
-        self._discarded_slider_preview_generation_id = None
-        if bool(getattr(self, "_simulation_running", False)):
-            logger.info("Superseding active simulation with new Run request")
-            self._cancel_active_run_for_restart()
+
+        selected_rows, selected_target_set_ids, empty_reason = read_run_target_state()
 
         rows_to_run = self._run_rows_for_target_set_ids(
             selected_target_set_ids,
@@ -2775,13 +2794,12 @@ class SimulationController(QtCore.QObject):
             self.ui.dialogs.message_box_warning("No Sets", reason)
             return None
 
-        try:
-            self.ui.solver.parse_sim_time_seconds()
-        except ValueError as exc:
-            self.ui.dialogs.message_box_warning("Invalid t_end", f"Fix t_end before running:\n\n{exc}")
-            return None
         if not self._resolve_wegscheider_cyclicity_for_run_or_abort():
             return None
+        self._discarded_slider_preview_generation_id = None
+        if bool(getattr(self, "_simulation_running", False)):
+            logger.info("Superseding active simulation with new Run request")
+            self._cancel_active_run_for_restart()
         return [int(row) for row in rows_to_run]
 
     def _run_simulation(self):

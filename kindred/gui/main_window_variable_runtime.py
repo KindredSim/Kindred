@@ -200,22 +200,43 @@ class MainWindowVariableRuntime:
                 )
                 setattr(mw, "_suppress_authoritative_mechanism_input_change", True)
                 try:
-                    mw.set_mechanism_reactions_text_with_optional_undo(
-                        sanitized_text,
-                        "Normalize mechanism parameter tokens for sliders",
-                        record_undo=False,
-                    )
-                    sync_authoritative_write = getattr(
+                    rewrite_reactions = getattr(
                         mw,
-                        "finalize_authoritative_mechanism_widget_write",
+                        "rewrite_authoritative_reactions_text",
                         None,
                     )
-                    if not callable(sync_authoritative_write):
-                        raise RuntimeError("MainWindow authoritative write finalizer is unavailable.")
-                    sync_authoritative_write(dispatch_consumers=False)
+                    if not callable(rewrite_reactions):
+                        raise RuntimeError("MainWindow authoritative reactions rewriter is unavailable.")
+
+                    rewritten: dict[str, str] = {"text": sanitized_text}
+
+                    def _rewrite(current_text: str) -> str:
+                        refreshed_sanitized, refreshed_variables, refreshed_metadata = self.sanitize_mechanism_parameter_conflicts(
+                            str(current_text or "")
+                        )
+                        if refreshed_variables or refreshed_metadata:
+                            raise RuntimeError(
+                                "Legacy line-counter-derived variables/metadata must not be used for sliders. "
+                                "Slider parameters must be derived from mechanism.metadata['step_index_map'] via "
+                                "enumerate_step_parameters_for_gui()."
+                            )
+                        rewritten["text"] = str(refreshed_sanitized)
+                        return str(refreshed_sanitized)
+
+                    ok = rewrite_reactions(
+                        action_label="Normalizing mechanism parameter tokens for sliders",
+                        description="Normalize mechanism parameter tokens for sliders",
+                        rewrite_text=_rewrite,
+                        record_undo=False,
+                        apply_transition=False,
+                        transition_source="slider_parameter_normalization",
+                    )
+                    if not ok:
+                        return
                 finally:
                     setattr(mw, "_suppress_authoritative_mechanism_input_change", previous_authoritative_suppress)
-                mechanism_text = sanitized_text
+                source = mw.canonical_mechanism_source()
+                mechanism_text = str(rewritten["text"])
 
             temperature_k = mw.temperature_spinbox_value()
             units = UnitsModel(temperature_K=temperature_k)
