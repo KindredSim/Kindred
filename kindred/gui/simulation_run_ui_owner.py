@@ -17,6 +17,7 @@ class SimulationRunUiOwner:
         self._results_table_getter = results_table_getter
         self._run_button_requested_enabled = True
         self._runtime_launch_available = False
+        self._draft_run_preflight_active = False
         self._draft_run_preflight_available = False
         self._launch_readiness_stale = False
         self._run_target_available = False
@@ -96,7 +97,8 @@ class SimulationRunUiOwner:
         self._mechanism_unavailable_tooltip = str(tooltip or "")
         self._apply_run_button_state()
 
-    def render_draft_run_preflight_available(self, available: bool) -> None:
+    def render_draft_run_preflight_available(self, available: bool, *, active: bool) -> None:
+        self._draft_run_preflight_active = bool(active)
         self._draft_run_preflight_available = bool(available)
         self._apply_run_button_state()
 
@@ -206,8 +208,10 @@ class SimulationRunUiOwner:
         editor.run_btn.setToolTip(tooltip)
         editor.run_btn.setEnabled(effective_enabled)
 
+    def _runtime_launch_ready(self) -> bool:
+        return bool(self._runtime_launch_available and not self._launch_readiness_stale)
+
     def _effective_runtime_launch_available(self) -> bool:
-        return bool(
-            self._draft_run_preflight_available
-            or (self._runtime_launch_available and not self._launch_readiness_stale)
-        )
+        if self._draft_run_preflight_active:
+            return bool(self._draft_run_preflight_available)
+        return self._runtime_launch_ready()

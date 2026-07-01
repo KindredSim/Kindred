@@ -61,6 +61,7 @@ from kindred.gui.fitting.completed_apply_authority import (
     CompletedFitApplyAuthority,
     CompletedFitApplyAuthorityOwner,
 )
+from kindred.gui.ports import AuthoritativeRewriteOutcome
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
     simulation_failure_detail_text,
@@ -82,7 +83,6 @@ from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.evaluator_state import (
     FittingEvaluatorStateOwner,
-    coerce_strict_fitting_prepared_metadata,
     prepared_simulation_matches_runtime_inputs,
 )
 from kindred.gui.fitting.runtime_inputs import FittingRuntimeInputs
@@ -305,7 +305,7 @@ class FittingWindow(QtWidgets.QDialog):
         mechanism_species: Optional[Sequence[str]] = None,
         mechanism_text_getter: Optional[Callable[[], str]] = None,
         reactions_text_getter: Optional[Callable[[], str]] = None,
-        reactions_text_rewriter: Optional[Callable[..., bool]] = None,
+        reactions_text_rewriter: Optional[Callable[..., AuthoritativeRewriteOutcome]] = None,
         simulation_builder: Optional[SimulationBuilder] = None,
         runtime_inputs: Optional[FittingRuntimeInputs] = None,
         dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
@@ -779,6 +779,19 @@ class FittingWindow(QtWidgets.QDialog):
             str(ds_id): self._species_table.applied_target_weights_for_dataset(str(ds_id))
             for ds_id in applied_targets.keys()
         }
+        runtime_identity = None
+        if prepared_simulation is None:
+            runtime_identity = {
+                "inputs": self._runtime_inputs.to_stamp_payload(),
+                "solver": str(requested_solver),
+                "rtol": float(rtol),
+                "atol": float(atol),
+                "param_names": self._param_names_for_readiness_identity(
+                    config=config,
+                    prepared_simulation=prepared_simulation,
+                    mechanism_text=mechanism_text,
+                ),
+            }
         stamp = build_global_fit_run_stamp(
             dataset_rows=list(dataset_selection.rows),
             included_ids=list(dataset_selection.ids),
@@ -790,21 +803,10 @@ class FittingWindow(QtWidgets.QDialog):
             mechanism_text=mechanism_text,
             reactions_text=reactions_text,
             prepared_simulation=prepared_simulation,
+            runtime_identity=runtime_identity,
             dataset_specs=list(dataset_specs),
             dataset_overrides=list(dataset_overrides),
         )
-        if prepared_simulation is None:
-            stamp["runtime_inputs"] = self._runtime_inputs.to_stamp_payload()
-            stamp["runtime_identity_request"] = {
-                "solver": str(requested_solver),
-                "rtol": f"{float(rtol):.12g}",
-                "atol": f"{float(atol):.12g}",
-                "param_names": self._param_names_for_readiness_identity(
-                    config=config,
-                    prepared_simulation=None,
-                    mechanism_text=mechanism_text,
-                ),
-            }
         stamp_hash = hash_global_fit_run_stamp(stamp)
         stamp_short = str(stamp_hash)[:12]
         fixed_params = self._fixed_params_for_run(config)
@@ -1712,19 +1714,24 @@ class FittingWindow(QtWidgets.QDialog):
         if not callable(getattr(self, "_simulation_builder", None)):
             return True
         stamp = dict(identity.stamp or {})
-        prepared = stamp.get("prepared_simulation")
-        if isinstance(prepared, Mapping):
-            return prepared_simulation_matches_runtime_inputs(
-                coerce_strict_fitting_prepared_metadata(prepared),
-                self._runtime_inputs.evaluator,
-            )
-        stamped_inputs = stamp.get("runtime_inputs")
-        if isinstance(stamped_inputs, Mapping):
+        prepared_simulation = stamp.get("prepared_simulation")
+        if isinstance(prepared_simulation, Mapping):
             try:
-                return FittingRuntimeInputs.from_stamp_payload(stamped_inputs).identity_key() == self._runtime_inputs.identity_key()
-            except RuntimeError:
+                return self._prepared_simulation_matches_runtime_inputs(
+                    PreparedSimulationMetadata.from_mapping(prepared_simulation)
+                )
+            except Exception:
                 return False
-        return False
+        runtime_identity = stamp.get("runtime_identity")
+        if not isinstance(runtime_identity, Mapping):
+            return False
+        stamped_inputs = runtime_identity.get("inputs")
+        if not isinstance(stamped_inputs, Mapping):
+            return False
+        try:
+            return FittingRuntimeInputs.from_stamp_payload(stamped_inputs).identity_key() == self._runtime_inputs.identity_key()
+        except RuntimeError:
+            return False
 
     def _fitting_evaluator_components_for_runtime_identity(
         self,
@@ -2337,12 +2344,11 @@ class FittingWindow(QtWidgets.QDialog):
             return str(updated_reactions_text)
 
         try:
-            ok = rewriter(
+            outcome = rewriter(
                 action_label="Updating Global Fit Reactions",
                 description="Global Fit: update Reactions",
                 rewrite_text=_rewrite,
                 record_undo=True,
-                apply_transition=True,
                 transition_source="global_fit_observable",
             )
         except _ObservableRewriteAborted:
@@ -2350,7 +2356,7 @@ class FittingWindow(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Add Observable", f"Failed to update Reactions DSL:\n\n{exc}")
             return None
-        if not ok:
+        if not outcome.may_continue:
             return None
         return str(updated_holder["text"]), tuple(updated_holder["missing_scalars"])
 

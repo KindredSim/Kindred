@@ -15,7 +15,13 @@ import math
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Signal
 
-from ..ui_helpers import make_bounded_label, make_placeholder_label, make_scroll_area, set_bounded_label_text
+from ..ui_helpers import (
+    apply_slider_name_label_layout_policy,
+    make_bounded_label,
+    make_placeholder_label,
+    make_scroll_area,
+    set_bounded_label_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +236,7 @@ class VariableSliders(QtWidgets.QWidget):
         top_row.setSpacing(8)
 
         name_label = make_bounded_label(self._format_label_text(name), max_width=260)
+        apply_slider_name_label_layout_policy(name_label)
         name_font = name_label.font()
         name_font.setBold(True)
         name_label.setFont(name_font)
@@ -362,6 +369,12 @@ class VariableSliders(QtWidgets.QWidget):
             return f"{name} ({meta['label']}){unit_suffix}{derived_suffix}"
         return f"{name}{unit_suffix}{derived_suffix}"
 
+    def _set_name_label_text(self, name: str) -> None:
+        label = self._labels.get(name)
+        if label is None:
+            return
+        set_bounded_label_text(label, self._format_label_text(name), max_width=260)
+        apply_slider_name_label_layout_policy(label)
 
     def _on_slider_changed(self, name: str, slider_pos: int) -> None:
         """
@@ -422,8 +435,7 @@ class VariableSliders(QtWidgets.QWidget):
         self._last_valid_values[name] = float(value)
 
         # Update display
-        if name in self._labels:
-            set_bounded_label_text(self._labels[name], self._format_label_text(name), max_width=260)
+        self._set_name_label_text(name)
         if name in self._value_labels:
             self._value_labels[name].setText(self._format_value(value))
 
@@ -469,8 +481,7 @@ class VariableSliders(QtWidgets.QWidget):
 
     def update_metadata(self, name: str, meta: Dict[str, object]) -> None:
         self._metadata[name] = dict(meta)
-        if name in self._labels:
-            set_bounded_label_text(self._labels[name], self._format_label_text(name), max_width=260)
+        self._set_name_label_text(name)
 
     def update_variable(self, name: str, value: float) -> None:
         """

@@ -32,29 +32,40 @@ class InitialConditionsSourceAcceptanceOwner:
         source: MechanismAuthoringSource,
         *,
         prompt_overwrite: bool,
+        destination_store: BatchInitialConditionsStore | None = None,
     ) -> InitialConditionsReconciliationPlan | None:
         return self._prepare_or_report(
             source,
             prompt_overwrite=bool(prompt_overwrite),
+            destination_store=destination_store,
         )
 
     def apply_prepared_plan(
         self,
         plan: InitialConditionsReconciliationPlan,
+        *,
+        notify_canonical_rows_changed: bool = True,
     ) -> InitialConditionsReconciliationResult:
-        return self._import_owner.apply_reconciliation_plan(plan)
+        return self._import_owner.apply_reconciliation_plan(
+            plan,
+            notify_canonical_rows_changed=bool(notify_canonical_rows_changed),
+        )
 
     def accept_importable_source(
         self,
         source: MechanismAuthoringSource,
         *,
         prompt_overwrite: bool,
-    ) -> MechanismAuthoringSource | None:
-        plan = self._prepare_or_report(source, prompt_overwrite=bool(prompt_overwrite))
+        destination_store: BatchInitialConditionsStore | None = None,
+    ) -> InitialConditionsReconciliationResult | None:
+        plan = self._prepare_or_report(
+            source,
+            prompt_overwrite=bool(prompt_overwrite),
+            destination_store=destination_store,
+        )
         if plan is None:
             return None
-        result = self._import_owner.apply_reconciliation_plan(plan)
-        return result.source
+        return self._import_owner.apply_reconciliation_plan(plan)
 
     def accept_project_source_after_batch_load(
         self,
@@ -62,20 +73,29 @@ class InitialConditionsSourceAcceptanceOwner:
         *,
         batch_store: BatchInitialConditionsStore,
         batch_payload_present: bool,
-    ) -> MechanismAuthoringSource | None:
+    ) -> InitialConditionsReconciliationResult | None:
         if bool(batch_payload_present) and not batch_initial_conditions_store_is_true_placeholder(batch_store):
-            return source.without_reaction_initial_concentrations()
-        return self.accept_importable_source(source, prompt_overwrite=False)
+            return InitialConditionsReconciliationResult(
+                InitialConditionsImportStatus.NO_IMPORT,
+                source.without_reaction_initial_concentrations(),
+            )
+        return self.accept_importable_source(
+            source,
+            prompt_overwrite=False,
+            destination_store=batch_store,
+        )
 
     def _prepare_or_report(
         self,
         source: MechanismAuthoringSource,
         *,
         prompt_overwrite: bool,
+        destination_store: BatchInitialConditionsStore | None = None,
     ) -> InitialConditionsReconciliationPlan | None:
         result = self._import_owner.prepare_reconciliation(
             source,
             prompt_overwrite=bool(prompt_overwrite),
+            destination_store=destination_store,
         )
         if result.status == InitialConditionsImportStatus.CANCELLED_OVERWRITE:
             return None

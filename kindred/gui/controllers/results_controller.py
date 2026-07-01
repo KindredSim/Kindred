@@ -86,7 +86,7 @@ def _coerce_display_refresh_source(source: object | None) -> DisplayRefreshSourc
     return DisplayRefreshSource.INCIDENTAL_REFRESH
 
 
-def _display_transition_published(outcome: SimulationCompletionDisplayOutcome | None) -> bool:
+def _display_publication_happened(outcome: SimulationCompletionDisplayOutcome | None) -> bool:
     transition = outcome.transition_outcome if outcome is not None else None
     return (
         isinstance(transition, DisplayTransitionOutcome)
@@ -1652,8 +1652,6 @@ class ResultsController(QtCore.QObject):
         set_ids: Sequence[str],
     ) -> list[str]:
         candidates = [str(set_id) for set_id in (set_ids or ()) if str(set_id)]
-        if not candidates:
-            return []
         active_transaction = self._active_display_transaction
         if isinstance(active_transaction, ActiveDisplayTransaction):
             preview_display_ids = {
@@ -1663,9 +1661,17 @@ class ResultsController(QtCore.QObject):
                 and str(metadata.set_id or "").strip()
                 and str(metadata.set_id or "").strip() in set(active_transaction.display_set_ids)
             }
+            if not candidates:
+                return [
+                    str(set_id).strip()
+                    for set_id in active_transaction.display_set_ids
+                    if str(set_id).strip() in preview_display_ids
+                ]
             matched_display_ids = [set_id for set_id in candidates if set_id in preview_display_ids]
             if matched_display_ids:
                 return matched_display_ids
+        if not candidates:
+            return []
         return [
             set_id
             for set_id in candidates
@@ -1892,7 +1898,19 @@ class ResultsController(QtCore.QObject):
             unresolved_intent_set_ids=affected_set_ids,
             event_kind=_DISPLAY_TRANSITION_RUNTIME_INPUT_PREVIEW_DEAUTHORIZATION.event_kind,
             cause=_DISPLAY_TRANSITION_RUNTIME_INPUT_PREVIEW_DEAUTHORIZATION.cause,
-            clear_plot=False,
+            clear_plot=True,
+        )
+
+    def deauthorize_active_display_for_runtime_input_change(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        affected_scope_is_global: bool,
+    ) -> DisplayTransitionOutcome | None:
+        return self._deauthorize_active_display(
+            transition=_DISPLAY_TRANSITION_RUNTIME_INPUT_PREVIEW_DEAUTHORIZATION,
+            affected_set_ids=affected_set_ids,
+            affected_scope_is_global=bool(affected_scope_is_global),
         )
 
     def _deauthorize_active_display(
@@ -4415,14 +4433,14 @@ class ResultsController(QtCore.QObject):
                 request_id=request_id,
                 run_id=run_id,
             )
-            if _display_transition_published(fresh_outcome):
+            if _display_publication_happened(fresh_outcome):
                 return fresh_outcome
             if fresh_preview_entries:
                 return fresh_outcome
             outcome = self.refresh_display_from_request_scope(
                 display_source=DisplayRefreshSource.SLIDER_REPLAY,
             )
-            if _display_transition_published(outcome):
+            if _display_publication_happened(outcome):
                 return outcome
             return fresh_outcome
         if valid_set_ids:
@@ -4561,7 +4579,7 @@ class ResultsController(QtCore.QObject):
             latest_request_id=int(latest_request_id),
             active_run_id=int(active_run_id),
         )
-        displayed = _display_transition_published(display_outcome)
+        displayed = _display_publication_happened(display_outcome)
         requested_show_ids_for_focus = (
             target_set_ids
             if pending_cache_kind == "preview" and target_set_ids

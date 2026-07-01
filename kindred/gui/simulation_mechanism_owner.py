@@ -4,7 +4,7 @@ from typing import Callable, Dict, Optional
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.validation import try_parse_finite_float
-from kindred.gui.ports import ReactionsDraftApplyResult
+from kindred.gui.ports import AuthoritativeRewriteOutcome, ReactionsDraftApplyResult
 
 
 class SimulationMechanismOwner:
@@ -21,7 +21,7 @@ class SimulationMechanismOwner:
         apply_reactions_overrides_to_text: Callable[..., str],
         apply_state_network_overrides_to_dsl: Callable[..., str],
         pending_initials_for_source_set: Callable[..., dict[str, float]] | None = None,
-        apply_wegscheider_resolution_reactions_rewrite: Callable[[str], None] | None = None,
+        apply_wegscheider_resolution_reactions_rewrite: Callable[[str], AuthoritativeRewriteOutcome] | None = None,
     ) -> None:
         self._mechanism_session_owner_getter = mechanism_session_owner_getter
         self._mechanism_editor_getter = mechanism_editor_getter
@@ -182,10 +182,13 @@ class SimulationMechanismOwner:
     def get_mechanism_text(self) -> str:
         return self._simulation_schema_text()
 
-    def apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> None:
+    def apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> AuthoritativeRewriteOutcome:
         if self._apply_wegscheider_resolution_reactions_rewrite is None:
             raise RuntimeError("Wegscheider resolution Reactions rewrite is unavailable.")
-        self._apply_wegscheider_resolution_reactions_rewrite(str(reactions_text))
+        outcome = self._apply_wegscheider_resolution_reactions_rewrite(str(reactions_text))
+        if isinstance(outcome, AuthoritativeRewriteOutcome):
+            return outcome
+        raise TypeError("apply_wegscheider_resolution_reactions_rewrite must return AuthoritativeRewriteOutcome.")
 
     def _simulation_schema_text(self) -> str:
         return str(self._mechanism_session_owner().canonical_full_dsl)

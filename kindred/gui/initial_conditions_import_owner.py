@@ -76,8 +76,10 @@ class InitialConditionsImportOwner:
         source: MechanismAuthoringSource,
         *,
         prompt_overwrite: bool,
+        destination_store: BatchInitialConditionsStore | None = None,
     ) -> InitialConditionsReconciliationPlan:
         original_source = source
+        destination_store = destination_store or self._batch_store_getter()
         try:
             extraction = extract_reaction_dsl_initial_condition_imports(
                 str(source.reactions_text or ""),
@@ -94,7 +96,10 @@ class InitialConditionsImportOwner:
             )
 
         value_imports = tuple(event for event in extraction.imports if event.value_bearing)
-        destination_names = self._destination_names_for_imports(value_imports)
+        destination_names = self._destination_names_for_imports(
+            value_imports,
+            destination_store=destination_store,
+        )
         value_seed_sets = {
             str(destination_names.get(event.import_id, event.source_name)): dict(event.values)
             for event in value_imports
@@ -106,7 +111,10 @@ class InitialConditionsImportOwner:
         rewritten_source = source.with_reactions_text(str(rewritten_reactions))
         if value_seed_sets:
             if prompt_overwrite:
-                affected = self._useful_initial_condition_overwrite_set_names(value_seed_sets)
+                affected = self._useful_initial_condition_overwrite_set_names(
+                    value_seed_sets,
+                    destination_store=destination_store,
+                )
                 if affected and not self._confirm_overwrite(tuple(affected)):
                     return InitialConditionsReconciliationPlan(
                         InitialConditionsImportStatus.CANCELLED_OVERWRITE,
@@ -119,13 +127,16 @@ class InitialConditionsImportOwner:
         species_names = self._species_names_for_source_or_import_seeds(
             rewritten_source,
             seed_sets=value_seed_sets,
+            destination_store=destination_store,
         )
 
-        species_changed = list(species_names) != list(self._batch_store_getter().visible_species() or ())
-        source_changed = rewritten_source != original_source
+        species_changed = list(species_names) != list(
+            destination_store.visible_species() or ()
+        )
+        source_rewritten = rewritten_source != original_source
         status = (
             InitialConditionsImportStatus.APPLIED
-            if value_seed_sets or species_changed or source_changed
+            if value_seed_sets or species_changed or source_rewritten
             else InitialConditionsImportStatus.NO_IMPORT
         )
         return InitialConditionsReconciliationPlan(
@@ -139,6 +150,8 @@ class InitialConditionsImportOwner:
     def apply_reconciliation_plan(
         self,
         plan: InitialConditionsReconciliationPlan,
+        *,
+        notify_canonical_rows_changed: bool = True,
     ) -> InitialConditionsReconciliationResult:
         if plan.status == InitialConditionsImportStatus.NO_IMPORT:
             return InitialConditionsReconciliationResult(
@@ -160,7 +173,7 @@ class InitialConditionsImportOwner:
         migrated_rows = self._materialize_imported_sets(seed_sets=plan.seed_sets)
         if migrated_rows:
             self._notify_rows_changed(migrated_rows)
-            if callable(self._notify_canonical_rows_changed):
+            if bool(notify_canonical_rows_changed) and callable(self._notify_canonical_rows_changed):
                 self._notify_canonical_rows_changed(
                     migrated_rows,
                     "initial_conditions_import_reconciliation",
@@ -232,7 +245,9 @@ class InitialConditionsImportOwner:
         source: MechanismAuthoringSource,
         *,
         seed_sets: Mapping[str, Mapping[str, object]],
+        destination_store: BatchInitialConditionsStore | None = None,
     ) -> tuple[str, ...]:
+        destination_store = destination_store or self._batch_store_getter()
         try:
             species_names = tuple(str(name) for name in self._species_names_for_source(source) if str(name))
             if species_names or not seed_sets:
@@ -240,7 +255,7 @@ class InitialConditionsImportOwner:
         except Exception:
             logger.debug("Deferred mechanism validation while reconciling Initial Conditions species", exc_info=True)
             if not seed_sets:
-                return tuple(self._batch_store_getter().visible_species() or ())
+                return tuple(destination_store.visible_species() or ())
         species_names: list[str] = []
         seen: set[str] = set()
         for seed in dict(seed_sets or {}).values():
@@ -251,17 +266,24 @@ class InitialConditionsImportOwner:
                     seen.add(name)
         return tuple(species_names)
 
-    def _batch_store_is_pristine_default_placeholder(self) -> bool:
-        return batch_initial_conditions_store_is_true_placeholder(self._batch_store_getter())
+    def _batch_store_is_pristine_default_placeholder(
+        self,
+        destination_store: BatchInitialConditionsStore | None = None,
+    ) -> bool:
+        store = destination_store or self._batch_store_getter()
+        return batch_initial_conditions_store_is_true_placeholder(store)
 
     def _destination_names_for_imports(
         self,
         imports: Sequence[InitialConditionImportEvent],
+        *,
+        destination_store: BatchInitialConditionsStore | None = None,
     ) -> dict[str, str]:
         destinations: dict[str, str] = {}
         if not imports:
             return destinations
-        existing = set(self._batch_store_getter().set_names() or [])
+        store = destination_store or self._batch_store_getter()
+        existing = set(store.set_names() or [])
         reserved = set(existing)
         for event in imports:
             import_id = str(event.import_id or "")
@@ -271,7 +293,7 @@ class InitialConditionsImportOwner:
             if (
                 source_kind == "anonymous_inline"
                 and source_name == "set1"
-                and not self._batch_store_is_pristine_default_placeholder()
+                and not self._batch_store_is_pristine_default_placeholder(store)
             ):
                 index = 1
                 while True:
@@ -287,9 +309,11 @@ class InitialConditionsImportOwner:
     def _useful_initial_condition_overwrite_set_names(
         self,
         seed_sets: Mapping[str, Mapping[str, object]],
+        *,
+        destination_store: BatchInitialConditionsStore | None = None,
     ) -> list[str]:
-        store = self._batch_store_getter()
-        if self._batch_store_is_pristine_default_placeholder():
+        store = destination_store or self._batch_store_getter()
+        if self._batch_store_is_pristine_default_placeholder(store):
             return []
         affected: list[str] = []
         for set_name, seed in dict(seed_sets or {}).items():

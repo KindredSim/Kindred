@@ -553,6 +553,9 @@ class MainWindowPreviewSession:
             if str(set_id) and bool(overlay)
         )
 
+    def staged_concentration_overlay_target_set_ids(self) -> tuple[str, ...]:
+        return self._staged_concentration_overlay_target_set_ids()
+
     def _prune_current_species_slider_replay_intent(self) -> None:
         self._reconcile_species_slider_replay_intent()
 
@@ -658,26 +661,37 @@ class MainWindowPreviewSession:
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
             self._clear_active_preview_cache_state()
-            self._deauthorize_completed_display_for_runtime_input_change(changed_set_ids)
+            self._deauthorize_display_for_runtime_input_change(changed_set_ids)
         self._refresh_transaction_button_state()
 
-    def _deauthorize_completed_display_for_runtime_input_change(self, changed_set_ids: Sequence[str]) -> None:
+    def _deauthorize_display_for_runtime_input_change(self, changed_set_ids: Sequence[str]) -> None:
         set_ids = tuple(str(set_id) for set_id in (changed_set_ids or ()) if str(set_id))
         if not set_ids:
             return
         try:
-            deauthorize = getattr(
-                getattr(self._mw, "results_controller", None),
-                "deauthorize_completed_run_display_for_runtime_input_preview",
+            results_controller = getattr(self._mw, "results_controller", None)
+            clear_workspace_previews = getattr(
+                results_controller,
+                "clear_display_if_workspace_previews_were_displayed",
                 None,
             )
-            if callable(deauthorize):
-                deauthorize(
+            if callable(clear_workspace_previews):
+                clear_workspace_previews(
+                    set_ids,
+                    clear_plot=True,
+                )
+            deauthorize_active_display = getattr(
+                results_controller,
+                "deauthorize_active_display_for_runtime_input_change",
+                None,
+            )
+            if callable(deauthorize_active_display):
+                deauthorize_active_display(
                     affected_set_ids=set_ids,
                     affected_scope_is_global=False,
                 )
         except Exception:
-            logger.debug("Failed to deauthorize completed display after runtime parameter edit", exc_info=True)
+            logger.debug("Failed to deauthorize display after runtime parameter edit", exc_info=True)
 
     def runtime_parameter_values(self, set_id: Optional[str] = None) -> dict[str, float]:
         target_set_id = str(set_id or "").strip() or self._focused_mechanism_workspace_set_id()
@@ -743,7 +757,7 @@ class MainWindowPreviewSession:
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
             self._clear_active_preview_cache_state()
-            self._deauthorize_completed_display_for_runtime_input_change(changed_set_ids)
+            self._deauthorize_display_for_runtime_input_change(changed_set_ids)
             self.stage_slider_replay_intent(
                 set_ids=changed_set_ids,
                 source="species_slider",
@@ -795,6 +809,7 @@ class MainWindowPreviewSession:
         )
         if changed and self._slider_drag_active:
             self._species_slider_drag_changed = True
+            self.queue_species_slider_simulation(label=f"init:{species}", delay_ms=80)
             return False
         return bool(changed)
 
@@ -832,11 +847,13 @@ class MainWindowPreviewSession:
             self._refresh_transaction_button_state()
         return bool(changed)
 
-    def prune_staged_concentration_overlays_to_species(self, species_names: Sequence[str]) -> bool:
+    def prune_staged_concentration_overlays_to_species(self, species_names: Sequence[str]) -> tuple[str, ...]:
         allowed_species = {str(species) for species in (species_names or []) if str(species)}
         changed = False
+        changed_set_ids: list[str] = []
         pruned_overlays: dict[str, dict[str, float]] = {}
         for set_id, overlay in list(self._staged_concentration_overlays_by_set_id.items()):
+            set_id_s = str(set_id)
             retained = {
                 str(species): float(value)
                 for species, value in dict(overlay or {}).items()
@@ -844,15 +861,16 @@ class MainWindowPreviewSession:
             }
             if retained != dict(overlay or {}):
                 changed = True
-                self._bump_dirty_state_generation([str(set_id)])
+                changed_set_ids.append(set_id_s)
+                self._bump_dirty_state_generation([set_id_s])
             if retained:
-                pruned_overlays[str(set_id)] = retained
+                pruned_overlays[set_id_s] = retained
         if not changed:
-            return False
+            return ()
         self._staged_concentration_overlays_by_set_id = pruned_overlays
         self._prune_current_species_slider_replay_intent()
         self._refresh_transaction_button_state()
-        return True
+        return tuple(dict.fromkeys(changed_set_ids))
 
     def has_staged_concentration_overlays(self) -> bool:
         return any(bool(values) for values in self._staged_concentration_overlays_by_set_id.values())
@@ -914,6 +932,24 @@ class MainWindowPreviewSession:
         if invalidate_preview_work:
             self._require_slider_preview_lifecycle_port().invalidate_slider_preview_work()
         self._refresh_transaction_button_state()
+
+    def clear_working_transaction_for_set_ids(
+        self,
+        set_ids: Sequence[str],
+        *,
+        invalidate_preview_work: bool = True,
+    ) -> bool:
+        target_set_ids = self._normalized_target_set_id_tuple(set_ids)
+        if not target_set_ids:
+            return False
+        changed = bool(self.reset_mechanism_workspaces(target_set_ids))
+        changed = bool(self.discard_concentration_overlays_for_set_ids(target_set_ids)) or changed
+        if changed and bool(invalidate_preview_work):
+            self._require_slider_preview_lifecycle_port().invalidate_slider_preview_work(
+                target_set_ids=target_set_ids,
+            )
+        self._refresh_transaction_button_state()
+        return bool(changed)
 
     def stop_slider_release_commit_timer(self) -> None:
         timer = self._slider_release_commit_timer
@@ -1038,7 +1074,7 @@ class MainWindowPreviewSession:
         if isinstance(meta, dict) and meta.get("type") == "energy":
             mw._refresh_energy_mode_derived_parameter_table()
         else:
-            mw._update_parameter_table_from_sliders()
+            mw._variable_runtime.update_parameter_table_from_sliders()
 
         if self._slider_release_in_progress:
             timer = self._slider_release_commit_timer
@@ -1057,30 +1093,6 @@ class MainWindowPreviewSession:
         timer.stop()
         timer.setInterval(interval_ms)
         timer.start()
-
-    def commit_slider_value(self, name: str, value: float) -> None:
-        """Stage a programmatic slider change for preview runs without mutating editor text."""
-        mw = self._mw
-        if not self.is_mechanism_valid_for_preview():
-            self._show_invalid_preview_state()
-            return
-        target_set_ids = self._ensure_slider_gesture_target_snapshot()
-        intent = self.stage_slider_replay_intent(
-            set_ids=target_set_ids,
-            source="variable_slider",
-        )
-        self.submit_slider_replay_intent(
-            intent,
-            preserve_existing_request=True,
-        )
-        self.stage_runtime_parameter_value(name, float(value), target_set_ids=target_set_ids)
-        meta = (mw.variable_metadata() or {}).get(name, {})
-        self._slider_triggered_simulation = True
-        mw._status_label.setText(f"Updating {name} = {value:.3g}...")
-        if isinstance(meta, dict) and meta.get("type") == "energy":
-            mw._refresh_energy_mode_derived_parameter_table()
-        else:
-            mw._update_parameter_table_from_sliders()
 
         interval_ms = self.variable_preview_debounce_ms(name)
         timer = self._ensure_variable_update_timer(interval_ms=interval_ms)

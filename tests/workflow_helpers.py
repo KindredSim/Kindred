@@ -139,8 +139,6 @@ def seed_simple_mechanism(main_window) -> None:
 
 def latest_fit_window(main_window):
     publisher = getattr(main_window, "fitting_runtime_input_publisher", None)
-    if publisher is None:
-        publisher = getattr(main_window, "_fitting_runtime_input_publisher", None)
     assert publisher is not None, "Expected Global Fit runtime-input publisher"
     windows = list(publisher.active_windows())
     assert windows, "Expected Global Fit window to be registered"

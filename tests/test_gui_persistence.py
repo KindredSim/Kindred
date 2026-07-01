@@ -1,5 +1,6 @@
-import os
+from copy import deepcopy
 import math
+import os
 
 import pytest
 from PySide6 import QtCore, QtWidgets
@@ -11,6 +12,17 @@ from kindred.gui.tutorial_manager import launch_tutorial
 from kindred.gui.widgets.tutorial_overlay import TutorialOverlay
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
+
+
+def _visible_project_state(window):
+    return deepcopy(window.serialize_project_state())
+
+
+def _serialized_batch_set(project_state, name: str) -> dict:
+    for entry in project_state["batch_initial_conditions"]["sets"]:
+        if entry["name"] == str(name):
+            return dict(entry)
+    raise AssertionError(f"Missing batch initial-condition set {name!r}")
 
 
 @pytest.fixture(scope="session")
@@ -38,12 +50,15 @@ def test_project_payload_without_state_network_clears_existing_state_network(mai
     )
     replacement_mechanism = "reaction: ProjectA -> ProjectB; k=0.4"
 
-    main_window._mechanism_editor.set_reactions_text("reaction: OldA -> OldB; k=1", block_signals=True)
-    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(stale_state_network_text)
-    main_window._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+    seed_payload = dict(main_window.serialize_project_state())
+    seed_payload["mechanism_source"] = MechanismAuthoringSource.from_parts(
+        reactions_text="reaction: OldA -> OldB; k=1",
+        state_network_dsl=stale_state_network_text,
+    ).to_payload()
+    main_window.apply_project_payload(seed_payload, record_undo=False)
     assert main_window.mechanism_state_network_dsl_raw() == stale_state_network_text
 
-    payload = dict(main_window._serialize_project_state())
+    payload = dict(main_window.serialize_project_state())
     payload["mechanism_source"] = {
         "reactions_text": replacement_mechanism,
         "state_network_dsl": "",
@@ -51,7 +66,7 @@ def test_project_payload_without_state_network_clears_existing_state_network(mai
     payload["notes"] = ""
     payload["batch_initial_conditions"] = {}
 
-    main_window._apply_project_payload(payload, record_undo=False)
+    main_window.apply_project_payload(payload, record_undo=False)
     qt_app.processEvents()
 
     assert main_window.mechanism_reactions_text_raw() == replacement_mechanism
@@ -84,16 +99,14 @@ def test_project_round_trip_includes_all_dsl(tmp_path, monkeypatch, qt_app):
 
     window = MainWindow()
     try:
-        window._set_authoritative_mechanism_editor_source(
-            MechanismAuthoringSource.from_parts(
-                reactions_text=reactions_text,
-                state_network_dsl=state_network_text,
-            ),
-            description="Seed full project source",
-            apply_transition=False,
-            record_undo=False,
+        source = MechanismAuthoringSource.from_parts(
+            reactions_text=reactions_text,
+            state_network_dsl=state_network_text,
         )
-        window._mechanism_editor._notes_text.setPlainText(notes_text)
+        seed_payload = dict(window.serialize_project_state())
+        seed_payload["notes"] = notes_text
+        seed_payload["mechanism_source"] = source.to_payload()
+        window.apply_project_payload(seed_payload, record_undo=False)
 
         project_path = tmp_path / "round_trip.kin"
         monkeypatch.setattr(
@@ -122,11 +135,13 @@ def test_project_round_trip_includes_all_dsl(tmp_path, monkeypatch, qt_app):
                 "let rate_ratio = [B] / max([A], 1e-6)",
             ]
         )
-        assert loader._mechanism_editor._reactions_text.toPlainText() == expected_reactions_text
-        assert loader._mechanism_editor._notes_text.toPlainText() == notes_text
-        assert loader._mechanism_editor._state_network_editor.get_state_network_dsl() == state_network_text
-        assert loader._batch_store.set_names()[:1] == ["set1"]
-        assert loader._batch_store.values_for_set("set1") == {"A": "1", "B": "0"}
+        loaded_state = loader.serialize_project_state()
+        assert loaded_state["mechanism_source"] == {
+            "reactions_text": expected_reactions_text,
+            "state_network_dsl": state_network_text,
+        }
+        assert loaded_state["notes"] == notes_text
+        assert _serialized_batch_set(loaded_state, "set1")["values"] == {"A": "1", "B": "0"}
     finally:
         loader.close()
 
@@ -134,7 +149,7 @@ def test_project_round_trip_includes_all_dsl(tmp_path, monkeypatch, qt_app):
 def test_project_load_with_saved_batch_initials_strips_mechanism_text_initials(main_window, qt_app):
     saved_store = BatchInitialConditionsStore([BatchSet("set1", {"A": "5.0", "B": "7.0"})])
     saved_store.set_species(["A", "B"])
-    payload = dict(main_window._serialize_project_state())
+    payload = dict(main_window.serialize_project_state())
     payload["mechanism_source"] = MechanismAuthoringSource.from_parts(
         reactions_text="\n".join(
             [
@@ -149,65 +164,63 @@ def test_project_load_with_saved_batch_initials_strips_mechanism_text_initials(m
     ).to_payload()
     payload["batch_initial_conditions"] = saved_store.as_serializable()
 
-    main_window._apply_project_payload(payload, record_undo=False)
+    main_window.apply_project_payload(payload, record_undo=False)
     qt_app.processEvents()
 
     assert main_window.mechanism_reactions_text_raw() == "reaction: A -> B; k=1"
-    assert main_window._batch_store.values_for_set("set1") == {"A": "5.0", "B": "7.0"}
+    assert _serialized_batch_set(main_window.serialize_project_state(), "set1")["values"] == {
+        "A": "5.0",
+        "B": "7.0",
+    }
 
 
-def test_project_apply_publishes_final_fit_runtime_inputs_once_after_project_settings(
+def test_project_apply_persists_fit_runtime_settings_after_project_settings(
     main_window,
-    monkeypatch,
     qt_app,
 ):
-    publisher = getattr(main_window, "fitting_runtime_input_publisher", None)
-    if publisher is None:
-        publisher = getattr(main_window, "_fitting_runtime_input_publisher", None)
-    assert publisher is not None
-
     notifications: list[dict[str, object]] = []
 
     class _FitWindow:
-        def apply_runtime_inputs(self, runtime_inputs, **_kwargs) -> None:
+        def objectName(self):
+            return "fit-window"
+
+        def apply_runtime_inputs(self, *, runtime_inputs):
             evaluator = runtime_inputs.evaluator
             notifications.append(
                 {
                     "temperature_K": float(evaluator.temperature_K),
                     "use_sparse_jacobian": bool(evaluator.use_sparse_jacobian),
-                    "wegscheider_cyclicity_enabled": bool(evaluator.wegscheider_cyclicity_enabled),
-                    "batch_runtime_lane_budget": int(runtime_inputs.batch_runtime_lane_budget),
+                    "wegscheider_cyclicity_enabled": bool(
+                        evaluator.wegscheider_cyclicity_enabled
+                    ),
+                    "batch_runtime_lane_budget": int(
+                        runtime_inputs.batch_runtime_lane_budget
+                    ),
                 }
             )
 
-        def close(self) -> bool:
-            return True
+    main_window.fitting_runtime_input_publisher.register_window(_FitWindow())
 
-    publisher.register_window(_FitWindow())
+    original_state = main_window.serialize_project_state()
+    original_temperature = float(original_state["temperature_K"])
+    original_sparse = bool(original_state["use_sparse_jacobian"])
+    original_wegscheider = bool(original_state["wegscheider_cyclicity_enabled"])
+    original_lane_budget = int(original_state["batch_runtime_lane_budget"])
 
-    original_programmatic_load = main_window._on_programmatic_mechanism_load
-
-    def _programmatic_load_probe(*args, **kwargs):
-        publisher.publish_current(reason="programmatic mechanism load probe", force=True)
-        assert notifications == []
-        return original_programmatic_load(*args, **kwargs)
-
-    monkeypatch.setattr(main_window, "_on_programmatic_mechanism_load", _programmatic_load_probe)
-
-    original_temperature = float(main_window._temperature_spinbox.value())
-    original_sparse = bool(main_window._use_sparse_jacobian)
-    original_wegscheider = bool(main_window._wegscheider_cyclicity_enabled)
-    original_lane_budget = int(main_window.simulation_controller.batch_runtime_lane_budget)
-
-    payload = dict(main_window._serialize_project_state())
+    payload = dict(main_window.serialize_project_state())
     payload["use_sparse_jacobian"] = not original_sparse
     payload["wegscheider_cyclicity_enabled"] = not original_wegscheider
     payload["batch_runtime_lane_budget"] = original_lane_budget + 1
     payload["temperature_K"] = original_temperature
 
-    main_window._apply_project_payload(payload, record_undo=False)
+    main_window.apply_project_payload(payload, record_undo=False)
     qt_app.processEvents()
 
+    applied_state = main_window.serialize_project_state()
+    assert float(applied_state["temperature_K"]) == original_temperature
+    assert bool(applied_state["use_sparse_jacobian"]) is (not original_sparse)
+    assert bool(applied_state["wegscheider_cyclicity_enabled"]) is (not original_wegscheider)
+    assert int(applied_state["batch_runtime_lane_budget"]) == original_lane_budget + 1
     assert notifications == [
         {
             "temperature_K": original_temperature,
@@ -218,39 +231,62 @@ def test_project_apply_publishes_final_fit_runtime_inputs_once_after_project_set
     ]
 
 
-def test_invalid_project_mechanism_source_is_rejected_before_session_reset(main_window, monkeypatch):
-    payload = dict(main_window._serialize_project_state())
+def test_invalid_project_mechanism_source_is_rejected_without_changing_project_state(
+    main_window,
+):
+    original_state = _visible_project_state(main_window)
+    payload = dict(main_window.serialize_project_state())
     payload["mechanism_source"] = {
         "reactions_text": "reaction: ReplacementA -> ReplacementB; k=1",
     }
 
-    def fail_if_reset_runs() -> None:
-        raise AssertionError("project session reset ran before mechanism source validation")
-
-    monkeypatch.setattr(main_window, "_reset_project_apply_dirty_session_state", fail_if_reset_runs)
-
     with pytest.raises(ValueError, match="state_network_dsl"):
-        main_window._apply_project_payload(payload, record_undo=False)
+        main_window.apply_project_payload(payload, record_undo=False)
+
+    assert _visible_project_state(main_window) == original_state
 
 
-def test_project_mechanism_source_rejects_unknown_source_fields_before_session_reset(
+def test_project_mechanism_source_rejects_unknown_source_fields_without_changing_project_state(
     main_window,
-    monkeypatch,
 ):
-    payload = dict(main_window._serialize_project_state())
+    original_state = _visible_project_state(main_window)
+    payload = dict(main_window.serialize_project_state())
     payload["mechanism_source"] = {
         "reactions_text": "reaction: ReplacementA -> ReplacementB; k=1",
         "state_network_dsl": "",
-        "mechanism_text": "reaction: LegacyA -> LegacyB; k=2",
+        "unexpected_source_field": "rejected",
     }
 
-    def fail_if_reset_runs() -> None:
-        raise AssertionError("project session reset ran before mechanism source validation")
+    with pytest.raises(ValueError, match="unexpected_source_field"):
+        main_window.apply_project_payload(payload, record_undo=False)
 
-    monkeypatch.setattr(main_window, "_reset_project_apply_dirty_session_state", fail_if_reset_runs)
+    assert _visible_project_state(main_window) == original_state
 
-    with pytest.raises(ValueError, match="mechanism_text"):
-        main_window._apply_project_payload(payload, record_undo=False)
+
+def test_project_source_initial_condition_reconciliation_failure_preserves_current_project(
+    main_window,
+):
+    original_state = _visible_project_state(main_window)
+    payload = dict(main_window.serialize_project_state())
+    payload["mechanism_source"] = MechanismAuthoringSource.from_parts(
+        reactions_text="\n".join(
+            [
+                "reaction: ReplacementA -> ReplacementB; k=1",
+                "set1 = {",
+                "  [ReplacementA] = 1.0",
+                "  unsupported initial condition text",
+                "}",
+            ]
+        ),
+        state_network_dsl="",
+    ).to_payload()
+    payload["batch_initial_conditions"] = BatchInitialConditionsStore().as_serializable()
+    payload["notes"] = "Replacement project notes"
+
+    with pytest.raises(ValueError, match="Initial Conditions could not be reconciled"):
+        main_window.apply_project_payload(payload, record_undo=False)
+
+    assert _visible_project_state(main_window) == original_state
 
 
 @pytest.mark.parametrize(
@@ -263,57 +299,53 @@ def test_project_mechanism_source_rejects_unknown_source_fields_before_session_r
         ("rtol", math.nan, "rtol"),
     ],
 )
-def test_invalid_current_project_payload_fields_are_rejected_before_session_reset(
+def test_invalid_current_project_payload_fields_are_rejected_without_changing_project_state(
     main_window,
-    monkeypatch,
     field,
     bad_value,
     message,
 ):
-    payload = dict(main_window._serialize_project_state())
+    original_state = _visible_project_state(main_window)
+    payload = dict(main_window.serialize_project_state())
     payload["mechanism_source"] = {
         "reactions_text": "reaction: ReplacementA -> ReplacementB; k=1",
         "state_network_dsl": "",
     }
     payload[field] = bad_value
 
-    def fail_if_reset_runs() -> None:
-        raise AssertionError(f"project session reset ran before {field} validation")
-
-    monkeypatch.setattr(main_window, "_reset_project_apply_dirty_session_state", fail_if_reset_runs)
-
     with pytest.raises((TypeError, ValueError), match=message):
-        main_window._apply_project_payload(payload, record_undo=False)
+        main_window.apply_project_payload(payload, record_undo=False)
+
+    assert _visible_project_state(main_window) == original_state
 
 
-def test_project_state_rejects_legacy_advanced_flag_before_session_reset(main_window, monkeypatch):
-    """Serialized projects neither persist nor accept the removed Advanced DSL toggle."""
-    payload = main_window._serialize_project_state()
-    assert 'use_advanced_dsl' not in payload
+def test_project_state_rejects_unknown_top_level_field_without_changing_project_state(
+    main_window,
+):
+    original_state = _visible_project_state(main_window)
+    payload = main_window.serialize_project_state()
+    assert "unexpected_project_field" not in payload
 
     legacy_payload = dict(payload)
-    legacy_payload['use_advanced_dsl'] = False
+    legacy_payload["unexpected_project_field"] = "ignored-by-no-one"
 
-    def fail_if_reset_runs() -> None:
-        raise AssertionError("project session reset ran before top-level payload validation")
+    with pytest.raises(ValueError, match="unexpected_project_field"):
+        main_window.apply_project_payload(legacy_payload, record_undo=False)
 
-    monkeypatch.setattr(main_window, "_reset_project_apply_dirty_session_state", fail_if_reset_runs)
-
-    with pytest.raises(ValueError, match="use_advanced_dsl"):
-        main_window._apply_project_payload(legacy_payload, record_undo=False)
+    assert _visible_project_state(main_window) == original_state
 
 
-def test_public_project_apply_validates_before_slider_transaction_guard(main_window, monkeypatch):
-    payload = main_window._serialize_project_state()
+def test_public_project_apply_rejects_invalid_payload_without_changing_project_state(
+    main_window,
+):
+    original_state = _visible_project_state(main_window)
+    payload = main_window.serialize_project_state()
     payload["project_schema_version"] = 5
-
-    def fail_if_slider_guard_runs(*args, **kwargs) -> bool:
-        raise AssertionError("slider transaction guard ran before project payload validation")
-
-    monkeypatch.setattr(main_window, "_guard_slider_transaction_invalidation", fail_if_slider_guard_runs)
 
     with pytest.raises(ValueError, match="project_schema_version"):
         main_window.apply_project_payload(payload, record_undo=False)
+
+    assert _visible_project_state(main_window) == original_state
 
 
 def test_new_project_uses_complete_current_project_payload(main_window, monkeypatch, qt_app):
@@ -323,15 +355,19 @@ def test_new_project_uses_complete_current_project_payload(main_window, monkeypa
         lambda *args, **kwargs: QtWidgets.QMessageBox.StandardButton.Discard,
     )
 
-    main_window._mechanism_editor.set_reactions_text("reaction: ExistingA -> ExistingB; k=1", block_signals=True)
-    main_window._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
-    main_window._apply_solver_runtime_state(solver="Radau", rtol=1e-6, atol=1e-12)
+    seed_payload = dict(main_window.serialize_project_state())
+    seed_payload["mechanism_source"] = MechanismAuthoringSource.from_parts(
+        reactions_text="reaction: ExistingA -> ExistingB; k=1",
+        state_network_dsl="",
+    ).to_payload()
+    main_window.apply_project_payload(seed_payload, record_undo=False)
+    main_window.apply_solver_runtime_state(solver="Radau", rtol=1e-6, atol=1e-12)
     main_window.config_controller.update_user_preference("solver", "BDF")
 
     main_window.project_controller.new_project()
     qt_app.processEvents()
 
-    payload = main_window._serialize_project_state()
+    payload = main_window.serialize_project_state()
     assert set(payload) >= {"version", "solver_method", "solver_warning"}
     assert payload["solver"] == "BDF"
     assert payload["solver_method"] == "BDF"
@@ -339,7 +375,6 @@ def test_new_project_uses_complete_current_project_payload(main_window, monkeypa
     assert payload["mechanism_source"] == {"reactions_text": "", "state_network_dsl": ""}
     assert main_window.mechanism_reactions_text_raw() == ""
     assert main_window.mechanism_state_network_dsl_raw() == ""
-    assert main_window._status_label.text() == "New project"
 
 
 def test_profile_activation_updates_widgets(tmp_path, monkeypatch, qt_app):

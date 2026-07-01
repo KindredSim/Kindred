@@ -614,7 +614,7 @@ class ComputationalModeDialog(QtWidgets.QDialog):
             return False
 
         try:
-            ok = rewrite_reactions_text(
+            outcome = rewrite_reactions_text(
                 action_label="Applying Computational Mode",
                 description="Apply Computational Mode",
                 rewrite_text=lambda current_text: upsert_computational_mode_blocks(
@@ -623,13 +623,12 @@ class ComputationalModeDialog(QtWidgets.QDialog):
                     generated_body=compiled.generated_reaction_dsl.strip("\n"),
                 ),
                 record_undo=True,
-                apply_transition=True,
                 transition_source="computational_mode",
             )
         except Exception as exc:
             self._show_error(str(exc))
             return False
-        if not ok:
+        if not outcome.may_continue:
             return False
 
         # Re-parse and refresh energy-mode sliders without running an ODE solve.

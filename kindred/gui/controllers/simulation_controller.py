@@ -473,8 +473,6 @@ class SimulationController(QtCore.QObject):
     def _run_rows_for_target_set_ids(
         self,
         target_set_ids: Sequence[str],
-        *,
-        fallback_rows: Sequence[int] = (),
     ) -> list[int]:
         target_ids = list(normalize_preview_target_set_ids(target_set_ids))
         if target_ids:
@@ -494,24 +492,7 @@ class SimulationController(QtCore.QObject):
             if any(set_id not in rows_by_set_id for set_id in target_ids):
                 return []
             return [int(rows_by_set_id[set_id]) for set_id in target_ids if set_id in rows_by_set_id]
-        try:
-            row_count = int(self.ui.batch.batch_store_row_count())
-        except Exception:
-            row_count = None
-        rows: list[int] = []
-        seen_rows: set[int] = set()
-        for row in fallback_rows or ():
-            try:
-                row_i = int(row)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if row_i in seen_rows:
-                continue
-            if row_count is not None and not (0 <= row_i < int(row_count)):
-                continue
-            seen_rows.add(row_i)
-            rows.append(row_i)
-        return rows
+        return []
 
     def _runtime_preview_replay_state(
         self,
@@ -1143,7 +1124,9 @@ class SimulationController(QtCore.QObject):
         self._prepare_ordinary_runtime_launch_context(
             target_set_ids=target_set_ids,
         )
-        requested_show_set_ids = self._runtime_requested_show_set_ids(target_set_ids)
+        requested_show_set_ids = self._completed_run_requested_show_set_ids(
+            target_set_ids
+        )
         intent = RuntimeLaunchIntent(
             intent_kind="ordinary",
             ui_action="run_selected",
@@ -1263,14 +1246,44 @@ class SimulationController(QtCore.QObject):
         if normalized_kind == "accept_dispatch":
             self.retry_runtime_dispatch_acceptance()
 
-    def _runtime_requested_show_set_ids(self, fallback_set_ids: Sequence[str]) -> tuple[str, ...]:
-        requested: Sequence[str] = ()
+    def _runtime_requested_show_set_ids(
+        self,
+        fallback_set_ids: Sequence[str],
+    ) -> tuple[str, ...]:
         try:
             requested = self.ui.batch.requested_show_batch_set_ids()
         except Exception:
-            requested = ()
+            requested = None
         ordered: list[str] = []
-        for raw_set_id in requested or ():
+        if requested is not None:
+            for raw_set_id in requested or ():
+                set_id = str(raw_set_id or "").strip()
+                if set_id and set_id not in ordered:
+                    ordered.append(set_id)
+            return tuple(ordered)
+        for raw_set_id in fallback_set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if set_id and set_id not in ordered:
+                ordered.append(set_id)
+        return tuple(ordered)
+
+    def _completed_run_requested_show_set_ids(
+        self,
+        fallback_set_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        try:
+            requested = self.ui.batch.requested_show_batch_set_ids()
+        except Exception:
+            requested = None
+        ordered: list[str] = []
+        if requested is not None:
+            for raw_set_id in requested or ():
+                set_id = str(raw_set_id or "").strip()
+                if set_id and set_id not in ordered:
+                    ordered.append(set_id)
+            if ordered:
+                return tuple(ordered)
+        for raw_set_id in fallback_set_ids or ():
             set_id = str(raw_set_id or "").strip()
             if set_id and set_id not in ordered:
                 ordered.append(set_id)
@@ -1664,12 +1677,17 @@ class SimulationController(QtCore.QObject):
             return normalized
         try:
             state = self.ui.batch.run_target_ui_state()
-            rows = list(getattr(state, "target_rows", ()) or ())
+            enabled = getattr(state, "enabled", None)
+            target_set_ids = tuple(
+                str(set_id)
+                for set_id in (getattr(state, "target_set_ids", ()) or ())
+                if str(set_id)
+            )
+            if enabled is not None and not bool(enabled):
+                return []
+            rows = self._run_rows_for_target_set_ids(target_set_ids)
         except Exception:
-            try:
-                rows = list(self.ui.batch.batch_rows_for_scope("selected"))
-            except Exception:
-                rows = []
+            rows = []
         return [int(row) for row in rows]
 
     def _parallel_batch_pool_settings_changed(self) -> None:
@@ -1711,7 +1729,9 @@ class SimulationController(QtCore.QObject):
             ui_action="runtime_readiness",
             rows=tuple(runtime_rows),
             set_ids=target_set_ids,
-            requested_show_set_ids=self._runtime_requested_show_set_ids(target_set_ids),
+            requested_show_set_ids=self._completed_run_requested_show_set_ids(
+                target_set_ids
+            ),
             requested_show_labels_by_set_id=self._runtime_requested_show_labels_by_set_id(target_set_ids),
             request_token=None,
             runtime_input_epochs=self._runtime_input_epochs_for_sets(target_set_ids),
@@ -1954,16 +1974,25 @@ class SimulationController(QtCore.QObject):
     ) -> None:
         invalidation_request_id = int(self._next_sim_request_id())
         self._discarded_slider_preview_generation_id = int(invalidation_request_id)
-        self._clear_preview_ownership()
-        self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+        normalized_targets = normalize_preview_target_set_ids(target_set_ids)
+        if bool(close_runtime_owner):
+            self._clear_preview_ownership()
+        if normalized_targets:
+            self._apply_runtime_lifecycle_ui_effects(
+                self._runtime_orchestrator.preview_replay_after_canonical_reset(
+                    current_state=self._pending_slider_preview_launch,
+                    reset_set_ids=normalized_targets,
+                )
+            )
+        else:
+            self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._clear_pending_preview_slider_plot_updates()
         preview_invalidator = self._preview_display_cache_invalidator
-        normalized_targets = normalize_preview_target_set_ids(target_set_ids)
         if callable(preview_invalidator):
             try:
                 preview_invalidator(
                     target_set_ids=normalized_targets,
-                    clear_plot=False,
+                    clear_plot=True,
                 )
             except Exception as exc:
                 self._record_nonfatal_exception(
@@ -2067,7 +2096,6 @@ class SimulationController(QtCore.QObject):
         close_preview_runtime_owner: bool = True,
     ) -> None:
         self._authoritative_mechanism_transition_epoch = int(epoch)
-        self._authoritative_runtime_input_epoch = int(epoch)
         affected_scope = self._normalize_runtime_input_set_ids(affected_set_ids)
         if affected_scope:
             epochs = dict(getattr(self, "_authoritative_runtime_input_set_epoch_by_set_id", {}) or {})
@@ -2078,10 +2106,14 @@ class SimulationController(QtCore.QObject):
             if active_set_ids and active_set_ids.intersection(set(affected_scope)):
                 self._invalidate_active_explicit_simulation_for_authoritative_change()
         else:
+            self._authoritative_runtime_input_epoch = int(epoch)
             self._authoritative_runtime_input_global_epoch = int(epoch)
             self._invalidate_active_explicit_simulation_for_authoritative_change()
         if (not affected_scope) or self._preview_work_intersects_runtime_input_scope(affected_scope):
-            self._invalidate_slider_preview_work(close_runtime_owner=bool(close_preview_runtime_owner))
+            self._invalidate_slider_preview_work(
+                target_set_ids=affected_scope,
+                close_runtime_owner=bool(close_preview_runtime_owner),
+            )
 
     def _queue_slider_plot_update(
         self,
@@ -2180,7 +2212,7 @@ class SimulationController(QtCore.QObject):
         focused_controls_use_workspace = getattr(refresh, "focused_controls_use_workspace", None)
         if focused_controls_use_workspace is not None:
             try:
-                self.ui.mechanism_helpers.sync_mechanism_controls_to_focused_batch_set(
+                self.ui.mechanism_controls.sync_mechanism_controls_to_focused_batch_set(
                     use_workspace=bool(focused_controls_use_workspace)
                 )
             except Exception as exc:
@@ -2360,7 +2392,7 @@ class SimulationController(QtCore.QObject):
             )
         if eligible_reset_set_ids:
             try:
-                self.ui.mechanism_helpers.sync_mechanism_controls_to_focused_batch_set(
+                self.ui.mechanism_controls.sync_mechanism_controls_to_focused_batch_set(
                     use_workspace=True
                 )
             except Exception as exc:
@@ -2741,31 +2773,45 @@ class SimulationController(QtCore.QObject):
         )
 
     def _run_selected_rows_or_abort(self) -> list[int] | None:
-        def read_run_target_state() -> tuple[list[int], tuple[str, ...], str]:
-            try:
-                run_target_state = self.ui.batch.run_target_ui_state()
-                target_rows = [
-                    int(row)
-                    for row in (getattr(run_target_state, "target_rows", ()) or ())
-                ]
-                target_set_ids = tuple(
-                    str(set_id)
-                    for set_id in (getattr(run_target_state, "target_set_ids", ()) or ())
-                    if str(set_id)
-                )
-                empty_reason_s = str(getattr(run_target_state, "empty_reason", "") or "")
-                return target_rows, target_set_ids, empty_reason_s
-            except Exception:
-                target_rows = list(self.ui.batch.batch_rows_for_scope("selected"))
-                target_set_ids = self._run_target_set_ids_for_rows(target_rows)
-                empty_reason_s = self.ui.batch.run_selected_empty_target_reason()
-                return target_rows, target_set_ids, empty_reason_s
+        def read_run_target_state() -> tuple[list[int], tuple[str, ...], str, bool]:
+            run_target_state = self.ui.batch.run_target_ui_state()
+            target_rows = [
+                int(row)
+                for row in (getattr(run_target_state, "target_rows", ()) or ())
+            ]
+            target_set_ids = tuple(
+                str(set_id)
+                for set_id in (getattr(run_target_state, "target_set_ids", ()) or ())
+                if str(set_id)
+            )
+            empty_reason_s = str(getattr(run_target_state, "empty_reason", "") or "")
+            enabled_attr = getattr(run_target_state, "enabled", None)
+            enabled = (
+                bool(target_rows and target_set_ids)
+                if enabled_attr is None
+                else bool(enabled_attr)
+            )
+            return target_rows, target_set_ids, empty_reason_s, enabled
 
-        preliminary_rows, preliminary_target_set_ids, preliminary_empty_reason = (
-            read_run_target_state()
-        )
-        if not preliminary_rows and not preliminary_target_set_ids:
-            reason = preliminary_empty_reason or self.ui.batch.run_selected_empty_target_reason()
+        try:
+            (
+                preliminary_rows,
+                preliminary_target_set_ids,
+                preliminary_empty_reason,
+                preliminary_enabled,
+            ) = (
+                read_run_target_state()
+            )
+        except Exception as exc:
+            logger.exception("Run target state unavailable before run preflight")
+            self.ui.run_ui.set_status_text("Cannot run: run target selection is unavailable.")
+            self.ui.dialogs.message_box_warning(
+                "No Sets",
+                f"Run target selection is unavailable:\n\n{exc}",
+            )
+            return None
+        if not preliminary_enabled:
+            reason = preliminary_empty_reason or "Select at least one set before running."
             self.ui.dialogs.message_box_warning("No Sets", reason)
             return None
 
@@ -2783,19 +2829,47 @@ class SimulationController(QtCore.QObject):
             self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
             return None
 
-        selected_rows, selected_target_set_ids, empty_reason = read_run_target_state()
+        try:
+            selected_rows, selected_target_set_ids, empty_reason, selected_enabled = read_run_target_state()
+        except Exception as exc:
+            logger.exception("Run target state unavailable after mechanism draft apply")
+            self.ui.run_source_publication.publish_applied_draft_run_abort(
+                "run_preflight_applied_draft_abort",
+                draft_apply_result=apply_draft_result,
+            )
+            self.ui.run_ui.set_status_text("Cannot run: run target selection is unavailable.")
+            self.ui.dialogs.message_box_warning(
+                "No Sets",
+                f"Run target selection is unavailable:\n\n{exc}",
+            )
+            return None
 
-        rows_to_run = self._run_rows_for_target_set_ids(
-            selected_target_set_ids,
-            fallback_rows=selected_rows,
-        )
+        if not selected_enabled:
+            self.ui.run_source_publication.publish_applied_draft_run_abort(
+                "run_preflight_applied_draft_abort",
+                draft_apply_result=apply_draft_result,
+            )
+            reason = empty_reason or "Select at least one set before running."
+            self.ui.dialogs.message_box_warning("No Sets", reason)
+            return None
+
+        rows_to_run = self._run_rows_for_target_set_ids(selected_target_set_ids)
         if not rows_to_run:
-            reason = empty_reason or self.ui.batch.run_selected_empty_target_reason()
+            self.ui.run_source_publication.publish_applied_draft_run_abort(
+                "run_preflight_applied_draft_abort",
+                draft_apply_result=apply_draft_result,
+            )
+            reason = empty_reason or "Select at least one set before running."
             self.ui.dialogs.message_box_warning("No Sets", reason)
             return None
 
         if not self._resolve_wegscheider_cyclicity_for_run_or_abort():
+            self.ui.run_source_publication.publish_applied_draft_run_abort(
+                "run_preflight_applied_draft_abort",
+                draft_apply_result=apply_draft_result,
+            )
             return None
+        self.ui.run_source_publication.publish_pending_canonical_initials_for_run(apply_draft_result)
         self._discarded_slider_preview_generation_id = None
         if bool(getattr(self, "_simulation_running", False)):
             logger.info("Superseding active simulation with new Run request")
@@ -2841,9 +2915,12 @@ class SimulationController(QtCore.QObject):
                 return False
             return True
 
-        self.ui.mechanism.apply_wegscheider_resolution_reactions_rewrite(
+        outcome = self.ui.mechanism.apply_wegscheider_resolution_reactions_rewrite(
             resolution.rewritten_reactions_text
         )
+        if not outcome.may_continue:
+            self.ui.run_ui.set_status_text("Run cancelled: Wegscheider cyclicity resolution was not applied.")
+            return False
         self.ui.run_ui.set_status_text("Applied Wegscheider cyclicity resolution.")
         return True
 

@@ -13,7 +13,12 @@ from PySide6.QtCore import Signal
 
 from kindred.gui.species_sliders_logic import compute_row_max, compute_slider_max_option_c, try_nonneg_finite
 from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableModel, BatchInitialConditionsTableView
-from ..ui_helpers import make_bounded_label, make_placeholder_label, make_scroll_area
+from ..ui_helpers import (
+    apply_slider_name_label_layout_policy,
+    make_bounded_label,
+    make_placeholder_label,
+    make_scroll_area,
+)
 
 __all__ = ["BatchSpeciesSliders"]
 
@@ -57,6 +62,88 @@ class _SpeciesSliderRow:
     slider_max: float
     dragging: bool = False
     mixed: bool = False
+
+
+class _GrooveDragSlider(QtWidgets.QSlider):
+    """Slider that treats left-button groove presses as direct drags."""
+
+    def __init__(
+        self,
+        orientation: QtCore.Qt.Orientation,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(orientation, parent)
+        self._groove_drag_active = False
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() is QtCore.Qt.MouseButton.LeftButton:
+            self._groove_drag_active = True
+            self.setSliderDown(True)
+            self._set_value_from_pointer_event(event)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if (
+            self._groove_drag_active
+            and event.buttons() & QtCore.Qt.MouseButton.LeftButton
+        ):
+            self._set_value_from_pointer_event(event)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if (
+            self._groove_drag_active
+            and event.button() is QtCore.Qt.MouseButton.LeftButton
+        ):
+            self._set_value_from_pointer_event(event)
+            self._groove_drag_active = False
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _set_value_from_pointer_event(self, event) -> None:
+        if hasattr(event, "position"):
+            point = event.position().toPoint()
+        else:
+            point = event.pos()
+        self.setValue(self._value_from_point(point))
+
+    def _value_from_point(self, point: QtCore.QPoint) -> int:
+        option = QtWidgets.QStyleOptionSlider()
+        self.initStyleOption(option)
+        style = self.style()
+        groove = style.subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_Slider,
+            option,
+            QtWidgets.QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        handle = style.subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_Slider,
+            option,
+            QtWidgets.QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+        if self.orientation() == QtCore.Qt.Orientation.Vertical:
+            available = max(1, int(groove.height()) - int(handle.height()))
+            pointer_pos = int(point.y()) - int(groove.y()) - int(handle.height() / 2)
+        else:
+            available = max(1, int(groove.width()) - int(handle.width()))
+            pointer_pos = int(point.x()) - int(groove.x()) - int(handle.width() / 2)
+        return int(
+            QtWidgets.QStyle.sliderValueFromPosition(
+                int(self.minimum()),
+                int(self.maximum()),
+                int(pointer_pos),
+                int(available),
+                bool(option.upsideDown),
+            )
+        )
 
 
 class BatchSpeciesSliders(QtWidgets.QWidget):
@@ -602,6 +689,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(8)
         name_label = make_bounded_label(str(species), container, max_width=240)
+        apply_slider_name_label_layout_policy(name_label)
         font = name_label.font()
         font.setBold(True)
         name_label.setFont(font)
@@ -613,7 +701,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         top.addWidget(value_label)
         layout.addLayout(top)
 
-        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal, container)
+        slider = _GrooveDragSlider(QtCore.Qt.Horizontal, container)
         slider.setMinimumHeight(28)
         slider.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         slider.setMinimum(0)

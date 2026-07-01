@@ -12,8 +12,7 @@ import platform
 import re
 import warnings
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Callable, Sequence, TYPE_CHECKING, Mapping, Literal
-from collections import OrderedDict
+from typing import Dict, Any, Optional, List, Tuple, Callable, Sequence, TYPE_CHECKING, Mapping
 import math
 
 import numpy as np
@@ -44,6 +43,7 @@ from kindred.gui.project_schema import (
 )
 
 if TYPE_CHECKING:
+    from kindred.core.mechanism_source import MechanismAuthoringSource
     from kindred.core.mechanism import Mechanism
     from kindred.gui.controllers.simulation_controller import SimulationController
     from kindred.gui.ports import SimulationUiPorts
@@ -65,7 +65,12 @@ from kindred.gui.app_wiring import (
     dock_shell_specs,
     load_solver_contract,
 )
+from kindred.gui.authoritative_rewrite_owner import AuthoritativeRewriteOwner
+from kindred.gui.canonical_initials_transition_owner import CanonicalInitialsTransitionOwner
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
+from kindred.gui.reactions_draft_resolution_owner import (
+    ReactionsDraftResolutionOwner,
+)
 from kindred.gui.fitting.runtime_inputs import (
     FittingEvaluatorRuntimeSettings,
     FittingRuntimeInputPublisher,
@@ -75,7 +80,12 @@ from kindred.gui.initial_conditions_import_owner import (
     InitialConditionsImportOwner,
 )
 from kindred.gui.initial_conditions_source_acceptance_owner import InitialConditionsSourceAcceptanceOwner
-from kindred.gui.ports import DisplayRefreshSource, ReactionsDraftApplyResult
+from kindred.gui.ports import (
+    AuthoritativeRewriteOutcome,
+    AuthoritativeRewriteStatus,
+    DisplayRefreshSource,
+    ReactionsDraftApplyResult,
+)
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.mechanism_session_owner import MechanismSessionOwner
 from kindred.gui.main_window_preview_session import MainWindowPreviewSession
@@ -108,17 +118,6 @@ _CANONICAL_BATCH_INITIALS_TRANSITION_DEBOUNCE_MS = 220
 _INTERACTIVE_RUNTIME_READINESS_REFRESH_DEBOUNCE_MS = 80
 _REACTIONS_DRAFT_DIRTY_REFRESH_MS = 100
 _DRAFT_EDIT_WARNING_SETTINGS_KEY = "mechanism_editor/suppress_draft_edit_warning"
-
-
-@dataclass(frozen=True)
-class ReactionsDraftResolution:
-    status: Literal["clean", "discarded", "applied", "cancelled", "failed"]
-    canonical_changed: bool = False
-    error: str = ""
-
-    @property
-    def may_continue(self) -> bool:
-        return self.status in {"clean", "discarded", "applied"}
 
 
 @dataclass(frozen=True)
@@ -252,7 +251,31 @@ class MainWindow(
             results_table_getter=lambda: getattr(self, "_results_table", None),
         )
         self._variable_runtime = MainWindowVariableRuntime(self)
-        self._mechanism_helpers = MainWindowMechanismHelpers(self)
+        self._reactions_draft_resolution_owner = ReactionsDraftResolutionOwner(
+            draft_dirty=self._reactions_draft_dirty,
+            prompt_draft_decision=self._prompt_reactions_draft_before_authoritative_change,
+            discard_draft=self._discard_reactions_draft,
+            apply_dirty_draft_with_transition=self._apply_reactions_draft_with_transition,
+            apply_dirty_draft_without_transition=self._apply_reactions_draft_for_authoritative_rewrite,
+            draft_error_text=self._reactions_draft_apply_error_text,
+        )
+        self._canonical_initials_transition_owner = CanonicalInitialsTransitionOwner(
+            batch_set_ids_for_rows=self._batch_set_ids_for_rows,
+            canonical_initials_identity_by_set_id=self._canonical_batch_initials_identity_by_set_id,
+            canonical_initials_identity_for_set_ids=self._canonical_batch_initials_identity_for_set_ids,
+            apply_authoritative_transition=self._apply_authoritative_mechanism_transition,
+            apply_canonical_initials_transition_effects=self._apply_canonical_batch_initials_transition_effects,
+            qt_parent=self,
+        )
+        self._authoritative_rewrite_owner = AuthoritativeRewriteOwner(
+            draft_resolution_owner=self._reactions_draft_resolution_owner,
+            canonical_source=self.canonical_mechanism_source,
+            write_source=self._set_authoritative_mechanism_editor_source,
+            publish_transition=(
+                self._canonical_initials_transition_owner.publish_authoritative_transition
+            ),
+        )
+        self._mechanism_helpers = MainWindowMechanismHelpers()
         self._simulation_mechanism_owner = SimulationMechanismOwner(
             mechanism_session_owner_getter=lambda: getattr(self, "_mechanism_session_owner", None),
             mechanism_editor_getter=lambda: getattr(self, "_mechanism_editor", None),
@@ -274,7 +297,7 @@ class MainWindow(
             num_points_getter=lambda: int(self._num_points_spinbox.value()),
             sim_time_text_getter=lambda: str(self._sim_time_spinbox.text()),
             parse_sim_time_seconds=self._parse_sim_time_seconds,
-            dsl_global_temperature_getter=self._dsl_global_temperature_K,
+            dsl_global_temperature_getter=self._variable_runtime.dsl_global_temperature_k,
             sparse_jacobian_getter=lambda: self._use_sparse_jacobian,
             wegscheider_cyclicity_getter=lambda: self._wegscheider_cyclicity_enabled,
         )
@@ -291,16 +314,7 @@ class MainWindow(
         )
         self._mechanism_runtime_transition = MechanismRuntimeTransitionService()
         self._authoritative_mechanism_runtime_refresh_defer_depth = 0
-        self._suppress_canonical_batch_initials_transition = False
-        self._pending_canonical_batch_initials_transition_set_ids: tuple[str, ...] = ()
-        self._pending_canonical_batch_initials_transition_source = "batch_initials_table_edit"
-        self._pending_canonical_batch_initials_discard_dirty_preview = True
-        self._canonical_batch_initials_transition_queued = False
-        self._canonical_batch_initials_transition_timer = QtCore.QTimer(self)
-        self._canonical_batch_initials_transition_timer.setSingleShot(True)
-        self._canonical_batch_initials_transition_timer.timeout.connect(
-            self._flush_canonical_batch_initials_transition
-        )
+        self._simulation_runtime_input_refresh_defer_depth = 0
         self._pending_interactive_runtime_readiness_rows: tuple[int, ...] = ()
         self._interactive_runtime_readiness_refresh_queued = False
         self._last_interactive_runtime_readiness_signature: tuple[tuple[int, ...], tuple[str, ...]] | None = None
@@ -696,6 +710,25 @@ class MainWindow(
                 )
         return identities
 
+    def _batch_set_ids_for_rows(self, rows: Sequence[int]) -> tuple[str, ...]:
+        set_ids: list[str] = []
+        seen: set[str] = set()
+        for row in rows or ():
+            try:
+                set_id = str(self._batch_set_id_for_row(int(row)) or "").strip()
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.runtime_transition.canonical_initials_identity.row_lookup",
+                    message="Failed to resolve batch set id for canonical batch initials transition",
+                    exc=exc,
+                )
+                continue
+            if not set_id or set_id in seen:
+                continue
+            set_ids.append(set_id)
+            seen.add(set_id)
+        return tuple(set_ids)
+
     def _apply_authoritative_mechanism_transition(
         self,
         *,
@@ -777,58 +810,64 @@ class MainWindow(
         elif outcome.runtime_invalidation_required and outcome.readiness_schedule_deferred:
             self._mark_launch_readiness_stale()
 
-    def _apply_canonical_batch_initials_transition(
+    def _apply_canonical_batch_initials_transition_effects(
         self,
+        outcome: MechanismTransitionOutcome,
         *,
         affected_set_ids: Sequence[str],
-        transition_source: str,
-        discard_dirty_preview: bool = True,
+        discard_dirty_preview: bool,
     ) -> None:
         affected_set_ids_t = tuple(
             dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id))
         )
-        if not affected_set_ids_t:
-            return
-        scoped_initial_identities = self._canonical_batch_initials_identity_for_set_ids(
-            affected_set_ids_t
+        invalidates_runtime_inputs = bool(
+            outcome.runtime_input_invalidation_required
+            or outcome.runtime_invalidation_required
         )
-        outcome = self._apply_authoritative_mechanism_transition(
-            transition_source=str(transition_source or "canonical_batch_initials_change"),
-            canonical_batch_initials_by_set_id=scoped_initial_identities,
-            affected_set_ids=affected_set_ids_t,
-            canonical_batch_initials_scope_is_partial=True,
-        )
-        if bool(outcome.runtime_input_invalidation_required) or bool(outcome.runtime_invalidation_required):
+        if invalidates_runtime_inputs:
             self._last_interactive_runtime_readiness_signature = None
             self._maybe_queue_run_target_runtime_readiness_refresh(force=True)
-        if bool(discard_dirty_preview) and (
-            bool(outcome.runtime_input_invalidation_required)
-            or bool(outcome.runtime_invalidation_required)
-        ):
-            dirty_preview_reset_set_ids = (
-                affected_set_ids_t
-                if bool(outcome.dirty_preview_reset_scope_is_global)
-                else outcome.dirty_preview_reset_set_ids
-            )
+        if bool(discard_dirty_preview):
+            if bool(outcome.dirty_preview_reset_scope_is_global):
+                try:
+                    self._preview_session.clear_working_transaction(
+                        invalidate_preview_work=False
+                    )
+                except Exception as exc:
+                    self._record_best_effort_failure(
+                        "main_window.canonical_initials.clear_global_dirty_preview",
+                        message="Failed to discard global dirty slider work after authoritative source change",
+                        exc=exc,
+                    )
+                try:
+                    self.results_controller.clear_active_display_transaction()
+                except Exception as exc:
+                    self._record_best_effort_failure(
+                        "main_window.canonical_initials.clear_global_display",
+                        message="Failed to clear display after authoritative source change",
+                        exc=exc,
+                    )
+                self._refresh_slider_transaction_button_state()
+                if affected_set_ids_t:
+                    self._refresh_species_sliders_after_canonical_initials_transition(
+                        affected_set_ids_t
+                    )
+                return
+            dirty_preview_reset_set_ids = outcome.dirty_preview_reset_set_ids
+            if not dirty_preview_reset_set_ids:
+                return
             preview_state_changed = False
             try:
                 preview_state_changed = bool(
-                    self._preview_session.reset_mechanism_workspaces(dirty_preview_reset_set_ids)
+                    self._preview_session.clear_working_transaction_for_set_ids(
+                        dirty_preview_reset_set_ids,
+                        invalidate_preview_work=False,
+                    )
                 )
             except Exception as exc:
                 self._record_best_effort_failure(
-                    "main_window.canonical_initials.reset_dirty_workspaces",
-                    message="Failed to discard dirty slider workspaces after canonical batch initial edit",
-                    exc=exc,
-                )
-            try:
-                preview_state_changed = bool(
-                    self._preview_session.discard_concentration_overlays_for_set_ids(dirty_preview_reset_set_ids)
-                ) or preview_state_changed
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.canonical_initials.discard_dirty_overlays",
-                    message="Failed to discard dirty species overlays after canonical batch initial edit",
+                    "main_window.canonical_initials.discard_dirty_preview",
+                    message="Failed to discard dirty preview state after canonical batch initial edit",
                     exc=exc,
                 )
             if preview_state_changed:
@@ -939,6 +978,9 @@ class MainWindow(
     def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
         self._update_temperature_mode_indicator()
         self._fitting_runtime_input_publisher.publish_if_changed(reason="temperature changed")
+        self._refresh_simulation_runtime_after_inputs_changed(
+            batch_runtime_pool_inputs_changed=False
+        )
 
     @staticmethod
     def _state_network_dialog_info_text() -> str:
@@ -995,12 +1037,13 @@ class MainWindow(
             return
         dirty_b = self._reactions_draft_dirty() if dirty is None else bool(dirty)
         if dirty_b:
-            if hasattr(run_ui, "render_draft_run_preflight_available"):
-                run_ui.render_draft_run_preflight_available(True)
+            run_ui.render_draft_run_preflight_available(
+                not bool(getattr(self, "_reactions_draft_apply_failed", False)),
+                active=True,
+            )
             run_ui.render_mechanism_launch_available(True, tooltip="")
             return
-        if hasattr(run_ui, "render_draft_run_preflight_available"):
-            run_ui.render_draft_run_preflight_available(False)
+        run_ui.render_draft_run_preflight_available(False, active=False)
         ready = bool(owner.is_ready_for_explicit_run())
         tooltip = "" if ready else "Cannot run: mechanism has errors. Fix and try again."
         run_ui.render_mechanism_launch_available(ready, tooltip=tooltip)
@@ -1102,47 +1145,42 @@ class MainWindow(
         self._refresh_symbolic_calculator_state()
 
     def _apply_reactions_draft(self) -> bool:
-        result = self._apply_reactions_draft_for_run()
-        self._flush_reactions_draft_apply_side_effects(result)
+        result = self._apply_reactions_draft_with_transition()
         return bool(result)
 
-    def _flush_reactions_draft_apply_side_effects(
+    def _prepare_reactions_draft_for_canonical_acceptance(
         self,
-        result: ReactionsDraftApplyResult,
-    ) -> None:
-        if not bool(result):
-            return
-        if (
-            tuple(getattr(result, "affected_rows", ()) or ())
-            or bool(getattr(self, "_canonical_batch_initials_transition_queued", False))
-        ):
-            self._flush_canonical_batch_initials_transition()
-
-    def _apply_reactions_draft_for_run(self) -> ReactionsDraftApplyResult:
+    ) -> tuple[ReactionsDraftApplyResult, object | None, object | None]:
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             raise RuntimeError("Mechanism session owner is unavailable.")
 
-        def _result(success: bool, affected_rows: tuple[int, ...] = ()) -> ReactionsDraftApplyResult:
+        def _result(
+            success: bool,
+            affected_rows: tuple[int, ...] = (),
+            *,
+            source_applied: bool = False,
+        ) -> ReactionsDraftApplyResult:
             return ReactionsDraftApplyResult(
                 bool(success),
                 tuple(int(row) for row in affected_rows),
+                bool(source_applied),
             )
 
         if not self._reactions_draft_dirty():
             self._refresh_reactions_draft_state()
-            return _result(True)
+            return _result(True), None, None
 
         candidate_source = owner.source_for_reactions_text(self._editor_reactions_text())
         candidate_validation = owner.validate_source(candidate_source)
         if not candidate_validation.valid:
             self._set_reactions_apply_failure(candidate_validation.error_message)
-            return _result(False)
+            return _result(False), None, None
         if str(candidate_source.state_network_dsl or "").strip() and not owner.source_is_ready_for_explicit_run(
             candidate_source
         ):
             self._set_reactions_apply_failure("State network topology is invalid.")
-            return _result(False)
+            return _result(False), None, None
 
         reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_apply(
             candidate_source,
@@ -1150,24 +1188,27 @@ class MainWindow(
         )
         if reconciliation_plan is None:
             self._set_reactions_apply_failure("Initial Conditions could not be reconciled.")
-            return _result(False)
+            return _result(False), None, None
 
         reconciled_source = reconciliation_plan.source
         validation = owner.validate_source(reconciled_source)
         if not validation.valid:
             self._set_reactions_apply_failure(validation.error_message)
-            return _result(False)
+            return _result(False), None, None
         if str(reconciled_source.state_network_dsl or "").strip() and not owner.source_is_ready_for_explicit_run(
             reconciled_source
         ):
             self._set_reactions_apply_failure("State network topology is invalid.")
-            return _result(False)
+            return _result(False), None, None
 
-        reconciliation_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
-            reconciliation_plan
-        )
-        owner.apply_authoritative_source(reconciled_source)
-        self._write_complete_authoritative_mechanism_source_to_editor(reconciled_source)
+        return _result(True, source_applied=True), reconciled_source, reconciliation_plan
+
+    def _accept_reactions_draft_source(self, source) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        owner.apply_authoritative_source(source)
+        self._write_complete_authoritative_mechanism_source_to_editor(source)
         previous_authoritative_suppress = bool(
             getattr(self, "_suppress_authoritative_mechanism_input_change", False)
         )
@@ -1177,13 +1218,58 @@ class MainWindow(
         self._suppress_authoritative_mechanism_input_change = False
         self._suppress_dirty_to_clean_runtime_readiness_refresh = True
         try:
-            self._apply_authoritative_mechanism_transition()
             self._reactions_draft_apply_failed = False
             self._refresh_reactions_draft_state()
         finally:
             self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
             self._suppress_dirty_to_clean_runtime_readiness_refresh = previous_clean_readiness_suppress
-        return _result(True, tuple(getattr(reconciliation_result, "affected_rows", ()) or ()))
+
+    def _accept_reactions_draft_source_and_materialize_initials(
+        self,
+        source,
+        reconciliation_plan,
+        result: ReactionsDraftApplyResult,
+    ) -> ReactionsDraftApplyResult:
+        self._accept_reactions_draft_source(source)
+        affected_rows: tuple[int, ...] = ()
+        if reconciliation_plan is not None:
+            materialization_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
+                reconciliation_plan,
+                notify_canonical_rows_changed=False,
+            )
+            affected_rows = tuple(
+                int(row)
+                for row in (getattr(materialization_result, "affected_rows", ()) or ())
+            )
+        return ReactionsDraftApplyResult(
+            bool(result),
+            affected_rows,
+            bool(getattr(result, "source_applied", False)),
+        )
+
+    def _apply_reactions_draft_with_transition(self) -> ReactionsDraftApplyResult:
+        result, source, reconciliation_plan = self._prepare_reactions_draft_for_canonical_acceptance()
+        if bool(result) and source is not None:
+            result = self._accept_reactions_draft_source_and_materialize_initials(
+                source,
+                reconciliation_plan,
+                result,
+            )
+            self._canonical_initials_transition_owner.publish_authoritative_transition(
+                "authoritative_change",
+                draft_apply_result=result,
+            )
+        return result
+
+    def _apply_reactions_draft_for_authoritative_rewrite(self) -> ReactionsDraftApplyResult:
+        result, source, reconciliation_plan = self._prepare_reactions_draft_for_canonical_acceptance()
+        if bool(result) and source is not None:
+            result = self._accept_reactions_draft_source_and_materialize_initials(
+                source,
+                reconciliation_plan,
+                result,
+            )
+        return result
 
     def _discard_reactions_draft(self) -> None:
         self._set_reactions_widget_text_from_canonical()
@@ -1191,8 +1277,13 @@ class MainWindow(
         self._refresh_reactions_draft_state()
 
     def _apply_dirty_reactions_for_run(self) -> ReactionsDraftApplyResult:
-        result = self._apply_reactions_draft_for_run()
-        self._flush_reactions_draft_apply_side_effects(result)
+        result, source, reconciliation_plan = self._prepare_reactions_draft_for_canonical_acceptance()
+        if bool(result) and source is not None:
+            result = self._accept_reactions_draft_source_and_materialize_initials(
+                source,
+                reconciliation_plan,
+                result,
+            )
         return result
 
     def _prompt_reactions_draft_before_authoritative_change(
@@ -1232,43 +1323,6 @@ class MainWindow(
         if clicked is discard_btn:
             return "discard"
         return "cancel"
-
-    def _resolve_reactions_draft_before_authoritative_change(
-        self,
-        action_label: str,
-        *,
-        continue_label: str = "Continue",
-        apply_label: str | None = None,
-        discard_label: str | None = None,
-        informative_text: str | None = None,
-    ) -> ReactionsDraftResolution:
-        if not self._reactions_draft_dirty():
-            return ReactionsDraftResolution("clean")
-        decision = str(
-            self._prompt_reactions_draft_before_authoritative_change(
-                action_label,
-                continue_label=str(continue_label or "Continue"),
-                apply_label=apply_label,
-                discard_label=discard_label,
-                informative_text=informative_text,
-            )
-            or "cancel"
-        ).strip().lower()
-        if decision == "cancel":
-            return ReactionsDraftResolution("cancelled")
-        if decision == "discard":
-            self._discard_reactions_draft()
-            return ReactionsDraftResolution("discarded")
-        if decision == "apply":
-            if bool(self._apply_reactions_draft()):
-                return ReactionsDraftResolution("applied", canonical_changed=True)
-            error = ""
-            editor = getattr(self, "_mechanism_editor", None)
-            label = getattr(editor, "_validation_label", None)
-            if label is not None and hasattr(label, "text"):
-                error = str(label.text() or "")
-            return ReactionsDraftResolution("failed", error=error)
-        return ReactionsDraftResolution("cancelled")
 
     def is_mechanism_valid_for_preview(self) -> bool:
         owner = getattr(self, "_mechanism_session_owner", None)
@@ -1694,10 +1748,17 @@ class MainWindow(
     def _simulation_runtime_settings_snapshot(self) -> Dict[str, object]:
         solver_contract = load_solver_contract()
         solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip()
+        try:
+            simulation_time_seconds = float(self._parse_sim_time_seconds())
+        except Exception:
+            simulation_time_seconds = str(self._sim_time_spinbox.text() or "").strip()
         return {
             "solver": str(solver_label or solver_contract.default_solver_name),
             "rtol": float(self._initial_rtol or 1e-6),
             "atol": float(self._initial_atol or 1e-12),
+            "temperature_K": float(self._temperature_spinbox.value()),
+            "simulation_time": simulation_time_seconds,
+            "num_points": int(self._num_points_spinbox.value()),
             "use_sparse_jacobian": bool(self._use_sparse_jacobian),
             "wegscheider_cyclicity_enabled": bool(self._wegscheider_cyclicity_enabled),
             "max_parallel_batch_workers": int(self._sim_controller.parallel_batch.max_parallel_workers),
@@ -1708,6 +1769,9 @@ class MainWindow(
             "slider_preview_solver": str(self._mechanism_editor.slider_solver_value() or "BDF"),
             "slider_preview_points": int(self._mechanism_editor.slider_points_value()),
         }
+
+    def _simulation_runtime_input_refresh_deferred(self) -> bool:
+        return int(getattr(self, "_simulation_runtime_input_refresh_defer_depth", 0) or 0) > 0
 
     def _simulation_batch_runtime_pool_settings_snapshot(self) -> Dict[str, object]:
         return {
@@ -1723,11 +1787,44 @@ class MainWindow(
         *,
         batch_runtime_pool_inputs_changed: bool = True,
     ) -> None:
+        if self._simulation_runtime_input_refresh_deferred():
+            return
+        self._invalidate_result_truth_for_simulation_runtime_inputs_changed()
         if bool(batch_runtime_pool_inputs_changed):
             self._sim_controller.simulation_runtime_inputs_changed()
         else:
             self._sim_controller.simulation_runtime_inputs_changed(
                 batch_runtime_pool_inputs_changed=False
+            )
+
+    def _invalidate_result_truth_for_simulation_runtime_inputs_changed(self) -> None:
+        required_attrs = (
+            "_sim_controller",
+            "results_controller",
+            "_simulation_batch_owner",
+            "_mechanism_helpers",
+        )
+        if not all(hasattr(self, attr) for attr in required_attrs):
+            return
+        try:
+            self._sim_controller.invalidate_active_explicit_simulation_for_authoritative_change()
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "main_window.runtime_inputs.invalidate_active_run",
+                message="Failed to invalidate active run after simulation runtime inputs changed",
+                exc=exc,
+            )
+        try:
+            self._apply_authoritative_result_truth_effects(
+                cache_stale_scope_is_global=True,
+                display_clear_scope_is_global=True,
+                clear_cached_mechanism=True,
+            )
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "main_window.runtime_inputs.invalidate_result_truth",
+                message="Failed to invalidate result truth after simulation runtime inputs changed",
+                exc=exc,
             )
 
     def _apply_simulation_runtime_readiness_render_state(
@@ -1780,36 +1877,175 @@ class MainWindow(
             return
         logger.warning(f"Startup profile '{self._initial_profile}' not found")
 
-    def _on_programmatic_mechanism_load(self, *, schedule_runtime_refresh: bool = True) -> None:
-        """
-        Invalidate slider runtime and clear variable sliders/overrides.
-
-        Programmatic loads often set editor text with signals blocked (undo commands and some load
-        paths), so MainWindow's `textChanged`-wired invalidation is not guaranteed to run.
-        """
+    def _refresh_after_authoritative_source_load(self) -> None:
         self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
         try:
             self._mechanism_editor._variable_sliders.clear()
         except Exception:
-            logger.debug("Failed to clear variable sliders after programmatic mechanism load", exc_info=True)
+            logger.debug("Failed to clear variable sliders after authoritative source load", exc_info=True)
             self._preview_session.clear_pending_slider_values()
 
-        self._apply_authoritative_mechanism_transition(
-            schedule_runtime_refresh=bool(schedule_runtime_refresh),
-            force_runtime_invalidation=True,
-            transition_source="programmatic_load",
-            canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
-        )
-        if bool(schedule_runtime_refresh):
-            self._update_batch_row_controls_state()
+        self._update_batch_row_controls_state()
         self._refresh_slider_transaction_button_state()
 
         try:
-            self._update_parameter_table_from_sliders()
+            self._variable_runtime.extract_and_populate_variables(
+                preserve_visibility=True,
+            )
         except Exception:
-            logger.debug("Failed to update parameter table after programmatic mechanism load", exc_info=True)
-            QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
+            logger.debug(
+                "Failed to refresh variable sliders after authoritative source load",
+                exc_info=True,
+            )
+
+        try:
+            self._variable_runtime.update_parameter_table_from_sliders()
+        except Exception:
+            logger.debug("Failed to update parameter table after authoritative source load", exc_info=True)
+            QtCore.QTimer.singleShot(
+                0,
+                self._variable_runtime.update_parameter_table_from_sliders,
+            )
+
+    def _source_load_plan_materializes_initial_conditions(self, reconciliation_plan) -> bool:
+        if reconciliation_plan is None:
+            return False
+        seed_sets = getattr(reconciliation_plan, "seed_sets", {}) or {}
+        if seed_sets:
+            return True
+        plan_species = [str(species) for species in (getattr(reconciliation_plan, "species_names", ()) or ()) if str(species)]
+        try:
+            current_species = [str(species) for species in (self._batch_store.visible_species() or ()) if str(species)]
+        except Exception:
+            current_species = []
+        return bool(plan_species != current_species)
+
+    def _prepare_authoritative_source_load_request(
+        self,
+        *,
+        source,
+        action_label: str,
+        guard_action_text: str,
+        prompt_overwrite: bool,
+        transition_source: str,
+        schedule_runtime_refresh: bool,
+        canceled_status_text: str | None = None,
+        continue_label: str = "Load",
+    ) -> tuple[object, object, ReactionsDraftApplyResult | None] | None:
+        draft_resolution = self._reactions_draft_resolution_owner.resolve_for_authoritative_source_load(
+            str(action_label),
+            continue_label=str(continue_label or "Load"),
+        )
+        if not draft_resolution.may_continue:
+            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
+                transition_source=str(transition_source or "authoritative_source_load"),
+                schedule_runtime_refresh=bool(schedule_runtime_refresh),
+                draft_apply_result=getattr(draft_resolution, "apply_result", None),
+            )
+            if canceled_status_text is not None:
+                self._status_label.setText(str(canceled_status_text))
+            return None
+        draft_apply_result = getattr(draft_resolution, "apply_result", None)
+        if not self._guard_slider_transaction_invalidation(action_text=str(guard_action_text)):
+            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
+                transition_source=str(transition_source or "authoritative_source_load"),
+                schedule_runtime_refresh=bool(schedule_runtime_refresh),
+                draft_apply_result=draft_apply_result,
+            )
+            if canceled_status_text is not None:
+                self._status_label.setText(str(canceled_status_text))
+            return None
+        source, reconciliation_plan = self._prepare_authoritative_source_load_reconciliation(
+            source,
+            prompt_overwrite=bool(prompt_overwrite),
+        )
+        if reconciliation_plan is None:
+            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
+                transition_source=str(transition_source or "authoritative_source_load"),
+                schedule_runtime_refresh=bool(schedule_runtime_refresh),
+                draft_apply_result=draft_apply_result,
+            )
+            if canceled_status_text is not None:
+                self._status_label.setText(str(canceled_status_text))
+            return None
+        return source, reconciliation_plan, draft_apply_result
+
+    def _execute_authoritative_source_load(
+        self,
+        *,
+        source,
+        reconciliation_plan,
+        draft_apply_result: ReactionsDraftApplyResult | None,
+        description: str,
+        transition_source: str,
+        schedule_runtime_refresh: bool,
+        record_undo: bool = True,
+        canonical_materialized: bool | None = None,
+        full_snapshot_required: bool = False,
+        before_materialize: Callable[[], None] | None = None,
+        before_refresh: Callable[[], None] | None = None,
+        rollback_before_abort_publish: Callable[[], None] | None = None,
+    ) -> None:
+        previous_text_signal_suppress = bool(
+            getattr(self, "_suppress_programmatic_text_change_signals", False)
+        )
+        self._suppress_programmatic_text_change_signals = True
+        try:
+            record_source_undo = (
+                bool(record_undo)
+                and not self._source_load_plan_materializes_initial_conditions(
+                    reconciliation_plan
+                )
+            )
+            self._canonical_initials_transition_owner.execute_source_load_transaction(
+                transition_source=str(transition_source or "authoritative_source_load"),
+                schedule_runtime_refresh=bool(schedule_runtime_refresh),
+                draft_apply_result=draft_apply_result,
+                commit_source=lambda: self._set_authoritative_mechanism_editor_source(
+                    source,
+                    description=str(description),
+                    record_undo=record_source_undo,
+                ),
+                materialize_initials=lambda: self._apply_authoritative_source_load_reconciliation_after_source_acceptance(
+                    reconciliation_plan
+                ),
+                refresh_after_commit=self._refresh_after_authoritative_source_load,
+                canonical_materialized=canonical_materialized,
+                full_snapshot_required=bool(full_snapshot_required),
+                before_materialize=before_materialize,
+                before_refresh=before_refresh,
+                rollback_before_abort_publish=rollback_before_abort_publish,
+            )
+        finally:
+            self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
+
+    def _prepare_authoritative_source_load_reconciliation(
+        self,
+        source,
+        *,
+        prompt_overwrite: bool,
+        destination_store=None,
+    ):
+        reconciliation_plan = self._initial_conditions_source_acceptance_owner.prepare_for_authoritative_apply(
+            source,
+            prompt_overwrite=bool(prompt_overwrite),
+            destination_store=destination_store,
+        )
+        if reconciliation_plan is None:
+            return None, None
+        return reconciliation_plan.source, reconciliation_plan
+
+    def _apply_authoritative_source_load_reconciliation_after_source_acceptance(
+        self,
+        reconciliation_plan,
+    ):
+        if reconciliation_plan is None:
+            return None
+        return self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
+            reconciliation_plan,
+            notify_canonical_rows_changed=False,
+        )
 
     def _current_mechanism_species_roster_for_colors(self) -> tuple[str, ...] | None:
         """Best-effort current mechanism species roster for color canonicalization."""
@@ -2450,6 +2686,9 @@ class MainWindow(
         self._apply_solver_runtime_state(solver=str(v))
         if not self._suppress_preference_updates:
             self.config_controller.update_user_preference("solver", self._initial_solver)
+        self._refresh_simulation_runtime_after_inputs_changed(
+            batch_runtime_pool_inputs_changed=False
+        )
 
     def _update_solver_summary_label(self) -> None:
         """Refresh the solver summary label shown in the Solver section."""
@@ -2490,6 +2729,9 @@ class MainWindow(
     def _on_num_points_user_edit(self, value: int) -> None:
         if not self._suppress_preference_updates:
             self.config_controller.update_user_preference("num_points", value)
+        self._refresh_simulation_runtime_after_inputs_changed(
+            batch_runtime_pool_inputs_changed=False
+        )
 
     def _on_sim_time_user_edit(self, text: str) -> None:
         if not self._suppress_preference_updates:
@@ -2497,6 +2739,13 @@ class MainWindow(
             stripped = str(text).strip()
             if stripped:
                 self.config_controller.update_user_preference("simulation_time", stripped)
+        try:
+            self._parse_sim_time_seconds()
+        except Exception:
+            return
+        self._refresh_simulation_runtime_after_inputs_changed(
+            batch_runtime_pool_inputs_changed=False
+        )
 
     def _compute_temperature_indicator_state(
         self,
@@ -2507,7 +2756,7 @@ class MainWindow(
         normalized_state_network_text = str(state_network_text or "")
         energy_mode_active = bool(normalized_state_network_text.strip())
 
-        t_override_k = self._dsl_global_temperature_K(mechanism_text)
+        t_override_k = self._variable_runtime.dsl_global_temperature_k(mechanism_text)
 
         temp_schedule = None
         schedule_defined = False
@@ -2740,37 +2989,26 @@ class MainWindow(
             from kindred.io.resources import get_preset_mechanism_source
 
             source = get_preset_mechanism_source(preset_id)
-            if not self._resolve_reactions_draft_before_authoritative_change(
-                f"Loading preset {preset_id}",
-                continue_label="Load",
-            ).may_continue:
-                self._status_label.setText("Canceled preset load")
-                return
-            if not self._guard_slider_transaction_invalidation(action_text=f"Loading preset {preset_id}"):
-                self._status_label.setText("Canceled preset load")
-                return
-            reconciled = self._initial_conditions_source_acceptance_owner.accept_importable_source(
-                source,
+            request = self._prepare_authoritative_source_load_request(
+                source=source,
+                action_label=f"Loading preset {preset_id}",
+                guard_action_text=f"Loading preset {preset_id}",
                 prompt_overwrite=True,
+                transition_source="preset_load",
+                schedule_runtime_refresh=True,
+                canceled_status_text="Canceled preset load",
             )
-            if reconciled is None:
-                self._status_label.setText("Canceled preset load")
+            if request is None:
                 return
-            source = reconciled
-            previous_text_signal_suppress = bool(
-                getattr(self, "_suppress_programmatic_text_change_signals", False)
+            source, reconciliation_plan, draft_apply_result = request
+            self._execute_authoritative_source_load(
+                source=source,
+                reconciliation_plan=reconciliation_plan,
+                draft_apply_result=draft_apply_result,
+                description=f"Load preset {preset_id}",
+                transition_source="preset_load",
+                schedule_runtime_refresh=True,
             )
-            self._suppress_programmatic_text_change_signals = True
-            try:
-                self._set_authoritative_mechanism_editor_source(
-                    source,
-                    description=f"Load preset {preset_id}",
-                    apply_transition=False,
-                    transition_source="preset_load",
-                )
-                self._on_programmatic_mechanism_load()
-            finally:
-                self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
             self._status_label.setText(f"Loaded preset mechanism: {preset_id}")
             logger.info(f"Loaded preset mechanism: {preset_id}")
 
@@ -2788,37 +3026,26 @@ class MainWindow(
             from kindred.io.resources import get_intervention_example_source
 
             source = get_intervention_example_source(example_id)
-            if not self._resolve_reactions_draft_before_authoritative_change(
-                f"Loading intervention example {example_id}",
-                continue_label="Load",
-            ).may_continue:
-                self._status_label.setText("Canceled intervention example load")
-                return
-            if not self._guard_slider_transaction_invalidation(action_text=f"Loading intervention example {example_id}"):
-                self._status_label.setText("Canceled intervention example load")
-                return
-            reconciled = self._initial_conditions_source_acceptance_owner.accept_importable_source(
-                source,
+            request = self._prepare_authoritative_source_load_request(
+                source=source,
+                action_label=f"Loading intervention example {example_id}",
+                guard_action_text=f"Loading intervention example {example_id}",
                 prompt_overwrite=True,
+                transition_source="intervention_example_load",
+                schedule_runtime_refresh=True,
+                canceled_status_text="Canceled intervention example load",
             )
-            if reconciled is None:
-                self._status_label.setText("Canceled intervention example load")
+            if request is None:
                 return
-            source = reconciled
-            previous_text_signal_suppress = bool(
-                getattr(self, "_suppress_programmatic_text_change_signals", False)
+            source, reconciliation_plan, draft_apply_result = request
+            self._execute_authoritative_source_load(
+                source=source,
+                reconciliation_plan=reconciliation_plan,
+                draft_apply_result=draft_apply_result,
+                description=f"Load intervention example {example_id}",
+                transition_source="intervention_example_load",
+                schedule_runtime_refresh=True,
             )
-            self._suppress_programmatic_text_change_signals = True
-            try:
-                self._set_authoritative_mechanism_editor_source(
-                    source,
-                    description=f"Load intervention example {example_id}",
-                    apply_transition=False,
-                    transition_source="intervention_example_load",
-                )
-                self._on_programmatic_mechanism_load()
-            finally:
-                self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
             self._status_label.setText(f"Loaded intervention example: {example_id}")
             logger.info("Loaded intervention example: %s", example_id)
 
@@ -2868,41 +3095,28 @@ class MainWindow(
         """Load template from template manager."""
         from kindred.core.mechanism_source import MechanismAuthoringSource
 
-        if not self._resolve_reactions_draft_before_authoritative_change(
-            "Loading this template",
-            continue_label="Load",
-        ).may_continue:
-            self._status_label.setText("Canceled template load")
-            return
-        if not self._guard_slider_transaction_invalidation(action_text="Loading this template"):
-            self._status_label.setText("Canceled template load")
-            return
-
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("Template load requires a complete mechanism source.")
-
-        previous_text_signal_suppress = bool(
-            getattr(self, "_suppress_programmatic_text_change_signals", False)
+        request = self._prepare_authoritative_source_load_request(
+            source=source,
+            action_label="Loading this template",
+            guard_action_text="Loading this template",
+            prompt_overwrite=True,
+            transition_source="template_load",
+            schedule_runtime_refresh=True,
+            canceled_status_text="Canceled template load",
         )
-        self._suppress_programmatic_text_change_signals = True
-        try:
-            reconciled = self._initial_conditions_source_acceptance_owner.accept_importable_source(
-                source,
-                prompt_overwrite=True,
-            )
-            if reconciled is None:
-                self._status_label.setText("Canceled template load")
-                return
-            source = reconciled
-            self._set_authoritative_mechanism_editor_source(
-                source,
-                description="Load template",
-                apply_transition=False,
-                transition_source="template_load",
-            )
-            self._on_programmatic_mechanism_load()
-        finally:
-            self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
+        if request is None:
+            return
+        source, reconciliation_plan, draft_apply_result = request
+        self._execute_authoritative_source_load(
+            source=source,
+            reconciliation_plan=reconciliation_plan,
+            draft_apply_result=draft_apply_result,
+            description="Load template",
+            transition_source="template_load",
+            schedule_runtime_refresh=True,
+        )
 
         self._status_label.setText("Loaded template from Template Manager")
         logger.info("Loaded template from Template Manager")
@@ -3363,9 +3577,8 @@ class MainWindow(
         """
         # Try high-level undo stack first
         if self._undo_stack.canUndo():
-            resolution = self._resolve_reactions_draft_before_authoritative_change(
+            resolution = self._reactions_draft_resolution_owner.resolve_for_stale_command(
                 "Undoing an authoritative mechanism change",
-                continue_label="Continue",
                 apply_label="Apply Draft; Do Not Undo",
                 discard_label="Discard Draft and Undo",
                 informative_text=(
@@ -3404,9 +3617,8 @@ class MainWindow(
         """
         # Try high-level undo stack first
         if self._undo_stack.canRedo():
-            resolution = self._resolve_reactions_draft_before_authoritative_change(
+            resolution = self._reactions_draft_resolution_owner.resolve_for_stale_command(
                 "Redoing an authoritative mechanism change",
-                continue_label="Continue",
                 apply_label="Apply Draft; Do Not Redo",
                 discard_label="Discard Draft and Redo",
                 informative_text=(
@@ -3938,7 +4150,14 @@ class MainWindow(
                 widget.blockSignals(False)
             widget.document().contentsChanged.emit()
 
-    def _apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
+    def _apply_project_payload(
+        self,
+        data: Dict[str, Any],
+        *,
+        record_undo: bool = True,
+        draft_apply_result: ReactionsDraftApplyResult | None = None,
+        validated_source: MechanismAuthoringSource | None = None,
+    ) -> None:
         """Populate the UI from serialized project data."""
         self._suppress_preference_updates = True
         simulation_runtime_settings_changed = False
@@ -3946,16 +4165,28 @@ class MainWindow(
         self._authoritative_mechanism_runtime_refresh_defer_depth = (
             int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) + 1
         )
+        self._simulation_runtime_input_refresh_defer_depth = (
+            int(getattr(self, "_simulation_runtime_input_refresh_defer_depth", 0) or 0) + 1
+        )
         try:
             with self._fitting_runtime_input_publisher.transaction(reason="project apply"):
                 (
                     simulation_runtime_settings_changed,
                     batch_runtime_pool_settings_changed,
-                ) = self._apply_project_payload_inner(data, record_undo=record_undo)
+                ) = self._apply_project_payload_inner(
+                    data,
+                    record_undo=record_undo,
+                    draft_apply_result=draft_apply_result,
+                    validated_source=validated_source,
+                )
         finally:
             self._authoritative_mechanism_runtime_refresh_defer_depth = max(
                 0,
                 int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) - 1,
+            )
+            self._simulation_runtime_input_refresh_defer_depth = max(
+                0,
+                int(getattr(self, "_simulation_runtime_input_refresh_defer_depth", 0) or 0) - 1,
             )
             self._suppress_preference_updates = False
         pending_mechanism_runtime_refresh = (
@@ -3971,9 +4202,12 @@ class MainWindow(
         data: Dict[str, Any],
         *,
         record_undo: bool = True,
+        draft_apply_result: ReactionsDraftApplyResult | None = None,
+        validated_source: MechanismAuthoringSource | None = None,
     ) -> tuple[bool, bool]:
         from kindred.core.batch_initial_conditions import (
             BatchInitialConditionsStore,
+            batch_initial_conditions_store_is_true_placeholder,
         )
         from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableModel
 
@@ -3981,55 +4215,121 @@ class MainWindow(
         previous_batch_runtime_pool_settings = (
             self._simulation_batch_runtime_pool_settings_snapshot()
         )
-        source = validate_project_payload(data)
-        batch_payload = data.get("batch_initial_conditions")
+        source = (
+            validated_source
+            if validated_source is not None
+            else validate_project_payload(data)
+        )
         try:
-            batch_store = (
-                BatchInitialConditionsStore.from_serializable(dict(batch_payload))
-                if batch_payload is not None
-                else BatchInitialConditionsStore()
+            batch_payload = data.get("batch_initial_conditions")
+            try:
+                batch_store = (
+                    BatchInitialConditionsStore.from_serializable(dict(batch_payload))
+                    if batch_payload is not None
+                    else BatchInitialConditionsStore()
+                )
+            except Exception as exc:
+                raise ValueError("project payload field 'batch_initial_conditions' is invalid.") from exc
+
+            notes_text = data.get('notes', "")
+
+            batch_model = BatchInitialConditionsTableModel(batch_store, parent=self)
+            batch_payload_materialized = (
+                batch_payload is not None
+                and not batch_initial_conditions_store_is_true_placeholder(batch_store)
             )
-        except Exception as exc:
-            raise ValueError("project payload field 'batch_initial_conditions' is invalid.") from exc
+            source_acceptance_result = None
+            reconciliation_plan = None
+            if (
+                batch_payload is not None
+                and not batch_initial_conditions_store_is_true_placeholder(batch_store)
+            ):
+                source_acceptance_result = self._initial_conditions_source_acceptance_owner.accept_project_source_after_batch_load(
+                    source,
+                    batch_store=batch_store,
+                    batch_payload_present=True,
+                )
+                if source_acceptance_result is not None:
+                    source = source_acceptance_result.source
+            else:
+                source, reconciliation_plan = self._prepare_authoritative_source_load_reconciliation(
+                    source,
+                    prompt_overwrite=False,
+                    destination_store=batch_store,
+                )
+                if reconciliation_plan is None:
+                    raise ValueError("project mechanism source Initial Conditions could not be reconciled.")
+        except Exception:
+            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
+                transition_source="project_load",
+                schedule_runtime_refresh=False,
+                draft_apply_result=draft_apply_result,
+            )
+            raise
 
-        notes_text = data.get('notes', "")
+        def _prepare_project_source_load_ui() -> None:
+            self._reset_project_apply_dirty_session_state()
+            self._clear_last_mechanism()
+            self._batch_store = batch_store
+            self._batch_model = batch_model
+            if self._batch_table is not None:
+                self._batch_table.setModel(self._batch_model)
+                self._rebind_batch_semantics_signal_bindings()
+            self._rebind_species_panel_after_batch_model_replacement()
+            self._update_batch_row_controls_state()
+            self._on_batch_current_changed()
+            self._set_plain_text_widget_with_optional_undo(
+                self._mechanism_editor._notes_text,
+                notes_text,
+                "Load project (notes)",
+                record_undo,
+            )
 
-        self._reset_project_apply_dirty_session_state()
-        self._clear_last_mechanism()
+        previous_source = self.canonical_mechanism_source()
+        previous_batch_store = self._batch_store
+        previous_batch_model = self._batch_model
+        previous_notes_text = self._mechanism_editor._notes_text.toPlainText()
+        previous_last_mechanism = self._mechanism_helpers.last_mechanism()
+        previous_last_context = self._mechanism_helpers.last_mechanism_context()
 
-        self._batch_store = batch_store
-        self._batch_model = BatchInitialConditionsTableModel(self._batch_store, parent=self)
-        if self._batch_table is not None:
-            self._batch_table.setModel(self._batch_model)
-            self._rebind_batch_semantics_signal_bindings()
-        reconciled = self._initial_conditions_source_acceptance_owner.accept_project_source_after_batch_load(
-            source,
-            batch_store=self._batch_store,
-            batch_payload_present=batch_payload is not None,
-        )
-        if reconciled is not None:
-            source = reconciled
+        def _restore_project_source_load_ui_after_failure() -> None:
+            self._write_complete_authoritative_mechanism_source_to_editor(previous_source)
+            self._batch_store = previous_batch_store
+            self._batch_model = previous_batch_model
+            if self._batch_table is not None:
+                self._batch_table.setModel(self._batch_model)
+                self._rebind_batch_semantics_signal_bindings()
+            self._rebind_species_panel_after_batch_model_replacement()
+            self._update_batch_row_controls_state()
+            self._on_batch_current_changed()
+            self._set_plain_text_widget_with_optional_undo(
+                self._mechanism_editor._notes_text,
+                previous_notes_text,
+                "Restore project notes after failed load",
+                False,
+            )
+            if previous_last_mechanism is None:
+                self._clear_last_mechanism()
+            else:
+                self._mechanism_helpers.remember_last_mechanism(
+                    previous_last_mechanism,
+                    str(previous_last_context.get("dsl_text") or ""),
+                    dict(previous_last_context.get("solver_config") or {}),
+                )
 
-        self._set_authoritative_mechanism_editor_source(
-            source,
+        self._execute_authoritative_source_load(
+            source=source,
+            reconciliation_plan=reconciliation_plan,
+            draft_apply_result=draft_apply_result,
             description="Load project mechanism source",
-            apply_transition=False,
             transition_source="project_load",
+            schedule_runtime_refresh=False,
             record_undo=record_undo,
+            canonical_materialized=True if batch_payload_materialized else None,
+            full_snapshot_required=True,
+            before_materialize=_prepare_project_source_load_ui,
+            rollback_before_abort_publish=_restore_project_source_load_ui_after_failure,
         )
-
-        self._rebind_species_panel_after_batch_model_replacement()
-        self._update_batch_row_controls_state()
-        self._on_batch_current_changed()
-
-        self._set_plain_text_widget_with_optional_undo(
-            self._mechanism_editor._notes_text,
-            notes_text,
-            "Load project (notes)",
-            record_undo,
-        )
-
-        self._on_programmatic_mechanism_load(schedule_runtime_refresh=False)
 
         _pref = self.config_controller.get_user_preference
         solver_value = data.get('solver', _pref('solver'))
@@ -4096,15 +4396,31 @@ class MainWindow(
 
     def apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> bool:
         """Public project apply API for controllers (avoid reaching into `_` helpers)."""
-        validate_project_payload(data)
-        if not self._resolve_reactions_draft_before_authoritative_change(
+        source = validate_project_payload(data)
+        draft_resolution = self._reactions_draft_resolution_owner.resolve_for_authoritative_source_load(
             "Loading this project",
             continue_label="Load",
-        ).may_continue:
+        )
+        if not draft_resolution.may_continue:
+            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
+                transition_source="project_load",
+                schedule_runtime_refresh=False,
+                draft_apply_result=getattr(draft_resolution, "apply_result", None),
+            )
             return False
         if not self._guard_slider_transaction_invalidation(action_text="Loading this project"):
+            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
+                transition_source="project_load",
+                schedule_runtime_refresh=False,
+                draft_apply_result=getattr(draft_resolution, "apply_result", None),
+            )
             return False
-        self._apply_project_payload(data, record_undo=record_undo)
+        self._apply_project_payload(
+            data,
+            record_undo=record_undo,
+            draft_apply_result=getattr(draft_resolution, "apply_result", None),
+            validated_source=source,
+        )
         return True
 
     def apply_solver_runtime_state(
@@ -4118,6 +4434,9 @@ class MainWindow(
             solver=solver,
             rtol=rtol,
             atol=atol,
+        )
+        self._refresh_simulation_runtime_after_inputs_changed(
+            batch_runtime_pool_inputs_changed=False
         )
 
     def add_to_recent_files(self, filepath: str) -> None:
@@ -4170,6 +4489,13 @@ class MainWindow(
             raise RuntimeError("Mechanism session owner is unavailable.")
         return owner.canonical_source
 
+    def _reactions_draft_apply_error_text(self) -> str:
+        editor = getattr(self, "_mechanism_editor", None)
+        label = getattr(editor, "_validation_label", None)
+        if label is not None and hasattr(label, "text"):
+            return str(label.text() or "")
+        return ""
+
     def rewrite_authoritative_mechanism_source(
         self,
         *,
@@ -4177,31 +4503,18 @@ class MainWindow(
         description: str,
         build_source: Callable[[object], object | None],
         record_undo: bool = True,
-        apply_transition: bool = True,
         transition_source: str = "authoritative_editor_rewrite",
-    ) -> bool:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        if not callable(build_source):
-            raise TypeError("build_source must be callable.")
-        resolution = self._resolve_reactions_draft_before_authoritative_change(
-            str(action_label or description or "Changing the mechanism source"),
-            continue_label="Continue",
-        )
-        if not resolution.may_continue:
-            return False
-        base_source = self.canonical_mechanism_source()
-        new_source = build_source(base_source)
-        if new_source is None:
-            return False
-        if not isinstance(new_source, MechanismAuthoringSource):
-            raise TypeError("build_source must return a MechanismAuthoringSource.")
-        return self._set_authoritative_mechanism_editor_source(
-            new_source,
+        before_publish: Callable[[], None] | None = None,
+        discard_dirty_preview: bool = True,
+    ) -> AuthoritativeRewriteOutcome:
+        return self._authoritative_rewrite_owner.rewrite_mechanism_source(
+            action_label=str(action_label or description or "Changing the mechanism source"),
             description=str(description or action_label or "Rewrite mechanism source"),
-            apply_transition=bool(apply_transition),
-            transition_source=str(transition_source or "authoritative_editor_rewrite"),
+            build_source=build_source,
             record_undo=bool(record_undo),
+            transition_source=str(transition_source or "authoritative_editor_rewrite"),
+            before_publish=before_publish,
+            discard_dirty_preview=bool(discard_dirty_preview),
         )
 
     def rewrite_authoritative_reactions_text(
@@ -4211,25 +4524,18 @@ class MainWindow(
         description: str,
         rewrite_text: Callable[[str], str | None],
         record_undo: bool = True,
-        apply_transition: bool = True,
         transition_source: str = "authoritative_reactions_rewrite",
-    ) -> bool:
-        if not callable(rewrite_text):
-            raise TypeError("rewrite_text must be callable.")
-
-        def _build_source(source):
-            next_reactions = rewrite_text(str(source.reactions_text))
-            if next_reactions is None:
-                return None
-            return source.with_reactions_text(str(next_reactions))
-
-        return self.rewrite_authoritative_mechanism_source(
+        before_publish: Callable[[], None] | None = None,
+        discard_dirty_preview: bool = True,
+    ) -> AuthoritativeRewriteOutcome:
+        return self._authoritative_rewrite_owner.rewrite_reactions_text(
             action_label=str(action_label or description or "Changing Reactions"),
             description=str(description or action_label or "Rewrite Reactions"),
-            build_source=_build_source,
+            rewrite_text=rewrite_text,
             record_undo=bool(record_undo),
-            apply_transition=bool(apply_transition),
             transition_source=str(transition_source or "authoritative_reactions_rewrite"),
+            before_publish=before_publish,
+            discard_dirty_preview=bool(discard_dirty_preview),
         )
 
     def set_variable_sliders(
@@ -4259,12 +4565,11 @@ class MainWindow(
     def parse_sim_time_seconds(self) -> float:
         return self._simulation_solver_owner.parse_sim_time_seconds()
 
-    def _apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> None:
-        self.rewrite_authoritative_reactions_text(
+    def _apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> AuthoritativeRewriteOutcome:
+        return self.rewrite_authoritative_reactions_text(
             action_label="Resolving Wegscheider cyclicity",
             description="Resolve Wegscheider cyclicity",
             rewrite_text=lambda _current: str(reactions_text),
-            apply_transition=True,
             transition_source="wegscheider_resolution",
         )
 
@@ -4438,11 +4743,17 @@ class MainWindow(
     def set_variable_metadata(self, metadata: Dict[str, Dict[str, object]] | None) -> None:
         self._variable_runtime.set_variable_metadata(metadata)
 
-    def _mutable_variable_metadata(self) -> Dict[str, Dict[str, object]]:
-        return self._variable_runtime.mutable_variable_metadata()
-
     def update_temperature_mode_indicator(self) -> None:
         self._update_temperature_mode_indicator()
+
+    def sync_mechanism_controls_to_focused_batch_set(
+        self,
+        *,
+        use_workspace: bool = True,
+    ) -> None:
+        self._sync_mechanism_controls_to_focused_batch_set(
+            use_workspace=bool(use_workspace),
+        )
 
     def populate_energy_mode_variables_from_mechanism(
         self,
@@ -4689,7 +5000,9 @@ class MainWindow(
             if callable(inspector):
                 intersects = bool(inspector(tuple(preview_removed)))
             if intersects:
-                self._sim_controller.invalidate_slider_preview_work()
+                self._sim_controller.invalidate_slider_preview_work(
+                    target_set_ids=tuple(preview_removed),
+                )
         except RuntimeError as exc:
             logger.debug("Failed to invalidate stale slider preview targets: %s", exc, exc_info=True)
 
@@ -5071,10 +5384,10 @@ class MainWindow(
         )
         if callable(refresh_runtime_readiness):
             if rows is None:
-                refresh_runtime_readiness(rows=None, fast_mode=True)
+                refresh_runtime_readiness(rows=None, fast_mode=False)
             else:
                 normalized_rows = tuple(int(row) for row in rows or ())
-                refresh_runtime_readiness(rows=normalized_rows, fast_mode=True)
+                refresh_runtime_readiness(rows=normalized_rows, fast_mode=False)
 
     def _queue_interactive_runtime_readiness_refresh(self, rows: Sequence[int]) -> None:
         normalized = tuple(dict.fromkeys(int(row) for row in (rows or ())))
@@ -5101,72 +5414,10 @@ class MainWindow(
         self._interactive_runtime_readiness_refresh_queued = False
         self._refresh_interactive_runtime_readiness_for_rows(rows)
 
-    def _queue_canonical_batch_initials_transition(
-        self,
-        *,
-        affected_set_ids: Sequence[str],
-        transition_source: str,
-        discard_dirty_preview: bool,
-        debounce_ms: int = _CANONICAL_BATCH_INITIALS_TRANSITION_DEBOUNCE_MS,
-    ) -> None:
-        normalized = tuple(
-            dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id))
-        )
-        if not normalized:
-            return
-        pending = list(getattr(self, "_pending_canonical_batch_initials_transition_set_ids", ()) or ())
-        for set_id in normalized:
-            if set_id not in pending:
-                pending.append(set_id)
-        self._pending_canonical_batch_initials_transition_set_ids = tuple(pending)
-        self._pending_canonical_batch_initials_transition_source = str(
-            transition_source or "batch_initials_table_edit"
-        )
-        self._pending_canonical_batch_initials_discard_dirty_preview = bool(discard_dirty_preview)
-        self._canonical_batch_initials_transition_queued = True
-        if QtCore.QCoreApplication.instance() is None:
-            self._flush_canonical_batch_initials_transition()
-            return
-        timer = getattr(self, "_canonical_batch_initials_transition_timer", None)
-        delay_ms = max(0, int(debounce_ms))
-        if isinstance(timer, QtCore.QTimer):
-            timer.start(delay_ms)
-        else:
-            QtCore.QTimer.singleShot(
-                delay_ms,
-                self._flush_canonical_batch_initials_transition,
-            )
-
-    def _flush_canonical_batch_initials_transition(self) -> None:
-        timer = getattr(self, "_canonical_batch_initials_transition_timer", None)
-        if isinstance(timer, QtCore.QTimer) and timer.isActive():
-            timer.stop()
-        affected_set_ids = tuple(
-            getattr(self, "_pending_canonical_batch_initials_transition_set_ids", ()) or ()
-        )
-        transition_source = str(
-            getattr(
-                self,
-                "_pending_canonical_batch_initials_transition_source",
-                "batch_initials_table_edit",
-            )
-            or "batch_initials_table_edit"
-        )
-        discard_dirty_preview = bool(
-            getattr(self, "_pending_canonical_batch_initials_discard_dirty_preview", True)
-        )
-        self._pending_canonical_batch_initials_transition_set_ids = ()
-        self._canonical_batch_initials_transition_queued = False
-        if not affected_set_ids:
-            return
-        self._apply_canonical_batch_initials_transition(
-            affected_set_ids=affected_set_ids,
-            transition_source=transition_source,
-            discard_dirty_preview=discard_dirty_preview,
-        )
-
     def _run_simulation_after_committing_batch_initials(self) -> None:
         self._commit_active_batch_table_editor()
+        if not self._guard_slider_transaction_invalidation(action_text="Running simulation"):
+            return
         self._sim_controller.run_simulation()
 
     def _refresh_run_target_ui_from_batch_scope(self) -> None:
@@ -5261,19 +5512,27 @@ class MainWindow(
         species_sync_snapshot = self._simulation_batch_owner.batch_species_column_sync_snapshot()
 
         self._batch_model.set_species(new_species)
-        prune_changed = False
+        pruned_overlay_set_ids: tuple[str, ...] = ()
         try:
             if hasattr(self._preview_session, "prune_staged_concentration_overlays_to_species"):
-                prune_changed = bool(self._preview_session.prune_staged_concentration_overlays_to_species(new_species))
+                prune_result = self._preview_session.prune_staged_concentration_overlays_to_species(new_species)
+                if isinstance(prune_result, bool):
+                    pruned_overlay_set_ids = () if not prune_result else self._effective_slider_edit_target_set_ids()
+                else:
+                    pruned_overlay_set_ids = tuple(
+                        dict.fromkeys(str(set_id) for set_id in (prune_result or ()) if str(set_id))
+                    )
         except RuntimeError as exc:
             logger.debug("Failed to prune staged concentration overlays after batch species sync: %s", exc, exc_info=True)
-        if prune_changed:
+        if pruned_overlay_set_ids:
             try:
                 self._preview_session.stop_species_slider_update_timer()
             except RuntimeError as exc:
                 logger.debug("Failed to stop species slider timer after pruning overlays: %s", exc, exc_info=True)
             try:
-                self._sim_controller.invalidate_slider_preview_work()
+                self._sim_controller.invalidate_slider_preview_work(
+                    target_set_ids=pruned_overlay_set_ids,
+                )
             except RuntimeError as exc:
                 logger.debug("Failed to invalidate stale slider preview work after pruning overlays: %s", exc, exc_info=True)
         self._simulation_batch_owner.reconcile_active_cache_after_species_column_sync(
@@ -5336,11 +5595,10 @@ class MainWindow(
         transition_source: str,
         discard_dirty_preview: bool,
     ) -> None:
-        self._queue_canonical_batch_initials_transition(
+        self._canonical_initials_transition_owner.publish_canonical_initials_transition(
             affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
             transition_source=str(transition_source or "batch_initials_table_edit"),
             discard_dirty_preview=bool(discard_dirty_preview),
-            debounce_ms=0,
         )
 
     def _on_batch_initial_rows_edited(
@@ -5349,7 +5607,7 @@ class MainWindow(
         transition_source: str,
         discard_dirty_preview: bool,
     ) -> None:
-        self._queue_canonical_batch_initials_transition(
+        self._canonical_initials_transition_owner.queue(
             affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
             transition_source=str(transition_source or "batch_initials_table_edit"),
             discard_dirty_preview=bool(discard_dirty_preview),
@@ -5904,7 +6162,7 @@ class MainWindow(
         if generated_block_start_line is None:
             return base_text
 
-        T_override = self._dsl_global_temperature_K(base_text)
+        T_override = self._variable_runtime.dsl_global_temperature_k(base_text)
         try:
             T = float(T_override) if T_override is not None else float(getattr(self, "_temperature_spinbox").value())
         except Exception:
@@ -6210,7 +6468,6 @@ class MainWindow(
                 float(value),
             ),
             record_undo=True,
-            apply_transition=True,
             transition_source="scalar_param_rewrite",
         )
 
@@ -6258,11 +6515,13 @@ class MainWindow(
                 derived = {}
             for name, val in derived.items():
                 sliders.update_variable_readout(name, float(val))
-                meta_map = self._mutable_variable_metadata()
-                meta = dict(meta_map.get(name) or {})
-                meta["editable"] = False
-                meta["derived"] = True
-                meta_map[name] = meta
+                meta = self._variable_runtime.update_variable_metadata_entry(
+                    name,
+                    {
+                        "editable": False,
+                        "derived": True,
+                    },
+                )
                 sliders.update_metadata(name, meta)
 
         # Refresh snapshot after any derived updates.
@@ -6282,11 +6541,13 @@ class MainWindow(
                 for update in authority_readout_updates_from_step_entry(entry, current):
                     current[update.name] = float(update.value)
                     sliders.update_variable_readout(update.name, float(update.value))
-                    meta_map = self._mutable_variable_metadata()
-                    meta = dict(meta_map.get(update.name) or {})
-                    meta["editable"] = bool(update.editable)
-                    meta["derived"] = bool(update.derived)
-                    meta_map[update.name] = meta
+                    meta = self._variable_runtime.update_variable_metadata_entry(
+                        update.name,
+                        {
+                            "editable": bool(update.editable),
+                            "derived": bool(update.derived),
+                        },
+                    )
                     sliders.update_metadata(update.name, meta)
 
     def _energy_mode_energy_unit_from_metadata(self) -> str:
@@ -6300,7 +6561,7 @@ class MainWindow(
         return self.canonical_mechanism_source().full_dsl
 
     def _energy_mode_temperature_K(self, full_dsl: str) -> float | None:
-        T_override = self._dsl_global_temperature_K(full_dsl)
+        T_override = self._variable_runtime.dsl_global_temperature_k(full_dsl)
         try:
             T = float(T_override) if T_override is not None else float(self._temperature_spinbox.value())
         except Exception:
@@ -6565,16 +6826,6 @@ class MainWindow(
         self._preview_session.on_variable_changed(name, value)
         self._refresh_slider_transaction_button_state()
 
-    def _commit_slider_value(self, name: str, value: float) -> None:
-        if not self._materialize_direct_slider_commit_to_authoritative_editors(name, value):
-            return
-        self._preview_session.commit_slider_value(name, value)
-        self._sim_controller.invalidate_slider_preview_work()
-        self._preview_session.stop_variable_update_timer()
-        self._preview_session.stop_slider_release_commit_timer()
-        self._preview_session.commit_current_mechanism_workspace(invalidate_preview_work=False)
-        self._sync_after_authoritative_slider_materialization()
-
     def _on_slider_drag_started(self, name: str) -> None:
         self._preview_session.on_slider_drag_started(name)
 
@@ -6599,8 +6850,6 @@ class MainWindow(
         model = getattr(self, "_batch_model", None)
         if model is None:
             return ()
-        previous_suppress = bool(getattr(self, "_suppress_canonical_batch_initials_transition", False))
-        self._suppress_canonical_batch_initials_transition = True
         try:
             result = self._preview_session.apply_staged_concentration_overlays(model)
             return tuple(str(set_id) for set_id in getattr(result, "touched_set_ids", ()) if str(set_id))
@@ -6610,9 +6859,7 @@ class MainWindow(
                 message="Failed to apply staged species-mode concentration overlays",
                 exc=exc,
             )
-        finally:
-            self._suppress_canonical_batch_initials_transition = previous_suppress
-        return ()
+            raise
 
     def _materialized_mechanism_editor_source_for_runtime_parameter_values(
         self,
@@ -6679,8 +6926,6 @@ class MainWindow(
         source,
         *,
         description: str,
-        apply_transition: bool = True,
-        transition_source: str = "authoritative_editor_rewrite",
         record_undo: bool = True,
     ) -> bool:
         from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -6688,15 +6933,6 @@ class MainWindow(
 
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be a MechanismAuthoringSource.")
-        if self._reactions_draft_dirty():
-            resolution = self._resolve_reactions_draft_before_authoritative_change(
-                str(description or "Changing the mechanism source"),
-                continue_label="Continue",
-            )
-            if not resolution.may_continue:
-                return False
-            if resolution.status == "applied":
-                return False
         transition_required = False
         previous_authoritative_suppress = bool(
             getattr(self, "_suppress_authoritative_mechanism_input_change", False)
@@ -6744,10 +6980,6 @@ class MainWindow(
             transition_required = True
         finally:
             self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-        if bool(apply_transition) and bool(transition_required):
-            self._apply_authoritative_mechanism_transition(
-                transition_source=str(transition_source or "authoritative_editor_rewrite")
-            )
         return bool(transition_required)
 
     def _write_complete_authoritative_mechanism_source_to_editor(self, source) -> bool:
@@ -6808,79 +7040,40 @@ class MainWindow(
             transition_source="mechanism_source_undo_redo",
         )
 
-    def _materialize_direct_slider_commit_to_authoritative_editors(self, name: str, value: float) -> bool:
-        return self._apply_runtime_parameter_values_to_mechanism_editors(
-            description=f"Apply slider {name}",
-            values_provider=lambda: self._direct_slider_commit_values_for_materialization(
-                name,
-                value,
-            ),
-        )
-
-    def _direct_slider_commit_values_for_materialization(self, name: str, value: float) -> Dict[str, float]:
-        focused_set_id = str(self._preview_session.focused_mechanism_workspace_set_id() or "")
-        effective_values = (
-            self._preview_session.runtime_parameter_values_for_set(focused_set_id)
-            if focused_set_id
-            else {}
-        )
-        normalized_values = self._runtime_parameter_values_for_materialization(
-            overrides=effective_values or {str(name): float(value)}
-        )
-        if str(name) not in normalized_values:
-            parsed, ok = try_parse_finite_float(value)
-            if ok:
-                normalized_values[str(name)] = float(parsed)
-        return normalized_values
-
-    def _apply_runtime_parameter_values_to_mechanism_editors(
+    def _rewrite_runtime_parameter_values_to_mechanism_editors(
         self,
         values: Optional[Dict[str, float]] = None,
         *,
         description: str = "Apply slider overrides",
         values_provider: Optional[Callable[[], Dict[str, float]]] = None,
-    ) -> bool:
+        before_publish: Callable[[], None] | None = None,
+    ) -> AuthoritativeRewriteOutcome:
         def _values_for_builder() -> Dict[str, float]:
             if callable(values_provider):
                 return dict(values_provider() or {})
             return dict(values or {})
 
-        ok = self.rewrite_authoritative_mechanism_source(
+        outcome = self.rewrite_authoritative_mechanism_source(
             action_label=str(description),
             description=str(description),
             build_source=lambda source: self._materialized_mechanism_editor_source_for_runtime_parameter_values(
                 _values_for_builder(),
                 base_source=source,
             ),
-            apply_transition=False,
             transition_source="slider_materialization",
+            before_publish=before_publish,
         )
-        if not ok:
-            self._status_label.setText("Canceled slider commit")
-            return False
-        return True
+        return outcome
 
-    def _sync_after_authoritative_slider_materialization(
+    def _refresh_after_authoritative_slider_materialization(
         self,
         *,
         affected_canonical_initial_set_ids: Sequence[str] = (),
     ) -> None:
-        affected_set_ids_t = tuple(
-            dict.fromkeys(str(set_id) for set_id in (affected_canonical_initial_set_ids or ()) if str(set_id))
-        )
-        canonical_initials_identity = (
-            self._canonical_batch_initials_identity_for_set_ids(affected_set_ids_t)
-            if affected_set_ids_t
-            else None
-        )
-        self._apply_authoritative_mechanism_transition(
-            transition_source="slider_materialization",
-            canonical_batch_initials_by_set_id=canonical_initials_identity,
-            affected_set_ids=affected_set_ids_t,
-            canonical_batch_initials_scope_is_partial=bool(affected_set_ids_t),
-        )
         try:
-            self._extract_and_populate_variables(preserve_visibility=True)
+            self._variable_runtime.extract_and_populate_variables(
+                preserve_visibility=True,
+            )
         except Exception:
             logger.exception("Failed to refresh sliders after authoritative slider materialization")
         try:
@@ -6891,26 +7084,80 @@ class MainWindow(
             logger.exception("Failed to rebuild species panel after slider materialization")
         self._refresh_slider_transaction_button_state()
 
-    def _finalize_authoritative_slider_materialization(
+    def _commit_runtime_parameters_from_sliders(
         self,
-        effective_values: Dict[str, float],
+        effective_values: Mapping[str, float] | None,
         *,
         description: str,
         apply_species_overlays: bool,
     ) -> None:
-        if not self._apply_runtime_parameter_values_to_mechanism_editors(
-            effective_values,
+        species_overlays_pending = bool(apply_species_overlays) and bool(
+            self._preview_session.has_staged_concentration_overlays()
+        )
+        affected_canonical_initial_set_ids: tuple[str, ...] = ()
+        species_committed = False
+        timers_stopped = False
+
+        def stop_timers_once() -> None:
+            nonlocal timers_stopped
+            if timers_stopped:
+                return
+            self._preview_session.stop_variable_update_timer()
+            self._preview_session.stop_slider_release_commit_timer()
+            timers_stopped = True
+
+        def commit_species_overlays_once() -> tuple[str, ...]:
+            nonlocal affected_canonical_initial_set_ids, species_committed
+            if species_committed or not species_overlays_pending:
+                return affected_canonical_initial_set_ids
+            stop_timers_once()
+            affected_canonical_initial_set_ids = tuple(
+                str(set_id)
+                for set_id in (
+                    self._commit_species_slider_values_to_selected_batch_rows() or ()
+                )
+                if str(set_id)
+            )
+            species_committed = True
+            return affected_canonical_initial_set_ids
+
+        outcome = self._rewrite_runtime_parameter_values_to_mechanism_editors(
+            dict(effective_values or {}),
             description=str(description),
+            before_publish=(
+                commit_species_overlays_once
+                if species_overlays_pending
+                else None
+            ),
+        )
+        if outcome.status is AuthoritativeRewriteStatus.CANCELLED:
+            self._status_label.setText("Canceled slider commit")
+            return
+        if outcome.status is AuthoritativeRewriteStatus.FAILED:
+            self._status_label.setText(str(outcome.error or "Slider commit failed"))
+            return
+
+        has_parameter_write = (
+            outcome.status is AuthoritativeRewriteStatus.REWRITE_APPLIED
+        )
+        has_authoritative_source_write = bool(outcome.source_updated)
+        if species_overlays_pending and not species_committed:
+            commit_species_overlays_once()
+        has_species_write = bool(affected_canonical_initial_set_ids)
+        if (
+            not has_parameter_write
+            and not has_species_write
+            and not has_authoritative_source_write
         ):
             return
-        self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
-        self._preview_session.stop_variable_update_timer()
-        self._preview_session.stop_slider_release_commit_timer()
-        affected_canonical_initial_set_ids: tuple[str, ...] = ()
-        if bool(apply_species_overlays):
-            affected_canonical_initial_set_ids = self._commit_species_slider_values_to_selected_batch_rows()
-        self._preview_session.commit_current_mechanism_workspace(invalidate_preview_work=False)
-        self._sync_after_authoritative_slider_materialization(
+        stop_timers_once()
+        self._sim_controller.discard_slider_preview_work_preserving_runtime_owner(
+            target_set_ids=affected_canonical_initial_set_ids,
+        )
+        self._preview_session.commit_current_mechanism_workspace(
+            invalidate_preview_work=False
+        )
+        self._refresh_after_authoritative_slider_materialization(
             affected_canonical_initial_set_ids=affected_canonical_initial_set_ids,
         )
 
@@ -6954,7 +7201,7 @@ class MainWindow(
                 ):
                     self._refresh_energy_mode_derived_parameter_table()
                 else:
-                    self._update_parameter_table_from_sliders()
+                    self._variable_runtime.update_parameter_table_from_sliders()
 
         if bool(rebuild_species_sliders):
             try:
@@ -6979,7 +7226,7 @@ class MainWindow(
         """
         focused_set_id = self._preview_session.focused_mechanism_workspace_set_id()
         effective_values = self._preview_session.runtime_parameter_values(set_id=focused_set_id)
-        self._finalize_authoritative_slider_materialization(
+        self._commit_runtime_parameters_from_sliders(
             effective_values,
             description="Apply runtime parameters",
             apply_species_overlays=True,
@@ -6990,14 +7237,24 @@ class MainWindow(
         target_set_ids = self._effective_slider_edit_target_set_ids()
         if bool(self._preview_session.has_staged_concentration_overlays()):
             replay_intent = self._preview_session.capture_reset_slider_replay_intent()
-            invalidation_target_set_ids = (
-                list(replay_intent.target_set_ids)
-                if replay_intent is not None and getattr(replay_intent, "target_set_ids", ())
-                else target_set_ids
-            )
+            if replay_intent is not None:
+                target_set_ids = tuple(
+                    str(set_id)
+                    for set_id in getattr(replay_intent, "target_set_ids", ())
+                    if str(set_id)
+                )
             self._discard_pending_slider_edits_for_invalidation(
-                target_set_ids=invalidation_target_set_ids,
+                target_set_ids=target_set_ids,
             )
+            restore_cache_truth = getattr(
+                getattr(self, "_simulation_batch_owner", None),
+                "restore_active_result_cache_truth_for_reset_set_ids",
+                None,
+            )
+            if callable(restore_cache_truth):
+                restore_cache_truth(target_set_ids)
+            self._refresh_batch_display_from_request_scope()
+            return
         else:
             self._sim_controller.discard_slider_preview_work_preserving_runtime_owner(
                 target_set_ids=target_set_ids,
@@ -7009,14 +7266,19 @@ class MainWindow(
                 sliders.end_live_drag()
 
             try:
-                self._extract_and_populate_variables(preserve_visibility=True)
+                self._variable_runtime.extract_and_populate_variables(
+                    preserve_visibility=True,
+                )
             except Exception:
                 logger.exception("Failed to refresh sliders after override reset")
             try:
-                self._update_parameter_table_from_sliders()
+                self._variable_runtime.update_parameter_table_from_sliders()
             except Exception:
                 logger.exception("Failed to update parameter table after override reset")
-                QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
+                QtCore.QTimer.singleShot(
+                    0,
+                    self._variable_runtime.update_parameter_table_from_sliders,
+                )
 
             try:
                 self._sync_cached_focus_to_current_batch_row()
@@ -7029,40 +7291,48 @@ class MainWindow(
             self._refresh_slider_transaction_button_state()
             self._refresh_batch_display_from_request_scope()
             return
-        self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
-        if replay_intent is not None:
-            self._preview_session.submit_slider_replay_intent(replay_intent)
-            self._sim_controller.launch_pending_slider_preview_replay()
-            if self.results_controller.active_display_transaction() is None:
-                self._refresh_batch_display_from_request_scope()
-        else:
-            self._refresh_batch_display_from_request_scope()
 
     def _discard_pending_slider_edits_for_invalidation(
         self,
         *,
         target_set_ids: Sequence[str] | None = None,
+        discard_species_preview: bool = True,
     ) -> bool:
         """Discard staged slider edits and leave the visible display recoverable."""
+        scoped_reset = target_set_ids is not None
         targets = target_set_ids or self._effective_slider_edit_target_set_ids()
         self._sim_controller.invalidate_slider_preview_work(
             target_set_ids=targets,
         )
-        self._preview_session.clear_working_transaction(invalidate_preview_work=False)
+        if scoped_reset:
+            if bool(discard_species_preview):
+                self._preview_session.clear_working_transaction_for_set_ids(
+                    targets,
+                    invalidate_preview_work=False,
+                )
+            else:
+                self._preview_session.reset_mechanism_workspaces(targets)
+        else:
+            self._preview_session.clear_working_transaction(invalidate_preview_work=False)
 
         sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
         if sliders is not None and hasattr(sliders, "end_live_drag"):
             sliders.end_live_drag()
 
         try:
-            self._extract_and_populate_variables(preserve_visibility=True)
+            self._variable_runtime.extract_and_populate_variables(
+                preserve_visibility=True,
+            )
         except Exception:
             logger.exception("Failed to refresh sliders after override reset")
         try:
-            self._update_parameter_table_from_sliders()
+            self._variable_runtime.update_parameter_table_from_sliders()
         except Exception:
             logger.exception("Failed to update parameter table after override reset")
-            QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
+            QtCore.QTimer.singleShot(
+                0,
+                self._variable_runtime.update_parameter_table_from_sliders,
+            )
 
         try:
             self._sync_cached_focus_to_current_batch_row()
@@ -7153,7 +7423,7 @@ class MainWindow(
         if changed:
             self.results_controller.clear_display_if_workspace_previews_were_displayed(
                 target_set_ids,
-                clear_plot=False,
+                clear_plot=True,
             )
             self._refresh_slider_transaction_button_state()
             if self.results_controller.active_display_transaction() is None:
@@ -7405,26 +7675,6 @@ class MainWindow(
             }
 
         return new_text
-
-    def _sanitize_mechanism_parameter_conflicts(self, text: str) -> tuple[str, "OrderedDict[str, float]", "OrderedDict[str, Dict[str, object]]"]:
-        return self._variable_runtime.sanitize_mechanism_parameter_conflicts(text)
-
-    def _extract_and_populate_variables(self, *, preserve_visibility: bool = False):
-        return self._variable_runtime.extract_and_populate_variables(
-            preserve_visibility=bool(preserve_visibility)
-        )
-
-    def _update_parameter_table_from_sliders(self) -> None:
-        return self._variable_runtime.update_parameter_table_from_sliders()
-
-    def _is_energy_mode_mechanism(self, mechanism: object) -> bool:
-        return bool(self._variable_runtime.is_energy_mode_mechanism(mechanism))
-
-    def _dsl_has_computational_mode_generated_block(self, dsl_text: str) -> bool:
-        return bool(self._variable_runtime.dsl_has_computational_mode_generated_block(dsl_text))
-
-    def _dsl_global_temperature_K(self, dsl_text: str) -> float | None:
-        return self._variable_runtime.dsl_global_temperature_k(dsl_text)
 
     def _set_temperature_override_state(self, *, enabled: bool, tooltip: str | None = None) -> None:
         spin = getattr(self, "_temperature_spinbox", None)
@@ -7873,7 +8123,9 @@ class MainWindow(
             )
             if slider_schema_refresh_needed:
                 try:
-                    self._extract_and_populate_variables(preserve_visibility=True)
+                    self._variable_runtime.extract_and_populate_variables(
+                        preserve_visibility=True,
+                    )
                     self._sync_mechanism_controls_to_focused_batch_set()
                 except Exception:
                     logger.exception("Failed to refresh variables after solver settings update")

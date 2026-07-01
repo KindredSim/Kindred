@@ -10,10 +10,11 @@ Provides methods for:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
 import math
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Callable, Dict, Optional, TYPE_CHECKING
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
@@ -31,6 +32,7 @@ from kindred.gui.fitting.constants import (
     FITTING_SEED_RANGE,
     FITTING_SOLVERS,
 )
+from kindred.gui.ports import AuthoritativeRewriteStatus
 from kindred.gui.mixins.ports import FittingMixinPorts
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 
@@ -104,11 +106,10 @@ class _FitProjectApplyPlan:
     parameter_delta: Optional[_FitParameterApplyDelta]
     parameter_outcome: Optional[_FitParameterApplyOutcome]
     initial_condition_items: tuple[_FitDatasetInitialConditionApplyItem, ...]
-    canonical_ic_affected_rows: tuple[int, ...]
-    canonical_ic_affected_set_ids: tuple[str, ...]
+    fit_parameter_dirty_discard_set_ids: tuple[str, ...]
+    fit_ic_dirty_discard_set_ids: tuple[str, ...]
     has_dataset_settings_sync: bool
     can_execute_parameter_apply: bool
-    needs_slider_guard: bool
     needs_display_refresh: bool
     is_true_noop: bool
 
@@ -162,6 +163,7 @@ class FittingMixin:
         *,
         parameter_delta: Optional[_FitParameterApplyDelta] = None,
         refresh_display: bool = True,
+        before_publish: Callable[[], None] | None = None,
     ) -> _FitParameterApplyWriteResult:
         """
         Update mechanism DSL text with fitted parameter values.
@@ -187,16 +189,28 @@ class FittingMixin:
         )
         if not force_fresh_boundary and preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE:
             logger.info("Fitted parameter project apply found unappliable requested targets; no rewrite will be performed")
-            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE, delta)
+            return _FitParameterApplyWriteResult(
+                _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE,
+                delta,
+            )
         if not force_fresh_boundary and preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT and not delta.has_real_change:
             logger.info("Fitted parameter project apply made no authoritative numeric change")
-            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT, delta)
+            return _FitParameterApplyWriteResult(
+                _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT,
+                delta,
+            )
         if not force_fresh_boundary and preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT and before_text == str(delta.updated_text or ""):
             logger.info("Fitted parameter project apply found the mechanism text already current")
-            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT, delta)
+            return _FitParameterApplyWriteResult(
+                _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT,
+                delta,
+            )
         if not force_fresh_boundary and preview_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT:
             logger.info("Fitted parameter project apply found no authoritative DSL rewrite to perform")
-            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT, delta)
+            return _FitParameterApplyWriteResult(
+                _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT,
+                delta,
+            )
 
         rewrite = getattr(self, "rewrite_authoritative_reactions_text", None)
         if not callable(rewrite):
@@ -212,18 +226,29 @@ class FittingMixin:
             )
             return str(applied_delta.updated_text or "")
 
-        ok = bool(
-            rewrite(
-                action_label="Applying fitted parameters to the project",
-                description="Global Fit: update Reactions",
-                rewrite_text=_rewrite,
-                record_undo=True,
-                apply_transition=True,
-                transition_source="global_fit_project_apply",
-            )
+        outcome = rewrite(
+            action_label="Applying fitted parameters to the project",
+            description="Global Fit: update Reactions",
+            rewrite_text=_rewrite,
+            record_undo=True,
+            transition_source="global_fit_project_apply",
+            before_publish=before_publish,
+            discard_dirty_preview=False,
         )
-        if not ok:
-            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_CANCELED, applied_delta)
+        if outcome.status is AuthoritativeRewriteStatus.CANCELLED:
+            return _FitParameterApplyWriteResult(
+                _FIT_PARAMETER_APPLY_STATUS_CANCELED,
+                applied_delta,
+            )
+        if outcome.status is AuthoritativeRewriteStatus.FAILED:
+            logger.warning(
+                "Fitted parameter project apply rewrite failed: %s",
+                str(getattr(outcome, "error", "") or "authoritative rewrite failed"),
+            )
+            return _FitParameterApplyWriteResult(
+                _FIT_PARAMETER_APPLY_STATUS_FAILED,
+                applied_delta,
+            )
 
         missing = [str(name) for name in applied_delta.missing]
         update_errors = [dict(error) for error in applied_delta.update_errors]
@@ -240,29 +265,74 @@ class FittingMixin:
             applied_delta,
             before_text=str(applied_delta.current_text or ""),
         )
+        final_status = _FIT_PARAMETER_APPLY_STATUS_REWRITTEN
         if applied_outcome.status == _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE:
             logger.info("Fitted parameter project apply found unappliable requested targets after draft resolution")
-            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE, applied_delta)
-        if applied_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT:
+            final_status = _FIT_PARAMETER_APPLY_STATUS_UNAPPLIABLE
+        elif applied_outcome.status == _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT:
             logger.info("Fitted parameter project apply found no authoritative DSL rewrite after draft resolution")
-            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT, applied_delta)
+            final_status = _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT
+        else:
+            after_text = str(get_canonical_reactions() or "")
+            if after_text == str(applied_delta.current_text or ""):
+                logger.warning("Fitted parameter project apply did not rewrite mechanism text")
+                return _FitParameterApplyWriteResult(
+                    _FIT_PARAMETER_APPLY_STATUS_FAILED,
+                    applied_delta,
+                )
 
-        after_text = str(get_canonical_reactions() or "")
-        if after_text == str(applied_delta.current_text or ""):
-            logger.warning("Fitted parameter project apply did not rewrite mechanism text")
-            return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_FAILED, applied_delta)
+        if bool(getattr(outcome, "source_updated", False)):
+            self._refresh_after_fit_authoritative_source_change(
+                applied_text=str(applied_delta.updated_text or ""),
+                refresh_display=bool(refresh_display),
+            )
 
-        if callable(getattr(self, "_on_programmatic_mechanism_load", None)):
-            self._on_programmatic_mechanism_load()
-        if callable(getattr(self, "_extract_and_populate_variables", None)):
-            self._extract_and_populate_variables(preserve_visibility=True)
+        if final_status == _FIT_PARAMETER_APPLY_STATUS_REWRITTEN:
+            logger.info(
+                "Wrote %d fitted parameter(s) to mechanism editor",
+                len(normalized_parameters),
+            )
+        return _FitParameterApplyWriteResult(
+            final_status,
+            applied_delta,
+        )
+
+    def _refresh_after_fit_authoritative_source_change(
+        self,
+        *,
+        applied_text: str,
+        refresh_display: bool,
+    ) -> None:
+        sync_authoritative_source = getattr(
+            self,
+            "_sync_mechanism_session_owner_after_authoritative_widget_write",
+            None,
+        )
+        if callable(sync_authoritative_source):
+            sync_authoritative_source(dispatch_consumers=False)
+        try:
+            self._variable_runtime.extract_and_populate_variables(
+                preserve_visibility=True,
+            )
+        except Exception as exc:
+            self._record_fitting_best_effort_failure(
+                "fitting.apply_project.parameter_slider_refresh",
+                message="Failed to refresh parameter sliders after fitted parameter apply",
+                exc=exc,
+            )
+        try:
+            self._variable_runtime.update_parameter_table_from_sliders()
+        except Exception as exc:
+            self._record_fitting_best_effort_failure(
+                "fitting.apply_project.parameter_table_refresh",
+                message="Failed to refresh parameter table after fitted parameter apply",
+                exc=exc,
+            )
         if callable(getattr(self, "_sync_batch_species_columns", None)):
-            mechanism_initials = self._extract_mechanism_initials(str(applied_delta.updated_text or ""))
+            mechanism_initials = self._extract_mechanism_initials(str(applied_text or ""))
             self._sync_batch_species_columns(list(mechanism_initials.keys()))
         if refresh_display and callable(getattr(self, "_refresh_batch_display_from_request_scope", None)):
             self._refresh_batch_display_from_request_scope()
-        logger.info("Wrote %d fitted parameter(s) to mechanism editor", len(normalized_parameters))
-        return _FitParameterApplyWriteResult(_FIT_PARAMETER_APPLY_STATUS_REWRITTEN, applied_delta)
 
     def _prepare_fit_parameter_project_text(
         self,
@@ -697,11 +767,9 @@ class FittingMixin:
             except Exception:
                 return ""
 
-        def _rewrite_reactions_text(**kwargs) -> bool:
-            rewrite = getattr(self, "rewrite_authoritative_reactions_text", None)
-            if not callable(rewrite):
-                raise RuntimeError("Authoritative mechanism Reactions rewriter is unavailable.")
-            return bool(rewrite(**kwargs))
+        rewrite_reactions_text = getattr(self, "rewrite_authoritative_reactions_text", None)
+        if not callable(rewrite_reactions_text):
+            raise RuntimeError("Authoritative mechanism Reactions rewriter is unavailable.")
 
         return GlobalFitLaunchContext(
             parent=self,
@@ -711,7 +779,7 @@ class FittingMixin:
             mechanism_parameter_scan_owner=ports.mechanism_parameter_scan_owner,
             mechanism_text_getter=lambda: str(self._get_mechanism_text() or ""),
             reactions_text_getter=_get_reactions_text,
-            reactions_text_rewriter=_rewrite_reactions_text,
+            reactions_text_rewriter=rewrite_reactions_text,
             extract_mechanism_initials=self._extract_mechanism_initials,
             record_best_effort_failure=self._record_fitting_best_effort_failure,
             set_status=self._set_fitting_status,
@@ -815,8 +883,6 @@ class FittingMixin:
                 str(getattr(settings, "batch_set_id", "") or "").strip() != resolved_set_id
                 or str(getattr(settings, "batch_set", "") or "").strip() != resolved_set_name
             )
-            if not (canonical_updates or settings_sync_updates or mapping_sync_needed):
-                continue
             plan.append(
                 _FitDatasetInitialConditionApplyItem(
                     dataset_id=str(dataset_id),
@@ -846,44 +912,196 @@ class FittingMixin:
             parameter_delta = self._build_fit_parameter_apply_delta(dict(parameters))
             parameter_outcome = self._build_fit_parameter_apply_outcome(parameter_delta)
 
+        fit_parameter_dirty_discard_set_ids: tuple[str, ...] = ()
+        if parameter_delta is not None:
+            fit_parameter_dirty_discard_set_ids = self._fit_parameter_dirty_preview_set_ids()
+
         initial_condition_items: tuple[_FitDatasetInitialConditionApplyItem, ...] = ()
         if normalized_scope in {"initial_conditions", "both"}:
             initial_condition_items, has_initial_updates = self._build_fit_initial_condition_apply_items(dataset_params)
             if not has_initial_updates:
                 raise RuntimeError("No fitted initial-condition values are available to apply.")
 
-        canonical_rows: list[int] = []
-        canonical_set_ids: list[str] = []
+        fit_ic_dirty_discard_set_ids: list[str] = []
         has_dataset_settings_sync = False
         has_canonical_ic_change = False
         for item in initial_condition_items:
+            set_id = str(item.set_id or "").strip()
+            item_changes_project = bool(
+                item.canonical_updates
+                or item.settings_sync_updates
+                or item.mapping_sync_needed
+            )
+            item_has_dirty_preview = self._fit_initial_condition_set_has_dirty_preview(set_id)
+            if (
+                set_id
+                and (item_changes_project or item_has_dirty_preview)
+                and set_id not in fit_ic_dirty_discard_set_ids
+            ):
+                fit_ic_dirty_discard_set_ids.append(set_id)
             if item.settings_sync_updates or item.mapping_sync_needed:
                 has_dataset_settings_sync = True
             if item.canonical_updates:
                 has_canonical_ic_change = True
-                if int(item.row) not in canonical_rows:
-                    canonical_rows.append(int(item.row))
-                set_id = str(item.set_id or "").strip()
-                if set_id and set_id not in canonical_set_ids:
-                    canonical_set_ids.append(set_id)
 
         has_parameter_warnings = bool(parameter_outcome is not None and parameter_outcome.warning_messages)
         can_execute_parameter_apply = bool(parameter_outcome is not None and parameter_outcome.rewrite_intended)
+        has_fit_parameter_dirty_discard = bool(fit_parameter_dirty_discard_set_ids)
+        has_fit_ic_dirty_discard = bool(fit_ic_dirty_discard_set_ids)
         return _FitProjectApplyPlan(
             scope=normalized_scope,
             parameter_delta=parameter_delta,
             parameter_outcome=parameter_outcome,
             initial_condition_items=tuple(initial_condition_items),
-            canonical_ic_affected_rows=tuple(canonical_rows),
-            canonical_ic_affected_set_ids=tuple(canonical_set_ids),
+            fit_parameter_dirty_discard_set_ids=tuple(fit_parameter_dirty_discard_set_ids),
+            fit_ic_dirty_discard_set_ids=tuple(fit_ic_dirty_discard_set_ids),
             has_dataset_settings_sync=bool(has_dataset_settings_sync),
             can_execute_parameter_apply=bool(can_execute_parameter_apply),
-            needs_slider_guard=bool(can_execute_parameter_apply),
-            needs_display_refresh=bool(can_execute_parameter_apply or has_canonical_ic_change),
+            needs_display_refresh=bool(
+                can_execute_parameter_apply
+                or has_fit_parameter_dirty_discard
+                or has_canonical_ic_change
+                or has_fit_ic_dirty_discard
+            ),
             is_true_noop=not bool(
-                can_execute_parameter_apply or has_canonical_ic_change or has_dataset_settings_sync or has_parameter_warnings
+                can_execute_parameter_apply
+                or has_fit_parameter_dirty_discard
+                or has_canonical_ic_change
+                or has_dataset_settings_sync
+                or has_fit_ic_dirty_discard
+                or has_parameter_warnings
             ),
         )
+
+    def _fit_parameter_dirty_preview_set_ids(self) -> tuple[str, ...]:
+        preview_session = getattr(self, "_preview_session", None)
+        dirty_workspace_ids = getattr(preview_session, "local_mechanism_workspace_set_ids", None)
+        if not callable(dirty_workspace_ids):
+            return ()
+        try:
+            set_ids = tuple(
+                dict.fromkeys(
+                    str(set_id).strip()
+                    for set_id in dirty_workspace_ids()
+                    if str(set_id).strip()
+                )
+            )
+        except Exception as exc:
+            self._record_fitting_best_effort_failure(
+                "fitting.apply_project.dirty_preview_scope",
+                message="Failed to inspect dirty slider preview scope before fitted parameter apply",
+                exc=exc,
+            )
+            raise RuntimeError("Dirty slider preview discard scope is unavailable.") from exc
+        return set_ids
+
+    def _fit_initial_condition_set_has_dirty_preview(self, set_id: str) -> bool:
+        set_id_s = str(set_id or "").strip()
+        if not set_id_s:
+            return False
+        preview_session = getattr(self, "_preview_session", None)
+        has_dirty_state = getattr(preview_session, "has_dirty_state_for_set", None)
+        if not callable(has_dirty_state):
+            return False
+        try:
+            return bool(has_dirty_state(set_id_s))
+        except Exception as exc:
+            self._record_fitting_best_effort_failure(
+                "fitting.apply_project.dirty_preview_probe",
+                message="Failed to inspect dirty initial-condition preview state before fit apply",
+                exc=exc,
+            )
+            return False
+
+    def _normalize_fit_dirty_discard_set_ids(
+        self,
+        target_set_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                str(set_id).strip()
+                for set_id in target_set_ids
+                if str(set_id).strip()
+            )
+        )
+
+    def _discard_fit_parameter_apply_dirty_preview_state(
+        self,
+        target_set_ids: tuple[str, ...],
+        *,
+        refresh_parameter_ui: bool = True,
+    ) -> bool:
+        normalized_set_ids = self._normalize_fit_dirty_discard_set_ids(target_set_ids)
+        if not normalized_set_ids:
+            return True
+        preview_session = getattr(self, "_preview_session", None)
+        clear_workspace = getattr(preview_session, "clear_local_mechanism_workspace", None)
+        if not callable(clear_workspace):
+            raise RuntimeError("Dirty slider preview discard is unavailable.")
+        changed = False
+        for set_id in normalized_set_ids:
+            changed = bool(clear_workspace(set_id)) or changed
+        if changed:
+            sim_controller = getattr(self, "_sim_controller", None)
+            invalidate_preview = getattr(sim_controller, "invalidate_slider_preview_work", None)
+            if callable(invalidate_preview):
+                invalidate_preview(target_set_ids=normalized_set_ids)
+        if changed and bool(refresh_parameter_ui):
+            try:
+                self._variable_runtime.extract_and_populate_variables(
+                    preserve_visibility=True,
+                )
+            except Exception as exc:
+                self._record_fitting_best_effort_failure(
+                    "fitting.apply_project.parameter_slider_refresh",
+                    message="Failed to refresh parameter sliders after fitted parameter apply",
+                    exc=exc,
+                )
+            try:
+                self._variable_runtime.update_parameter_table_from_sliders()
+            except Exception as exc:
+                self._record_fitting_best_effort_failure(
+                    "fitting.apply_project.parameter_table_refresh",
+                    message="Failed to refresh parameter table after fitted parameter apply",
+                    exc=exc,
+                )
+        try:
+            has_parameter_workspace = getattr(preview_session, "has_local_mechanism_workspace", None)
+            if not callable(has_parameter_workspace):
+                raise RuntimeError("Dirty slider preview verification is unavailable.")
+            return not any(bool(has_parameter_workspace(set_id)) for set_id in normalized_set_ids)
+        except Exception as exc:
+            self._record_fitting_best_effort_failure(
+                "fitting.apply_project.dirty_preview_discard",
+                message="Failed to verify dirty slider preview discard after fitted parameter apply",
+                exc=exc,
+            )
+            return False
+
+    def _discard_fit_initial_condition_apply_dirty_preview_state(
+        self,
+        target_set_ids: tuple[str, ...],
+    ) -> bool:
+        normalized_set_ids = self._normalize_fit_dirty_discard_set_ids(target_set_ids)
+        if not normalized_set_ids:
+            return True
+        discard_pending = getattr(self, "_discard_pending_slider_edits_for_invalidation", None)
+        if not callable(discard_pending):
+            raise RuntimeError("Dirty initial-condition preview discard is unavailable.")
+        discard_pending(target_set_ids=normalized_set_ids)
+        preview_session = getattr(self, "_preview_session", None)
+        has_dirty_state = getattr(preview_session, "has_dirty_state_for_set", None)
+        if not callable(has_dirty_state):
+            raise RuntimeError("Dirty initial-condition preview verification is unavailable.")
+        try:
+            return not any(bool(has_dirty_state(set_id)) for set_id in normalized_set_ids)
+        except Exception as exc:
+            self._record_fitting_best_effort_failure(
+                "fitting.apply_project.dirty_initial_condition_preview_discard",
+                message="Failed to verify dirty initial-condition preview discard after fit apply",
+                exc=exc,
+            )
+            return False
 
     def _apply_fit_initial_condition_project_updates(
         self,
@@ -921,6 +1139,19 @@ class FittingMixin:
                 )
             if hasattr(batch_model, "validate_rows"):
                 batch_model.validate_rows(sorted(set(affected_rows)))
+        affected_set_ids = tuple(
+            dict.fromkeys(
+                str(item.set_id).strip()
+                for item in plan
+                if item.canonical_updates and str(item.set_id).strip()
+            )
+        )
+        if affected_set_ids:
+            self._canonical_initials_transition_owner.publish_canonical_initials_transition(
+                affected_set_ids=affected_set_ids,
+                transition_source="fitting_project_apply_initial_conditions",
+                discard_dirty_preview=False,
+            )
 
     def _apply_fit_results_to_project(
         self,
@@ -935,88 +1166,100 @@ class FittingMixin:
             and callable(getattr(self, "_reactions_draft_dirty", None))
             and self._reactions_draft_dirty()
         )
+
         if plan.is_true_noop and not needs_fresh_parameter_boundary:
             if plan.parameter_outcome is not None and plan.parameter_outcome.warning_messages:
                 return "\n".join(str(message) for message in plan.parameter_outcome.warning_messages)
             return True
 
-        if plan.needs_slider_guard or needs_fresh_parameter_boundary:
-            guard = getattr(self, "_guard_slider_transaction_invalidation", None)
-            if callable(guard):
-                if not guard(action_text="Applying fitted parameters to the project"):
-                    return False
-
-        applied_any = False
-        parameter_outcome = plan.parameter_outcome
-        parameter_warnings = list(parameter_outcome.warning_messages) if parameter_outcome is not None else []
-        parameter_apply_failed = False
-        if plan.parameter_delta is not None and (plan.can_execute_parameter_apply or needs_fresh_parameter_boundary):
-            parameter_write_result = self._write_fit_results_to_mechanism(
-                dict(parameters),
-                parameter_delta=plan.parameter_delta,
-                refresh_display=False,
-            )
-            if parameter_write_result.status == _FIT_PARAMETER_APPLY_STATUS_CANCELED:
-                return False
-            parameter_outcome = self._build_fit_parameter_apply_outcome(
-                parameter_write_result.delta,
-                write_status=parameter_write_result.status,
-            )
-        if parameter_outcome is not None:
-            parameter_warnings = list(parameter_outcome.warning_messages)
-            applied_any = bool(parameter_outcome.applied_any)
-            parameter_apply_failed = bool(parameter_outcome.rewrite_failed)
-        if plan.initial_condition_items:
-            previous_suppress = bool(getattr(self, "_suppress_canonical_batch_initials_transition", False))
-            if hasattr(self, "_suppress_canonical_batch_initials_transition"):
-                setattr(self, "_suppress_canonical_batch_initials_transition", True)
-            try:
-                self._apply_fit_initial_condition_project_updates(plan.initial_condition_items)
-            finally:
-                if hasattr(self, "_suppress_canonical_batch_initials_transition"):
-                    setattr(self, "_suppress_canonical_batch_initials_transition", previous_suppress)
-            if plan.canonical_ic_affected_set_ids:
-                self._apply_canonical_batch_initials_transition(
-                    affected_set_ids=plan.canonical_ic_affected_set_ids,
-                    transition_source="fitting_project_apply_initial_conditions",
-                    discard_dirty_preview=True,
-                )
-            applied_any = True
-
-        if (
-            plan.needs_display_refresh
-            and applied_any
-            and callable(getattr(self, "_refresh_batch_display_from_request_scope", None))
+        publisher = getattr(self, "_fitting_runtime_input_publisher", None)
+        transaction = getattr(publisher, "transaction", None)
+        publish_transaction = nullcontext()
+        if bool(plan.initial_condition_items) and plan.parameter_delta is not None and callable(
+            transaction
         ):
-            self._refresh_batch_display_from_request_scope()
-        if parameter_apply_failed and applied_any:
-            parameter_warnings.append(
-                "Fitted parameter values were not written to the current mechanism text."
+            publish_transaction = transaction(reason="fitting project apply")
+
+        with publish_transaction:
+            applied_any = False
+            parameter_outcome = plan.parameter_outcome
+            parameter_warnings = (
+                list(parameter_outcome.warning_messages)
+                if parameter_outcome is not None
+                else []
             )
-        if parameter_warnings:
-            warning_text = "\n".join(str(message) for message in parameter_warnings)
-            if applied_any:
-                return (
-                    "Applied remaining valid project updates, but skipped these parameter updates:\n"
-                    f"{warning_text}"
+            parameter_apply_failed = False
+            parameter_dirty_preview_discarded = False
+            parameter_dirty_preview_discard_failed = False
+
+            def _discard_parameter_dirty_preview_after_commit() -> None:
+                nonlocal parameter_dirty_preview_discarded
+                nonlocal parameter_dirty_preview_discard_failed
+                if not plan.fit_parameter_dirty_discard_set_ids:
+                    return
+                parameter_dirty_preview_discarded = bool(
+                    self._discard_fit_parameter_apply_dirty_preview_state(
+                        plan.fit_parameter_dirty_discard_set_ids,
+                        refresh_parameter_ui=False,
+                    )
                 )
-            return warning_text
-        if parameter_apply_failed:
-            return False
+                parameter_dirty_preview_discard_failed = not parameter_dirty_preview_discarded
+
+            if plan.parameter_delta is not None and (
+                plan.can_execute_parameter_apply or needs_fresh_parameter_boundary
+            ):
+                parameter_write_result = self._write_fit_results_to_mechanism(
+                    dict(parameters),
+                    parameter_delta=plan.parameter_delta,
+                    refresh_display=False,
+                    before_publish=_discard_parameter_dirty_preview_after_commit,
+                )
+                if parameter_write_result.status == _FIT_PARAMETER_APPLY_STATUS_CANCELED:
+                    return False
+                parameter_outcome = self._build_fit_parameter_apply_outcome(
+                    parameter_write_result.delta,
+                    write_status=parameter_write_result.status,
+                )
+            if parameter_outcome is not None:
+                parameter_warnings = list(parameter_outcome.warning_messages)
+                applied_any = bool(parameter_outcome.applied_any)
+                parameter_apply_failed = bool(parameter_outcome.rewrite_failed)
+            if bool(parameter_outcome is not None and parameter_outcome.applied_any):
+                if parameter_dirty_preview_discard_failed:
+                    return False
+                if not parameter_dirty_preview_discarded and not self._discard_fit_parameter_apply_dirty_preview_state(
+                    plan.fit_parameter_dirty_discard_set_ids
+                ):
+                    return False
+                applied_any = True
+            if plan.initial_condition_items:
+                self._apply_fit_initial_condition_project_updates(
+                    plan.initial_condition_items,
+                )
+                if not self._discard_fit_initial_condition_apply_dirty_preview_state(
+                    plan.fit_ic_dirty_discard_set_ids
+                ):
+                    return False
+                applied_any = True
+
+            if (
+                plan.needs_display_refresh
+                and applied_any
+                and callable(getattr(self, "_refresh_batch_display_from_request_scope", None))
+            ):
+                self._refresh_batch_display_from_request_scope()
+            if parameter_apply_failed and applied_any:
+                parameter_warnings.append(
+                    "Fitted parameter values were not written to the current mechanism text."
+                )
+            if parameter_warnings:
+                warning_text = "\n".join(str(message) for message in parameter_warnings)
+                if applied_any:
+                    return (
+                        "Applied remaining valid project updates, but skipped these parameter updates:\n"
+                        f"{warning_text}"
+                    )
+                return warning_text
+            if parameter_apply_failed:
+                return False
         return True
-
-    def _apply_dataset_initial_updates(self, dataset_id: str, updates: Dict[str, float]) -> None:
-        """Persist fitted initial concentrations back to dataset settings."""
-        from kindred.gui.controllers.dataset_errors import DatasetOwnerError
-
-        try:
-            settings = self._require_fitting_ports().dataset_fit_settings_store.get_fit_settings(dataset_id)
-        except DatasetOwnerError:
-            return
-        changed = False
-        for species, value in updates.items():
-            if settings.initial_conditions.get(species) != value:
-                settings.initial_conditions[species] = float(value)
-                changed = True
-        if changed:
-            self._require_fitting_ports().dataset_fit_settings_store.update_fit_settings(dataset_id, settings)

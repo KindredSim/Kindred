@@ -354,6 +354,35 @@ def _normalize_prepared_simulation_block(prepared_simulation: Optional[object]) 
     return block
 
 
+def _normalize_runtime_identity_block(runtime_identity: Optional[Mapping[str, Any]]) -> Optional[dict[str, Any]]:
+    if not isinstance(runtime_identity, Mapping):
+        return None
+    inputs = runtime_identity.get("inputs")
+    if not isinstance(inputs, Mapping):
+        return None
+    evaluator = inputs.get("evaluator")
+    if not isinstance(evaluator, Mapping):
+        return None
+    return {
+        "inputs": {
+            "evaluator": {
+                "temperature_K": _float_to_canonical_str(evaluator.get("temperature_K")),
+                "use_sparse_jacobian": bool(evaluator.get("use_sparse_jacobian")),
+                "wegscheider_cyclicity_enabled": bool(
+                    evaluator.get("wegscheider_cyclicity_enabled")
+                ),
+            },
+            "batch_runtime_lane_budget": int(inputs.get("batch_runtime_lane_budget") or 0),
+        },
+        "solver": str(runtime_identity.get("solver") or ""),
+        "rtol": _float_to_canonical_str(runtime_identity.get("rtol")),
+        "atol": _float_to_canonical_str(runtime_identity.get("atol")),
+        "param_names": sorted(
+            {str(name) for name in (runtime_identity.get("param_names") or ()) if str(name).strip()}
+        ),
+    }
+
+
 def build_global_fit_run_stamp(
     *,
     dataset_rows: Sequence[Dict[str, Any]],
@@ -366,6 +395,7 @@ def build_global_fit_run_stamp(
     mechanism_text: str,
     reactions_text: str,
     prepared_simulation: Optional[object] = None,
+    runtime_identity: Optional[Mapping[str, Any]] = None,
     dataset_specs: Optional[Sequence[object]] = None,
     dataset_overrides: Optional[Sequence[object]] = None,
     dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
@@ -413,8 +443,9 @@ def build_global_fit_run_stamp(
         dataset_overrides=overrides,
     )
     prepared_block = _normalize_prepared_simulation_block(prepared_simulation)
+    runtime_identity_block = _normalize_runtime_identity_block(runtime_identity)
 
-    return {
+    stamp = {
         "version": 3,
         "mode": "global",
         "kindred_version": str(KINDRED_VERSION or ""),
@@ -444,6 +475,9 @@ def build_global_fit_run_stamp(
         "mechanism_sha256": _sha256_hex(mechanism_text),
         "reactions_sha256": _sha256_hex(reactions_text),
     }
+    if prepared_block is None and runtime_identity_block is not None:
+        stamp["runtime_identity"] = runtime_identity_block
+    return stamp
 
 
 def finalize_global_fit_run_stamp_prepared_simulation(
@@ -454,10 +488,14 @@ def finalize_global_fit_run_stamp_prepared_simulation(
     finalized = deepcopy(dict(stamp or {}))
     if prepared_block is None:
         return finalized
+    for key in (
+        "runtime_identity",
+        "runtime_inputs",
+        "runtime_identity_request",
+        "runtime_request",
+    ):
+        finalized.pop(key, None)
     finalized["prepared_simulation"] = prepared_block
-    for key in tuple(finalized):
-        if str(key).startswith("runtime_"):
-            finalized.pop(key, None)
     return finalized
 
 

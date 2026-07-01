@@ -140,7 +140,10 @@ class SimulationBatchOwner:
         if scope_key == "all":
             return list(range(total))
         if scope_key in {"run", "selected-else-active", "selected_else_active"}:
-            return [int(row) for row in self.run_target_ui_state().target_rows]
+            state = self.run_target_ui_state()
+            if not bool(getattr(state, "enabled", False)):
+                return []
+            return [int(row) for row in getattr(state, "target_rows", ())]
         return resolve_run_scope(
             selected_rows=self._batch_selected_rows(),
             total_rows=total,
@@ -274,7 +277,10 @@ class SimulationBatchOwner:
         return self.run_target_ui_state().empty_reason
 
     def selected_run_target_rows(self) -> List[int]:
-        return [int(row) for row in self.run_target_ui_state().target_rows]
+        state = self.run_target_ui_state()
+        if not bool(getattr(state, "enabled", False)):
+            return []
+        return [int(row) for row in getattr(state, "target_rows", ())]
 
     def concentration_set_interaction_transaction(
         self,
@@ -324,8 +330,13 @@ class SimulationBatchOwner:
         display_refresh_needed = bool(gesture_key in {"show_checkbox", "show_membership_change"})
 
         slider_rebuild_needed = gesture_key in {"slider_checkbox", "slider_target_change"}
-        run_rows = self.run_target_ui_state().target_rows
-        empty_reason = self.run_target_ui_state().empty_reason if not run_rows else ""
+        run_target_state = self.run_target_ui_state()
+        run_rows = (
+            tuple(getattr(run_target_state, "target_rows", ()) or ())
+            if bool(getattr(run_target_state, "enabled", False))
+            else ()
+        )
+        empty_reason = str(getattr(run_target_state, "empty_reason", "") or "") if not run_rows else ""
 
         return ConcentrationSetInteractionTransaction(
             gesture=gesture_key,

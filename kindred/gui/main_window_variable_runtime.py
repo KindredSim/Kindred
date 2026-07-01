@@ -12,15 +12,7 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_reverse_rate,
 )
 from kindred.core.simulator.dsl_text_update import (
-    _dedupe_tokens_case_insensitive,
-    _duplicate_canonical_step_token,
-    _get_token_float,
-    _is_equilibrium_k_token,
-    _is_legacy_equilibrium_constant_token,
-    _parse_mechanism_semicolon_kv,
-    _remove_token_aliases,
-    _serialize_mechanism_semicolon_kv,
-    _set_token_float,
+    normalize_reaction_step_parameter_tokens_for_gui,
 )
 
 if TYPE_CHECKING:
@@ -39,9 +31,6 @@ class MainWindowVariableRuntime:
     def variable_metadata(self) -> Dict[str, Dict[str, object]]:
         return {str(name): dict(meta or {}) for name, meta in self._variable_metadata.items()}
 
-    def mutable_variable_metadata(self) -> Dict[str, Dict[str, object]]:
-        return self._variable_metadata
-
     def set_variable_metadata(self, metadata: Dict[str, Dict[str, object]] | None) -> None:
         normalized: Dict[str, Dict[str, object]] = {}
         for name, meta in dict(metadata or {}).items():
@@ -50,6 +39,18 @@ class MainWindowVariableRuntime:
 
     def clear_variable_metadata(self) -> None:
         self._variable_metadata = {}
+
+    def update_variable_metadata_entry(
+        self,
+        name: str,
+        updates: MappingABC[str, object],
+    ) -> Dict[str, object]:
+        name_s = str(name)
+        meta = dict(self._variable_metadata.get(name_s) or {})
+        for key, value in dict(updates or {}).items():
+            meta[str(key)] = value
+        self._variable_metadata[name_s] = meta
+        return dict(meta)
 
     def _normalize_visibility_scope_value(self, value: object) -> object:
         if value is None or isinstance(value, (bool, int, str)):
@@ -103,58 +104,18 @@ class MainWindowVariableRuntime:
     def sanitize_mechanism_parameter_conflicts(
         self,
         text: str,
-    ) -> tuple[str, "OrderedDict[str, float]", "OrderedDict[str, Dict[str, object]]"]:
+    ) -> str:
         lines = text.split("\n")
         changed = False
-        variables: OrderedDict[str, float] = OrderedDict()
-        metadata: OrderedDict[str, Dict[str, object]] = OrderedDict()
 
         for idx, line in enumerate(lines):
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
 
-            lower = stripped.lower()
-            prefix, tokens, comment = _parse_mechanism_semicolon_kv(line)
-            if _duplicate_canonical_step_token(tokens) is not None:
-                continue
-            tokens = _dedupe_tokens_case_insensitive(tokens)
-
             original_line = line
-
-            if "<->" in lower or "<=>" in lower:
-                if any(_is_legacy_equilibrium_constant_token(key) for key, _ in tokens):
-                    continue
-                if sum(1 for key, _ in tokens if _is_equilibrium_k_token(key)) > 1:
-                    continue
-                k_explicit = any(_is_equilibrium_k_token(key) for key, _ in tokens)
-                kf_val = _get_token_float(tokens, ("kf", "k"))
-                kr_val = _get_token_float(tokens, ("kr",))
-                k_val = _get_token_float(tokens, ("Keq",)) if k_explicit else None
-
-                if kf_val is not None and (not math.isfinite(kf_val) or kf_val <= 0):
-                    kf_val = None
-                if kr_val is not None and (not math.isfinite(kr_val) or kr_val <= 0):
-                    kr_val = None
-                if k_val is not None and (not math.isfinite(k_val) or abs(k_val) < 1e-12):
-                    k_val = None
-
-                if kf_val is not None:
-                    _set_token_float(tokens, "kf", kf_val, aliases=("k",))
-                if kr_val is not None:
-                    _set_token_float(tokens, "kr", kr_val)
-                if k_explicit and k_val is not None:
-                    _set_token_float(tokens, "Keq", k_val)
-
-                _remove_token_aliases(tokens, ("k",))
-                new_line = _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
-            elif "->" in lower:
-                rate_val = _get_token_float(tokens, ("k", "kf"))
-                if rate_val is not None:
-                    _set_token_float(tokens, "k", rate_val)
-                _remove_token_aliases(tokens, ("kf", "kr"))
-                new_line = _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
-            else:
+            new_line = normalize_reaction_step_parameter_tokens_for_gui(line)
+            if new_line == original_line:
                 continue
 
             if new_line != original_line:
@@ -162,11 +123,15 @@ class MainWindowVariableRuntime:
                 changed = True
 
         if not changed:
-            return text, variables, metadata
+            return text
 
-        return "\n".join(lines), variables, metadata
+        return "\n".join(lines)
 
-    def extract_and_populate_variables(self, *, preserve_visibility: bool = False) -> None:
+    def extract_and_populate_variables(
+        self,
+        *,
+        preserve_visibility: bool = False,
+    ) -> None:
         mw = self._mw
         try:
             from kindred.core.batch_initial_conditions import (
@@ -185,65 +150,22 @@ class MainWindowVariableRuntime:
             if not source.full_dsl.strip():
                 return
 
-            sanitized_text, baseline_variables, baseline_metadata = self.sanitize_mechanism_parameter_conflicts(
+            sanitized_text = self.sanitize_mechanism_parameter_conflicts(
                 mechanism_text
             )
-            if baseline_variables or baseline_metadata:
-                raise RuntimeError(
-                    "Legacy line-counter-derived variables/metadata must not be used for sliders. "
-                    "Slider parameters must be derived from mechanism.metadata['step_index_map'] via "
-                    "enumerate_step_parameters_for_gui()."
-                )
-            if sanitized_text != mechanism_text:
-                previous_authoritative_suppress = bool(
-                    getattr(mw, "_suppress_authoritative_mechanism_input_change", False)
-                )
-                setattr(mw, "_suppress_authoritative_mechanism_input_change", True)
-                try:
-                    rewrite_reactions = getattr(
-                        mw,
-                        "rewrite_authoritative_reactions_text",
-                        None,
-                    )
-                    if not callable(rewrite_reactions):
-                        raise RuntimeError("MainWindow authoritative reactions rewriter is unavailable.")
-
-                    rewritten: dict[str, str] = {"text": sanitized_text}
-
-                    def _rewrite(current_text: str) -> str:
-                        refreshed_sanitized, refreshed_variables, refreshed_metadata = self.sanitize_mechanism_parameter_conflicts(
-                            str(current_text or "")
-                        )
-                        if refreshed_variables or refreshed_metadata:
-                            raise RuntimeError(
-                                "Legacy line-counter-derived variables/metadata must not be used for sliders. "
-                                "Slider parameters must be derived from mechanism.metadata['step_index_map'] via "
-                                "enumerate_step_parameters_for_gui()."
-                            )
-                        rewritten["text"] = str(refreshed_sanitized)
-                        return str(refreshed_sanitized)
-
-                    ok = rewrite_reactions(
-                        action_label="Normalizing mechanism parameter tokens for sliders",
-                        description="Normalize mechanism parameter tokens for sliders",
-                        rewrite_text=_rewrite,
-                        record_undo=False,
-                        apply_transition=False,
-                        transition_source="slider_parameter_normalization",
-                    )
-                    if not ok:
-                        return
-                finally:
-                    setattr(mw, "_suppress_authoritative_mechanism_input_change", previous_authoritative_suppress)
-                source = mw.canonical_mechanism_source()
-                mechanism_text = str(rewritten["text"])
+            parse_reactions_text = (
+                str(sanitized_text)
+                if sanitized_text != mechanism_text
+                else str(mechanism_text)
+            )
 
             temperature_k = mw.temperature_spinbox_value()
             units = UnitsModel(temperature_K=temperature_k)
 
             parse_source = source.with_reactions_text(
-                strip_named_reaction_dsl_initial_concentration_sets(mechanism_text)
+                strip_named_reaction_dsl_initial_concentration_sets(parse_reactions_text)
             )
+            committed_schema_text = source.without_reaction_initial_concentrations().full_dsl
             try:
                 solver_owner = getattr(mw, "_simulation_solver_owner", None)
                 if solver_owner is not None and callable(getattr(solver_owner, "wegscheider_cyclicity_enabled", None)):
@@ -380,13 +302,16 @@ class MainWindowVariableRuntime:
                 logger.info("Populated %s variable sliders", len(variables))
                 mw._preview_session.sync_committed_slider_values(
                     {k: v for k, v in variables.items() if metadata.get(k, {}).get("editable") is not False},
-                    schema_text=parse_source.full_dsl,
+                    schema_text=committed_schema_text,
                 )
                 self.update_parameter_table_from_sliders()
             else:
                 logger.info("No variables found to populate sliders")
                 mw.clear_variable_sliders()
-                mw._preview_session.sync_committed_slider_values({}, schema_text=parse_source.full_dsl)
+                mw._preview_session.sync_committed_slider_values(
+                    {},
+                    schema_text=committed_schema_text,
+                )
                 self.clear_variable_metadata()
                 self.update_parameter_table_from_sliders()
             self.set_variable_metadata(metadata)

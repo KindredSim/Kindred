@@ -53,6 +53,7 @@ __all__ = [
     "build_current_text_step_analysis_context",
     "authoritative_parameter_values_match",
     "format_authoritative_parameter_value",
+    "normalize_reaction_step_parameter_tokens_for_gui",
     "step_rewrite_block_reason",
 ]
 
@@ -354,6 +355,54 @@ def _remove_token_aliases(tokens: list[list[str]], aliases: tuple[str, ...]) -> 
         if not any(_token_matches_alias(key, alias) for alias in aliases):
             filtered.append([key, val])
     tokens[:] = filtered
+
+
+def normalize_reaction_step_parameter_tokens_for_gui(line: str) -> str:
+    """Return a GUI-safe reaction step line with public DSL token normalization."""
+    stripped = str(line or "").strip()
+    if not stripped or stripped.startswith("#"):
+        return str(line or "")
+
+    lower = stripped.lower()
+    prefix, tokens, comment = _parse_mechanism_semicolon_kv(str(line or ""))
+    if _duplicate_canonical_step_token(tokens) is not None:
+        return str(line or "")
+    tokens = _dedupe_tokens_case_insensitive(tokens)
+
+    if "<->" in lower or "<=>" in lower:
+        if any(_is_legacy_equilibrium_constant_token(key) for key, _ in tokens):
+            return str(line or "")
+        if sum(1 for key, _ in tokens if _is_equilibrium_k_token(key)) > 1:
+            return str(line or "")
+        k_explicit = any(_is_equilibrium_k_token(key) for key, _ in tokens)
+        kf_val = _get_token_float(tokens, ("kf", "k"))
+        kr_val = _get_token_float(tokens, ("kr",))
+        k_val = _get_token_float(tokens, ("Keq",)) if k_explicit else None
+
+        if kf_val is not None and (not math.isfinite(kf_val) or kf_val <= 0):
+            kf_val = None
+        if kr_val is not None and (not math.isfinite(kr_val) or kr_val <= 0):
+            kr_val = None
+        if k_val is not None and (not math.isfinite(k_val) or abs(k_val) < 1e-12):
+            k_val = None
+
+        if kf_val is not None:
+            _set_token_float(tokens, "kf", kf_val, aliases=("k",))
+        if kr_val is not None:
+            _set_token_float(tokens, "kr", kr_val)
+        if k_explicit and k_val is not None:
+            _set_token_float(tokens, "Keq", k_val)
+        _remove_token_aliases(tokens, ("k",))
+        return _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
+
+    if "->" in lower:
+        rate_val = _get_token_float(tokens, ("k", "kf"))
+        if rate_val is not None:
+            _set_token_float(tokens, "k", rate_val)
+        _remove_token_aliases(tokens, ("kf", "kr"))
+        return _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
+
+    return str(line or "")
 
 
 def _index_step_lines(lines: list[str]) -> tuple[dict[int, int], dict[int, int]]:

@@ -14,6 +14,7 @@ from kindred.gui.display_name_policy import (
 )
 
 __all__ = [
+    "apply_slider_name_label_layout_policy",
     "make_bounded_label",
     "make_compact_label",
     "make_placeholder_label",
@@ -60,6 +61,14 @@ def _apply_non_layout_bearing_label_policy(label: QtWidgets.QLabel, *, max_width
     label.setMaximumWidth(width)
     label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, label.sizePolicy().verticalPolicy())
     label.setWordWrap(False)
+
+
+def apply_slider_name_label_layout_policy(label: QtWidgets.QLabel) -> None:
+    label.setMinimumWidth(1)
+    label.setSizePolicy(
+        QtWidgets.QSizePolicy.Preferred,
+        label.sizePolicy().verticalPolicy(),
+    )
 
 
 def set_bounded_label_text(

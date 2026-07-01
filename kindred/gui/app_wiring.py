@@ -225,6 +225,8 @@ def build_simulation_plumbing(main_window: MainWindow) -> SimulationPlumbing:
         results=main_window.results_controller,
         provenance=main_window._simulation_provenance_owner,
         mechanism_helpers=main_window._mechanism_helpers,
+        mechanism_controls=main_window,
+        run_source_publication=main_window._canonical_initials_transition_owner,
     )
     controller = SimulationController(ui_port, parent=main_window)
     main_window._preview_session.set_slider_preview_lifecycle_port(controller)

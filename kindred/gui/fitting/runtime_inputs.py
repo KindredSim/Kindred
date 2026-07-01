@@ -301,7 +301,7 @@ class FittingRuntimeInputPublisher:
     def _publish_inputs(self, inputs: FittingRuntimeInputs, *, reason: str) -> FittingRuntimeInputs:
         self._generation += 1
         published = replace(inputs, generation=int(self._generation))
-        self._last_identity_key = published.identity_key()
+        delivery_failed = False
         for window in self._live_windows():
             try:
                 handler = getattr(window, "apply_runtime_inputs", None)
@@ -309,11 +309,14 @@ class FittingRuntimeInputPublisher:
                     raise RuntimeError("Active fitting window has no typed runtime-input subscriber.")
                 handler(runtime_inputs=published)
             except Exception as exc:
+                delivery_failed = True
                 self._record_publication_failure(
                     "active_fit_window_runtime_inputs_changed",
                     message=f"Failed to notify an active fitting window about runtime input changes for {reason}",
                     exc=exc,
                 )
+        if not delivery_failed:
+            self._last_identity_key = published.identity_key()
         return published
 
     def _live_windows(self) -> list[object]:

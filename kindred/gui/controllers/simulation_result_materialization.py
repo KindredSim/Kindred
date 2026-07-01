@@ -119,20 +119,20 @@ class SimulationResultMaterializationOwner:
         ):
             self._ui.variable_runtime.sync_energy_mode_temperature_from_mechanism(mechanism)
         elif energy_mode:
-            self._ui.mechanism_helpers.set_temperature_override_state(
+            self._ui.mechanism_controls.set_temperature_override_state(
                 enabled=True,
                 tooltip="Temperature for thermodynamic calculations (energy mode: add T=... to override).",
             )
             temperature_k = float(self._ui.solver.temperature_spinbox_value())
-            self._ui.mechanism_helpers.set_temperature_mode_indicator_text(
+            self._ui.mechanism_controls.set_temperature_mode_indicator_text(
                 f"Temperature: {temperature_k:.2f} K (energy mode: set T=... in DSL)"
             )
         else:
-            self._ui.mechanism_helpers.set_temperature_override_state(
+            self._ui.mechanism_controls.set_temperature_override_state(
                 enabled=True,
                 tooltip="Temperature for thermodynamic calculations",
             )
-            self._ui.mechanism_helpers.update_temperature_mode_indicator()
+            self._ui.mechanism_controls.update_temperature_mode_indicator()
         return energy_mode
 
     def remember_primary_result_mechanism(

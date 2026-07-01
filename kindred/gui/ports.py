@@ -13,9 +13,34 @@ from kindred.gui.controllers.preview_target_identity import normalize_preview_ta
 class ReactionsDraftApplyResult:
     success: bool
     affected_rows: tuple[int, ...] = ()
+    source_applied: bool = False
 
     def __bool__(self) -> bool:
         return bool(self.success)
+
+
+class AuthoritativeRewriteStatus(Enum):
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    DIRTY_DRAFT_APPLIED = "dirty_draft_applied"
+    NO_OP_AFTER_CANONICAL_CHANGE = "no_op_after_canonical_change"
+    REWRITE_APPLIED = "rewrite_applied"
+    CLEAN_NO_OP = "clean_no_op"
+
+
+@dataclass(frozen=True, slots=True)
+class AuthoritativeRewriteOutcome:
+    status: AuthoritativeRewriteStatus
+    dirty_draft_applied: bool = False
+    source_updated: bool = False
+    error: str = ""
+
+    @property
+    def may_continue(self) -> bool:
+        return self.status not in {
+            AuthoritativeRewriteStatus.CANCELLED,
+            AuthoritativeRewriteStatus.FAILED,
+        }
 
 
 class DisplayRefreshSource(Enum):
@@ -822,7 +847,11 @@ class SliderPreviewLifecyclePort(Protocol):
 
     def clear_pending_slider_preview_replay(self, *, clear_plot_updates: bool = True) -> None: ...
 
-    def invalidate_slider_preview_work(self) -> None: ...
+    def invalidate_slider_preview_work(
+        self,
+        *,
+        target_set_ids: Sequence[str] = (),
+    ) -> None: ...
 
     def launch_pending_slider_preview_replay(self) -> None: ...
 
@@ -1058,7 +1087,7 @@ class SimulationMechanismPort(Protocol):
 
     def get_mechanism_text(self) -> str: ...
 
-    def apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> None: ...
+    def apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> AuthoritativeRewriteOutcome: ...
 
 
 class SimulationSolverPort(Protocol):
@@ -1254,12 +1283,6 @@ class SimulationMechanismHelpersPort(Protocol):
 
     def remember_last_mechanism(self, mechanism: object, mechanism_text: str, solver_config: Dict[str, Any]) -> None: ...
 
-    def set_temperature_override_state(self, *, enabled: bool, tooltip: str) -> None: ...
-
-    def set_temperature_mode_indicator_text(self, text: str) -> None: ...
-
-    def update_temperature_mode_indicator(self) -> None: ...
-
     def authoritative_structure_snapshot(
         self,
         *,
@@ -1268,7 +1291,30 @@ class SimulationMechanismHelpersPort(Protocol):
         builder: Callable[[str], object],
     ) -> object: ...
 
+
+class SimulationMechanismControlsPort(Protocol):
+    def set_temperature_override_state(self, *, enabled: bool, tooltip: str) -> None: ...
+
+    def set_temperature_mode_indicator_text(self, text: str) -> None: ...
+
+    def update_temperature_mode_indicator(self) -> None: ...
+
     def sync_mechanism_controls_to_focused_batch_set(self, *, use_workspace: bool = True) -> None: ...
+
+
+class SimulationRunSourcePublicationPort(Protocol):
+    def publish_pending_canonical_initials_for_run(
+        self,
+        draft_apply_result: ReactionsDraftApplyResult | None = None,
+    ) -> object | None: ...
+
+    def publish_applied_draft_run_abort(
+        self,
+        transition_source: str,
+        *,
+        draft_apply_result: ReactionsDraftApplyResult | None,
+    ) -> object | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class SimulationUiPorts:
@@ -1283,3 +1329,5 @@ class SimulationUiPorts:
     results: SimulationResultsPort
     provenance: SimulationProvenancePort
     mechanism_helpers: SimulationMechanismHelpersPort
+    mechanism_controls: SimulationMechanismControlsPort
+    run_source_publication: SimulationRunSourcePublicationPort

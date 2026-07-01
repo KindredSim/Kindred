@@ -34,6 +34,7 @@ from kindred.gui.fitting.batch_mapping import (
     select_batch_set,
     unique_batch_set_name,
 )
+from kindred.gui.ports import AuthoritativeRewriteOutcome
 from kindred.gui.fitting.runtime_inputs import FittingEvaluatorRuntimeSettings, FittingRuntimeInputs
 from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity
 
@@ -178,7 +179,7 @@ class GlobalFitLaunchContext:
     mechanism_parameter_scan_owner: Any
     mechanism_text_getter: Callable[[], str]
     reactions_text_getter: Callable[[], str]
-    reactions_text_rewriter: Callable[..., bool]
+    reactions_text_rewriter: Callable[..., AuthoritativeRewriteOutcome]
     extract_mechanism_initials: Callable[[str], Dict[str, float]]
     record_best_effort_failure: Callable[..., None]
     set_status: Callable[[str], None]

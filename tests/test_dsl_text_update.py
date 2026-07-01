@@ -1,8 +1,10 @@
 import pytest
 
-from kindred.core.simulator.dsl_text_update import analyze_step_parameter_update
+from kindred.core.simulator.dsl_text_update import (
+    analyze_step_parameter_update,
+    normalize_reaction_step_parameter_tokens_for_gui,
+)
 from kindred.core.simulator.dsl import extract_parameters_from_dsl, parse_dsl_to_mechanism
-from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 from kindred.gui.parameter_enumeration import enumerate_step_parameters_for_gui
 
 
@@ -52,15 +54,12 @@ def test_text_update_does_not_treat_legacy_aliases_as_keq_tokens(key):
 
 
 @pytest.mark.parametrize("key", ["K", "K_eq", "k_eq"])
-def test_runtime_sanitizer_does_not_canonicalize_legacy_keq_aliases(key):
-    runtime = MainWindowVariableRuntime.__new__(MainWindowVariableRuntime)
+def test_parameter_token_normalization_does_not_canonicalize_legacy_keq_aliases(key):
     source = f"equilibrium: A <-> B; kf=6.0; {key}=3.0"
 
-    updated, variables, metadata = runtime.sanitize_mechanism_parameter_conflicts(source)
+    updated = normalize_reaction_step_parameter_tokens_for_gui(source)
 
     assert updated == source
-    assert variables == {}
-    assert metadata == {}
 
 
 def test_updating_derived_kr_on_dg_authority_equilibrium_is_blocked():

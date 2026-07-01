@@ -25,33 +25,7 @@ class ProfileMixin:
         ports = getattr(self, "_profile_ports", None)
         if isinstance(ports, ProfileMixinPorts):
             return ports
-
-        profile_manager = getattr(self, "_profile_manager", None)
-        profile_indicator = getattr(self, "_profile_indicator", None)
-        status_label = getattr(self, "_status_label", None)
-        num_points_spinbox = getattr(self, "_num_points_spinbox", None)
-        dark_mode_action = getattr(self, "_dark_mode_action", None)
-        if profile_manager is None or profile_indicator is None or status_label is None:
-            raise RuntimeError("ProfileMixin ports are not initialized.")
-
-        settings_owner = getattr(self, "_settings_owner", None)
-        settings_set_value = getattr(settings_owner, "settings_set_value", None)
-        settings_remove = getattr(settings_owner, "settings_remove", None)
-        if not callable(settings_set_value) or not callable(settings_remove):
-            raise RuntimeError("ProfileMixin settings owner is not initialized.")
-
-        return ProfileMixinPorts(
-            profile_manager=profile_manager,
-            profiles_menu_getter=lambda: getattr(self, "_profiles_menu", None),
-            profile_indicator_setter=lambda text: profile_indicator.setText(str(text)),
-            status_setter=lambda text: status_label.setText(str(text)),
-            settings_set_value=settings_set_value,
-            settings_remove=settings_remove,
-            num_points_spinbox=num_points_spinbox,
-            dark_mode_action=dark_mode_action,
-            toggle_theme=self._toggle_theme,
-            update_solver_summary_label=self._update_solver_summary_label,
-        )
+        raise RuntimeError("ProfileMixin ports are not initialized.")
 
     def _update_profiles_menu(self) -> None:
         """Update Profiles menu with available profiles."""
