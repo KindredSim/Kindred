@@ -15,6 +15,7 @@ from typing import Callable, Mapping, Tuple
 from kindred.core.equilibrium_rate_authority import public_text_equilibrium_role_editable
 from kindred.core.runtime_defaults import WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT
 
+from .computational_mode import GENERATED_BLOCK_END, GENERATED_BLOCK_START
 from .step_constraint_authority import (
     StepConstraintAuthorityAnalysis,
     StepConstraintAuthorityError,
@@ -53,7 +54,6 @@ __all__ = [
     "build_current_text_step_analysis_context",
     "authoritative_parameter_values_match",
     "format_authoritative_parameter_value",
-    "normalize_reaction_step_parameter_tokens_for_gui",
     "step_rewrite_block_reason",
 ]
 
@@ -357,70 +357,31 @@ def _remove_token_aliases(tokens: list[list[str]], aliases: tuple[str, ...]) -> 
     tokens[:] = filtered
 
 
-def normalize_reaction_step_parameter_tokens_for_gui(line: str) -> str:
-    """Return a GUI-safe reaction step line with public DSL token normalization."""
-    stripped = str(line or "").strip()
-    if not stripped or stripped.startswith("#"):
-        return str(line or "")
-
-    lower = stripped.lower()
-    prefix, tokens, comment = _parse_mechanism_semicolon_kv(str(line or ""))
-    if _duplicate_canonical_step_token(tokens) is not None:
-        return str(line or "")
-    tokens = _dedupe_tokens_case_insensitive(tokens)
-
-    if "<->" in lower or "<=>" in lower:
-        if any(_is_legacy_equilibrium_constant_token(key) for key, _ in tokens):
-            return str(line or "")
-        if sum(1 for key, _ in tokens if _is_equilibrium_k_token(key)) > 1:
-            return str(line or "")
-        k_explicit = any(_is_equilibrium_k_token(key) for key, _ in tokens)
-        kf_val = _get_token_float(tokens, ("kf", "k"))
-        kr_val = _get_token_float(tokens, ("kr",))
-        k_val = _get_token_float(tokens, ("Keq",)) if k_explicit else None
-
-        if kf_val is not None and (not math.isfinite(kf_val) or kf_val <= 0):
-            kf_val = None
-        if kr_val is not None and (not math.isfinite(kr_val) or kr_val <= 0):
-            kr_val = None
-        if k_val is not None and (not math.isfinite(k_val) or abs(k_val) < 1e-12):
-            k_val = None
-
-        if kf_val is not None:
-            _set_token_float(tokens, "kf", kf_val, aliases=("k",))
-        if kr_val is not None:
-            _set_token_float(tokens, "kr", kr_val)
-        if k_explicit and k_val is not None:
-            _set_token_float(tokens, "Keq", k_val)
-        _remove_token_aliases(tokens, ("k",))
-        return _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
-
-    if "->" in lower:
-        rate_val = _get_token_float(tokens, ("k", "kf"))
-        if rate_val is not None:
-            _set_token_float(tokens, "k", rate_val)
-        _remove_token_aliases(tokens, ("kf", "kr"))
-        return _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
-
-    return str(line or "")
-
-
 def _index_step_lines(lines: list[str]) -> tuple[dict[int, int], dict[int, int]]:
     reaction_lines: dict[int, int] = {}
     equilibrium_lines: dict[int, int] = {}
     line_counter = 0
+    in_generated_block = False
     for idx, line in enumerate(lines):
         stripped = str(line).strip()
+        if stripped == GENERATED_BLOCK_START:
+            in_generated_block = True
+            continue
+        if stripped == GENERATED_BLOCK_END:
+            in_generated_block = False
+            continue
         if not stripped or stripped.startswith("#"):
             continue
         lower = stripped.lower()
         if "<->" in lower or "<=>" in lower:
             line_counter += 1
-            equilibrium_lines[line_counter] = idx
+            if not in_generated_block:
+                equilibrium_lines[line_counter] = idx
             continue
         if "->" in lower:
             line_counter += 1
-            reaction_lines[line_counter] = idx
+            if not in_generated_block:
+                reaction_lines[line_counter] = idx
     return reaction_lines, equilibrium_lines
 
 

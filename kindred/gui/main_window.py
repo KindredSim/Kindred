@@ -31,7 +31,6 @@ from kindred.core.simulator.dsl_text_update import (
     analyze_step_parameter_update,
     build_current_text_step_analysis_context,
     format_authoritative_parameter_value,
-    step_rewrite_block_reason,
 )
 from kindred.core.validation import try_parse_finite_float
 from kindred.core.datasets.observation_payload import dense_view_from_observations, observations_from_payload
@@ -1224,23 +1223,45 @@ class MainWindow(
             self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
             self._suppress_dirty_to_clean_runtime_readiness_refresh = previous_clean_readiness_suppress
 
-    def _accept_reactions_draft_source_and_materialize_initials(
+    def _apply_prepared_reactions_draft_source_transaction(
         self,
         source,
         reconciliation_plan,
         result: ReactionsDraftApplyResult,
+        *,
+        transition_source: str,
+        publish_on_success: bool,
     ) -> ReactionsDraftApplyResult:
-        self._accept_reactions_draft_source(source)
-        affected_rows: tuple[int, ...] = ()
-        if reconciliation_plan is not None:
+        materialization_result_holder: dict[str, object | None] = {"result": None}
+
+        def _commit_source() -> bool:
+            self._accept_reactions_draft_source(source)
+            return True
+
+        def _materialize_initials() -> object | None:
+            if reconciliation_plan is None:
+                return None
             materialization_result = self._initial_conditions_source_acceptance_owner.apply_prepared_plan(
                 reconciliation_plan,
                 notify_canonical_rows_changed=False,
             )
-            affected_rows = tuple(
-                int(row)
-                for row in (getattr(materialization_result, "affected_rows", ()) or ())
-            )
+            materialization_result_holder["result"] = materialization_result
+            return materialization_result
+
+        self._canonical_initials_transition_owner.execute_source_load_transaction(
+            transition_source=str(transition_source or "authoritative_change"),
+            schedule_runtime_refresh=not self._authoritative_mechanism_runtime_refresh_deferred(),
+            draft_apply_result=None,
+            commit_source=_commit_source,
+            materialize_initials=_materialize_initials,
+            refresh_after_commit=lambda: None,
+            publish_on_success=bool(publish_on_success),
+        )
+        materialization_result = materialization_result_holder.get("result")
+        affected_rows: tuple[int, ...] = tuple(
+            int(row)
+            for row in (getattr(materialization_result, "affected_rows", ()) or ())
+        )
         return ReactionsDraftApplyResult(
             bool(result),
             affected_rows,
@@ -1250,24 +1271,24 @@ class MainWindow(
     def _apply_reactions_draft_with_transition(self) -> ReactionsDraftApplyResult:
         result, source, reconciliation_plan = self._prepare_reactions_draft_for_canonical_acceptance()
         if bool(result) and source is not None:
-            result = self._accept_reactions_draft_source_and_materialize_initials(
+            result = self._apply_prepared_reactions_draft_source_transaction(
                 source,
                 reconciliation_plan,
                 result,
-            )
-            self._canonical_initials_transition_owner.publish_authoritative_transition(
-                "authoritative_change",
-                draft_apply_result=result,
+                transition_source="authoritative_change",
+                publish_on_success=True,
             )
         return result
 
     def _apply_reactions_draft_for_authoritative_rewrite(self) -> ReactionsDraftApplyResult:
         result, source, reconciliation_plan = self._prepare_reactions_draft_for_canonical_acceptance()
         if bool(result) and source is not None:
-            result = self._accept_reactions_draft_source_and_materialize_initials(
+            result = self._apply_prepared_reactions_draft_source_transaction(
                 source,
                 reconciliation_plan,
                 result,
+                transition_source="authoritative_rewrite_draft_apply",
+                publish_on_success=False,
             )
         return result
 
@@ -1279,10 +1300,12 @@ class MainWindow(
     def _apply_dirty_reactions_for_run(self) -> ReactionsDraftApplyResult:
         result, source, reconciliation_plan = self._prepare_reactions_draft_for_canonical_acceptance()
         if bool(result) and source is not None:
-            result = self._accept_reactions_draft_source_and_materialize_initials(
+            result = self._apply_prepared_reactions_draft_source_transaction(
                 source,
                 reconciliation_plan,
                 result,
+                transition_source="run_preflight_dirty_draft_apply",
+                publish_on_success=False,
             )
         return result
 
@@ -5812,8 +5835,16 @@ class MainWindow(
         *,
         set_id: Optional[str] = None,
         overrides: Optional[Dict[str, float]] = None,
+        override_metadata: Optional[Dict[str, Dict[str, object]]] = None,
     ) -> list[tuple[str, float, dict]]:
-        meta_map = self.variable_metadata() or {}
+        meta_map = dict(self.variable_metadata() or {})
+        meta_map.update(
+            {
+                str(name): dict(meta or {})
+                for name, meta in dict(override_metadata or {}).items()
+                if str(name).strip() and isinstance(meta, dict)
+            }
+        )
         override_map = self._runtime_parameter_values_for_materialization(set_id=set_id, overrides=overrides)
         energy_overrides: list[tuple[str, float, dict]] = []
         for name, value in override_map.items():
@@ -6122,6 +6153,7 @@ class MainWindow(
         *,
         set_id: Optional[str] = None,
         overrides: Optional[Dict[str, float]] = None,
+        override_metadata: Optional[Dict[str, Dict[str, object]]] = None,
     ) -> str:
         """
         Apply energy-mode ΔG° overrides to Computational Mode fast equilibria inside the generated block.
@@ -6131,7 +6163,11 @@ class MainWindow(
         """
         energy_overrides = [
             o
-            for o in self._collect_energy_overrides(set_id=set_id, overrides=overrides)
+            for o in self._collect_energy_overrides(
+                set_id=set_id,
+                overrides=overrides,
+                override_metadata=override_metadata,
+            )
             if str(o[2].get("role") or "") == "dG_eq_fast"
         ]
         if not energy_overrides:
@@ -6150,17 +6186,6 @@ class MainWindow(
         body = extract_marked_block(base_text, start_marker=GENERATED_BLOCK_START, end_marker=GENERATED_BLOCK_END)
         if not body:
             return base_text
-        full_lines = str(base_text).splitlines()
-        generated_block_start_line = next(
-            (
-                idx
-                for idx, raw_line in enumerate(full_lines)
-                if str(raw_line).strip() == str(GENERATED_BLOCK_START)
-            ),
-            None,
-        )
-        if generated_block_start_line is None:
-            return base_text
 
         T_override = self._variable_runtime.dsl_global_temperature_k(base_text)
         try:
@@ -6172,18 +6197,6 @@ class MainWindow(
 
         from kindred.core.constants import R as R_J_per_mol_K
         from kindred.core.units import UnitsModel
-        step_constraint_context = {
-            "temperature_K": float(T),
-            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
-        }
-        step_analysis_context = build_current_text_step_analysis_context(
-            str(base_text or ""),
-            step_constraint_context=step_constraint_context,
-        )
-        equilibrium_step_by_line_index = {
-            int(line_index): int(step_index)
-            for step_index, line_index in step_analysis_context.equilibrium_lines.items()
-        }
 
         overrides_by_id: dict[str, tuple[float, dict]] = {}
         for _name, val, meta in energy_overrides:
@@ -6197,7 +6210,6 @@ class MainWindow(
         lines = str(body).splitlines()
         changed = False
         for i, raw in enumerate(lines):
-            absolute_line_index = int(generated_block_start_line) + 1 + int(i)
             before_comment, hash_sep, comment_rest = str(raw).partition("#")
             code = before_comment.strip()
             if not code.lower().startswith("equilibrium:"):
@@ -6235,15 +6247,6 @@ class MainWindow(
                 )
                 continue
             if not (math.isfinite(K) and K > 0.0):
-                continue
-            step_index = equilibrium_step_by_line_index.get(int(absolute_line_index))
-            if step_index is None:
-                continue
-            if step_rewrite_block_reason(
-                step_index=int(step_index),
-                affected_parameter_names=(f"kf{int(step_index)}", f"kr{int(step_index)}", f"Keq{int(step_index)}"),
-                step_analysis_context=step_analysis_context,
-            ) is not None:
                 continue
 
             self._set_semicolon_kv(tokens, "dG_eq", f"{float(new_dG):.12g}")
@@ -6583,9 +6586,7 @@ class MainWindow(
         label = str(ch.get("label") or ch.get("cm_id") or "fast equilibrium")
         var_eq = str(ch.get("var_eq") or "")
         if not var_eq:
-            cm_id = str(ch.get("cm_id") or "")
-            slug = re.sub(r"[^A-Za-z0-9_]+", "_", cm_id).strip("_") or "fast_eq"
-            var_eq = f"dG_eq_fast__{slug}"
+            return None
         try:
             dG_eq = float(
                 self.runtime_parameter_values_for_set(fast_mode=True).get(var_eq, ch.get("dG_eq"))

@@ -255,20 +255,25 @@ class FittingRuntimeInputPublisher:
         try:
             yield
         except Exception:
-            if self._transaction_depth == 1:
-                self._transaction_force_requested = False
-            raise
-        finally:
+            outermost = self._transaction_depth == 1
+            force = bool(self._transaction_force_requested)
             self._transaction_depth = max(0, int(self._transaction_depth) - 1)
-        if self._transaction_depth > 0:
-            return
-        force = bool(self._transaction_force_requested)
-        self._transaction_force_requested = False
-        inputs = self._capture_inputs_typed_or_record(reason=reason)
-        if inputs is None:
-            return
-        if force or inputs.identity_key() != self._last_identity_key:
-            self._publish_inputs(inputs, reason=reason)
+            if outermost:
+                self._transaction_force_requested = False
+                if force:
+                    self.publish_current(reason=reason, force=True)
+            raise
+        else:
+            self._transaction_depth = max(0, int(self._transaction_depth) - 1)
+            if self._transaction_depth > 0:
+                return
+            force = bool(self._transaction_force_requested)
+            self._transaction_force_requested = False
+            inputs = self._capture_inputs_typed_or_record(reason=reason)
+            if inputs is None:
+                return
+            if force or inputs.identity_key() != self._last_identity_key:
+                self._publish_inputs(inputs, reason=reason)
 
     def _capture_inputs_typed_or_record(self, *, reason: str) -> FittingRuntimeInputs | None:
         try:

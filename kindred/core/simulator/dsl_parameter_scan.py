@@ -18,14 +18,19 @@ from kindred.core.equilibrium_rate_authority import (
     step_entry_authored_role_is_editable,
 )
 from . import parameter_algebra
-from kindred.core.mechanism_metadata import MechanismMetadataKeys
+from kindred.core.mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
+from kindred.core.units import UnitsModel
 from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
 
 from .dsl import _parse_dsl_ir
 from .dsl_build import build_mechanism_from_ir
 from .errors import DSLError
 from .parameter_algebra_spec import collect_algebra_section_lines
-from .parameter_namespace import build_namespace_from_ir_steps, build_namespace_from_mechanism
+from .parameter_namespace import (
+    build_namespace_from_ir_steps,
+    build_namespace_from_mechanism,
+    generated_fast_equilibrium_parameter_name,
+)
 from .step_indexing import get_step_index_map
 
 
@@ -149,6 +154,40 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
             )
         )
 
+    energy_unit = str((getattr(mechanism, "metadata", {}) or {}).get(MechanismMetadataKeys.ENERGY_UNIT) or "kJ/mol")
+    unit_conv = UnitsModel(energy_unit=energy_unit)
+    step_entry_by_equilibrium_index: dict[int, dict] = {}
+    for entry in step_entry_by_index.values():
+        if not isinstance(entry, dict) or str(entry.get("kind") or "") != "equilibrium":
+            continue
+        equilibrium_index, ok = try_parse_int(entry.get("equilibrium_index", -1))
+        if ok:
+            step_entry_by_equilibrium_index[int(equilibrium_index)] = entry
+    for equilibrium_index, eq in enumerate(eqs):
+        metadata = dict(getattr(eq, "metadata", {}) or {})
+        name = generated_fast_equilibrium_parameter_name(metadata)
+        if name is None:
+            continue
+        dG_eq_j = _finite_value(metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
+        if dG_eq_j is None:
+            continue
+        entry = step_entry_by_equilibrium_index.get(int(equilibrium_index), {})
+        step_index = None
+        parsed_step_index, step_ok = try_parse_int(entry.get("step_index")) if entry else (None, False)
+        if step_ok:
+            step_index = int(parsed_step_index)
+        context = str(entry.get("context") or metadata.get("cm_id") or name)
+        parameters.append(
+            ParameterDefinition(
+                name=name,
+                value=float(unit_conv.from_jmol(float(dG_eq_j))),
+                context=context,
+                source="Generated fast-equilibrium dG_eq",
+                step_index=step_index,
+                editable=True,
+            )
+        )
+
     return parameters
 
 
@@ -169,8 +208,13 @@ def extract_parameter_names_from_dsl(text: str) -> set[str]:
     param_names: set[str] = set()
 
     ir = _parse_dsl_ir(text)
+    mechanism = build_mechanism_from_ir(ir, initials={})
     mechanism_namespace = build_namespace_from_ir_steps(ir.steps)
     param_names.update(mechanism_namespace.flat_names())
+    for eq in getattr(mechanism, "equilibria", []) or []:
+        name = generated_fast_equilibrium_parameter_name(dict(getattr(eq, "metadata", {}) or {}))
+        if name is not None:
+            param_names.add(name)
 
     spec = parameter_algebra.parse_parameter_algebra_spec_from_dsl_text(
         text,

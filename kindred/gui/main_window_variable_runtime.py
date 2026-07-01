@@ -11,9 +11,8 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
 )
-from kindred.core.simulator.dsl_text_update import (
-    normalize_reaction_step_parameter_tokens_for_gui,
-)
+from kindred.core.simulator.computational_mode import GENERATED_BLOCK_START
+from kindred.core.simulator.parameter_namespace import generated_fast_equilibrium_parameter_name
 
 if TYPE_CHECKING:
     from kindred.gui.main_window import MainWindow
@@ -101,32 +100,6 @@ class MainWindowVariableRuntime:
             signature.append((str(name), scope_meta))
         return tuple(signature)
 
-    def sanitize_mechanism_parameter_conflicts(
-        self,
-        text: str,
-    ) -> str:
-        lines = text.split("\n")
-        changed = False
-
-        for idx, line in enumerate(lines):
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-
-            original_line = line
-            new_line = normalize_reaction_step_parameter_tokens_for_gui(line)
-            if new_line == original_line:
-                continue
-
-            if new_line != original_line:
-                lines[idx] = new_line
-                changed = True
-
-        if not changed:
-            return text
-
-        return "\n".join(lines)
-
     def extract_and_populate_variables(
         self,
         *,
@@ -146,26 +119,16 @@ class MainWindowVariableRuntime:
             from kindred.core.units import UnitsModel
 
             source = mw.canonical_mechanism_source()
-            mechanism_text = source.reactions_text
             if not source.full_dsl.strip():
                 return
-
-            sanitized_text = self.sanitize_mechanism_parameter_conflicts(
-                mechanism_text
-            )
-            parse_reactions_text = (
-                str(sanitized_text)
-                if sanitized_text != mechanism_text
-                else str(mechanism_text)
-            )
 
             temperature_k = mw.temperature_spinbox_value()
             units = UnitsModel(temperature_K=temperature_k)
 
             parse_source = source.with_reactions_text(
-                strip_named_reaction_dsl_initial_concentration_sets(parse_reactions_text)
+                strip_named_reaction_dsl_initial_concentration_sets(str(source.reactions_text))
             )
-            committed_schema_text = source.without_reaction_initial_concentrations().full_dsl
+            committed_schema_text = parse_source.full_dsl
             try:
                 solver_owner = getattr(mw, "_simulation_solver_owner", None)
                 if solver_owner is not None and callable(getattr(solver_owner, "wegscheider_cyclicity_enabled", None)):
@@ -209,19 +172,6 @@ class MainWindowVariableRuntime:
                 return
 
             variables, metadata = enumerate_step_parameters_for_gui(mechanism)
-            current_metadata = self.variable_metadata()
-            has_current_energy_sliders = any(
-                isinstance(meta, dict) and meta.get("type") == "energy"
-                for meta in dict(current_metadata or {}).values()
-            )
-            if self.is_energy_mode_mechanism(mechanism) and (not variables or has_current_energy_sliders):
-                self.populate_energy_mode_variables_from_mechanism(
-                    mechanism,
-                    refresh_sliders=True,
-                    preserve_visibility=bool(preserve_visibility),
-                )
-                return
-
             unit_map = solver_parameter_units_from_mechanism(mechanism)
 
             for name, meta in list(metadata.items()):
@@ -288,6 +238,31 @@ class MainWindowVariableRuntime:
                         if "constraint_reason" in info:
                             meta["constraint_reason"] = info["constraint_reason"]
                     metadata[nm] = meta
+
+            current_metadata = self.variable_metadata()
+            has_current_energy_sliders = any(
+                isinstance(meta, dict) and meta.get("type") == "energy"
+                for meta in dict(current_metadata or {}).values()
+            )
+            has_generated_fast_equilibrium = self.has_generated_computational_fast_equilibrium(
+                mechanism
+            )
+            if (
+                has_generated_fast_equilibrium
+                or self.is_energy_mode_mechanism(mechanism)
+            ) and (
+                has_generated_fast_equilibrium
+                or not variables
+                or has_current_energy_sliders
+            ):
+                self.populate_energy_mode_variables_from_mechanism(
+                    mechanism,
+                    refresh_sliders=True,
+                    preserve_visibility=bool(preserve_visibility),
+                    base_variables=variables if has_generated_fast_equilibrium else None,
+                    base_metadata=metadata if has_generated_fast_equilibrium else None,
+                )
+                return
 
             visibility_scope_signature = self._slider_visibility_scope_signature(variables, metadata)
             self.set_variable_metadata(metadata)
@@ -362,13 +337,20 @@ class MainWindowVariableRuntime:
         edges = sn.get("edges")
         return bool(states or edges)
 
+    def has_generated_computational_fast_equilibrium(self, mechanism: object) -> bool:
+        for eq in list(getattr(mechanism, "equilibria", []) or []):
+            eq_meta = getattr(eq, "metadata", {}) or {}
+            if not isinstance(eq_meta, MappingABC):
+                continue
+            if str(eq_meta.get("authority_source") or "") != "generated_computational_mode":
+                continue
+            if str(eq_meta.get("cm_id") or "").strip():
+                return True
+        return False
+
     def dsl_has_computational_mode_generated_block(self, dsl_text: str) -> bool:
         if not dsl_text:
             return False
-        try:
-            from kindred.core.simulator.computational_mode import GENERATED_BLOCK_START
-        except Exception:
-            GENERATED_BLOCK_START = "# === Generated from Computational Mode ==="
         return str(GENERATED_BLOCK_START).strip() in str(dsl_text)
 
     def dsl_global_temperature_k(self, dsl_text: str) -> float | None:
@@ -414,6 +396,8 @@ class MainWindowVariableRuntime:
         *,
         refresh_sliders: bool,
         preserve_visibility: bool = False,
+        base_variables: MappingABC[str, object] | None = None,
+        base_metadata: MappingABC[str, MappingABC[str, object]] | None = None,
     ) -> None:
         mw = self._mw
 
@@ -563,228 +547,192 @@ class MainWindowVariableRuntime:
 
         ts_channels.sort(key=lambda c: (str(c.get("ts")), str(c.get("reactant")), str(c.get("product"))))
 
-        fast_eq_channels: list[dict[str, object]] = []
-        try:
-            from kindred.core.simulator.computational_mode import (
-                GENERATED_BLOCK_END,
-                GENERATED_BLOCK_START,
-                extract_marked_block,
-            )
-        except Exception:
-            extract_marked_block = None  # type: ignore[assignment]
-            GENERATED_BLOCK_START = ""
-            GENERATED_BLOCK_END = ""
-
-        reactions_text = mw.canonical_mechanism_source().reactions_text
-
-        generated_body = None
-        try:
-            if callable(extract_marked_block) and reactions_text:
-                generated_body = extract_marked_block(
-                    reactions_text,
-                    start_marker=GENERATED_BLOCK_START,
-                    end_marker=GENERATED_BLOCK_END,
-                )
-        except Exception:
-            generated_body = None
-
-        def _parse_fast_side(side: str) -> dict[str, int]:
-            out: dict[str, int] = {}
-            for raw in [p.strip() for p in str(side or "").split("+") if p.strip()]:
-                term = raw.replace(" ", "")
-                match = re.match(r"^(\d+)?([A-Za-z_][A-Za-z0-9_]*)$", term)
-                if not match:
-                    raise ValueError("invalid term")
-                coeff = int(match.group(1) or "1")
-                name = str(match.group(2))
-                out[name] = out.get(name, 0) + coeff
-            return out
-
-        def _canonical_fast_side(sto: dict[str, int]) -> str:
-            parts: list[str] = []
-            for name in sorted(sto.keys()):
-                coeff = int(sto[name])
-                parts.append(f"{name}" if coeff == 1 else f"{coeff}{name}")
-            return "+".join(parts)
-
-        if generated_body:
-            for raw in str(generated_body).splitlines():
-                before_comment, _, _comment = str(raw).partition("#")
-                code = before_comment.strip()
-                if not code or code.startswith("#"):
+        step_context_by_equilibrium_index: dict[int, str] = {}
+        if isinstance(meta, MappingABC):
+            for entry in list(meta.get("step_index_map") or []):
+                if not isinstance(entry, MappingABC):
                     continue
-                if not code.lower().startswith("equilibrium:"):
+                if str(entry.get("kind") or "") != "equilibrium":
                     continue
-                chunks = [c.strip() for c in code.split(";") if c.strip()]
-                if not chunks:
-                    continue
-                prefix = chunks[0]
-                if ":" not in prefix:
-                    continue
-                eqn = prefix.split(":", 1)[1].strip()
-
-                tokens: dict[str, str] = {}
-                for part in chunks[1:]:
-                    if "=" not in part:
-                        continue
-                    key, value = part.split("=", 1)
-                    tokens[str(key).strip()] = str(value).strip()
-
                 try:
-                    kf = float(tokens.get("kf") or "")
-                except Exception as exc:
-                    mw._record_best_effort_failure(
-                        "main_window.energy_channels.fast_eq.read_k",
-                        message="Skipping fast-equilibrium entry with invalid kf token",
-                        exc=exc,
-                    )
-                    continue
-                if not (math.isfinite(kf) and kf > 0.0):
-                    continue
-                kr_token = None
-                try:
-                    if tokens.get("kr") is not None:
-                        kr_token = float(tokens.get("kr") or "")
+                    eq_index = int(entry.get("equilibrium_index"))
                 except Exception:
-                    kr_token = None
-
-                try:
-                    if "<=>" in eqn:
-                        lhs, rhs = [p.strip() for p in eqn.split("<=>", 1)]
-                    else:
-                        lhs, rhs = [p.strip() for p in eqn.split("<->", 1)]
-                    sto_fwd = _parse_fast_side(lhs)
-                    sto_rev = _parse_fast_side(rhs)
-                    molecularity_fwd = int(sum(int(v) for v in sto_fwd.values()))
-                    molecularity_rev = int(sum(int(v) for v in sto_rev.values()))
-                    if molecularity_fwd < 1 or molecularity_rev < 1:
-                        continue
-                    cm_id = str(tokens.get("cm_id") or f"feq__{_canonical_fast_side(sto_fwd)}__{_canonical_fast_side(sto_rev)}")
-                except Exception as exc:
-                    mw._record_best_effort_failure(
-                        "main_window.energy_channels.fast_eq.parse_equation",
-                        message="Skipping fast-equilibrium entry due to invalid equilibrium equation tokens",
-                        exc=exc,
-                    )
                     continue
+                context = str(entry.get("context") or "").strip()
+                if context:
+                    step_context_by_equilibrium_index[eq_index] = context
 
+        def _context_molecularity(context: str) -> tuple[int, int]:
+            text = str(context or "")
+            arrow = "<=>" if "<=>" in text else "<->" if "<->" in text else ""
+            if not arrow:
+                return 1, 1
+
+            def _side_count(side: str) -> int:
+                total = 0
+                for raw in [part.strip() for part in str(side or "").split("+") if part.strip()]:
+                    term = raw.replace(" ", "")
+                    match = re.match(r"^(\d+)?[A-Za-z_][A-Za-z0-9_]*$", term)
+                    if match is None:
+                        return 1
+                    total += int(match.group(1) or "1")
+                return max(1, int(total or 1))
+
+            lhs, rhs = [part.strip() for part in text.split(arrow, 1)]
+            return _side_count(lhs), _side_count(rhs)
+
+        fast_eq_channels: list[dict[str, object]] = []
+        for eq_index, eq in enumerate(list(getattr(mechanism, "equilibria", []) or [])):
+            eq_meta = getattr(eq, "metadata", {}) or {}
+            if not isinstance(eq_meta, MappingABC):
+                continue
+            if str(eq_meta.get("authority_source") or "") != "generated_computational_mode":
+                continue
+            cm_id = str(eq_meta.get("cm_id") or "").strip()
+            if not cm_id:
+                mw._record_best_effort_failure(
+                    "main_window.energy_channels.fast_eq.cm_id",
+                    message="Skipping generated fast-equilibrium channel without cm_id metadata",
+                    exc=None,
+                )
+                continue
+            label = str(step_context_by_equilibrium_index.get(int(eq_index)) or cm_id or "fast equilibrium")
+            try:
+                dg_eq_j = float(eq_meta.get("dG_eq_J_per_mol"))
+            except Exception as exc:
+                mw._record_best_effort_failure(
+                    "main_window.energy_channels.fast_eq.read_dG",
+                    message=f"Skipping parsed fast-equilibrium channel with invalid dG metadata ({label})",
+                    exc=exc,
+                )
+                continue
+            dg_eq_val = (
+                float(unit_conv.from_jmol(float(dg_eq_j)))
+                if unit_conv is not None
+                else float(dg_eq_j) / 1000.0
+            )
+            kf = _equilibrium_value(eq, "kf")
+            kr = _equilibrium_value(eq, "kr")
+            k_thermo = _equilibrium_value(eq, "Keq")
+            if (
+                (not math.isfinite(float(k_thermo)) or float(k_thermo) <= 0.0)
+                and temperature_k is not None
+                and math.isfinite(float(temperature_k))
+                and float(temperature_k) > 0.0
+            ):
+                try:
+                    k_thermo = float(math.exp(-float(dg_eq_j) / (float(r_j_per_mol_k) * float(temperature_k))))
+                except Exception:
+                    k_thermo = float("nan")
+            if not (
+                math.isfinite(float(kf))
+                and float(kf) > 0.0
+                and math.isfinite(float(kr))
+                and float(kr) > 0.0
+                and math.isfinite(float(k_thermo))
+                and float(k_thermo) > 0.0
+            ):
+                continue
+            try:
+                std_ratio = float(eq_meta.get("std_ratio"))
+            except Exception as exc:
+                mw._record_best_effort_failure(
+                    "main_window.energy_channels.fast_eq.std_ratio",
+                    message=f"Skipping generated fast-equilibrium channel with invalid std_ratio metadata ({label})",
+                    exc=exc,
+                )
+                continue
+            if not (math.isfinite(float(std_ratio)) and float(std_ratio) > 0.0):
+                mw._record_best_effort_failure(
+                    "main_window.energy_channels.fast_eq.std_ratio",
+                    message=f"Skipping generated fast-equilibrium channel with non-positive std_ratio metadata ({label})",
+                    exc=None,
+                )
+                continue
+            molecularity_fwd, molecularity_rev = _context_molecularity(label)
+            try:
+                molecularity_fwd = int(eq_meta.get("molecularity_fwd") or molecularity_fwd)
+            except Exception:
+                molecularity_fwd = int(molecularity_fwd)
+            try:
+                molecularity_rev = int(eq_meta.get("molecularity_rev") or molecularity_rev)
+            except Exception:
+                molecularity_rev = int(molecularity_rev)
+            unit_kf = "1/s"
+            unit_kr = "1/s"
+            try:
+                if rate_units is not None:
+                    unit_kf = str(rate_units(int(molecularity_fwd)))
+                    unit_kr = str(rate_units(int(molecularity_rev)))
+            except Exception:
                 unit_kf = "1/s"
                 unit_kr = "1/s"
-                try:
-                    if rate_units is not None:
-                        unit_kf = str(rate_units(int(molecularity_fwd)))
-                        unit_kr = str(rate_units(int(molecularity_rev)))
-                except Exception:
-                    unit_kf = "1/s"
-                    unit_kr = "1/s"
 
-                dg_eq_val = None
-                try:
-                    if tokens.get("dG_eq") is not None:
-                        dg_eq_val = float(tokens.get("dG_eq") or "")
-                except Exception:
-                    dg_eq_val = None
-
-                std_ratio = 1.0
-                try:
-                    if tokens.get("cm_std_ratio") is not None:
-                        std_ratio = float(tokens.get("cm_std_ratio") or "1.0")
-                except Exception:
-                    std_ratio = 1.0
-                k_thermo = float("nan")
-                if dg_eq_val is not None and temperature_k is not None and math.isfinite(float(temperature_k)) and float(temperature_k) > 0.0:
-                    try:
-                        dg_eq_j = (
-                            float(unit_conv.to_jmol(float(dg_eq_val)))
-                            if unit_conv is not None
-                            else float(dg_eq_val) * 1000.0
-                        )
-                        k_thermo = float(math.exp(-float(dg_eq_j) / (float(r_j_per_mol_k) * float(temperature_k))))
-                        if (
-                            tokens.get("cm_std_ratio") is None
-                            and kr_token is not None
-                            and math.isfinite(k_thermo)
-                            and k_thermo > 0.0
-                            and math.isfinite(kr_token)
-                            and kr_token > 0.0
-                        ):
-                            kc = float(kf / kr_token)
-                            std_ratio = float(kc / k_thermo)
-                    except Exception:
-                        std_ratio = 1.0
-                        k_thermo = float("nan")
-                elif (
-                    kr_token is not None
-                    and math.isfinite(kr_token)
-                    and kr_token > 0.0
-                    and temperature_k is not None
-                    and math.isfinite(float(temperature_k))
-                    and float(temperature_k) > 0.0
-                ):
-                    try:
-                        kc = float(kf / kr_token)
-                        dg_eq_j = -float(r_j_per_mol_k) * float(temperature_k) * math.log(kc)
-                        dg_eq_val = (
-                            float(unit_conv.from_jmol(float(dg_eq_j)))
-                            if unit_conv is not None
-                            else float(dg_eq_j) / 1000.0
-                        )
-                        k_thermo = float(math.exp(-float(dg_eq_j) / (float(r_j_per_mol_k) * float(temperature_k))))
-                        std_ratio = 1.0
-                    except Exception as exc:
-                        mw._record_best_effort_failure(
-                            "main_window.energy_channels.fast_eq.derive_dG_from_Kc",
-                            message="Skipping fast-equilibrium entry due to failure deriving dG_eq from Kc",
-                            exc=exc,
-                        )
-                        continue
-
-                if dg_eq_val is None:
-                    continue
-                if not (math.isfinite(float(std_ratio)) and float(std_ratio) > 0.0):
-                    std_ratio = 1.0
-                kr = float("nan")
-                if math.isfinite(k_thermo) and k_thermo > 0.0:
-                    kr = float(kf / (k_thermo * max(1e-300, float(std_ratio))))
-                elif kr_token is not None and math.isfinite(kr_token) and kr_token > 0.0:
-                    kr = float(kr_token)
-                if not (math.isfinite(kr) and kr > 0.0):
-                    continue
-
-                fast_eq_channels.append(
-                    {
-                        "kind": "fast_equilibrium",
-                        "cm_id": cm_id,
-                        "label": eqn,
-                        "dG_eq": float(dg_eq_val),
-                        "kf_fixed": float(kf),
-                        "kr": float(kr),
-                        "K_thermo": float(k_thermo),
-                        "std_ratio": float(std_ratio),
-                        "molecularity_fwd": int(molecularity_fwd),
-                        "molecularity_rev": int(molecularity_rev),
-                        "unit_kf": unit_kf,
-                        "unit_kr": unit_kr,
-                    }
-                )
+            fast_eq_channels.append(
+                {
+                    "kind": "fast_equilibrium",
+                    "cm_id": cm_id,
+                    "label": label,
+                    "dG_eq": float(dg_eq_val),
+                    "kf_fixed": float(kf),
+                    "kr": float(kr),
+                    "K_thermo": float(k_thermo),
+                    "std_ratio": float(std_ratio),
+                    "molecularity_fwd": int(max(1, int(molecularity_fwd))),
+                    "molecularity_rev": int(max(1, int(molecularity_rev))),
+                    "unit_kf": unit_kf,
+                    "unit_kr": unit_kr,
+                }
+            )
 
         fast_eq_channels.sort(key=lambda c: (str(c.get("cm_id")), str(c.get("label"))))
         all_channels = list(ts_channels) + list(fast_eq_channels)
         mw._energy_mode_channels = list(all_channels)
 
+        variables: OrderedDict[str, float] = OrderedDict()
+        vmeta: OrderedDict[str, Dict[str, object]] = OrderedDict()
+        params: Dict[str, Tuple[float, str]] = {}
+        base_meta_map = dict(base_metadata or {})
+        for raw_name, raw_value in dict(base_variables or {}).items():
+            name = str(raw_name)
+            try:
+                value = float(raw_value)
+            except Exception:
+                continue
+            meta_entry = dict(base_meta_map.get(name) or {})
+            variables[name] = value
+            vmeta[name] = meta_entry
+            params[name] = (value, str(meta_entry.get("unit") or "1"))
+
         if not all_channels:
-            mw.clear_variable_sliders()
-            mw._preview_session.sync_committed_slider_values(
-                {},
-                schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
-            )
-            self.clear_variable_metadata()
+            self.set_variable_metadata(dict(vmeta))
+            if refresh_sliders and variables:
+                mw.set_variable_sliders(
+                    dict(variables),
+                    metadata=dict(vmeta),
+                    preserve_visibility=bool(preserve_visibility),
+                    visibility_scope_signature=self._slider_visibility_scope_signature(
+                        dict(variables),
+                        dict(vmeta),
+                    ),
+                )
+                mw._preview_session.sync_committed_slider_values(
+                    dict(variables),
+                    schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
+                )
+            else:
+                mw.clear_variable_sliders()
+                mw._preview_session.sync_committed_slider_values(
+                    {},
+                    schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
+                )
+                self.clear_variable_metadata()
             mw._energy_mode_channels = []
             try:
                 plot = mw.main_plot()
                 updater = getattr(plot, "update_parameters", None)
                 if callable(updater):
-                    updater({})
+                    updater(dict(params))
             except Exception as exc:
                 logger.debug("Failed to clear plot parameter summary: %s", exc, exc_info=True)
                 mw._plot_parameter_summary_stale = True
@@ -799,10 +747,6 @@ class MainWindowVariableRuntime:
             if hi <= lo:
                 hi = lo + max(1.0, span)
             return float(lo), float(hi)
-
-        variables: OrderedDict[str, float] = OrderedDict()
-        vmeta: OrderedDict[str, Dict[str, object]] = OrderedDict()
-        params: Dict[str, Tuple[float, str]] = {}
 
         for ch in ts_channels:
             reactant = str(ch["reactant"])
@@ -851,9 +795,6 @@ class MainWindowVariableRuntime:
             params[f"k_r ({label})"] = (float(ch["kr"]), str(ch.get("unit_kr") or "1/s"))
             params[f"Keq ({label})"] = (float(ch["Keq"]), "1")
 
-        def _slug(text: str) -> str:
-            return re.sub(r"[^A-Za-z0-9_]+", "_", str(text or "").strip()).strip("_") or "fast_eq"
-
         for ch in fast_eq_channels:
             cm_id = str(ch.get("cm_id") or "")
             label = str(ch.get("label") or cm_id or "fast equilibrium")
@@ -861,7 +802,14 @@ class MainWindowVariableRuntime:
             kf_fixed = float(ch.get("kf_fixed") or float("nan"))
             std_ratio = float(ch.get("std_ratio") or 1.0)
 
-            var_eq = f"dG_eq_fast__{_slug(cm_id)}"
+            var_eq = generated_fast_equilibrium_parameter_name(
+                {
+                    "authority_source": "generated_computational_mode",
+                    "cm_id": cm_id,
+                }
+            )
+            if var_eq is None:
+                continue
             ch["var_eq"] = var_eq
 
             variables[var_eq] = dg_eq

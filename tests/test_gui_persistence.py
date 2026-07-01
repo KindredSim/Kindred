@@ -7,6 +7,7 @@ from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore, BatchSet
 from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.gui.fitting.runtime_inputs import FittingRuntimeInputs
 from kindred.gui.main_window import MainWindow
 from kindred.gui.tutorial_manager import launch_tutorial
 from kindred.gui.widgets.tutorial_overlay import TutorialOverlay
@@ -23,6 +24,24 @@ def _serialized_batch_set(project_state, name: str) -> dict:
         if entry["name"] == str(name):
             return dict(entry)
     raise AssertionError(f"Missing batch initial-condition set {name!r}")
+
+
+def _assert_latest_runtime_inputs_match_window(window, notifications) -> None:
+    assert notifications
+    runtime_inputs = notifications[-1]
+    assert isinstance(runtime_inputs, FittingRuntimeInputs)
+    assert runtime_inputs.generation > 0
+    project_state = window.serialize_project_state()
+    assert runtime_inputs.to_stamp_payload() == {
+        "evaluator": {
+            "temperature_K": float(window.temperature_spinbox_value()),
+            "use_sparse_jacobian": bool(project_state["use_sparse_jacobian"]),
+            "wegscheider_cyclicity_enabled": bool(
+                project_state["wegscheider_cyclicity_enabled"]
+            ),
+        },
+        "batch_runtime_lane_budget": int(project_state["batch_runtime_lane_budget"]),
+    }
 
 
 @pytest.fixture(scope="session")
@@ -229,6 +248,135 @@ def test_project_apply_persists_fit_runtime_settings_after_project_settings(
             "batch_runtime_lane_budget": original_lane_budget + 1,
         }
     ]
+
+
+def test_project_load_abort_after_dirty_reactions_apply_publishes_runtime_inputs(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    notifications = []
+
+    class _FitWindow:
+        def objectName(self):
+            return "fit-window"
+
+        def apply_runtime_inputs(self, *, runtime_inputs):
+            notifications.append(runtime_inputs)
+
+    main_window.fitting_runtime_input_publisher.register_window(_FitWindow())
+    monkeypatch.setattr(
+        main_window._reactions_draft_resolution_owner,
+        "_prompt_draft_decision",
+        lambda *args, **kwargs: "apply",
+    )
+    main_window._mechanism_editor.set_reactions_text("reaction: DraftA -> DraftB; k=2")
+    main_window._refresh_reactions_draft_state()
+
+    payload = dict(main_window.serialize_project_state())
+    payload["mechanism_source"] = MechanismAuthoringSource.from_parts(
+        reactions_text="\n".join(
+            [
+                "reaction: ReplacementA -> ReplacementB; k=1",
+                "set1 = {",
+                "  [ReplacementA] = 1.0",
+                "  unsupported initial condition text",
+                "}",
+            ]
+        ),
+        state_network_dsl="",
+    ).to_payload()
+    payload["batch_initial_conditions"] = BatchInitialConditionsStore().as_serializable()
+
+    with pytest.raises(ValueError, match="Initial Conditions could not be reconciled"):
+        main_window.apply_project_payload(payload, record_undo=False)
+    qt_app.processEvents()
+
+    assert main_window.mechanism_reactions_text_raw() == "reaction: DraftA -> DraftB; k=2"
+    _assert_latest_runtime_inputs_match_window(main_window, notifications)
+
+
+def test_reactions_draft_materialization_failure_publishes_committed_source(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    notifications = []
+
+    class _FitWindow:
+        def objectName(self):
+            return "fit-window"
+
+        def apply_runtime_inputs(self, *, runtime_inputs):
+            notifications.append(runtime_inputs)
+
+    main_window.fitting_runtime_input_publisher.register_window(_FitWindow())
+    main_window._mechanism_editor.set_reactions_text("reaction: DraftA -> DraftB; k=2")
+
+    def _raise_after_source_commit(*args, **kwargs):
+        raise RuntimeError("forced materialization failure")
+
+    monkeypatch.setattr(
+        main_window._initial_conditions_source_acceptance_owner,
+        "apply_prepared_plan",
+        _raise_after_source_commit,
+    )
+
+    with pytest.raises(RuntimeError, match="forced materialization failure"):
+        main_window._apply_reactions_draft_with_transition()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_reactions_text_raw() == "reaction: DraftA -> DraftB; k=2"
+    _assert_latest_runtime_inputs_match_window(main_window, notifications)
+
+
+def test_authoritative_rewrite_draft_materialization_failure_publishes_once(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    notifications = []
+
+    class _FitWindow:
+        def objectName(self):
+            return "fit-window"
+
+        def apply_runtime_inputs(self, *, runtime_inputs):
+            notifications.append(runtime_inputs)
+
+    main_window.fitting_runtime_input_publisher.register_window(_FitWindow())
+    monkeypatch.setattr(
+        main_window._reactions_draft_resolution_owner,
+        "_prompt_draft_decision",
+        lambda *args, **kwargs: "apply",
+    )
+    main_window._mechanism_editor.set_reactions_text("reaction: DraftA -> DraftB; k=2")
+    main_window._refresh_reactions_draft_state()
+
+    def _raise_after_source_commit(*args, **kwargs):
+        raise RuntimeError("forced materialization failure")
+
+    monkeypatch.setattr(
+        main_window._initial_conditions_source_acceptance_owner,
+        "apply_prepared_plan",
+        _raise_after_source_commit,
+    )
+
+    with pytest.raises(RuntimeError, match="forced materialization failure"):
+        main_window.rewrite_authoritative_mechanism_source(
+            action_label="Rewrite after draft",
+            description="Rewrite after draft",
+            build_source=lambda source: source.with_reactions_text(
+                "reaction: RewriteA -> RewriteB; k=3"
+            ),
+            record_undo=False,
+            transition_source="test_rewrite_after_draft",
+        )
+    qt_app.processEvents()
+
+    assert main_window.mechanism_reactions_text_raw() == "reaction: DraftA -> DraftB; k=2"
+    assert len(notifications) == 1
+    _assert_latest_runtime_inputs_match_window(main_window, notifications)
 
 
 def test_invalid_project_mechanism_source_is_rejected_without_changing_project_state(

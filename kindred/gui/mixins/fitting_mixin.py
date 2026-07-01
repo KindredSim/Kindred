@@ -348,19 +348,103 @@ class FittingMixin:
             if source_text is not None
             else str(get_canonical_reactions() or "")
         )
+        normalized_parameters = {str(name): value for name, value in dict(parameters or {}).items()}
+        generated_fast_metadata = self._fit_generated_fast_parameter_metadata(current_text)
+        generated_fast_parameters = {
+            str(name): value
+            for name, value in normalized_parameters.items()
+            if str(name) in generated_fast_metadata
+        }
+        ordinary_parameters = {
+            str(name): value
+            for name, value in normalized_parameters.items()
+            if str(name) not in generated_fast_parameters
+        }
         analysis = analyze_parameter_updates_to_dsl_text(
             current_text,
-            parameters,
+            ordinary_parameters,
             authoritative_values=self._current_fit_authoritative_parameter_values(),
             step_constraint_context=self._current_fit_step_constraint_context(),
         )
+        updated_text = str(analysis.updated_text)
+        missing = list(analysis.missing)
+        update_errors = [dict(error) for error in analysis.update_errors]
+        if generated_fast_parameters:
+            generated_writer = getattr(self, "_apply_energy_overrides_to_computational_mode_fast_equilibria", None)
+            if callable(generated_writer):
+                before_generated = updated_text
+                updated_text = str(
+                    generated_writer(
+                        updated_text,
+                        overrides=generated_fast_parameters,
+                        override_metadata=generated_fast_metadata,
+                    )
+                )
+                for name, value in generated_fast_parameters.items():
+                    current_value = generated_fast_metadata.get(name, {}).get("value")
+                    if (
+                        updated_text == before_generated
+                        and current_value is not None
+                        and not authoritative_parameter_values_match(current_value, value)
+                    ):
+                        missing.append(str(name))
+            else:
+                missing.extend(str(name) for name in generated_fast_parameters)
         return {
             "current_text": current_text,
-            "updated_text": analysis.updated_text,
-            "missing": list(analysis.missing),
-            "update_errors": [dict(error) for error in analysis.update_errors],
+            "updated_text": updated_text,
+            "missing": missing,
+            "update_errors": update_errors,
             "step_outcomes": tuple(analysis.step_outcomes),
         }
+
+    @staticmethod
+    def _fit_generated_fast_parameter_metadata(source_text: str) -> Dict[str, Dict[str, object]]:
+        try:
+            from kindred.core.mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
+            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+            from kindred.core.simulator.parameter_namespace import generated_fast_equilibrium_parameter_name
+            from kindred.core.units import UnitsModel
+
+            mechanism = parse_dsl_to_mechanism(str(source_text or ""), initials={})
+        except Exception:
+            return {}
+        metadata_by_name: Dict[str, Dict[str, object]] = {}
+        mechanism_meta = getattr(mechanism, "metadata", {}) or {}
+        energy_unit = str(
+            mechanism_meta.get(MechanismMetadataKeys.ENERGY_UNIT)
+            if isinstance(mechanism_meta, dict)
+            else "kJ/mol"
+        ) or "kJ/mol"
+        unit_conv = UnitsModel(energy_unit=energy_unit)
+        for eq in list(getattr(mechanism, "equilibria", []) or []):
+            metadata = dict(getattr(eq, "metadata", {}) or {})
+            name = generated_fast_equilibrium_parameter_name(metadata)
+            if name is None:
+                continue
+            try:
+                dG_eq_j = float(metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
+                value = float(unit_conv.from_jmol(dG_eq_j))
+            except Exception:
+                continue
+            try:
+                kf_fixed = float(getattr(eq, "kf"))
+            except Exception:
+                kf_fixed = metadata.get("kf")
+            try:
+                std_ratio = float(metadata.get("std_ratio"))
+            except Exception:
+                std_ratio = metadata.get("std_ratio")
+            metadata_by_name[str(name)] = {
+                "type": "energy",
+                "role": "dG_eq_fast",
+                "cm_id": str(metadata.get("cm_id") or ""),
+                "unit": energy_unit,
+                "kf_fixed": kf_fixed,
+                "std_ratio": std_ratio,
+                "value": value,
+            }
+        return metadata_by_name
 
     def _current_fit_authoritative_parameter_values(self) -> Dict[str, float]:
         preview_session = getattr(self, "_preview_session", None)

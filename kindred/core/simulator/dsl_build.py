@@ -228,6 +228,10 @@ def build_mechanism_from_ir(
             entry.update(authority.step_map_fields())
             entry["user_provided_kf"] = bool(getattr(step, "user_kf_explicit", False))
             entry["user_provided_kr"] = bool(getattr(step, "user_kr_explicit", False))
+            if str(eq_metadata.get("authority_source") or ""):
+                entry["authority_source"] = str(eq_metadata["authority_source"])
+            if str(eq_metadata.get("cm_id") or ""):
+                entry["cm_id"] = str(eq_metadata["cm_id"])
         else:
             entry["reaction_index"] = int(rxn_index)
         step_index_map.append(entry)

@@ -8,6 +8,7 @@ from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import (
     MechanismParameterNamespace,
+    is_reserved_generated_fast_equilibrium_parameter_name,
     is_protected_indexed_identifier,
 )
 
@@ -130,6 +131,23 @@ def _raise_protected_step_key_identifier_error(
         suggestion=(
             "Use a canonical indexed mechanism parameter such as k1, kf1, kr1, or Keq1, "
             "or choose a longer ordinary name such as 'K1_test'."
+        ),
+        line_number=line_number,
+        line_content=line_content,
+    )
+
+
+def _raise_reserved_generated_fast_identifier_error(
+    raw_name: str,
+    *,
+    line_number: int,
+    line_content: str,
+) -> None:
+    raise DSLError(
+        f"{raw_name!r} is a reserved generated fast-equilibrium parameter name.",
+        suggestion=(
+            "Generated fast-equilibrium dG parameters are owned by Computational Mode metadata. "
+            "Choose a scalar/observable name outside the 'dG_eq_fast__' namespace."
         ),
         line_number=line_number,
         line_content=line_content,
@@ -397,6 +415,12 @@ def extract_parameter_assignments_from_algebra_lines(
 
         if classification.kind == "param":
             raw_name = classification.raw_name
+            if is_reserved_generated_fast_equilibrium_parameter_name(raw_name):
+                _raise_reserved_generated_fast_identifier_error(
+                    raw_name,
+                    line_number=line_no,
+                    line_content=original,
+                )
             resolution = mechanism_namespace.resolve(raw_name)
             if classification.invalid_protected_indexed_identifier:
                 _raise_invalid_protected_indexed_identifier_error(
@@ -450,6 +474,12 @@ def extract_parameter_assignments_from_algebra_lines(
 
         if classification.kind == "let":
             target_raw = classification.raw_name
+            if is_reserved_generated_fast_equilibrium_parameter_name(target_raw):
+                _raise_reserved_generated_fast_identifier_error(
+                    target_raw,
+                    line_number=line_no,
+                    line_content=original,
+                )
             resolution = mechanism_namespace.resolve(target_raw)
             target = resolution.canonical_name or target_raw
             if resolution.canonical_name is not None and target in mechanism_param_names:
@@ -502,6 +532,12 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
         if classification.kind == "param":
             continue
         if classification.kind == "let":
+            if is_reserved_generated_fast_equilibrium_parameter_name(classification.raw_name):
+                _raise_reserved_generated_fast_identifier_error(
+                    classification.raw_name,
+                    line_number=_line_no,
+                    line_content=raw.rstrip("\n"),
+                )
             if is_protected_indexed_parameter_identifier(classification.raw_name):
                 _raise_protected_observable_identifier_error(
                     classification.raw_name,

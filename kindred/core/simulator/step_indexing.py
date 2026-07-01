@@ -82,6 +82,10 @@ def lookup_step_param_target(
     m = _CANON_PARAM_RE.match(str(name))
     if not m:
         return None
+    namespace = build_namespace_from_mechanism(mechanism)
+    resolution = namespace.resolve(str(name))
+    if resolution.canonical_name is None or str(resolution.canonical_name) != str(name):
+        return None
     role = m.group(1)
     step_no, ok = try_parse_int(m.group(2))
     if not ok:

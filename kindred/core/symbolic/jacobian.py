@@ -10,12 +10,14 @@ from kindred.core.mechanism import Equilibrium, Mechanism, Reaction
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
+    EquilibriumRateInputContext,
     effective_reverse_rate_from_keq,
     normalize_existing_equilibrium_rate_authority,
 )
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
     canonical_name_for_mechanism_step_parameter,
+    generated_fast_equilibrium_parameter_name,
 )
 
 from .artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR, SymbolicArtifactIdentity
@@ -120,11 +122,13 @@ class _EquilibriumRateSource:
     kf: object | None
     kr: object | None
     keq: object | None
-    kf_name: str
-    kr_name: str
-    keq_name: str
+    kf_name: str | None
+    kr_name: str | None
+    keq_name: str | None
     reverse_std_ratio: float = 1.0
     reverse_authority: str = "keq"
+    symbolic_parameterized: bool = True
+    generated_parameter_name: str | None = None
 
 
 class _ParameterRegistry:
@@ -301,6 +305,40 @@ def _equilibrium_rate_source(
     kf = getattr(eq, "kf", None)
     kr = getattr(eq, "kr", None)
     keq = _explicit_keq_source(eq)
+    meta = getattr(eq, "metadata", {}) or {}
+    if isinstance(meta, Mapping) and (
+        str(meta.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
+    ):
+        generated_name = generated_fast_equilibrium_parameter_name(meta)
+        reverse_authority = "keq" if keq is not None else "kr"
+        try:
+            authority = normalize_existing_equilibrium_rate_authority(eq)
+        except ValueError:
+            authority = None
+        if authority is not None and authority.kind == EquilibriumRateAuthorityKind.KR:
+            keq = None
+            reverse_authority = "kr"
+        elif authority is not None and authority.kind == EquilibriumRateAuthorityKind.KEQ:
+            keq = authority.Keq
+            reverse_authority = "keq"
+        try:
+            reverse_std_ratio = float(authority.reverse_std_ratio) if authority is not None else 1.0
+        except Exception:
+            reverse_std_ratio = 1.0
+        if not math.isfinite(reverse_std_ratio) or reverse_std_ratio <= 0.0:
+            reverse_std_ratio = 1.0
+        return _EquilibriumRateSource(
+            kf=kf,
+            kr=kr,
+            keq=keq,
+            kf_name=None,
+            kr_name=None,
+            keq_name=None,
+            reverse_std_ratio=reverse_std_ratio,
+            reverse_authority=reverse_authority,
+            symbolic_parameterized=False,
+            generated_parameter_name=generated_name,
+        )
     kf_name = _canonical_step_parameter_name(
         mechanism,
         kind="equilibrium",
@@ -364,12 +402,14 @@ def _equilibrium_rates(
 ) -> tuple[Any, Any]:
     source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
     kf_value, kr_value, keq_value = _equilibrium_parameter_value_triad(source)
-    kf_symbol = registry.parameter(kf_value, label="equilibrium kf", default_name=source.kf_name)
+    if not source.symbolic_parameterized:
+        return float(kf_value), float(kr_value)
+    kf_symbol = registry.parameter(kf_value, label="equilibrium kf", default_name=str(source.kf_name or ""))
     if source.reverse_authority == "kr":
-        kr_symbol = registry.parameter(kr_value, label="equilibrium kr", default_name=source.kr_name)
+        kr_symbol = registry.parameter(kr_value, label="equilibrium kr", default_name=str(source.kr_name or ""))
         return kf_symbol, kr_symbol
-    registry.parameter(kr_value, label="equilibrium kr", default_name=source.kr_name)
-    keq_symbol = registry.parameter(keq_value, label="equilibrium Keq", default_name=source.keq_name)
+    registry.parameter(kr_value, label="equilibrium kr", default_name=str(source.kr_name or ""))
+    keq_symbol = registry.parameter(keq_value, label="equilibrium Keq", default_name=str(source.keq_name or ""))
     return kf_symbol, effective_reverse_rate_from_keq(
         kf_symbol,
         keq_symbol,
@@ -434,13 +474,18 @@ def _positive_reverse_std_ratio(value: object) -> float:
 
 
 def _equilibrium_parameter_value_triad(source: _EquilibriumRateSource) -> tuple[float, float, float]:
-    kf_value = _finite_scalar(source.kf, label=f"symbolic parameter {source.kf_name}")
+    kf_label = source.kf_name or source.generated_parameter_name or "generated computational-mode equilibrium kf"
+    kr_label = source.kr_name or source.generated_parameter_name or "generated computational-mode equilibrium kr"
+    keq_label = source.keq_name or source.generated_parameter_name or "generated computational-mode equilibrium Keq"
+    kf_value = _finite_scalar(source.kf, label=f"symbolic parameter {kf_label}")
     reverse_std_ratio = _positive_reverse_std_ratio(source.reverse_std_ratio)
     kr_value = _symbolic_snapshot_scalar_value(source.kr) if source.kr is not None else None
     keq_value = _symbolic_snapshot_scalar_value(source.keq) if source.keq is not None else None
 
     if source.keq is not None and keq_value is None:
-        raise UnsupportedSymbolicExpressionError("equilibrium Keq input must be finite for symbolic Jacobian.")
+        raise UnsupportedSymbolicExpressionError(
+            f"equilibrium Keq input {keq_label} must be finite for symbolic Jacobian."
+        )
     if keq_value is not None:
         if keq_value <= 0.0:
             raise UnsupportedSymbolicExpressionError("equilibrium Keq must be positive.")
@@ -449,7 +494,9 @@ def _equilibrium_parameter_value_triad(source: _EquilibriumRateSource) -> tuple[
 
     if kr_value is None:
         if source.kr is not None:
-            raise UnsupportedSymbolicExpressionError("equilibrium kr input must be finite for symbolic Jacobian.")
+            raise UnsupportedSymbolicExpressionError(
+                f"equilibrium kr input {kr_label} must be finite for symbolic Jacobian."
+            )
         raise UnsupportedSymbolicExpressionError(
             "Symbolic Jacobian requires finite equilibrium kf plus finite kr or Keq."
         )
@@ -586,6 +633,7 @@ def _structure_identity_payload(
                 "kf_parameter": source.kf_name,
                 "kr_parameter": source.kr_name,
                 "keq_parameter": source.keq_name,
+                "generated_parameter": source.generated_parameter_name,
                 "reverse_authority": source.reverse_authority,
                 "reverse_std_ratio": source.reverse_std_ratio,
             }
@@ -615,10 +663,12 @@ def _symbolic_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
     for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
         source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
         _equilibrium_parameter_value_triad(source)
+        if not source.symbolic_parameterized:
+            continue
         if source.reverse_authority == "kr":
-            parameter_names.update((source.kf_name, source.kr_name))
+            parameter_names.update((str(source.kf_name), str(source.kr_name)))
         else:
-            parameter_names.update((source.kf_name, source.kr_name, source.keq_name))
+            parameter_names.update((str(source.kf_name), str(source.kr_name), str(source.keq_name)))
     return tuple(sorted(parameter_names))
 
 
@@ -641,9 +691,11 @@ def _parameter_values_for_mechanism(
     for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
         source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
         kf_value, kr_value, keq_value = _equilibrium_parameter_value_triad(source)
-        values[source.kf_name] = float(kf_value)
-        values[source.kr_name] = float(kr_value)
-        values[source.keq_name] = float(keq_value)
+        if not source.symbolic_parameterized:
+            continue
+        values[str(source.kf_name)] = float(kf_value)
+        values[str(source.kr_name)] = float(kr_value)
+        values[str(source.keq_name)] = float(keq_value)
 
     out: dict[str, float] = {}
     for name in parameter_symbols:

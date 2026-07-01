@@ -4,11 +4,15 @@ from dataclasses import dataclass
 import re
 from typing import Iterable, Iterator, Mapping, Sequence
 
-from kindred.core.equilibrium_rate_authority import authority_fields_from_step_entry
+from kindred.core.equilibrium_rate_authority import (
+    EquilibriumRateInputContext,
+    authority_fields_from_step_entry,
+)
 from kindred.core.validation import try_parse_int
 
 _CANONICAL_NAME_RE = re.compile(r"^(k|kf|kr|Keq)([1-9]\d*)$")
 _PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:K|k|kf|kr|Keq)([1-9]\d*)$", re.IGNORECASE)
+GENERATED_FAST_EQUILIBRIUM_PARAMETER_PREFIX = "dG_eq_fast__"
 
 
 @dataclass(frozen=True)
@@ -111,18 +115,36 @@ class MechanismParameterNamespace:
         )
 
 
+def generated_fast_equilibrium_parameter_name(metadata: Mapping[str, object]) -> str | None:
+    if (
+        str(metadata.get("authority_source") or "")
+        != EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
+    ):
+        return None
+    cm_id = str(metadata.get("cm_id") or "").strip()
+    if not cm_id:
+        return None
+    return f"dG_eq_fast__{cm_id}"
+
+
+def is_reserved_generated_fast_equilibrium_parameter_name(raw_name: str) -> bool:
+    return str(raw_name or "").strip().startswith(GENERATED_FAST_EQUILIBRIUM_PARAMETER_PREFIX)
+
+
 @dataclass(frozen=True)
 class _NamespaceStepDescriptor:
     step_index: int
     step_kind: str
     has_explicit_keq: bool
     source_index: int | None = None
+    generated_computational_mode: bool = False
 
 
 @dataclass(frozen=True)
 class _StepNamespacePolicy:
     step_kind: str
     has_explicit_keq: bool
+    generated_computational_mode: bool = False
 
 
 def is_protected_indexed_identifier(raw_name: str) -> bool:
@@ -160,6 +182,8 @@ def _iter_canonical_items(
     descriptors: Sequence[_NamespaceStepDescriptor],
 ) -> Iterator[MechanismParameterNamespaceItem]:
     for descriptor in descriptors:
+        if bool(descriptor.generated_computational_mode):
+            continue
         step_index = int(descriptor.step_index)
         step_kind = str(descriptor.step_kind)
         if step_kind == "reaction":
@@ -242,6 +266,7 @@ def _namespace_policy_from_step(step: object) -> _StepNamespacePolicy:
     return _StepNamespacePolicy(
         step_kind="equilibrium" if is_equilibrium_step else "reaction",
         has_explicit_keq=bool(getattr(step, "Keq_input", None) is not None),
+        generated_computational_mode=bool(getattr(step, "generated_computational_mode", False)),
     )
 
 
@@ -269,6 +294,7 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
         if step_kind not in {"reaction", "equilibrium"}:
             raise ValueError(f"Mechanism step_index_map entry {source_index} has an invalid kind {step_kind!r}.")
         has_explicit_keq = False
+        generated_computational_mode = False
         if step_kind == "equilibrium":
             authority = authority_fields_from_step_entry(raw_entry)
             if not authority:
@@ -276,12 +302,17 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
                     f"Mechanism equilibrium step_index_map entry {source_index} is missing equilibrium_authority."
                 )
             has_explicit_keq = bool(authority.get("has_explicit_keq_param"))
+            generated_computational_mode = (
+                str(raw_entry.get("authority_source") or "")
+                == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
+            )
         descriptors.append(
             _NamespaceStepDescriptor(
                 step_index=step_index,
                 step_kind=step_kind,
                 has_explicit_keq=has_explicit_keq,
                 source_index=source_index,
+                generated_computational_mode=bool(generated_computational_mode),
             )
         )
     return descriptors
@@ -353,6 +384,7 @@ def build_namespace_from_ir_steps(steps: Sequence[object]) -> MechanismParameter
                 step_index=step_index,
                 step_kind=policy.step_kind,
                 has_explicit_keq=policy.has_explicit_keq,
+                generated_computational_mode=policy.generated_computational_mode,
             )
         )
     return _build_namespace(descriptors)

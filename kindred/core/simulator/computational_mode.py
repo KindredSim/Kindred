@@ -604,6 +604,7 @@ def compile_comp_spec(spec: CompSpec, *, output_energy_unit: str = "kJ/mol") -> 
     state_deg: Dict[str, float] = {}
 
     equilibrium_lines: List[str] = []
+    generated_fast_cm_ids: set[str] = set()
 
     def _ensure_gs_state(stoich: Dict[str, int]) -> str:
         key = _canonical_side(stoich)
@@ -698,6 +699,12 @@ def compile_comp_spec(spec: CompSpec, *, output_energy_unit: str = "kJ/mol") -> 
                 return " + ".join(out)
 
             cm_id = f"feq__{_canonical_side(rxn.reactants)}__{_canonical_side(rxn.products)}"
+            if cm_id in generated_fast_cm_ids:
+                raise ValueError(
+                    f"duplicate generated fast-equilibrium cm_id {cm_id!r}; "
+                    "Computational Mode fast equilibria must have unique reactant/product sides."
+                )
+            generated_fast_cm_ids.add(cm_id)
             dG_eq_out = float(out_units.from_jmol(float(dG_eq)))
             equilibrium_lines.append(
                 "equilibrium: "

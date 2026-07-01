@@ -10,7 +10,10 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+from kindred.core.simulator.parameter_namespace import (
+    build_namespace_from_mechanism,
+    generated_fast_equilibrium_parameter_name,
+)
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
@@ -645,17 +648,35 @@ class ParametersIcsTab(QtWidgets.QWidget):
     # Parameter table
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _allows_parameter_fitting(entry: Dict[str, Any]) -> bool:
+        editable = entry.get("editable", True)
+        if editable is None:
+            return True
+        return bool(editable)
+
+    def _shared_definition_allows_fitting(self, name: str) -> bool:
+        definition = dict(getattr(self, "_shared_param_definitions", {}).get(str(name)) or {})
+        return self._allows_parameter_fitting(definition)
+
     def _populate_parameter_table(self) -> None:
         self._param_table.blockSignals(True)
         self._param_table.setRowCount(len(self._parameter_state))
         for row, entry in enumerate(self._parameter_state):
+            row_allows_fitting = self._allows_parameter_fitting(entry)
             check_item = QtWidgets.QTableWidgetItem()
-            check_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            check_item.setCheckState(Qt.Checked if entry.get("fit", True) else Qt.Unchecked)
+            check_flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+            if row_allows_fitting:
+                check_flags |= Qt.ItemIsUserCheckable
+            check_item.setFlags(check_flags)
+            check_item.setCheckState(Qt.Checked if row_allows_fitting and entry.get("fit", True) else Qt.Unchecked)
             self._param_table.setItem(row, 0, check_item)
             log_item = QtWidgets.QTableWidgetItem()
-            log_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            log_item.setCheckState(Qt.Checked if entry.get("log10", False) else Qt.Unchecked)
+            log_flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+            if row_allows_fitting:
+                log_flags |= Qt.ItemIsUserCheckable
+            log_item.setFlags(log_flags)
+            log_item.setCheckState(Qt.Checked if row_allows_fitting and entry.get("log10", False) else Qt.Unchecked)
             self._param_table.setItem(row, 1, log_item)
             name_item = QtWidgets.QTableWidgetItem(str(entry["name"]))
             name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -663,12 +684,18 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._param_table.setItem(row, 2, name_item)
             value_item = QtWidgets.QTableWidgetItem(f"{entry['value']:.6g}")
             value_item.setTextAlignment(Qt.AlignCenter)
+            if not row_allows_fitting:
+                value_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self._param_table.setItem(row, 3, value_item)
             min_item = QtWidgets.QTableWidgetItem(f"{entry['min']:.6g}")
             min_item.setTextAlignment(Qt.AlignCenter)
+            if not row_allows_fitting:
+                min_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self._param_table.setItem(row, 4, min_item)
             max_item = QtWidgets.QTableWidgetItem(f"{entry['max']:.6g}")
             max_item.setTextAlignment(Qt.AlignCenter)
+            if not row_allows_fitting:
+                max_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self._param_table.setItem(row, 5, max_item)
             last = entry.get("last_fit")
             display = "—" if last is None else f"{last:.6g}"
@@ -725,6 +752,17 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if not (0 <= row < len(self._parameter_state)):
             return
         entry = self._parameter_state[row]
+        row_allows_fitting = self._allows_parameter_fitting(entry)
+        if not row_allows_fitting:
+            entry["fit"] = False
+            entry["log10"] = False
+            if col in {0, 1} and item.checkState() != Qt.Unchecked:
+                self._param_table.blockSignals(True)
+                try:
+                    item.setCheckState(Qt.Unchecked)
+                finally:
+                    self._param_table.blockSignals(False)
+            return
         if col == 0:
             fit_flag = item.checkState() == Qt.Checked
             entry["fit"] = bool(fit_flag)
@@ -887,8 +925,16 @@ class ParametersIcsTab(QtWidgets.QWidget):
         try:
             mechanism = parse_dsl_to_mechanism(mechanism_text, initials={})
             step_map = get_step_index_map(mechanism)
+            namespace = build_namespace_from_mechanism(mechanism)
         except Exception as exc:
             return f"Mechanism steps are unavailable until the mechanism source parses.\n\n{exc}"
+
+        names_by_step: dict[int, list[str]] = {}
+        for item in namespace.ordered_items:
+            step_index = item.info.step_index
+            if step_index is None:
+                continue
+            names_by_step.setdefault(int(step_index), []).append(str(item.canonical_name))
 
         lines: list[str] = ["Mechanism Steps", ""]
         if not step_map:
@@ -902,17 +948,26 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 context = str(entry.get("context") or "").strip()
                 if not context:
                     context = str(entry.get("kind") or "step")
-                lines.append(f"Step {step_index}    {context}")
+                generated_name = generated_fast_equilibrium_parameter_name(entry)
+                parameter_names = tuple(names_by_step.get(int(step_index)) or ())
+                if generated_name:
+                    lines.append(f"Step {step_index}    {context}    parameter: {generated_name}")
+                elif parameter_names:
+                    lines.append(f"Step {step_index}    {context}    parameters: {', '.join(parameter_names)}")
+                else:
+                    lines.append(f"Step {step_index}    {context}")
 
         lines.extend(
             [
                 "",
-                "Parameter names use the step number: kN, kfN, krN, and KeqN refer to Step N.",
+                "Only listed parameter names are editable for fitting.",
             ]
         )
         return "\n".join(lines)
 
     def _add_rate_parameter(self, name: str) -> None:
+        if not self._shared_definition_allows_fitting(name):
+            return
         present = {
             str(entry.get("param_name") or "")
             for entry in self._parameter_state
@@ -1216,7 +1271,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
             if scope == "shared":
                 param_name = str(entry.get("param_name") or "")
                 if update_fixed and param_name:
-                    if param_name.startswith(INITIAL_PREFIX):
+                    if not self._allows_parameter_fitting(entry):
+                        self._fixed_shared_params.pop(param_name, None)
+                    elif param_name.startswith(INITIAL_PREFIX):
                         # Shared "init:*" is only used when explicitly fittable; when removed, fall back
                         # to per-dataset fixed initials and allow re-adding.
                         self._fixed_shared_params.pop(param_name, None)
@@ -1253,11 +1310,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
             name
             for name in (getattr(self, "_shared_param_definitions", {}) or {}).keys()
             if name and not str(name).startswith(INITIAL_PREFIX) and not _is_scalar(str(name))
+            and self._shared_definition_allows_fitting(str(name))
         }
         candidates |= {
             str(k)
             for k in (self._fixed_shared_params or {}).keys()
             if str(k) and not str(k).startswith(INITIAL_PREFIX) and not _is_scalar(str(k))
+            and self._shared_definition_allows_fitting(str(k))
         }
         remaining = sorted({name for name in candidates if name and name not in present})
         return remaining
@@ -1417,7 +1476,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         for entry in self._parameter_state:
             if entry.get("scope") == "shared":
                 name = entry["param_name"]
-                if name in self._last_fit_params:
+                if name in self._last_fit_params and self._allows_parameter_fitting(entry):
                     entry["value"] = float(self._last_fit_params[name])
                     entry["fit"] = True
                     entry["last_fit"] = self._last_fit_params[name]
@@ -1449,7 +1508,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
         parameters: Dict[str, float] = {}
         bounds: Dict[str, Tuple[float, float]] = {}
         log10_params: Dict[str, bool] = {}
-        fixed_params: Dict[str, float] = dict(self.get_fixed_shared_params() or {})
+        fixed_params: Dict[str, float] = {
+            str(name): value
+            for name, value in (self.get_fixed_shared_params() or {}).items()
+            if self._shared_definition_allows_fitting(str(name))
+        }
         global_dataset_params = self.get_global_dataset_params()
         global_dataset_variable_params = self.get_global_dataset_variable_params()
         parameter_state = self.get_parameter_state()
@@ -1508,6 +1571,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 )
                 return None
             scope = str(entry.get("scope") or "shared")
+            row_allows_fitting = self._allows_parameter_fitting(entry)
+            if not row_allows_fitting:
+                fit_flag = False
+                log10_flag = False
             updated = dict(entry)
             updated["value"] = value
             updated["min"] = min_val
@@ -1521,7 +1588,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     parameters[param_name] = value
                     bounds[param_name] = (min_val, max_val)
                     log10_params[param_name] = bool(log10_flag)
-                else:
+                elif row_allows_fitting:
                     fixed_params[param_name] = value
             elif scope == "dataset":
                 ds_id = str(entry.get("dataset_id") or "")
@@ -1591,6 +1658,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             min_bound = float(definition.get("min", value * 0.1 if value else -10.0))
             max_bound = float(definition.get("max", value * 10.0 if value else 10.0))
             self._shared_param_definitions[name] = dict(definition)
+            editable = ParametersIcsTab._allows_parameter_fitting(definition)
             state.append(
                 {
                     "scope": "shared",
@@ -1600,8 +1668,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     "value": value,
                     "min": min_bound,
                     "max": max_bound,
-                    "fit": True,
+                    "fit": editable,
                     "log10": False,
+                    "editable": editable,
                     "last_fit": None,
                 }
             )
@@ -1873,8 +1942,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
                             merged[field] = float(previous.get(field, row.get(field)))
                         except (TypeError, ValueError):
                             merged[field] = float(row.get(field, 0.0))
-                    merged["fit"] = bool(previous.get("fit", True))
-                    merged["log10"] = bool(previous.get("log10", False))
+                    row_allows_fitting = self._allows_parameter_fitting(row)
+                    merged["fit"] = bool(previous.get("fit", True)) if row_allows_fitting else False
+                    merged["log10"] = bool(previous.get("log10", False)) if row_allows_fitting else False
                     merged["last_fit"] = previous.get("last_fit")
                     row = merged
                 merged_shared_names.add(param_name)

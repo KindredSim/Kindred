@@ -113,11 +113,15 @@ def build_ode_rhs_from_mechanism(
         return None
 
     def _compute_equilibrium_constant(meta: Dict[str, object], eq_obj: Equilibrium, T: float) -> Optional[float]:
+        keq_input = meta.get("Keq_input")
+        if callable(keq_input):
+            val = _evaluate_scalar(keq_input)
+            return float(val) if val is not None else None
         if meta.get("dG_eq_J_per_mol") is not None:
             val = _evaluate_scalar(meta["dG_eq_J_per_mol"])
             return K_from_deltaG_eq(float(val), T) if val is not None else None
-        if meta.get("Keq_input") is not None:
-            val = _evaluate_scalar(meta["Keq_input"])
+        if keq_input is not None:
+            val = _evaluate_scalar(keq_input)
             return float(val) if val is not None else None
         if eq_obj.Keq is not None:
             val = _evaluate_scalar(eq_obj.Keq)

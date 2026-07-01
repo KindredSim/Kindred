@@ -36,9 +36,7 @@ from typing import Dict, List, Optional, Tuple, cast, TYPE_CHECKING
 import re
 
 from ..equilibrium_rate_authority import (
-    derive_generated_computational_std_ratio_from_legacy_kr,
     effective_reverse_rate_from_keq,
-    validate_generated_computational_legacy_kr,
     validate_equilibrium_rate_authority_flags,
 )
 from ..units import UnitsModel
@@ -475,6 +473,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
     lines = [ln.rstrip() for ln in raw_lines]
     in_generated_computational_mode_block = False
+    generated_computational_mode_cm_ids: set[str] = set()
     for line_no, raw in enumerate(lines, start=1):
         line = raw.strip()
         lower = line.lower()
@@ -641,18 +640,26 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         # equilibrium: line
         if lower.startswith("equilibrium:"):
             _, rest = line.split(":", 1)
-            steps.append(
-                _parse_equilibrium_step(
-                    rest,
-                    energy_unit=energy_unit,
-                    T=temperature_K,
-                    C0=standard_conc_M,
-                    kappa_global=kappa_global,
-                    line_number=line_no,
-                    line_content=raw,
-                    generated_computational_mode=in_generated_computational_mode_block,
-                )
+            parsed_step = _parse_equilibrium_step(
+                rest,
+                energy_unit=energy_unit,
+                T=temperature_K,
+                C0=standard_conc_M,
+                kappa_global=kappa_global,
+                line_number=line_no,
+                line_content=raw,
+                generated_computational_mode=in_generated_computational_mode_block,
             )
+            if bool(in_generated_computational_mode_block):
+                cm_id = str(getattr(parsed_step, "cm_id", "") or "").strip()
+                if cm_id in generated_computational_mode_cm_ids:
+                    raise DSLError(
+                        f"duplicate generated Computational Mode cm_id {cm_id!r}; generated fast equilibria must have unique cm_id values.",
+                        line_number=line_no,
+                        line_content=raw,
+                    )
+                generated_computational_mode_cm_ids.add(cm_id)
+            steps.append(parsed_step)
             continue
 
         # Fallback: Try to parse as bare arrow syntax (no "reaction:" or "equilibrium:" prefix)
@@ -1355,10 +1362,28 @@ def _parse_equilibrium_step(
         _validate_rate_or_K(Keq, "Keq", line_number=line_number, line_content=line_content)
     dG_eqJ = None
     has_cm_generated_identity = bool(str(params.get("cm_id") or "").strip())
-    has_cm_generated_authority = bool(has_cm_generated_identity and generated_computational_mode)
+    has_cm_generated_authority = bool(generated_computational_mode)
     if (has_cm_generated_identity or params.get("cm_std_ratio") is not None) and not generated_computational_mode:
         raise DSLError(
             "Computational Mode generated equilibrium fields are only valid inside the generated Computational Mode block",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    if has_cm_generated_authority and not has_cm_generated_identity:
+        raise DSLError(
+            "generated Computational Mode cm_id is required for generated fast equilibria.",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    if has_cm_generated_authority and has_explicit_Keq:
+        raise DSLError(
+            "generated Computational Mode Keq is not accepted; generated fast equilibria must use kf with dG_eq, cm_id, and cm_std_ratio.",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    if has_cm_generated_authority and not has_explicit_dG_eq:
+        raise DSLError(
+            "generated Computational Mode dG_eq is required for generated fast equilibria.",
             line_number=line_number,
             line_content=line_content,
         )
@@ -1379,12 +1404,17 @@ def _parse_equilibrium_step(
             raise DSLError("kr must be numeric", line_number=line_number, line_content=line_content)
         _validate_rate_or_K(krv, "kr", line_number=line_number, line_content=line_content)
         kr_explicit = krv
-        if not has_cm_generated_authority:
-            exp_rates.append(krv)
+        if has_cm_generated_authority:
+            raise DSLError(
+                "generated Computational Mode kr is not accepted; generated fast equilibria must use kf with dG_eq and cm_std_ratio.",
+                line_number=line_number,
+                line_content=line_content,
+            )
+        exp_rates.append(krv)
 
     _validate_equilibrium_rate_authority_for_dsl(
         has_kf=kf_explicit is not None,
-        has_kr=(kr_explicit is not None and not has_cm_generated_authority),
+        has_kr=kr_explicit is not None,
         has_Keq=has_explicit_Keq,
         has_dG_eq=has_explicit_dG_eq,
         line_number=line_number,
@@ -1411,6 +1441,12 @@ def _parse_equilibrium_step(
         cm_std_ratio = _float_or_none(params.get("cm_std_ratio"))
         if cm_std_ratio is None or cm_std_ratio <= 0.0:
             raise DSLError("cm_std_ratio must be positive and numeric", line_number=line_number, line_content=line_content)
+    if has_cm_generated_authority and cm_std_ratio is None:
+        raise DSLError(
+            "generated Computational Mode cm_std_ratio is required for generated fast equilibria.",
+            line_number=line_number,
+            line_content=line_content,
+        )
 
     fe = _derive_equilibrium_rates_with_context(
         Keq=Keq,
@@ -1420,45 +1456,6 @@ def _parse_equilibrium_step(
         line_number=line_number,
         line_content=line_content,
     )
-    if (
-        has_cm_generated_authority
-        and cm_std_ratio is None
-        and dG_eqJ is not None
-        and kf_explicit is not None
-        and kr_explicit is not None
-    ):
-        try:
-            cm_std_ratio = derive_generated_computational_std_ratio_from_legacy_kr(
-                kf=float(kf_explicit),
-                kr=float(kr_explicit),
-                Keq=float(fe.Keq),
-            )
-        except ValueError as exc:
-            raise DSLError(
-                str(exc),
-                line_number=line_number,
-                line_content=line_content,
-            ) from exc
-    if (
-        has_cm_generated_authority
-        and cm_std_ratio is not None
-        and dG_eqJ is not None
-        and kf_explicit is not None
-        and kr_explicit is not None
-    ):
-        try:
-            validate_generated_computational_legacy_kr(
-                kf=float(kf_explicit),
-                kr=float(kr_explicit),
-                Keq=float(fe.Keq),
-                reverse_std_ratio=float(cm_std_ratio),
-            )
-        except ValueError as exc:
-            raise DSLError(
-                str(exc),
-                line_number=line_number,
-                line_content=line_content,
-            ) from exc
     kf = fe.kf if kf_explicit is None else kf_explicit
     kr = fe.kr if kr_explicit is None else kr_explicit
     if kr_explicit is None and (has_explicit_Keq or dG_eqJ is not None):

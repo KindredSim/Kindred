@@ -163,12 +163,17 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
 
     meta = getattr(eq, "metadata", {}) or {}
     if isinstance(meta, Mapping):
+        metadata_keq_source = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+        if callable(metadata_keq_source):
+            metadata_keq = _finite_float_or_none(metadata_keq_source)
+            if metadata_keq is not None:
+                return float(metadata_keq)
         dg_value = _finite_float_or_none(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
         if dg_value is not None:
             from kindred.core.kinetics import K_from_deltaG_eq
 
             return float(K_from_deltaG_eq(dg_value, float(temperature_K)))
-        metadata_keq = _finite_float_or_none(meta.get(EquilibriumMetadataKeys.KEQ_INPUT))
+        metadata_keq = _finite_float_or_none(metadata_keq_source)
         if metadata_keq is not None:
             return float(metadata_keq)
     direct_keq = _finite_float_or_none(getattr(eq, "Keq", None))
@@ -329,30 +334,6 @@ def validate_equilibrium_rate_authority_values(
     context: EquilibriumRateInputContext | str | None = None,
 ) -> None:
     normalize_equilibrium_rate_authority(kf=kf, kr=kr, Keq=Keq, metadata=metadata, context=context)
-
-
-def validate_generated_computational_legacy_kr(
-    *,
-    kf: float,
-    kr: float,
-    Keq: float,
-    reverse_std_ratio: float,
-) -> None:
-    derived_kr = float(effective_reverse_rate_from_keq(float(kf), float(Keq), float(reverse_std_ratio)))
-    if not math.isclose(float(kr), derived_kr, rel_tol=1e-6, abs_tol=1e-12):
-        raise ValueError("legacy Computational Mode kr is inconsistent with kf, dG_eq, and cm_std_ratio")
-
-
-def derive_generated_computational_std_ratio_from_legacy_kr(
-    *,
-    kf: float,
-    kr: float,
-    Keq: float,
-) -> float:
-    value = float(kf) / (float(kr) * float(Keq))
-    if not (math.isfinite(value) and value > 0.0):
-        raise ValueError("legacy Computational Mode kr is inconsistent with kf and dG_eq")
-    return float(value)
 
 
 def normalize_equilibrium_rate_authority(

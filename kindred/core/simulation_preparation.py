@@ -58,6 +58,7 @@ from kindred.core.symbolic.structure_cache import (
 )
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
+    generated_fast_equilibrium_parameter_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -1483,6 +1484,7 @@ def _apply_parameter_overrides_to_prepared_mechanism(
     mechanism: Any,
     *,
     parameter_partition: SimulationParameterValuePartition,
+    runtime_bindings: Mapping[str, Any] | None = None,
 ) -> _ParameterOverrideApplication:
     """Apply slider-style values and report whether dependent runtime math changed."""
     partition = parameter_partition
@@ -1490,8 +1492,23 @@ def _apply_parameter_overrides_to_prepared_mechanism(
     if not partition.raw_values:
         return _ParameterOverrideApplication(rebuild_rhs=False)
 
-    mechanism_override_items = sorted(partition.mechanism_binding_values.items())
-    if not mechanism_override_items:
+    runtime_names = set(partition.runtime_parameter_names)
+    runtime_binding_by_name = {
+        str(name): binding
+        for name, binding in dict(runtime_bindings or {}).items()
+        if str(name)
+    }
+    runtime_override_items = sorted(
+        (str(name), float(value))
+        for name, value in partition.mechanism_binding_values.items()
+        if str(name) in runtime_names
+    )
+    mechanism_override_items = sorted(
+        (str(name), float(value))
+        for name, value in partition.mechanism_binding_values.items()
+        if str(name) not in runtime_names
+    )
+    if not mechanism_override_items and not runtime_override_items:
         return _ParameterOverrideApplication(rebuild_rhs=False)
 
     from kindred.core.simulator.step_indexing import lookup_step_param_target
@@ -1584,6 +1601,16 @@ def _apply_parameter_overrides_to_prepared_mechanism(
                 mechanism=mechanism,
                 require_mutable=True,
             )
+    for name, value in runtime_override_items:
+        binding = runtime_binding_by_name.get(str(name))
+        setter = getattr(binding, "set", None)
+        if not callable(setter):
+            raise SimulationPreparationError(
+                "parameter_overrides",
+                f"Runtime parameter {name!r} has no prepared execution binding.",
+            )
+        setter(float(value))
+        override_applied = True
     return _ParameterOverrideApplication(
         rebuild_rhs=bool(override_applied),
     )
@@ -1593,12 +1620,14 @@ def apply_parameter_overrides_to_prepared_mechanism(
     mechanism: Any,
     *,
     parameter_partition: SimulationParameterValuePartition,
+    runtime_bindings: Mapping[str, Any] | None = None,
 ) -> bool:
     """Apply slider-style values and report whether dependent runtime math changed."""
     return bool(
         _apply_parameter_overrides_to_prepared_mechanism(
             mechanism,
             parameter_partition=parameter_partition,
+            runtime_bindings=runtime_bindings,
         ).rebuild_rhs
     )
 
@@ -1841,10 +1870,12 @@ def prepared_simulation_run_for_execution_request(
         request_payload,
         prepared_unresolved_intervention_schedule=prepared_unresolved_schedule,
     )
+    runtime_parameter_names = _available_energy_binding_names(prepared.mechanism)
     parameter_partition = partition_simulation_parameter_values(
         mechanism=prepared.mechanism,
         parameter_overrides=request_payload.parameter_overrides,
         unresolved_intervention_schedule=unresolved_intervention_schedule,
+        runtime_parameter_names=runtime_parameter_names,
     )
     try:
         _raise_unowned_request_parameter_values(
@@ -1856,10 +1887,21 @@ def prepared_simulation_run_for_execution_request(
     if request_payload.parameter_overrides and parameter_partition.unbound_mechanism_parameter_names:
         return prepare_simulation_worker_run(execution_request=request_payload)
 
+    runtime_parameter_names, runtime_bindings = _install_requested_energy_runtime_bindings(
+        prepared.mechanism,
+        request_payload.parameter_overrides,
+    )
+    parameter_partition = partition_simulation_parameter_values(
+        mechanism=prepared.mechanism,
+        parameter_overrides=request_payload.parameter_overrides,
+        unresolved_intervention_schedule=unresolved_intervention_schedule,
+        runtime_parameter_names=runtime_parameter_names,
+    )
     try:
         override_application = _apply_parameter_overrides_to_prepared_mechanism(
             prepared.mechanism,
             parameter_partition=parameter_partition,
+            runtime_bindings=runtime_bindings,
         )
     except Exception as exc:
         raise SimulationPreparationError("parameter_overrides", str(exc)) from exc
@@ -2315,10 +2357,12 @@ def _symbolic_jacobian_snapshot_values_for_execution_text(
     )
     if parameter_overrides:
         unresolved_intervention_schedule = parse_intervention_schedule_from_dsl(str(mechanism_text or ""))
+        runtime_parameter_names = _available_energy_binding_names(mechanism)
         parameter_partition = partition_simulation_parameter_values(
             mechanism=mechanism,
             parameter_overrides=parameter_overrides,
             unresolved_intervention_schedule=unresolved_intervention_schedule,
+            runtime_parameter_names=runtime_parameter_names,
         )
         override_names = sorted(parameter_partition.bindable_mechanism_parameter_names)
         internal_names = _internal_parameter_algebra_binding_names(
@@ -2329,14 +2373,20 @@ def _symbolic_jacobian_snapshot_values_for_execution_text(
             mechanism,
             sorted(set(override_names) | set(internal_names)),
         )
+        runtime_parameter_names, runtime_bindings = _install_requested_energy_runtime_bindings(
+            mechanism,
+            parameter_overrides,
+        )
         parameter_partition = partition_simulation_parameter_values(
             mechanism=mechanism,
             parameter_overrides=parameter_overrides,
             unresolved_intervention_schedule=unresolved_intervention_schedule,
+            runtime_parameter_names=runtime_parameter_names,
         )
         apply_parameter_overrides_to_prepared_mechanism(
             mechanism,
             parameter_partition=parameter_partition,
+            runtime_bindings=runtime_bindings,
         )
     return _symbolic_jacobian_parameter_values_from_mechanism(
         mechanism,
@@ -2537,6 +2587,7 @@ def prepare_simulation_worker_run(
         else unresolved_intervention_schedule_override
     )
     parameter_partition: SimulationParameterValuePartition | None = None
+    rebuild_rhs_for_parameter_overrides = False
     if request_payload is not None and (
         bool(request_payload.parameter_overrides)
         or bool(
@@ -2545,10 +2596,12 @@ def prepare_simulation_worker_run(
         )
     ):
         try:
+            runtime_parameter_names = _available_energy_binding_names(mechanism)
             parameter_partition = partition_simulation_parameter_values(
                 mechanism=mechanism,
                 parameter_overrides=request_payload.parameter_overrides,
                 unresolved_intervention_schedule=unresolved_intervention_schedule,
+                runtime_parameter_names=runtime_parameter_names,
             )
             mechanism_override_names = sorted(parameter_partition.bindable_mechanism_parameter_names)
             internal_names = _internal_parameter_algebra_binding_names(
@@ -2559,14 +2612,20 @@ def prepare_simulation_worker_run(
                 mechanism,
                 sorted(set(mechanism_override_names) | set(internal_names)),
             )
+            runtime_parameter_names, runtime_bindings = _install_requested_energy_runtime_bindings(
+                mechanism,
+                request_payload.parameter_overrides,
+            )
             parameter_partition = partition_simulation_parameter_values(
                 mechanism=mechanism,
                 parameter_overrides=request_payload.parameter_overrides,
                 unresolved_intervention_schedule=unresolved_intervention_schedule,
+                runtime_parameter_names=runtime_parameter_names,
             )
-            apply_parameter_overrides_to_prepared_mechanism(
+            rebuild_rhs_for_parameter_overrides = apply_parameter_overrides_to_prepared_mechanism(
                 mechanism,
                 parameter_partition=parameter_partition,
+                runtime_bindings=runtime_bindings,
             )
         except Exception as exc:
             raise SimulationPreparationError("parameter_overrides", str(exc)) from exc
@@ -2600,7 +2659,7 @@ def prepare_simulation_worker_run(
     except InterventionScheduleError as exc:
         raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
 
-    if rhs is None:
+    if rhs is None or bool(rebuild_rhs_for_parameter_overrides):
         try:
             from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 
@@ -2992,23 +3051,6 @@ class _StructuredEnergyBinding(RateBinding):
         self.value = float(self._state.binding_value(self._role))
 
 
-def _canonical_fast_equilibrium_side(stoich: Mapping[str, float]) -> str:
-    def _fmt_coeff(value: float) -> str:
-        rounded = round(float(value))
-        if abs(float(value) - float(rounded)) < 1e-12:
-            return str(int(rounded))
-        return f"{float(value):g}"
-
-    parts: List[str] = []
-    for name in sorted(str(key) for key in stoich.keys()):
-        coeff = float(stoich[name])
-        if abs(coeff - 1.0) < 1e-12:
-            parts.append(str(name))
-        else:
-            parts.append(f"{_fmt_coeff(coeff)}{name}")
-    return "_".join(parts)
-
-
 def _available_energy_binding_names(mechanism: Any) -> frozenset[str]:
     names: set[str] = set()
     for eq in getattr(mechanism, "equilibria", []) or []:
@@ -3019,12 +3061,28 @@ def _available_energy_binding_names(mechanism: Any) -> frozenset[str]:
         if str(metadata.get("source") or "") == "state_network" and reactant and product and ts:
             names.add(f"dGact_fwd__{ts}__{reactant}__{product}")
             names.add(f"dG_eq__{ts}__{reactant}__{product}")
-        fast_equilibrium = bool(metadata.get(EquilibriumMetadataKeys.FAST_EQUILIBRIUM, getattr(eq, "fast", False)))
-        if fast_equilibrium:
-            slug = _canonical_fast_equilibrium_side(getattr(eq, "stoich_forward", {}) or {})
-            slug += "__" + _canonical_fast_equilibrium_side(getattr(eq, "stoich_back", {}) or {})
-            names.add(f"dG_eq_fast__feq__{slug}")
+        fast_name = generated_fast_equilibrium_parameter_name(metadata)
+        if fast_name is not None:
+            names.add(fast_name)
     return frozenset(names)
+
+
+def _install_requested_energy_runtime_bindings(
+    mechanism: Any,
+    parameter_overrides: Mapping[str, Any] | None,
+) -> tuple[frozenset[str], Dict[str, Any]]:
+    runtime_names = _available_energy_binding_names(mechanism)
+    if not runtime_names or not isinstance(parameter_overrides, Mapping):
+        return runtime_names, {}
+    requested = {
+        str(name or "").strip()
+        for name in parameter_overrides.keys()
+        if str(name or "").strip()
+    }
+    requested_runtime_names = sorted(str(name) for name in runtime_names if str(name) in requested)
+    if not requested_runtime_names:
+        return runtime_names, {}
+    return runtime_names, _install_energy_bindings(mechanism, requested_runtime_names)
 
 
 def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]:
@@ -3032,7 +3090,6 @@ def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]
     from kindred.core.rate_binding import RateBinding
     from kindred.core.units import UnitsModel
     from kindred.core.validation import try_parse_callable_finite_float
-    from kindred.core.constants import R
 
     requested = {str(name) for name in (names or []) if str(name).strip()}
     if not requested:
@@ -3086,12 +3143,9 @@ def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]
                 bindings[eq_name] = _StructuredEnergyBinding(name=eq_name, state=state, role="dG_eq")
             continue
 
-        fast_equilibrium = bool(metadata.get(EquilibriumMetadataKeys.FAST_EQUILIBRIUM, getattr(eq, "fast", False)))
-        if not fast_equilibrium:
+        slider_name = generated_fast_equilibrium_parameter_name(metadata)
+        if slider_name is None:
             continue
-        slug = _canonical_fast_equilibrium_side(getattr(eq, "stoich_forward", {}) or {})
-        slug += "__" + _canonical_fast_equilibrium_side(getattr(eq, "stoich_back", {}) or {})
-        slider_name = f"dG_eq_fast__feq__{slug}"
         if slider_name not in requested:
             continue
 
@@ -3106,21 +3160,19 @@ def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]
             kf_setter = None
         dG_eq_raw = metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL)
         dG_eq_parsed, dG_eq_ok = try_parse_callable_finite_float(dG_eq_raw)
-        if dG_eq_ok:
-            dG_eq_J_per_mol = float(dG_eq_parsed)
-        else:
-            Keq_input_value, Keq_input_ok = try_parse_callable_finite_float(metadata.get(EquilibriumMetadataKeys.KEQ_INPUT))
-            if Keq_input_ok and math.isfinite(Keq_input_value) and Keq_input_value > 0.0:
-                dG_eq_J_per_mol = float(-float(R) * float(mech_meta.temperature_K) * math.log(float(Keq_input_value)))
-            else:
-                dG_eq_J_per_mol = 0.0
+        if not dG_eq_ok:
+            continue
+        dG_eq_J_per_mol = float(dG_eq_parsed)
+        std_ratio_raw, std_ratio_ok = try_parse_callable_finite_float(metadata.get("std_ratio"))
+        if not (std_ratio_ok and math.isfinite(float(std_ratio_raw)) and float(std_ratio_raw) > 0.0):
+            continue
         state = _FastEquilibriumEnergyBindingState(
             units=units,
             temperature_K=float(mech_meta.temperature_K),
             kf_fixed=float(kf_fixed),
             kf_getter=kf_getter,
             kf_setter=kf_setter,
-            std_ratio=max(1e-300, float(metadata.get("std_ratio") or 1.0)),
+            std_ratio=float(std_ratio_raw),
             dG_eq_J_per_mol=float(dG_eq_J_per_mol),
             metadata=metadata,
         )

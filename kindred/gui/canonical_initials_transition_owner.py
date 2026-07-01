@@ -339,6 +339,7 @@ class CanonicalInitialsTransitionOwner:
         full_snapshot_required: bool = False,
         before_materialize: Callable[[], None] | None = None,
         before_refresh: Callable[[], None] | None = None,
+        publish_on_success: bool = True,
         rollback_before_abort_publish: Callable[[], None] | None = None,
     ) -> _SourceLoadOutcome:
         transition_source_s = str(transition_source or "authoritative_source_load")
@@ -374,12 +375,13 @@ class CanonicalInitialsTransitionOwner:
                 before_refresh()
             refresh_after_commit()
             abort_outcome = source_load_outcome
-            publication_attempted = True
-            self._publish_source_load_outcome(
-                transition_source=transition_source_s,
-                schedule_runtime_refresh=bool(schedule_runtime_refresh),
-                outcome=source_load_outcome,
-            )
+            if bool(publish_on_success):
+                publication_attempted = True
+                self._publish_source_load_outcome(
+                    transition_source=transition_source_s,
+                    schedule_runtime_refresh=bool(schedule_runtime_refresh),
+                    outcome=source_load_outcome,
+                )
             return source_load_outcome
         except Exception:
             if callable(rollback_before_abort_publish):

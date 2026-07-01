@@ -45,11 +45,13 @@ class AuthoritativeRewriteOwner:
         initial_source = self._canonical_source()
         draft_applied = False
         draft_apply_result: ReactionsDraftApplyResult | None = None
+        draft_resolution_completed = False
         try:
             resolution = self._draft_resolution_owner.resolve_for_authoritative_rewrite(
                 str(action_label or description or "Changing the mechanism source"),
                 continue_label="Continue",
             )
+            draft_resolution_completed = True
             if not resolution.may_continue:
                 if resolution.status == "failed":
                     return AuthoritativeRewriteOutcome(
@@ -82,6 +84,8 @@ class AuthoritativeRewriteOwner:
                 )
             )
         except Exception:
+            if not draft_resolution_completed:
+                raise
             source_updated = bool(
                 draft_applied or self._canonical_source_differs_from(initial_source)
             )
