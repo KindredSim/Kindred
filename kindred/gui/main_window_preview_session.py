@@ -243,12 +243,10 @@ class MainWindowPreviewSession:
         self._refresh_transaction_button_state()
         return True
 
-    def commit_current_mechanism_workspace(self, *, invalidate_preview_work: bool = True) -> dict[str, float]:
+    def clear_current_mechanism_workspace_after_source_commit(self, *, invalidate_preview_work: bool = True) -> dict[str, float]:
         focused_set_id = self._focused_mechanism_workspace_set_id()
-        result = self._param_store.commit_effective_as_shared(
-            focused_set_id
-        )
-        if focused_set_id:
+        result = dict(self._param_store.shared_params)
+        if focused_set_id and self._param_store.clear_local_overrides_for_set(focused_set_id):
             self._bump_dirty_state_generation([focused_set_id])
         self.reset_preview_state()
         if invalidate_preview_work:

@@ -31,6 +31,7 @@ from kindred.core.simulator.dsl_text_update import (
     analyze_step_parameter_update,
     build_current_text_step_analysis_context,
     format_authoritative_parameter_value,
+    materialize_generated_fast_dg_overrides_to_dsl_text,
 )
 from kindred.core.validation import try_parse_finite_float
 from kindred.core.datasets.observation_payload import dense_view_from_observations, observations_from_payload
@@ -283,7 +284,6 @@ class MainWindow(
             apply_dirty_reactions_for_run=self._apply_dirty_reactions_for_run,
             pending_initials_for_source_set=self._pending_initials_for_source_set,
             apply_reactions_overrides_to_text=self._apply_reactions_overrides_to_text,
-            apply_state_network_overrides_to_dsl=self._apply_state_network_overrides_to_dsl,
             apply_wegscheider_resolution_reactions_rewrite=(
                 self._apply_wegscheider_resolution_reactions_rewrite
             ),
@@ -802,6 +802,17 @@ class MainWindow(
                     affected_set_ids=outcome.active_work_supersede_set_ids,
                     close_preview_runtime_owner=False,
                 )
+        if bool(outcome.dirty_preview_reset_scope_is_global):
+            try:
+                self._preview_session.clear_working_transaction(
+                    invalidate_preview_work=False
+                )
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.authoritative_transition.clear_global_dirty_preview",
+                    message="Failed to discard global dirty slider work after authoritative mechanism source change",
+                    exc=exc,
+                )
         if outcome.runtime_invalidation_required and outcome.readiness_schedule_required:
             self._sim_controller.simulation_runtime_inputs_changed(
                 batch_runtime_pool_inputs_changed=False
@@ -828,16 +839,6 @@ class MainWindow(
             self._maybe_queue_run_target_runtime_readiness_refresh(force=True)
         if bool(discard_dirty_preview):
             if bool(outcome.dirty_preview_reset_scope_is_global):
-                try:
-                    self._preview_session.clear_working_transaction(
-                        invalidate_preview_work=False
-                    )
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "main_window.canonical_initials.clear_global_dirty_preview",
-                        message="Failed to discard global dirty slider work after authoritative source change",
-                        exc=exc,
-                    )
                 try:
                     self.results_controller.clear_active_display_transaction()
                 except Exception as exc:
@@ -2776,8 +2777,10 @@ class MainWindow(
         state_network_text: str,
     ) -> TemperatureIndicatorState:
         mechanism_text = str(reactions_text)
-        normalized_state_network_text = str(state_network_text or "")
-        energy_mode_active = bool(normalized_state_network_text.strip())
+        energy_mode_active = self._temperature_indicator_energy_mode_active(
+            reactions_text=mechanism_text,
+            state_network_text=str(state_network_text or ""),
+        )
 
         t_override_k = self._variable_runtime.dsl_global_temperature_k(mechanism_text)
 
@@ -2830,6 +2833,25 @@ class MainWindow(
             constant_schedule_k=constant_schedule_k,
             indicator_text=indicator_text,
         )
+
+    def _temperature_indicator_energy_mode_active(
+        self,
+        *,
+        reactions_text: str,
+        state_network_text: str,
+    ) -> bool:
+        try:
+            from kindred.core.mechanism_source import MechanismAuthoringSource
+            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+            source = MechanismAuthoringSource.from_parts(
+                reactions_text=str(reactions_text or ""),
+                state_network_dsl=str(state_network_text or ""),
+            )
+            mechanism = parse_dsl_to_mechanism(source.full_dsl, initials={})
+        except Exception:
+            return False
+        return bool(self._variable_runtime.is_energy_mode_mechanism(mechanism))
 
     def _update_temperature_mode_indicator(self) -> None:
         """
@@ -5826,7 +5848,6 @@ class MainWindow(
             if text != previous_text:
                 step_analysis_context = None
         if has_energy_overrides:
-            text = self._apply_energy_overrides_to_inline_state_network(text, overrides=override_map)
             text = self._apply_energy_overrides_to_computational_mode_fast_equilibria(text, overrides=override_map)
         return text
 
@@ -5861,292 +5882,6 @@ class MainWindow(
                 )
         return energy_overrides
 
-    @staticmethod
-    def _infer_global_energy_unit(lines: list[str], overrides: list[tuple[str, float, dict]]) -> str:
-        global_unit = None
-        for raw in lines:
-            before_comment, _, _comment = raw.partition("#")
-            stripped = before_comment.strip()
-            if not stripped:
-                continue
-            if not stripped.lower().startswith("energy="):
-                continue
-            _key, _eq, rest = stripped.partition("=")
-            unit_val = rest.strip().split()[0] if rest.strip() else ""
-            if unit_val in ("kJ/mol", "kcal/mol", "J/mol"):
-                global_unit = unit_val
-        if global_unit is None:
-            for _name, _value, meta in overrides:
-                unit_val = meta.get("unit")
-                if unit_val:
-                    global_unit = str(unit_val)
-                    break
-        return str(global_unit or "kJ/mol")
-
-    def _parse_inline_state_network_energy(
-        self,
-        *,
-        lines: list[str],
-        global_unit: str,
-        normalize_energy_to_J_per_mol,
-    ) -> tuple[dict[str, int], dict[str, str], dict[str, float]]:
-        state_row_index: dict[str, int] = {}
-        state_unit_out: dict[str, str] = {}
-        energy_jmol: dict[str, float] = {}
-
-        for idx, raw in enumerate(lines):
-            before_comment, _, _comment = raw.partition("#")
-            stripped = before_comment.strip()
-            if not stripped.lower().startswith("state:"):
-                continue
-            _prefix, rest = stripped.split(":", 1)
-            parts = [p.strip() for p in re.split(r"[;,]", rest) if p.strip()]
-            name: str | None = None
-            kv: dict[str, str] = {}
-            for part in parts:
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    kv[k.strip().lower()] = v.strip()
-                elif name is None:
-                    name = part.strip()
-            if not name:
-                name = kv.get("name") or kv.get("state")
-            if not name:
-                continue
-
-            unit_line = (kv.get("energy_unit") or global_unit or "kJ/mol").strip()
-            energy_val_str = kv.get("energy")
-
-            ej = 0.0
-            explicit_unit: str | None = None
-            if energy_val_str is not None and str(energy_val_str).strip() != "":
-                evs = str(energy_val_str).strip()
-                if evs in ("kJ/mol", "kcal/mol", "J/mol"):
-                    evs = ""
-                if evs:
-                    tok = evs.split()
-                    if len(tok) == 2 and tok[1] in ("kJ/mol", "kcal/mol", "J/mol"):
-                        explicit_unit = tok[1]
-                        try:
-                            v0 = float(tok[0])
-                        except Exception:
-                            v0 = None
-                        if v0 is not None:
-                            ej = normalize_energy_to_J_per_mol(v0, explicit_unit)
-                    else:
-                        try:
-                            v0 = float(tok[0])
-                        except Exception:
-                            v0 = None
-                        if v0 is not None:
-                            ej = normalize_energy_to_J_per_mol(v0, unit_line)
-
-            state_row_index[name] = int(idx)
-            state_unit_out[name] = str(explicit_unit or unit_line or global_unit or "kJ/mol")
-            energy_jmol[name] = float(ej)
-
-        return state_row_index, state_unit_out, energy_jmol
-
-    def _apply_energy_overrides_to_state_energies(
-        self,
-        *,
-        energy_jmol: dict[str, float],
-        overrides: list[tuple[str, float, dict]],
-        global_unit: str,
-        UnitsModel,
-    ) -> set[str]:
-        dG_eq_overrides = sorted([o for o in overrides if str(o[2].get("role") or "") == "dG_eq"], key=lambda o: o[0])
-        dG_act_overrides = sorted([o for o in overrides if str(o[2].get("role") or "") == "dG_act_fwd"], key=lambda o: o[0])
-
-        touched: set[str] = set()
-
-        for _name, value, meta in dG_eq_overrides:
-            reactant = str(meta.get("reactant") or "")
-            product = str(meta.get("product") or "")
-            unit_in = str(meta.get("unit") or global_unit or "kJ/mol")
-            if reactant not in energy_jmol or product not in energy_jmol:
-                continue
-            try:
-                dG_j = float(UnitsModel(energy_unit=unit_in).to_jmol(float(value)))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.inline_state_network.to_jmol.dG_eq",
-                    message=f"Failed to convert dG_eq energy override to J/mol for '{reactant}->{product}'",
-                    exc=exc,
-                )
-                continue
-            new_e = float(energy_jmol[reactant] + dG_j)
-            if not math.isclose(new_e, float(energy_jmol[product]), rel_tol=0.0, abs_tol=1e-6):
-                energy_jmol[product] = new_e
-                touched.add(product)
-
-        for _name, value, meta in dG_act_overrides:
-            reactant = str(meta.get("reactant") or "")
-            ts = str(meta.get("ts") or "")
-            unit_in = str(meta.get("unit") or global_unit or "kJ/mol")
-            if reactant not in energy_jmol or ts not in energy_jmol:
-                continue
-            try:
-                dG_j = float(UnitsModel(energy_unit=unit_in).to_jmol(float(value)))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.inline_state_network.to_jmol.dG_act_fwd",
-                    message=f"Failed to convert dG_act_fwd energy override to J/mol for '{reactant}->{ts}'",
-                    exc=exc,
-                )
-                continue
-            new_e = float(energy_jmol[reactant] + dG_j)
-            if not math.isclose(new_e, float(energy_jmol[ts]), rel_tol=0.0, abs_tol=1e-6):
-                energy_jmol[ts] = new_e
-                touched.add(ts)
-
-        return touched
-
-    def _rewrite_inline_state_network_energy_lines(
-        self,
-        *,
-        lines: list[str],
-        state_row_index: dict[str, int],
-        state_unit_out: dict[str, str],
-        energy_jmol: dict[str, float],
-        touched: set[str],
-        global_unit: str,
-        UnitsModel,
-    ) -> bool:
-        energy_pat = re.compile(
-            r"(\benergy\s*=\s*)([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)(\s*(?:kJ/mol|kcal/mol|J/mol))?",
-            flags=re.IGNORECASE,
-        )
-
-        changed = False
-        for name in sorted(touched):
-            idx = state_row_index.get(name)
-            if idx is None:
-                continue
-            raw = lines[idx]
-            before_comment, hash_sep, comment_rest = raw.partition("#")
-            unit_out = str(state_unit_out.get(name) or global_unit or "kJ/mol")
-            try:
-                new_val = float(UnitsModel(energy_unit=unit_out).from_jmol(float(energy_jmol[name])))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.inline_state_network.from_jmol",
-                    message=f"Failed to convert energy back to '{unit_out}' for state '{name}'",
-                    exc=exc,
-                )
-                continue
-            new_val_str = f"{new_val:.6g}"
-
-            def _repl(m: re.Match[str]) -> str:
-                prefix = m.group(1)
-                suffix = m.group(3) or ""
-                if suffix:
-                    return f"{prefix}{new_val_str}{suffix}"
-                return f"{prefix}{new_val_str}"
-
-            updated_before, n = energy_pat.subn(_repl, before_comment, count=1)
-            if n == 0:
-                continue
-            updated_line = updated_before + (hash_sep + comment_rest if hash_sep else "")
-            if updated_line != raw:
-                lines[idx] = updated_line
-                changed = True
-
-        return changed
-
-    @staticmethod
-    def _parse_semicolon_kv_tokens(code: str) -> tuple[str, list[list[str]]]:
-        chunks = [c.strip() for c in str(code or "").split(";") if c.strip()]
-        if not chunks:
-            return "", []
-        prefix = chunks[0].strip()
-        tokens: list[list[str]] = []
-        for chunk in chunks[1:]:
-            for part in [piece.strip() for piece in str(chunk).split(",") if piece.strip()]:
-                if "=" not in part:
-                    continue
-                k, v = part.split("=", 1)
-                tokens.append([k.strip(), v.strip()])
-        return prefix, tokens
-
-    @staticmethod
-    def _get_semicolon_kv(tokens: list[list[str]], key: str) -> str | None:
-        for k, v in tokens:
-            if str(k).strip() == key:
-                return str(v).strip()
-        return None
-
-    @staticmethod
-    def _set_semicolon_kv(tokens: list[list[str]], key: str, value: str) -> None:
-        for pair in tokens:
-            if str(pair[0]).strip() == key:
-                pair[1] = str(value)
-                return
-        tokens.append([str(key), str(value)])
-
-    @staticmethod
-    def _remove_semicolon_kv(tokens: list[list[str]], key: str) -> None:
-        tokens[:] = [pair for pair in tokens if str(pair[0]).strip() != key]
-
-    def _apply_energy_overrides_to_inline_state_network(
-        self,
-        base_text: str,
-        *,
-        set_id: Optional[str] = None,
-        overrides: Optional[Dict[str, float]] = None,
-    ) -> str:
-        """
-        Apply energy-mode slider overrides (ΔG‡_fwd and ΔG°) to any `state:` lines present in `base_text`.
-
-        This supports both comma-style and semicolon-style state-network DSL,
-        and preserves line formatting by only rewriting the numeric energy token.
-        """
-        energy_overrides = self._collect_energy_overrides(set_id=set_id, overrides=overrides)
-        if not energy_overrides:
-            return base_text
-
-        try:
-            from kindred.core.simulator.kinetics import normalize_energy_to_J_per_mol
-            from kindred.core.units import UnitsModel
-        except Exception:
-            return base_text
-
-        text = str(base_text or "")
-        if not text.strip():
-            return base_text
-        lines = text.splitlines()
-
-        global_unit = self._infer_global_energy_unit(lines, energy_overrides)
-        state_row_index, state_unit_out, energy_jmol = self._parse_inline_state_network_energy(
-            lines=lines,
-            global_unit=global_unit,
-            normalize_energy_to_J_per_mol=normalize_energy_to_J_per_mol,
-        )
-        if not state_row_index:
-            return base_text
-
-        touched = self._apply_energy_overrides_to_state_energies(
-            energy_jmol=energy_jmol,
-            overrides=energy_overrides,
-            global_unit=global_unit,
-            UnitsModel=UnitsModel,
-        )
-        if not touched:
-            return base_text
-
-        changed = self._rewrite_inline_state_network_energy_lines(
-            lines=lines,
-            state_row_index=state_row_index,
-            state_unit_out=state_unit_out,
-            energy_jmol=energy_jmol,
-            touched=touched,
-            global_unit=global_unit,
-            UnitsModel=UnitsModel,
-        )
-        if not changed:
-            return base_text
-        return "\n".join(lines)
-
     def _apply_energy_overrides_to_computational_mode_fast_equilibria(
         self,
         base_text: str,
@@ -6158,8 +5893,8 @@ class MainWindow(
         """
         Apply energy-mode ΔG° overrides to Computational Mode fast equilibria inside the generated block.
 
-        These generated fast equilibria keep `kf=` fixed and rewrite `dG_eq=`.
-        The effective reverse rate is derived from ΔG° plus the generated standard-state ratio.
+        Generated fast equilibria keep source-owned `kf=` and `cm_std_ratio=`
+        values in the generated block and rewrite only source-owned `dG_eq=`.
         """
         energy_overrides = [
             o
@@ -6173,20 +5908,6 @@ class MainWindow(
         if not energy_overrides:
             return base_text
 
-        try:
-            from kindred.core.simulator.computational_mode import (
-                GENERATED_BLOCK_END,
-                GENERATED_BLOCK_START,
-                extract_marked_block,
-                upsert_marked_block,
-            )
-        except Exception:
-            return base_text
-
-        body = extract_marked_block(base_text, start_marker=GENERATED_BLOCK_START, end_marker=GENERATED_BLOCK_END)
-        if not body:
-            return base_text
-
         T_override = self._variable_runtime.dsl_global_temperature_k(base_text)
         try:
             T = float(T_override) if T_override is not None else float(getattr(self, "_temperature_spinbox").value())
@@ -6195,216 +5916,11 @@ class MainWindow(
         if not (math.isfinite(T) and T > 0.0):
             return base_text
 
-        from kindred.core.constants import R as R_J_per_mol_K
-        from kindred.core.units import UnitsModel
-
-        overrides_by_id: dict[str, tuple[float, dict]] = {}
-        for _name, val, meta in energy_overrides:
-            cm_id = str(meta.get("cm_id") or "")
-            if not cm_id:
-                continue
-            overrides_by_id[cm_id] = (float(val), dict(meta))
-        if not overrides_by_id:
-            return base_text
-
-        lines = str(body).splitlines()
-        changed = False
-        for i, raw in enumerate(lines):
-            before_comment, hash_sep, comment_rest = str(raw).partition("#")
-            code = before_comment.strip()
-            if not code.lower().startswith("equilibrium:"):
-                continue
-            prefix, tokens = self._parse_semicolon_kv_tokens(code)
-            cm_id = self._get_semicolon_kv(tokens, "cm_id") or ""
-            if not cm_id or cm_id not in overrides_by_id:
-                continue
-
-            new_dG, meta = overrides_by_id[cm_id]
-            unit_in = str(meta.get("unit") or "kJ/mol")
-
-            kf_text = self._get_semicolon_kv(tokens, "kf")
-            try:
-                kf_fixed = float(meta.get("kf_fixed")) if meta.get("kf_fixed") is not None else float(kf_text or "nan")
-            except Exception:
-                kf_fixed = float("nan")
-            try:
-                std_ratio = float(meta.get("std_ratio") or 1.0)
-            except Exception:
-                std_ratio = 1.0
-            if not (math.isfinite(std_ratio) and std_ratio > 0.0):
-                std_ratio = 1.0
-            if not (math.isfinite(kf_fixed) and kf_fixed > 0.0):
-                continue
-
-            try:
-                dG_eq_J = float(UnitsModel(energy_unit=unit_in).to_jmol(float(new_dG)))
-                K = float(math.exp(-float(dG_eq_J) / (float(R_J_per_mol_K) * float(T))))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.computational_mode_fast_eq.compute_K",
-                    message=f"Failed to compute K from Computational Mode fast-equilibrium dG_eq override (cm_id='{cm_id}')",
-                    exc=exc,
-                )
-                continue
-            if not (math.isfinite(K) and K > 0.0):
-                continue
-
-            self._set_semicolon_kv(tokens, "dG_eq", f"{float(new_dG):.12g}")
-            self._set_semicolon_kv(tokens, "kf", f"{float(kf_fixed):.17g}")
-            self._set_semicolon_kv(tokens, "cm_std_ratio", f"{float(std_ratio):.17g}")
-            self._remove_semicolon_kv(tokens, "kr")
-
-            serialized = prefix
-            if tokens:
-                serialized += "; " + "; ".join(f"{k}={v}" for k, v in tokens if k)
-            serialized = serialized + (hash_sep + comment_rest if hash_sep else "")
-            if serialized != raw:
-                lines[i] = serialized
-                changed = True
-
-        if not changed:
-            return base_text
-        new_body = "\n".join(lines).rstrip("\n")
-        return upsert_marked_block(
+        return materialize_generated_fast_dg_overrides_to_dsl_text(
             base_text,
-            start_marker=GENERATED_BLOCK_START,
-            end_marker=GENERATED_BLOCK_END,
-            body=new_body,
-            blank_line_before=True,
+            energy_overrides,
+            temperature_K=T,
         )
-
-    @staticmethod
-    def _parse_state_network_dsl_state_line(line: str) -> tuple[str | None, list[list[str]], str | None]:
-        before_comment, _, _comment = line.partition("#")
-        if ":" not in before_comment:
-            return None, [], None
-        _prefix, rest = before_comment.split(":", 1)
-        parts = [p.strip() for p in rest.split(",") if p.strip()]
-        name: str | None = None
-        tokens: list[list[str]] = []
-        for part in parts:
-            if "=" in part:
-                key, val = part.split("=", 1)
-                tokens.append([key.strip(), val.strip()])
-            elif name is None:
-                name = part
-        if not name:
-            for key, val in tokens:
-                if key.strip().lower() in {"name", "state"}:
-                    name = val.strip()
-                    break
-        unit: str | None = None
-        energy_val_str: str | None = None
-        for key, val in tokens:
-            kl = key.strip().lower()
-            if kl == "energy_unit":
-                unit = val.strip()
-            elif kl == "energy":
-                energy_val_str = val.strip()
-        if energy_val_str is not None:
-            tok = energy_val_str.split()
-            if len(tok) == 2 and tok[1] in ("kJ/mol", "kcal/mol", "J/mol"):
-                unit = tok[1]
-        return name, tokens, unit
-
-    @staticmethod
-    def _update_token_case_insensitive(tokens: list[list[str]], key: str, value: str) -> None:
-        for pair in tokens:
-            if pair and str(pair[0]).strip().lower() == str(key).strip().lower():
-                pair[1] = str(value)
-                return
-        tokens.append([str(key), str(value)])
-
-    def _apply_state_network_overrides_to_dsl(
-        self,
-        base_dsl: str,
-        *,
-        set_id: Optional[str] = None,
-        overrides: Optional[Dict[str, float]] = None,
-    ) -> str:
-        """Return state-network DSL with energy-mode slider overrides applied."""
-        energy_overrides = self._collect_energy_overrides(set_id=set_id, overrides=overrides)
-        if not energy_overrides:
-            return base_dsl
-
-        drag_baseline_dsl = self._preview_session.drag_baseline_state_network_dsl()
-        if self._preview_session.slider_drag_active() and drag_baseline_dsl is not None:
-            dsl = str(drag_baseline_dsl or "")
-        else:
-            dsl = base_dsl
-
-        try:
-            from kindred.core.simulator.kinetics import normalize_energy_to_J_per_mol
-            from kindred.core.units import UnitsModel
-        except Exception:
-            return dsl
-
-        lines = (dsl or "").splitlines()
-        state_rows: dict[str, dict[str, object]] = {}
-        energy_jmol: dict[str, float] = {}
-
-        for i, raw in enumerate(lines):
-            stripped = raw.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if not stripped.lower().startswith("state:"):
-                continue
-            name, tokens, unit = self._parse_state_network_dsl_state_line(raw)
-            if not name:
-                continue
-            unit = unit or "kJ/mol"
-            val_str = None
-            for key, val in tokens:
-                if key.strip().lower() == "energy":
-                    val_str = val.strip()
-                    break
-            try:
-                energy_val = float(val_str) if val_str is not None else 0.0
-            except Exception:
-                energy_val = 0.0
-            try:
-                ej = normalize_energy_to_J_per_mol(energy_val, unit)
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.state_network_dsl.normalize_energy",
-                    message=f"Failed to normalize state-network energy '{name}' to J/mol",
-                    exc=exc,
-                )
-                continue
-            state_rows[str(name)] = {"line_index": i, "tokens": tokens, "unit": unit}
-            energy_jmol[str(name)] = float(ej)
-
-        if not state_rows:
-            return dsl
-        _ = self._apply_energy_overrides_to_state_energies(
-            energy_jmol=energy_jmol,
-            overrides=energy_overrides,
-            global_unit="kJ/mol",
-            UnitsModel=UnitsModel,
-        )
-
-        for name, row in state_rows.items():
-            if name not in energy_jmol:
-                continue
-            try:
-                idx = int(row["line_index"])
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.state_network_dsl.state_line_index",
-                    message=f"Invalid state-network line index for state '{name}'",
-                    exc=exc,
-                )
-                continue
-            unit_out = str(row.get("unit") or "kJ/mol")
-            new_val = float(UnitsModel(energy_unit=str(unit_out)).from_jmol(float(energy_jmol[name])))
-            tokens = row.get("tokens")
-            if not isinstance(tokens, list):
-                continue
-            self._update_token_case_insensitive(tokens, "energy", f"{new_val:.6g}")
-            params = ", ".join(f"{k}={v}" for k, v in tokens if k)
-            lines[idx] = f"state: {name}, {params}".strip()
-
-        return "\n".join(lines)
 
     def _updated_reactions_text_with_scalar_param(self, reactions_text: str, name: str, value: float) -> str:
         from kindred.core.simulator.algebra_section import (
@@ -6600,8 +6116,17 @@ class MainWindow(
             return None
         if not math.isfinite(dG_eq):
             return None
+        source_unit = str(ch.get("source_unit") or energy_unit)
+        source_unit_conv = unit_conv
         try:
-            dG_eq_J = float(unit_conv.to_jmol(dG_eq))
+            from kindred.core.units import UnitsModel
+
+            source_unit_conv = UnitsModel(energy_unit=source_unit)
+        except Exception:
+            source_unit = str(energy_unit)
+            source_unit_conv = unit_conv
+        try:
+            dG_eq_J = float(source_unit_conv.to_jmol(dG_eq))
         except Exception as exc:
             self._record_best_effort_failure(
                 "main_window.energy_table.fast_eq.to_jmol",
@@ -6651,108 +6176,8 @@ class MainWindow(
             unit_kf = "1/s"
             unit_kr = "1/s"
         return {
-            f"ΔG° ({label})": (dG_eq, energy_unit),
+            f"ΔG° ({label})": (dG_eq, source_unit),
             f"k_f ({label})": (kf_fixed, unit_kf),
-            f"k_r ({label})": (kr, unit_kr),
-            f"Keq ({label})": (K, "1"),
-        }
-
-    def _energy_mode_params_for_ts_channel(
-        self,
-        ch: dict[str, object],
-        *,
-        energy_unit: str,
-        unit_conv,
-        T: float,
-        R: float,
-        prefactor: float,
-        K_from_deltaG_eq,
-        rate_units,
-    ) -> Dict[str, Tuple[float, str]] | None:
-        reactant = str(ch.get("reactant") or "")
-        product = str(ch.get("product") or "")
-        ts = str(ch.get("ts") or "")
-        if not (reactant and product and ts):
-            return None
-        label = str(ch.get("label") or f"{reactant}→{product} via {ts}")
-
-        var_act = f"dGact_fwd__{ts}__{reactant}__{product}"
-        var_eq = f"dG_eq__{ts}__{reactant}__{product}"
-        try:
-            overrides = self.runtime_parameter_values_for_set(fast_mode=True)
-            dG_act = float(overrides.get(var_act, ch.get("dG_act_fwd")))
-            dG_eq = float(overrides.get(var_eq, ch.get("dG_eq")))
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "main_window.energy_table.ts_channel.read_dG",
-                message=f"Failed to read energy-mode channel dG values ({label})",
-                exc=exc,
-            )
-            return None
-        if not (math.isfinite(dG_act) and math.isfinite(dG_eq)):
-            return None
-        try:
-            dG_act_J = float(unit_conv.to_jmol(dG_act))
-            dG_eq_J = float(unit_conv.to_jmol(dG_eq))
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "main_window.energy_table.ts_channel.to_jmol",
-                message=f"Failed to convert energy-mode channel dG values to J/mol ({label})",
-                exc=exc,
-            )
-            return None
-
-        try:
-            kappa = float(ch.get("kappa") or 1.0)
-        except Exception:
-            kappa = 1.0
-        try:
-            deg_ratio_fwd = float(ch.get("degeneracy_ratio_fwd") or 1.0)
-        except Exception:
-            deg_ratio_fwd = 1.0
-        try:
-            deg_ratio_rev = float(ch.get("degeneracy_ratio_rev") or 1.0)
-        except Exception:
-            deg_ratio_rev = 1.0
-
-        try:
-            K = float(K_from_deltaG_eq(dG_eq_J, T))
-            dG_rev_J = float(dG_act_J - dG_eq_J)
-
-            m_fwd = int(ch.get("molecularity_fwd") or 1)
-            m_rev = int(ch.get("molecularity_rev") or 1)
-            unit_kf = str(rate_units(int(m_fwd)))
-            unit_kr = str(rate_units(int(m_rev)))
-
-            std_ts = ch.get("std_conc_product_ts")
-            std_react = ch.get("std_conc_product_reactant")
-            std_prod = ch.get("std_conc_product_product")
-            std_ts_f = float(std_ts) if std_ts is not None else 1.0
-            std_react_f = float(std_react) if std_react is not None else 1.0
-            std_prod_f = float(std_prod) if std_prod is not None else 1.0
-            std_ratio_fwd = std_ts_f / std_react_f
-            std_ratio_rev = std_ts_f / std_prod_f
-            if not (math.isfinite(std_ratio_fwd) and std_ratio_fwd > 0.0):
-                std_ratio_fwd = 1.0
-            if not (math.isfinite(std_ratio_rev) and std_ratio_rev > 0.0):
-                std_ratio_rev = 1.0
-
-            expo_fwd = math.exp(-float(dG_act_J) / (R * float(T)))
-            expo_rev = math.exp(-float(dG_rev_J) / (R * float(T)))
-            kf = float(float(kappa) * float(prefactor) * float(deg_ratio_fwd) * float(expo_fwd) * float(std_ratio_fwd))
-            kr = float(float(kappa) * float(prefactor) * float(deg_ratio_rev) * float(expo_rev) * float(std_ratio_rev))
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "main_window.energy_table.ts_channel.compute_rates",
-                message=f"Failed to compute energy-mode channel rates ({label})",
-                exc=exc,
-            )
-            return None
-
-        return {
-            f"ΔG‡_fwd ({label})": (dG_act, energy_unit),
-            f"ΔG° ({label})": (dG_eq, energy_unit),
-            f"k_f ({label})": (kf, unit_kf),
             f"k_r ({label})": (kr, unit_kr),
             f"Keq ({label})": (K, "1"),
         }
@@ -6779,40 +6204,27 @@ class MainWindow(
             return
 
         try:
-            from kindred.core.constants import R
-            from kindred.core.simulator.kinetics import K_from_deltaG_eq, eyring_prefactor, rate_units
+            from kindred.core.simulator.kinetics import K_from_deltaG_eq, rate_units
             from kindred.core.units import UnitsModel
         except Exception:
             return
 
         unit_conv = UnitsModel(energy_unit=energy_unit)
         params: Dict[str, Tuple[float, str]] = {}
-        prefactor = float(eyring_prefactor(T))
 
         for ch in channels:
             if not isinstance(ch, dict):
                 continue
-            kind = str(ch.get("kind") or "ts_channel")
-            if kind == "fast_equilibrium":
-                out = self._energy_mode_params_for_fast_equilibrium_channel(
-                    ch,
-                    energy_unit=energy_unit,
-                    unit_conv=unit_conv,
-                    T=T,
-                    K_from_deltaG_eq=K_from_deltaG_eq,
-                    rate_units=rate_units,
-                )
-            else:
-                out = self._energy_mode_params_for_ts_channel(
-                    ch,
-                    energy_unit=energy_unit,
-                    unit_conv=unit_conv,
-                    T=T,
-                    R=float(R),
-                    prefactor=prefactor,
-                    K_from_deltaG_eq=K_from_deltaG_eq,
-                    rate_units=rate_units,
-                )
+            if str(ch.get("kind") or "") != "fast_equilibrium":
+                continue
+            out = self._energy_mode_params_for_fast_equilibrium_channel(
+                ch,
+                energy_unit=energy_unit,
+                unit_conv=unit_conv,
+                T=T,
+                K_from_deltaG_eq=K_from_deltaG_eq,
+                rate_units=rate_units,
+            )
             if out:
                 params.update(out)
 
@@ -6873,9 +6285,7 @@ class MainWindow(
         source = base_source if base_source is not None else self.canonical_mechanism_source()
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("base_source must be a MechanismAuthoringSource.")
-        non_scalar_values, scalar_values, state_network_values = (
-            self._partition_effective_slider_commit_values(values)
-        )
+        non_scalar_values, scalar_values = self._partition_effective_slider_commit_values(values)
         reactions_text = str(source.reactions_text)
         if non_scalar_values:
             reactions_text = self._apply_reactions_overrides_to_text(
@@ -6888,25 +6298,18 @@ class MainWindow(
                 scalar_values,
             )
 
-        state_network_dsl = str(source.state_network_dsl)
-        if state_network_dsl.strip() and state_network_values:
-            state_network_dsl = self._apply_state_network_overrides_to_dsl(
-                state_network_dsl,
-                overrides=state_network_values,
-            )
         return MechanismAuthoringSource.from_parts(
             reactions_text=reactions_text,
-            state_network_dsl=state_network_dsl,
+            state_network_dsl=str(source.state_network_dsl),
         )
 
     def _partition_effective_slider_commit_values(
         self,
         values: Dict[str, float],
-    ) -> tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+    ) -> tuple[Dict[str, float], Dict[str, float]]:
         metadata = self.variable_metadata() or {}
         non_scalar_values: Dict[str, float] = {}
         scalar_values: Dict[str, float] = {}
-        state_network_values: Dict[str, float] = {}
         for name, value in dict(values or {}).items():
             name_s = str(name)
             try:
@@ -6917,10 +6320,12 @@ class MainWindow(
             if isinstance(meta, dict) and meta.get("type") == "scalar":
                 scalar_values[name_s] = value_f
                 continue
-            non_scalar_values[name_s] = value_f
             if isinstance(meta, dict) and meta.get("type") == "energy":
-                state_network_values[name_s] = value_f
-        return non_scalar_values, scalar_values, state_network_values
+                if str(meta.get("role") or "") == "dG_eq_fast":
+                    non_scalar_values[name_s] = value_f
+                continue
+            non_scalar_values[name_s] = value_f
+        return non_scalar_values, scalar_values
 
     def _set_authoritative_mechanism_editor_source(
         self,
@@ -7155,7 +6560,7 @@ class MainWindow(
         self._sim_controller.discard_slider_preview_work_preserving_runtime_owner(
             target_set_ids=affected_canonical_initial_set_ids,
         )
-        self._preview_session.commit_current_mechanism_workspace(
+        self._preview_session.clear_current_mechanism_workspace_after_source_commit(
             invalidate_preview_work=False
         )
         self._refresh_after_authoritative_slider_materialization(

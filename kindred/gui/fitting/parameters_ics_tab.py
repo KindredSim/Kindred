@@ -1655,8 +1655,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
             if not name.strip():
                 continue
             value = float(definition.get("value", 1.0))
-            min_bound = float(definition.get("min", value * 0.1 if value else -10.0))
-            max_bound = float(definition.get("max", value * 10.0 if value else 10.0))
+            min_raw = definition.get("min")
+            max_raw = definition.get("max")
+            min_bound = float(min_raw if min_raw is not None else (value * 0.1 if value else -10.0))
+            max_bound = float(max_raw if max_raw is not None else (value * 10.0 if value else 10.0))
             self._shared_param_definitions[name] = dict(definition)
             editable = ParametersIcsTab._allows_parameter_fitting(definition)
             state.append(

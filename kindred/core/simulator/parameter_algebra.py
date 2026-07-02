@@ -19,8 +19,10 @@ from typing import Dict, Optional, Set
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
     authority_fields_from_step_entry,
+    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
+    generated_equilibrium_authority_kind,
     normalize_existing_equilibrium_rate_authority,
     require_step_entry_authored_role_is_editable,
     step_entry_authored_role_is_editable,
@@ -111,7 +113,15 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
                 continue
             eq = eqs[idx]
             if role in {"kf", "kr"}:
-                v = _as_float(getattr(eq, role, None))
+                meta = getattr(eq, "metadata", {}) or {}
+                generated_kind = generated_equilibrium_authority_kind(meta)
+                if generated_kind and role == "kf":
+                    v = effective_equilibrium_forward_rate(eq, temperature_K=float(temperature_K))
+                elif generated_kind and role == "kr":
+                    v = effective_equilibrium_reverse_rate(eq, temperature_K=float(temperature_K))
+                else:
+                    raw_value = getattr(eq, "kf", None) if role == "kf" else getattr(eq, "kr", None)
+                    v = _as_float(raw_value)
                 if role == "kr":
                     authority = normalize_existing_equilibrium_rate_authority(eq)
                     if authority.kind == EquilibriumRateAuthorityKind.KEQ:
@@ -194,13 +204,16 @@ def _set_mechanism_param(
         require_step_entry_authored_role_is_editable(entry, role, parameter_name=name)
         eq = eqs[idx]
         if role in {"kf", "kr"}:
-            current = getattr(eq, role, None)
+            current = getattr(eq, "kf", None) if role == "kf" else getattr(eq, "kr", None)
             if require_mutable:
                 if hasattr(current, "set"):
                     current.set(float(value))  # type: ignore[call-arg]
                     return
                 raise DSLError(f"Parameter {name!r} is not mutable in this run (missing binding)")
-            eqs[idx] = replace(eq, **{role: float(value)})
+            if role == "kf":
+                eqs[idx] = replace(eq, kf=float(value))
+            else:
+                eqs[idx] = replace(eq, kr=float(value))
             return
         if role == "Keq":
             meta = dict(getattr(eq, "metadata", {}) or {})

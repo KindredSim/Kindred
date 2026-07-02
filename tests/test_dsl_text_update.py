@@ -179,10 +179,6 @@ class _GeneratedFastMaterializationHarness:
     )
     _collect_energy_overrides = MainWindow._collect_energy_overrides
     _runtime_parameter_values_for_materialization = MainWindow._runtime_parameter_values_for_materialization
-    _parse_semicolon_kv_tokens = staticmethod(MainWindow._parse_semicolon_kv_tokens)
-    _get_semicolon_kv = staticmethod(MainWindow._get_semicolon_kv)
-    _set_semicolon_kv = staticmethod(MainWindow._set_semicolon_kv)
-    _remove_semicolon_kv = staticmethod(MainWindow._remove_semicolon_kv)
 
     def __init__(self, metadata=None) -> None:
         self._metadata = dict(metadata or {})
@@ -399,7 +395,7 @@ def test_generated_fast_energy_override_materializes_by_cm_id_not_indexed_step_m
         overrides={"dG_eq_fast__feq__A__B": 2.5},
     )
 
-    assert "equilibrium: A <-> B; kf=10; dG_eq=2.5; cm_id=feq__A__B; cm_std_ratio=1" in updated
+    assert "equilibrium: A <-> B; kf=10.0; dG_eq=2.5; cm_id=feq__A__B; cm_std_ratio=1.0" in updated
     assert "kr=" not in updated
     parse_dsl_to_mechanism(updated, initials={})
 

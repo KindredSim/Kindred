@@ -12,10 +12,13 @@ from kindred.core.exceptions import FitSimulationError
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
-    authority_readout_updates_from_step_entry,
+    GeneratedEquilibriumAuthorityKind,
+    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
 )
+from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.simulator.computational_mode import CompReaction, CompSpec, CompSpecies, compile_comp_spec
 from kindred.core.simulator.computational_mode import GENERATED_BLOCK_END, GENERATED_BLOCK_START
 from kindred.core.simulator.dsl import (
@@ -24,9 +27,10 @@ from kindred.core.simulator.dsl import (
     parse_dsl_to_mechanism,
 )
 from kindred.core.simulator.errors import DSLError
-from kindred.core.simulator.parameter_algebra import read_mechanism_parameter_values
+from kindred.core.simulator.parameter_algebra import mechanism_parameter_names, read_mechanism_parameter_values
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
+    SimulationPreparationError,
     prepare_bound_mechanism,
     prepare_simulation_worker_run,
 )
@@ -37,6 +41,30 @@ from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 
 
 pytestmark = pytest.mark.unit
+
+
+def _direct_state_network_mechanism():
+    network = StateNetwork()
+    network.add_state("A", kind=StateType.GS, energy=(0.0, "kJ/mol"), std_conc_product_M=1.0)
+    network.add_state("B", kind=StateType.GS, energy=(1.0, "kJ/mol"), std_conc_product_M=0.5)
+    network.add_edge("A", "B")
+    return StateNetworkConverter(temperature_K=298.15, C0_M=1.0).convert(
+        network,
+        initials={"A": 0.0, "B": 1.0},
+    )
+
+
+def _transition_state_network_mechanism():
+    network = StateNetwork()
+    network.add_state("A", kind=StateType.GS, energy=(0.0, "kJ/mol"), std_conc_product_M=1.0)
+    network.add_state("B", kind=StateType.GS, energy=(1.0, "kJ/mol"), std_conc_product_M=0.5)
+    network.add_state("TS", kind=StateType.TS, energy=(50.0, "kJ/mol"), std_conc_product_M=1.0)
+    network.add_edge("A", "TS")
+    network.add_edge("TS", "B")
+    return StateNetworkConverter(temperature_K=298.15, C0_M=1.0).convert(
+        network,
+        initials={"A": 0.0, "B": 1.0},
+    )
 
 
 def test_computational_mode_fast_equilibrium_generates_kf_dg_authority_without_kr():
@@ -103,15 +131,28 @@ def test_state_network_direct_fast_equilibrium_uses_thermodynamic_authority():
     authority = normalize_existing_equilibrium_rate_authority(eq)
     expected_keq = math.exp(-1000.0 / (8.31446261815324 * 298.15))
     expected_std_ratio = 0.5
-    expected_kr = float(eq.kf) / (expected_keq * expected_std_ratio)
+    expected_kr = effective_equilibrium_reverse_rate(eq)
+    generated_model = eq.metadata[EquilibriumMetadataKeys.GENERATED_RATE_MODEL]
 
     assert authority.kind == EquilibriumRateAuthorityKind.KEQ
-    assert eq.Keq == pytest.approx(expected_keq)
-    assert eq.kr == pytest.approx(expected_kr)
+    assert authority.kf_editable is False
+    assert authority.kr_editable is False
+    assert generated_model["type"] == GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM
+    assert eq.Keq is None
+    assert eq.kr is None
+    assert effective_equilibrium_keq(eq) == pytest.approx(expected_keq)
+    assert expected_kr == pytest.approx(float(eq.kf) / (expected_keq * expected_std_ratio))
+    assert mechanism.metadata.get("step_index_map") == []
+    assert {"kf1", "kr1", "Keq1"}.isdisjoint(mechanism_parameter_names(mechanism))
+    assert read_mechanism_parameter_values(mechanism, names={"kf1", "kr1", "Keq1"}) == {}
     np.testing.assert_allclose(rhs(0.0, np.asarray([0.0, 1.0], dtype=float)), [expected_kr, -expected_kr])
+    serialized = mechanism.to_serializable()["equilibria"][0]
+    assert "kf" not in serialized
+    assert "kr" not in serialized
+    assert "Keq" not in serialized
 
 
-def test_state_network_transition_state_readback_uses_explicit_rate_authority_for_keq():
+def test_state_network_transition_state_uses_generated_owner_without_indexed_readout():
     network = StateNetwork()
     network.add_state("A", kind=StateType.GS, energy=(0.0, "kJ/mol"), std_conc_product_M=1.0)
     network.add_state("B", kind=StateType.GS, energy=(1.0, "kJ/mol"), std_conc_product_M=0.5)
@@ -125,16 +166,18 @@ def test_state_network_transition_state_readback_uses_explicit_rate_authority_fo
 
     eq = mechanism.equilibria[0]
     authority = normalize_existing_equilibrium_rate_authority(eq)
-    expected_keq = float(eq.kf) / float(eq.kr)
+    effective_keq = effective_equilibrium_keq(eq)
     algebra_values = read_mechanism_parameter_values(mechanism, names={"Keq1"})
 
     assert authority.kind == EquilibriumRateAuthorityKind.KR
-    assert eq.metadata["Keq"] != pytest.approx(expected_keq)
-    assert effective_equilibrium_keq(eq) == pytest.approx(expected_keq)
-    assert algebra_values["Keq1"] == pytest.approx(expected_keq)
+    assert "Keq" not in eq.metadata
+    assert effective_keq is not None and effective_keq > 0.0
+    assert mechanism.metadata.get("step_index_map") == []
+    assert "Keq1" not in mechanism_parameter_names(mechanism)
+    assert algebra_values == {}
 
 
-def test_state_network_transition_state_readout_refresh_derives_keq_from_current_rates():
+def test_state_network_transition_state_does_not_publish_generated_indexed_updates():
     network = StateNetwork()
     network.add_state("A", kind=StateType.GS, energy=(0.0, "kJ/mol"), std_conc_product_M=1.0)
     network.add_state("B", kind=StateType.GS, energy=(1.0, "kJ/mol"), std_conc_product_M=0.5)
@@ -145,17 +188,45 @@ def test_state_network_transition_state_readout_refresh_derives_keq_from_current
         network,
         initials={"A": 0.0, "B": 1.0},
     )
-    entry = mechanism.metadata["step_index_map"][0]
 
-    updates = {
-        update.name: update.value
-        for update in authority_readout_updates_from_step_entry(
-            entry,
-            {"kf1": 4.0, "kr1": 1.0, "Keq1": 2.0},
-        )
-    }
+    assert mechanism.metadata.get("step_index_map") == []
+    assert {"kf1", "kr1", "Keq1"}.isdisjoint(mechanism_parameter_names(mechanism))
+    assert read_mechanism_parameter_values(mechanism, names={"kf1", "kr1", "Keq1"}) == {}
 
-    assert updates["Keq1"] == pytest.approx(4.0)
+
+def test_state_network_transition_state_generated_owner_model_survives_without_scalar_slots():
+    mechanism = _transition_state_network_mechanism()
+    eq = mechanism.equilibria[0]
+    expected_kf = effective_equilibrium_forward_rate(eq, temperature_K=298.15)
+    expected_kr = effective_equilibrium_reverse_rate(eq, temperature_K=298.15)
+
+    object.__setattr__(eq, "kf", None)
+    object.__setattr__(eq, "kr", None)
+
+    authority = normalize_existing_equilibrium_rate_authority(eq)
+    rhs = build_ode_rhs_from_mechanism(mechanism)
+
+    assert authority.kind == EquilibriumRateAuthorityKind.KR
+    assert authority.kf == pytest.approx(expected_kf)
+    assert authority.kr == pytest.approx(expected_kr)
+    assert authority.kf_editable is False
+    assert authority.kr_editable is False
+    np.testing.assert_allclose(
+        rhs(0.0, np.asarray([0.0, 1.0], dtype=float)),
+        [expected_kr, -expected_kr],
+    )
+
+
+def test_state_network_generated_symbolic_jacobian_status_does_not_fabricate_indexed_parameters():
+    for mechanism in (_direct_state_network_mechanism(), _transition_state_network_mechanism()):
+        support = classify_symbolic_jacobian_support(mechanism)
+
+        assert not support.supported
+        assert support.code == "generated-equilibrium"
+        assert "indexed" not in support.reason.lower()
+        assert "kf1" not in support.reason
+        assert "kr1" not in support.reason
+        assert "Keq1" not in support.reason
 
 
 def test_generated_computational_mode_payload_rejects_legacy_kr_without_std_ratio():
@@ -446,7 +517,7 @@ def test_generated_fast_execution_request_override_is_worker_runtime_parameter()
     np.testing.assert_allclose(version1_rate, [version1_expected_kr, -version1_expected_kr])
 
 
-def test_runtime_keq_binding_is_authoritative_for_equilibrium_readouts():
+def test_runtime_derived_kr_override_is_rejected_for_dg_authority_equilibrium():
     source = (
         "energy=kJ/mol\n"
         "equilibrium: A <-> B; kf=10.0; dG_eq=1.0\n"
@@ -463,12 +534,8 @@ def test_runtime_keq_binding_is_authoritative_for_equilibrium_readouts():
         parameter_overrides={"kr1": requested_kr},
     )
 
-    prepared = prepare_simulation_worker_run(execution_request=request)
-    values = read_mechanism_parameter_values(prepared.mechanism, names={"Keq1", "kr1"})
-
-    assert effective_equilibrium_keq(prepared.mechanism.equilibria[0]) == pytest.approx(desired_keq)
-    assert values["Keq1"] == pytest.approx(desired_keq)
-    assert values["kr1"] == pytest.approx(requested_kr)
+    with pytest.raises(SimulationPreparationError, match="derived readout"):
+        prepare_simulation_worker_run(execution_request=request)
 
 
 def test_generated_fast_parameter_discovery_uses_generated_metadata_name():

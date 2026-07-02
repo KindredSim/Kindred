@@ -8,7 +8,7 @@ from kindred.core.simulation_identity import contained_simulation_owner_identity
 pytestmark = pytest.mark.unit
 
 
-def _preview_structural_digest(mechanism_text: str) -> str:
+def _preview_mechanism_digest(mechanism_text: str) -> str:
     payload = contained_simulation_owner_identity(
         execution_mode="preview",
         owner_mechanism_text=mechanism_text,
@@ -23,21 +23,21 @@ def _preview_structural_digest(mechanism_text: str) -> str:
         set_id="default",
         parameter_names=["Keq1"],
     )
-    return str(payload["structural_mechanism_digest"])
+    return str(payload["mechanism_digest"])
 
 
 @pytest.mark.parametrize("key", ["Keq", "keq", "KEQ"])
-def test_preview_identity_masks_exact_keq_key_case_insensitively(key):
-    assert _preview_structural_digest(f"equilibrium: A <-> B; kf=1; {key}=2") == (
-        _preview_structural_digest(f"equilibrium: A <-> B; kf=1; {key}=3")
+def test_preview_identity_tracks_exact_keq_key_value_case_insensitively(key):
+    assert _preview_mechanism_digest(f"equilibrium: A <-> B; kf=1; {key}=2") != (
+        _preview_mechanism_digest(f"equilibrium: A <-> B; kf=1; {key}=3")
     )
 
 
 @pytest.mark.parametrize("key", ["K", "K_eq", "k_eq"])
-def test_preview_identity_does_not_mask_legacy_keq_aliases(key):
-    first_digest = _preview_structural_digest(f"equilibrium: A <-> B; kf=1; {key}=2")
-    second_digest = _preview_structural_digest(f"equilibrium: A <-> B; kf=1; {key}=3")
-    canonical_digest = _preview_structural_digest("equilibrium: A <-> B; kf=1; Keq=2")
+def test_preview_identity_tracks_legacy_keq_alias_values(key):
+    first_digest = _preview_mechanism_digest(f"equilibrium: A <-> B; kf=1; {key}=2")
+    second_digest = _preview_mechanism_digest(f"equilibrium: A <-> B; kf=1; {key}=3")
+    canonical_digest = _preview_mechanism_digest("equilibrium: A <-> B; kf=1; Keq=2")
 
     assert first_digest != second_digest
     assert first_digest != canonical_digest

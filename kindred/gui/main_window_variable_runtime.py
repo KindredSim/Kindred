@@ -8,10 +8,10 @@ import re
 from typing import TYPE_CHECKING, Dict, Tuple
 
 from kindred.core.equilibrium_rate_authority import (
+    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
 )
-from kindred.core.simulator.computational_mode import GENERATED_BLOCK_START
 from kindred.core.simulator.parameter_namespace import generated_fast_equilibrium_parameter_name
 
 if TYPE_CHECKING:
@@ -255,12 +255,14 @@ class MainWindowVariableRuntime:
                 or not variables
                 or has_current_energy_sliders
             ):
+                projection_base_variables = variables if has_generated_fast_equilibrium else None
+                projection_base_metadata = metadata if has_generated_fast_equilibrium else None
                 self.populate_energy_mode_variables_from_mechanism(
                     mechanism,
                     refresh_sliders=True,
                     preserve_visibility=bool(preserve_visibility),
-                    base_variables=variables if has_generated_fast_equilibrium else None,
-                    base_metadata=metadata if has_generated_fast_equilibrium else None,
+                    base_variables=projection_base_variables,
+                    base_metadata=projection_base_metadata,
                 )
                 return
 
@@ -276,7 +278,7 @@ class MainWindowVariableRuntime:
                 )
                 logger.info("Populated %s variable sliders", len(variables))
                 mw._preview_session.sync_committed_slider_values(
-                    {k: v for k, v in variables.items() if metadata.get(k, {}).get("editable") is not False},
+                    self._committable_slider_values(variables, metadata),
                     schema_text=committed_schema_text,
                 )
                 self.update_parameter_table_from_sliders()
@@ -298,6 +300,23 @@ class MainWindowVariableRuntime:
                 logger.debug("Failed to clear sliders after extraction failure: %s", clear_exc, exc_info=True)
             mw._preview_session.sync_committed_slider_values({})
             self.clear_variable_metadata()
+
+    @staticmethod
+    def _committable_slider_values(
+        values: MappingABC[str, float],
+        metadata: MappingABC[str, MappingABC[str, object]],
+    ) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for raw_name, raw_value in dict(values or {}).items():
+            name = str(raw_name)
+            meta = metadata.get(name) if isinstance(metadata, MappingABC) else None
+            if isinstance(meta, MappingABC) and meta.get("editable") is False:
+                continue
+            try:
+                out[name] = float(raw_value)
+            except Exception:
+                continue
+        return out
 
     def update_parameter_table_from_sliders(self) -> None:
         mw = self._mw
@@ -327,15 +346,7 @@ class MainWindowVariableRuntime:
             return
 
     def is_energy_mode_mechanism(self, mechanism: object) -> bool:
-        meta = getattr(mechanism, "metadata", {}) or {}
-        if not isinstance(meta, MappingABC):
-            return False
-        sn = meta.get("state_network")
-        if not isinstance(sn, MappingABC):
-            return False
-        states = sn.get("states")
-        edges = sn.get("edges")
-        return bool(states or edges)
+        return bool(self.has_generated_computational_fast_equilibrium(mechanism))
 
     def has_generated_computational_fast_equilibrium(self, mechanism: object) -> bool:
         for eq in list(getattr(mechanism, "equilibria", []) or []):
@@ -347,11 +358,6 @@ class MainWindowVariableRuntime:
             if str(eq_meta.get("cm_id") or "").strip():
                 return True
         return False
-
-    def dsl_has_computational_mode_generated_block(self, dsl_text: str) -> bool:
-        if not dsl_text:
-            return False
-        return str(GENERATED_BLOCK_START).strip() in str(dsl_text)
 
     def dsl_global_temperature_k(self, dsl_text: str) -> float | None:
         if not dsl_text:
@@ -409,6 +415,9 @@ class MainWindowVariableRuntime:
             if role == "kr":
                 value = effective_equilibrium_reverse_rate(eq_obj, temperature_K=effective_temperature)
                 return float(value) if value is not None else float("nan")
+            if role == "kf":
+                value = effective_equilibrium_forward_rate(eq_obj, temperature_K=effective_temperature)
+                return float(value) if value is not None else float("nan")
             raw_value = getattr(eq_obj, role, None)
             try:
                 return float(raw_value() if callable(raw_value) else raw_value)
@@ -424,12 +433,12 @@ class MainWindowVariableRuntime:
 
         try:
             from kindred.core.simulator.kinetics import rate_units
+            from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
             from kindred.core.units import UnitsModel
         except Exception:
+            EquilibriumMetadataKeys = None  # type: ignore[assignment]
             UnitsModel = None  # type: ignore[assignment]
             rate_units = None  # type: ignore[assignment]
-
-        unit_conv = UnitsModel(energy_unit=energy_unit) if UnitsModel is not None else None  # type: ignore[call-arg]
 
         temperature_k: float | None = None
         if isinstance(meta, MappingABC) and meta.get("temperature_K") is not None:
@@ -442,110 +451,6 @@ class MainWindowVariableRuntime:
                 temperature_k = float(mw.temperature_spinbox_value())
             except Exception:
                 temperature_k = None
-
-        ts_channels: list[dict[str, object]] = []
-        for eq in list(getattr(mechanism, "equilibria", []) or []):
-            eq_meta = getattr(eq, "metadata", {}) or {}
-            if not isinstance(eq_meta, MappingABC):
-                continue
-            if str(eq_meta.get("source") or "") != "state_network":
-                continue
-            reactant = str(eq_meta.get("reactant") or "")
-            product = str(eq_meta.get("product") or "")
-            ts = str(eq_meta.get("ts") or "")
-            if not (reactant and product and ts):
-                continue
-            try:
-                dg_act_fwd_j = float(eq_meta.get("dG_act_fwd_J_per_mol"))
-                dg_eq_j = float(eq_meta.get("dG_eq_J_per_mol"))
-            except Exception as exc:
-                mw._record_best_effort_failure(
-                    "main_window.energy_channels.read_dG",
-                    message=f"Skipping energy-mode channel with invalid dG metadata ({reactant}->{product} via {ts})",
-                    exc=exc,
-                )
-                continue
-            if unit_conv is not None:
-                dg_act_val = float(unit_conv.from_jmol(dg_act_fwd_j))
-                dg_eq_val = float(unit_conv.from_jmol(dg_eq_j))
-            else:
-                dg_act_val = dg_act_fwd_j / 1000.0
-                dg_eq_val = dg_eq_j / 1000.0
-            try:
-                kappa = float(eq_meta.get("kappa") or 1.0)
-            except Exception:
-                kappa = 1.0
-            try:
-                deg_ratio_fwd = float(eq_meta.get("degeneracy_ratio_fwd") or 1.0)
-            except Exception:
-                deg_ratio_fwd = 1.0
-            try:
-                deg_ratio_rev = float(eq_meta.get("degeneracy_ratio_rev") or 1.0)
-            except Exception:
-                deg_ratio_rev = 1.0
-            try:
-                molecularity_fwd = int(eq_meta.get("molecularity_fwd") or 1)
-            except Exception:
-                molecularity_fwd = 1
-            try:
-                molecularity_rev = int(eq_meta.get("molecularity_rev") or 1)
-            except Exception:
-                molecularity_rev = 1
-            unit_kf = "1/s"
-            unit_kr = "1/s"
-            try:
-                if rate_units is not None:
-                    unit_kf = str(rate_units(int(molecularity_fwd)))
-                    unit_kr = str(rate_units(int(molecularity_rev)))
-            except Exception:
-                unit_kf = "1/s"
-                unit_kr = "1/s"
-
-            std_ts = None
-            std_react = None
-            std_prod = None
-            try:
-                if eq_meta.get("std_conc_product_ts") is not None:
-                    std_ts = float(eq_meta.get("std_conc_product_ts"))
-            except Exception:
-                std_ts = None
-            try:
-                if eq_meta.get("std_conc_product_reactant") is not None:
-                    std_react = float(eq_meta.get("std_conc_product_reactant"))
-            except Exception:
-                std_react = None
-            try:
-                if eq_meta.get("std_conc_product_product") is not None:
-                    std_prod = float(eq_meta.get("std_conc_product_product"))
-            except Exception:
-                std_prod = None
-            label = f"{reactant}→{product} via {ts}"
-            ts_channels.append(
-                {
-                    "kind": "ts_channel",
-                    "reactant": reactant,
-                    "product": product,
-                    "ts": ts,
-                    "label": label,
-                    "dG_act_fwd": dg_act_val,
-                    "dG_eq": dg_eq_val,
-                    "kappa": kappa,
-                    "degeneracy_ratio_fwd": deg_ratio_fwd,
-                    "degeneracy_ratio_rev": deg_ratio_rev,
-                    "molecularity_fwd": int(molecularity_fwd),
-                    "molecularity_rev": int(molecularity_rev),
-                    "std_conc_product_ts": std_ts,
-                    "std_conc_product_reactant": std_react,
-                    "std_conc_product_product": std_prod,
-                    "kf": _equilibrium_value(eq, "kf"),
-                    "kr": _equilibrium_value(eq, "kr"),
-                    "Keq": _equilibrium_value(eq, "Keq"),
-                    "unit_kf": unit_kf,
-                    "unit_kr": unit_kr,
-                }
-            )
-
-        ts_channels.sort(key=lambda c: (str(c.get("ts")), str(c.get("reactant")), str(c.get("product"))))
 
         step_context_by_equilibrium_index: dict[int, str] = {}
         if isinstance(meta, MappingABC):
@@ -606,9 +511,15 @@ class MainWindowVariableRuntime:
                     exc=exc,
                 )
                 continue
+            source_energy_unit = str(
+                eq_meta.get(EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT)  # type: ignore[union-attr]
+                if EquilibriumMetadataKeys is not None
+                else ""
+            ) or energy_unit
+            source_unit_conv = UnitsModel(energy_unit=source_energy_unit) if UnitsModel is not None else None  # type: ignore[call-arg]
             dg_eq_val = (
-                float(unit_conv.from_jmol(float(dg_eq_j)))
-                if unit_conv is not None
+                float(source_unit_conv.from_jmol(float(dg_eq_j)))
+                if source_unit_conv is not None
                 else float(dg_eq_j) / 1000.0
             )
             kf = _equilibrium_value(eq, "kf")
@@ -678,6 +589,7 @@ class MainWindowVariableRuntime:
                     "kr": float(kr),
                     "K_thermo": float(k_thermo),
                     "std_ratio": float(std_ratio),
+                    "source_unit": source_energy_unit,
                     "molecularity_fwd": int(max(1, int(molecularity_fwd))),
                     "molecularity_rev": int(max(1, int(molecularity_rev))),
                     "unit_kf": unit_kf,
@@ -686,7 +598,7 @@ class MainWindowVariableRuntime:
             )
 
         fast_eq_channels.sort(key=lambda c: (str(c.get("cm_id")), str(c.get("label"))))
-        all_channels = list(ts_channels) + list(fast_eq_channels)
+        all_channels = list(fast_eq_channels)
         mw._energy_mode_channels = list(all_channels)
 
         variables: OrderedDict[str, float] = OrderedDict()
@@ -717,7 +629,7 @@ class MainWindowVariableRuntime:
                     ),
                 )
                 mw._preview_session.sync_committed_slider_values(
-                    dict(variables),
+                    self._committable_slider_values(variables, vmeta),
                     schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
                 )
             else:
@@ -748,53 +660,6 @@ class MainWindowVariableRuntime:
                 hi = lo + max(1.0, span)
             return float(lo), float(hi)
 
-        for ch in ts_channels:
-            reactant = str(ch["reactant"])
-            product = str(ch["product"])
-            ts = str(ch["ts"])
-            label = str(ch["label"])
-            dg_act = float(ch["dG_act_fwd"])
-            dg_eq = float(ch["dG_eq"])
-
-            var_act = f"dGact_fwd__{ts}__{reactant}__{product}"
-            var_eq = f"dG_eq__{ts}__{reactant}__{product}"
-
-            variables[var_act] = dg_act
-            variables[var_eq] = dg_eq
-
-            act_lo, act_hi = _range(dg_act, nonnegative=True)
-            eq_lo, eq_hi = _range(dg_eq, nonnegative=False)
-            vmeta[var_act] = {
-                "type": "energy",
-                "role": "dG_act_fwd",
-                "ts": ts,
-                "reactant": reactant,
-                "product": product,
-                "label": f"{label} (ΔG‡_fwd)",
-                "unit": energy_unit,
-                "scale": "linear",
-                "min": act_lo,
-                "max": act_hi,
-            }
-            vmeta[var_eq] = {
-                "type": "energy",
-                "role": "dG_eq",
-                "ts": ts,
-                "reactant": reactant,
-                "product": product,
-                "label": f"{label} (ΔG°)",
-                "unit": energy_unit,
-                "scale": "linear",
-                "min": eq_lo,
-                "max": eq_hi,
-            }
-
-            params[f"ΔG‡_fwd ({label})"] = (dg_act, energy_unit)
-            params[f"ΔG° ({label})"] = (dg_eq, energy_unit)
-            params[f"k_f ({label})"] = (float(ch["kf"]), str(ch.get("unit_kf") or "1/s"))
-            params[f"k_r ({label})"] = (float(ch["kr"]), str(ch.get("unit_kr") or "1/s"))
-            params[f"Keq ({label})"] = (float(ch["Keq"]), "1")
-
         for ch in fast_eq_channels:
             cm_id = str(ch.get("cm_id") or "")
             label = str(ch.get("label") or cm_id or "fast equilibrium")
@@ -819,7 +684,8 @@ class MainWindowVariableRuntime:
                 "role": "dG_eq_fast",
                 "cm_id": cm_id,
                 "label": f"{label} (ΔG° fast)",
-                "unit": energy_unit,
+                "unit": str(ch.get("source_unit") or energy_unit),
+                "source_unit": str(ch.get("source_unit") or energy_unit),
                 "scale": "linear",
                 "min": eq_lo,
                 "max": eq_hi,
@@ -831,7 +697,9 @@ class MainWindowVariableRuntime:
             kr_val = float(ch.get("kr") or float("nan"))
             try:
                 if temperature_k is not None and math.isfinite(float(temperature_k)) and float(temperature_k) > 0.0:
-                    dg_eq_j = float(unit_conv.to_jmol(dg_eq)) if unit_conv is not None else float(dg_eq) * 1000.0
+                    source_unit = str(ch.get("source_unit") or energy_unit)
+                    source_conv = UnitsModel(energy_unit=source_unit) if UnitsModel is not None else None  # type: ignore[call-arg]
+                    dg_eq_j = float(source_conv.to_jmol(dg_eq)) if source_conv is not None else float(dg_eq) * 1000.0
                     k_thermo = float(math.exp(-float(dg_eq_j) / (float(r_j_per_mol_k) * float(temperature_k))))
                     if math.isfinite(k_thermo) and k_thermo > 0.0 and math.isfinite(kf_fixed) and kf_fixed > 0.0:
                         kr_val = float(kf_fixed / (k_thermo * max(1e-300, float(std_ratio))))
@@ -840,7 +708,7 @@ class MainWindowVariableRuntime:
                 k_thermo = float("nan")
                 kr_val = float(ch.get("kr") or float("nan"))
 
-            params[f"ΔG° ({label})"] = (dg_eq, energy_unit)
+            params[f"ΔG° ({label})"] = (dg_eq, str(ch.get("source_unit") or energy_unit))
             params[f"k_f ({label})"] = (kf_fixed, str(ch.get("unit_kf") or "1/s"))
             params[f"k_r ({label})"] = (kr_val, str(ch.get("unit_kr") or "1/s"))
             params[f"Keq ({label})"] = (k_thermo, "1")
@@ -856,7 +724,7 @@ class MainWindowVariableRuntime:
                 visibility_scope_signature=visibility_scope_signature,
             )
             mw._preview_session.sync_committed_slider_values(
-                dict(variables),
+                self._committable_slider_values(variables, vmeta),
                 schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
             )
 

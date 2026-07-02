@@ -10,6 +10,7 @@ from kindred.core.intervention_schedule import (
     coerce_intervention_schedule,
     intervention_schedule_identity_fingerprints,
     normalized_intervention_schedule_identity_fingerprints,
+    normalized_intervention_schedule_payload,
 )
 from kindred.core.simulation_preparation import SimulationExecutionRequest, SimulationPreparationError
 
@@ -236,16 +237,33 @@ class SimulationPlan:
         schedule = coerce_intervention_schedule(self.execution_request.intervention_schedule)
         if schedule is None:
             return "", ""
+        schedule_values = (
+            dict(self.execution_request.schedule_parameter_values)
+            if isinstance(self.execution_request.schedule_parameter_values, Mapping)
+            else {}
+        )
         prepared_payload = self.execution_request.prepared_payload
         if isinstance(prepared_payload, Mapping):
             mechanism = prepared_payload.get("mechanism")
             if mechanism is not None:
                 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
+                namespace = build_namespace_from_mechanism(mechanism)
+                if schedule_values:
+                    normalized_payload = normalized_intervention_schedule_payload(
+                        schedule,
+                        mechanism_namespace=namespace,
+                    )
+                    normalized_schedule = coerce_intervention_schedule(normalized_payload)
+                    if normalized_schedule is not None:
+                        schedule = normalized_schedule.resolve_parameters(schedule_values)
+                    return intervention_schedule_identity_fingerprints(schedule)
                 return normalized_intervention_schedule_identity_fingerprints(
                     schedule,
-                    mechanism_namespace=build_namespace_from_mechanism(mechanism),
+                    mechanism_namespace=namespace,
                 )
+        if schedule_values:
+            schedule = schedule.resolve_parameters(schedule_values)
         return intervention_schedule_identity_fingerprints(schedule)
 
     def _validate_cache_identity_schedule(self) -> None:

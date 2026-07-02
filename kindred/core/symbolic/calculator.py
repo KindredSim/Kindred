@@ -20,7 +20,11 @@ from kindred.core.algebra.grammar import BUILTIN_FUNCTIONS as ALGEBRA_BUILTIN_FU
 from kindred.core.algebra.grammar import HELPER_FUNCTIONS as ALGEBRA_HELPER_FUNCTIONS
 from kindred.core.algebra.printer import expression_to_source
 from kindred.core.algebra.symbols import PROTECTED_NAMES as ALGEBRA_PROTECTED_NAMES
-from kindred.core.mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView
+from kindred.core.equilibrium_rate_authority import (
+    EquilibriumRateInputContext,
+    generated_equilibrium_authority_kind,
+)
+from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
 from kindred.core.simulator.parameter_algebra_spec import (
     ParameterAlgebraSpec,
@@ -229,10 +233,22 @@ def _check_available(mechanism: Any) -> None:
         raise SymbolicCalculatorUnavailable(
             "Symbolic calculator is unavailable for mechanisms with scheduled interventions."
         )
-    if isinstance(raw_metadata, Mapping) and raw_metadata.get(MechanismMetadataKeys.STATE_NETWORK):
+    if _has_generated_equilibrium_authority(mechanism):
         raise SymbolicCalculatorUnavailable(
-            "Symbolic calculator is unavailable for mechanisms with state-network definitions."
+            "Symbolic calculator is unavailable for mechanisms with generated equilibria."
         )
+
+
+def _has_generated_equilibrium_authority(mechanism: Any) -> bool:
+    for eq in list(getattr(mechanism, "equilibria", []) or []):
+        eq_meta = getattr(eq, "metadata", {}) or {}
+        if not isinstance(eq_meta, Mapping):
+            continue
+        if generated_equilibrium_authority_kind(eq_meta):
+            return True
+        if str(eq_meta.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value:
+            return True
+    return False
 
 
 def _build_context(mechanism: Any, *, mechanism_source: str) -> _CalculatorContext:

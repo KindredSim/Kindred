@@ -20,6 +20,14 @@ import numpy as np
 from .constants import R, h, k_B
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
+    GeneratedEquilibriumAuthorityKind,
+    GENERATED_RATE_MODEL_ERROR,
+    effective_equilibrium_forward_rate,
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+    generated_equilibrium_authority_kind,
+    generated_equilibrium_forward_rate_from_metadata,
+    generated_equilibrium_reverse_rate_from_metadata,
     normalize_existing_equilibrium_rate_authority,
 )
 from .mechanism import Mechanism, Reaction, Equilibrium
@@ -113,6 +121,16 @@ def build_ode_rhs_from_mechanism(
         return None
 
     def _compute_equilibrium_constant(meta: Dict[str, object], eq_obj: Equilibrium, T: float) -> Optional[float]:
+        if generated_equilibrium_authority_kind(meta):
+            return effective_equilibrium_keq(eq_obj, temperature_K=T)
+        authority = normalize_existing_equilibrium_rate_authority(eq_obj)
+        if (
+            authority.kind == EquilibriumRateAuthorityKind.KEQ
+            and authority.dG_eq_J_per_mol is not None
+            and not authority.has_explicit_keq_param
+        ):
+            val = _evaluate_scalar(authority.dG_eq_J_per_mol)
+            return K_from_deltaG_eq(float(val), T) if val is not None else None
         keq_input = meta.get("Keq_input")
         if callable(keq_input):
             val = _evaluate_scalar(keq_input)
@@ -127,6 +145,11 @@ def build_ode_rhs_from_mechanism(
             val = _evaluate_scalar(eq_obj.Keq)
             return float(val) if val is not None else None
         return None
+
+    def _evaluate_rate_binding(binding: RateBinding, T: float) -> float:
+        if bool(getattr(binding, "accepts_runtime_temperature", False)):
+            return float(binding(T))  # type: ignore[call-arg]
+        return float(binding())
 
     def _require_positive_finite_runtime_Keq(Keq_value: float) -> float:
         Keq_float = float(Keq_value)
@@ -180,12 +203,27 @@ def build_ode_rhs_from_mechanism(
             self._Keq_const = Keq_const
             self._authority = normalize_existing_equilibrium_rate_authority(eq_obj)
             self._authority_kind = self._authority.kind
+            self._generated_authority_kind = generated_equilibrium_authority_kind(self._meta)
+            self._generated_ts_authority = (
+                self._generated_authority_kind == GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES
+            )
 
         def __call__(self, T: float) -> Tuple[float, float]:
+            if self._generated_authority_kind:
+                kf_generated = effective_equilibrium_forward_rate(self._eq, temperature_K=T)
+                kr_generated = effective_equilibrium_reverse_rate(self._eq, temperature_K=T)
+                if kf_generated is None or kr_generated is None:
+                    raise ValueError(GENERATED_RATE_MODEL_ERROR)
+                return float(kf_generated), float(kr_generated)
+
             Keq_T = _compute_equilibrium_constant(self._meta, self._eq, T)
             kf_val = _eval_model(self._forward_model, T, self._fwd_mol)
+            if kf_val is None:
+                kf_val = generated_equilibrium_forward_rate_from_metadata(self._meta, temperature_K=T)
+            if kf_val is None and self._generated_ts_authority:
+                raise ValueError(GENERATED_RATE_MODEL_ERROR)
             if kf_val is None and self._kf_binding is not None:
-                kf_val = float(self._kf_binding())
+                kf_val = _evaluate_rate_binding(self._kf_binding, T)
             elif kf_val is None and callable(getattr(self._eq, "kf", None)):
                 kf_val = _evaluate_scalar(getattr(self._eq, "kf", None))
             elif kf_val is None and self._user_kf:
@@ -199,8 +237,12 @@ def build_ode_rhs_from_mechanism(
                 kf_val = self._kf_const
 
             kr_val = _eval_model(self._reverse_model, T, self._rev_mol)
+            if kr_val is None:
+                kr_val = generated_equilibrium_reverse_rate_from_metadata(self._meta, temperature_K=T)
+            if kr_val is None and self._generated_ts_authority:
+                raise ValueError(GENERATED_RATE_MODEL_ERROR)
             if kr_val is None and self._kr_binding is not None:
-                kr_val = float(self._kr_binding())
+                kr_val = _evaluate_rate_binding(self._kr_binding, T)
             elif kr_val is None and callable(getattr(self._eq, "kr", None)):
                 kr_val = _evaluate_scalar(getattr(self._eq, "kr", None))
             elif kr_val is None and self._user_kr:
@@ -222,7 +264,7 @@ def build_ode_rhs_from_mechanism(
 
             thermo_Keq = Keq_T if Keq_T is not None else self._Keq_const
             if thermo_Keq is None and self._Keq_binding is not None:
-                thermo_Keq = float(self._Keq_binding())
+                thermo_Keq = _evaluate_rate_binding(self._Keq_binding, T)
 
             if self._authority_kind == EquilibriumRateAuthorityKind.KR:
                 thermo_Keq = None

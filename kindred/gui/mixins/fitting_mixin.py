@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
 import math
-from typing import Callable, Dict, Optional, TYPE_CHECKING
+from typing import Callable, Dict, Mapping, Optional, TYPE_CHECKING
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
@@ -355,6 +355,11 @@ class FittingMixin:
             for name, value in normalized_parameters.items()
             if str(name) in generated_fast_metadata
         }
+        source_authoritative_values = {
+            str(name): float(meta["value"])
+            for name, meta in generated_fast_metadata.items()
+            if isinstance(meta, Mapping) and meta.get("value") is not None
+        }
         ordinary_parameters = {
             str(name): value
             for name, value in normalized_parameters.items()
@@ -363,7 +368,6 @@ class FittingMixin:
         analysis = analyze_parameter_updates_to_dsl_text(
             current_text,
             ordinary_parameters,
-            authoritative_values=self._current_fit_authoritative_parameter_values(),
             step_constraint_context=self._current_fit_step_constraint_context(),
         )
         updated_text = str(analysis.updated_text)
@@ -396,6 +400,7 @@ class FittingMixin:
             "missing": missing,
             "update_errors": update_errors,
             "step_outcomes": tuple(analysis.step_outcomes),
+            "source_authoritative_values": source_authoritative_values,
         }
 
     @staticmethod
@@ -416,7 +421,6 @@ class FittingMixin:
             if isinstance(mechanism_meta, dict)
             else "kJ/mol"
         ) or "kJ/mol"
-        unit_conv = UnitsModel(energy_unit=energy_unit)
         for eq in list(getattr(mechanism, "equilibria", []) or []):
             metadata = dict(getattr(eq, "metadata", {}) or {})
             name = generated_fast_equilibrium_parameter_name(metadata)
@@ -424,7 +428,6 @@ class FittingMixin:
                 continue
             try:
                 dG_eq_j = float(metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
-                value = float(unit_conv.from_jmol(dG_eq_j))
             except Exception:
                 continue
             try:
@@ -435,24 +438,24 @@ class FittingMixin:
                 std_ratio = float(metadata.get("std_ratio"))
             except Exception:
                 std_ratio = metadata.get("std_ratio")
+            source_energy_unit = str(
+                metadata.get(EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT)
+                or energy_unit
+                or "kJ/mol"
+            )
+            source_unit_conv = UnitsModel(energy_unit=source_energy_unit)
+            source_value = float(source_unit_conv.from_jmol(dG_eq_j))
             metadata_by_name[str(name)] = {
                 "type": "energy",
                 "role": "dG_eq_fast",
                 "cm_id": str(metadata.get("cm_id") or ""),
-                "unit": energy_unit,
+                "unit": source_energy_unit,
+                "source_unit": source_energy_unit,
                 "kf_fixed": kf_fixed,
                 "std_ratio": std_ratio,
-                "value": value,
+                "value": source_value,
             }
         return metadata_by_name
-
-    def _current_fit_authoritative_parameter_values(self) -> Dict[str, float]:
-        preview_session = getattr(self, "_preview_session", None)
-        param_store = getattr(preview_session, "param_store", None)
-        return {
-            str(name): float(value)
-            for name, value in dict(getattr(param_store, "shared_params", {}) or {}).items()
-        }
 
     def _current_fit_step_constraint_context(self) -> Dict[str, object]:
         ports = self._require_fitting_ports()
@@ -613,7 +616,6 @@ class FittingMixin:
             str(name): float(value)
             for name, value in dict(parameters or {}).items()
         }
-        authoritative_values = self._current_fit_authoritative_parameter_values()
         update = self._prepare_fit_parameter_project_text(
             normalized_parameters,
             source_text=source_text,
@@ -631,9 +633,10 @@ class FittingMixin:
             if (
                 step_outcomes_by_name[str(name)].semantic_value_change
                 if str(name) in step_outcomes_by_name
-                else not authoritative_parameter_values_match(
-                    authoritative_values.get(str(name)),
+                else self._source_parameter_value_changed(
+                    str(name),
                     float(value),
+                    update=update,
                 )
             )
         )
@@ -642,7 +645,7 @@ class FittingMixin:
         warning_messages = self._fit_parameter_warning_messages(missing, update_errors, step_outcomes)
         return _FitParameterApplyDelta(
             parameters=dict(normalized_parameters),
-            authoritative_values=dict(authoritative_values),
+            authoritative_values=dict(update.get("source_authoritative_values") or {}),
             changed_names=changed_names,
             current_text=current_text,
             updated_text=updated_text,
@@ -653,6 +656,23 @@ class FittingMixin:
             has_real_change=bool(changed_names),
             needs_dsl_rewrite=(updated_text != current_text),
         )
+
+    @staticmethod
+    def _source_parameter_value_changed(
+        name: str,
+        value: float,
+        *,
+        update: Mapping[str, object],
+    ) -> bool:
+        source_values = dict(update.get("source_authoritative_values") or {})
+        if str(name) in source_values:
+            return not authoritative_parameter_values_match(
+                source_values.get(str(name)),
+                float(value),
+            )
+        if str(name) in set(str(item) for item in (update.get("missing") or ())):
+            return False
+        return str(update.get("updated_text") or "") != str(update.get("current_text") or "")
 
     def _init_fitting_defaults(self) -> None:
         """Initialize document-override fitting defaults as empty (no document loaded yet)."""

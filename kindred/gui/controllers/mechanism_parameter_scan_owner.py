@@ -62,7 +62,7 @@ class MechanismParameterScanOwner:
             name = definition.name
             if str(name) in constrained:
                 continue
-            min_bound, max_bound = self._suggest_parameter_bounds(name, definition.value)
+            min_bound, max_bound = self._definition_parameter_bounds(definition)
             params.append(
                 {
                     "name": name,
@@ -136,6 +136,25 @@ class MechanismParameterScanOwner:
             raise RuntimeError("Mechanism parameter scan requires an explicit Wegscheider setting.")
         return value
 
+    def _definition_parameter_bounds(self, definition: object) -> tuple:
+        min_value = getattr(definition, "min", None)
+        max_value = getattr(definition, "max", None)
+        try:
+            min_bound = float(min_value)
+            max_bound = float(max_value)
+            value = float(getattr(definition, "value"))
+        except Exception:
+            return self._suggest_parameter_bounds(
+                str(getattr(definition, "name", "") or ""),
+                float(getattr(definition, "value")),
+            )
+        if min_bound < max_bound and min_bound <= value <= max_bound:
+            return min_bound, max_bound
+        return self._suggest_parameter_bounds(
+            str(getattr(definition, "name", "") or ""),
+            value,
+        )
+
     def _suggest_parameter_bounds(self, param_name: str, param_value: float) -> tuple:
         if param_name.startswith("k") and param_name[0].lower() == "k":
             if param_value > 0:
@@ -162,14 +181,26 @@ class MechanismParameterScanOwner:
             min_bound = max(param_value * 0.5, 0)
             max_bound = min(param_value * 1.5, 200)
         elif param_name.startswith("dG"):
-            min_bound = max(param_value * 2, -100)
-            max_bound = min(param_value * 2, 100)
+            span = max(10.0, abs(param_value) * 0.5)
+            min_bound = max(param_value - span, -100)
+            max_bound = min(param_value + span, 100)
+            if max_bound <= min_bound:
+                min_bound = param_value - span
+                max_bound = param_value + span
         elif param_name.startswith("dH"):
-            min_bound = max(param_value * 2, -150)
-            max_bound = min(param_value * 2, 150)
+            span = max(10.0, abs(param_value) * 0.5)
+            min_bound = max(param_value - span, -150)
+            max_bound = min(param_value + span, 150)
+            if max_bound <= min_bound:
+                min_bound = param_value - span
+                max_bound = param_value + span
         elif param_name.startswith("dS"):
-            min_bound = max(param_value * 2, -100)
-            max_bound = min(param_value * 2, 100)
+            span = max(10.0, abs(param_value) * 0.5)
+            min_bound = max(param_value - span, -100)
+            max_bound = min(param_value + span, 100)
+            if max_bound <= min_bound:
+                min_bound = param_value - span
+                max_bound = param_value + span
         else:
             if param_value > 0:
                 min_bound = param_value * 0.1

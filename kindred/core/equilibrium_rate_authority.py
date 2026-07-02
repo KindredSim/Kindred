@@ -8,6 +8,8 @@ from typing import Any, Mapping
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 
 AUTHORITY_ERROR = "equilibrium requires kf and exactly one of kr or Keq/dG_eq"
+GENERATED_RATE_MODEL_ERROR = "generated transition-state equilibrium requires complete generated_rate_model"
+GENERATED_DIRECT_MODEL_ERROR = "generated direct thermodynamic equilibrium requires complete generated_rate_model"
 
 
 class EquilibriumRateAuthorityKind:
@@ -19,7 +21,11 @@ class EquilibriumRateInputContext(str, Enum):
     PUBLIC = "public"
     NORMALIZED_PUBLIC = "normalized_public"
     GENERATED_COMPUTATIONAL_MODE = "generated_computational_mode"
-    GENERATED_STATE_NETWORK = "generated_state_network"
+
+
+class GeneratedEquilibriumAuthorityKind:
+    TRANSITION_STATE_BARRIER_RATES = "generated_transition_state_barrier_rates"
+    DIRECT_THERMODYNAMIC_EQUILIBRIUM = "generated_direct_thermodynamic_equilibrium"
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +40,8 @@ class EquilibriumRateAuthority:
     reverse_std_ratio: object = 1.0
     has_explicit_keq_param: bool = False
     has_thermo_param: bool = False
+    kf_editable: bool = True
+    kr_editable: bool = True
 
     @property
     def consumes_keq(self) -> bool:
@@ -52,9 +60,9 @@ class EquilibriumRateAuthority:
     def authored_role_is_editable(self, role: str) -> bool:
         role = str(role)
         if role == "kf":
-            return True
+            return bool(self.kf_editable)
         if role == "kr":
-            return self.kind == EquilibriumRateAuthorityKind.KR
+            return self.kind == EquilibriumRateAuthorityKind.KR and bool(self.kr_editable)
         if role == "Keq":
             return bool(self.has_explicit_keq_param)
         if role == "dG_eq":
@@ -121,17 +129,238 @@ def effective_reverse_rate_from_keq(kf: object, Keq: object, reverse_std_ratio: 
     return kf / (Keq * reverse_std_ratio)  # type: ignore[operator]
 
 
-def _finite_float_or_none(value: object) -> float | None:
+def _finite_float_or_none(value: object, *, temperature_K: float | None = None) -> float | None:
     if value is None:
         return None
     try:
-        raw = value() if callable(value) else value
+        if callable(value):
+            if temperature_K is not None and bool(getattr(value, "accepts_runtime_temperature", False)):
+                raw = value(float(temperature_K))
+            else:
+                raw = value()
+        else:
+            raw = value
         out = float(raw)
     except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(out):
         return None
     return float(out)
+
+
+def _metadata_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "0", "false", "no", "off", "none", "null"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)
+
+
+def generated_equilibrium_authority_kind(metadata: Mapping[str, Any] | None) -> str:
+    meta = metadata or {}
+    kind = str(meta.get(EquilibriumMetadataKeys.GENERATED_AUTHORITY) or "")
+    if kind in {
+        GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES,
+        GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM,
+    }:
+        return kind
+    return ""
+
+
+def _generated_rate_model(metadata: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    meta = metadata or {}
+    model = meta.get(EquilibriumMetadataKeys.GENERATED_RATE_MODEL)
+    return model if isinstance(model, Mapping) else {}
+
+
+def _required_positive_model_float(
+    model: Mapping[str, Any],
+    key: str,
+    *,
+    temperature_K: float | None = None,
+) -> float | None:
+    if key not in model:
+        return None
+    value = _finite_float_or_none(model.get(key), temperature_K=temperature_K)
+    if value is None or value <= 0.0:
+        return None
+    return float(value)
+
+
+def _generated_model_temperature(model: Mapping[str, Any]) -> float | None:
+    temperature = _finite_float_or_none(model.get("temperature_K"))
+    if temperature is None or temperature <= 0.0:
+        return None
+    return float(temperature)
+
+
+def generated_transition_state_rate_from_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    temperature_K: float,
+    direction: str,
+) -> float | None:
+    meta = metadata or {}
+    if generated_equilibrium_authority_kind(meta) != GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES:
+        return None
+    model = _generated_rate_model(meta)
+    if str(model.get("type") or "") != GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES:
+        return None
+    if direction == "forward":
+        dG_key = "dG_act_fwd_J_per_mol"
+        degeneracy_key = "degeneracy_ratio_fwd"
+        std_ratio_key = "std_ratio_fwd"
+    elif direction == "reverse":
+        dG_key = "dG_act_rev_J_per_mol"
+        degeneracy_key = "degeneracy_ratio_rev"
+        std_ratio_key = "std_ratio_rev"
+    else:
+        return None
+    dG = _finite_float_or_none(model.get(dG_key), temperature_K=temperature_K)
+    if dG is None:
+        return None
+    T = float(temperature_K)
+    if not (math.isfinite(T) and T > 0.0):
+        return None
+    kappa = _required_positive_model_float(model, "kappa", temperature_K=temperature_K)
+    degeneracy_ratio = _required_positive_model_float(model, degeneracy_key, temperature_K=temperature_K)
+    std_ratio = _required_positive_model_float(model, std_ratio_key, temperature_K=temperature_K)
+    if kappa is None or degeneracy_ratio is None or std_ratio is None:
+        return None
+
+    from kindred.core.constants import R, h, k_B
+
+    return float(
+        kappa
+        * float(k_B)
+        * T
+        / float(h)
+        * degeneracy_ratio
+        * math.exp(-float(dG) / (float(R) * T))
+        * std_ratio
+    )
+
+
+def generated_direct_forward_rate_from_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    temperature_K: float,
+) -> float | None:
+    _ = temperature_K
+    meta = metadata or {}
+    if generated_equilibrium_authority_kind(meta) != GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        return None
+    model = _generated_rate_model(meta)
+    if str(model.get("type") or "") != GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        return None
+    return _required_positive_model_float(model, "kf")
+
+
+def generated_direct_keq_from_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    temperature_K: float,
+) -> float | None:
+    meta = metadata or {}
+    if generated_equilibrium_authority_kind(meta) != GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        return None
+    model = _generated_rate_model(meta)
+    if str(model.get("type") or "") != GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        return None
+    dG = _finite_float_or_none(model.get("dG_eq_J_per_mol"), temperature_K=temperature_K)
+    std_ratio = _required_positive_model_float(model, "std_ratio", temperature_K=temperature_K)
+    T = float(temperature_K)
+    if dG is None or std_ratio is None or not (math.isfinite(T) and T > 0.0):
+        return None
+    from kindred.core.kinetics import K_from_deltaG_eq
+
+    return float(K_from_deltaG_eq(dG, T))
+
+
+def generated_direct_reverse_rate_from_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    temperature_K: float,
+) -> float | None:
+    meta = metadata or {}
+    model = _generated_rate_model(meta)
+    kf = generated_direct_forward_rate_from_metadata(meta, temperature_K=temperature_K)
+    keq = generated_direct_keq_from_metadata(meta, temperature_K=temperature_K)
+    std_ratio = _required_positive_model_float(model, "std_ratio", temperature_K=temperature_K)
+    if kf is None or keq is None or std_ratio is None or abs(float(keq)) <= 1e-30:
+        return None
+    return float(effective_reverse_rate_from_keq(kf, keq, std_ratio))
+
+
+def generated_equilibrium_forward_rate_from_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    temperature_K: float,
+) -> float | None:
+    kind = generated_equilibrium_authority_kind(metadata)
+    if kind == GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        return generated_direct_forward_rate_from_metadata(metadata, temperature_K=temperature_K)
+    return generated_transition_state_rate_from_metadata(
+        metadata,
+        temperature_K=temperature_K,
+        direction="forward",
+    )
+
+
+def generated_equilibrium_reverse_rate_from_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    temperature_K: float,
+) -> float | None:
+    kind = generated_equilibrium_authority_kind(metadata)
+    if kind == GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        return generated_direct_reverse_rate_from_metadata(metadata, temperature_K=temperature_K)
+    return generated_transition_state_rate_from_metadata(
+        metadata,
+        temperature_K=temperature_K,
+        direction="reverse",
+    )
+
+
+def generated_transition_state_rate_model_is_complete(metadata: Mapping[str, Any] | None) -> bool:
+    meta = metadata or {}
+    if generated_equilibrium_authority_kind(meta) != GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES:
+        return False
+    model = _generated_rate_model(meta)
+    temperature = _finite_float_or_none(model.get("temperature_K"))
+    if temperature is None or temperature <= 0.0:
+        return False
+    return (
+        generated_equilibrium_forward_rate_from_metadata(meta, temperature_K=temperature) is not None
+        and generated_equilibrium_reverse_rate_from_metadata(meta, temperature_K=temperature) is not None
+    )
+
+
+def generated_direct_thermodynamic_equilibrium_model_is_complete(metadata: Mapping[str, Any] | None) -> bool:
+    meta = metadata or {}
+    if generated_equilibrium_authority_kind(meta) != GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        return False
+    model = _generated_rate_model(meta)
+    if str(model.get("type") or "") != GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        return False
+    temperature = _generated_model_temperature(model)
+    if temperature is None:
+        return False
+    return (
+        generated_direct_forward_rate_from_metadata(meta, temperature_K=temperature) is not None
+        and generated_direct_keq_from_metadata(meta, temperature_K=temperature) is not None
+        and generated_direct_reverse_rate_from_metadata(meta, temperature_K=temperature) is not None
+    )
+
+
+def _generated_model_error_for_kind(kind: str) -> str:
+    if kind == GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        return GENERATED_DIRECT_MODEL_ERROR
+    return GENERATED_RATE_MODEL_ERROR
 
 
 def plain_finite_float_or_none(value: object) -> float | None:
@@ -152,35 +381,91 @@ def plain_finite_float_or_none(value: object) -> float | None:
     return float(out)
 
 
+def effective_equilibrium_forward_rate(eq: object, *, temperature_K: float = 298.15) -> float | None:
+    temperature = float(temperature_K)
+    meta = getattr(eq, "metadata", {}) or {}
+    if isinstance(meta, Mapping):
+        generated_kind = generated_equilibrium_authority_kind(meta)
+        if generated_kind:
+            generated_forward = generated_equilibrium_forward_rate_from_metadata(
+                meta,
+                temperature_K=temperature,
+            )
+            generated_reverse = generated_equilibrium_reverse_rate_from_metadata(
+                meta,
+                temperature_K=temperature,
+            )
+            if generated_forward is None or generated_reverse is None:
+                raise ValueError(_generated_model_error_for_kind(generated_kind))
+            return float(generated_forward)
+    return _finite_float_or_none(getattr(eq, "kf", None), temperature_K=temperature)
+
+
 def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> float | None:
     authority = normalize_existing_equilibrium_rate_authority(eq)
+    temperature = float(temperature_K)
+    meta = getattr(eq, "metadata", {}) or {}
+    if isinstance(meta, Mapping):
+        generated_kind = generated_equilibrium_authority_kind(meta)
+        if generated_kind == GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+            generated_keq = generated_direct_keq_from_metadata(meta, temperature_K=temperature)
+            generated_forward = generated_equilibrium_forward_rate_from_metadata(meta, temperature_K=temperature)
+            generated_reverse = generated_equilibrium_reverse_rate_from_metadata(meta, temperature_K=temperature)
+            if generated_keq is None or generated_forward is None or generated_reverse is None:
+                raise ValueError(GENERATED_DIRECT_MODEL_ERROR)
+            return float(generated_keq)
     if authority.kind == EquilibriumRateAuthorityKind.KR:
-        kf = _finite_float_or_none(authority.kf)
-        kr = _finite_float_or_none(authority.kr)
+        if (
+            isinstance(meta, Mapping)
+            and generated_equilibrium_authority_kind(meta)
+            == GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES
+        ):
+            kf = generated_equilibrium_forward_rate_from_metadata(meta, temperature_K=temperature)
+            kr = generated_equilibrium_reverse_rate_from_metadata(meta, temperature_K=temperature)
+            if kf is None or kr is None or abs(kr) <= 1e-30:
+                raise ValueError(GENERATED_RATE_MODEL_ERROR)
+            return float(kf) / float(kr)
+        kf = None
+        kr = None
+        if isinstance(meta, Mapping):
+            kf = effective_equilibrium_forward_rate(eq, temperature_K=temperature)
+            kr = generated_equilibrium_reverse_rate_from_metadata(meta, temperature_K=temperature)
+        if kr is None:
+            kf = _finite_float_or_none(authority.kf, temperature_K=temperature)
+            kr = _finite_float_or_none(authority.kr, temperature_K=temperature)
         if kf is not None and kr is not None and abs(kr) > 1e-30:
             return float(kf) / float(kr)
         return None
 
-    meta = getattr(eq, "metadata", {}) or {}
     if isinstance(meta, Mapping):
+        if (
+            authority.kind == EquilibriumRateAuthorityKind.KEQ
+            and authority.dG_eq_J_per_mol is not None
+            and not authority.has_explicit_keq_param
+        ):
+            dg_value = _finite_float_or_none(authority.dG_eq_J_per_mol, temperature_K=temperature)
+            if dg_value is not None:
+                from kindred.core.kinetics import K_from_deltaG_eq
+
+                return float(K_from_deltaG_eq(dg_value, temperature))
         metadata_keq_source = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
         if callable(metadata_keq_source):
-            metadata_keq = _finite_float_or_none(metadata_keq_source)
+            metadata_keq = _finite_float_or_none(metadata_keq_source, temperature_K=temperature)
             if metadata_keq is not None:
                 return float(metadata_keq)
-        dg_value = _finite_float_or_none(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
+        dg_value = _finite_float_or_none(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL), temperature_K=temperature)
         if dg_value is not None:
             from kindred.core.kinetics import K_from_deltaG_eq
 
-            return float(K_from_deltaG_eq(dg_value, float(temperature_K)))
-        metadata_keq = _finite_float_or_none(metadata_keq_source)
+            return float(K_from_deltaG_eq(dg_value, temperature))
+        metadata_keq = _finite_float_or_none(metadata_keq_source, temperature_K=temperature)
         if metadata_keq is not None:
             return float(metadata_keq)
-    direct_keq = _finite_float_or_none(getattr(eq, "Keq", None))
+    direct_keq = _finite_float_or_none(getattr(eq, "Keq", None), temperature_K=temperature)
     if direct_keq is not None:
         return float(direct_keq)
-    kf = _finite_float_or_none(getattr(eq, "kf", None))
-    kr = _finite_float_or_none(getattr(eq, "kr", None))
+    kf = effective_equilibrium_forward_rate(eq, temperature_K=temperature)
+    kr = _finite_float_or_none(getattr(eq, "kr", None), temperature_K=temperature)
     if kf is not None and kr is not None and abs(kr) > 1e-30:
         return float(kf) / float(kr)
     return None
@@ -188,14 +473,26 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
 
 def effective_equilibrium_reverse_rate(eq: object, *, temperature_K: float = 298.15) -> float | None:
     authority = normalize_existing_equilibrium_rate_authority(eq)
+    temperature = float(temperature_K)
+    meta = getattr(eq, "metadata", {}) or {}
+    if isinstance(meta, Mapping):
+        generated_kind = generated_equilibrium_authority_kind(meta)
+        generated_rate = generated_equilibrium_reverse_rate_from_metadata(
+            meta,
+            temperature_K=temperature,
+        )
+        if generated_rate is not None:
+            return float(generated_rate)
+        if generated_kind:
+            raise ValueError(_generated_model_error_for_kind(generated_kind))
     if authority.kind == EquilibriumRateAuthorityKind.KR:
-        return _finite_float_or_none(authority.kr)
-    kf = _finite_float_or_none(getattr(eq, "kf", None))
-    keq = effective_equilibrium_keq(eq, temperature_K=float(temperature_K))
+        return _finite_float_or_none(authority.kr, temperature_K=temperature)
+    kf = effective_equilibrium_forward_rate(eq, temperature_K=temperature)
+    keq = effective_equilibrium_keq(eq, temperature_K=temperature)
     if kf is None or keq is None or abs(keq) <= 1e-30:
         return None
     value = authority.effective_reverse_rate(Keq=keq, kf=kf)
-    return _finite_float_or_none(value)
+    return _finite_float_or_none(value, temperature_K=temperature)
 
 
 def authority_readout_updates_from_step_entry(
@@ -274,9 +571,7 @@ def _metadata_has_thermo_authority(metadata: Mapping[str, Any] | None) -> bool:
 
 
 def _is_generated_equilibrium_metadata(metadata: Mapping[str, Any] | None) -> bool:
-    meta = metadata or {}
-    source = str(meta.get("source") or "")
-    return source in {"state_network", "state_network_direct"}
+    return bool(generated_equilibrium_authority_kind(metadata))
 
 
 def _coerce_context(context: EquilibriumRateInputContext | str | None) -> EquilibriumRateInputContext:
@@ -349,13 +644,68 @@ def normalize_equilibrium_rate_authority(
     metadata_keq = _metadata_keq_input(meta)
     metadata_dg = _metadata_dg_eq(meta)
     user_kf, user_kr = _metadata_user_flags(meta)
+    thermo_count = int(Keq is not None or metadata_keq is not None) + int(metadata_dg is not None)
+    has_thermo = thermo_count > 0
+    generated_kind = generated_equilibrium_authority_kind(meta)
+    if generated_kind == GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES:
+        if not generated_transition_state_rate_model_is_complete(meta):
+            raise ValueError(GENERATED_RATE_MODEL_ERROR)
+        model = _generated_rate_model(meta)
+        model_temperature = _generated_model_temperature(model)
+        if model_temperature is None:
+            raise ValueError(GENERATED_RATE_MODEL_ERROR)
+        model_kf = generated_equilibrium_forward_rate_from_metadata(meta, temperature_K=float(model_temperature))
+        model_kr = generated_equilibrium_reverse_rate_from_metadata(meta, temperature_K=float(model_temperature))
+        if model_kf is None or model_kr is None:
+            raise ValueError(GENERATED_RATE_MODEL_ERROR)
+        return EquilibriumRateAuthority(
+            kind=EquilibriumRateAuthorityKind.KR,
+            kf=float(model_kf),
+            kr=float(model_kr),
+            Keq=None,
+            derived_role="Keq",
+            source=generated_kind,
+            dG_eq_J_per_mol=metadata_dg,
+            reverse_std_ratio=_metadata_reverse_std_ratio(meta),
+            has_thermo_param=bool(has_thermo),
+            kf_editable=False,
+            kr_editable=False,
+        )
+    if generated_kind == GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM:
+        if not generated_direct_thermodynamic_equilibrium_model_is_complete(meta):
+            raise ValueError(GENERATED_DIRECT_MODEL_ERROR)
+        model = _generated_rate_model(meta)
+        model_temperature = _generated_model_temperature(model)
+        model_kf = generated_direct_forward_rate_from_metadata(
+            meta,
+            temperature_K=float(model_temperature if model_temperature is not None else 298.15),
+        )
+        model_keq = generated_direct_keq_from_metadata(
+            meta,
+            temperature_K=float(model_temperature if model_temperature is not None else 298.15),
+        )
+        model_dg = _finite_float_or_none(model.get("dG_eq_J_per_mol"))
+        model_std_ratio = _required_positive_model_float(model, "std_ratio")
+        if model_kf is None or model_keq is None or model_dg is None or model_std_ratio is None:
+            raise ValueError(GENERATED_DIRECT_MODEL_ERROR)
+        return EquilibriumRateAuthority(
+            kind=EquilibriumRateAuthorityKind.KEQ,
+            kf=float(model_kf),
+            kr=kr,
+            Keq=float(model_keq),
+            derived_role="kr",
+            source=generated_kind,
+            dG_eq_J_per_mol=float(model_dg),
+            reverse_std_ratio=float(model_std_ratio),
+            has_explicit_keq_param=False,
+            has_thermo_param=True,
+            kf_editable=False,
+            kr_editable=False,
+        )
     has_kf = kf is not None
     has_kr = kr is not None
     if kf is None:
         raise ValueError(AUTHORITY_ERROR)
-
-    thermo_count = int(Keq is not None or metadata_keq is not None) + int(metadata_dg is not None)
-    has_thermo = thermo_count > 0
     if thermo_count > 1 and ctx == EquilibriumRateInputContext.PUBLIC:
         raise ValueError(AUTHORITY_ERROR)
 
@@ -377,21 +727,8 @@ def normalize_equilibrium_rate_authority(
     elif ctx == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE:
         if not has_thermo:
             raise ValueError(AUTHORITY_ERROR)
-    elif ctx == EquilibriumRateInputContext.GENERATED_STATE_NETWORK:
-        if not has_kr and not has_thermo:
-            raise ValueError(AUTHORITY_ERROR)
     else:
         raise ValueError(AUTHORITY_ERROR)
-
-    if ctx == EquilibriumRateInputContext.GENERATED_STATE_NETWORK and has_kr and user_kr and not has_thermo:
-        return EquilibriumRateAuthority(
-            kind=EquilibriumRateAuthorityKind.KR,
-            kf=kf,
-            kr=kr,
-            Keq=None,
-            derived_role="Keq",
-            source=ctx.value,
-        )
 
     if has_kr and not has_thermo:
         return EquilibriumRateAuthority(
@@ -401,19 +738,6 @@ def normalize_equilibrium_rate_authority(
             Keq=None,
             derived_role="Keq",
             source=ctx.value,
-        )
-
-    if has_kr and has_thermo and ctx == EquilibriumRateInputContext.GENERATED_STATE_NETWORK and user_kr:
-        return EquilibriumRateAuthority(
-            kind=EquilibriumRateAuthorityKind.KR,
-            kf=kf,
-            kr=kr,
-            Keq=None,
-            derived_role="Keq",
-            source=ctx.value,
-            dG_eq_J_per_mol=metadata_dg,
-            reverse_std_ratio=_metadata_reverse_std_ratio(meta),
-            has_thermo_param=bool(has_thermo),
         )
 
     if has_kr and has_thermo and ctx == EquilibriumRateInputContext.PUBLIC:
@@ -444,9 +768,7 @@ def normalize_existing_equilibrium_rate_authority(eq: object) -> EquilibriumRate
     meta = getattr(eq, "metadata", {}) or {}
     context: EquilibriumRateInputContext | str = EquilibriumRateInputContext.PUBLIC
     if isinstance(meta, Mapping):
-        if str(meta.get("source") or "") == "state_network" or _is_generated_equilibrium_metadata(meta):
-            context = EquilibriumRateInputContext.GENERATED_STATE_NETWORK
-        elif str(meta.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value:
+        if str(meta.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value:
             context = EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE
         elif (
             (_metadata_has_thermo_authority(meta) or getattr(eq, "Keq", None) is not None)

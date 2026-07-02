@@ -1,8 +1,9 @@
 """
 Small, pure helpers for editing Kindred DSL text.
 
-This module intentionally avoids importing the DSL parser to keep it cycle-safe and
-cheap to import from GUI/controller layers.
+This module avoids parser imports at module import time so GUI/controller imports
+stay cycle-safe. Helpers that need source grammar rules lazy-import the owning
+parser locally.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import re
-from typing import Callable, Mapping, Tuple
+from typing import Callable, Iterable, Mapping, Tuple
 
 from kindred.core.equilibrium_rate_authority import public_text_equilibrium_role_editable
 from kindred.core.runtime_defaults import WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT
@@ -54,6 +55,7 @@ __all__ = [
     "build_current_text_step_analysis_context",
     "authoritative_parameter_values_match",
     "format_authoritative_parameter_value",
+    "materialize_generated_fast_dg_overrides_to_dsl_text",
     "step_rewrite_block_reason",
 ]
 
@@ -210,6 +212,170 @@ def _serialize_mechanism_semicolon_kv(prefix: str, tokens: list[list[str]], comm
     if comment_tail:
         base = f"{base} {comment_tail.strip()}"
     return base.strip()
+
+
+_ENERGY_UNITS = frozenset({"kJ/mol", "kcal/mol", "J/mol"})
+
+
+def _energy_unit_or_default(value: object, default: str = "kJ/mol") -> str:
+    unit = str(value or "").strip()
+    return unit if unit in _ENERGY_UNITS else str(default)
+
+
+def _global_energy_unit_from_lines(lines: Iterable[str], default: str = "kJ/mol") -> str:
+    unit = str(default)
+    for raw in lines:
+        stripped = str(raw or "").split("#", 1)[0].strip()
+        match = re.match(r"^energy\s*=\s*(\S+)", stripped, flags=re.IGNORECASE)
+        if match is not None and str(match.group(1) or "").strip() in _ENERGY_UNITS:
+            unit = str(match.group(1)).strip()
+    return unit
+
+
+def _energy_value_and_unit(value_text: object, default_unit: str) -> tuple[float, str, bool] | None:
+    text = str(value_text or "").strip()
+    if not text:
+        return None
+    pieces = text.split()
+    unit = _energy_unit_or_default(default_unit)
+    explicit_unit = False
+    number_text = pieces[0]
+    if len(pieces) >= 2 and pieces[1] in _ENERGY_UNITS:
+        unit = pieces[1]
+        explicit_unit = True
+    try:
+        return float(number_text), unit, explicit_unit
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _get_token_value(tokens: list[list[str]], key: str) -> str | None:
+    for token_key, token_value in tokens:
+        if str(token_key).strip().lower() == str(key).strip().lower():
+            return str(token_value).strip()
+    return None
+
+
+def _set_token_value(tokens: list[list[str]], key: str, value: str) -> None:
+    for pair in tokens:
+        if str(pair[0]).strip().lower() == str(key).strip().lower():
+            pair[1] = str(value)
+            return
+    tokens.append([str(key), str(value)])
+
+
+def _remove_token(tokens: list[list[str]], key: str) -> None:
+    tokens[:] = [pair for pair in tokens if str(pair[0]).strip().lower() != str(key).strip().lower()]
+
+
+def _serialize_generated_fast_line(prefix: str, tokens: list[list[str]], comment_tail: str) -> str:
+    base = prefix.rstrip()
+    if tokens:
+        base += "; " + "; ".join(f"{key}={value}" for key, value in tokens if str(key).strip())
+    if comment_tail:
+        base += f" {comment_tail.strip()}"
+    return base.strip()
+
+
+def materialize_generated_fast_dg_overrides_to_dsl_text(
+    base_text: str,
+    energy_overrides: Iterable[tuple[str, float, Mapping[str, object]]],
+    *,
+    temperature_K: float,
+) -> str:
+    """Rewrite generated-fast dG_eq values while preserving source-owned kf/std-ratio fields."""
+    overrides = [
+        (str(name), float(value), dict(metadata))
+        for name, value, metadata in energy_overrides
+        if str(metadata.get("role") or "") == "dG_eq_fast"
+    ]
+    if not overrides:
+        return str(base_text or "")
+    from kindred.core.simulator.computational_mode import (
+        GENERATED_BLOCK_END,
+        GENERATED_BLOCK_START,
+        extract_marked_block,
+        upsert_marked_block,
+    )
+    from kindred.core.constants import R as R_J_per_mol_K
+    from kindred.core.units import UnitsModel
+
+    temperature = float(temperature_K)
+    if not (math.isfinite(temperature) and temperature > 0.0):
+        return str(base_text or "")
+    body = extract_marked_block(
+        str(base_text or ""),
+        start_marker=GENERATED_BLOCK_START,
+        end_marker=GENERATED_BLOCK_END,
+    )
+    if not body:
+        return str(base_text or "")
+    global_unit = _global_energy_unit_from_lines(str(base_text or "").splitlines(), "kJ/mol")
+    overrides_by_cm_id: dict[str, tuple[float, Mapping[str, object]]] = {}
+    for _name, value, metadata in overrides:
+        cm_id = str(metadata.get("cm_id") or "").strip()
+        if cm_id:
+            overrides_by_cm_id[cm_id] = (float(value), metadata)
+    if not overrides_by_cm_id:
+        return str(base_text or "")
+
+    lines = str(body).splitlines()
+    changed = False
+    for line_index, raw in enumerate(lines):
+        before_comment, hash_sep, comment_rest = str(raw).partition("#")
+        code = before_comment.strip()
+        if not code.lower().startswith("equilibrium:"):
+            continue
+        prefix, tokens = _parse_mechanism_semicolon_kv(code)[:2]
+        cm_id = _get_token_value(tokens, "cm_id") or ""
+        if cm_id not in overrides_by_cm_id:
+            continue
+        dG_input_value, metadata = overrides_by_cm_id[cm_id]
+        dG_source_text = _get_token_value(tokens, "dG_eq")
+        parsed_source = _energy_value_and_unit(dG_source_text, global_unit)
+        if parsed_source is None:
+            continue
+        _old_value, source_unit, explicit_source_unit = parsed_source
+        kf_value = _energy_value_and_unit(_get_token_value(tokens, "kf"), "")
+        std_ratio_text = _get_token_value(tokens, "cm_std_ratio")
+        try:
+            std_ratio = float(std_ratio_text) if std_ratio_text is not None else float("nan")
+        except (TypeError, ValueError, OverflowError):
+            std_ratio = float("nan")
+        if kf_value is None or not (math.isfinite(float(kf_value[0])) and float(kf_value[0]) > 0.0):
+            continue
+        if not (math.isfinite(std_ratio) and std_ratio > 0.0):
+            continue
+        try:
+            dG_eq_J = float(UnitsModel(energy_unit=source_unit).to_jmol(float(dG_input_value)))
+            serialized_dG = float(UnitsModel(energy_unit=source_unit).from_jmol(dG_eq_J))
+            K = float(math.exp(-dG_eq_J / (float(R_J_per_mol_K) * temperature)))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not (math.isfinite(K) and K > 0.0):
+            continue
+        serialized = f"{serialized_dG:.12g}"
+        if explicit_source_unit:
+            serialized = f"{serialized} {source_unit}"
+        _set_token_value(tokens, "dG_eq", serialized)
+        _remove_token(tokens, "kr")
+        updated = _serialize_generated_fast_line(
+            prefix,
+            tokens,
+            hash_sep + comment_rest if hash_sep else "",
+        )
+        if updated != raw:
+            lines[line_index] = updated
+            changed = True
+    if not changed:
+        return str(base_text or "")
+    return upsert_marked_block(
+        str(base_text or ""),
+        start_marker=GENERATED_BLOCK_START,
+        end_marker=GENERATED_BLOCK_END,
+        body="\n".join(lines).rstrip("\n"),
+        blank_line_before=True,
+    )
 
 
 def _dedupe_tokens_case_insensitive(tokens: list[list[str]]) -> list[list[str]]:

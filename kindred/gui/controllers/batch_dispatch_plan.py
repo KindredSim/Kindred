@@ -29,6 +29,7 @@ class BatchSetDispatchInput:
     preview_batch_cache_token: str = ""
     prepared_payload: Mapping[str, Any] | None = None
     parameter_overrides: Mapping[str, Any] | None = None
+    schedule_parameter_values: Mapping[str, Any] | None = None
     intervention_schedule: Mapping[str, Any] | None = None
     contained_owner_identity: Mapping[str, Any] | None = None
     algebra_policy: SimulationAlgebraPolicy = SimulationAlgebraPolicy.BATCH_BEST_EFFORT
@@ -166,10 +167,22 @@ def _schedule_payload_and_identity_for_dispatch(
     schedule_value: object,
     *,
     prepared_payload: Mapping[str, Any] | None,
+    schedule_parameter_values: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str, str]:
     schedule = coerce_intervention_schedule(schedule_value)
     if schedule is None:
         return None, "", ""
+
+    def _identity_schedule(schedule_obj):
+        if isinstance(schedule_parameter_values, Mapping) and schedule_parameter_values:
+            return schedule_obj.resolve_parameters(
+                {
+                    str(name): float(value)
+                    for name, value in dict(schedule_parameter_values).items()
+                    if str(name)
+                }
+            )
+        return schedule_obj
 
     if isinstance(prepared_payload, Mapping):
         mechanism = prepared_payload.get("mechanism")
@@ -184,7 +197,7 @@ def _schedule_payload_and_identity_for_dispatch(
             if normalized_schedule is None:
                 return None, "", ""
             declarative_fingerprint, executable_fingerprint = intervention_schedule_identity_fingerprints(
-                normalized_schedule
+                _identity_schedule(normalized_schedule)
             )
             return (
                 normalized_schedule.to_payload(),
@@ -192,7 +205,9 @@ def _schedule_payload_and_identity_for_dispatch(
                 executable_fingerprint,
             )
 
-    declarative_fingerprint, executable_fingerprint = intervention_schedule_identity_fingerprints(schedule)
+    declarative_fingerprint, executable_fingerprint = intervention_schedule_identity_fingerprints(
+        _identity_schedule(schedule)
+    )
     return schedule.to_payload(), declarative_fingerprint, executable_fingerprint
 
 
@@ -221,6 +236,7 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
         ) = _schedule_payload_and_identity_for_dispatch(
             dispatch_input.intervention_schedule,
             prepared_payload=effective_prepared_payload,
+            schedule_parameter_values=dispatch_input.schedule_parameter_values,
         )
         simulation_identity.pop("intervention_schedule_declarative_fingerprint", None)
         simulation_identity.pop("intervention_schedule_executable_fingerprint", None)
@@ -250,6 +266,11 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
                 parameter_overrides=(
                     dict(dispatch_input.parameter_overrides)
                     if isinstance(dispatch_input.parameter_overrides, Mapping)
+                    else None
+                ),
+                schedule_parameter_values=(
+                    dict(dispatch_input.schedule_parameter_values)
+                    if isinstance(dispatch_input.schedule_parameter_values, Mapping)
                     else None
                 ),
             )
@@ -286,7 +307,15 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
         elif isinstance(plan_execution_request, dict) and has_intervention_schedule_input:
             plan_execution_request = dict(plan_execution_request)
             plan_execution_request.pop("intervention_schedule", None)
-        elif (
+        if isinstance(plan_execution_request, dict) and isinstance(dispatch_input.schedule_parameter_values, Mapping):
+            plan_execution_request = dict(plan_execution_request)
+            if dispatch_input.schedule_parameter_values:
+                plan_execution_request["schedule_parameter_values"] = dict(
+                    dispatch_input.schedule_parameter_values
+                )
+            else:
+                plan_execution_request.pop("schedule_parameter_values", None)
+        if (
             isinstance(plan_execution_request, dict)
             and not bool(dispatch_input.fast_mode)
             and isinstance(plan_execution_request.get("intervention_schedule"), Mapping)
@@ -294,6 +323,7 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
             normalized_schedule_payload, _, _ = _schedule_payload_and_identity_for_dispatch(
                 plan_execution_request["intervention_schedule"],
                 prepared_payload=effective_prepared_payload,
+                schedule_parameter_values=plan_execution_request.get("schedule_parameter_values"),
             )
             if normalized_schedule_payload is not None:
                 plan_execution_request = dict(plan_execution_request)

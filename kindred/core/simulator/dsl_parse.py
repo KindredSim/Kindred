@@ -771,6 +771,7 @@ class ParsedStep:
     cm_id: Optional[str] = None
     cm_std_ratio: Optional[float] = None
     generated_computational_mode: bool = False
+    source_energy_unit: Optional[str] = None
 
 
 def _parse_energy_unit_directive(line: str) -> str:
@@ -1485,6 +1486,7 @@ def _parse_equilibrium_step(
         cm_id=(str(params.get("cm_id") or "").strip() or None),
         cm_std_ratio=cm_std_ratio,
         generated_computational_mode=bool(generated_computational_mode),
+        source_energy_unit=str(energy_unit),
     )
 
 

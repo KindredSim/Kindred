@@ -32,8 +32,9 @@ def test_mechanism_inspector_sections_use_complete_source_with_state_network() -
     sections = build_mechanism_inspector_sections(source.full_dsl)
 
     assert "Step 1 reaction: X -> Y" in sections.steps_text
-    assert "State-network generated content:" in sections.steps_text
-    assert "Symbolic RHS equations are unavailable for mechanisms with state-network definitions." in (
+    assert "Generated mechanism content:" in sections.steps_text
+    assert "State-network generated content:" not in sections.steps_text
+    assert "Symbolic RHS equations are unavailable for mechanisms with generated equilibria." in (
         sections.equations_text
     )
     assert "No intervention schedule." in sections.interventions_text

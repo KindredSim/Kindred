@@ -8,6 +8,7 @@ from typing import Dict, Mapping
 
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.equilibrium_rate_authority import (
+    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
 )
@@ -70,7 +71,7 @@ def build_algebra_symbol_table(mechanism) -> SymbolTable:
                     raise ValueError(f"equilibrium index {eq_idx} is out of range")
                 eq = eqs[eq_idx]
                 if info.role == "kf":
-                    value_obj = getattr(eq, str(info.role), None)
+                    value_obj = effective_equilibrium_forward_rate(eq, temperature_K=temperature_K)
                 elif info.role == "kr":
                     value_obj = effective_equilibrium_reverse_rate(eq, temperature_K=temperature_K)
                 elif info.role == "Keq":

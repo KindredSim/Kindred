@@ -542,7 +542,11 @@ class TestPublicAliasAndStateMemberParsing:
         )
 
         assert len(mechanism.equilibria) == 1
-        assert mechanism.equilibria[0].metadata["source"] == "state_network_direct"
+        assert (
+            mechanism.equilibria[0].metadata["generated_equilibrium_authority"]
+            == "generated_direct_thermodynamic_equilibrium"
+        )
+        assert "source" not in mechanism.equilibria[0].metadata
 
     @pytest.mark.parametrize(
         ("members", "message"),

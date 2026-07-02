@@ -10,6 +10,7 @@ from collections import OrderedDict
 from typing import Dict, Mapping, Tuple
 
 from kindred.core.equilibrium_rate_authority import (
+    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
@@ -104,7 +105,8 @@ def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[s
 
             name = item.canonical_name
             if role == "kf":
-                value, ok = _try_finite_float(getattr(eq, "kf", None))
+                effective_kf = effective_equilibrium_forward_rate(eq, temperature_K=temperature_K)
+                value, ok = (float(effective_kf), True) if effective_kf is not None else (0.0, False)
             elif role == "kr":
                 effective_kr = effective_equilibrium_reverse_rate(eq, temperature_K=temperature_K)
                 value, ok = (float(effective_kr), True) if effective_kr is not None else (0.0, False)

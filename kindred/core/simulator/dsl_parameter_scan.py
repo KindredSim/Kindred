@@ -12,6 +12,7 @@ from typing import Mapping
 
 from kindred.core.algebra.simulation_series import compile_algebra_observables
 from kindred.core.equilibrium_rate_authority import (
+    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
@@ -53,6 +54,12 @@ class ParameterDefinition:
         1-based index of the reaction/equilibrium line in the DSL.
     editable : bool
         Whether the parameter is a writable public/fitting endpoint.
+    unit : str | None
+        Unit owned by the source endpoint, when the value is unitful.
+    role : str | None
+        Source role for structured endpoints such as generated fast equilibria.
+    min/max : float | None
+        Optional source-owned default scan range.
     """
 
     name: str
@@ -61,6 +68,10 @@ class ParameterDefinition:
     source: str
     step_index: int | None = None
     editable: bool = True
+    unit: str | None = None
+    role: str | None = None
+    min: float | None = None
+    max: float | None = None
 
 
 def _finite_value(value: object) -> float | None:
@@ -131,9 +142,10 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
             continue
         eq = eqs[equilibrium_index]
         authority = normalize_existing_equilibrium_rate_authority(eq)
+        kf_value = effective_equilibrium_forward_rate(eq, temperature_K=temperature_K)
         kr_value = effective_equilibrium_reverse_rate(eq, temperature_K=temperature_K)
         source, value = {
-            "kf": ("Forward rate", _finite_value(getattr(eq, "kf", None))),
+            "kf": ("Forward rate", kf_value),
             "kr": ("Reverse rate", kr_value),
             "Keq": ("Equilibrium constant", effective_equilibrium_keq(eq, temperature_K=temperature_K)),
         }.get(role, ("", None))
@@ -154,8 +166,6 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
             )
         )
 
-    energy_unit = str((getattr(mechanism, "metadata", {}) or {}).get(MechanismMetadataKeys.ENERGY_UNIT) or "kJ/mol")
-    unit_conv = UnitsModel(energy_unit=energy_unit)
     step_entry_by_equilibrium_index: dict[int, dict] = {}
     for entry in step_entry_by_index.values():
         if not isinstance(entry, dict) or str(entry.get("kind") or "") != "equilibrium":
@@ -171,6 +181,14 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
         dG_eq_j = _finite_value(metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
         if dG_eq_j is None:
             continue
+        source_energy_unit = str(
+            metadata.get(EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT)
+            or (getattr(mechanism, "metadata", {}) or {}).get(MechanismMetadataKeys.ENERGY_UNIT)
+            or "kJ/mol"
+        )
+        unit_conv = UnitsModel(energy_unit=source_energy_unit)
+        source_value = float(unit_conv.from_jmol(float(dG_eq_j)))
+        span = max(10.0, abs(source_value) * 0.5)
         entry = step_entry_by_equilibrium_index.get(int(equilibrium_index), {})
         step_index = None
         parsed_step_index, step_ok = try_parse_int(entry.get("step_index")) if entry else (None, False)
@@ -180,11 +198,15 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
         parameters.append(
             ParameterDefinition(
                 name=name,
-                value=float(unit_conv.from_jmol(float(dG_eq_j))),
+                value=source_value,
                 context=context,
-                source="Generated fast-equilibrium dG_eq",
+                source="Generated fast dG_eq",
                 step_index=step_index,
                 editable=True,
+                unit=source_energy_unit,
+                role="dG_eq_fast",
+                min=float(source_value - span),
+                max=float(source_value + span),
             )
         )
 

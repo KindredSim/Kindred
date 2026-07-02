@@ -8,6 +8,10 @@ from collections.abc import Callable, Mapping
 
 from PySide6 import QtWidgets
 
+from kindred.core.equilibrium_rate_authority import (
+    EquilibriumRateInputContext,
+    generated_equilibrium_authority_kind,
+)
 from kindred.core.batch_initial_conditions import strip_named_reaction_dsl_initial_concentration_sets
 from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 from kindred.core.intervention_schedule import InterventionScheduleError, intervention_schedule_parameter_names
@@ -68,20 +72,20 @@ def _format_steps(mechanism: object) -> str:
     else:
         lines.append("No indexed DSL reaction or equilibrium steps.")
 
-    state_network_summary = _format_state_network_summary(mechanism)
-    if state_network_summary:
+    generated_summary = _format_generated_mechanism_summary(mechanism)
+    if generated_summary:
         if lines:
             lines.append("")
-        lines.extend(state_network_summary)
+        lines.extend(generated_summary)
     return "\n".join(lines)
 
 
 def _format_equations(mechanism: object) -> str:
-    if _state_network_metadata(mechanism):
+    if _has_unsupported_generated_equilibrium(mechanism):
         return "\n".join(
             [
-                "Symbolic RHS equations are unavailable for mechanisms with state-network definitions.",
-                "State-network generated reactions/equilibria are included in simulation, but they are not represented in indexed symbolic RHS output.",
+                "Symbolic RHS equations are unavailable for mechanisms with generated equilibria.",
+                "Generated equilibria are included in simulation, but they are not represented in indexed symbolic RHS output.",
             ]
         )
 
@@ -158,46 +162,44 @@ def _format_interventions(mechanism: object) -> str:
     return "\n".join(lines)
 
 
-def _state_network_metadata(mechanism: object) -> Mapping[str, object]:
-    metadata = getattr(mechanism, "metadata", {}) or {}
-    if not isinstance(metadata, Mapping):
-        return {}
-    raw = metadata.get(MechanismMetadataKeys.STATE_NETWORK)
-    if isinstance(raw, Mapping):
-        return raw
-    return {}
-
-
-def _format_state_network_summary(mechanism: object) -> list[str]:
-    state_network = _state_network_metadata(mechanism)
-    if not state_network:
-        return []
-    raw_states = state_network.get("states")
-    raw_edges = state_network.get("edges")
-    state_count = len(raw_states) if isinstance(raw_states, Mapping) else 0
-    edge_count = len(raw_edges) if isinstance(raw_edges, list) else 0
+def _format_generated_mechanism_summary(mechanism: object) -> list[str]:
     generated_reaction_count = sum(
         1
         for rxn in getattr(mechanism, "reactions", []) or []
-        if _is_state_network_generated_metadata(getattr(rxn, "metadata", {}) or {})
+        if _is_generated_mechanism_metadata(getattr(rxn, "metadata", {}) or {})
     )
     generated_equilibrium_count = sum(
         1
         for eq in getattr(mechanism, "equilibria", []) or []
-        if _is_state_network_generated_metadata(getattr(eq, "metadata", {}) or {})
+        if _is_generated_mechanism_metadata(getattr(eq, "metadata", {}) or {})
     )
+    if generated_reaction_count == 0 and generated_equilibrium_count == 0:
+        return []
     return [
-        "State-network generated content:",
-        f"  states={state_count}, edges={edge_count}",
+        "Generated mechanism content:",
         f"  generated reactions={generated_reaction_count}, generated equilibria={generated_equilibrium_count}",
-        "  Generated steps are simulation inputs but do not consume indexed DSL step numbers.",
+        "  Generated steps are canonical simulation inputs but do not consume indexed DSL step numbers.",
     ]
 
 
-def _is_state_network_generated_metadata(metadata: object) -> bool:
+def _is_generated_mechanism_metadata(metadata: object) -> bool:
     if not isinstance(metadata, Mapping):
         return False
-    return str(metadata.get("source") or "") in {"state_network", "state_network_direct"}
+    if generated_equilibrium_authority_kind(metadata):
+        return True
+    return str(metadata.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
+
+
+def _has_unsupported_generated_equilibrium(mechanism: object) -> bool:
+    for eq in list(getattr(mechanism, "equilibria", []) or []):
+        metadata = getattr(eq, "metadata", {}) or {}
+        if not isinstance(metadata, Mapping):
+            continue
+        if generated_equilibrium_authority_kind(metadata):
+            return True
+        if str(metadata.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value:
+            return True
+    return False
 
 
 class MechanismInspectorDialog(QtWidgets.QDialog):

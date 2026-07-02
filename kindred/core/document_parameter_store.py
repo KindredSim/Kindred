@@ -60,7 +60,7 @@ class DocumentParameterStore:
         self._schema_text = str(text or "")
         self._schema_id = hashlib.sha256(self._schema_text.encode("utf-8")).hexdigest()
 
-    def _schema_parameter_names(self) -> set[str]:
+    def _schema_committed_parameter_names(self) -> set[str]:
         text = str(self._schema_text or "").strip()
         if not text:
             return set()
@@ -69,9 +69,15 @@ class DocumentParameterStore:
             return set()
         names: set[str] = set()
         try:
-            from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+            from kindred.core.simulator.dsl_parameter_scan import extract_parameters_from_dsl
 
-            names = {str(name) for name in build_namespace_from_mechanism(mechanism).canonical_names if str(name)}
+            for definition in extract_parameters_from_dsl(text):
+                name = str(getattr(definition, "name", "") or "").strip()
+                if not name:
+                    continue
+                if getattr(definition, "editable", True) is False:
+                    continue
+                names.add(name)
         except Exception:
             names = set()
         try:
@@ -85,13 +91,18 @@ class DocumentParameterStore:
                     info = scalar_info.get(name_s) if isinstance(scalar_info, Mapping) else None
                     if isinstance(info, Mapping) and info.get("derived") is True:
                         continue
+                    if isinstance(info, Mapping) and info.get("editable") is False:
+                        continue
                     names.add(name_s)
         except Exception:
             pass
         try:
             from kindred.core.simulation_preparation import _available_energy_binding_names
 
-            names.update(str(name) for name in _available_energy_binding_names(mechanism) if str(name))
+            for runtime_name in _available_energy_binding_names(mechanism):
+                name_s = str(runtime_name or "").strip()
+                if name_s:
+                    names.add(name_s)
         except Exception:
             pass
         return names
@@ -100,13 +111,13 @@ class DocumentParameterStore:
         name_s = str(name or "").strip()
         if not name_s:
             return False
-        allowed_names = self._schema_parameter_names()
+        allowed_names = self._schema_committed_parameter_names()
         if allowed_names:
             return name_s in allowed_names
         return False
 
     def parameter_names(self) -> list[str]:
-        return sorted(self._schema_parameter_names())
+        return sorted(self._schema_committed_parameter_names())
 
     def _schema_mechanism(self) -> object | None:
         text = str(self._schema_text or "").strip()
@@ -210,7 +221,7 @@ class DocumentParameterStore:
         return float(parsed)
 
     def _canonical_parameter_values(self, values: Mapping[str, object]) -> Dict[str, float]:
-        allowed_names = self._schema_parameter_names()
+        allowed_names = self._schema_committed_parameter_names()
         if not allowed_names:
             return {}
         canonical: Dict[str, float] = {}
@@ -414,56 +425,6 @@ class DocumentParameterStore:
     # ------------------------------------------------------------------
     # Commit / globalize
     # ------------------------------------------------------------------
-
-    def commit_effective_as_shared(self, set_id: Optional[str]) -> Dict[str, float]:
-        """
-        Merge the focused set's effective values into shared params and preserve
-        other sets' staged local overrides where they still differ from the new baseline.
-
-        This is the "commit current set" operation: the focused set's effective values
-        become the new shared baseline, the focused set's local overrides are discarded,
-        and other sets remain dirty if their staged values still differ from the new
-        canonical baseline.
-        """
-        set_id_s = self._normalized_local_override_set_id(set_id)
-        if set_id_s is None:
-            return dict(self._shared_params)
-        effective = self.runtime_parameter_values(set_id_s)
-        new_shared_params = {}
-        for key, value in dict(effective or {}).items():
-            key_s = str(key or "").strip()
-            value_f = self._finite_float(value)
-            if value_f is None:
-                continue
-            if not self._parameter_name_allowed(key_s):
-                continue
-            new_shared_params[key_s] = float(value_f)
-        if self._equilibrium_conflict_message(new_shared_params):
-            return dict(self._shared_params)
-        preserved: Dict[str, Dict[str, float]] = {}
-        for raw_sid, workspace in list(self._set_local_overrides.items()):
-            sid_s = self._normalized_local_override_set_id(raw_sid)
-            if sid_s is None or sid_s == set_id_s:
-                continue
-            retained: Dict[str, float] = {}
-            for name, val in list(dict(workspace or {}).items()):
-                if not self._parameter_name_allowed(str(name)):
-                    continue
-                baseline = new_shared_params.get(str(name))
-                val_f = float(val)
-                if baseline is None:
-                    continue
-                if math.isclose(val_f, float(baseline), rel_tol=1e-12, abs_tol=1e-12):
-                    continue
-                retained[str(name)] = val_f
-                retained[str(name)] = val_f
-            candidate = dict(new_shared_params)
-            candidate.update(retained)
-            if retained and not self._equilibrium_conflict_message(candidate):
-                preserved[sid_s] = retained
-        self._shared_params = new_shared_params
-        self._set_local_overrides = preserved
-        return dict(self._shared_params)
 
     # ------------------------------------------------------------------
     # Fingerprinting (for cache identity)

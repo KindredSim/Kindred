@@ -19,7 +19,6 @@ class SimulationMechanismOwner:
         variable_runtime: object,
         apply_dirty_reactions_for_run: Callable[[], ReactionsDraftApplyResult],
         apply_reactions_overrides_to_text: Callable[..., str],
-        apply_state_network_overrides_to_dsl: Callable[..., str],
         pending_initials_for_source_set: Callable[..., dict[str, float]] | None = None,
         apply_wegscheider_resolution_reactions_rewrite: Callable[[str], AuthoritativeRewriteOutcome] | None = None,
     ) -> None:
@@ -30,7 +29,6 @@ class SimulationMechanismOwner:
         self._apply_dirty_reactions_for_run = apply_dirty_reactions_for_run
         self._pending_initials_for_source_set = pending_initials_for_source_set
         self._apply_reactions_overrides_to_text = apply_reactions_overrides_to_text
-        self._apply_state_network_overrides_to_dsl = apply_state_network_overrides_to_dsl
         self._apply_wegscheider_resolution_reactions_rewrite = apply_wegscheider_resolution_reactions_rewrite
 
     def apply_dirty_reactions_for_run(self) -> ReactionsDraftApplyResult:
@@ -72,10 +70,7 @@ class SimulationMechanismOwner:
                     materialized.reactions_text,
                     set_id=set_id,
                 ),
-                state_network_dsl=self._apply_state_network_overrides_to_dsl(
-                    materialized.state_network_dsl,
-                    set_id=set_id,
-                ),
+                state_network_dsl=materialized.state_network_dsl,
             )
         if bool(strip_initial_concentrations):
             materialized = materialized.without_reaction_initial_concentrations()

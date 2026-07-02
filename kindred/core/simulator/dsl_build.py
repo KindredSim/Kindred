@@ -17,7 +17,7 @@ from ..equilibrium_rate_authority import (
     normalize_equilibrium_rate_authority,
 )
 from ..mechanism import Mechanism
-from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
+from ..mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .errors import DSLError
 from .common import K_from_deltaG_eq
@@ -182,6 +182,9 @@ def build_mechanism_from_ir(
                     eq_metadata["authority_source"] = EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
             if getattr(step, "cm_std_ratio", None) is not None:
                 eq_metadata["std_ratio"] = float(getattr(step, "cm_std_ratio"))
+            source_energy_unit = str(getattr(step, "source_energy_unit", "") or "").strip()
+            if source_energy_unit:
+                eq_metadata[EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT] = source_energy_unit
             authority_context = (
                 EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE
                 if bool(getattr(step, "generated_computational_mode", False))
@@ -286,10 +289,9 @@ def build_mechanism_from_ir(
                 fast=eq.fast,
                 metadata=getattr(eq, "metadata", None) or None,
                 record_step_index=False,
-                authority_context=EquilibriumRateInputContext.GENERATED_STATE_NETWORK,
             )
 
-        # Safety guard: state-network generated steps do not participate in canonical step indexing
+        # Safety guard: converter-generated steps do not participate in canonical step indexing.
         from kindred.core.simulator.parameter_namespace import is_protected_indexed_identifier
 
         def _fail(reason: str) -> None:

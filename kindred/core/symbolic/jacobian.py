@@ -12,6 +12,7 @@ from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
     EquilibriumRateInputContext,
     effective_reverse_rate_from_keq,
+    generated_equilibrium_authority_kind,
     normalize_existing_equilibrium_rate_authority,
 )
 from kindred.core.simulator.parameter_namespace import (
@@ -339,6 +340,10 @@ def _equilibrium_rate_source(
             symbolic_parameterized=False,
             generated_parameter_name=generated_name,
         )
+    if isinstance(meta, Mapping) and generated_equilibrium_authority_kind(meta):
+        raise UnsupportedSymbolicExpressionError(
+            "Generated equilibrium owner models are outside symbolic Jacobian support."
+        )
     kf_name = _canonical_step_parameter_name(
         mechanism,
         kind="equilibrium",
@@ -541,6 +546,34 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
     equilibria_payload = []
     for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
         meta = dict(getattr(eq, "metadata", {}) or {})
+        generated_kind = generated_equilibrium_authority_kind(meta)
+        if generated_kind:
+            kf = getattr(eq, "kf", None)
+            kr = getattr(eq, "kr", None)
+            keq = _explicit_keq_source(eq)
+            keq_input = _metadata_keq_input(eq)
+            has_forward_model = bool(meta.get(EquilibriumMetadataKeys.FORWARD_MODEL))
+            has_reverse_model = bool(meta.get("reverse_model"))
+            has_dg_eq = bool(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None)
+            equilibria_payload.append(
+                {
+                    "index": idx,
+                    "kf_value_kind": _symbolic_snapshot_value_kind(kf) if kf is not None else "missing",
+                    "kr_value_kind": _symbolic_snapshot_value_kind(kr) if kr is not None else "missing",
+                    "Keq_value_kind": _symbolic_snapshot_value_kind(keq) if keq is not None else "missing",
+                    "Keq_input_value_kind": (
+                        _symbolic_snapshot_value_kind(keq_input) if keq_input is not None else "missing"
+                    ),
+                    "has_forward_model": has_forward_model,
+                    "has_reverse_model": has_reverse_model,
+                    "has_dG_eq_J_per_mol": has_dg_eq,
+                    "generated_authority_kind": generated_kind,
+                }
+            )
+            if not unsupported_code:
+                unsupported_code = "generated-equilibrium"
+                unsupported_reason = "Generated equilibrium owner models are outside symbolic Jacobian support."
+            continue
         source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=idx - 1)
         kf = source.kf
         kr = source.kr

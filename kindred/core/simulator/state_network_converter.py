@@ -27,9 +27,9 @@ import math
 from typing import Dict, List, Optional, Set
 
 from .state_model import StateNetwork, State, StateType
-from ..equilibrium_rate_authority import EquilibriumRateInputContext
+from ..equilibrium_rate_authority import GeneratedEquilibriumAuthorityKind
 from ..mechanism import Mechanism
-from ..mechanism_metadata import EquilibriumMetadataKeys
+from ..mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataView
 from ..constants import R, k_B, h
 
 # Aliases for clarity
@@ -121,6 +121,13 @@ class StateNetworkConverter:
             raise ValueError(f"State network validation failed: {e}") from e
 
         mechanism = Mechanism()
+        MechanismMetadataView(
+            temperature_K=float(self.T),
+            standard_conc_M=float(self.C0),
+            kappa_global=float(self.kappa),
+            energy_unit="J/mol",
+        ).apply_to_metadata(mechanism.metadata)
+        mechanism.metadata["step_index_map"] = []
         initials = initials or {}
 
         # Get all states and edges
@@ -274,7 +281,18 @@ class StateNetworkConverter:
         )
 
         meta = {
-            "source": "state_network",
+            EquilibriumMetadataKeys.GENERATED_AUTHORITY: GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES,
+            EquilibriumMetadataKeys.GENERATED_RATE_MODEL: {
+                "type": GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES,
+                "temperature_K": float(self.T),
+                "kappa": float(self.kappa),
+                "dG_act_fwd_J_per_mol": float(dG_forward),
+                "dG_act_rev_J_per_mol": float(dG_reverse),
+                "degeneracy_ratio_fwd": float(deg_ratio_forward),
+                "degeneracy_ratio_rev": float(deg_ratio_reverse),
+                "std_ratio_fwd": float(std_ratio_fwd),
+                "std_ratio_rev": float(std_ratio_rev),
+            },
             "reactant": gs1.name,
             "product": gs2.name,
             "ts": ts.name,
@@ -293,11 +311,8 @@ class StateNetworkConverter:
             "dG_eq_J_per_mol": float(dG_eq),
             "degeneracy_ratio_fwd": float(deg_ratio_forward),
             "degeneracy_ratio_rev": float(deg_ratio_reverse),
-            "kf": float(k_forward),
-            "kr": float(k_reverse),
-            "Keq": float(K),
-            EquilibriumMetadataKeys.USER_PROVIDED_KF: True,
-            EquilibriumMetadataKeys.USER_PROVIDED_KR: True,
+            EquilibriumMetadataKeys.USER_PROVIDED_KF: False,
+            EquilibriumMetadataKeys.USER_PROVIDED_KR: False,
         }
 
         # Add as equilibrium to mechanism
@@ -309,7 +324,7 @@ class StateNetworkConverter:
             kr=k_reverse,
             fast=False,  # Not instantaneous equilibrium
             metadata=meta,
-            authority_context=EquilibriumRateInputContext.GENERATED_STATE_NETWORK,
+            record_step_index=False,
         )
 
     def _add_direct_equilibrium(
@@ -341,8 +356,6 @@ class StateNetworkConverter:
 
         # Use fast equilibrium defaults
         k_forward = 1e6  # Fast
-        Kc = float(K * (std_prod / std_react))
-        k_reverse = k_forward / Kc
 
         logger.info(
             f"Adding direct equilibrium: {gs1.name} <-> {gs2.name}\n"
@@ -350,7 +363,14 @@ class StateNetworkConverter:
         )
 
         meta = {
-            "source": "state_network_direct",
+            EquilibriumMetadataKeys.GENERATED_AUTHORITY: GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM,
+            EquilibriumMetadataKeys.GENERATED_RATE_MODEL: {
+                "type": GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM,
+                "temperature_K": float(self.T),
+                "kf": float(k_forward),
+                "dG_eq_J_per_mol": float(dG),
+                "std_ratio": float(std_prod / std_react),
+            },
             "reactant": gs1.name,
             "product": gs2.name,
             "temperature_K": float(self.T),
@@ -362,23 +382,20 @@ class StateNetworkConverter:
             "state_energy_reactant_J_per_mol": float(gs1.energy_jmol),
             "state_energy_product_J_per_mol": float(gs2.energy_jmol),
             "dG_eq_J_per_mol": float(dG),
-            "kf": float(k_forward),
-            "kr": float(k_reverse),
-            "Keq": float(K),
             "std_ratio": float(std_prod / std_react),
-            EquilibriumMetadataKeys.USER_PROVIDED_KF: True,
+            EquilibriumMetadataKeys.USER_PROVIDED_KF: False,
             EquilibriumMetadataKeys.USER_PROVIDED_KR: False,
         }
 
         mechanism._add_equilibrium_with_authority_context(
             stoich_forward=stoich_forward,
             stoich_back=stoich_back,
-            Keq=K,
+            Keq=None,
             kf=k_forward,
-            kr=k_reverse,
+            kr=None,
             fast=True,
             metadata=meta,
-            authority_context=EquilibriumRateInputContext.GENERATED_STATE_NETWORK,
+            record_step_index=False,
         )
 
     def _eyring_rate(self, dG_barrier_J_per_mol: float, degeneracy_ratio: float, *, std_ratio: float = 1.0) -> float:

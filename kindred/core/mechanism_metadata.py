@@ -34,10 +34,13 @@ class EquilibriumMetadataKeys:
     USER_PROVIDED_KF = "user_provided_kf"
     USER_PROVIDED_KR = "user_provided_kr"
     DG_EQ_J_PER_MOL = "dG_eq_J_per_mol"
+    SOURCE_ENERGY_UNIT = "source_energy_unit"
     KEQ_INPUT = "Keq_input"
     EXPLICIT_RATES = "explicit_rates"
     FORWARD_MODEL = "forward_model"
     STANDARD_CONC_M = "standard_conc_M"
+    GENERATED_AUTHORITY = "generated_equilibrium_authority"
+    GENERATED_RATE_MODEL = "generated_rate_model"
 
 
 def _as_float(value: object, *, default: float) -> float:

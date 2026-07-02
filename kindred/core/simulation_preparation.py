@@ -699,6 +699,7 @@ class SimulationExecutionRequest:
     mechanism_text: str = ""
     simulation_identity: Optional[Dict[str, Any]] = None
     parameter_overrides: Optional[Dict[str, float]] = None
+    schedule_parameter_values: Optional[Dict[str, float]] = None
     intervention_schedule: InterventionSchedule | Mapping[str, Any] | None = None
     version: int = 1
     _intervention_schedule_authority: bool = field(default=False, repr=False, compare=False)
@@ -713,6 +714,7 @@ class SimulationExecutionRequest:
         mechanism_text: str = "",
         simulation_identity: Optional[Mapping[str, Any]] = None,
         parameter_overrides: Optional[Mapping[str, Any]] = None,
+        schedule_parameter_values: Optional[Mapping[str, Any]] = None,
         intervention_schedule: InterventionSchedule | Mapping[str, Any] | None | object = _INTERVENTION_SCHEDULE_UNSET,
         version: int = 1,
     ) -> None:
@@ -729,6 +731,16 @@ class SimulationExecutionRequest:
             "parameter_overrides",
             {str(name): float(value) for name, value in dict(parameter_overrides or {}).items()}
             if isinstance(parameter_overrides, Mapping)
+            else None,
+        )
+        object.__setattr__(
+            self,
+            "schedule_parameter_values",
+            {
+                str(name): float(value)
+                for name, value in _coerce_schedule_parameter_value_items(schedule_parameter_values)
+            }
+            if isinstance(schedule_parameter_values, Mapping)
             else None,
         )
         object.__setattr__(self, "intervention_schedule", stored_schedule)
@@ -751,6 +763,7 @@ class SimulationExecutionRequest:
             mechanism_text=self.mechanism_text,
             simulation_identity=self.simulation_identity,
             parameter_overrides=self.parameter_overrides,
+            schedule_parameter_values=self.schedule_parameter_values,
             intervention_schedule=intervention_schedule,
             version=self.version,
         )
@@ -793,6 +806,16 @@ class SimulationExecutionRequest:
                 if isinstance(payload.get("parameter_overrides"), Mapping)
                 else None
             ),
+            schedule_parameter_values=(
+                {
+                    str(name): float(value)
+                    for name, value in _coerce_schedule_parameter_value_items(
+                        payload.get("schedule_parameter_values")
+                    )
+                }
+                if isinstance(payload.get("schedule_parameter_values"), Mapping)
+                else None
+            ),
         )
         if intervention_schedule_present:
             kwargs["intervention_schedule"] = intervention_schedule
@@ -817,6 +840,11 @@ class SimulationExecutionRequest:
             payload["parameter_overrides"] = {
                 str(name): float(value)
                 for name, value in dict(self.parameter_overrides or {}).items()
+            }
+        if self.schedule_parameter_values:
+            payload["schedule_parameter_values"] = {
+                str(name): float(value)
+                for name, value in dict(self.schedule_parameter_values or {}).items()
             }
         if self.has_intervention_schedule_authority:
             if self.intervention_schedule is None:
@@ -1390,6 +1418,64 @@ def _coerce_parameter_override_items(
     return items
 
 
+def _coerce_schedule_parameter_value_items(
+    schedule_parameter_values: Mapping[str, Any] | None,
+) -> list[tuple[str, float]]:
+    if not isinstance(schedule_parameter_values, Mapping) or not schedule_parameter_values:
+        return []
+    items: list[tuple[str, float]] = []
+    for raw_name, raw_value in schedule_parameter_values.items():
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SimulationPreparationError(
+                "intervention_schedule",
+                f"Schedule parameter value {name!r} must be numeric.",
+            ) from exc
+        if not np.isfinite(value):
+            raise SimulationPreparationError(
+                "intervention_schedule",
+                f"Schedule parameter value {name!r} must be finite.",
+            )
+        items.append((name, value))
+    return items
+
+
+def _schedule_resolution_values_for_request(
+    request_payload: SimulationExecutionRequest | None,
+    unresolved_intervention_schedule: InterventionSchedule | None,
+    parameter_partition: SimulationParameterValuePartition | None,
+) -> Dict[str, float] | None:
+    values: Dict[str, float] = {}
+    if parameter_partition is not None:
+        values.update(parameter_partition.schedule_resolution_values)
+    referenced = set(intervention_schedule_parameter_names(unresolved_intervention_schedule))
+    if request_payload is None:
+        return values if values else None
+    if not request_payload.schedule_parameter_values:
+        if parameter_partition is not None and referenced:
+            return values
+        return values if values else None
+    supplied = {
+        str(name): float(value)
+        for name, value in _coerce_schedule_parameter_value_items(
+            request_payload.schedule_parameter_values
+        )
+    }
+    unknown = sorted(name for name in supplied if name not in referenced)
+    if unknown:
+        raise SimulationPreparationError(
+            "intervention_schedule",
+            "Schedule parameter value(s) are not referenced by the intervention schedule: "
+            + ", ".join(unknown),
+        )
+    values.update(supplied)
+    return values if values else None
+
+
 def _scalar_parameter_override_known(mechanism: Any, name: str) -> bool:
     meta = getattr(mechanism, "metadata", None)
     if not isinstance(meta, dict):
@@ -1672,15 +1758,16 @@ def _equilibrium_override_binding_target(
     role: str,
     entry: Mapping[str, Any],
 ) -> tuple[str, str]:
-    from kindred.core.equilibrium_rate_authority import EquilibriumRateAuthorityKind
     from kindred.core.equilibrium_rate_authority import normalize_existing_equilibrium_rate_authority
 
     eq = mechanism.equilibria[int(idx)]
     authority = normalize_existing_equilibrium_rate_authority(eq)
-    if authority.kind == EquilibriumRateAuthorityKind.KEQ and role == "kr":
-        return "Keq", _equilibrium_step_parameter_name(entry, "Keq")
-    if authority.kind == EquilibriumRateAuthorityKind.KR and role == "Keq":
-        return "kr", _equilibrium_step_parameter_name(entry, "kr")
+    if not authority.authored_role_is_editable(str(role)):
+        name = _equilibrium_step_parameter_name(entry, str(role))
+        raise SimulationPreparationError(
+            "parameter_overrides",
+            f"equilibrium parameter {name} is a derived readout and cannot be used as write authority.",
+        )
     return str(role), _equilibrium_step_parameter_name(entry, str(role))
 
 
@@ -1693,64 +1780,12 @@ def _equilibrium_override_assignment(
     value: float,
     override_values_by_name: Mapping[str, float],
 ) -> tuple[str, str, float]:
-    from kindred.core.equilibrium_rate_authority import (
-        EquilibriumRateAuthorityKind,
-        effective_reverse_rate_from_keq,
-        normalize_existing_equilibrium_rate_authority,
-    )
-
-    eq = mechanism.equilibria[int(idx)]
-    authority = normalize_existing_equilibrium_rate_authority(eq)
     target_role, target_name = _equilibrium_override_binding_target(
         mechanism,
         idx=int(idx),
         role=str(role),
         entry=entry,
     )
-    if target_role == role:
-        return target_role, target_name, float(value)
-
-    kf_name = _equilibrium_step_parameter_name(entry, "kf")
-    if kf_name in override_values_by_name:
-        kf_value = float(override_values_by_name[kf_name])
-    else:
-        kf_value = _finite_runtime_override_scalar(
-            getattr(eq, "kf", None),
-            label=f"equilibrium parameter {kf_name}",
-        )
-    reverse_std_ratio = _finite_runtime_override_scalar(
-        authority.reverse_std_ratio,
-        label=f"equilibrium {target_name} reverse standard ratio",
-    )
-    if reverse_std_ratio <= 0.0:
-        raise SimulationPreparationError(
-            "parameter_overrides",
-            f"equilibrium {target_name} reverse standard ratio must be positive.",
-        )
-    if role == "Keq" and authority.kind == EquilibriumRateAuthorityKind.KR:
-        keq_value = float(value)
-        if keq_value <= 0.0:
-            raise SimulationPreparationError(
-                "parameter_overrides",
-                f"equilibrium parameter {_equilibrium_step_parameter_name(entry, 'Keq')} must be positive.",
-            )
-        return (
-            target_role,
-            target_name,
-            float(effective_reverse_rate_from_keq(kf_value, keq_value, reverse_std_ratio)),
-        )
-    if role == "kr" and authority.kind == EquilibriumRateAuthorityKind.KEQ:
-        kr_value = float(value)
-        if abs(kr_value) <= 1e-30:
-            raise SimulationPreparationError(
-                "parameter_overrides",
-                f"equilibrium parameter {_equilibrium_step_parameter_name(entry, 'kr')} must be non-zero.",
-            )
-        return (
-            target_role,
-            target_name,
-            float(kf_value) / (float(kr_value) * float(reverse_std_ratio)),
-        )
     return target_role, target_name, float(value)
 
 
@@ -1918,7 +1953,11 @@ def prepared_simulation_run_for_execution_request(
         intervention_schedule,
         request_payload,
         allow_deferred_parameters=True,
-        parameter_values=parameter_partition.schedule_resolution_values,
+        parameter_values=_schedule_resolution_values_for_request(
+            request_payload,
+            unresolved_intervention_schedule,
+            parameter_partition,
+        ),
     )
     warnings = list(getattr(prepared, "warnings", None) or [])
     if intervention_schedule is not None:
@@ -2648,10 +2687,10 @@ def prepare_simulation_worker_run(
                 request_payload,
                 structured_prepared_request=structured_prepared_request,
             ),
-            parameter_values=(
-                parameter_partition.schedule_resolution_values
-                if parameter_partition is not None
-                else None
+            parameter_values=_schedule_resolution_values_for_request(
+                request_payload,
+                unresolved_intervention_schedule,
+                parameter_partition,
             ),
         )
         if intervention_schedule is not None:
@@ -2893,80 +2932,6 @@ def _reject_requested_algebra_owned_mechanism_parameters_for_fitting(
 
 
 @dataclass
-class _StateNetworkEnergyBindingState:
-    units: Any
-    temperature_K: float
-    kappa: float
-    degeneracy_ratio_fwd: float
-    degeneracy_ratio_rev: float
-    std_ratio_fwd: float
-    std_ratio_rev: float
-    dG_act_fwd_J_per_mol: float
-    dG_eq_J_per_mol: float
-    metadata: Dict[str, Any]
-
-    def _sync_metadata(self) -> None:
-        self.metadata[EquilibriumMetadataKeys.DG_EQ_J_PER_MOL] = float(self.dG_eq_J_per_mol)
-        self.metadata["dG_act_fwd_J_per_mol"] = float(self.dG_act_fwd_J_per_mol)
-        self.metadata["dG_act_rev_J_per_mol"] = float(self.dG_act_rev_J_per_mol())
-        self.metadata["kf"] = float(self.kf())
-        self.metadata["kr"] = float(self.kr())
-        self.metadata["Keq"] = float(self.Keq())
-
-    def dG_act_rev_J_per_mol(self) -> float:
-        return float(self.dG_act_fwd_J_per_mol - self.dG_eq_J_per_mol)
-
-    def _eyring_rate(self, dG_barrier_J_per_mol: float, *, degeneracy_ratio: float, std_ratio: float) -> float:
-        from kindred.core.constants import R, h, k_B
-
-        T = float(self.temperature_K)
-        exponent = math.exp(-float(dG_barrier_J_per_mol) / (float(R) * T))
-        prefactor = float(self.kappa) * float(k_B) * T / float(h)
-        return float(prefactor * float(degeneracy_ratio) * exponent * float(std_ratio))
-
-    def kf(self) -> float:
-        return self._eyring_rate(
-            self.dG_act_fwd_J_per_mol,
-            degeneracy_ratio=self.degeneracy_ratio_fwd,
-            std_ratio=self.std_ratio_fwd,
-        )
-
-    def kr(self) -> float:
-        return self._eyring_rate(
-            self.dG_act_rev_J_per_mol(),
-            degeneracy_ratio=self.degeneracy_ratio_rev,
-            std_ratio=self.std_ratio_rev,
-        )
-
-    def Keq(self) -> float:
-        from kindred.core.kinetics import K_from_deltaG_eq
-
-        return float(K_from_deltaG_eq(self.dG_eq_J_per_mol, self.temperature_K))
-
-    def binding_value(self, role: str) -> float:
-        if role == "dG_act_fwd":
-            return float(self.units.from_jmol(self.dG_act_fwd_J_per_mol))
-        if role == "dG_eq":
-            return float(self.units.from_jmol(self.dG_eq_J_per_mol))
-        if role == "kf":
-            return float(self.kf())
-        if role == "kr":
-            return float(self.kr())
-        if role == "Keq":
-            return float(self.Keq())
-        raise KeyError(f"Unknown state-network energy binding role: {role}")
-
-    def apply_slider_value(self, role: str, value: float) -> None:
-        if role == "dG_act_fwd":
-            self.dG_act_fwd_J_per_mol = float(self.units.to_jmol(value))
-        elif role == "dG_eq":
-            self.dG_eq_J_per_mol = float(self.units.to_jmol(value))
-        else:
-            raise KeyError(f"Unknown state-network energy slider role: {role}")
-        self._sync_metadata()
-
-
-@dataclass
 class _FastEquilibriumEnergyBindingState:
     units: Any
     temperature_K: float
@@ -2996,7 +2961,7 @@ class _FastEquilibriumEnergyBindingState:
     def kr(self) -> float:
         return float(self.kf() / (self.Keq() * self.std_ratio))
 
-    def binding_value(self, role: str) -> float:
+    def binding_value(self, role: str, temperature_K: float | None = None) -> float:
         if role == "dG_eq_fast":
             return float(self.units.from_jmol(self.dG_eq_J_per_mol))
         if role == "kf":
@@ -3036,18 +3001,30 @@ class _FastEquilibriumEnergyBindingState:
 
 
 class _StructuredEnergyBinding(RateBinding):
-    def __init__(self, *, name: str, state: Any, role: str) -> None:
+    accepts_runtime_temperature = True
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        state: Any,
+        role: str,
+        commit_after_set: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__(name=str(name), value=float(state.binding_value(role)))
         self._state = state
         self._role = str(role)
+        self._commit_after_set = commit_after_set
 
-    def __call__(self) -> float:
-        current = float(self._state.binding_value(self._role))
+    def __call__(self, temperature_K: float | None = None) -> float:
+        current = float(self._state.binding_value(self._role, temperature_K))
         self.value = current
         return current
 
     def set(self, new_value: float) -> None:
         self._state.apply_slider_value(self._role, float(new_value))
+        if self._commit_after_set is not None:
+            self._commit_after_set()
         self.value = float(self._state.binding_value(self._role))
 
 
@@ -3055,12 +3032,6 @@ def _available_energy_binding_names(mechanism: Any) -> frozenset[str]:
     names: set[str] = set()
     for eq in getattr(mechanism, "equilibria", []) or []:
         metadata = dict(getattr(eq, "metadata", {}) or {})
-        reactant = str(metadata.get("reactant") or "")
-        product = str(metadata.get("product") or "")
-        ts = str(metadata.get("ts") or "")
-        if str(metadata.get("source") or "") == "state_network" and reactant and product and ts:
-            names.add(f"dGact_fwd__{ts}__{reactant}__{product}")
-            names.add(f"dG_eq__{ts}__{reactant}__{product}")
         fast_name = generated_fast_equilibrium_parameter_name(metadata)
         if fast_name is not None:
             names.add(fast_name)
@@ -3096,52 +3067,10 @@ def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]
         return {}
 
     mech_meta = MechanismMetadataView.from_metadata(getattr(mechanism, "metadata", {}) or {})
-    units = UnitsModel(energy_unit=str(mech_meta.energy_unit), temperature_K=float(mech_meta.temperature_K))
     bindings: Dict[str, Any] = {}
 
     for index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
         metadata = dict(getattr(eq, "metadata", {}) or {})
-
-        reactant = str(metadata.get("reactant") or "")
-        product = str(metadata.get("product") or "")
-        ts = str(metadata.get("ts") or "")
-        if str(metadata.get("source") or "") == "state_network" and reactant and product and ts:
-            act_name = f"dGact_fwd__{ts}__{reactant}__{product}"
-            eq_name = f"dG_eq__{ts}__{reactant}__{product}"
-            if act_name not in requested and eq_name not in requested:
-                continue
-
-            state = _StateNetworkEnergyBindingState(
-                units=units,
-                temperature_K=float(metadata.get("temperature_K") or mech_meta.temperature_K),
-                kappa=float(metadata.get("kappa") or 1.0),
-                degeneracy_ratio_fwd=float(metadata.get("degeneracy_ratio_fwd") or 1.0),
-                degeneracy_ratio_rev=float(metadata.get("degeneracy_ratio_rev") or 1.0),
-                std_ratio_fwd=float(metadata.get("std_conc_product_ts") or 1.0)
-                / max(1e-300, float(metadata.get("std_conc_product_reactant") or 1.0)),
-                std_ratio_rev=float(metadata.get("std_conc_product_ts") or 1.0)
-                / max(1e-300, float(metadata.get("std_conc_product_product") or 1.0)),
-                dG_act_fwd_J_per_mol=float(metadata.get("dG_act_fwd_J_per_mol") or 0.0),
-                dG_eq_J_per_mol=float(metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) or 0.0),
-                metadata=metadata,
-            )
-            state._sync_metadata()
-            kf_binding = _StructuredEnergyBinding(name=f"{act_name}:kf", state=state, role="kf")
-            kr_binding = _StructuredEnergyBinding(name=f"{eq_name}:kr", state=state, role="kr")
-            Keq_binding = _StructuredEnergyBinding(name=f"{eq_name}:Keq", state=state, role="Keq")
-            metadata[EquilibriumMetadataKeys.KEQ_INPUT] = Keq_binding
-            mechanism.equilibria[index] = replace(
-                eq,
-                kf=kf_binding,
-                kr=kr_binding,
-                Keq=Keq_binding,
-                metadata=metadata,
-            )
-            if act_name in requested:
-                bindings[act_name] = _StructuredEnergyBinding(name=act_name, state=state, role="dG_act_fwd")
-            if eq_name in requested:
-                bindings[eq_name] = _StructuredEnergyBinding(name=eq_name, state=state, role="dG_eq")
-            continue
 
         slider_name = generated_fast_equilibrium_parameter_name(metadata)
         if slider_name is None:
@@ -3166,8 +3095,10 @@ def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]
         std_ratio_raw, std_ratio_ok = try_parse_callable_finite_float(metadata.get("std_ratio"))
         if not (std_ratio_ok and math.isfinite(float(std_ratio_raw)) and float(std_ratio_raw) > 0.0):
             continue
+        source_energy_unit = str(metadata.get(EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT) or mech_meta.energy_unit)
+        source_units = UnitsModel(energy_unit=source_energy_unit, temperature_K=float(mech_meta.temperature_K))
         state = _FastEquilibriumEnergyBindingState(
-            units=units,
+            units=source_units,
             temperature_K=float(mech_meta.temperature_K),
             kf_fixed=float(kf_fixed),
             kf_getter=kf_getter,
@@ -3177,16 +3108,25 @@ def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]
             metadata=metadata,
         )
         state._sync_metadata()
-        kr_binding = _StructuredEnergyBinding(name=f"{slider_name}:kr", state=state, role="kr")
-        Keq_binding = _StructuredEnergyBinding(name=f"{slider_name}:Keq", state=state, role="Keq")
-        metadata[EquilibriumMetadataKeys.KEQ_INPUT] = Keq_binding
+        metadata.pop(EquilibriumMetadataKeys.KEQ_INPUT, None)
         mechanism.equilibria[index] = replace(
             eq,
-            kr=kr_binding,
-            Keq=Keq_binding,
+            kr=None,
+            Keq=None,
             metadata=metadata,
         )
-        bindings[slider_name] = _StructuredEnergyBinding(name=slider_name, state=state, role="dG_eq_fast")
+        def commit_fast_equilibrium_metadata(idx: int = index, state_ref: Any = state) -> None:
+            mechanism.equilibria[idx] = replace(
+                mechanism.equilibria[idx],
+                metadata=state_ref.metadata,
+            )
+
+        bindings[slider_name] = _StructuredEnergyBinding(
+            name=slider_name,
+            state=state,
+            role="dG_eq_fast",
+            commit_after_set=commit_fast_equilibrium_metadata,
+        )
 
     return bindings
 
@@ -3744,6 +3684,15 @@ def build_prepared_simulation_func(
                 )
             except Exception as exc:
                 raise FitSimulationError(f"Parameter algebra failed during global simulation: {exc}") from exc
+            try:
+                from kindred.core.ode_builder import build_ode_rhs_from_mechanism
+
+                bound.rhs = build_ode_rhs_from_mechanism(bound.mechanism)
+            except Exception as exc:
+                raise FitSimulationError(
+                    f"Failed to rebuild RHS after parameter binding updates: {exc}",
+                    details={"fatal": True, "stage": "ode_build"},
+                ) from exc
             last_shared_fp = shared_fp
 
         current_intervention_schedule = intervention_schedule

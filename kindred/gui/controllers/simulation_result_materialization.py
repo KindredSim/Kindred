@@ -105,10 +105,7 @@ class SimulationResultMaterializationOwner:
         _ = solver_config
         energy_mode = bool(
             mechanism is not None
-            and (
-                self._ui.variable_runtime.is_energy_mode_mechanism(mechanism)
-                or self._ui.variable_runtime.dsl_has_computational_mode_generated_block(str(mechanism_text))
-            )
+            and self._ui.variable_runtime.is_energy_mode_mechanism(mechanism)
         )
         if (not bool(is_primary)) or bool(is_preview):
             return energy_mode

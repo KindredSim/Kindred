@@ -53,9 +53,12 @@ from .validation import validate_name
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
     EquilibriumRateInputContext,
+    GeneratedEquilibriumAuthorityKind,
+    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     effective_reverse_rate_from_keq,
+    generated_equilibrium_authority_kind,
     normalize_equilibrium_rate_authority,
     plain_finite_float_or_none,
     validate_equilibrium_rate_authority_values,
@@ -546,7 +549,11 @@ class Mechanism:
             metadata=meta,
             context=authority_context,
         )
-        if authority.kind == EquilibriumRateAuthorityKind.KEQ:
+        generated_kind = generated_equilibrium_authority_kind(meta)
+        if (
+            authority.kind == EquilibriumRateAuthorityKind.KEQ
+            and generated_kind != GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM
+        ):
             effective_keq = Keq
             if effective_keq is None and meta.get(EquilibriumMetadataKeys.KEQ_INPUT) is not None:
                 effective_keq = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
@@ -643,19 +650,29 @@ class Mechanism:
 
         equilibria_block = []
         for e in self.equilibria:
-            effective_keq = effective_equilibrium_keq(e, temperature_K=temperature_K)
-            effective_kr = effective_equilibrium_reverse_rate(e, temperature_K=temperature_K)
-            equilibria_block.append(
-                {
+            metadata = dict(e.metadata)
+            generated_kind = generated_equilibrium_authority_kind(metadata)
+            entry = {
                 "stoich_forward": OrderedDict(sorted(e.stoich_forward.items(), key=lambda kv: order_map[kv[0]])),
                 "stoich_back":   OrderedDict(sorted(e.stoich_back.items(),   key=lambda kv: order_map[kv[0]])),
-                "Keq": effective_keq if effective_keq is not None else e.Keq,
-                "kf": e.kf,
-                "kr": effective_kr if effective_kr is not None else e.kr,
                 "fast": e.fast,
-                "metadata": OrderedDict(sorted(dict(e.metadata).items())),
+                "metadata": OrderedDict(sorted(metadata.items())),
             }
-            )
+            effective_kf = effective_equilibrium_forward_rate(e, temperature_K=temperature_K)
+            effective_keq = effective_equilibrium_keq(e, temperature_K=temperature_K)
+            effective_kr = effective_equilibrium_reverse_rate(e, temperature_K=temperature_K)
+            if generated_kind:
+                if effective_kf is None or effective_keq is None or effective_kr is None:
+                    raise ValueError("generated equilibrium requires complete generated owner model for serialization")
+            else:
+                entry.update(
+                    {
+                        "Keq": effective_keq if effective_keq is not None else e.Keq,
+                        "kf": effective_kf if effective_kf is not None else e.kf,
+                        "kr": effective_kr if effective_kr is not None else e.kr,
+                    }
+                )
+            equilibria_block.append(entry)
         return {
             "species": species_block,
             "reactions": reactions_block,

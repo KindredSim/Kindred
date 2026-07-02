@@ -37,6 +37,7 @@ __all__ = ["StateNetworkEditor"]
 
 _STATE_KIND_OPTIONS = ("GS", "TS")
 _ENERGY_UNIT_OPTIONS = ("kJ/mol", "kcal/mol", "J/mol")
+_PRESERVED_STATE_FIELD_KEYS = ("members", "std", "standard_state")
 
 
 class _ComboBoxItemDelegate(QStyledItemDelegate):
@@ -186,6 +187,35 @@ class StateNetworkEditor(QWidget):
         self._change_flush_timer.timeout.connect(self._flush_user_change)
         if self._debug_state_net:
             self._states_table.itemSelectionChanged.connect(self._debug_on_states_selection_changed)
+
+    @staticmethod
+    def _preserved_state_fields_from_kv(kv: Dict[str, str]) -> Dict[str, str]:
+        preserved: Dict[str, str] = {}
+        for key in _PRESERVED_STATE_FIELD_KEYS:
+            value = kv.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                preserved[key] = text
+        return preserved
+
+    @staticmethod
+    def _preserved_state_fields_from_item(item: QTableWidgetItem | None) -> Dict[str, str]:
+        if item is None:
+            return {}
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return {}
+        preserved: Dict[str, str] = {}
+        for key in _PRESERVED_STATE_FIELD_KEYS:
+            value = data.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                preserved[key] = text
+        return preserved
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -362,11 +392,16 @@ class StateNetworkEditor(QWidget):
                 unit_str = unit_item.text().strip() if unit_item and unit_item.text().strip() else "kJ/mol"
                 deg_str = degeneracy.text().strip() if degeneracy and degeneracy.text().strip() else "1"
 
-                lines.append(
-                    f"state: {name_str}, kind={kind_str}, "
-                    f"energy={energy_str}, energy_unit={unit_str}, "
-                    f"degeneracy={deg_str}"
-                )
+                parts = [
+                    f"state: {name_str}",
+                    f"kind={kind_str}",
+                    f"energy={energy_str}",
+                    f"energy_unit={unit_str}",
+                    f"degeneracy={deg_str}",
+                ]
+                for key, value in self._preserved_state_fields_from_item(name).items():
+                    parts.append(f"{key}={value}")
+                lines.append(", ".join(parts))
 
         # Add edges
         for row in range(self._edges_table.rowCount()):
@@ -395,15 +430,25 @@ class StateNetworkEditor(QWidget):
             # Clear existing data (must also dispose of cell widgets to avoid leaks)
             self._reset_tables()
 
-            # Parse DSL
+            energy_unit = "kJ/mol"
             for line in dsl_text.strip().split('\n'):
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
 
-                if line.lower().startswith('state:'):
-                    self._parse_state_line(line)
-                elif line.lower().startswith('edge:'):
+                lower = line.lower()
+                if lower.startswith("energy="):
+                    try:
+                        from kindred.core.simulator.dsl_parse import _parse_energy_unit_directive
+
+                        energy_unit = _parse_energy_unit_directive(line)
+                    except Exception:
+                        logger.debug("StateNetworkEditor: ignored invalid energy directive %r", line, exc_info=True)
+                    continue
+
+                if lower.startswith('state:'):
+                    self._parse_state_line(line, energy_unit=energy_unit)
+                elif lower.startswith('edge:'):
                     self._parse_edge_line(line)
 
             self._validate()
@@ -770,41 +815,49 @@ class StateNetworkEditor(QWidget):
             if debug_entered:
                 self._debug_reentrancy_exit("validate")
 
-    def _parse_state_line(self, line: str):
-        """Parse 'state: name, kind=GS, energy=0, ...' line."""
-        # Simple parser
+    @staticmethod
+    def _editor_energy_from_state_kv(kv: Dict[str, str], default_unit: str) -> Tuple[str, str]:
+        energy_text = str(kv.get("energy") or "0").strip()
+        unit = str(kv.get("energy_unit") or default_unit or "kJ/mol").strip()
+        if energy_text:
+            parts = energy_text.split()
+            if len(parts) == 2 and parts[1] in _ENERGY_UNIT_OPTIONS:
+                energy_text = parts[0]
+                unit = parts[1]
+        if unit not in _ENERGY_UNIT_OPTIONS:
+            unit = "kJ/mol"
+        return energy_text or "0", unit
+
+    def _parse_state_line(self, line: str, *, energy_unit: str = "kJ/mol"):
+        """Load a parser-valid `state:` line into the editor tables."""
         _, rest = line.split(':', 1)
-        parts = rest.split(',')
+        try:
+            from kindred.core.simulator.dsl_parse import _parse_state_rest
 
-        state_data = {"name": "", "kind": "GS", "energy": "0", "unit": "kJ/mol", "degeneracy": "1"}
+            name, kv = _parse_state_rest(rest)
+        except Exception:
+            logger.debug("StateNetworkEditor: ignored invalid state line %r", line, exc_info=True)
+            return
 
-        for part in parts:
-            part = part.strip()
-            if '=' in part:
-                key, value = part.split('=', 1)
-                key = key.strip().lower()
-                value = value.strip()
+        if not name:
+            return
 
-                if key == "kind":
-                    state_data["kind"] = value.upper()
-                elif key == "energy":
-                    state_data["energy"] = value
-                elif key == "energy_unit":
-                    state_data["unit"] = value
-                elif key == "degeneracy":
-                    state_data["degeneracy"] = value
-                elif key in ("name", "state"):
-                    state_data["name"] = value
-            else:
-                # First part without '=' is the name
-                if not state_data["name"]:
-                    state_data["name"] = part
+        energy_text, unit = self._editor_energy_from_state_kv(kv, energy_unit)
+        state_data = {
+            "name": str(name),
+            "kind": str(kv.get("kind") or "GS").strip().upper(),
+            "energy": energy_text,
+            "unit": unit,
+            "degeneracy": str(kv.get("degeneracy") or "1").strip() or "1",
+        }
 
         # Add row
         row = self._states_table.rowCount()
         self._states_table.insertRow(row)
 
-        self._states_table.setItem(row, 0, QTableWidgetItem(state_data["name"]))
+        name_item = QTableWidgetItem(state_data["name"])
+        name_item.setData(Qt.ItemDataRole.UserRole, self._preserved_state_fields_from_kv(kv))
+        self._states_table.setItem(row, 0, name_item)
 
         self._states_table.setItem(row, 1, QTableWidgetItem(state_data["kind"]))
 
@@ -817,21 +870,13 @@ class StateNetworkEditor(QWidget):
     def _parse_edge_line(self, line: str):
         """Parse 'edge: A,B' or 'edge: A-B' line."""
         _, rest = line.split(':', 1)
-        rest = rest.strip()
+        try:
+            from kindred.core.simulator.dsl_parse import _parse_edge_step
 
-        # Split by comma or dash
-        if ',' in rest:
-            parts = rest.split(',')
-        elif '-' in rest:
-            parts = rest.split('-')
-        else:
-            return  # Invalid
-
-        if len(parts) != 2:
+            state_a, state_b = _parse_edge_step(rest)
+        except Exception:
+            logger.debug("StateNetworkEditor: ignored invalid edge line %r", line, exc_info=True)
             return
-
-        state_a = parts[0].strip()
-        state_b = parts[1].strip()
 
         # Add row
         row = self._edges_table.rowCount()
