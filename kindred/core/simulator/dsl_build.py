@@ -89,10 +89,13 @@ def build_mechanism_from_ir(
         init_conc = float(initials_merged.get(sp_name, 0.0))
         mechanism.add_species(sp_name, init_conc)
 
-    # Add reactions/equilibria to mechanism (preserve DSL order for step indexing)
-    for step_no, step in enumerate(steps, start=1):
+    # Add reactions/equilibria to mechanism. Generated Computational Mode rows
+    # build mechanism objects but do not consume authored public step indices.
+    authored_step_no = 0
+    for _source_step_no, step in enumerate(steps, start=1):
         reactants = dict(getattr(step, "reactants", {}) or {})
         products = dict(getattr(step, "products", {}) or {})
+        generated_computational_mode = bool(getattr(step, "generated_computational_mode", False))
 
         model = str(getattr(step, "model", "Eyring") or "Eyring")
 
@@ -178,7 +181,7 @@ def build_mechanism_from_ir(
             ).to_metadata()
             if getattr(step, "cm_id", None) is not None:
                 eq_metadata["cm_id"] = str(getattr(step, "cm_id"))
-                if bool(getattr(step, "generated_computational_mode", False)):
+                if generated_computational_mode:
                     eq_metadata["authority_source"] = EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
             if getattr(step, "cm_std_ratio", None) is not None:
                 eq_metadata["std_ratio"] = float(getattr(step, "cm_std_ratio"))
@@ -187,7 +190,7 @@ def build_mechanism_from_ir(
                 eq_metadata[EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT] = source_energy_unit
             authority_context = (
                 EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE
-                if bool(getattr(step, "generated_computational_mode", False))
+                if generated_computational_mode
                 else EquilibriumRateInputContext.NORMALIZED_PUBLIC
             )
             authority = normalize_equilibrium_rate_authority(
@@ -218,11 +221,15 @@ def build_mechanism_from_ir(
                 overrides=rxn_overrides or None,
             )
 
-        # Record canonical step-index mapping for downstream layers (GUI/algebra/fitting).
+        if generated_computational_mode:
+            continue
+
+        # Record canonical authored step-index mapping for downstream layers (GUI/algebra/fitting).
+        authored_step_no += 1
         arrow = "<->" if is_equilibrium_step else "->"
         context = f"{_fmt_side(reactants)} {arrow} {_fmt_side(products)}"
         entry: Dict[str, object] = {
-            "step_index": int(step_no),
+            "step_index": int(authored_step_no),
             "kind": namespace_policy.step_kind,
             "context": context,
         }
@@ -231,8 +238,6 @@ def build_mechanism_from_ir(
             entry.update(authority.step_map_fields())
             entry["user_provided_kf"] = bool(getattr(step, "user_kf_explicit", False))
             entry["user_provided_kr"] = bool(getattr(step, "user_kr_explicit", False))
-            if str(eq_metadata.get("authority_source") or ""):
-                entry["authority_source"] = str(eq_metadata["authority_source"])
             if str(eq_metadata.get("cm_id") or ""):
                 entry["cm_id"] = str(eq_metadata["cm_id"])
         else:

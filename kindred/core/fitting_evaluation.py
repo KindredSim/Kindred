@@ -12,7 +12,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
-import numbers
 import pickle
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -32,6 +31,8 @@ from kindred.core.intervention_schedule import (
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     SimulationExecutionRequest,
+    _available_energy_binding_names,
+    _bind_requested_parameters_to_prepared_mechanism,
     _bind_symbolic_jacobian_for_current_mechanism,
     _build_solver_config,
     _fit_simulation_error_from_preparation_error,
@@ -39,6 +40,7 @@ from kindred.core.simulation_preparation import (
     _raise_unowned_request_parameter_values,
     _prepared_metadata_with_symbolic_jacobian,
     _reject_requested_algebra_owned_mechanism_parameters_for_fitting,
+    _scalar_parameter_is_derived,
     _solve_request,
     _symbolic_jacobian_for_bind_failure,
     assert_simulation_execution_request_schedule_identity,
@@ -148,6 +150,18 @@ def _raise_for_forwarded_parameter_values(
             origins=origins,
             failed_params=failed_params,
         )
+
+
+def _reject_requested_derived_scalars_for_fitting(mechanism: object, names: object) -> None:
+    for raw_name in names or ():
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        if _scalar_parameter_is_derived(mechanism, name):
+            raise _prepare_preparation_failure(
+                "parameter_binding",
+                f"derived scalar parameter {name!r} cannot be used as fitting write authority.",
+            )
 
 
 def _build_fitting_cancellation_event(cancellation_check):
@@ -358,35 +372,13 @@ def _payload_value_for_comparison(value: Any) -> Any:
     return value
 
 
-def _binding_payload_for_comparison(name: str, binding: Any) -> Dict[str, Any]:
-    if isinstance(binding, Mapping):
-        binding_name = binding.get("name", name)
-        binding_value = binding.get("value")
-    elif isinstance(binding, numbers.Real):
-        binding_name = name
-        binding_value = binding
-    else:
-        binding_name = getattr(binding, "name", name)
-        binding_value = getattr(binding, "value", None)
-    if binding_value is None and callable(binding):
-        binding_value = binding()
-    if binding_value is None:
-        binding_value = 0.0
-    return {"name": str(binding_name), "value": float(binding_value)}
-
-
 def _execution_request_payload_for_comparison(value: SimulationExecutionRequest) -> Dict[str, Any]:
     payload = _payload_value_for_comparison(value.to_payload())
     prepared_payload = payload.get("prepared_payload")
     if isinstance(prepared_payload, dict):
         prepared_payload = dict(prepared_payload)
         prepared_payload.pop("mechanism", None)
-        bindings = prepared_payload.get("bindings")
-        if isinstance(bindings, dict):
-            prepared_payload["bindings"] = {
-                str(name): _binding_payload_for_comparison(str(name), binding)
-                for name, binding in bindings.items()
-            }
+        prepared_payload.pop("bindings", None)
         payload["prepared_payload"] = prepared_payload
     return payload
 
@@ -530,14 +522,15 @@ def prepare_fitting_execution_context(
         initials={},
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
-    requested_partition = partition_simulation_parameter_values(
-        mechanism=bound.mechanism,
-        parameter_overrides=None,
-        unresolved_intervention_schedule=bound.unresolved_intervention_schedule,
-        requested_parameter_names=param_names or [],
-        runtime_parameter_names=bound.bindings.keys(),
-    )
     try:
+        _reject_requested_derived_scalars_for_fitting(bound.mechanism, param_names or [])
+        requested_partition = partition_simulation_parameter_values(
+            mechanism=bound.mechanism,
+            parameter_overrides=None,
+            unresolved_intervention_schedule=bound.unresolved_intervention_schedule,
+            requested_parameter_names=param_names or [],
+            runtime_parameter_names=_available_energy_binding_names(bound.mechanism),
+        )
         _raise_unowned_request_parameter_values(requested_partition)
         canonical_requested_param_names = canonicalize_request_parameter_names(
             requested_partition,
@@ -554,7 +547,7 @@ def prepare_fitting_execution_context(
             _prepare_preparation_failure("parameter_binding", exc)
         ) from exc
     prepared_payload = dict(bound.as_serializable_execution_payload())
-    prepared_payload["bindings"] = dict(bound.bindings)
+    prepared_payload["requested_parameter_names"] = list(canonical_requested_param_names)
     intervention_schedule = coerce_intervention_schedule(prepared_payload.get("intervention_schedule"))
     from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
@@ -768,6 +761,57 @@ class SerialFittingEvaluator:
         if _fitting_cancel_requested(self._cancellation_check):
             raise FittingCancelled()
 
+    def _raise_unrequested_schedule_candidate_authority(
+        self,
+        parameter_partition: Any,
+        candidate_parameter_names: set[str],
+    ) -> None:
+        if not candidate_parameter_names:
+            return
+        schedule_names = {
+            str(name)
+            for name in getattr(parameter_partition, "schedule_parameter_names", ())
+            if str(name).strip()
+        }
+        if not schedule_names:
+            return
+        requested_names = {
+            str(name)
+            for name in (self._context.requested_param_names or ())
+            if str(name).strip()
+        }
+        schedule_name_by_raw = dict(
+            getattr(parameter_partition, "schedule_parameter_name_by_raw", {}) or {}
+        )
+        owner_by_raw = {
+            **dict(getattr(parameter_partition, "mechanism_parameter_name_by_raw", {}) or {}),
+            **dict(getattr(parameter_partition, "unbound_mechanism_parameter_name_by_raw", {}) or {}),
+            **dict(getattr(parameter_partition, "runtime_parameter_name_by_raw", {}) or {}),
+        }
+        schedule_owner_by_raw = {
+            raw_name: str(schedule_name_by_raw.get(raw_name, raw_name))
+            for raw_name in schedule_names
+        }
+        for candidate_name in sorted(str(name) for name in candidate_parameter_names if str(name).strip()):
+            candidate_owner = str(owner_by_raw.get(candidate_name, candidate_name))
+            for schedule_raw_name, schedule_owner in sorted(schedule_owner_by_raw.items()):
+                if candidate_name != schedule_raw_name and candidate_owner != schedule_owner:
+                    continue
+                if (
+                    candidate_name in requested_names
+                    or candidate_owner in requested_names
+                    or schedule_raw_name in requested_names
+                    or schedule_owner in requested_names
+                ):
+                    continue
+                raise FitSimulationError(
+                    (
+                        f"Unrequested intervention schedule parameter {candidate_name!r} "
+                        "cannot be used as fitting candidate authority."
+                    ),
+                    details={"fatal": True, "stage": "parameter_binding"},
+                )
+
     def __call__(self, params: Dict[str, float]) -> SimulationSeriesPayload:
         return self.evaluate_series(params)
 
@@ -810,6 +854,11 @@ class SerialFittingEvaluator:
         shared_values: Dict[str, float] = {}
         from kindred.core.simulation_preparation import partition_simulation_parameter_values
 
+        candidate_parameter_names = {
+            str(name)
+            for name in dict(params or {})
+            if str(name).strip() and not str(name).startswith(self._context.initial_prefix)
+        }
         non_initial_parameters = {
             str(name): value
             for name, value in param_map.items()
@@ -820,10 +869,14 @@ class SerialFittingEvaluator:
                 mechanism=prepared_run.mechanism,
                 parameter_overrides=non_initial_parameters,
                 unresolved_intervention_schedule=prepared_run.unresolved_intervention_schedule,
-                runtime_parameter_names=self._bindings.keys(),
+                runtime_parameter_names=_available_energy_binding_names(prepared_run.mechanism),
                 validate_values=False,
             )
             _raise_unowned_request_parameter_values(parameter_partition)
+            self._raise_unrequested_schedule_candidate_authority(
+                parameter_partition,
+                candidate_parameter_names,
+            )
         except SimulationPreparationError as exc:
             raise _fit_simulation_error_from_preparation_error(exc) from exc
         except ValueError as exc:
@@ -832,6 +885,7 @@ class SerialFittingEvaluator:
                 failed_params=failed_params,
                 details={"fatal": True, "stage": "parameter_binding"},
             ) from exc
+        requested_parameter_names = set(self._context.requested_param_names or ())
         for key, raw_val in param_map.items():
             name = str(key)
             if name.startswith(self._context.initial_prefix):
@@ -848,6 +902,14 @@ class SerialFittingEvaluator:
                 binding_name = parameter_partition.mechanism_parameter_name_by_raw.get(name, name)
                 if binding_name not in self._bindings:
                     if name in parameter_partition.schedule_only_parameter_names:
+                        if name not in requested_parameter_names:
+                            raise FitSimulationError(
+                                (
+                                    f"Unrequested intervention schedule parameter {name!r} "
+                                    "cannot be used as fitting candidate authority."
+                                ),
+                                details={"fatal": True, "stage": "parameter_binding"},
+                            )
                         _coerce_consumed_parameter_value(
                             name=name,
                             raw_value=raw_val,
@@ -880,6 +942,9 @@ class SerialFittingEvaluator:
         if shared_fp != self._last_shared_fp:
             self._apply_shared_values(shared_values)
             self._last_shared_fp = shared_fp
+            prepared_run = self._prepared_run
+            if prepared_run is None:
+                raise RuntimeError("Prepared fitting lane unavailable.")
 
         y0 = np.asarray(prepared_run.y0, dtype=float).copy()
         for species_name, value in initial_overrides.items():
@@ -1042,10 +1107,27 @@ class SerialFittingEvaluator:
             use_sparse_jacobian=bool(self._context.prepared_metadata.use_sparse_jacobian),
             wegscheider_cyclicity_enabled=bool(self._context.prepared_metadata.wegscheider_cyclicity_enabled),
         )
-        prepared_payload = dict(self._context.execution_request.prepared_payload or {})
-        bindings = prepared_payload.get("bindings") or {}
-        if not isinstance(bindings, Mapping):
-            raise FitSimulationError("Structured fitting payload is missing mutable bindings.", details={"fatal": True})
+        try:
+            bindings = _bind_requested_parameters_to_prepared_mechanism(
+                prepared_run.mechanism,
+                self._context.requested_param_names,
+                unresolved_intervention_schedule=prepared_run.unresolved_intervention_schedule,
+            )
+            from kindred.core.ode_builder import build_ode_rhs_from_mechanism
+
+            rhs = build_ode_rhs_from_mechanism(prepared_run.mechanism)
+            prepared_run = replace(
+                prepared_run,
+                rhs=rhs,
+                request=replace(prepared_run.request, rhs=rhs),
+            )
+        except SimulationPreparationError as exc:
+            raise _fit_simulation_error_from_preparation_error(exc) from exc
+        except Exception as exc:
+            raise FitSimulationError(
+                f"Structured fitting preparation failed: {exc}",
+                details={"fatal": True, "stage": "parameter_binding"},
+            ) from exc
         self._prepared_run = prepared_run
         symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
             jacobian_func=prepared_run.request.jacobian_func,
@@ -1139,3 +1221,19 @@ class SerialFittingEvaluator:
                 )
         except Exception as exc:
             raise FitSimulationError(f"Parameter algebra failed during fitting simulation: {exc}") from exc
+
+        if shared_values:
+            try:
+                from kindred.core.ode_builder import build_ode_rhs_from_mechanism
+
+                rhs = build_ode_rhs_from_mechanism(prepared_run.mechanism)
+            except Exception as exc:
+                raise FitSimulationError(
+                    f"Failed to rebuild RHS after parameter binding updates: {exc}",
+                    details={"fatal": True, "stage": "ode_build"},
+                ) from exc
+            self._prepared_run = replace(
+                prepared_run,
+                rhs=rhs,
+                request=replace(prepared_run.request, rhs=rhs),
+            )

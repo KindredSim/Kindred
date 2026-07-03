@@ -8,11 +8,10 @@ import math
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from kindred.core.batch_parallel import batch_mechanism_signature, compute_effective_batch_workers
-from kindred.core.intervention_schedule import (
-    intervention_schedule_identity_fingerprints,
-    intervention_schedule_parameter_names,
-)
 from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.simulation_preparation import (
+    intervention_schedule_payload_and_identity_for_execution_text,
+)
 from kindred.core.simulation_identity import (
     SimulationScopeIdentity,
     canonical_initials_fingerprint,
@@ -37,6 +36,11 @@ from kindred.gui.ports import CompletedRunDisplayIntent
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 logger = logging.getLogger(__name__)
+
+
+class _RuntimeParameterValuesUnavailableForReadiness(ValueError):
+    pass
+
 
 __all__ = [
     "RunDispatchContext",
@@ -119,7 +123,7 @@ class SimulationRunPreparationDependencies:
     pending_initials_for_run_source_set: Callable[..., Dict[str, Any]]
     simulation_identity_for_set: Callable[..., Any]
     resolved_initials_for_batch_row: Callable[..., Dict[str, Any]]
-    runtime_parameter_values_for_set: Callable[..., Dict[str, Any]]
+    local_runtime_parameter_overrides_for_set: Callable[..., Dict[str, Any]]
     preview_contained_owner_identity: Callable[..., Dict[str, Any]]
     ordinary_contained_owner_identity: Callable[..., Dict[str, Any]]
     record_run_cache_key: Callable[..., None]
@@ -464,7 +468,7 @@ class SimulationRunMechanismPreparationOwner:
         full_source = self._ports.mechanism.mechanism_source_for_run_set(
             base_source,
             set_id=primary_set_id,
-            apply_parameter_overrides=bool(has_runtime_parameter_values),
+            apply_parameter_overrides=False,
             strip_initial_concentrations=True,
         )
         full_dsl = full_source.full_dsl
@@ -641,10 +645,13 @@ class SimulationRunDispatchPreparationOwner:
         simulation_identity_by_set_id: Dict[str, Dict[str, Any]] = {}
         initials_by_set_id: Dict[str, Dict[str, Any]] = {}
         intervention_schedule_by_set_id: Dict[str, Dict[str, Any]] = {}
-        schedule_parameter_values_by_set_id: Dict[str, Dict[str, float]] = {}
+        runtime_parameter_values_by_set_id: Dict[str, Dict[str, float]] = {}
         contained_owner_identity_by_set_id: Dict[str, Dict[str, Any]] = {}
         owned_species_by_set_id: Dict[str, tuple[str, ...]] = {}
         solver_temperature_K = _semantic_temperature_from_solver_config(solver_context.solver_config)
+
+        class _RuntimeParameterValuesUnavailable(RuntimeError):
+            pass
 
         def _abort_invalid_intervention_schedule(set_id_s: str, exc: BaseException) -> None:
             if bool(runtime_readiness_only):
@@ -664,84 +671,109 @@ class SimulationRunDispatchPreparationOwner:
             if not bool(fast_mode):
                 self._deps.requeue_preserved_pending_slider_replay_after_preflight_abort()
 
-        def _submitted_intervention_schedule_from_text(text: str):
-            from kindred.core.intervention_schedule import (
-                coerce_intervention_schedule,
-                normalized_intervention_schedule_payload,
-                parse_intervention_schedule_from_dsl,
+        def _abort_runtime_parameter_values_unavailable(set_id_s: str, exc: BaseException) -> None:
+            if bool(runtime_readiness_only):
+                raise _RuntimeParameterValuesUnavailableForReadiness(
+                    f"Runtime parameter values are unavailable for set {set_id_s!r}: {exc}"
+                ) from exc
+            self._deps.record_nonfatal_exception("Failed to read runtime parameter values for run plan", exc)
+            self._ports.dialogs.message_box_warning(
+                "Runtime Parameters Unavailable",
+                f"Runtime parameter values for set {set_id_s!r} could not be read before running:\n\n{exc}",
             )
+            if bool(fast_mode):
+                self._deps.clear_failed_fast_preview_ownership()
+            self._deps.set_simulation_running(False)
+            self._ports.run_ui.set_run_button_enabled(True)
+            self._ports.run_ui.set_stop_button_enabled(False)
+            self._deps.set_slider_simulation_active(False)
+            self._deps.clear_slider_triggered_preflight_state(fast_mode=bool(fast_mode))
+            if not bool(fast_mode):
+                self._deps.requeue_preserved_pending_slider_replay_after_preflight_abort()
 
-            intervention_schedule = parse_intervention_schedule_from_dsl(str(text or ""))
-            if intervention_schedule is None:
-                return None
-            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-            from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
-
-            mechanism = parse_dsl_to_mechanism(str(text or ""), initials={})
-            namespace = build_namespace_from_mechanism(mechanism)
-            payload = normalized_intervention_schedule_payload(
-                intervention_schedule,
-                mechanism_namespace=namespace,
-            )
-            return coerce_intervention_schedule(payload)
-
-        def _referenced_schedule_parameter_values(set_id_s: str, intervention_schedule: object) -> Dict[str, float]:
-            names = sorted(
-                str(name)
-                for name in intervention_schedule_parameter_names(intervention_schedule)
-                if str(name)
-            )
-            if not names:
-                return {}
-            try:
-                runtime_values = self._deps.runtime_parameter_values_for_set(set_id=set_id_s)
-            except TypeError:
-                runtime_values = self._deps.runtime_parameter_values_for_set(set_id_s)
-            except Exception:
-                return {}
-            if not isinstance(runtime_values, Mapping):
-                return {}
-            referenced_values: Dict[str, float] = {}
-            for name in names:
-                if name not in runtime_values:
+        def _coerce_runtime_value_mapping(
+            raw_values: object,
+            *,
+            set_id_s: str,
+            value_kind: str,
+        ) -> Dict[str, float]:
+            if not isinstance(raw_values, Mapping):
+                raise _RuntimeParameterValuesUnavailable(
+                    f"{value_kind} for set {set_id_s!r} were not a mapping."
+                )
+            values: Dict[str, float] = {}
+            for raw_name, raw_value in raw_values.items():
+                name = str(raw_name or "").strip()
+                if not name:
                     continue
                 try:
-                    value = float(runtime_values[name])
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                if math.isfinite(value):
-                    referenced_values[name] = value
-            return referenced_values
+                    value = float(raw_value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise _RuntimeParameterValuesUnavailable(
+                        f"{value_kind} {name!r} for set {set_id_s!r} is not finite numeric."
+                    ) from exc
+                if not math.isfinite(value):
+                    raise _RuntimeParameterValuesUnavailable(
+                        f"{value_kind} {name!r} for set {set_id_s!r} is not finite numeric."
+                    )
+                values[name] = value
+            return values
 
-        def _schedule_identity_fingerprints_for_values(
-            intervention_schedule: object | None,
-            schedule_values: Mapping[str, float] | None,
-        ) -> tuple[str, str]:
-            if intervention_schedule is None:
-                return "", ""
-            schedule_for_identity = intervention_schedule
-            if isinstance(schedule_values, Mapping) and schedule_values:
-                schedule_for_identity = intervention_schedule.resolve_parameters(schedule_values)
-            return intervention_schedule_identity_fingerprints(schedule_for_identity)
+        def _local_runtime_parameter_overrides(set_id_s: str) -> Dict[str, float]:
+            if set_id_s in runtime_parameter_values_by_set_id:
+                return dict(runtime_parameter_values_by_set_id[set_id_s])
+            if not bool(mechanism_context.has_runtime_parameter_values):
+                return {}
+            try:
+                raw_values = self._deps.local_runtime_parameter_overrides_for_set(set_id=set_id_s)
+            except Exception as exc:
+                raise _RuntimeParameterValuesUnavailable(
+                    f"Runtime parameter values are unavailable for set {set_id_s!r}."
+                ) from exc
+            values = _coerce_runtime_value_mapping(
+                raw_values,
+                set_id_s=set_id_s,
+                value_kind="Runtime parameter value",
+            )
+            runtime_parameter_values_by_set_id[set_id_s] = values
+            return dict(values)
+
+        def _core_schedule_payload_identity(
+            *,
+            mechanism_text: str,
+            initials: Mapping[str, Any],
+            prepared_payload: Mapping[str, Any] | None,
+            parameter_overrides: Mapping[str, Any] | None,
+        ) -> tuple[dict[str, Any] | None, str, str]:
+            return intervention_schedule_payload_and_identity_for_execution_text(
+                mechanism_text=str(mechanism_text or ""),
+                initials=dict(initials or {}),
+                t_span=(0.0, float(solver_context.t_end)),
+                solver_config=solver_context.solver_config,
+                prepared_payload=prepared_payload if isinstance(prepared_payload, Mapping) else None,
+                parameter_overrides=parameter_overrides if isinstance(parameter_overrides, Mapping) else None,
+            )
 
         for index, set_id in enumerate(mechanism_context.queue_ids):
             set_id_s = str(set_id)
             if index >= len(mechanism_context.batch_rows):
                 try:
-                    intervention_schedule = _submitted_intervention_schedule_from_text(
-                        str(mechanism_context.owner_full_dsl or "")
-                    )
-                    referenced_values = (
-                        _referenced_schedule_parameter_values(set_id_s, intervention_schedule)
-                        if intervention_schedule is not None
-                        else {}
-                    )
+                    prepared_execution_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id_s)
+                    prepared_payload = solver_context.prepared_payload_by_set_id.get(set_id_s)
+                    runtime_parameter_overrides = _local_runtime_parameter_overrides(set_id_s)
                     (
+                        intervention_schedule_payload,
                         intervention_schedule_declarative_fingerprint,
                         intervention_schedule_executable_fingerprint,
-                    ) = _schedule_identity_fingerprints_for_values(
-                        intervention_schedule,
-                        referenced_values,
+                    ) = _core_schedule_payload_identity(
+                        mechanism_text=str(mechanism_context.owner_full_dsl or ""),
+                        initials={},
+                        prepared_payload=(
+                            prepared_execution_payload
+                            if isinstance(prepared_execution_payload, Mapping)
+                            else prepared_payload if isinstance(prepared_payload, Mapping) else None
+                        ),
+                        parameter_overrides=runtime_parameter_overrides or None,
                     )
                     identity = self._deps.simulation_identity_for_set(
                         set_id=set_id_s,
@@ -756,17 +788,16 @@ class SimulationRunDispatchPreparationOwner:
                         ),
                         fast_mode=bool(fast_mode),
                     )
+                except _RuntimeParameterValuesUnavailable as exc:
+                    _abort_runtime_parameter_values_unavailable(set_id_s, exc)
+                    return None
                 except Exception as exc:
                     _abort_invalid_intervention_schedule(set_id_s, exc)
                     return None
                 identity_payload = identity.to_payload()
-                if intervention_schedule is not None:
-                    intervention_schedule_by_set_id[set_id_s] = intervention_schedule.to_payload()
-                    if referenced_values:
-                        schedule_parameter_values_by_set_id[set_id_s] = referenced_values
+                if intervention_schedule_payload is not None:
+                    intervention_schedule_by_set_id[set_id_s] = dict(intervention_schedule_payload)
                 simulation_identity_by_set_id[set_id_s] = identity_payload
-                prepared_execution_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id_s)
-                prepared_payload = solver_context.prepared_payload_by_set_id.get(set_id_s)
                 owned_species = _owned_species_from_prepared_launch_payload(
                     prepared_execution_payload,
                     prepared_payload,
@@ -786,7 +817,7 @@ class SimulationRunDispatchPreparationOwner:
             request_source = self._ports.mechanism.mechanism_source_for_run_set(
                 mechanism_context.base_source,
                 set_id=set_id_s,
-                apply_parameter_overrides=bool(mechanism_context.has_runtime_parameter_values),
+                apply_parameter_overrides=False,
                 strip_initial_concentrations=True,
             )
             request_mechanism_text = request_source.full_dsl
@@ -802,27 +833,6 @@ class SimulationRunDispatchPreparationOwner:
             )
             if owned_species:
                 owned_species_by_set_id[set_id_s] = owned_species
-            try:
-                intervention_schedule = _submitted_intervention_schedule_from_text(str(request_mechanism_text))
-                referenced_values = (
-                    _referenced_schedule_parameter_values(set_id_s, intervention_schedule)
-                    if intervention_schedule is not None
-                    else {}
-                )
-                (
-                    intervention_schedule_declarative_fingerprint,
-                    intervention_schedule_executable_fingerprint,
-                ) = _schedule_identity_fingerprints_for_values(
-                    intervention_schedule,
-                    referenced_values,
-                )
-            except Exception as exc:
-                _abort_invalid_intervention_schedule(set_id_s, exc)
-                return None
-            if intervention_schedule is not None:
-                intervention_schedule_by_set_id[set_id_s] = intervention_schedule.to_payload()
-                if referenced_values:
-                    schedule_parameter_values_by_set_id[set_id_s] = referenced_values
             try:
                 pending_initials = {}
                 if bool(fast_mode):
@@ -857,6 +867,21 @@ class SimulationRunDispatchPreparationOwner:
                 return None
 
             try:
+                runtime_parameter_overrides = _local_runtime_parameter_overrides(set_id_s)
+                (
+                    intervention_schedule_payload,
+                    intervention_schedule_declarative_fingerprint,
+                    intervention_schedule_executable_fingerprint,
+                ) = _core_schedule_payload_identity(
+                    mechanism_text=str(request_mechanism_text),
+                    initials=initials_dict,
+                    prepared_payload=(
+                        prepared_execution_payload
+                        if isinstance(prepared_execution_payload, Mapping)
+                        else prepared_payload if isinstance(prepared_payload, Mapping) else None
+                    ),
+                    parameter_overrides=runtime_parameter_overrides or None,
+                )
                 identity = self._deps.simulation_identity_for_set(
                     set_id=set_id_s,
                     solver_config=solver_context.solver_config,
@@ -871,10 +896,15 @@ class SimulationRunDispatchPreparationOwner:
                     ),
                     fast_mode=bool(fast_mode),
                 )
+            except _RuntimeParameterValuesUnavailable as exc:
+                _abort_runtime_parameter_values_unavailable(set_id_s, exc)
+                return None
             except Exception as exc:
                 _abort_invalid_intervention_schedule(set_id_s, exc)
                 return None
             identity_payload = identity.to_payload()
+            if intervention_schedule_payload is not None:
+                intervention_schedule_by_set_id[set_id_s] = dict(intervention_schedule_payload)
             simulation_identity_by_set_id[set_id_s] = identity_payload
             initials_by_set_id[set_id_s] = dict(initials_dict)
             if bool(fast_mode):
@@ -936,6 +966,11 @@ class SimulationRunDispatchPreparationOwner:
             initials_dict = initials_by_set_id.get(set_id_s)
             if not isinstance(initials_dict, dict):
                 continue
+            try:
+                runtime_parameter_overrides = _local_runtime_parameter_overrides(set_id_s)
+            except _RuntimeParameterValuesUnavailable as exc:
+                _abort_runtime_parameter_values_unavailable(set_id_s, exc)
+                return None
             set_name = (
                 str(mechanism_context.queue_names[index])
                 if index < len(mechanism_context.queue_names)
@@ -962,8 +997,7 @@ class SimulationRunDispatchPreparationOwner:
                         if isinstance(prepared_execution_payload, Mapping)
                         else None
                     ),
-                    parameter_overrides=None,
-                    schedule_parameter_values=schedule_parameter_values_by_set_id.get(set_id_s),
+                    parameter_overrides=runtime_parameter_overrides or None,
                     intervention_schedule=intervention_schedule_by_set_id.get(set_id_s),
                     contained_owner_identity=contained_owner_identity_by_set_id.get(set_id_s),
                     algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
@@ -1102,6 +1136,18 @@ class SimulationRunPreparationOwner:
                 runtime_readiness_only=True,
                 mechanism_context=mechanism_context,
                 solver_context=solver_context,
+            )
+        except _RuntimeParameterValuesUnavailableForReadiness as exc:
+            return self._blocked_prepared_request_set(
+                intent=intent,
+                blocked_reason=RuntimePreparationBlockedReason(
+                    source="dispatch",
+                    code="runtime_parameters_unavailable",
+                    message=f"Runtime Parameters Unavailable: {exc}",
+                    rows=tuple(rows),
+                    set_ids=tuple(mechanism_context.queue_ids),
+                    retryable=True,
+                ),
             )
         except Exception as exc:
             return self._blocked_prepared_request_set(

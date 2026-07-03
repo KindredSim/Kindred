@@ -538,16 +538,21 @@ def _index_step_lines(lines: list[str]) -> tuple[dict[int, int], dict[int, int]]
             continue
         if not stripped or stripped.startswith("#"):
             continue
-        lower = stripped.lower()
+        if in_generated_block:
+            continue
+        code = stripped.split("#", 1)[0].strip()
+        if not code:
+            continue
+        lower = code.lower()
+        if lower.startswith("comp:"):
+            continue
         if "<->" in lower or "<=>" in lower:
             line_counter += 1
-            if not in_generated_block:
-                equilibrium_lines[line_counter] = idx
+            equilibrium_lines[line_counter] = idx
             continue
         if "->" in lower:
             line_counter += 1
-            if not in_generated_block:
-                reaction_lines[line_counter] = idx
+            reaction_lines[line_counter] = idx
     return reaction_lines, equilibrium_lines
 
 

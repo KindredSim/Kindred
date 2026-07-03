@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Iterable, Optional
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.validation import try_parse_finite_float
@@ -64,11 +64,15 @@ class SimulationMechanismOwner:
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be a MechanismAuthoringSource.")
         materialized = source
-        if self.has_local_runtime_parameter_values() and bool(apply_parameter_overrides):
+        target_set_id = str(set_id or "").strip()
+        if (
+            self._has_local_runtime_overrides_for_set(target_set_id)
+            and bool(apply_parameter_overrides)
+        ):
             materialized = MechanismAuthoringSource.from_parts(
                 reactions_text=self._apply_reactions_overrides_to_text(
                     materialized.reactions_text,
-                    set_id=set_id,
+                    set_id=target_set_id,
                 ),
                 state_network_dsl=materialized.state_network_dsl,
             )
@@ -135,6 +139,11 @@ class SimulationMechanismOwner:
     def has_local_runtime_parameter_values(self) -> bool:
         return bool(self._preview_session.has_local_mechanism_workspaces())
 
+    def _has_local_runtime_overrides_for_set(self, target_set_id: str) -> bool:
+        if not str(target_set_id or "").strip():
+            return self.has_local_runtime_parameter_values()
+        return bool(self._preview_session.param_store.has_local_overrides_for_set(target_set_id))
+
     def simulation_schema_id(self, *, fast_mode: bool = False) -> str:
         param_store = self._preview_session.param_store
         schema_text = (
@@ -149,7 +158,7 @@ class SimulationMechanismOwner:
     def runtime_parameter_fingerprint_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> str:
         self.simulation_schema_id(fast_mode=bool(fast_mode))
         target_set_id = str(set_id or "").strip()
-        param_store = self._preview_session.param_store
+        param_store = self._runtime_param_store_after_workspace_validation(target_set_id)
         if not param_store.has_local_overrides_for_set(target_set_id):
             return ""
         return str(param_store.param_fingerprint(target_set_id) or "")
@@ -158,21 +167,55 @@ class SimulationMechanismOwner:
         self.simulation_schema_id(fast_mode=bool(fast_mode))
         return list(self._preview_session.param_store.parameter_names())
 
-    def runtime_parameter_values_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> Dict[str, float]:
+    def local_runtime_parameter_overrides_for_set(
+        self,
+        *,
+        set_id: Optional[str],
+        fast_mode: bool = True,
+    ) -> Dict[str, float]:
         self.simulation_schema_id(fast_mode=bool(fast_mode))
         target_set_id = str(set_id or "").strip()
-        raw = self._preview_session.runtime_parameter_values(set_id=target_set_id)
+        param_store = self._runtime_param_store_after_workspace_validation(target_set_id)
+        if not target_set_id or not param_store.has_local_overrides_for_set(target_set_id):
+            return {}
+        raw = param_store.local_runtime_parameter_overrides(target_set_id)
+        return self._finite_allowed_runtime_values(raw, allowed_names=param_store.parameter_names())
+
+    def focused_runtime_parameter_values(self, *, fast_mode: bool = True) -> Dict[str, float]:
+        self.simulation_schema_id(fast_mode=bool(fast_mode))
+        focused_set_id = str(self._preview_session.focused_mechanism_workspace_set_id() or "").strip()
+        param_store = self._runtime_param_store_after_workspace_validation(focused_set_id)
+        raw = self._preview_session.runtime_parameter_values(set_id=None)
+        return self._finite_allowed_runtime_values(raw, allowed_names=param_store.parameter_names())
+
+    def _finite_allowed_runtime_values(
+        self,
+        raw: object,
+        *,
+        allowed_names: Iterable[str],
+    ) -> Dict[str, float]:
         values: Dict[str, float] = {}
-        allowed_names = set(self._preview_session.param_store.parameter_names())
+        allowed = {str(name or "").strip() for name in (allowed_names or ()) if str(name or "").strip()}
         for key, value in dict(raw or {}).items():
             name_s = str(key or "").strip()
-            if not name_s or name_s not in allowed_names:
+            if not name_s or name_s not in allowed:
                 continue
             parsed, ok = try_parse_finite_float(value)
             if not ok:
                 continue
             values[name_s] = float(parsed)
         return values
+
+    def _runtime_param_store_after_workspace_validation(self, target_set_id: str):
+        param_store = self._preview_session.param_store
+        invalid_names = param_store.invalid_local_runtime_parameter_names_for_set(target_set_id)
+        if invalid_names:
+            names = ", ".join(invalid_names)
+            raise ValueError(
+                f"Local runtime parameter workspace for set {target_set_id!r} "
+                f"contains malformed or non-finite value(s): {names}."
+            )
+        return param_store
 
     def get_mechanism_text(self) -> str:
         return self._simulation_schema_text()

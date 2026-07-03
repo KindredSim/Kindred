@@ -10,6 +10,9 @@ from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 AUTHORITY_ERROR = "equilibrium requires kf and exactly one of kr or Keq/dG_eq"
 GENERATED_RATE_MODEL_ERROR = "generated transition-state equilibrium requires complete generated_rate_model"
 GENERATED_DIRECT_MODEL_ERROR = "generated direct thermodynamic equilibrium requires complete generated_rate_model"
+GENERATED_FAST_EQUILIBRIUM_RUNTIME_PARAMETER_PREFIX = "dG_eq_fast__"
+_AUTHORITY_SOURCE_METADATA_KEY = "authority_source"
+_GENERATED_SCALAR_MIRROR_METADATA_KEYS = frozenset({"kf", "kr", "Keq"})
 
 
 class EquilibriumRateAuthorityKind:
@@ -115,6 +118,14 @@ class EquilibriumRateAuthority:
             items.append(("dG_eq_J_per_mol", self.dG_eq_J_per_mol))
         return tuple(items)
 
+    def authored_symbolic_roles(self) -> tuple[str, ...]:
+        roles = ["kf"]
+        if self.kind == EquilibriumRateAuthorityKind.KR:
+            roles.append("kr")
+        elif self.has_explicit_keq_param:
+            roles.append("Keq")
+        return tuple(roles)
+
 
 @dataclass(frozen=True, slots=True)
 class EquilibriumAuthorityReadoutUpdate:
@@ -127,6 +138,31 @@ class EquilibriumAuthorityReadoutUpdate:
 def effective_reverse_rate_from_keq(kf: object, Keq: object, reverse_std_ratio: object = 1.0) -> object:
     """Return the effective reverse rate for thermodynamic equilibrium authority."""
     return kf / (Keq * reverse_std_ratio)  # type: ignore[operator]
+
+
+def json_safe_equilibrium_authority_payload(value: object) -> object:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): json_safe_equilibrium_authority_payload(value[key])
+            for key in sorted(value.keys(), key=lambda item: str(item))
+        }
+    if isinstance(value, (tuple, list)):
+        return [json_safe_equilibrium_authority_payload(item) for item in value]
+    if isinstance(value, set):
+        return [json_safe_equilibrium_authority_payload(item) for item in sorted(value, key=lambda item: str(item))]
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+    if math.isfinite(numeric):
+        return numeric
+    return str(value)
 
 
 def _finite_float_or_none(value: object, *, temperature_K: float | None = None) -> float | None:
@@ -761,6 +797,8 @@ def normalize_equilibrium_rate_authority(
         reverse_std_ratio=_metadata_reverse_std_ratio(meta),
         has_explicit_keq_param=bool(metadata_keq is not None or (Keq is not None and metadata_dg is None)),
         has_thermo_param=bool(has_thermo),
+        kf_editable=ctx != EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE,
+        kr_editable=ctx != EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE,
     )
 
 
@@ -768,7 +806,7 @@ def normalize_existing_equilibrium_rate_authority(eq: object) -> EquilibriumRate
     meta = getattr(eq, "metadata", {}) or {}
     context: EquilibriumRateInputContext | str = EquilibriumRateInputContext.PUBLIC
     if isinstance(meta, Mapping):
-        if str(meta.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value:
+        if str(meta.get(_AUTHORITY_SOURCE_METADATA_KEY) or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value:
             context = EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE
         elif (
             (_metadata_has_thermo_authority(meta) or getattr(eq, "Keq", None) is not None)
@@ -782,6 +820,85 @@ def normalize_existing_equilibrium_rate_authority(eq: object) -> EquilibriumRate
         metadata=meta if isinstance(meta, Mapping) else {},
         context=context,
     )
+
+
+def _source_metadata_mapping(source: object) -> Mapping[str, Any]:
+    if isinstance(source, Mapping) and "equilibrium_authority" not in source:
+        return source
+    meta = getattr(source, "metadata", {}) or {}
+    return meta if isinstance(meta, Mapping) else {}
+
+
+def _source_authority_fields(source: object) -> Mapping[str, Any]:
+    if isinstance(source, Mapping):
+        fields = authority_fields_from_step_entry(source)
+        if fields:
+            return fields
+    return {}
+
+
+def _generated_fast_runtime_source(source: object, metadata: Mapping[str, Any]) -> str:
+    fields = _source_authority_fields(source)
+    if fields:
+        return str(fields.get("source") or "")
+    if not isinstance(source, Mapping):
+        try:
+            return str(normalize_existing_equilibrium_rate_authority(source).source)
+        except ValueError:
+            return ""
+    return str(metadata.get(_AUTHORITY_SOURCE_METADATA_KEY) or "")
+
+
+def _generated_fast_runtime_has_thermo_authority(source: object, metadata: Mapping[str, Any]) -> bool:
+    fields = _source_authority_fields(source)
+    if fields:
+        return bool(fields.get("has_thermo_param"))
+    if not isinstance(source, Mapping):
+        try:
+            authority = normalize_existing_equilibrium_rate_authority(source)
+        except ValueError:
+            return False
+        return authority.kind == EquilibriumRateAuthorityKind.KEQ and bool(authority.has_thermo_param)
+    return metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None
+
+
+def generated_fast_equilibrium_runtime_parameter_name(source: object) -> str | None:
+    metadata = _source_metadata_mapping(source)
+    if _generated_fast_runtime_source(source, metadata) != EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value:
+        return None
+    if not _generated_fast_runtime_has_thermo_authority(source, metadata):
+        return None
+    cm_id_source: object | None = None
+    if isinstance(source, Mapping):
+        cm_id_source = source.get("cm_id")
+    if cm_id_source is None:
+        cm_id_source = metadata.get("cm_id")
+    cm_id = str(cm_id_source or "").strip()
+    if not cm_id:
+        return None
+    return f"{GENERATED_FAST_EQUILIBRIUM_RUNTIME_PARAMETER_PREFIX}{cm_id}"
+
+
+def equilibrium_is_generated_authority_output(source: object) -> bool:
+    metadata = _source_metadata_mapping(source)
+    return bool(
+        generated_equilibrium_authority_kind(metadata)
+        or generated_fast_equilibrium_runtime_parameter_name(source) is not None
+    )
+
+
+def json_safe_equilibrium_metadata_payload(source: object) -> dict[str, object]:
+    payload = json_safe_equilibrium_authority_payload(_source_metadata_mapping(source))
+    if not isinstance(payload, Mapping):
+        return {}
+    out = {str(key): payload[key] for key in payload}
+    if equilibrium_is_generated_authority_output(source):
+        return {
+            key: value
+            for key, value in out.items()
+            if key not in _GENERATED_SCALAR_MIRROR_METADATA_KEYS
+        }
+    return out
 
 
 def authority_fields_from_step_entry(entry: Mapping[str, Any] | None) -> Mapping[str, Any]:

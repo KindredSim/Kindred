@@ -7,8 +7,8 @@ Canonical rule:
 - Equilibrium step -> parameters kfN, krN, and KeqN
 
 Policy:
-- State-network generated steps are excluded from the step-index map to avoid
-  collisions with user-visible names (see parse_dsl_to_mechanism).
+- State-network and generated Computational Mode steps are excluded from the
+  step-index map to avoid collisions with user-visible authored names.
 """
 
 from __future__ import annotations

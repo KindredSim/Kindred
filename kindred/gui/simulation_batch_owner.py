@@ -989,13 +989,26 @@ class SimulationBatchOwner:
             set_id=str(set_id),
             mechanism_text=mechanism_text,
         )
-        from kindred.core.intervention_schedule import normalized_intervention_schedule_identity_fingerprints_from_dsl_text
+        parameter_values = getattr(self._mechanism_owner, "local_runtime_parameter_overrides_for_set", None)
+        parameter_overrides = (
+            dict(parameter_values(set_id=str(set_id), fast_mode=True))
+            if callable(parameter_values)
+            else {}
+        )
+        from kindred.core.simulation_preparation import (
+            intervention_schedule_payload_and_identity_for_execution_text,
+        )
 
         (
+            _intervention_schedule_payload,
             intervention_schedule_declarative_fingerprint,
             intervention_schedule_executable_fingerprint,
-        ) = normalized_intervention_schedule_identity_fingerprints_from_dsl_text(
-            str(mechanism_text or "")
+        ) = intervention_schedule_payload_and_identity_for_execution_text(
+            mechanism_text=str(mechanism_text or ""),
+            initials={},
+            t_span=(0.0, float(expected_t_end)),
+            solver_config=expected_solver_config,
+            parameter_overrides=parameter_overrides or None,
         )
         initials_fingerprint = ""
         row = self._batch_row_for_set_id(str(set_id))
@@ -1052,7 +1065,7 @@ class SimulationBatchOwner:
                 set_id=str(set_id),
                 apply_parameter_overrides=False,
             ).full_dsl
-            parameter_values = getattr(self._mechanism_owner, "runtime_parameter_values_for_set", None)
+            parameter_values = getattr(self._mechanism_owner, "local_runtime_parameter_overrides_for_set", None)
             parameter_overrides = (
                 dict(parameter_values(set_id=str(set_id)))
                 if callable(parameter_values)

@@ -11,8 +11,8 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
+    generated_fast_equilibrium_runtime_parameter_name,
 )
-from kindred.core.simulator.parameter_namespace import generated_fast_equilibrium_parameter_name
 
 if TYPE_CHECKING:
     from kindred.gui.main_window import MainWindow
@@ -120,6 +120,14 @@ class MainWindowVariableRuntime:
 
             source = mw.canonical_mechanism_source()
             if not source.full_dsl.strip():
+                mw.clear_variable_sliders()
+                self.clear_variable_metadata()
+                mw._energy_mode_channels = []
+                mw._preview_session.sync_committed_slider_values(
+                    {},
+                    schema_text=source.without_reaction_initial_concentrations().full_dsl,
+                )
+                self.update_parameter_table_from_sliders()
                 return
 
             temperature_k = mw.temperature_spinbox_value()
@@ -350,12 +358,7 @@ class MainWindowVariableRuntime:
 
     def has_generated_computational_fast_equilibrium(self, mechanism: object) -> bool:
         for eq in list(getattr(mechanism, "equilibria", []) or []):
-            eq_meta = getattr(eq, "metadata", {}) or {}
-            if not isinstance(eq_meta, MappingABC):
-                continue
-            if str(eq_meta.get("authority_source") or "") != "generated_computational_mode":
-                continue
-            if str(eq_meta.get("cm_id") or "").strip():
+            if generated_fast_equilibrium_runtime_parameter_name(eq) is not None:
                 return True
         return False
 
@@ -486,12 +489,61 @@ class MainWindowVariableRuntime:
             lhs, rhs = [part.strip() for part in text.split(arrow, 1)]
             return _side_count(lhs), _side_count(rhs)
 
+        def _format_stoich_side(side: object) -> str:
+            if not isinstance(side, MappingABC):
+                return ""
+            pieces: list[str] = []
+            for raw_name, raw_coeff in sorted(side.items(), key=lambda item: str(item[0])):
+                name = str(raw_name or "").strip()
+                if not name:
+                    return ""
+                try:
+                    coeff = float(raw_coeff)
+                except Exception:
+                    return ""
+                if not math.isfinite(coeff) or coeff <= 0.0:
+                    return ""
+                if abs(coeff - 1.0) < 1e-12:
+                    pieces.append(name)
+                elif abs(coeff - round(coeff)) < 1e-12:
+                    pieces.append(f"{int(round(coeff))}{name}")
+                else:
+                    pieces.append(f"{coeff:g}{name}")
+            return " + ".join(pieces)
+
+        def _equilibrium_context_from_stoich(eq_obj: object) -> str:
+            lhs = _format_stoich_side(getattr(eq_obj, "stoich_forward", {}) or {})
+            rhs = _format_stoich_side(getattr(eq_obj, "stoich_back", {}) or {})
+            if lhs and rhs:
+                return f"{lhs} <-> {rhs}"
+            return ""
+
+        def _stoich_molecularity(side: object) -> int | None:
+            if not isinstance(side, MappingABC):
+                return None
+            try:
+                total = float(sum(float(value) for value in side.values()))
+            except Exception:
+                return None
+            rounded = int(round(total))
+            if rounded >= 1 and abs(total - float(rounded)) <= 1e-9:
+                return int(rounded)
+            return None
+
+        def _equilibrium_molecularity(eq_obj: object) -> tuple[int, int] | None:
+            fwd = _stoich_molecularity(getattr(eq_obj, "stoich_forward", {}) or {})
+            rev = _stoich_molecularity(getattr(eq_obj, "stoich_back", {}) or {})
+            if fwd is None or rev is None:
+                return None
+            return fwd, rev
+
         fast_eq_channels: list[dict[str, object]] = []
         for eq_index, eq in enumerate(list(getattr(mechanism, "equilibria", []) or [])):
             eq_meta = getattr(eq, "metadata", {}) or {}
             if not isinstance(eq_meta, MappingABC):
                 continue
-            if str(eq_meta.get("authority_source") or "") != "generated_computational_mode":
+            var_eq = generated_fast_equilibrium_runtime_parameter_name(eq)
+            if var_eq is None:
                 continue
             cm_id = str(eq_meta.get("cm_id") or "").strip()
             if not cm_id:
@@ -501,7 +553,13 @@ class MainWindowVariableRuntime:
                     exc=None,
                 )
                 continue
-            label = str(step_context_by_equilibrium_index.get(int(eq_index)) or cm_id or "fast equilibrium")
+            stoich_context = _equilibrium_context_from_stoich(eq)
+            label = str(
+                step_context_by_equilibrium_index.get(int(eq_index))
+                or stoich_context
+                or cm_id
+                or "fast equilibrium"
+            )
             try:
                 dg_eq_j = float(eq_meta.get("dG_eq_J_per_mol"))
             except Exception as exc:
@@ -561,6 +619,9 @@ class MainWindowVariableRuntime:
                 )
                 continue
             molecularity_fwd, molecularity_rev = _context_molecularity(label)
+            stoich_molecularity = _equilibrium_molecularity(eq)
+            if stoich_molecularity is not None:
+                molecularity_fwd, molecularity_rev = stoich_molecularity
             try:
                 molecularity_fwd = int(eq_meta.get("molecularity_fwd") or molecularity_fwd)
             except Exception:
@@ -583,6 +644,7 @@ class MainWindowVariableRuntime:
                 {
                     "kind": "fast_equilibrium",
                     "cm_id": cm_id,
+                    "var_eq": var_eq,
                     "label": label,
                     "dG_eq": float(dg_eq_val),
                     "kf_fixed": float(kf),
@@ -667,15 +729,9 @@ class MainWindowVariableRuntime:
             kf_fixed = float(ch.get("kf_fixed") or float("nan"))
             std_ratio = float(ch.get("std_ratio") or 1.0)
 
-            var_eq = generated_fast_equilibrium_parameter_name(
-                {
-                    "authority_source": "generated_computational_mode",
-                    "cm_id": cm_id,
-                }
-            )
-            if var_eq is None:
+            var_eq = str(ch.get("var_eq") or "")
+            if not var_eq:
                 continue
-            ch["var_eq"] = var_eq
 
             variables[var_eq] = dg_eq
             eq_lo, eq_hi = _range(dg_eq, nonnegative=False)

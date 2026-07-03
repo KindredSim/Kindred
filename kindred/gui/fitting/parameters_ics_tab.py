@@ -9,11 +9,8 @@ import numpy as np
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
-from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-from kindred.core.simulator.parameter_namespace import (
-    build_namespace_from_mechanism,
-    generated_fast_equilibrium_parameter_name,
-)
+from kindred.core.simulator.dsl import extract_parameters_from_dsl, parse_dsl_to_mechanism
+from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
@@ -948,14 +945,20 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 context = str(entry.get("context") or "").strip()
                 if not context:
                     context = str(entry.get("kind") or "step")
-                generated_name = generated_fast_equilibrium_parameter_name(entry)
                 parameter_names = tuple(names_by_step.get(int(step_index)) or ())
-                if generated_name:
-                    lines.append(f"Step {step_index}    {context}    parameter: {generated_name}")
-                elif parameter_names:
+                if parameter_names:
                     lines.append(f"Step {step_index}    {context}    parameters: {', '.join(parameter_names)}")
                 else:
                     lines.append(f"Step {step_index}    {context}")
+        generated_fast_names = [
+            str(param.name)
+            for param in extract_parameters_from_dsl(mechanism_text)
+            if str(getattr(param, "role", "") or "") == "dG_eq_fast"
+            and bool(getattr(param, "editable", False))
+            and str(getattr(param, "name", "") or "")
+        ]
+        if generated_fast_names:
+            lines.append("Generated fast parameters: " + ", ".join(sorted(generated_fast_names)))
 
         lines.extend(
             [

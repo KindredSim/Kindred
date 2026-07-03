@@ -4752,9 +4752,19 @@ class MainWindow(
             fast_mode=bool(fast_mode),
         )
 
-    def runtime_parameter_values_for_set(self, set_id: Optional[str] = None, *, fast_mode: bool = True) -> Dict[str, float]:
-        return self._simulation_mechanism_owner.runtime_parameter_values_for_set(
+    def local_runtime_parameter_overrides_for_set(
+        self,
+        *,
+        set_id: Optional[str],
+        fast_mode: bool = True,
+    ) -> Dict[str, float]:
+        return self._simulation_mechanism_owner.local_runtime_parameter_overrides_for_set(
             set_id=set_id,
+            fast_mode=bool(fast_mode),
+        )
+
+    def focused_runtime_parameter_values(self, *, fast_mode: bool = True) -> Dict[str, float]:
+        return self._simulation_mechanism_owner.focused_runtime_parameter_values(
             fast_mode=bool(fast_mode),
         )
 
@@ -5790,11 +5800,12 @@ class MainWindow(
         set_id: Optional[str] = None,
         overrides: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
-        raw = (
-            self.runtime_parameter_values_for_set(set_id=set_id, fast_mode=True)
-            if overrides is None
-            else dict(overrides or {})
-        )
+        if overrides is not None:
+            raw = dict(overrides or {})
+        elif set_id is not None:
+            raw = self.local_runtime_parameter_overrides_for_set(set_id=set_id, fast_mode=True)
+        else:
+            raw = self.focused_runtime_parameter_values(fast_mode=True)
         normalized: Dict[str, float] = {}
         for key, value in raw.items():
             parsed, ok = try_parse_finite_float(value)
@@ -6105,7 +6116,7 @@ class MainWindow(
             return None
         try:
             dG_eq = float(
-                self.runtime_parameter_values_for_set(fast_mode=True).get(var_eq, ch.get("dG_eq"))
+                self.focused_runtime_parameter_values(fast_mode=True).get(var_eq, ch.get("dG_eq"))
             )
         except Exception as exc:
             self._record_best_effort_failure(

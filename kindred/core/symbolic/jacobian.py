@@ -10,15 +10,14 @@ from kindred.core.mechanism import Equilibrium, Mechanism, Reaction
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
-    EquilibriumRateInputContext,
     effective_reverse_rate_from_keq,
+    generated_fast_equilibrium_runtime_parameter_name,
     generated_equilibrium_authority_kind,
     normalize_existing_equilibrium_rate_authority,
 )
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
     canonical_name_for_mechanism_step_parameter,
-    generated_fast_equilibrium_parameter_name,
 )
 
 from .artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR, SymbolicArtifactIdentity
@@ -130,6 +129,7 @@ class _EquilibriumRateSource:
     reverse_authority: str = "keq"
     symbolic_parameterized: bool = True
     generated_parameter_name: str | None = None
+    authored_symbolic_roles: tuple[str, ...] = ()
 
 
 class _ParameterRegistry:
@@ -307,10 +307,8 @@ def _equilibrium_rate_source(
     kr = getattr(eq, "kr", None)
     keq = _explicit_keq_source(eq)
     meta = getattr(eq, "metadata", {}) or {}
-    if isinstance(meta, Mapping) and (
-        str(meta.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
-    ):
-        generated_name = generated_fast_equilibrium_parameter_name(meta)
+    generated_name = generated_fast_equilibrium_runtime_parameter_name(eq)
+    if generated_name is not None:
         reverse_authority = "keq" if keq is not None else "kr"
         try:
             authority = normalize_existing_equilibrium_rate_authority(eq)
@@ -380,6 +378,11 @@ def _equilibrium_rate_source(
     elif authority is not None and authority.kind == EquilibriumRateAuthorityKind.KEQ:
         keq = authority.Keq
         reverse_authority = "keq"
+    authored_symbolic_roles = (
+        authority.authored_symbolic_roles()
+        if authority is not None
+        else (("kf", "kr") if reverse_authority == "kr" else ("kf", "Keq"))
+    )
     try:
         reverse_std_ratio = float(authority.reverse_std_ratio) if authority is not None else 1.0
     except Exception:
@@ -395,6 +398,7 @@ def _equilibrium_rate_source(
         keq_name=keq_name,
         reverse_std_ratio=reverse_std_ratio,
         reverse_authority=reverse_authority,
+        authored_symbolic_roles=authored_symbolic_roles,
     )
 
 
@@ -413,11 +417,13 @@ def _equilibrium_rates(
     if source.reverse_authority == "kr":
         kr_symbol = registry.parameter(kr_value, label="equilibrium kr", default_name=str(source.kr_name or ""))
         return kf_symbol, kr_symbol
-    registry.parameter(kr_value, label="equilibrium kr", default_name=str(source.kr_name or ""))
-    keq_symbol = registry.parameter(keq_value, label="equilibrium Keq", default_name=str(source.keq_name or ""))
+    if "Keq" in source.authored_symbolic_roles:
+        keq_source = registry.parameter(keq_value, label="equilibrium Keq", default_name=str(source.keq_name or ""))
+    else:
+        keq_source = keq_value
     return kf_symbol, effective_reverse_rate_from_keq(
         kf_symbol,
-        keq_symbol,
+        keq_source,
         _positive_reverse_std_ratio(source.reverse_std_ratio),
     )
 
@@ -679,6 +685,19 @@ def _structure_identity_payload(
     }
 
 
+def _symbolic_names_for_equilibrium_source(source: _EquilibriumRateSource) -> tuple[str, ...]:
+    role_to_name = {
+        "kf": source.kf_name,
+        "kr": source.kr_name,
+        "Keq": source.keq_name,
+    }
+    return tuple(
+        str(role_to_name[role])
+        for role in source.authored_symbolic_roles
+        if role in role_to_name and role_to_name[role] is not None
+    )
+
+
 def _symbolic_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
     parameter_names: set[str] = set()
     for reaction_index, rxn in enumerate(getattr(mechanism, "reactions", []) or []):
@@ -698,10 +717,7 @@ def _symbolic_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
         _equilibrium_parameter_value_triad(source)
         if not source.symbolic_parameterized:
             continue
-        if source.reverse_authority == "kr":
-            parameter_names.update((str(source.kf_name), str(source.kr_name)))
-        else:
-            parameter_names.update((str(source.kf_name), str(source.kr_name), str(source.keq_name)))
+        parameter_names.update(_symbolic_names_for_equilibrium_source(source))
     return tuple(sorted(parameter_names))
 
 
@@ -726,9 +742,20 @@ def _parameter_values_for_mechanism(
         kf_value, kr_value, keq_value = _equilibrium_parameter_value_triad(source)
         if not source.symbolic_parameterized:
             continue
-        values[str(source.kf_name)] = float(kf_value)
-        values[str(source.kr_name)] = float(kr_value)
-        values[str(source.keq_name)] = float(keq_value)
+        role_to_name = {
+            "kf": source.kf_name,
+            "kr": source.kr_name,
+            "Keq": source.keq_name,
+        }
+        role_to_value = {
+            "kf": kf_value,
+            "kr": kr_value,
+            "Keq": keq_value,
+        }
+        for role in source.authored_symbolic_roles:
+            name = role_to_name.get(role)
+            if name is not None:
+                values[str(name)] = float(role_to_value[role])
 
     out: dict[str, float] = {}
     for name in parameter_symbols:

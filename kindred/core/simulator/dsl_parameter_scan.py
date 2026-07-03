@@ -15,6 +15,7 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
+    generated_fast_equilibrium_runtime_parameter_name,
     normalize_existing_equilibrium_rate_authority,
     step_entry_authored_role_is_editable,
 )
@@ -30,7 +31,6 @@ from .parameter_algebra_spec import collect_algebra_section_lines
 from .parameter_namespace import (
     build_namespace_from_ir_steps,
     build_namespace_from_mechanism,
-    generated_fast_equilibrium_parameter_name,
 )
 from .step_indexing import get_step_index_map
 
@@ -175,7 +175,7 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
             step_entry_by_equilibrium_index[int(equilibrium_index)] = entry
     for equilibrium_index, eq in enumerate(eqs):
         metadata = dict(getattr(eq, "metadata", {}) or {})
-        name = generated_fast_equilibrium_parameter_name(metadata)
+        name = generated_fast_equilibrium_runtime_parameter_name(eq)
         if name is None:
             continue
         dG_eq_j = _finite_value(metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
@@ -234,7 +234,7 @@ def extract_parameter_names_from_dsl(text: str) -> set[str]:
     mechanism_namespace = build_namespace_from_ir_steps(ir.steps)
     param_names.update(mechanism_namespace.flat_names())
     for eq in getattr(mechanism, "equilibria", []) or []:
-        name = generated_fast_equilibrium_parameter_name(dict(getattr(eq, "metadata", {}) or {}))
+        name = generated_fast_equilibrium_runtime_parameter_name(eq)
         if name is not None:
             param_names.add(name)
 

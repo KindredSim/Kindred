@@ -8,7 +8,7 @@ from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import (
     MechanismParameterNamespace,
-    is_reserved_generated_fast_equilibrium_parameter_name,
+    is_reserved_generated_fast_equilibrium_runtime_name,
     is_protected_indexed_identifier,
 )
 
@@ -415,7 +415,7 @@ def extract_parameter_assignments_from_algebra_lines(
 
         if classification.kind == "param":
             raw_name = classification.raw_name
-            if is_reserved_generated_fast_equilibrium_parameter_name(raw_name):
+            if is_reserved_generated_fast_equilibrium_runtime_name(raw_name):
                 _raise_reserved_generated_fast_identifier_error(
                     raw_name,
                     line_number=line_no,
@@ -474,7 +474,7 @@ def extract_parameter_assignments_from_algebra_lines(
 
         if classification.kind == "let":
             target_raw = classification.raw_name
-            if is_reserved_generated_fast_equilibrium_parameter_name(target_raw):
+            if is_reserved_generated_fast_equilibrium_runtime_name(target_raw):
                 _raise_reserved_generated_fast_identifier_error(
                     target_raw,
                     line_number=line_no,
@@ -532,7 +532,7 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
         if classification.kind == "param":
             continue
         if classification.kind == "let":
-            if is_reserved_generated_fast_equilibrium_parameter_name(classification.raw_name):
+            if is_reserved_generated_fast_equilibrium_runtime_name(classification.raw_name):
                 _raise_reserved_generated_fast_identifier_error(
                     classification.raw_name,
                     line_number=_line_no,

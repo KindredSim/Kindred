@@ -406,9 +406,9 @@ class FittingMixin:
     @staticmethod
     def _fit_generated_fast_parameter_metadata(source_text: str) -> Dict[str, Dict[str, object]]:
         try:
+            from kindred.core.equilibrium_rate_authority import generated_fast_equilibrium_runtime_parameter_name
             from kindred.core.mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
             from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-            from kindred.core.simulator.parameter_namespace import generated_fast_equilibrium_parameter_name
             from kindred.core.units import UnitsModel
 
             mechanism = parse_dsl_to_mechanism(str(source_text or ""), initials={})
@@ -423,7 +423,7 @@ class FittingMixin:
         ) or "kJ/mol"
         for eq in list(getattr(mechanism, "equilibria", []) or []):
             metadata = dict(getattr(eq, "metadata", {}) or {})
-            name = generated_fast_equilibrium_parameter_name(metadata)
+            name = generated_fast_equilibrium_runtime_parameter_name(eq)
             if name is None:
                 continue
             try:

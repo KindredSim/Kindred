@@ -623,6 +623,13 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
         # reaction: line
         if lower.startswith("reaction:"):
+            if in_generated_computational_mode_block:
+                raise DSLError(
+                    "reaction rows are not accepted inside the generated Computational Mode block; "
+                    "generated Computational Mode block rows must use explicit generated equilibrium lines.",
+                    line_number=line_no,
+                    line_content=raw,
+                )
             _, rest = line.split(":", 1)
             steps.append(
                 _parse_reaction_step(
@@ -664,6 +671,13 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
         # Fallback: Try to parse as bare arrow syntax (no "reaction:" or "equilibrium:" prefix)
         if _ARROW_RE.search(line):
+            if in_generated_computational_mode_block:
+                raise DSLError(
+                    "Bare arrow syntax is not accepted inside the generated Computational Mode block; "
+                    "generated Computational Mode block rows must use explicit generated equilibrium lines.",
+                    line_number=line_no,
+                    line_content=raw,
+                )
             steps.append(
                 _parse_bare_arrow_step(
                     line,

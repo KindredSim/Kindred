@@ -58,8 +58,13 @@ from .equilibrium_rate_authority import (
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     effective_reverse_rate_from_keq,
+    equilibrium_is_generated_authority_output,
+    generated_fast_equilibrium_runtime_parameter_name,
     generated_equilibrium_authority_kind,
+    json_safe_equilibrium_metadata_payload,
+    json_safe_equilibrium_authority_payload,
     normalize_equilibrium_rate_authority,
+    normalize_existing_equilibrium_rate_authority,
     plain_finite_float_or_none,
     validate_equilibrium_rate_authority_values,
 )
@@ -119,6 +124,12 @@ def _freeze_value(value: Any) -> Any:
         return tuple(_freeze_value(item) for item in value)
     if isinstance(value, (set, frozenset)):
         return frozenset(_freeze_value(item) for item in value)
+    return value
+
+
+def _clone_authority_slot(value: Any) -> Any:
+    if callable(getattr(value, "set", None)):
+        return copy.deepcopy(value)
     return value
 
 
@@ -358,6 +369,7 @@ class Mechanism:
                 r,
                 reactants=dict(r.reactants),
                 products=dict(r.products),
+                rate=_clone_authority_slot(r.rate),
                 rate_orders=dict(r.rate_orders),
                 overrides=dict(r.overrides),
             )
@@ -368,7 +380,10 @@ class Mechanism:
                 e,
                 stoich_forward=dict(e.stoich_forward),
                 stoich_back=dict(e.stoich_back),
-                metadata=dict(e.metadata),
+                kf=_clone_authority_slot(e.kf),
+                kr=_clone_authority_slot(e.kr),
+                Keq=_clone_authority_slot(e.Keq),
+                metadata=copy.deepcopy(dict(e.metadata)),
             )
             for e in self.equilibria
         ]
@@ -624,8 +639,8 @@ class Mechanism:
         """
         Deterministic serialization of the mechanism structure.
 
-        Note: `rate`, `Keq`, `kf`, and `kr` are stored as-is and may be non-JSON types.
-        Callers are responsible for serializing expressions if needed.
+        Equilibrium entries publish authored owner/basis coordinates only. Derived
+        reverse-side readouts are not emitted as peer authored fields.
         """
         declaration_order = self.metadata["declaration_order"]
         order_map = {name: idx for idx, name in enumerate(declaration_order)}
@@ -638,8 +653,11 @@ class Mechanism:
                 "rate_orders": OrderedDict(sorted(r.rate_orders.items(), key=lambda kv: order_map[kv[0]])),
                 "net_stoich": OrderedDict(sorted(r.net_stoich.items(), key=lambda kv: order_map[kv[0]])),
                 "order": r.order,
-                "overrides": OrderedDict(sorted(r.overrides.items())),
-                "rate": r.rate,
+                "overrides": OrderedDict(
+                    (key, json_safe_equilibrium_authority_payload(value))
+                    for key, value in sorted(r.overrides.items())
+                ),
+                "rate": json_safe_equilibrium_authority_payload(r.rate),
             }
             for r in self.reactions
         ]
@@ -650,8 +668,8 @@ class Mechanism:
 
         equilibria_block = []
         for e in self.equilibria:
-            metadata = dict(e.metadata)
-            generated_kind = generated_equilibrium_authority_kind(metadata)
+            metadata = json_safe_equilibrium_metadata_payload(e)
+            generated_authority_output = equilibrium_is_generated_authority_output(e)
             entry = {
                 "stoich_forward": OrderedDict(sorted(e.stoich_forward.items(), key=lambda kv: order_map[kv[0]])),
                 "stoich_back":   OrderedDict(sorted(e.stoich_back.items(),   key=lambda kv: order_map[kv[0]])),
@@ -661,17 +679,35 @@ class Mechanism:
             effective_kf = effective_equilibrium_forward_rate(e, temperature_K=temperature_K)
             effective_keq = effective_equilibrium_keq(e, temperature_K=temperature_K)
             effective_kr = effective_equilibrium_reverse_rate(e, temperature_K=temperature_K)
-            if generated_kind:
+            if generated_authority_output:
+                authority = normalize_existing_equilibrium_rate_authority(e)
                 if effective_kf is None or effective_keq is None or effective_kr is None:
                     raise ValueError("generated equilibrium requires complete generated owner model for serialization")
-            else:
-                entry.update(
-                    {
-                        "Keq": effective_keq if effective_keq is not None else e.Keq,
-                        "kf": effective_kf if effective_kf is not None else e.kf,
-                        "kr": effective_kr if effective_kr is not None else e.kr,
-                    }
+                entry["equilibrium_authority"] = json_safe_equilibrium_authority_payload(
+                    authority.step_map_fields()["equilibrium_authority"]
                 )
+                generated_fast_name = generated_fast_equilibrium_runtime_parameter_name(e)
+                if generated_fast_name is not None:
+                    if authority.dG_eq_J_per_mol is None:
+                        raise ValueError("generated fast equilibrium requires dG owner coordinate for serialization")
+                    entry["kf"] = json_safe_equilibrium_authority_payload(effective_kf)
+                    entry["dG_eq_J_per_mol"] = json_safe_equilibrium_authority_payload(
+                        authority.dG_eq_J_per_mol
+                    )
+                    entry["runtime_parameter"] = {
+                        "name": generated_fast_name,
+                        "role": "dG_eq_fast",
+                    }
+            else:
+                authority = normalize_existing_equilibrium_rate_authority(e)
+                kf_value = effective_kf if effective_kf is not None else e.kf
+                entry["kf"] = json_safe_equilibrium_authority_payload(kf_value)
+                if authority.kind == EquilibriumRateAuthorityKind.KR:
+                    kr_value = effective_kr if effective_kr is not None else authority.kr
+                    entry["kr"] = json_safe_equilibrium_authority_payload(kr_value)
+                elif authority.has_explicit_keq_param:
+                    keq_value = effective_keq if effective_keq is not None else authority.Keq
+                    entry["Keq"] = json_safe_equilibrium_authority_payload(keq_value)
             equilibria_block.append(entry)
         return {
             "species": species_block,

@@ -5,6 +5,7 @@ import re
 from typing import Iterable, Iterator, Mapping, Sequence
 
 from kindred.core.equilibrium_rate_authority import (
+    GENERATED_FAST_EQUILIBRIUM_RUNTIME_PARAMETER_PREFIX,
     EquilibriumRateInputContext,
     authority_fields_from_step_entry,
 )
@@ -12,7 +13,7 @@ from kindred.core.validation import try_parse_int
 
 _CANONICAL_NAME_RE = re.compile(r"^(k|kf|kr|Keq)([1-9]\d*)$")
 _PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:K|k|kf|kr|Keq)([1-9]\d*)$", re.IGNORECASE)
-GENERATED_FAST_EQUILIBRIUM_PARAMETER_PREFIX = "dG_eq_fast__"
+GENERATED_FAST_EQUILIBRIUM_PARAMETER_PREFIX = GENERATED_FAST_EQUILIBRIUM_RUNTIME_PARAMETER_PREFIX
 
 
 @dataclass(frozen=True)
@@ -115,19 +116,7 @@ class MechanismParameterNamespace:
         )
 
 
-def generated_fast_equilibrium_parameter_name(metadata: Mapping[str, object]) -> str | None:
-    if (
-        str(metadata.get("authority_source") or "")
-        != EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
-    ):
-        return None
-    cm_id = str(metadata.get("cm_id") or "").strip()
-    if not cm_id:
-        return None
-    return f"dG_eq_fast__{cm_id}"
-
-
-def is_reserved_generated_fast_equilibrium_parameter_name(raw_name: str) -> bool:
+def is_reserved_generated_fast_equilibrium_runtime_name(raw_name: str) -> bool:
     return str(raw_name or "").strip().startswith(GENERATED_FAST_EQUILIBRIUM_PARAMETER_PREFIX)
 
 
@@ -303,7 +292,7 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
                 )
             has_explicit_keq = bool(authority.get("has_explicit_keq_param"))
             generated_computational_mode = (
-                str(raw_entry.get("authority_source") or "")
+                str(authority.get("source") or "")
                 == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
             )
         descriptors.append(
@@ -377,13 +366,18 @@ def canonical_name_for_mechanism_step_parameter(
 
 def build_namespace_from_ir_steps(steps: Sequence[object]) -> MechanismParameterNamespace:
     descriptors: list[_NamespaceStepDescriptor] = []
-    for step_index, step in enumerate(steps, start=1):
+    authored_step_index = 0
+    for source_index, step in enumerate(steps):
         policy = _namespace_policy_from_step(step)
+        if policy.generated_computational_mode:
+            continue
+        authored_step_index += 1
         descriptors.append(
             _NamespaceStepDescriptor(
-                step_index=step_index,
+                step_index=authored_step_index,
                 step_kind=policy.step_kind,
                 has_explicit_keq=policy.has_explicit_keq,
+                source_index=source_index,
                 generated_computational_mode=policy.generated_computational_mode,
             )
         )

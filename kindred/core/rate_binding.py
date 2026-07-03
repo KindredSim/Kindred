@@ -20,6 +20,8 @@ class RateBinding:
     def __call__(self) -> float:
         return float(self.value)
 
+    def __float__(self) -> float:
+        return float(self.value)
+
     def set(self, new_value: float) -> None:
         self.value = float(new_value)
-

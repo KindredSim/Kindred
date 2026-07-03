@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from PySide6 import QtWidgets
 
 from kindred.core.equilibrium_rate_authority import (
-    EquilibriumRateInputContext,
+    generated_fast_equilibrium_runtime_parameter_name,
     generated_equilibrium_authority_kind,
 )
 from kindred.core.batch_initial_conditions import strip_named_reaction_dsl_initial_concentration_sets
@@ -178,7 +178,7 @@ def _format_generated_mechanism_summary(mechanism: object) -> list[str]:
     return [
         "Generated mechanism content:",
         f"  generated reactions={generated_reaction_count}, generated equilibria={generated_equilibrium_count}",
-        "  Generated steps are canonical simulation inputs but do not consume indexed DSL step numbers.",
+        "  Generated equilibria are source-owned conversion outputs and do not consume authored DSL step indices.",
     ]
 
 
@@ -187,7 +187,7 @@ def _is_generated_mechanism_metadata(metadata: object) -> bool:
         return False
     if generated_equilibrium_authority_kind(metadata):
         return True
-    return str(metadata.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
+    return generated_fast_equilibrium_runtime_parameter_name(metadata) is not None
 
 
 def _has_unsupported_generated_equilibrium(mechanism: object) -> bool:
@@ -195,9 +195,7 @@ def _has_unsupported_generated_equilibrium(mechanism: object) -> bool:
         metadata = getattr(eq, "metadata", {}) or {}
         if not isinstance(metadata, Mapping):
             continue
-        if generated_equilibrium_authority_kind(metadata):
-            return True
-        if str(metadata.get("authority_source") or "") == EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value:
+        if _is_generated_mechanism_metadata(metadata):
             return True
     return False
 

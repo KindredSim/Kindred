@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import json
 import math
 
 import numpy as np
@@ -36,7 +37,11 @@ from kindred.core.simulation_preparation import (
 )
 from kindred.core.simulator.state_model import StateNetwork, StateType
 from kindred.core.simulator.state_network_converter import StateNetworkConverter
-from kindred.core.symbolic.jacobian import classify_symbolic_jacobian_support
+from kindred.core.symbolic.jacobian import (
+    build_symbolic_jacobian_artifact,
+    build_symbolic_jacobian_structure,
+    classify_symbolic_jacobian_support,
+)
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 
 
@@ -88,6 +93,20 @@ def test_computational_mode_fast_equilibrium_generates_kf_dg_authority_without_k
     assert "; dG_eq=" in compiled.generated_reaction_dsl
     assert "; cm_std_ratio=" in compiled.generated_reaction_dsl
     assert "; kr=" not in compiled.generated_reaction_dsl
+
+
+def test_public_keq_equilibrium_symbolic_parameters_exclude_derived_reverse_rate():
+    mechanism = parse_dsl_to_mechanism(
+        "equilibrium: A <-> B; kf=6.0; Keq=3.0\ninit: A=1.0, B=0.0",
+        initials={},
+    )
+
+    structure = build_symbolic_jacobian_structure(mechanism)
+    artifact = build_symbolic_jacobian_artifact(mechanism)
+
+    assert structure.parameter_symbols == ("Keq1", "kf1")
+    assert "kr1" not in artifact.identity.to_payload()["parameter_symbols"]
+    assert "kr1" not in dict(artifact.evaluation_snapshot)
 
 
 def test_computational_mode_fast_equilibrium_parses_to_effective_reverse_rate():
@@ -150,6 +169,7 @@ def test_state_network_direct_fast_equilibrium_uses_thermodynamic_authority():
     assert "kf" not in serialized
     assert "kr" not in serialized
     assert "Keq" not in serialized
+    json.dumps(mechanism.to_serializable())
 
 
 def test_state_network_transition_state_uses_generated_owner_without_indexed_readout():
@@ -331,12 +351,30 @@ def test_generated_fast_runtime_parameters_are_owned_by_generated_metadata_only(
     store.set_schema(mixed_source)
 
     names = set(store.parameter_names())
+    definitions = {param.name: param for param in extract_parameters_from_dsl(mixed_source)}
 
     assert "dG_eq_fast__feq__A__B" in names
-    assert "kf1" not in names
+    assert "kf1" in names
     assert "kr1" not in names
     assert "Keq1" not in names
+    assert {"kf1", "kr1", "Keq1"}.issubset(definitions)
+    assert definitions["kf1"].editable is True
+    assert definitions["kr1"].editable is False
+    assert definitions["Keq1"].editable is False
+    assert "kf2" not in names
+    assert "kr2" not in names
+    assert "Keq2" not in names
     assert "dG_eq_fast__feq__C__D" not in names
+    serialized_equilibria = parse_dsl_to_mechanism(mixed_source, initials={}).to_serializable()["equilibria"]
+    assert serialized_equilibria[0]["kf"] == pytest.approx(10.0)
+    assert serialized_equilibria[0]["dG_eq_J_per_mol"] == pytest.approx(1000.0)
+    assert serialized_equilibria[0]["runtime_parameter"] == {
+        "name": "dG_eq_fast__feq__A__B",
+        "role": "dG_eq_fast",
+    }
+    assert "kr" not in serialized_equilibria[0]
+    assert "Keq" not in serialized_equilibria[0]
+    json.dumps({"equilibria": serialized_equilibria})
 
     generated_bound = prepare_bound_mechanism(
         mixed_source,
@@ -344,11 +382,11 @@ def test_generated_fast_runtime_parameters_are_owned_by_generated_metadata_only(
         initials={},
     )
     assert "dG_eq_fast__feq__A__B" in generated_bound.bindings
-    assert "kf1" not in generated_bound.bindings
-    assert "kr1" not in generated_bound.bindings
-    assert "Keq1" not in generated_bound.bindings
+    assert "kf2" not in generated_bound.bindings
+    assert "kr2" not in generated_bound.bindings
+    assert "Keq2" not in generated_bound.bindings
 
-    for indexed_name in ("kf1", "kr1", "Keq1"):
+    for indexed_name in ("kf2", "kr2", "Keq2"):
         with pytest.raises(FitSimulationError, match="not a valid indexed|Unknown request parameter"):
             prepare_bound_mechanism(
                 mixed_source,
@@ -362,6 +400,40 @@ def test_generated_fast_runtime_parameters_are_owned_by_generated_metadata_only(
             ["dG_eq_fast__feq__C__D"],
             initials={},
         )
+
+
+def test_generated_fast_prepared_binding_rebuilds_rhs_after_dg_change():
+    source = (
+        "energy=kJ/mol\n"
+        f"{GENERATED_BLOCK_START}\n"
+        "equilibrium: A <-> B; kf=10.0; dG_eq=1.0; cm_id=feq__A__B; cm_std_ratio=1.0\n"
+        f"{GENERATED_BLOCK_END}\n"
+        "init: A=0.0, B=1.0"
+    )
+    bound = prepare_bound_mechanism(
+        source,
+        ["dG_eq_fast__feq__A__B"],
+        initials={"A": 0.0, "B": 1.0},
+    )
+
+    before = np.asarray(bound.rhs(0.0, bound.y0), dtype=float)
+    bound.bindings["dG_eq_fast__feq__A__B"].set(3.0)
+    after = np.asarray(bound.rhs(0.0, bound.y0), dtype=float)
+
+    expected_keq = math.exp(-3000.0 / (8.31446261815324 * 298.15))
+    expected_kr = 10.0 / expected_keq
+    assert before[0] != pytest.approx(expected_kr)
+    np.testing.assert_allclose(after, [expected_kr, -expected_kr])
+    serialized = bound.mechanism.to_serializable()["equilibria"][0]
+    assert serialized["kf"] == pytest.approx(10.0)
+    assert serialized["dG_eq_J_per_mol"] == pytest.approx(3000.0)
+    assert serialized["runtime_parameter"] == {
+        "name": "dG_eq_fast__feq__A__B",
+        "role": "dG_eq_fast",
+    }
+    assert {"kr", "Keq"}.isdisjoint(serialized)
+    assert {"kf", "kr", "Keq"}.isdisjoint(serialized["metadata"])
+    json.dumps(serialized)
 
 
 def test_fitting_tab_does_not_publish_noneditable_equilibrium_readouts(qt_app, qtbot):
@@ -413,6 +485,25 @@ def test_fitting_tab_does_not_publish_noneditable_equilibrium_readouts(qt_app, q
     assert set(config["parameters"]) == {"kf1"}
     assert "kr1" not in config["fixed_params"]
     assert "Keq1" not in config["fixed_params"]
+
+
+def test_fitting_reference_lists_generated_fast_dg_without_step_index_rows():
+    source = (
+        "energy=kJ/mol\n"
+        f"{GENERATED_BLOCK_START}\n"
+        "equilibrium: A <-> B; kf=10.0; dG_eq=1.0; cm_id=feq__A__B; cm_std_ratio=1.0\n"
+        f"{GENERATED_BLOCK_END}\n"
+        "init: A=1.0, B=0.0"
+    )
+    tab = ParametersIcsTab.__new__(ParametersIcsTab)
+    tab._mechanism_text_getter = lambda: source
+
+    reference_text = ParametersIcsTab._mechanism_steps_reference_text(tab)
+
+    assert "dG_eq_fast__feq__A__B" in reference_text
+    assert "kf1" not in reference_text
+    assert "kr1" not in reference_text
+    assert "Keq1" not in reference_text
 
 
 def test_generated_fast_endpoint_name_cannot_be_redeclared_as_scalar_param():
@@ -555,10 +646,14 @@ def test_generated_fast_parameter_discovery_uses_generated_metadata_name():
     assert definitions["dG_eq_fast__feq__A__B"].value == pytest.approx(1.0)
     assert definitions["dG_eq_fast__feq__A__B"].editable is True
     assert "dG_eq_fast__feq__A__B" in names
-    assert "kf1" not in definitions
-    assert "kr1" not in definitions
-    assert "Keq1" not in definitions
-    assert {"kf2", "kr2", "Keq2"}.issubset(definitions)
+    assert {"kf1", "kr1", "Keq1"}.issubset(definitions)
+    assert {"kf1", "kr1", "Keq1"}.issubset(names)
+    assert "kf2" not in definitions
+    assert "kr2" not in definitions
+    assert "Keq2" not in definitions
+    assert "kf2" not in names
+    assert "kr2" not in names
+    assert "Keq2" not in names
 
 
 def test_generated_fast_parameter_name_preserves_exact_cm_id_identity():

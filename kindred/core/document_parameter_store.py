@@ -274,6 +274,26 @@ class DocumentParameterStore:
             return {}
         return self._canonical_parameter_values(self._set_local_overrides.get(set_id_s) or {})
 
+    def invalid_local_runtime_parameter_names_for_set(self, set_id: Optional[str]) -> list[str]:
+        """Return schema-owned local override names whose raw values are not finite floats."""
+        set_id_s = self._normalized_local_override_set_id(set_id)
+        if set_id_s is None:
+            return []
+        workspace = self._set_local_overrides.get(set_id_s) or {}
+        if not isinstance(workspace, Mapping) or not workspace:
+            return []
+        allowed_names = self._schema_committed_parameter_names()
+        if not allowed_names:
+            return []
+        invalid_names: set[str] = set()
+        for key, value in dict(workspace).items():
+            name_s = str(key or "").strip()
+            if not name_s or name_s not in allowed_names:
+                continue
+            if self._finite_float(value) is None:
+                invalid_names.add(name_s)
+        return sorted(invalid_names)
+
     def set_ids_with_local_overrides(self) -> list[str]:
         return [set_id for set_id, _workspace in self._visible_local_override_items()]
 
@@ -311,6 +331,13 @@ class DocumentParameterStore:
         if overrides:
             result.update(overrides)
         return self._canonical_parameter_values(result)
+
+    def local_runtime_parameter_overrides(self, set_id: Optional[str]) -> Dict[str, float]:
+        """Return only set-local runtime override values for *set_id*."""
+        set_id_s = self._normalized_local_override_set_id(set_id)
+        if set_id_s is None:
+            return {}
+        return self._canonical_parameter_values(self._set_local_overrides.get(set_id_s) or {})
 
     # ------------------------------------------------------------------
     # Staging (per-set runtime parameter mutation)

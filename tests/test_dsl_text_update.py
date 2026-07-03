@@ -7,6 +7,8 @@ from kindred.core.simulator.dsl_text_update import (
     analyze_step_parameter_update,
 )
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+from kindred.core.simulator.dsl_parameter_scan import extract_parameter_names_from_dsl
+from kindred.core.simulator.errors import DSLError
 from kindred.gui.main_window import MainWindow
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 from kindred.gui.mixins.fitting_mixin import FittingMixin
@@ -226,6 +228,27 @@ def test_variable_runtime_does_not_parse_hidden_normalized_source_when_canonical
     assert window._preview_session.values is None
 
 
+def test_empty_canonical_source_clears_variable_sliders_and_preview_state():
+    source = MechanismAuthoringSource.from_parts(reactions_text="", state_network_dsl="")
+    window = _VariableRuntimeWindow(source)
+    window.slider_values = {"stale": 1.0}
+    window.slider_metadata = {"stale": {"unit": "1"}}
+    window._preview_session.values = {"stale": 1.0}
+    window._energy_mode_channels = [{"kind": "stale"}]
+    runtime = MainWindowVariableRuntime(window)
+    runtime.set_variable_metadata({"stale": {"unit": "1"}})
+
+    runtime.extract_and_populate_variables()
+
+    assert window.cleared is True
+    assert window.slider_values == {}
+    assert window.slider_metadata == {}
+    assert window._preview_session.values == {}
+    assert window._energy_mode_channels == []
+    assert runtime.variable_metadata() == {}
+    assert window._plot.parameters == {}
+
+
 def test_energy_mode_fast_equilibrium_variables_come_from_parsed_mechanism_metadata_not_generated_text():
     generated_text = "\n".join(
         [
@@ -252,6 +275,44 @@ def test_energy_mode_fast_equilibrium_variables_come_from_parsed_mechanism_metad
 
     assert "dG_eq_fast__feq__A__B" in (window.slider_values or {})
     assert window.slider_metadata["dG_eq_fast__feq__A__B"]["role"] == "dG_eq_fast"
+
+
+def test_generated_fast_gui_units_use_generated_equilibrium_stoichiometry_without_step_index_row():
+    generated_text = "\n".join(
+        [
+            "energy=kJ/mol",
+            GENERATED_BLOCK_START,
+            "equilibrium: A + B <-> C; kf=10.0; dG_eq=1.0; cm_id=feq__A+B__C; cm_std_ratio=1.0",
+            GENERATED_BLOCK_END,
+            "init: A=1.0, B=1.0, C=0.0",
+        ]
+    )
+    mechanism = parse_dsl_to_mechanism(generated_text, initials={})
+    window = _VariableRuntimeWindow(
+        MechanismAuthoringSource.from_parts(
+            reactions_text=generated_text,
+            state_network_dsl="",
+        )
+    )
+    runtime = MainWindowVariableRuntime(window)
+
+    runtime.populate_energy_mode_variables_from_mechanism(
+        mechanism,
+        refresh_sliders=True,
+    )
+
+    assert mechanism.metadata.get("step_index_map") == []
+    assert "dG_eq_fast__feq__A+B__C" in (window.slider_values or {})
+    assert "kf1" not in (window.slider_values or {})
+    assert "kr1" not in (window.slider_values or {})
+    assert "Keq1" not in (window.slider_values or {})
+    channel = window._energy_mode_channels[0]
+    assert channel["molecularity_fwd"] == 2
+    assert channel["molecularity_rev"] == 1
+    assert channel["unit_kf"] == "1/(M*s)"
+    assert channel["unit_kr"] == "1/s"
+    assert window._plot.parameters["k_f (A + B <-> C)"][1] == "1/(M*s)"
+    assert window._plot.parameters["k_r (A + B <-> C)"][1] == "1/s"
 
 
 def test_generated_fast_equilibrium_routes_through_normal_variable_refresh():
@@ -301,12 +362,12 @@ def test_generated_fast_equilibrium_refresh_preserves_public_step_sliders():
     runtime.extract_and_populate_variables()
 
     assert "dG_eq_fast__feq__A__B" in (window.slider_values or {})
-    assert "kf1" not in (window.slider_values or {})
-    assert "kr1" not in (window.slider_values or {})
-    assert "Keq1" not in (window.slider_values or {})
-    assert "kf2" in (window.slider_values or {})
-    assert "kr2" in (window.slider_values or {})
-    assert "Keq2" in (window.slider_values or {})
+    assert "kf1" in (window.slider_values or {})
+    assert "kr1" in (window.slider_values or {})
+    assert "Keq1" in (window.slider_values or {})
+    assert "kf2" not in (window.slider_values or {})
+    assert "kr2" not in (window.slider_values or {})
+    assert "Keq2" not in (window.slider_values or {})
 
 
 def test_energy_mode_does_not_expose_public_equilibrium_as_generated_fast_slider():
@@ -355,16 +416,101 @@ def test_text_update_does_not_rewrite_generated_block_indexed_parameters():
     analysis = analyze_parameter_updates_to_dsl_text(
         source,
         {
-            "kf1": 99.0,
-            "kf2": 5.0,
+            "kf1": 5.0,
+            "kf2": 99.0,
         },
     )
 
-    assert "kf1" in analysis.missing
+    assert "kf2" in analysis.missing
     assert "equilibrium: A <-> B; kf=10.0; dG_eq=1.0; cm_id=feq__A__B; cm_std_ratio=1.0" in analysis.updated_text
     assert "equilibrium: C <-> D" in analysis.updated_text
     assert "kf=5" in analysis.updated_text
     assert "dG_eq=2.0" in analysis.updated_text
+
+
+def test_text_update_does_not_count_computational_mode_source_rows_as_public_steps():
+    source = "\n".join(
+        [
+            "energy=kJ/mol",
+            "comp: rxn A <-> B fast_k=100",
+            GENERATED_BLOCK_START,
+            "equilibrium: A <-> B; kf=10.0; dG_eq=1.0; cm_id=feq__A__B; cm_std_ratio=1.0",
+            GENERATED_BLOCK_END,
+            "equilibrium: C <-> D; kf=4.0; dG_eq=2.0",
+            "init: A=1.0, B=0.0, C=1.0, D=0.0",
+        ]
+    )
+
+    names = extract_parameter_names_from_dsl(source)
+    analysis = analyze_parameter_updates_to_dsl_text(
+        source,
+        {
+            "kf1": 5.0,
+            "kf2": 99.0,
+        },
+    )
+
+    assert "kf1" in names
+    assert "kf2" not in names
+    assert "kf2" in analysis.missing
+    assert "comp: rxn A <-> B fast_k=100" in analysis.updated_text
+    assert "comp: rxn A <-> B; kf=5" not in analysis.updated_text
+    assert "equilibrium: A <-> B; kf=10.0; dG_eq=1.0; cm_id=feq__A__B; cm_std_ratio=1.0" in analysis.updated_text
+    assert "equilibrium: C <-> D" in analysis.updated_text
+    assert "kf=5" in analysis.updated_text
+    assert "dG_eq=2.0" in analysis.updated_text
+
+
+def test_generated_block_rejects_bare_arrow_fallback_rows():
+    source = "\n".join(
+        [
+            "energy=kJ/mol",
+            GENERATED_BLOCK_START,
+            "A <-> B; kf=10.0; dG_eq=1.0",
+            GENERATED_BLOCK_END,
+            "equilibrium: C <-> D; kf=4.0; dG_eq=2.0",
+            "init: A=1.0, B=0.0, C=1.0, D=0.0",
+        ]
+    )
+
+    with pytest.raises(DSLError, match="generated Computational Mode block"):
+        extract_parameter_names_from_dsl(source)
+
+
+def test_generated_block_rejects_explicit_reaction_rows():
+    source = "\n".join(
+        [
+            "energy=kJ/mol",
+            GENERATED_BLOCK_START,
+            "reaction: A -> B; k=1.0",
+            GENERATED_BLOCK_END,
+            "equilibrium: C <-> D; kf=4.0; dG_eq=2.0",
+            "init: A=1.0, B=0.0, C=1.0, D=0.0",
+        ]
+    )
+
+    with pytest.raises(DSLError, match="generated Computational Mode block"):
+        extract_parameter_names_from_dsl(source)
+
+
+def test_text_update_ignores_arrows_inside_inline_comments_on_non_step_lines():
+    source = "\n".join(
+        [
+            "param scale = 1 # A -> B",
+            "reaction: A -> B; k=1.0",
+            "init: A=1.0, B=0.0",
+        ]
+    )
+
+    names = extract_parameter_names_from_dsl(source)
+    analysis = analyze_parameter_updates_to_dsl_text(source, {"k1": 2.0, "k2": 3.0})
+
+    assert "k1" in names
+    assert "k2" not in names
+    assert "k2" in analysis.missing
+    assert "param scale = 1 # A -> B" in analysis.updated_text
+    assert "param scale = 1 ; k=2" not in analysis.updated_text
+    assert "reaction: A -> B ; k=2" in analysis.updated_text
 
 
 def test_generated_fast_energy_override_materializes_by_cm_id_not_indexed_step_map():

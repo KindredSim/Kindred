@@ -7,12 +7,13 @@ from typing import Any, Dict, Mapping, Optional
 import numpy as np
 
 from kindred.core.intervention_schedule import (
-    coerce_intervention_schedule,
     intervention_schedule_identity_fingerprints,
-    normalized_intervention_schedule_identity_fingerprints,
-    normalized_intervention_schedule_payload,
 )
-from kindred.core.simulation_preparation import SimulationExecutionRequest, SimulationPreparationError
+from kindred.core.simulation_preparation import (
+    SimulationExecutionRequest,
+    SimulationPreparationError,
+    materialized_intervention_schedule_for_execution_request,
+)
 
 __all__ = [
     "SimulationAlgebraPolicy",
@@ -129,6 +130,11 @@ class SimulationPlan:
         if not isinstance(self.metadata, Mapping):
             raise TypeError("metadata must be a mapping.")
         object.__setattr__(self, "metadata", _copy_payload_value(self.metadata))
+        object.__setattr__(
+            self,
+            "cache_identity_payload",
+            self._cache_identity_payload_with_materialized_schedule_identity(),
+        )
         self._validate_cache_identity_schedule()
 
     @classmethod
@@ -234,37 +240,35 @@ class SimulationPlan:
         return tuple(str(item) for item in queue_ids if str(item))
 
     def _expected_schedule_identity(self) -> tuple[str, str]:
-        schedule = coerce_intervention_schedule(self.execution_request.intervention_schedule)
+        schedule = materialized_intervention_schedule_for_execution_request(self.execution_request)
         if schedule is None:
             return "", ""
-        schedule_values = (
-            dict(self.execution_request.schedule_parameter_values)
-            if isinstance(self.execution_request.schedule_parameter_values, Mapping)
-            else {}
-        )
-        prepared_payload = self.execution_request.prepared_payload
-        if isinstance(prepared_payload, Mapping):
-            mechanism = prepared_payload.get("mechanism")
-            if mechanism is not None:
-                from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
-
-                namespace = build_namespace_from_mechanism(mechanism)
-                if schedule_values:
-                    normalized_payload = normalized_intervention_schedule_payload(
-                        schedule,
-                        mechanism_namespace=namespace,
-                    )
-                    normalized_schedule = coerce_intervention_schedule(normalized_payload)
-                    if normalized_schedule is not None:
-                        schedule = normalized_schedule.resolve_parameters(schedule_values)
-                    return intervention_schedule_identity_fingerprints(schedule)
-                return normalized_intervention_schedule_identity_fingerprints(
-                    schedule,
-                    mechanism_namespace=namespace,
-                )
-        if schedule_values:
-            schedule = schedule.resolve_parameters(schedule_values)
         return intervention_schedule_identity_fingerprints(schedule)
+
+    def _cache_identity_payload_with_materialized_schedule_identity(self) -> Optional[Dict[str, Any]]:
+        if not self.execution_request.has_intervention_schedule_authority:
+            return self.cache_identity_payload
+        payload = self.cache_identity_payload
+        if not isinstance(payload, Mapping):
+            return self.cache_identity_payload
+        identity = payload.get("simulation_identity")
+        if not isinstance(identity, Mapping):
+            return self.cache_identity_payload
+        if "intervention_schedule_fingerprint" in identity:
+            return self.cache_identity_payload
+        actual_declarative = str(identity.get("intervention_schedule_declarative_fingerprint") or "")
+        actual_executable = str(identity.get("intervention_schedule_executable_fingerprint") or "")
+        if actual_declarative or actual_executable:
+            return self.cache_identity_payload
+        expected_declarative, expected_executable = self._expected_schedule_identity()
+        if not expected_declarative and not expected_executable:
+            return self.cache_identity_payload
+        updated_payload = _copy_payload_value(payload)
+        updated_identity = dict(updated_payload.get("simulation_identity") or {})
+        updated_identity["intervention_schedule_declarative_fingerprint"] = expected_declarative
+        updated_identity["intervention_schedule_executable_fingerprint"] = expected_executable
+        updated_payload["simulation_identity"] = updated_identity
+        return updated_payload
 
     def _validate_cache_identity_schedule(self) -> None:
         identity = self.simulation_identity_payload()

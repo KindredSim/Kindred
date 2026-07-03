@@ -217,6 +217,21 @@ class StateNetworkEditor(QWidget):
                 preserved[key] = text
         return preserved
 
+    def _clear_preserved_state_fields_for_row(self, row: int | None) -> None:
+        if row is None:
+            return
+        try:
+            row_i = int(row)
+        except (TypeError, ValueError):
+            return
+        if row_i < 0 or row_i >= self._states_table.rowCount():
+            return
+        item = self._states_table.item(row_i, 0)
+        if item is None or not self._preserved_state_fields_from_item(item):
+            return
+        with QtCore.QSignalBlocker(self._states_table):
+            item.setData(Qt.ItemDataRole.UserRole, {})
+
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         if self._debug_state_net and not self._debug_open_snapshot_done:
@@ -691,8 +706,9 @@ class StateNetworkEditor(QWidget):
         self._validate()
         self.stateNetworkChanged.emit()
 
-    def _on_states_changed(self):
+    def _on_states_changed(self, row: int = -1, column: int = -1):
         """Handle state table changes."""
+        _ = column
         if not self._updating:
             debug_entered = False
             if self._debug_state_net:
@@ -701,6 +717,7 @@ class StateNetworkEditor(QWidget):
                     self._debug_reentrancy_exit("states_changed")
                     return
             try:
+                self._clear_preserved_state_fields_for_row(row)
                 self._schedule_user_change()
             finally:
                 if debug_entered:

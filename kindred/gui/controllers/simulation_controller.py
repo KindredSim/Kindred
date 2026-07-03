@@ -178,7 +178,7 @@ class SimulationController(QtCore.QObject):
                 pending_initials_for_run_source_set=self.ui.mechanism.pending_initials_for_run_source_set,
                 simulation_identity_for_set=self._simulation_identity_for_set,
                 resolved_initials_for_batch_row=self._resolved_initials_for_batch_row,
-                runtime_parameter_values_for_set=self._runtime_parameter_values_for_set,
+                local_runtime_parameter_overrides_for_set=self._local_runtime_parameter_overrides_for_set,
                 preview_contained_owner_identity=self._preview_contained_owner_identity,
                 ordinary_contained_owner_identity=self._ordinary_contained_owner_identity,
                 record_run_cache_key=self._batch_cache.record_run_cache_key,
@@ -1641,13 +1641,10 @@ class SimulationController(QtCore.QObject):
         owner_plan_payload = dict(simulation_plan_payload or {})
         factory = getattr(self, "_contained_simulation_owner_factory", None)
         if callable(factory):
-            try:
-                return factory(
-                    fast_mode=bool(fast_mode),
-                    simulation_plan_payload=owner_plan_payload,
-                )
-            except TypeError:
-                return factory(fast_mode=bool(fast_mode))
+            return factory(
+                fast_mode=bool(fast_mode),
+                simulation_plan_payload=owner_plan_payload,
+            )
         from kindred.core.simulation_containment import WarmSimulationOwner
 
         timeout_s = getattr(self, "_contained_simulation_timeout_s", None)
@@ -2565,7 +2562,7 @@ class SimulationController(QtCore.QObject):
             )
             mechanism_text = mechanism_source.full_dsl
             parameter_overrides = (
-                self._runtime_parameter_values_for_set(set_id=str(set_id))
+                self._local_runtime_parameter_overrides_for_set(set_id=str(set_id))
                 if bool(fast_mode) and self.ui.mechanism.has_local_runtime_parameter_values()
                 else {}
             )
@@ -2715,16 +2712,13 @@ class SimulationController(QtCore.QObject):
         except Exception:
             return []
 
-    def _runtime_parameter_values_for_set(self, *, set_id: Optional[str]) -> Dict[str, float]:
-        try:
-            values = dict(
-                self.ui.mechanism.runtime_parameter_values_for_set(
-                    set_id=set_id,
-                    fast_mode=True,
-                )
+    def _local_runtime_parameter_overrides_for_set(self, *, set_id: Optional[str]) -> Dict[str, float]:
+        values = dict(
+            self.ui.mechanism.local_runtime_parameter_overrides_for_set(
+                set_id=set_id,
+                fast_mode=True,
             )
-        except Exception:
-            return {}
+        )
         return {name: value for name, value in values.items() if str(name)}
 
     def _preview_contained_owner_identity(
