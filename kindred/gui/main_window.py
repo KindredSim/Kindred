@@ -54,18 +54,18 @@ from kindred.gui.app_wiring import (
     build_batch_initial_conditions,
     build_batch_dock_panel,
     build_mechanism_dock,
-    build_profile_and_template_managers,
     build_right_dock_and_dataset_owners,
     build_settings_and_controllers,
     build_sliders_dock,
     build_simulation_plumbing,
     build_symbolic_calculator_dock,
+    build_template_manager,
     build_window_shell,
     dock_default_area,
     dock_shell_specs,
     load_solver_contract,
 )
-from kindred.gui.authoritative_rewrite_owner import AuthoritativeRewriteOwner
+from kindred.gui.mechanism_source_transaction_owner import MechanismSourceTransactionOwner
 from kindred.gui.canonical_initials_transition_owner import CanonicalInitialsTransitionOwner
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
 from kindred.gui.reactions_draft_resolution_owner import (
@@ -95,12 +95,10 @@ from kindred.gui.simulation_mechanism_owner import SimulationMechanismOwner
 from kindred.gui.simulation_provenance_owner import SimulationProvenanceOwner
 from kindred.gui.simulation_run_ui_owner import SimulationRunUiOwner
 from kindred.gui.simulation_settings_owner import SimulationSettingsOwner
-from kindred.gui.simulation_solver_owner import SimulationSolverOwner, resolve_solver_tolerance
+from kindred.gui.simulation_runtime_settings_owner import RUNTIME_SETTING_UNSET, SimulationRuntimeSettingsOwner
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
-from kindred.gui.mixins.ports import FittingMixinPorts, ProfileMixinPorts
+from kindred.gui.mixins.ports import FittingMixinPorts
 from kindred.gui.mixins.fitting_mixin import FittingMixin
-from kindred.gui.mixins.profile_mixin import ProfileMixin
-from kindred.gui.widgets.ribbon import CollapsibleRibbonHost, RibbonGroup, RibbonPage
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +106,6 @@ __all__ = ["MainWindow"]
 
 # Online documentation is not yet published.
 DOCUMENTATION_URL: Optional[str] = None
-_SOLVER_STATE_UNSET = object()
 _STARTUP_WIDTH_RATIO = 0.86
 _STARTUP_HEIGHT_RATIO = 0.88
 _MIN_STARTUP_WIDTH = 1280
@@ -154,7 +151,6 @@ def _startup_size_for_screen(screen: Optional[QtGui.QScreen]) -> QtCore.QSize:
 class MainWindow(
     QtWidgets.QMainWindow,
     FittingMixin,
-    ProfileMixin,
 ):
     """
     Redesigned Kindred main window.
@@ -175,20 +171,13 @@ class MainWindow(
     def simulation_controller(self) -> SimulationController:
         return self._sim_controller
 
-    def __init__(
-        self,
-        profile: Optional[str] = None,
-        solver: Optional[str] = None,
-        rtol: Optional[float] = None,
-        atol: Optional[float] = None,
-    ):
+    def __init__(self):
         super().__init__()
-        self._init_cli_args(profile=profile, solver=solver, rtol=rtol, atol=atol)
         self._settings_owner = SimulationSettingsOwner()
         self._init_simulation_plumbing_and_state()
         self._init_batch_initial_conditions()
         self._init_settings_and_controllers()
-        self._init_profile_and_template_managers()
+        self._init_template_manager()
         self._init_window_shell()
         self._init_simulation_controller()
         self._init_mechanism_dock_and_panel()
@@ -203,46 +192,6 @@ class MainWindow(
         self._bootstrap_window_state()
 
         logger.info("Kindred MainWindow initialized (new design)")
-
-    def _init_cli_args(
-        self,
-        *,
-        profile: Optional[str],
-        solver: Optional[str],
-        rtol: Optional[float],
-        atol: Optional[float],
-    ) -> None:
-        normalized_rtol = self._normalize_startup_solver_tolerance(rtol, field_name="rtol")
-        normalized_atol = self._normalize_startup_solver_tolerance(atol, field_name="atol")
-        # Store launch overrides for later use.
-        self._initial_profile = profile
-        self._initial_solver = solver
-        self._initial_rtol = normalized_rtol
-        self._initial_atol = normalized_atol
-        self._explicit_startup_solver_value = solver
-        self._explicit_startup_rtol_value = normalized_rtol
-        self._explicit_startup_atol_value = normalized_atol
-        self._explicit_startup_solver_override = solver is not None
-        self._explicit_startup_rtol_override = normalized_rtol is not None
-        self._explicit_startup_atol_override = normalized_atol is not None
-
-    def _normalize_startup_solver_tolerance(
-        self,
-        value: Optional[float],
-        *,
-        field_name: str,
-    ) -> Optional[float]:
-        if value is None:
-            return None
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            logger.warning("Ignoring invalid startup solver tolerance %s=%r", field_name, value)
-            return None
-        if not math.isfinite(parsed) or parsed <= 0.0:
-            logger.warning("Ignoring invalid startup solver tolerance %s=%r", field_name, value)
-            return None
-        return float(parsed)
 
     def _init_simulation_plumbing_and_state(self) -> None:
         self._preview_session = MainWindowPreviewSession(self)
@@ -267,13 +216,48 @@ class MainWindow(
             apply_canonical_initials_transition_effects=self._apply_canonical_batch_initials_transition_effects,
             qt_parent=self,
         )
-        self._authoritative_rewrite_owner = AuthoritativeRewriteOwner(
+        self._mechanism_source_transaction_owner = MechanismSourceTransactionOwner(
+            mechanism_session_owner_getter=lambda: getattr(self, "_mechanism_session_owner", None),
+            mechanism_editor_getter=lambda: getattr(self, "_mechanism_editor", None),
+            undo_stack_getter=lambda: self._undo_stack,
             draft_resolution_owner=self._reactions_draft_resolution_owner,
-            canonical_source=self.canonical_mechanism_source,
-            write_source=self._set_authoritative_mechanism_editor_source,
+            refresh_reactions_draft_state=self._refresh_reactions_draft_state,
+            get_authoritative_suppress=lambda: bool(
+                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+            ),
+            set_authoritative_suppress=lambda value: setattr(
+                self,
+                "_suppress_authoritative_mechanism_input_change",
+                bool(value),
+            ),
+            get_programmatic_text_suppress=lambda: bool(
+                getattr(self, "_suppress_programmatic_text_change_signals", False)
+            ),
+            set_programmatic_text_suppress=lambda value: setattr(
+                self,
+                "_suppress_programmatic_text_change_signals",
+                bool(value),
+            ),
             publish_transition=(
                 self._canonical_initials_transition_owner.publish_authoritative_transition
             ),
+            apply_transition=self._apply_authoritative_mechanism_transition,
+            publish_aborted_source_load_attempt=(
+                self._canonical_initials_transition_owner.publish_aborted_source_load_attempt
+            ),
+            execute_source_load_transaction=(
+                self._canonical_initials_transition_owner.execute_source_load_transaction
+            ),
+            guard_slider_transaction_invalidation=self._guard_slider_transaction_invalidation,
+            prepare_source_load_reconciliation=self._prepare_authoritative_source_load_reconciliation,
+            apply_source_load_reconciliation_after_acceptance=(
+                self._apply_authoritative_source_load_reconciliation_after_source_acceptance
+            ),
+            refresh_after_source_load=self._refresh_after_authoritative_source_load,
+            source_load_plan_materializes_initial_conditions=(
+                self._source_load_plan_materializes_initial_conditions
+            ),
+            set_status_text=lambda text: self._status_label.setText(str(text)),
         )
         self._mechanism_helpers = MainWindowMechanismHelpers()
         self._simulation_mechanism_owner = SimulationMechanismOwner(
@@ -288,17 +272,12 @@ class MainWindow(
                 self._apply_wegscheider_resolution_reactions_rewrite
             ),
         )
-        self._simulation_solver_owner = SimulationSolverOwner(
-            initial_solver_getter=lambda: self._initial_solver,
-            initial_rtol_getter=lambda: self._initial_rtol,
-            initial_atol_getter=lambda: self._initial_atol,
+        self._simulation_runtime_settings_owner = SimulationRuntimeSettingsOwner(
             temperature_getter=lambda: float(self._temperature_spinbox.value()),
             num_points_getter=lambda: int(self._num_points_spinbox.value()),
             sim_time_text_getter=lambda: str(self._sim_time_spinbox.text()),
             parse_sim_time_seconds=self._parse_sim_time_seconds,
             dsl_global_temperature_getter=self._variable_runtime.dsl_global_temperature_k,
-            sparse_jacobian_getter=lambda: self._use_sparse_jacobian,
-            wegscheider_cyclicity_getter=lambda: self._wegscheider_cyclicity_enabled,
         )
         self._last_fit_metadata: Optional[Dict[str, Any]] = None
         self._reactions_draft_apply_failed = False
@@ -323,16 +302,11 @@ class MainWindow(
             self._flush_interactive_runtime_readiness_refresh
         )
 
-        # Fitting state.
-        self._last_fit_result = None
-
         # Best-effort failure recording (GUI hardening).
         self._best_effort_failures: set[str] = set()
         self._best_effort_failure_counts: Dict[str, int] = {}
 
         # Mechanism + simulation state.
-        self._use_sparse_jacobian = bool(PROJECT_DEFAULTS["use_sparse_jacobian"])
-        self._wegscheider_cyclicity_enabled = bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"])
         self._suppress_preference_updates = False  # Guard: True during document apply and settings load.
         self._pre_dsl_temperature: float | None = None  # Spinbox value before T= override.
         self._temperature_dsl_override_active = False
@@ -397,7 +371,7 @@ class MainWindow(
                 )
             ),
             mechanism_owner=self._simulation_mechanism_owner,
-            solver_owner=self._simulation_solver_owner,
+            solver_owner=self._simulation_runtime_settings_owner,
             update_batch_row_controls_state=self._update_batch_row_controls_state,
             sync_batch_species_columns=self._sync_batch_species_columns,
             sync_mechanism_controls_to_focused_batch_set=self._sync_mechanism_controls_to_focused_batch_set,
@@ -424,9 +398,8 @@ class MainWindow(
         # Undo/Redo stack for high-level operations.
         self._undo_stack = controllers.undo_stack
 
-    def _init_profile_and_template_managers(self) -> None:
-        managers = build_profile_and_template_managers()
-        self._profile_manager = managers.profile_manager
+    def _init_template_manager(self) -> None:
+        managers = build_template_manager()
         self._template_manager = managers.template_manager
 
     def _init_window_shell(self) -> None:
@@ -488,11 +461,10 @@ class MainWindow(
         self.addDockWidget(self._default_dock_area(self._sliders_dock), self._sliders_dock)
 
     def _init_batch_dock_and_panel(self) -> None:
-        solver_contract = load_solver_contract()
         batch_dock_components = build_batch_dock_panel(
             self,
             batch_model=self._batch_model,
-            initial_solver=str(self._initial_solver or solver_contract.default_solver_name),
+            current_solver=self._simulation_runtime_settings_owner.current_solver_name(),
             on_add_batch_set=self._add_batch_set,
             on_move_selected_batch_sets_up=self._move_selected_batch_sets_up,
             on_move_selected_batch_sets_down=self._move_selected_batch_sets_down,
@@ -524,18 +496,28 @@ class MainWindow(
     def _capture_fitting_runtime_inputs(self) -> FittingRuntimeInputs:
         return FittingRuntimeInputs(
             evaluator=FittingEvaluatorRuntimeSettings(
-                temperature_K=self._require_global_fit_temperature(self._temperature_spinbox.value()),
+                temperature_K=self._effective_fitting_runtime_temperature_K(),
                 use_sparse_jacobian=self._require_global_fit_bool(
-                    "_use_sparse_jacobian",
+                    self._simulation_runtime_settings_owner.use_sparse_jacobian(),
                     "use_sparse_jacobian",
                 ),
                 wegscheider_cyclicity_enabled=self._require_global_fit_bool(
-                    "_wegscheider_cyclicity_enabled",
+                    self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled(),
                     "wegscheider_cyclicity_enabled",
                 ),
             ),
             batch_runtime_lane_budget=int(self._sim_controller.batch_runtime_lane_budget),
         )
+
+    def _effective_fitting_runtime_temperature_K(self) -> float:
+        try:
+            source = self.canonical_mechanism_source()
+            t_override_k = self._variable_runtime.dsl_global_temperature_k(source.full_dsl)
+        except Exception:
+            t_override_k = None
+        if t_override_k is not None:
+            return self._require_global_fit_temperature(t_override_k)
+        return self._require_global_fit_temperature(self._temperature_spinbox.value())
 
     def _wire_mechanism_editor_signals(self) -> None:
         sliders = self._mechanism_editor._variable_sliders
@@ -591,16 +573,8 @@ class MainWindow(
         self._set_runtime_parameter_buttons_enabled(bool(dirty))
 
     def _mechanism_session_texts_from_widgets(self) -> tuple[str, str]:
-        editor = getattr(self, "_mechanism_editor", None)
-        if editor is None:
-            raise RuntimeError("Mechanism editor is unavailable.")
-        reactions_widget = getattr(editor, "_reactions_text", None)
-        state_editor = getattr(editor, "_state_network_editor", None)
-        if reactions_widget is None or state_editor is None:
-            raise RuntimeError("Mechanism editor widgets are unavailable.")
-        reactions_text = str(reactions_widget.toPlainText())
-        state_network_dsl = str(state_editor.get_state_network_dsl() or "")
-        return reactions_text, state_network_dsl
+        source = self._mechanism_source_transaction_owner.source_from_widgets()
+        return str(source.reactions_text), str(source.state_network_dsl)
 
     def _mechanism_session_topology_is_valid(self) -> bool:
         editor = getattr(self, "_mechanism_editor", None)
@@ -610,34 +584,12 @@ class MainWindow(
         return bool(state_editor.is_valid())
 
     def _sync_mechanism_session_owner_from_widgets(self, *, authoritative: bool) -> None:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        if not bool(authoritative):
-            raise RuntimeError("Reactions drafts are editor text until Apply Changes.")
-        reactions_text, state_network_dsl = self._mechanism_session_texts_from_widgets()
-        owner.apply_authoritative_source(
-            MechanismAuthoringSource.from_parts(
-                reactions_text=reactions_text,
-                state_network_dsl=state_network_dsl,
-            )
+        self._mechanism_source_transaction_owner.sync_from_widgets(
+            authoritative=bool(authoritative)
         )
 
     def _sync_canonical_state_network_from_widget(self) -> None:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        _reactions_text, state_network_dsl = self._mechanism_session_texts_from_widgets()
-        owner.apply_authoritative_source(
-            MechanismAuthoringSource.from_parts(
-                reactions_text=str(owner.canonical_reactions_text),
-                state_network_dsl=state_network_dsl,
-            )
-        )
+        self._mechanism_source_transaction_owner.sync_state_network_from_widget()
 
     def _refresh_authoritative_mechanism_derived_ui(self) -> None:
         self._update_temperature_mode_indicator()
@@ -924,44 +876,12 @@ class MainWindow(
         *,
         dispatch_consumers: bool,
     ) -> None:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
-        self._refresh_reactions_draft_state()
-        if bool(dispatch_consumers):
-            self._apply_authoritative_mechanism_transition()
+        self._mechanism_source_transaction_owner.sync_after_authoritative_widget_write(
+            dispatch_consumers=bool(dispatch_consumers)
+        )
 
     def _restore_mechanism_widgets_from_owner_canonical(self) -> None:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        editor = getattr(self, "_mechanism_editor", None)
-        if owner is None or editor is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        reactions_widget = getattr(editor, "_reactions_text", None)
-        state_editor = getattr(editor, "_state_network_editor", None)
-        if reactions_widget is None or state_editor is None:
-            raise RuntimeError("Mechanism editor widgets are unavailable.")
-
-        canonical_reactions = str(owner.canonical_reactions_text)
-        if str(reactions_widget.toPlainText()) != canonical_reactions:
-            reactions_widget.blockSignals(True)
-            try:
-                reactions_widget.setPlainText(canonical_reactions)
-            finally:
-                reactions_widget.blockSignals(False)
-
-        canonical_state_network = str(owner.canonical_state_network_dsl or "")
-        if str(state_editor.get_state_network_dsl() or "") != canonical_state_network:
-            state_editor.blockSignals(True)
-            try:
-                if canonical_state_network.strip():
-                    state_editor.set_state_network_dsl(canonical_state_network)
-                else:
-                    state_editor.clear()
-            finally:
-                state_editor.blockSignals(False)
-
-        self._refresh_reactions_draft_state()
+        self._mechanism_source_transaction_owner.restore_widgets_from_canonical()
 
     def _on_reactions_text_changed_for_main_window(self) -> None:
         if bool(getattr(self, "_suppress_programmatic_text_change_signals", False)):
@@ -1086,20 +1006,10 @@ class MainWindow(
             self._maybe_queue_run_target_runtime_readiness_refresh(force=True)
 
     def _set_reactions_widget_text_from_canonical(self) -> None:
-        self._set_reactions_widget_text(self._canonical_reactions_text())
+        self._mechanism_source_transaction_owner.set_reactions_widget_text_from_canonical()
 
     def _set_reactions_widget_text(self, text: str) -> None:
-        widget = self._reactions_text_widget()
-        if widget is None or str(widget.toPlainText()) == str(text):
-            return
-        previous_text_signal_suppress = bool(
-            getattr(self, "_suppress_programmatic_text_change_signals", False)
-        )
-        self._suppress_programmatic_text_change_signals = True
-        try:
-            widget.setPlainText(str(text))
-        finally:
-            self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
+        self._mechanism_source_transaction_owner.set_reactions_widget_text(str(text))
 
     def _reactions_user_mutation_allowed(self) -> bool:
         if bool(getattr(self, "_reactions_draft_warning_prompted", False)):
@@ -1204,10 +1114,6 @@ class MainWindow(
         return _result(True, source_applied=True), reconciled_source, reconciliation_plan
 
     def _accept_reactions_draft_source(self, source) -> None:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        owner.apply_authoritative_source(source)
         self._write_complete_authoritative_mechanism_source_to_editor(source)
         previous_authoritative_suppress = bool(
             getattr(self, "_suppress_authoritative_mechanism_input_change", False)
@@ -1234,6 +1140,7 @@ class MainWindow(
         publish_on_success: bool,
     ) -> ReactionsDraftApplyResult:
         materialization_result_holder: dict[str, object | None] = {"result": None}
+        previous_source = self.canonical_mechanism_source()
 
         def _commit_source() -> bool:
             self._accept_reactions_draft_source(source)
@@ -1249,6 +1156,9 @@ class MainWindow(
             materialization_result_holder["result"] = materialization_result
             return materialization_result
 
+        def _rollback_source() -> None:
+            self._write_complete_authoritative_mechanism_source_to_editor(previous_source)
+
         self._canonical_initials_transition_owner.execute_source_load_transaction(
             transition_source=str(transition_source or "authoritative_change"),
             schedule_runtime_refresh=not self._authoritative_mechanism_runtime_refresh_deferred(),
@@ -1257,6 +1167,7 @@ class MainWindow(
             materialize_initials=_materialize_initials,
             refresh_after_commit=lambda: None,
             publish_on_success=bool(publish_on_success),
+            rollback_before_abort_publish=_rollback_source,
         )
         materialization_result = materialization_result_holder.get("result")
         affected_rows: tuple[int, ...] = tuple(
@@ -1582,7 +1493,9 @@ class MainWindow(
             plot_tabs=self._plot_tabs,
             mechanism_getter=self._get_mechanism_text,
             simulation_runner=self._run_dataset_simulation,
-            wegscheider_cyclicity_enabled_getter=self._get_wegscheider_cyclicity_enabled,
+            wegscheider_cyclicity_enabled_getter=(
+                self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled
+            ),
         )
         self._right_dock = right_dock_components.dock
         self._right_panel = right_dock_components.panel
@@ -1728,31 +1641,15 @@ class MainWindow(
         self._temperature_mode_indicator.setStyleSheet("QLabel { font-style: italic; }")
         self._status_bar.addPermanentWidget(self._temperature_mode_indicator)
 
-        # Profile indicator in status bar.
-        self._profile_indicator = QtWidgets.QLabel("Profile: None")
-        self._profile_indicator.setStyleSheet("QLabel { font-style: italic; }")
-        self._status_bar.addPermanentWidget(self._profile_indicator)
-
     def _finish_window_composition(self) -> None:
         """Complete window composition before any persisted/bootstrap state is applied."""
         self._create_menus()
-        # ──────────────────────────────────────────────────────────────
-        # HIDDEN FEATURE: Ribbon
-        # Status: Hidden from users — NOT dead code
-        # Reason: Undertested and not integrated with current workflows
-        # Code: kindred/gui/widgets/ribbon.py, _init_ribbon_host() in this file
-        # Unhide: Uncomment the line below after the feature passes a
-        #         dedicated integration audit and is approved for user access.
-        # Tracked: chore/post-merge-audit-cleanup branch
-        # ──────────────────────────────────────────────────────────────
-        # self._init_ribbon_host()
         self._init_mixin_ports()
         self._connect_signals()
         self._simulation_runtime_availability_shutdown_started = False
 
     def _bootstrap_window_state(self) -> None:
         """Apply launch overrides and persisted startup state after composition prerequisites exist."""
-        self._apply_initial_profile()
         self._suppress_preference_updates = True
         try:
             self._load_settings()
@@ -1771,20 +1668,22 @@ class MainWindow(
 
     def _simulation_runtime_settings_snapshot(self) -> Dict[str, object]:
         solver_contract = load_solver_contract()
-        solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip()
+        solver_label = str(self._simulation_runtime_settings_owner.current_solver_name() or solver_contract.default_solver_name).strip()
         try:
             simulation_time_seconds = float(self._parse_sim_time_seconds())
         except Exception:
             simulation_time_seconds = str(self._sim_time_spinbox.text() or "").strip()
         return {
             "solver": str(solver_label or solver_contract.default_solver_name),
-            "rtol": float(self._initial_rtol or 1e-6),
-            "atol": float(self._initial_atol or 1e-12),
+            "rtol": float(self._simulation_runtime_settings_owner.current_rtol() or 1e-6),
+            "atol": float(self._simulation_runtime_settings_owner.current_atol() or 1e-12),
             "temperature_K": float(self._temperature_spinbox.value()),
             "simulation_time": simulation_time_seconds,
             "num_points": int(self._num_points_spinbox.value()),
-            "use_sparse_jacobian": bool(self._use_sparse_jacobian),
-            "wegscheider_cyclicity_enabled": bool(self._wegscheider_cyclicity_enabled),
+            "use_sparse_jacobian": bool(self._simulation_runtime_settings_owner.use_sparse_jacobian()),
+            "wegscheider_cyclicity_enabled": bool(
+                self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled()
+            ),
             "max_parallel_batch_workers": int(self._sim_controller.parallel_batch.max_parallel_workers),
             "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
             "limit_blas_threads_per_worker": bool(
@@ -1878,28 +1777,10 @@ class MainWindow(
             status_setter=lambda text: self._status_label.setText(str(text)),
             temperature_getter=lambda: float(self._temperature_spinbox.value()),
             num_points_getter=lambda: int(self._num_points_spinbox.value()),
+            wegscheider_cyclicity_enabled_getter=(
+                self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled
+            ),
         )
-        self._profile_ports = ProfileMixinPorts(
-            profile_manager=self._profile_manager,
-            profiles_menu_getter=lambda: None,  # Hidden: Profiles menu removed from menu bar
-            profile_indicator_setter=lambda text: self._profile_indicator.setText(str(text)),
-            status_setter=lambda text: self._status_label.setText(str(text)),
-            settings_set_value=self._settings_owner.settings_set_value,
-            settings_remove=self._settings_owner.settings_remove,
-            num_points_spinbox=self._num_points_spinbox,
-            dark_mode_action=getattr(self, "_dark_mode_action", None),
-            toggle_theme=self._toggle_theme,
-            update_solver_summary_label=self._update_solver_summary_label,
-        )
-
-    def _apply_initial_profile(self) -> None:
-        if not self._initial_profile:
-            return
-        if self._profile_manager.get_profile(self._initial_profile):
-            self._activate_profile(self._initial_profile)
-            logger.info(f"Applied startup profile: {self._initial_profile}")
-            return
-        logger.warning(f"Startup profile '{self._initial_profile}' not found")
 
     def _refresh_after_authoritative_source_load(self) -> None:
         self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
@@ -1957,43 +1838,16 @@ class MainWindow(
         canceled_status_text: str | None = None,
         continue_label: str = "Load",
     ) -> tuple[object, object, ReactionsDraftApplyResult | None] | None:
-        draft_resolution = self._reactions_draft_resolution_owner.resolve_for_authoritative_source_load(
-            str(action_label),
+        return self._mechanism_source_transaction_owner.prepare_source_load_request(
+            source=source,
+            action_label=str(action_label),
+            guard_action_text=str(guard_action_text),
+            prompt_overwrite=bool(prompt_overwrite),
+            transition_source=str(transition_source or "authoritative_source_load"),
+            schedule_runtime_refresh=bool(schedule_runtime_refresh),
+            canceled_status_text=canceled_status_text,
             continue_label=str(continue_label or "Load"),
         )
-        if not draft_resolution.may_continue:
-            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
-                transition_source=str(transition_source or "authoritative_source_load"),
-                schedule_runtime_refresh=bool(schedule_runtime_refresh),
-                draft_apply_result=getattr(draft_resolution, "apply_result", None),
-            )
-            if canceled_status_text is not None:
-                self._status_label.setText(str(canceled_status_text))
-            return None
-        draft_apply_result = getattr(draft_resolution, "apply_result", None)
-        if not self._guard_slider_transaction_invalidation(action_text=str(guard_action_text)):
-            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
-                transition_source=str(transition_source or "authoritative_source_load"),
-                schedule_runtime_refresh=bool(schedule_runtime_refresh),
-                draft_apply_result=draft_apply_result,
-            )
-            if canceled_status_text is not None:
-                self._status_label.setText(str(canceled_status_text))
-            return None
-        source, reconciliation_plan = self._prepare_authoritative_source_load_reconciliation(
-            source,
-            prompt_overwrite=bool(prompt_overwrite),
-        )
-        if reconciliation_plan is None:
-            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
-                transition_source=str(transition_source or "authoritative_source_load"),
-                schedule_runtime_refresh=bool(schedule_runtime_refresh),
-                draft_apply_result=draft_apply_result,
-            )
-            if canceled_status_text is not None:
-                self._status_label.setText(str(canceled_status_text))
-            return None
-        return source, reconciliation_plan, draft_apply_result
 
     def _execute_authoritative_source_load(
         self,
@@ -2011,38 +1865,20 @@ class MainWindow(
         before_refresh: Callable[[], None] | None = None,
         rollback_before_abort_publish: Callable[[], None] | None = None,
     ) -> None:
-        previous_text_signal_suppress = bool(
-            getattr(self, "_suppress_programmatic_text_change_signals", False)
+        self._mechanism_source_transaction_owner.execute_source_load(
+            source=source,
+            reconciliation_plan=reconciliation_plan,
+            draft_apply_result=draft_apply_result,
+            description=str(description),
+            transition_source=str(transition_source or "authoritative_source_load"),
+            schedule_runtime_refresh=bool(schedule_runtime_refresh),
+            record_undo=bool(record_undo),
+            canonical_materialized=canonical_materialized,
+            full_snapshot_required=bool(full_snapshot_required),
+            before_materialize=before_materialize,
+            before_refresh=before_refresh,
+            rollback_before_abort_publish=rollback_before_abort_publish,
         )
-        self._suppress_programmatic_text_change_signals = True
-        try:
-            record_source_undo = (
-                bool(record_undo)
-                and not self._source_load_plan_materializes_initial_conditions(
-                    reconciliation_plan
-                )
-            )
-            self._canonical_initials_transition_owner.execute_source_load_transaction(
-                transition_source=str(transition_source or "authoritative_source_load"),
-                schedule_runtime_refresh=bool(schedule_runtime_refresh),
-                draft_apply_result=draft_apply_result,
-                commit_source=lambda: self._set_authoritative_mechanism_editor_source(
-                    source,
-                    description=str(description),
-                    record_undo=record_source_undo,
-                ),
-                materialize_initials=lambda: self._apply_authoritative_source_load_reconciliation_after_source_acceptance(
-                    reconciliation_plan
-                ),
-                refresh_after_commit=self._refresh_after_authoritative_source_load,
-                canonical_materialized=canonical_materialized,
-                full_snapshot_required=bool(full_snapshot_required),
-                before_materialize=before_materialize,
-                before_refresh=before_refresh,
-                rollback_before_abort_publish=rollback_before_abort_publish,
-            )
-        finally:
-            self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
 
     def _prepare_authoritative_source_load_reconciliation(
         self,
@@ -2111,7 +1947,7 @@ class MainWindow(
 
             temperature_k = float(self._temperature_spinbox.value())
             units = UnitsModel(temperature_K=temperature_k)
-            wegscheider_enabled = bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled())
+            wegscheider_enabled = bool(self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled())
 
             def _build_structure_snapshot(full_dsl: str) -> object:
                 mechanism_obj = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
@@ -2197,21 +2033,6 @@ class MainWindow(
         """Save user preferences to QSettings."""
         self.config_controller.save_settings()
 
-    def set_simulation_cache_caps(self, *, result_cap: int, preview_cap: int, persist: bool = True) -> None:
-        self._sim_controller.set_simulation_cache_caps(result_cap=result_cap, preview_cap=preview_cap, persist=persist)
-
-    def simulation_cache_stats(self) -> Dict[str, Dict[str, int]]:
-        return self._sim_controller.simulation_cache_stats()
-
-    def purge_simulation_result_cache(self) -> None:
-        self._sim_controller.purge_simulation_result_cache()
-
-    def purge_simulation_preview_cache(self) -> None:
-        self._sim_controller.purge_simulation_preview_cache()
-
-    def purge_simulation_all_caches(self) -> None:
-        self._sim_controller.purge_simulation_all_caches()
-
     def _create_menus(self):
         """Create the menu bar and shortcut customization registry."""
         self._shortcut_actions = {}
@@ -2270,36 +2091,7 @@ class MainWindow(
             [
                 ("&Undo", self._undo, QtGui.QKeySequence.Undo, "undoAction", "Undo last edit in mechanism editor"),
                 ("&Redo", self._redo, QtGui.QKeySequence.Redo, "redoAction", "Redo previously undone edit"),
-                # ──────────────────────────────────────────────────────────────
-                # HIDDEN FEATURE: Species Registry
-                # Status: Hidden from users — NOT dead code
-                # Reason: Undertested and not integrated with current workflows
-                # Code: _open_species_registry() and _gather_species_registry_entries() in this file
-                # Unhide: Uncomment the line below after the feature passes a
-                #         dedicated integration audit and is approved for user access.
-                # Tracked: chore/post-merge-audit-cleanup branch
-                # ──────────────────────────────────────────────────────────────
-                # ("&Species Registry...", self._open_species_registry, None, "speciesRegistryAction", "View and manage species definitions and properties"),
-                # ──────────────────────────────────────────────────────────────
-                # HIDDEN FEATURE: State Network Editor
-                # Status: Hidden from users — NOT dead code
-                # Reason: Undertested and not integrated with current workflows
-                # Code: kindred/gui/widgets/state_network_editor.py, _open_state_network() in this file
-                # Unhide: Uncomment the line below after the feature passes a
-                #         dedicated integration audit and is approved for user access.
-                # Tracked: chore/post-merge-audit-cleanup branch
-                # ──────────────────────────────────────────────────────────────
-                # ("State &Network Editor...", self._open_state_network, None, "stateNetworkAction", "Edit state transition networks for TST calculations"),
-                # ──────────────────────────────────────────────────────────────
-                # HIDDEN FEATURE: Computational Mode
-                # Status: Hidden from users — NOT dead code
-                # Reason: Undertested and not integrated with current workflows
-                # Code: kindred/gui/widgets/computational_mode_dialog.py, _open_computational_mode() in this file
-                # Unhide: Uncomment the line below after the feature passes a
-                #         dedicated integration audit and is approved for user access.
-                # Tracked: chore/post-merge-audit-cleanup branch
-                # ──────────────────────────────────────────────────────────────
-                # ("&Computational Mode...", self._open_computational_mode, None, "computationalModeAction", "Convert absolute computed free energies into energy-mode DSL blocks"),
+                ("State &Network Editor...", self._open_state_network, None, "stateNetworkAction", "Edit state transition networks for TST calculations"),
                 None,
                 ("Customize &Keyboard Shortcuts...", self._open_shortcuts_dialog, "Ctrl+K", "customizeShortcutsAction", "Customize keyboard shortcuts for actions"),
             ],
@@ -2341,20 +2133,6 @@ class MainWindow(
                 ("&Dark Mode", self._toggle_theme, "Ctrl+Shift+D", "darkModeAction", "Toggle between light and dark theme", {"checkable": True, "store_as": "_dark_mode_action"}),
             ],
         )
-
-        # ──────────────────────────────────────────────────────────────
-        # HIDDEN FEATURE: Profiles
-        # Status: Hidden from users — NOT dead code
-        # Reason: Undertested and not integrated with current workflows
-        # Code: kindred/config/profiles.py, kindred/gui/mixins/profile_mixin.py
-        # Unhide: Uncomment the lines below after the feature passes a
-        #         dedicated integration audit and is approved for user access.
-        #         Also restore profiles_menu_getter in _init_mixin_ports().
-        # Tracked: chore/post-merge-audit-cleanup branch
-        # ──────────────────────────────────────────────────────────────
-        # self._profiles_menu = QtWidgets.QMenu("&Profiles", self)
-        # menubar.addMenu(self._profiles_menu)
-        # self._update_profiles_menu()
 
         examples_menu = QtWidgets.QMenu("E&xamples", self)
         menubar.addMenu(examples_menu)
@@ -2404,16 +2182,6 @@ class MainWindow(
                 ("Global Fit...", self._run_global_fit, "Ctrl+Shift+F", "globalFitAction", "Fit shared parameters across all loaded datasets (Ctrl+Shift+F)"),
             ],
         )
-
-        # ──────────────────────────────────────────────────────────────
-        # HIDDEN FEATURE: Temperature Schedule
-        # Status: Hidden from users — NOT dead code
-        # Reason: Undertested and not integrated with current workflows
-        # Code: kindred/gui/widgets/temperature_schedule_editor.py, kindred/core/temperature_dsl.py
-        # Note: The Tools menu is hidden entirely because this is its only remaining item.
-        # Unhide: Recreate the Tools menu and uncomment the action below after the
-        #         feature passes a dedicated integration audit and is approved for user access.
-        # ──────────────────────────────────────────────────────────────
 
         help_menu = menubar.addMenu("&Help")
         self._help_menu = help_menu
@@ -2500,75 +2268,6 @@ class MainWindow(
             self._simulation_run_ui_owner.bind_run_action(action)
         return action
 
-    def _init_ribbon_host(self) -> None:
-        self._ribbon_toolbar = QtWidgets.QToolBar("Ribbon", self)
-        self._ribbon_toolbar.setObjectName("mainRibbonToolbar")
-        self._ribbon_toolbar.setMovable(False)
-        self._ribbon_toolbar.setFloatable(False)
-        self._ribbon_toolbar.setAllowedAreas(QtCore.Qt.TopToolBarArea)
-        self._ribbon_toolbar.setContextMenuPolicy(QtCore.Qt.PreventContextMenu)
-
-        self._ribbon_host = CollapsibleRibbonHost(self)
-        self._ribbon_host.add_page(self._build_view_ribbon_page())
-        self._ribbon_host.collapseToggleRequested.connect(self.set_ribbon_collapsed)
-
-        self._ribbon_toolbar.addWidget(self._ribbon_host)
-        self.addToolBar(QtCore.Qt.TopToolBarArea, self._ribbon_toolbar)
-
-    def _build_view_ribbon_page(self) -> RibbonPage:
-        page = RibbonPage("View", self)
-        page.setObjectName("viewRibbonPage")
-
-        panels_group = RibbonGroup("Panels", page)
-        for spec in dock_shell_specs():
-            action = self._dock_toggle_actions[spec.identity_key]
-            panels_group.add_compact_action(
-                action,
-                object_name=f"{spec.identity_key}RibbonButton",
-            )
-
-        analysis_group = RibbonGroup("Analysis", page)
-        for surface_name in _ANALYSIS_SURFACE_NAMES:
-            analysis_group.add_compact_action(
-                self._analysis_surface_actions[str(surface_name)],
-                object_name=f"{str(surface_name).lower()}SurfaceRibbonButton",
-            )
-
-        window_group = RibbonGroup("Window", page)
-        window_group.add_primary_action(
-            self._reset_layout_action,
-            text_override="Restore Default Layout",
-            object_name="resetLayoutRibbonButton",
-        )
-        window_group.add_compact_action(
-            self._panel_layout_tips_action,
-            object_name="panelLayoutTipsRibbonButton",
-        )
-        window_group.add_compact_action(
-            self._dark_mode_action,
-            object_name="darkModeRibbonButton",
-        )
-
-        page.add_group(panels_group)
-        page.add_group(analysis_group)
-        page.add_group(window_group)
-        return page
-
-    def set_ribbon_collapsed(self, collapsed: bool) -> None:
-        ribbon_host = getattr(self, "_ribbon_host", None)
-        if ribbon_host is None:
-            return
-        collapsed_value = bool(collapsed)
-        if ribbon_host.is_collapsed() == collapsed_value:
-            return
-        self._run_preserving_maximized_state(lambda: ribbon_host.set_collapsed(collapsed_value))
-
-    def ribbon_collapsed(self) -> bool:
-        ribbon_host = getattr(self, "_ribbon_host", None)
-        if ribbon_host is None:
-            return False
-        return bool(ribbon_host.is_collapsed())
-
     def _connect_signals(self):
         """Connect signals between components."""
         # Dataset import panel signals
@@ -2631,67 +2330,27 @@ class MainWindow(
             raise ValueError(f"t_end must be > 0, got: {raw!r}")
         return float(value)
 
-    def _coerce_solver_tolerance(
-        self,
-        value: object,
-        *,
-        field_name: str,
-        current_value: Optional[float],
-    ) -> float:
-        resolved = resolve_solver_tolerance(
-            value,
-            field_name=field_name,
-            current_value=current_value,
-            default_value=PROJECT_DEFAULTS[field_name],
-        )
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            parsed = float("nan")
-        if (
-            value is None
-            or isinstance(value, bool)
-            or not math.isfinite(parsed)
-            or parsed <= 0.0
-            or parsed != resolved
-        ):
-            logger.warning(
-                "Invalid solver tolerance %s=%r; using resolved value %s",
-                field_name,
-                value,
-                resolved,
-            )
-        return resolved
-
-    def _apply_solver_runtime_state(
+    def _apply_runtime_settings(
         self,
         *,
-        solver: object = _SOLVER_STATE_UNSET,
-        rtol: object = _SOLVER_STATE_UNSET,
-        atol: object = _SOLVER_STATE_UNSET,
+        solver: object = RUNTIME_SETTING_UNSET,
+        rtol: object = RUNTIME_SETTING_UNSET,
+        atol: object = RUNTIME_SETTING_UNSET,
+        use_sparse_jacobian: object = RUNTIME_SETTING_UNSET,
+        wegscheider_cyclicity_enabled: object = RUNTIME_SETTING_UNSET,
     ) -> None:
         solver_contract = load_solver_contract()
-
-        if solver is not _SOLVER_STATE_UNSET:
-            solver_label = str(solver or "").strip() or solver_contract.default_solver_name
-            solver_method, _warning = solver_contract.normalize_solver_name(solver_label)
-            self._initial_solver = str(solver_method)
-        if rtol is not _SOLVER_STATE_UNSET:
-            self._initial_rtol = self._coerce_solver_tolerance(
-                rtol,
-                field_name="rtol",
-                current_value=self._initial_rtol,
-            )
-        if atol is not _SOLVER_STATE_UNSET:
-            self._initial_atol = self._coerce_solver_tolerance(
-                atol,
-                field_name="atol",
-                current_value=self._initial_atol,
-            )
+        self._simulation_runtime_settings_owner.apply_runtime_settings(
+            solver=solver,
+            rtol=rtol,
+            atol=atol,
+            use_sparse_jacobian=use_sparse_jacobian,
+            wegscheider_cyclicity_enabled=wegscheider_cyclicity_enabled,
+        )
 
         combo = getattr(self, "_solver_method_combo", None)
         if combo is not None:
-            solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
+            solver_label = str(self._simulation_runtime_settings_owner.current_solver_name() or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
             combo.blockSignals(True)
             try:
                 idx = int(combo.findText(str(solver_label)))
@@ -2707,9 +2366,9 @@ class MainWindow(
         self._update_solver_summary_label()
 
     def _on_solver_method_changed(self, v: str) -> None:
-        self._apply_solver_runtime_state(solver=str(v))
+        self._apply_runtime_settings(solver=str(v))
         if not self._suppress_preference_updates:
-            self.config_controller.update_user_preference("solver", self._initial_solver)
+            self.config_controller.update_user_preference("solver", self._simulation_runtime_settings_owner.current_solver_name())
         self._refresh_simulation_runtime_after_inputs_changed(
             batch_runtime_pool_inputs_changed=False
         )
@@ -2720,15 +2379,13 @@ class MainWindow(
             return
 
         solver_contract = load_solver_contract()
-        solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
-        solver_method, solver_warning = solver_contract.normalize_solver_name(solver_label)
+        solver_label = str(self._simulation_runtime_settings_owner.current_solver_name() or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
+        solver_method = solver_contract.normalize_solver_name(solver_label)
         solver_display = str(solver_method)
         if str(solver_method) != str(solver_label):
             solver_display = f"{solver_label} → {solver_method}"
-        if solver_warning:
-            solver_display = f"{solver_display} ({solver_warning})"
-        rtol = self._initial_rtol or 1e-6
-        atol = self._initial_atol or 1e-12
+        rtol = self._simulation_runtime_settings_owner.current_rtol() or 1e-6
+        atol = self._simulation_runtime_settings_owner.current_atol() or 1e-12
         points = int(self._num_points_spinbox.value())
         sim_time_raw = ""
         try:
@@ -2742,7 +2399,7 @@ class MainWindow(
 
         time_part = f"{sim_time:g} s" if isinstance(sim_time, float) else f"{sim_time_raw or '?'} s"
         summary = f"Solver: {solver_display} • rtol={rtol:.1e} • atol={atol:.1e} • Points: {points:,} • Time: {time_part}"
-        if self._use_sparse_jacobian and str(solver_method).upper() in {"RADAU", "BDF"}:
+        if self._simulation_runtime_settings_owner.use_sparse_jacobian() and str(solver_method).upper() in {"RADAU", "BDF"}:
             summary += " • Symbolic J"
         self._solver_summary_label.setText(summary)
 
@@ -2758,15 +2415,12 @@ class MainWindow(
         )
 
     def _on_sim_time_user_edit(self, text: str) -> None:
-        if not self._suppress_preference_updates:
-            # QLineEdit can emit empty strings during editing; skip to avoid persisting invalid state.
-            stripped = str(text).strip()
-            if stripped:
-                self.config_controller.update_user_preference("simulation_time", stripped)
         try:
-            self._parse_sim_time_seconds()
+            sim_time = self._parse_sim_time_seconds()
         except Exception:
             return
+        if not self._suppress_preference_updates:
+            self.config_controller.update_user_preference("simulation_time", f"{float(sim_time):g}")
         self._refresh_simulation_runtime_after_inputs_changed(
             batch_runtime_pool_inputs_changed=False
         )
@@ -3287,144 +2941,6 @@ class MainWindow(
             logger.info("Keyboard shortcuts updated")
             self._status_label.setText("Keyboard shortcuts updated")
 
-    def _open_species_registry(self):
-        """Open the Species Registry dialog."""
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Species Registry")
-        dialog.setMinimumSize(420, 360)
-
-        layout = QtWidgets.QVBoxLayout(dialog)
-
-        # Info label
-        info_label = QtWidgets.QLabel(
-            "Species are automatically detected from the current mechanism DSL.\n"
-            "Use this view to confirm initials before running simulations."
-        )
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-
-        # Summary label updated after detection
-        summary_label = QtWidgets.QLabel()
-        summary_label.setObjectName("speciesRegistrySummary")
-        layout.addWidget(summary_label)
-
-        # Species list
-        layout.addWidget(QtWidgets.QLabel("Detected Species:"))
-        species_list = QtWidgets.QListWidget()
-        species_list.setObjectName("speciesRegistryList")
-        layout.addWidget(species_list, stretch=1)
-
-        entries, error_message = self._gather_species_registry_entries()
-        if entries:
-            summary_label.setText(f"Detected {len(entries)} species")
-            for index, (name, initial) in enumerate(entries, start=1):
-                prec = f"{initial:.6g}" if isinstance(initial, (int, float)) else str(initial)
-                species_list.addItem(f"{index}. {name} (initial={prec})")
-        else:
-            placeholder = error_message or "No species detected. Add reactions to the mechanism editor."
-            summary_label.setText(placeholder)
-            species_list.addItem(placeholder)
-
-        # Close button
-        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
-        button_box.rejected.connect(dialog.reject)
-        layout.addWidget(button_box)
-
-        dialog.exec()
-
-    def _gather_species_registry_entries(self) -> Tuple[List[Tuple[str, float]], Optional[str]]:
-        """
-        Parse the mechanism DSL and return detected species entries.
-
-        Returns
-        -------
-        tuple
-            ([(name, initial_conc), ...], error_message_or_None)
-        """
-        from kindred.core.batch_initial_conditions import (
-            strip_named_reaction_dsl_initial_concentration_sets,
-        )
-        from kindred.core.simulator.algebra_section import is_algebra_line
-
-        text = self.mechanism_reactions_text_raw()
-        if not text.strip():
-            logger.info("Species registry requested with empty mechanism editor")
-            return [], "Mechanism editor is empty. Enter reactions to detect species."
-        try:
-            parse_text = strip_named_reaction_dsl_initial_concentration_sets(text)
-        except Exception as exc:
-            logger.warning("Failed to preprocess DSL for species registry: %s", exc, exc_info=True)
-            return [], f"DSL parse error: {exc}"
-
-        invalid_line: Optional[str] = None
-        for raw in parse_text.splitlines():
-            stripped = raw.strip()
-            if not stripped:
-                continue
-            lower = stripped.lower()
-            if stripped.startswith("#"):
-                continue
-            if is_algebra_line(raw):
-                continue
-            if lower.startswith(
-                (
-                    "reaction:",
-                    "equilibrium:",
-                    "state:",
-                    "edge:",
-                    "comp:",
-                    "energy=",
-                    "t=",
-                    "c0=",
-                    "c°=",
-                    "κ=",
-                    "kappa=",
-                    "init:",
-                    "initial:",
-                    "temp_const:",
-                    "temp_step:",
-                    "temp_response:",
-                )
-            ):
-                continue
-            if stripped.startswith("[") and "=" in stripped:
-                continue
-            if "->" in stripped or "<->" in stripped or "<=>" in stripped:
-                continue
-            invalid_line = stripped
-            break
-
-        if invalid_line:
-            message = f"DSL parse error: unrecognized line: '{invalid_line}'"
-            logger.warning(message)
-            return [], message
-
-        try:
-            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-            from kindred.core.units import UnitsModel
-        except Exception as exc:  # pragma: no cover - import typically succeeds
-            logger.error("Species registry unavailable: %s", exc, exc_info=True)
-            return [], "DSL parser is unavailable. See logs for details."
-
-        try:
-            units = UnitsModel(
-                temperature_K=self._temperature_spinbox.value(),
-            )
-            mechanism = parse_dsl_to_mechanism(parse_text, initials={}, units=units)
-        except Exception as exc:
-            logger.warning("Failed to parse DSL for species registry: %s", exc, exc_info=True)
-            return [], f"DSL parse error: {exc}"
-
-        entries: List[Tuple[str, float]] = []
-        for name, species in mechanism.species.items():
-            initial = getattr(species, "initial_conc", 0.0)
-            try:
-                entries.append((name, float(initial)))
-            except Exception:
-                entries.append((name, initial))
-
-        return entries, None
-
     def _open_state_network(self):
         """Open the State Network Editor dialog."""
         logger.info("Opening State Network Editor dialog")
@@ -3521,7 +3037,7 @@ class MainWindow(
 
             QtCore.QTimer.singleShot(0, _diag_0ms)
 
-        # This hidden editor is live: edits publish immediately through stateNetworkChanged.
+        # State Network edits publish immediately through stateNetworkChanged.
         button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
         button_box.rejected.connect(dialog.reject)
         layout.addWidget(button_box)
@@ -3563,51 +3079,6 @@ class MainWindow(
                 self._state_network_editor_restore_failed = True
 
         dialog.finished.connect(_restore_state_network_editor)
-        dialog.setWindowModality(Qt.ApplicationModal)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def _open_computational_mode(self) -> None:
-        """Open the Computational Mode dialog."""
-        logger.info("Opening Computational Mode dialog")
-
-        existing = getattr(self, "_computational_mode_dialog", None)
-        if existing is not None:
-            try:
-                if existing.isVisible():
-                    existing.raise_()
-                    existing.activateWindow()
-                    return
-            except RuntimeError as exc:
-                logger.debug("Computational mode dialog reference was invalid: %s", exc, exc_info=True)
-                if getattr(self, "_computational_mode_dialog", None) is existing:
-                    self._computational_mode_dialog = None
-
-        try:
-            from kindred.gui.widgets.computational_mode_dialog import ComputationalModeDialog
-        except Exception as exc:  # pragma: no cover - import typically succeeds
-            logger.error("Failed to import Computational Mode dialog: %s", exc, exc_info=True)
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Computational Mode Unavailable",
-                "Computational Mode dialog could not be loaded. See logs for details.",
-            )
-            return
-
-        dialog = ComputationalModeDialog(self)
-        self._computational_mode_dialog = dialog
-
-        def _cleanup(_result: int) -> None:
-            if getattr(self, "_computational_mode_dialog", None) is dialog:
-                self._computational_mode_dialog = None
-            try:
-                dialog.deleteLater()
-            except RuntimeError as exc:
-                logger.debug("Failed to schedule computational mode dialog deletion: %s", exc, exc_info=True)
-                self._computational_mode_dialog_delete_failed = True
-
-        dialog.finished.connect(_cleanup)
         dialog.setWindowModality(Qt.ApplicationModal)
         dialog.show()
         dialog.raise_()
@@ -4031,58 +3502,29 @@ class MainWindow(
     def _get_solver_settings(self) -> Dict[str, Any]:
         """Get the current solver settings."""
         solver_contract = load_solver_contract()
-        solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
-        solver_method, solver_warning = solver_contract.normalize_solver_name(solver_label)
+        solver_label = str(self._simulation_runtime_settings_owner.current_solver_name() or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
+        solver_method = solver_contract.normalize_solver_name(solver_label)
         return {
             "solver": str(solver_method),
-            "solver_label": str(solver_label),
-            "solver_warning": str(solver_warning) if solver_warning else None,
-            'rtol': self._initial_rtol or 1e-6,
-            'atol': self._initial_atol or 1e-12,
-            'use_sparse_jacobian': bool(self._use_sparse_jacobian),
-            'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
+            'rtol': self._simulation_runtime_settings_owner.current_rtol() or 1e-6,
+            'atol': self._simulation_runtime_settings_owner.current_atol() or 1e-12,
+            'use_sparse_jacobian': bool(self._simulation_runtime_settings_owner.use_sparse_jacobian()),
+            'wegscheider_cyclicity_enabled': bool(
+                self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled()
+            ),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
             'batch_runtime_lane_budget': int(self._sim_controller.batch_runtime_lane_budget),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
         }
 
-    def _get_wegscheider_cyclicity_enabled(self) -> bool:
-        value = getattr(self, "_wegscheider_cyclicity_enabled", None)
-        if not isinstance(value, bool):
-            raise RuntimeError("Wegscheider setting is not available.")
-        return value
-
     def _get_global_fit_launch_settings(self) -> object:
         from kindred.gui.fitting.launch import GlobalFitLaunchSettings
 
-        solver_contract = load_solver_contract()
-        solver_label = str(self._initial_solver or "").strip()
-        if not solver_label:
-            raise RuntimeError("Global Fit launch settings require explicit solver.")
-        solver_method, _solver_warning = solver_contract.normalize_solver_name(solver_label)
-        rtol = self._require_global_fit_tolerance("_initial_rtol", "rtol")
-        atol = self._require_global_fit_tolerance("_initial_atol", "atol")
         return GlobalFitLaunchSettings(
-            solver=str(solver_method),
-            rtol=float(rtol),
-            atol=float(atol),
             runtime_inputs=self._fitting_runtime_input_publisher.current_inputs(),
         )
 
-    def _require_global_fit_tolerance(self, attr_name: str, label: str) -> float:
-        value = getattr(self, attr_name, None)
-        if value is None:
-            raise RuntimeError(f"Global Fit launch settings require explicit {label}.")
-        try:
-            numeric = float(value)
-        except Exception as exc:
-            raise RuntimeError(f"Global Fit launch settings require numeric {label}.") from exc
-        if not math.isfinite(numeric) or numeric <= 0.0:
-            raise RuntimeError(f"Global Fit launch settings require positive finite {label}.")
-        return numeric
-
-    def _require_global_fit_bool(self, attr_name: str, label: str) -> bool:
-        value = getattr(self, attr_name, None)
+    def _require_global_fit_bool(self, value: object, label: str) -> bool:
         if not isinstance(value, bool):
             raise RuntimeError(f"Global Fit launch settings require explicit {label}.")
         return value
@@ -4110,8 +3552,8 @@ class MainWindow(
         from kindred.core.mechanism_source import MechanismAuthoringSource
 
         solver_contract = load_solver_contract()
-        solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
-        solver_method, solver_warning = solver_contract.normalize_solver_name(solver_label)
+        solver_label = str(self._simulation_runtime_settings_owner.current_solver_name() or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
+        solver_name = solver_contract.normalize_solver_name(solver_label)
         mechanism_source = MechanismAuthoringSource.from_parts(
             reactions_text=self.mechanism_reactions_text_raw(),
             state_network_dsl=self.mechanism_state_network_dsl_raw(),
@@ -4129,13 +3571,13 @@ class MainWindow(
             'version': KINDRED_VERSION,
             'mechanism_source': mechanism_source.to_payload(),
             'notes': self._mechanism_editor._notes_text.toPlainText(),
-            "solver": str(solver_label),
-            "solver_method": str(solver_method),
-            "solver_warning": str(solver_warning) if solver_warning else None,
-            'rtol': self._initial_rtol or 1e-6,
-            'atol': self._initial_atol or 1e-12,
-            'use_sparse_jacobian': bool(self._use_sparse_jacobian),
-            'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
+            "solver": str(solver_name),
+            'rtol': self._simulation_runtime_settings_owner.current_rtol() or 1e-6,
+            'atol': self._simulation_runtime_settings_owner.current_atol() or 1e-12,
+            'use_sparse_jacobian': bool(self._simulation_runtime_settings_owner.use_sparse_jacobian()),
+            'wegscheider_cyclicity_enabled': bool(
+                self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled()
+            ),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
             'batch_runtime_lane_budget': int(self._sim_controller.batch_runtime_lane_budget),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
@@ -4381,12 +3823,6 @@ class MainWindow(
         rtol_value = data.get('rtol', _pref('rtol'))
         atol_value = data.get('atol', _pref('atol'))
 
-        self._use_sparse_jacobian = bool(
-            data.get('use_sparse_jacobian', _pref('use_sparse_jacobian'))
-        )
-        self._wegscheider_cyclicity_enabled = bool(
-            data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
-        )
         try:
             self._sim_controller.parallel_batch.max_parallel_workers = min(
                 int(MAX_PARALLEL_WORKERS_CEILING),
@@ -4420,10 +3856,16 @@ class MainWindow(
             int(data.get('num_points', _pref('num_points')))
         )
 
-        self._apply_solver_runtime_state(
+        self._apply_runtime_settings(
             solver=solver_value,
             rtol=rtol_value,
             atol=atol_value,
+            use_sparse_jacobian=bool(
+                data.get('use_sparse_jacobian', _pref('use_sparse_jacobian'))
+            ),
+            wegscheider_cyclicity_enabled=bool(
+                data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
+            ),
         )
 
         # Loaded project files carry a complete fitting-default snapshot.
@@ -4442,43 +3884,38 @@ class MainWindow(
     def apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> bool:
         """Public project apply API for controllers (avoid reaching into `_` helpers)."""
         source = validate_project_payload(data)
-        draft_resolution = self._reactions_draft_resolution_owner.resolve_for_authoritative_source_load(
-            "Loading this project",
+        preflight_ok, draft_apply_result = self._mechanism_source_transaction_owner.prepare_source_load_preflight(
+            action_label="Loading this project",
+            guard_action_text="Loading this project",
+            transition_source="project_load",
+            schedule_runtime_refresh=False,
             continue_label="Load",
         )
-        if not draft_resolution.may_continue:
-            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
-                transition_source="project_load",
-                schedule_runtime_refresh=False,
-                draft_apply_result=getattr(draft_resolution, "apply_result", None),
-            )
-            return False
-        if not self._guard_slider_transaction_invalidation(action_text="Loading this project"):
-            self._canonical_initials_transition_owner.publish_aborted_source_load_attempt(
-                transition_source="project_load",
-                schedule_runtime_refresh=False,
-                draft_apply_result=getattr(draft_resolution, "apply_result", None),
-            )
+        if not preflight_ok:
             return False
         self._apply_project_payload(
             data,
             record_undo=record_undo,
-            draft_apply_result=getattr(draft_resolution, "apply_result", None),
+            draft_apply_result=draft_apply_result,
             validated_source=source,
         )
         return True
 
-    def apply_solver_runtime_state(
+    def apply_runtime_settings(
         self,
         *,
-        solver: object = _SOLVER_STATE_UNSET,
-        rtol: object = _SOLVER_STATE_UNSET,
-        atol: object = _SOLVER_STATE_UNSET,
+        solver: object = RUNTIME_SETTING_UNSET,
+        rtol: object = RUNTIME_SETTING_UNSET,
+        atol: object = RUNTIME_SETTING_UNSET,
+        use_sparse_jacobian: object = RUNTIME_SETTING_UNSET,
+        wegscheider_cyclicity_enabled: object = RUNTIME_SETTING_UNSET,
     ) -> None:
-        self._apply_solver_runtime_state(
+        self._apply_runtime_settings(
             solver=solver,
             rtol=rtol,
             atol=atol,
+            use_sparse_jacobian=use_sparse_jacobian,
+            wegscheider_cyclicity_enabled=wegscheider_cyclicity_enabled,
         )
         self._refresh_simulation_runtime_after_inputs_changed(
             batch_runtime_pool_inputs_changed=False
@@ -4529,10 +3966,7 @@ class MainWindow(
         return self._simulation_mechanism_owner.mechanism_state_network_dsl_raw()
 
     def canonical_mechanism_source(self):
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        return owner.canonical_source
+        return self._mechanism_source_transaction_owner.canonical_source
 
     def _reactions_draft_apply_error_text(self) -> str:
         editor = getattr(self, "_mechanism_editor", None)
@@ -4552,7 +3986,7 @@ class MainWindow(
         before_publish: Callable[[], None] | None = None,
         discard_dirty_preview: bool = True,
     ) -> AuthoritativeRewriteOutcome:
-        return self._authoritative_rewrite_owner.rewrite_mechanism_source(
+        return self._mechanism_source_transaction_owner.rewrite_mechanism_source(
             action_label=str(action_label or description or "Changing the mechanism source"),
             description=str(description or action_label or "Rewrite mechanism source"),
             build_source=build_source,
@@ -4573,7 +4007,7 @@ class MainWindow(
         before_publish: Callable[[], None] | None = None,
         discard_dirty_preview: bool = True,
     ) -> AuthoritativeRewriteOutcome:
-        return self._authoritative_rewrite_owner.rewrite_reactions_text(
+        return self._mechanism_source_transaction_owner.rewrite_reactions_text(
             action_label=str(action_label or description or "Changing Reactions"),
             description=str(description or action_label or "Rewrite Reactions"),
             rewrite_text=rewrite_text,
@@ -4605,10 +4039,10 @@ class MainWindow(
         self._simulation_mechanism_owner.clear_variable_sliders()
 
     def temperature_spinbox_value(self) -> float:
-        return self._simulation_solver_owner.temperature_spinbox_value()
+        return self._simulation_runtime_settings_owner.temperature_spinbox_value()
 
     def parse_sim_time_seconds(self) -> float:
-        return self._simulation_solver_owner.parse_sim_time_seconds()
+        return self._simulation_runtime_settings_owner.parse_sim_time_seconds()
 
     def _apply_wegscheider_resolution_reactions_rewrite(self, reactions_text: str) -> AuthoritativeRewriteOutcome:
         return self.rewrite_authoritative_reactions_text(
@@ -4770,27 +4204,6 @@ class MainWindow(
 
     def get_mechanism_text(self) -> str:
         return self._simulation_mechanism_owner.get_mechanism_text()
-
-    def explicit_startup_solver_name(self) -> Optional[str]:
-        solver = getattr(self, "_explicit_startup_solver_value", None)
-        return str(solver) if solver is not None else None
-
-    def has_explicit_startup_solver_override(self) -> bool:
-        return bool(getattr(self, "_explicit_startup_solver_override", False))
-
-    def has_explicit_startup_rtol_override(self) -> bool:
-        return bool(getattr(self, "_explicit_startup_rtol_override", False))
-
-    def has_explicit_startup_atol_override(self) -> bool:
-        return bool(getattr(self, "_explicit_startup_atol_override", False))
-
-    def explicit_startup_rtol(self) -> Optional[float]:
-        value = getattr(self, "_explicit_startup_rtol_value", None)
-        return float(value) if value is not None else None
-
-    def explicit_startup_atol(self) -> Optional[float]:
-        value = getattr(self, "_explicit_startup_atol_value", None)
-        return float(value) if value is not None else None
 
     def variable_metadata(self) -> Dict[str, Dict[str, object]]:
         return self._simulation_mechanism_owner.variable_metadata()
@@ -5833,7 +5246,7 @@ class MainWindow(
         step_analysis_context = None
         step_constraint_context = {
             "temperature_K": float(self._temperature_spinbox.value()),
-            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
+            "wegscheider_cyclicity_enabled": bool(self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled()),
         }
         for var_name, var_value in override_map.items():
             meta = metadata.get(var_name, {})
@@ -6215,7 +5628,8 @@ class MainWindow(
             return
 
         try:
-            from kindred.core.simulator.kinetics import K_from_deltaG_eq, rate_units
+            from kindred.core.kinetics import K_from_deltaG_eq
+            from kindred.core.simulator.kinetics import rate_units
             from kindred.core.units import UnitsModel
         except Exception:
             return
@@ -6345,117 +5759,17 @@ class MainWindow(
         description: str,
         record_undo: bool = True,
     ) -> bool:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-        from kindred.gui.undo_commands import SetMechanismSourceCommand
-
-        if not isinstance(source, MechanismAuthoringSource):
-            raise TypeError("source must be a MechanismAuthoringSource.")
-        transition_required = False
-        previous_authoritative_suppress = bool(
-            getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+        return self._mechanism_source_transaction_owner.set_authoritative_editor_source(
+            source,
+            description=str(description),
+            record_undo=bool(record_undo),
         )
-        self._suppress_authoritative_mechanism_input_change = True
-        try:
-            reactions_widget = self._mechanism_editor._reactions_text
-            current_reactions = str(reactions_widget.toPlainText() or "")
-            state_editor = getattr(getattr(self, "_mechanism_editor", None), "_state_network_editor", None)
-            state_editor_available = (
-                state_editor is not None
-                and hasattr(state_editor, "get_state_network_dsl")
-                and hasattr(state_editor, "set_state_network_dsl")
-            )
-            current_state = (
-                str(state_editor.get_state_network_dsl() or "")
-                if state_editor_available
-                else ""
-            )
-            reactions_text_s = str(source.reactions_text)
-            state_network_dsl_s = str(source.state_network_dsl)
-            reactions_changed = reactions_text_s != current_reactions
-            state_changed = state_editor_available and state_network_dsl_s != current_state
-            if not reactions_changed and not state_changed:
-                return False
-            owner = getattr(self, "_mechanism_session_owner", None)
-            old_source = (
-                owner.canonical_source
-                if owner is not None
-                else MechanismAuthoringSource.from_parts(
-                    reactions_text=current_reactions,
-                    state_network_dsl=current_state,
-                )
-            )
-            if bool(record_undo):
-                command = SetMechanismSourceCommand(
-                    new_source=source,
-                    old_source=old_source,
-                    apply_source=self._apply_mechanism_source_undo_stack_replacement,
-                    description=str(description),
-                )
-                self._undo_stack.push(command)
-            else:
-                self._write_complete_authoritative_mechanism_source_to_editor(source)
-            transition_required = True
-        finally:
-            self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-        return bool(transition_required)
 
     def _write_complete_authoritative_mechanism_source_to_editor(self, source) -> bool:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        if not isinstance(source, MechanismAuthoringSource):
-            raise TypeError("source must be a MechanismAuthoringSource.")
-        editor = getattr(self, "_mechanism_editor", None)
-        if editor is None:
-            raise RuntimeError("Mechanism editor is unavailable.")
-        reactions_widget = getattr(editor, "_reactions_text", None)
-        state_editor = getattr(editor, "_state_network_editor", None)
-        if reactions_widget is None:
-            raise RuntimeError("Mechanism Reactions editor is unavailable.")
-        state_editor_available = (
-            state_editor is not None
-            and hasattr(state_editor, "get_state_network_dsl")
-            and hasattr(state_editor, "set_state_network_dsl")
-        )
-        current_reactions = str(reactions_widget.toPlainText() or "")
-        current_state = (
-            str(state_editor.get_state_network_dsl() or "")
-            if state_editor_available
-            else ""
-        )
-        reactions_text = str(source.reactions_text)
-        state_network_dsl = str(source.state_network_dsl)
-        reactions_changed = reactions_text != current_reactions
-        state_changed = state_editor_available and state_network_dsl != current_state
-        if not reactions_changed and not state_changed:
-            return False
-
-        previous_reactions_block = reactions_widget.blockSignals(True)
-        previous_state_block = None
-        if state_editor_available:
-            previous_state_block = state_editor.blockSignals(True)
-        try:
-            if reactions_changed:
-                reactions_widget.setPlainText(reactions_text)
-            if state_changed:
-                state_editor.set_state_network_dsl(state_network_dsl)
-        finally:
-            if state_editor_available:
-                state_editor.blockSignals(bool(previous_state_block))
-            reactions_widget.blockSignals(bool(previous_reactions_block))
-
-        self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
-        self._refresh_reactions_draft_state()
-        return True
+        return self._mechanism_source_transaction_owner.write_complete_source_to_editor(source)
 
     def _apply_mechanism_source_undo_stack_replacement(self, source) -> None:
-        changed = self._write_complete_authoritative_mechanism_source_to_editor(source)
-        if not bool(changed):
-            return
-        if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
-            return
-        self._apply_authoritative_mechanism_transition(
-            transition_source="mechanism_source_undo_redo",
-        )
+        self._mechanism_source_transaction_owner.apply_undo_stack_replacement(source)
 
     def _rewrite_runtime_parameter_values_to_mechanism_editors(
         self,
@@ -6940,7 +6254,7 @@ class MainWindow(
             metadata = dict(self.variable_metadata())
         step_constraint_context = {
             "temperature_K": float(self._temperature_spinbox.value()),
-            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
+            "wegscheider_cyclicity_enabled": bool(self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled()),
         }
         try:
             outcome = analyze_step_parameter_update(
@@ -7362,11 +6676,13 @@ class MainWindow(
 
         # Populate dialog with current settings
         current_settings = {
-            "solver": str(self._initial_solver or solver_contract.default_solver_name),
-            'rtol': self._initial_rtol or 1e-6,
-            'atol': self._initial_atol or 1e-12,
-            'use_sparse_jacobian': self._use_sparse_jacobian,
-            'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
+            "solver": str(self._simulation_runtime_settings_owner.current_solver_name() or solver_contract.default_solver_name),
+            'rtol': self._simulation_runtime_settings_owner.current_rtol() or 1e-6,
+            'atol': self._simulation_runtime_settings_owner.current_atol() or 1e-12,
+            'use_sparse_jacobian': bool(self._simulation_runtime_settings_owner.use_sparse_jacobian()),
+            'wegscheider_cyclicity_enabled': bool(
+                self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled()
+            ),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
             'batch_runtime_lane_budget': int(self._sim_controller.batch_runtime_lane_budget),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
@@ -7385,11 +6701,13 @@ class MainWindow(
             previous_batch_runtime_pool_settings = (
                 self._simulation_batch_runtime_pool_settings_snapshot()
             )
-            current_solver = str(self._initial_solver or solver_contract.default_solver_name)
-            current_rtol = float(self._initial_rtol or 1e-6)
-            current_atol = float(self._initial_atol or 1e-12)
-            current_sparse = bool(self._use_sparse_jacobian)
-            current_wegscheider = bool(self._wegscheider_cyclicity_enabled)
+            current_solver = str(self._simulation_runtime_settings_owner.current_solver_name() or solver_contract.default_solver_name)
+            current_rtol = float(self._simulation_runtime_settings_owner.current_rtol() or 1e-6)
+            current_atol = float(self._simulation_runtime_settings_owner.current_atol() or 1e-12)
+            current_sparse = bool(self._simulation_runtime_settings_owner.use_sparse_jacobian())
+            current_wegscheider = bool(
+                self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled()
+            )
             current_runtime_settings = {
                 "solver": str(current_solver),
                 "rtol": float(current_rtol),
@@ -7439,10 +6757,6 @@ class MainWindow(
                     ),
                 ),
             }
-            if 'use_sparse_jacobian' in settings:
-                self._use_sparse_jacobian = bool(settings['use_sparse_jacobian'])
-            if 'wegscheider_cyclicity_enabled' in settings:
-                self._wegscheider_cyclicity_enabled = bool(settings['wegscheider_cyclicity_enabled'])
             if 'max_parallel_batch_workers' in settings:
                 try:
                     self._sim_controller.parallel_batch.max_parallel_workers = min(
@@ -7474,7 +6788,7 @@ class MainWindow(
                     settings['limit_blas_threads_per_worker']
                 )
             if 'result_cache_cap' in settings or 'preview_cache_cap' in settings:
-                self.set_simulation_cache_caps(
+                cache_caps_result = self._sim_controller.set_simulation_cache_caps(
                     result_cap=int(
                         settings.get(
                             'result_cache_cap',
@@ -7489,6 +6803,11 @@ class MainWindow(
                     ),
                     persist=True,
                 )
+                if not cache_caps_result.ok:
+                    self._simulation_dialogs.message_box_warning(
+                        "Simulation Cache",
+                        cache_caps_result.message or "Failed to update simulation cache settings.",
+                    )
             self._settings_owner.settings_set_value(
                 "simulation/slider_preview_solver",
                 str(next_runtime_settings["slider_preview_solver"]),
@@ -7508,18 +6827,27 @@ class MainWindow(
             self._mechanism_editor.set_slider_solver_value(str(next_runtime_settings["slider_preview_solver"]))
             self._mechanism_editor.set_slider_points_value(int(next_runtime_settings["slider_preview_points"]))
             logger.info(f"Solver settings updated: {settings}")
-            self._apply_solver_runtime_state(
-                solver=settings.get('solver', self._initial_solver or solver_contract.default_solver_name),
-                rtol=settings.get('rtol', self._initial_rtol or 1e-6),
-                atol=settings.get('atol', self._initial_atol or 1e-12),
+            self._apply_runtime_settings(
+                solver=settings.get('solver', self._simulation_runtime_settings_owner.current_solver_name() or solver_contract.default_solver_name),
+                rtol=settings.get('rtol', self._simulation_runtime_settings_owner.current_rtol() or 1e-6),
+                atol=settings.get('atol', self._simulation_runtime_settings_owner.current_atol() or 1e-12),
+                use_sparse_jacobian=settings.get('use_sparse_jacobian', current_sparse),
+                wegscheider_cyclicity_enabled=settings.get(
+                    'wegscheider_cyclicity_enabled',
+                    current_wegscheider,
+                ),
             )
             # Record dialog changes as user preferences.
-            self.config_controller.update_user_preference("solver", self._initial_solver)
-            self.config_controller.update_user_preference("rtol", self._initial_rtol)
-            self.config_controller.update_user_preference("atol", self._initial_atol)
-            self.config_controller.update_user_preference("use_sparse_jacobian", self._use_sparse_jacobian)
+            self.config_controller.update_user_preference("solver", self._simulation_runtime_settings_owner.current_solver_name())
+            self.config_controller.update_user_preference("rtol", self._simulation_runtime_settings_owner.current_rtol())
+            self.config_controller.update_user_preference("atol", self._simulation_runtime_settings_owner.current_atol())
             self.config_controller.update_user_preference(
-                "wegscheider_cyclicity_enabled", self._wegscheider_cyclicity_enabled,
+                "use_sparse_jacobian",
+                self._simulation_runtime_settings_owner.use_sparse_jacobian(),
+            )
+            self.config_controller.update_user_preference(
+                "wegscheider_cyclicity_enabled",
+                self._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled(),
             )
             self.config_controller.update_user_preference(
                 "max_parallel_batch_workers",
@@ -7562,41 +6890,6 @@ class MainWindow(
                     batch_runtime_pool_inputs_changed=bool(batch_runtime_pool_settings_changed)
                 )
 
-    def _open_temperature_schedule_editor(self):
-        """Open temperature schedule editor dialog."""
-        from kindred.gui.widgets.temperature_schedule_editor import TemperatureScheduleDialog
-
-        dialog = TemperatureScheduleDialog(self)
-
-        # Connect signal to insert DSL into mechanism editor
-        def on_schedule_created(dsl_text: str):
-            if not self._reactions_user_mutation_allowed():
-                return
-            # Get current mechanism text
-            current_text = self._mechanism_editor._reactions_text.toPlainText()
-
-            # Insert DSL at cursor position or append if empty
-            cursor = self._mechanism_editor._reactions_text.textCursor()
-            if cursor.hasSelection():
-                # Replace selection
-                cursor.insertText(dsl_text)
-            elif current_text.strip():
-                # Append with newline separator
-                cursor.movePosition(QtGui.QTextCursor.End)
-                if not current_text.endswith('\n'):
-                    cursor.insertText('\n')
-                cursor.insertText(dsl_text + '\n')
-            else:
-                # Insert at beginning
-                cursor.insertText(dsl_text + '\n')
-
-            logger.info(f"Temperature schedule inserted: {dsl_text}")
-
-        dialog.scheduleCreated.connect(on_schedule_created)
-
-        # Show dialog (non-modal to allow user to see mechanism editor)
-        dialog.exec()
-
     def closeEvent(self, event):
         """
         Handle window close event - save settings and clean up worker threads.
@@ -7626,6 +6919,10 @@ class MainWindow(
 
         fit_windows_ready = self._prepare_fit_window_shutdown_for_close()
         if not fit_windows_ready:
+            try:
+                self._sim_controller.abort_simulation_shutdown_for_close()
+            except Exception:
+                logger.debug("Failed to abort simulation shutdown after deferred close", exc_info=True)
             logger.warning("Deferring close event while fit window shutdown is still in progress")
             event.ignore()
             return

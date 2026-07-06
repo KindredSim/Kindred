@@ -1046,7 +1046,8 @@ def _resolve_Keq_from_params(
     Precondition: at least one of "Keq" or "dG_eq" must be present in params.
     Returns (Keq, dG_eqJ_or_None). Raises DSLError on numeric/overflow/underflow issues.
     """
-    from .kinetics import K_from_deltaG_eq, normalize_energy_to_J_per_mol
+    from ..kinetics import K_from_deltaG_eq
+    from .kinetics import normalize_energy_to_J_per_mol
 
     Keq = _float_or_none(params.get("Keq"))
     dG_eqJ: Optional[float] = None
@@ -1083,8 +1084,9 @@ def _parse_reaction_like_step(
     line_number: int | None,
     line_content: str | None,
 ) -> ParsedStep:
+    from ..kinetics import arrhenius_rate, eyring_rate
     from .common import molecularity
-    from .kinetics import arrhenius_rate, eyring_rate, normalize_energy_to_J_per_mol
+    from .kinetics import normalize_energy_to_J_per_mol
 
     try:
         react, prod, arrow = _parse_stoich(stoich_part)

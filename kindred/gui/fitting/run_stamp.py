@@ -195,10 +195,10 @@ def _normalize_dataset_specs_block(dataset_specs: Optional[Sequence[object]]) ->
     return sorted(normalized, key=lambda item: str(item["id"]))
 
 
-def _normalize_global_fit_weights_used(weights_used: Optional[Dict[str, float]]) -> Optional[dict[str, str]]:
-    if weights_used is None:
+def _normalize_global_fit_weight_map(weights: Optional[Dict[str, float]]) -> Optional[dict[str, str]]:
+    if weights is None:
         return None
-    return {str(k): _float_to_canonical_str(v) for k, v in sorted(weights_used.items()) if str(k).strip()}
+    return {str(k): _float_to_canonical_str(v) for k, v in sorted(weights.items()) if str(k).strip()}
 
 
 def _normalize_fit_config_dict(fit_config: Dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -217,10 +217,6 @@ def _normalize_fit_config_dict(fit_config: Dict[str, Any]) -> tuple[dict[str, An
     except Exception:
         config["max_nfev"] = 0
     config["seed"] = config.get("seed")
-    try:
-        config["parallel_starts"] = int(config.get("parallel_starts") or 0)
-    except Exception:
-        config["parallel_starts"] = 0
     for key in ("ftol", "xtol"):
         config[key] = _float_to_canonical_str(config.get(key, 0.0))
     return config, {"parameters": parameters, "fixed_params": fixed_params, "bounds": bounds, "log10_params": log10_params}
@@ -388,7 +384,8 @@ def build_global_fit_run_stamp(
     dataset_rows: Sequence[Dict[str, Any]],
     included_ids: Sequence[str],
     applied_fit_targets: Dict[str, Sequence[str]],
-    weights_used: Optional[Dict[str, float]],
+    weights_requested: Optional[Dict[str, float]],
+    objective_weights_used: Dict[str, float],
     weight_mode: str,
     applied_target_weights: Optional[Dict[str, Dict[str, float]]] = None,
     fit_config: Dict[str, Any],
@@ -417,7 +414,8 @@ def build_global_fit_run_stamp(
         applied_target_weights=applied_target_weights_norm,
     )
     dataset_specs_block = _normalize_dataset_specs_block(dataset_specs)
-    weights_block = _normalize_global_fit_weights_used(weights_used)
+    requested_weights_block = _normalize_global_fit_weight_map(weights_requested)
+    objective_weights_block = _normalize_global_fit_weight_map(objective_weights_used)
 
     config, extracted = _normalize_fit_config_dict(fit_config)
     parameters = extracted["parameters"]
@@ -454,12 +452,12 @@ def build_global_fit_run_stamp(
         "fit_targets_applied": {k: applied_norm[k] for k in ordered_ids if k in applied_norm},
         "target_weights_applied": {k: applied_target_weights_norm[k] for k in ordered_ids if k in applied_target_weights_norm},
         "weight_mode": str(weight_mode or ""),
-        "weights_used": weights_block,
+        "weights_requested": requested_weights_block,
+        "objective_weights_used": objective_weights_block,
         "algorithm": {
             "method": str(config.get("method") or ""),
             "max_nfev": int(config.get("max_nfev") or 0),
             "seed": (int(config["seed"]) if config.get("seed") is not None else None),
-            "parallel_starts": int(config.get("parallel_starts") or 0),
             "ftol": str(config.get("ftol") or ""),
             "xtol": str(config.get("xtol") or ""),
         },

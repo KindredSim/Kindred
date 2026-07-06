@@ -5,7 +5,11 @@ import math
 from typing import Any, Mapping, MutableMapping, Optional
 
 from kindred.core.simulator.common import normalize_energy_unit
-from kindred.core.temperature import TemperatureScheduleProtocol, coerce_temperature_schedule
+from kindred.core.temperature import (
+    TemperatureScheduleProtocol,
+    coerce_temperature_kelvin,
+    coerce_temperature_schedule,
+)
 from kindred.core.intervention_schedule import InterventionSchedule, coerce_intervention_schedule
 
 __all__ = [
@@ -91,14 +95,21 @@ class MechanismMetadataView:
     temperature_schedule: Optional[TemperatureScheduleProtocol] = None
     intervention_schedule: Optional[InterventionSchedule] = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "temperature_K",
+            coerce_temperature_kelvin(self.temperature_K, field=MechanismMetadataKeys.TEMPERATURE_K),
+        )
+
     @classmethod
     def from_metadata(cls, meta: Mapping[str, Any] | None) -> "MechanismMetadataView":
         if not isinstance(meta, Mapping):
             meta = {}
         return cls(
-            temperature_K=_as_float(
+            temperature_K=coerce_temperature_kelvin(
                 meta.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15),
-                default=298.15,
+                field=MechanismMetadataKeys.TEMPERATURE_K,
             ),
             standard_conc_M=_as_float(
                 meta.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0),

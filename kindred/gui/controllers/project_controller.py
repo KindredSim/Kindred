@@ -7,10 +7,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
-import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.datasets.observation_payload import export_rows_from_observations
 from kindred.gui.project_schema import (
     QSETTINGS_KEY_MAP,
     get_default_project_payload,
@@ -30,7 +28,6 @@ __all__ = ["ProjectController"]
 @dataclass(frozen=True, slots=True)
 class ExportPrecondition:
     active_display_transaction: bool = False
-    payload: Optional[Dict[str, object]] = None
 
 
 class ProjectController(QtCore.QObject):
@@ -177,11 +174,6 @@ class ProjectController(QtCore.QObject):
         get_user_preference = self.mw.config_controller.get_user_preference
         for key in QSETTINGS_KEY_MAP:
             payload[key] = get_user_preference(key)
-        from kindred.core.simulator.solvers import normalize_solver_name
-
-        solver_method, solver_warning = normalize_solver_name(payload["solver"])
-        payload["solver_method"] = str(solver_method)
-        payload["solver_warning"] = str(solver_warning) if solver_warning else None
         applied = self._apply_project_payload(payload, record_undo=False)
         if not applied:
             return
@@ -287,14 +279,14 @@ class ProjectController(QtCore.QObject):
                 "No active simulation display transaction is available to export."
             )
             return None
-        payload = self._resolve_export_payload(current_plot)
-        if payload is None:
+        build_visible_export = getattr(current_plot, "build_visible_export", None)
+        if not callable(build_visible_export):
             self._warn_no_export_target(
                 "No simulation or dataset data available to export.\n\n"
                 "Please run a simulation (Simulation → Run) or load a dataset (Data → Load Dataset)."
             )
             return None
-        return ExportPrecondition(payload=payload)
+        return ExportPrecondition()
 
     def _active_transaction_export_available(self, plot_widget) -> bool:
         if not self._is_results_main_plot(plot_widget):
@@ -309,60 +301,6 @@ class ProjectController(QtCore.QObject):
         if not callable(main_plot_getter):
             return False
         return plot_widget is main_plot_getter()
-
-    def _resolve_export_payload(self, plot_widget) -> Optional[Dict[str, object]]:
-        if plot_widget is None:
-            return None
-
-        export_payload = getattr(plot_widget, "export_payload", None)
-        if callable(export_payload):
-            try:
-                payload = export_payload()
-            except ValueError:
-                payload = None
-            if isinstance(payload, dict) and payload:
-                normalized = self._normalize_export_payload(payload)
-                if normalized is not None:
-                    return normalized
-
-        get_dataset_data = getattr(plot_widget, "get_dataset_data", None)
-        if not callable(get_dataset_data):
-            return None
-        try:
-            data = get_dataset_data()
-        except ValueError:
-            data = None
-        if isinstance(data, dict) and data:
-            t_raw = data.get("t")
-            if t_raw is None:
-                return None
-            t_values = np.asarray(t_raw, dtype=float).reshape(-1)
-            if "species" in data and isinstance(data.get("species"), dict):
-                species_map = dict(data["species"])
-            else:
-                species_map = {k: v for k, v in data.items() if k != "t"}
-            species_map = {str(k): v for k, v in species_map.items() if k and k != "species"}
-            if not species_map:
-                return None
-            return {"t": t_values, "series": species_map}
-
-        return None
-
-    @staticmethod
-    def _normalize_export_payload(payload: Dict[str, object]) -> Optional[Dict[str, object]]:
-        observations = payload.get("observations")
-        if isinstance(observations, dict) and observations:
-            normalized: Dict[str, object] = {"observations": dict(observations)}
-            if payload.get("x_header") is not None:
-                normalized["x_header"] = str(payload.get("x_header"))
-            return normalized
-        t_raw = payload.get("t")
-        if t_raw is None:
-            return None
-        series = payload.get("series")
-        if not isinstance(series, dict) or not series:
-            return None
-        return {"t": np.asarray(t_raw, dtype=float).reshape(-1), "series": dict(series)}
 
     def handle_export_config(self, config: dict) -> None:
         try:
@@ -406,12 +344,8 @@ class ProjectController(QtCore.QObject):
             if isinstance(export, tuple) and len(export) == 2:
                 return export
 
-        payload = self._resolve_export_payload(plot)
-        if payload:
-            return self._prepare_payload_export_rows(payload, plot=plot, scope=scope)
-
         raise ValueError(
-            "Current plot does not implement the export interface (expected build_visible_export() or export_payload())."
+            "Current plot does not implement the export interface (expected build_visible_export())."
         )
 
     def _prepare_active_transaction_export_rows(
@@ -422,48 +356,3 @@ class ProjectController(QtCore.QObject):
         if self._is_results_main_plot(plot):
             return self.mw.results_controller.build_main_plot_csv_export(scope)
         return None
-
-    @staticmethod
-    def _prepare_payload_export_rows(
-        payload: Dict[str, object],
-        *,
-        plot,
-        scope: str,
-    ) -> Tuple[List[str], List[List[object]]]:
-        # Payload-based export is a generic fallback for plot widgets that do not
-        # implement the public `build_visible_export(scope)` interface. This code
-        # must not reach into plot-private UI state.
-        _ = plot
-        scope = str(scope or "")
-        observations = payload.get("observations")
-        if isinstance(observations, dict) and observations:
-            header, rows = export_rows_from_observations(observations)
-            if header:
-                header[0] = str(payload.get("x_header") or "Time")
-            return header, rows
-        t_values = np.asarray(payload.get("t"), dtype=float).reshape(-1)
-        if t_values.size == 0:
-            raise ValueError("Time axis has no points to export.")
-
-        series = payload.get("series") or {}
-        if not isinstance(series, dict) or not series:
-            raise ValueError("No series data available to export.")
-
-        species_names = [str(name) for name in series.keys() if str(name)]
-
-        arrays: List[np.ndarray] = []
-        for name in species_names:
-            arr = np.asarray(series[name], dtype=float).reshape(-1)
-            if arr.size != t_values.size:
-                raise ValueError(
-                    f"Series '{name}' length ({arr.size}) does not match time axis length ({t_values.size})."
-                )
-            arrays.append(arr)
-
-        header = ["Time"] + species_names
-
-        def row_iter():
-            for idx in range(t_values.shape[0]):
-                yield [t_values[idx]] + [arr[idx] for arr in arrays]
-
-        return header, row_iter()

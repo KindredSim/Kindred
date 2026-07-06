@@ -201,7 +201,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     - Reactions tab: DSL text editor for reactions, algebra declarations, and computational-mode content
     - Notes tab: persisted free-form text (never parsed or injected)
 
-    Advanced features (Species Registry and State Network) are accessible via Edit menu.
+    The State Network editor is accessible via the Edit menu.
 
     The reaction text editor is directly editable. MainWindow owns the
     draft/apply/discard flow and validates only when changes are applied.
@@ -568,10 +568,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         notes_layout.addWidget(self._notes_text)
         self._tabs.addTab(self._notes_tab, "Notes")
 
-        # Species and State Network tabs moved to Edit menu
-        # Keep references for menu access but don't add to main tabs
-        self._species_tab = None  # Created on demand from Edit menu
-        # Keep for Edit menu access, but ensure it is not visible in the tabbed editor:
+        # Keep the State Network editor available through the Edit menu without
+        # adding it to the tabbed editor:
         # a visible, non-laid-out child widget will sit at (0, 0) and can intercept
         # clicks on the QTabBar (making it impossible to switch back to "Reactions").
         self._state_network_editor = StateNetworkEditor(parent=self)
@@ -831,7 +829,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def set_slider_solver_value(self, s: str) -> None:
         """Set the slider solver value."""
-        solver_name, _warning = normalize_solver_name(s)
+        solver_name = normalize_solver_name(s)
         idx = self._slider_solver_combo.findText(solver_name)
         if idx < 0:
             idx = self._slider_solver_combo.findText(DEFAULT_SOLVER_NAME)

@@ -11,8 +11,8 @@ import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
 
+from ..kinetics import K_from_deltaG_eq
 from .errors import DSLError, non_integer_molecularity_error, non_positive_stoichiometry_error
-from .kinetics import K_from_deltaG_eq
 
 __all__ = [
     "DSLError",

@@ -2457,6 +2457,8 @@ def main(argv: list[str]) -> int:
             continue
         if inf.has_main_guard:
             continue
+        if mod in entrypoints:
+            continue
         if inf.relpath.startswith("tools/audit/"):
             continue
         if len(incoming_sources.get(mod, set())) == 0:

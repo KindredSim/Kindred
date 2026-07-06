@@ -41,6 +41,7 @@ __all__ = [
     "FITTING_DEFAULTS_KEYS",
     "get_default_project_payload",
     "get_user_preference_payload",
+    "sanitize_simulation_time_preference",
     "validate_project_payload",
 ]
 
@@ -112,13 +113,12 @@ _PROJECT_STRING_FIELDS = frozenset(
         "version",
         "notes",
         "solver",
-        "solver_method",
         "simulation_time",
         "fitting_method",
         "fitting_solver",
     }
 )
-_PROJECT_OPTIONAL_STRING_FIELDS = frozenset({"solver_warning"})
+_PROJECT_OPTIONAL_STRING_FIELDS = frozenset()
 _PROJECT_BOOL_FIELDS = frozenset(
     {
         "use_sparse_jacobian",
@@ -241,21 +241,12 @@ def _require_choice_field(
 ) -> None:
     value = str(data[field]).strip()
     if normalize_solver:
-        normalized, warning = normalize_solver_name(value)
-        if warning or str(normalized) not in choices:
+        normalized = normalize_solver_name(value)
+        if str(normalized) not in choices:
             raise ValueError(f"project payload field {field!r} must be one of {choices!r}.")
         return
     if value.lower() not in {choice.lower() for choice in choices}:
         raise ValueError(f"project payload field {field!r} must be one of {choices!r}.")
-
-
-def _require_solver_metadata_consistency(data: Mapping[str, object]) -> None:
-    solver_method, solver_warning = normalize_solver_name(str(data["solver"]))
-    if data["solver_method"] != str(solver_method):
-        raise ValueError("project payload field 'solver_method' does not match 'solver'.")
-    expected_warning = str(solver_warning) if solver_warning else None
-    if data["solver_warning"] != expected_warning:
-        raise ValueError("project payload field 'solver_warning' does not match 'solver'.")
 
 
 def validate_project_payload(data: Mapping[str, object]) -> MechanismAuthoringSource:
@@ -290,7 +281,7 @@ def validate_project_payload(data: Mapping[str, object]) -> MechanismAuthoringSo
     _require_simulation_time(data)
     _require_choice_field(data, "fitting_method", FITTING_METHODS)
     _require_choice_field(data, "fitting_solver", FITTING_SOLVERS, normalize_solver=True)
-    _require_solver_metadata_consistency(data)
+    _require_choice_field(data, "solver", ("Radau", "BDF"), normalize_solver=True)
 
     return source
 
@@ -304,6 +295,18 @@ def get_default_project_payload() -> dict[str, object]:
     return copy.deepcopy(PROJECT_DEFAULTS)
 
 
+def sanitize_simulation_time_preference(raw: object, default: object | None = None) -> str:
+    fallback = PROJECT_DEFAULTS["simulation_time"] if default is None else default
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return str(fallback)
+    minimum, maximum = SIMULATION_TIME_RANGE
+    if not math.isfinite(value) or value <= float(minimum) or value > float(maximum):
+        return str(fallback)
+    return f"{float(value):g}"
+
+
 def get_user_preference_payload(settings: QSettings) -> dict[str, object]:
     """Build a complete payload using QSettings values for dual-persisted keys.
 
@@ -313,6 +316,50 @@ def get_user_preference_payload(settings: QSettings) -> dict[str, object]:
     """
     result = get_default_project_payload()
 
+    def _finite_positive_setting(raw: object, default: object, key: str) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return float(default)
+        if not math.isfinite(value) or value <= 0.0:
+            return float(default)
+        minimum = _PROJECT_POSITIVE_NUMBER_MINIMUMS.get(key)
+        if minimum is not None and value < float(minimum):
+            return float(default)
+        maximum = _PROJECT_POSITIVE_NUMBER_MAXIMUMS.get(key)
+        if maximum is not None and value > float(maximum):
+            return float(default)
+        return float(value)
+
+    def _int_setting(raw: object, default: object, key: str) -> int:
+        try:
+            value = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return int(default)
+        if key in {"max_parallel_batch_workers", "batch_runtime_lane_budget"}:
+            return min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(1, value),
+            )
+        limits = _PROJECT_INT_RANGES.get(key)
+        if limits is None:
+            return int(value)
+        minimum, maximum = limits
+        if value < int(minimum) or value > int(maximum):
+            return int(default)
+        return int(value)
+
+    def _solver_setting(raw: object, default: object) -> str:
+        try:
+            return normalize_solver_name(str(raw or default))
+        except Exception:
+            return normalize_solver_name(str(default))
+
+    def _choice_setting(raw: object, default: object, choices: tuple[str, ...]) -> str:
+        value = str(raw or default).strip()
+        by_lower = {str(choice).lower(): str(choice) for choice in choices}
+        return by_lower.get(value.lower(), str(default))
+
     # Read each dual-persisted key from QSettings with type-safe coercion.
     for key, qs_key in QSETTINGS_KEY_MAP.items():
         default = PROJECT_DEFAULTS[key]
@@ -320,21 +367,22 @@ def get_user_preference_payload(settings: QSettings) -> dict[str, object]:
             if isinstance(default, bool):
                 result[key] = settings.value(qs_key, default, type=bool)
             elif isinstance(default, float):
-                result[key] = settings.value(qs_key, default, type=float)
+                result[key] = _finite_positive_setting(
+                    settings.value(qs_key, default, type=float),
+                    default,
+                    key,
+                )
             elif isinstance(default, int):
-                raw = settings.value(qs_key, default, type=int)
-                if key in {"max_parallel_batch_workers", "batch_runtime_lane_budget"}:
-                    raw = min(
-                        int(MAX_PARALLEL_WORKERS_CEILING),
-                        max(1, raw),
-                    )
-                result[key] = raw
+                result[key] = _int_setting(settings.value(qs_key, default, type=int), default, key)
             elif key == "simulation_time":
-                raw = settings.value(qs_key, default)
-                if isinstance(raw, (int, float)):
-                    result[key] = f"{float(raw):g}"
-                else:
-                    result[key] = str(raw) if raw else str(default)
+                result[key] = sanitize_simulation_time_preference(
+                    settings.value(qs_key, default),
+                    default,
+                )
+            elif key == "fitting_method":
+                result[key] = _choice_setting(settings.value(qs_key, default), default, FITTING_METHODS)
+            elif key in {"solver", "fitting_solver"}:
+                result[key] = _solver_setting(settings.value(qs_key, default), default)
             else:
                 raw = settings.value(qs_key, default)
                 result[key] = str(raw) if raw else str(default)

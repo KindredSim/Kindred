@@ -93,7 +93,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         stats_group = QtWidgets.QGroupBox("Fit Statistics")
         form = QtWidgets.QFormLayout(stats_group)
         self._stats_labels: Dict[str, QtWidgets.QLabel] = {}
-        for label_text in ["Datasets", "Series", "Points", "Parameters", "DF", "SSQ", "Weighted SSQ", "-logL"]:
+        for label_text in ["Datasets", "Series", "Points", "Parameters", "DF", "SSQ", "Objective SSQ"]:
             value_label = QtWidgets.QLabel("\u2014")
             form.addRow(f"{label_text}:", value_label)
             self._stats_labels[label_text] = value_label
@@ -302,14 +302,14 @@ class FitTrackerPanel(QtWidgets.QWidget):
             delta_text = f" (delta {cost - self._previous_cost:.2e})"
         self._previous_cost = cost if np.isfinite(cost) else self._previous_cost
         self._set_live_text(
-            f"Iter {iteration} | Cost {_format_metric(cost)}{delta_text}",
+            f"Iter {iteration} | Objective SSQ {_format_metric(cost)}{delta_text}",
             dict(payload_dict.get("shared_params") or {}),
         )
 
     def update_final(self, iteration: int, cost: float, shared_params: Dict[str, float]) -> None:
         self._previous_cost = float(cost) if np.isfinite(float(cost)) else self._previous_cost
         self._set_live_text(
-            f"Iter {int(iteration)} | Cost {_format_metric(cost)}",
+            f"Iter {int(iteration)} | Objective SSQ {_format_metric(cost)}",
             dict(shared_params or {}),
         )
 
@@ -552,6 +552,16 @@ class RunResultsTab(QtWidgets.QWidget):
     ) -> None:
         _ = dataset_ids
         self._render_projection = None
+        self._last_stats = {}
+        if self._stamp_dialog is not None and self._stamp_dialog.isVisible():
+            self._stamp_dialog.refresh(
+                self._last_run_stamp,
+                self._last_run_stamp_hash,
+                self._last_run_stamp_short,
+                None,
+                fitted_params=self._last_fitted_params or None,
+                dataset_fitted_params=self._format_dataset_params_for_dialog(),
+            )
         self._refresh_plot_views(refresh_all=refresh_all)
 
     def push_final_result(self, result: "GlobalFitResult", dataset_entries: Sequence[Dict[str, Any]]) -> None:
@@ -798,14 +808,18 @@ class RunResultsTab(QtWidgets.QWidget):
             else _as_float_array(entry.get("x_obs", entry.get("t")))
         )
         data_y = all_species.get(current_species, np.asarray([], dtype=float))
-        chi_squared = None
+        residual_mse = None
         r_squared = None
         if dataset_projection is not None:
             dataset_stats = dict(dataset_projection.dataset_stats)
             try:
-                chi_squared = float(dataset_stats.get("chi_squared")) if dataset_stats.get("chi_squared") is not None else None
+                residual_mse = (
+                    float(dataset_stats.get("residual_mse"))
+                    if dataset_stats.get("residual_mse") is not None
+                    else None
+                )
             except Exception:
-                chi_squared = None
+                residual_mse = None
             try:
                 r_squared = float(dataset_stats.get("r_squared")) if dataset_stats.get("r_squared") is not None else None
             except Exception:
@@ -815,6 +829,11 @@ class RunResultsTab(QtWidgets.QWidget):
             dataset_projection.observed_x_label
             if dataset_projection is not None
             else ("Time" if x_name == "t" else x_name)
+        )
+        x_units = (
+            dataset_projection.observed_x_units
+            if dataset_projection is not None
+            else ("s" if x_name == "t" else None)
         )
         entry_id = str(entry.get("id") or "").strip()
         entry_index = 0
@@ -832,10 +851,10 @@ class RunResultsTab(QtWidgets.QWidget):
             "data_x": data_x,
             "data_y": data_y,
             "fit_render_projection": dataset_projection,
-            "chi_squared": chi_squared,
+            "residual_mse": residual_mse,
             "r_squared": r_squared,
             "all_species": all_species,
             "current_species": current_species,
             "x_label": x_label,
-            "x_units": "s" if x_name == "t" else None,
+            "x_units": x_units,
         }

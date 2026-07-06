@@ -9,12 +9,12 @@ from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
-from kindred.core.api.simulation import SimulationBuilder
 from kindred.core.fitting_evaluation import SerialFittingEvaluator, coerce_fitting_series_evaluator
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     coerce_prepared_simulation_metadata,
 )
+from kindred.gui.fitting.simulation_builder_contract import SimulationBuilder
 from kindred.gui.fitting.runtime_inputs import FittingEvaluatorRuntimeSettings
 from kindred.gui.project_schema import SIMULATION_TEMPERATURE_K_RANGE
 

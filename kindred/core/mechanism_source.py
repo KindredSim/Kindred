@@ -7,6 +7,24 @@ _STATE_NETWORK_SECTION_HEADER = "# State Network"
 _PAYLOAD_FIELDS = frozenset({"reactions_text", "state_network_dsl"})
 
 
+def _line_starts_state_network_record(line: str) -> bool:
+    lowered = str(line or "").strip().lower()
+    return (
+        lowered.startswith("state:")
+        or lowered.startswith("edge:")
+        or lowered.startswith("energy=")
+    )
+
+
+def _looks_like_state_network_section(lines: list[str]) -> bool:
+    for line in lines:
+        stripped = str(line or "").strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _line_starts_state_network_record(stripped)
+    return False
+
+
 @dataclass(frozen=True)
 class MechanismAuthoringSource:
     """Complete authored mechanism source: Reactions text plus State Network DSL."""
@@ -29,6 +47,7 @@ class MechanismAuthoringSource:
                 index
                 for index, line in enumerate(lines)
                 if line.strip().lower() == _STATE_NETWORK_SECTION_HEADER.lower()
+                and _looks_like_state_network_section(lines[index + 1 :])
             ),
             None,
         )

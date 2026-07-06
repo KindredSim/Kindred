@@ -512,9 +512,6 @@ def prepare_fitting_execution_context(
         use_sparse_jacobian=bool(use_sparse_jacobian),
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
-    if prepared_solver_config.solver_warning:
-        logger.warning(prepared_solver_config.solver_warning)
-
     bound = prepare_bound_mechanism(
         mechanism_text=mechanism_text,
         param_names=list(param_names or []),
@@ -569,11 +566,6 @@ def prepare_fitting_execution_context(
         temperature_K=float(temperature_K),
         solver_requested=str(prepared_solver_config.solver_input),
         solver_normalized=str(prepared_solver_config.solver),
-        solver_warning=(
-            str(prepared_solver_config.solver_warning)
-            if prepared_solver_config.solver_warning
-            else None
-        ),
         rtol=float(prepared_solver_config.rtol),
         atol=float(prepared_solver_config.atol),
         use_sparse_jacobian=bool(prepared_solver_config.use_sparse_jacobian),

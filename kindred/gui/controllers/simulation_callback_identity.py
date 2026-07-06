@@ -34,6 +34,10 @@ class SimulationCallbackIdentity:
             raise ValueError("SimulationCallbackIdentity.cache_key is required.")
         if not isinstance(self.simulation_identity, Mapping):
             raise ValueError("SimulationCallbackIdentity.simulation_identity is required.")
+        if not self.simulation_identity:
+            raise ValueError("SimulationCallbackIdentity.simulation_identity cannot be empty.")
+        if bool(self.fast_mode) and self.preview_batch_cache_token is None:
+            raise ValueError("Preview callback identity requires preview batch cache token.")
         object.__setattr__(self, "run_id", int(self.run_id))
         object.__setattr__(self, "fast_mode", bool(self.fast_mode))
         object.__setattr__(self, "request_id", int(self.request_id))
@@ -96,6 +100,10 @@ class SimulationCallbackIdentity:
             raise ValueError("SimulationCallbackIdentity.request_id is required.")
         if cache_key is None:
             raise ValueError("SimulationCallbackIdentity.cache_key is required.")
+        if not isinstance(simulation_identity, Mapping) or not simulation_identity:
+            raise ValueError("SimulationCallbackIdentity.simulation_identity cannot be empty.")
+        if bool(fast_mode) and preview_batch_cache_token is None:
+            raise ValueError("Preview callback identity requires preview batch cache token.")
         return cls(
             run_id=int(run_id),
             fast_mode=bool(fast_mode),

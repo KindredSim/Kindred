@@ -45,8 +45,6 @@ def _build_simulation_success_payload_base(
         "mechanism_text": str(mechanism_text or ""),
         "solver_config": dict(solver_config or {}),
         "provenance": provenance_payload,
-        "fallback_occurred": bool(getattr(result, "fallback_occurred", False)),
-        "fallback_message": getattr(result, "fallback_message", None),
     }
     if base_species_count is not None:
         payload["base_species_count"] = max(0, int(base_species_count))

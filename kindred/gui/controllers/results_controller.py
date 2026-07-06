@@ -2139,17 +2139,58 @@ class ResultsController(QtCore.QObject):
             return None
         focus_resolution = resolution
         if focused_set_id not in requested_show_set:
-            try:
-                focus_resolution = self._ui.workspace_display_request_resolution((focused_set_id,))
-            except Exception as exc:
-                logger.debug("Failed to resolve focused set display availability: %s", exc, exc_info=True)
-                focus_resolution = resolution
+            return (
+                resolution.unavailable_cause
+                or DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE
+            )
         if focus_resolution.resolved_entries and focus_resolution.focused_has_resolved_entry:
             return None
         return (
             focus_resolution.unavailable_cause
             or resolution.unavailable_cause
             or DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE
+        )
+
+    @staticmethod
+    def _semantic_unavailable_set_ids_for_transition(
+        resolution: BatchDisplayRequestResolution,
+        transition_outcome: DisplayTransitionOutcome | None,
+    ) -> tuple[str, ...]:
+        transition_ids: tuple[str, ...] = ()
+        if isinstance(transition_outcome, DisplayTransitionOutcome):
+            transition_ids = tuple(
+                str(set_id)
+                for set_id in (transition_outcome.semantic_unavailable_set_ids or ())
+                if str(set_id)
+            )
+        return tuple(
+            deduped_set_ids(
+                (
+                    *tuple(resolution.semantic_unavailable_set_ids or ()),
+                    *transition_ids,
+                )
+            )
+        )
+
+    @staticmethod
+    def _missing_intent_set_ids_for_transition(
+        resolution: BatchDisplayRequestResolution,
+        transition_outcome: DisplayTransitionOutcome | None,
+    ) -> tuple[str, ...]:
+        transition_ids: tuple[str, ...] = ()
+        if isinstance(transition_outcome, DisplayTransitionOutcome):
+            transition_ids = tuple(
+                str(set_id)
+                for set_id in (transition_outcome.missing_intent_set_ids or ())
+                if str(set_id)
+            )
+        return tuple(
+            deduped_set_ids(
+                (
+                    *tuple(resolution.missing_intent_set_ids or ()),
+                    *transition_ids,
+                )
+            )
         )
 
     def _completed_run_denied_unavailable_outcome(
@@ -2175,12 +2216,20 @@ class ResultsController(QtCore.QObject):
                 if str(entry.set_id)
             ),
         }
+        semantic_unavailable_ids = (
+            tuple(deduped_set_ids(resolution.semantic_unavailable_set_ids))
+            if cause is DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE
+            else ()
+        )
+        semantic_unavailable_set = set(semantic_unavailable_ids)
         missing_ids = tuple(
             set_id
             for set_id in requested_ids
-            if set_id not in available_ids
+            if set_id not in available_ids and set_id not in semantic_unavailable_set
         )
-        unresolved_ids = missing_ids or requested_ids
+        unresolved_ids = tuple(
+            deduped_set_ids((*missing_ids, *semantic_unavailable_ids))
+        ) or requested_ids
         outcome = self._record_unpublished_display_request_outcome(
             cause=cause,
             affected_set_ids=requested_ids,
@@ -2188,6 +2237,7 @@ class ResultsController(QtCore.QObject):
             requested_labels_by_set_id=self._popup_labels_by_set_id(requested_ids),
             unresolved_intent_set_ids=unresolved_ids,
             missing_intent_set_ids=missing_ids,
+            semantic_unavailable_set_ids=semantic_unavailable_ids,
             outcome_kind=DisplayTransitionOutcomeKind.DENIED,
             display_status=DisplayStatus.DISPLAY_DENIED,
         )
@@ -2968,6 +3018,14 @@ class ResultsController(QtCore.QObject):
                 has_resolved_workspace_preview=resolution.has_resolved_workspace_preview,
                 focused_uses_workspace_controls=resolution.focused_uses_workspace_controls,
                 focused_has_resolved_entry=resolution.focused_has_resolved_entry,
+                missing_intent_set_ids=self._missing_intent_set_ids_for_transition(
+                    resolution,
+                    transition_outcome,
+                ),
+                semantic_unavailable_set_ids=self._semantic_unavailable_set_ids_for_transition(
+                    resolution,
+                    transition_outcome,
+                ),
             ),
         )
 
@@ -3071,6 +3129,14 @@ class ResultsController(QtCore.QObject):
                 has_resolved_workspace_preview=resolution.has_resolved_workspace_preview,
                 focused_uses_workspace_controls=resolution.focused_uses_workspace_controls,
                 focused_has_resolved_entry=resolution.focused_has_resolved_entry,
+                missing_intent_set_ids=self._missing_intent_set_ids_for_transition(
+                    resolution,
+                    transition_outcome,
+                ),
+                semantic_unavailable_set_ids=self._semantic_unavailable_set_ids_for_transition(
+                    resolution,
+                    transition_outcome,
+                ),
             ),
         )
 
@@ -3102,21 +3168,34 @@ class ResultsController(QtCore.QObject):
                 ),
                 resolution,
             )
-        if cache_resolution_cause_for_transition(
-            self._transition_outcome(outcome),
+        transition_outcome = self._transition_outcome(outcome)
+        transition_cause = cache_resolution_cause_for_transition(
+            transition_outcome,
             default=DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE,
-        ) is not DisplayTransitionCause.INVALID_CACHE_ENTRY:
+        )
+        if transition_cause not in {
+            DisplayTransitionCause.INVALID_CACHE_ENTRY,
+            DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+        }:
             return None, resolution
         return (
             None,
             BatchDisplayRequestResolution(
                 resolved_entries=resolution.resolved_entries,
-                unavailable_cause=DisplayTransitionCause.INVALID_CACHE_ENTRY,
+                unavailable_cause=transition_cause,
                 coverage=resolution.coverage,
                 has_workspace_display_request=resolution.has_workspace_display_request,
                 has_resolved_workspace_preview=resolution.has_resolved_workspace_preview,
                 focused_uses_workspace_controls=resolution.focused_uses_workspace_controls,
                 focused_has_resolved_entry=resolution.focused_has_resolved_entry,
+                missing_intent_set_ids=self._missing_intent_set_ids_for_transition(
+                    resolution,
+                    transition_outcome,
+                ),
+                semantic_unavailable_set_ids=self._semantic_unavailable_set_ids_for_transition(
+                    resolution,
+                    transition_outcome,
+                ),
             ),
         )
 
@@ -3187,6 +3266,32 @@ class ResultsController(QtCore.QObject):
                 affected_set_ids=requested_ids,
                 unresolved_intent_set_ids=requested_ids,
                 cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
+                display_status=DisplayStatus.DISPLAY_DENIED,
+            )
+            self._ui.set_status_text(display_transition_status_text(transition_outcome))
+            return self._refresh_failed(
+                focused_controls_use_workspace=request.focused_dirty,
+                transition_outcome=transition_outcome,
+            )
+        if resolution.unavailable_cause is DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE:
+            semantic_ids = tuple(
+                deduped_set_ids(resolution.semantic_unavailable_set_ids)
+            ) or requested_ids
+            semantic_set = set(semantic_ids)
+            missing_ids = tuple(
+                set_id
+                for set_id in deduped_set_ids(resolution.missing_intent_set_ids)
+                if set_id not in semantic_set
+            )
+            unresolved_ids = tuple(
+                deduped_set_ids((*missing_ids, *semantic_ids))
+            )
+            transition_outcome = self._record_unpublished_display_request_outcome(
+                affected_set_ids=requested_ids,
+                unresolved_intent_set_ids=unresolved_ids or requested_ids,
+                missing_intent_set_ids=missing_ids,
+                semantic_unavailable_set_ids=semantic_ids,
+                cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
                 display_status=DisplayStatus.DISPLAY_DENIED,
             )
             self._ui.set_status_text(display_transition_status_text(transition_outcome))
@@ -4220,10 +4325,11 @@ class ResultsController(QtCore.QObject):
         if not target_ids:
             return None
         display_ids = requested_show_ids or target_ids
+        if set(display_ids) - set(target_ids):
+            return None
         if (
             not display_ids
-            or set(display_ids) != set(target_ids)
-            or set(target_ids) != set(entries_by_id)
+            or set(display_ids) - set(entries_by_id)
         ):
             return None
         primary_id = str(prefer_set or "").strip()
@@ -4262,13 +4368,13 @@ class ResultsController(QtCore.QObject):
         target_ids = tuple(str(set_id) for set_id in transaction.target_set_ids if str(set_id))
         if not expected_ids:
             return self._simulation_no_display_outcome(DisplayTransitionCause.DISPLAY_MUTATION_DENIED)
-        if not target_ids or set(target_ids) != set(expected_ids):
+        if not target_ids or set(expected_ids) - set(target_ids):
             return self._simulation_no_display_outcome(
                 DisplayTransitionCause.DISPLAY_MUTATION_DENIED,
                 affected_set_ids=expected_ids,
             )
         entries_by_id = {str(entry.set_id): entry for entry in entries if str(entry.set_id)}
-        if set(expected_ids) != set(entries_by_id) or set(target_ids) != set(entries_by_id):
+        if set(expected_ids) != set(entries_by_id):
             return self._simulation_no_display_outcome(
                 DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
                 affected_set_ids=expected_ids,
@@ -4420,10 +4526,32 @@ class ResultsController(QtCore.QObject):
         prefer_set: Optional[str],
         valid_set_ids: Sequence[str],
         fresh_preview_entries: Mapping[str, FreshPreviewDisplayEntry],
+        semantic_unavailable_set_ids: Sequence[str],
         request_id: Optional[int],
         run_id: Optional[int],
     ) -> Optional[SimulationCompletionDisplayOutcome]:
         if str(cache_kind or "") == "preview":
+            target_ids = tuple(deduped_set_ids(target_set_ids or ()))
+            requested_show_ids = tuple(deduped_set_ids(requested_show_set_ids or ()))
+            semantic_unavailable_ids = tuple(
+                set_id
+                for set_id in deduped_set_ids(semantic_unavailable_set_ids or ())
+                if ((not target_ids) or set_id in target_ids)
+                and ((not requested_show_ids) or set_id in requested_show_ids)
+            )
+            if semantic_unavailable_ids:
+                requested_scope = requested_show_ids or target_ids or semantic_unavailable_ids
+                return self._simulation_no_display_outcome(
+                    DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+                    affected_set_ids=semantic_unavailable_ids,
+                    requested_show_set_ids=requested_scope,
+                    requested_labels_by_set_id=self._popup_labels_by_set_id(requested_scope),
+                    attempted_display_set_ids=target_ids,
+                    unresolved_intent_set_ids=semantic_unavailable_ids,
+                    semantic_unavailable_set_ids=semantic_unavailable_ids,
+                    outcome_kind=DisplayTransitionOutcomeKind.FAILED,
+                    display_status=DisplayStatus.NO_COMPLETE_DISPLAYABLE_REQUEST_SCOPE,
+                )
             fresh_outcome = self.publish_fresh_preview_from_entries(
                 fresh_preview_entries=fresh_preview_entries,
                 requested_show_set_ids=requested_show_set_ids,
@@ -4474,6 +4602,7 @@ class ResultsController(QtCore.QObject):
         focused_set_id: Optional[str],
         valid_set_ids: Sequence[str],
         fresh_preview_entries: Mapping[str, FreshPreviewDisplayEntry],
+        semantic_unavailable_set_ids: Sequence[str],
         request_id: Optional[int],
         run_id: Optional[int],
         accepted_preview_request_id: Optional[int],
@@ -4514,6 +4643,7 @@ class ResultsController(QtCore.QObject):
             prefer_set=prefer_set,
             valid_set_ids=valid_set_ids,
             fresh_preview_entries=fresh_preview_entries,
+            semantic_unavailable_set_ids=semantic_unavailable_set_ids,
             request_id=request_id,
             run_id=run_id,
         )
@@ -4570,6 +4700,9 @@ class ResultsController(QtCore.QObject):
             focused_set_id=focused_set_id,
             valid_set_ids=getattr(pending, "valid_set_ids", ()),
             fresh_preview_entries=dict(getattr(pending, "fresh_preview_entries", {}) or {}),
+            semantic_unavailable_set_ids=tuple(
+                getattr(pending, "semantic_unavailable_set_ids", ()) or ()
+            ),
             request_id=resolved_request_id,
             run_id=resolved_run_id,
             accepted_preview_request_id=getattr(pending, "accepted_preview_request_id", None),

@@ -157,7 +157,7 @@ class GlobalFitWorker(QtCore.QThread):
             fit_func = default_fit_global
         self._fit_func = fit_func
         solver_label = str(solver or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
-        solver_method, _solver_warning = normalize_solver_name(solver_label)
+        solver_method = normalize_solver_name(solver_label)
         self._solver = str(solver_method)
         # Tolerances are baked into the simulation closure; kwargs accepted here for API consistency.
         self._best_update_interval_s = max(0.0, float(best_update_interval_s))
@@ -276,7 +276,7 @@ class GlobalFitWorker(QtCore.QThread):
                 raise FittingCancelled()
             fraction = int(100 * iteration / max(1, self._max_nfev))
             percent = min(95, max(5, fraction))
-            message = f"Iteration {iteration}: SSQ={cost:.4g}"
+            message = f"Iteration {iteration}: Objective SSQ={cost:.4g}"
             self.progress.emit(percent, message)
             self._maybe_emit_best(iteration, cost, params)
 

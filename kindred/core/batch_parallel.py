@@ -219,6 +219,7 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     from kindred.core.simulation_preparation import (
         SimulationPreparationError,
         prepare_simulation_worker_run,
+        require_complete_internal_solver_config,
     )
     from kindred.core.simulator.solvers import solve_ode
 
@@ -245,21 +246,17 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     include_mechanism_in_result_payload = bool(task.get("include_mechanism_in_result_payload", False))
     if has_plan_execution_request:
         mechanism_text = str(plan_execution_request.get("mechanism_text") or mechanism_text or "")
-        solver_config = dict(plan_execution_request.get("solver_config") or solver_config)
+        solver_config = require_complete_internal_solver_config(
+            plan_execution_request.get("solver_config"),
+            stage="simulation_plan.solver_config",
+        )
         initials = dict(plan_execution_request.get("initials") or initials)
         simulation_identity = plan_execution_request.get("simulation_identity") or simulation_identity
         execution_request = plan_execution_request
     structured_prepared_request = isinstance(execution_request, Mapping) and execution_request.get("prepared_payload") is not None
-    temperature_K = float(solver_config.get("temperature_K") or 298.15)
-    wegscheider_enabled = bool(
-        solver_config.get(
-            "wegscheider_cyclicity_enabled",
-            WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
-        )
-    )
-    use_sparse_jacobian = bool(
-        solver_config.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
-    )
+    temperature_K = float(solver_config["temperature_K"])
+    wegscheider_enabled = bool(solver_config["wegscheider_cyclicity_enabled"])
+    use_sparse_jacobian = bool(solver_config["use_sparse_jacobian"])
     # Structured prepared execution is authoritative and may safely reuse a
     # structural prepared-runtime key. Text-driven batch preview tasks must key
     # the worker cache by the actual mechanism text, otherwise later slider
@@ -387,11 +384,6 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         "solver_config": {
             **dict(solver_config),
             "solver": str(prepared.request.solver),
-            "solver_warning": (
-                str(prepared.solver_warning)
-                if getattr(prepared, "solver_warning", None)
-                else None
-            ),
             "rtol": float(prepared.request.rtol),
             "atol": float(prepared.request.atol),
             "grid": dict(getattr(prepared.request, "grid", {}) or {}),

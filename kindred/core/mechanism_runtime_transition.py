@@ -9,7 +9,7 @@ from kindred.core.mechanism_source import MechanismAuthoringSource
 
 
 def _normalize_text_for_identity(text: str) -> str:
-    return "\n".join(" ".join(str(line).split()) for line in str(text or "").splitlines()).strip()
+    return "\n".join(str(line).rstrip() for line in str(text or "").splitlines()).strip()
 
 
 def _normalize_mapping_identity(values: Mapping[str, object] | None) -> tuple[tuple[str, str], ...]:

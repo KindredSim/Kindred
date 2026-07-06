@@ -13,8 +13,7 @@ Current contract
 - Locked conventions: constants, κ default 1.0.
 
 Core Arrhenius/Eyring/K(ΔG°) mappings live in :mod:`kindred.core.kinetics`.
-This module layers on energy normalization and preview formatting for the DSL
-and GUI, and re-exports the shared core formulas for convenience.
+This module owns simulator DSL and GUI preview helpers only.
 """
 
 from __future__ import annotations
@@ -23,15 +22,10 @@ import math
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 
 from ..units import kcalmol_to_jmol, kjmol_to_jmol
-from ..kinetics import K_from_deltaG_eq, arrhenius_rate, eyring_prefactor, eyring_rate
 
 
 __all__ = [
     "rate_units",
-    "eyring_prefactor",
-    "eyring_rate",
-    "arrhenius_rate",
-    "K_from_deltaG_eq",
     "normalize_energy_to_J_per_mol",
     "format_sci_half_up",
     "preview_line",

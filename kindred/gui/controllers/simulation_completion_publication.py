@@ -5,6 +5,10 @@ import logging
 from time import perf_counter
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
+from kindred.core.simulation_preparation import require_complete_internal_solver_config
+from kindred.core.simulation_identity import coerce_simulation_identity
+from kindred.core.temperature import coerce_temperature_kelvin
+from kindred.core.time_grid import normalize_time_grid_policy
 from kindred.gui.display_authority import (
     compose_fresh_preview_display_entry,
     resolve_canonical_reference_authority,
@@ -28,6 +32,10 @@ from kindred.gui.ports import (
 logger = logging.getLogger(__name__)
 
 
+class _FreshPreviewIdentityUnavailable(RuntimeError):
+    pass
+
+
 @dataclass
 class CompletionCallbackState:
     run_id: Optional[int]
@@ -43,6 +51,7 @@ class CompletionCallbackState:
     explicit_batch_coalescing: bool
     simulation_identity: Mapping[str, Any] | None = None
     preview_batch_cache_token: str | None = None
+    fresh_preview_workspace_identity_payload: Mapping[str, Any] | None = None
     stale_fast_handoff_after_display: bool = False
     batch_queue_done: bool = False
 
@@ -60,8 +69,6 @@ class CompletionResultState:
     mechanism_text: str
     solver_config: Mapping[str, Any]
     warnings: Sequence[Any]
-    fallback_occurred: bool
-    fallback_message: object | None
     series: Dict[str, Any]
     is_primary: bool
     energy_mode: bool
@@ -129,10 +136,14 @@ class SimulationCompletionPublicationOwner:
             self.apply_materialization_contract(completion, state)
             self.publish_primary_materialization(completion, state)
             self.apply_algebra_status(completion)
-            self.publish_cache_truth(state)
-            self.publish_cache_entry(completion, state)
-            self.record_in_flight_completion_display_entry(completion, state)
-            display_outcome = self.publish_display(completion, state)
+            cache_preflight_outcome = self.preflight_cache_publication(completion, state)
+            if cache_preflight_outcome is None:
+                self.publish_cache_entry(completion, state)
+                self.publish_cache_truth(state)
+                self.record_in_flight_completion_display_entry(completion, state)
+                display_outcome = self.publish_display(completion, state)
+            else:
+                display_outcome = cache_preflight_outcome
             if self._non_displayed_outcome_is_terminal(display_outcome, state):
                 if isinstance(state.ctx, Mapping):
                     state.ctx = self._batch_context_owner.deactivate_if_active(state.ctx)
@@ -191,8 +202,6 @@ class SimulationCompletionPublicationOwner:
             mechanism_text=mechanism_text,
             solver_config=solver_config_map,
             warnings=warnings if isinstance(warnings, Sequence) and not isinstance(warnings, (str, bytes)) else (),
-            fallback_occurred=bool(result.get("fallback_occurred")),
-            fallback_message=result.get("fallback_message"),
             series={str(species_name): Y[i, :] for i, species_name in enumerate(species_names)},
             is_primary=True,
             energy_mode=False,
@@ -275,19 +284,66 @@ class SimulationCompletionPublicationOwner:
             active_cache_invalidated_set_ids=cache_reconciliation.active_cache_invalidated_set_ids,
         )
 
+    def preflight_cache_publication(
+        self,
+        completion: CompletionResultState,
+        state: CompletionCallbackState,
+    ) -> SimulationCompletionDisplayOutcome | None:
+        del completion
+        self.resolve_cache_key(state)
+        if not state.cache_key:
+            return None
+        set_id = str(state.batch_set_id or "").strip()
+        if not set_id:
+            return self._semantic_cache_publication_unavailable(
+                state,
+                reason="Completion cache publication requires a batch set id.",
+            )
+        identity = coerce_simulation_identity(state.simulation_identity)
+        if identity is None:
+            return self._semantic_cache_publication_unavailable(
+                state,
+                reason=f"Completion cache publication requires simulation identity for set {set_id!r}.",
+            )
+        state.simulation_identity = identity.to_payload()
+        if state.is_preview and state.preview_batch_cache_token is None:
+            return self._semantic_cache_publication_unavailable(
+                state,
+                reason=f"Preview completion cache publication requires preview token for set {set_id!r}.",
+            )
+        if state.slider_triggered and state.is_preview:
+            try:
+                state.fresh_preview_workspace_identity_payload = (
+                    self._fresh_preview_workspace_identity_payload(state)
+                )
+            except _FreshPreviewIdentityUnavailable as exc:
+                self._deps.record_nonfatal_exception("Failed to build fresh preview display identity", exc)
+                return self._semantic_cache_publication_unavailable(state, reason=str(exc))
+        return None
+
+    def _semantic_cache_publication_unavailable(
+        self,
+        state: CompletionCallbackState,
+        *,
+        reason: str,
+    ) -> SimulationCompletionDisplayOutcome:
+        self._deps.record_nonfatal_exception(
+            "Completion cache publication semantic metadata unavailable",
+            RuntimeError(str(reason)),
+        )
+        set_id = str(state.batch_set_id or "").strip()
+        return self.publish_completed_run_display_unavailable(
+            cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+            affected_set_ids=([set_id] if set_id else []),
+            requested_show_set_ids=([set_id] if set_id else []),
+            semantic_unavailable_set_ids=([set_id] if set_id else []),
+        )
+
     def publish_primary_materialization(
         self,
         completion: CompletionResultState,
         state: CompletionCallbackState,
     ) -> None:
-        if (not state.is_preview) and completion.is_primary and completion.fallback_occurred:
-            solver_name = completion.solver_config.get("solver", "selected solver")
-            warning_text = f"The requested stiff solver {solver_name} failed"
-            warning_text += f" ({completion.fallback_message})." if completion.fallback_message else "."
-            warning_text += " The simulation retried with an alternative stiff SciPy solver."
-            logger.warning("Displaying solver fallback warning: %s", warning_text)
-            self._ui.dialogs.message_box_warning("Solver fallback", warning_text)
-
         if state.is_preview or (not completion.is_primary) or completion.mechanism is None:
             return
         self._result_materialization_owner.remember_primary_result_mechanism(
@@ -331,9 +387,14 @@ class SimulationCompletionPublicationOwner:
             )
             else None
         )
-        cache_simulation_identity = dict(state.simulation_identity or {})
+        cache_identity = coerce_simulation_identity(state.simulation_identity)
+        if cache_identity is None:
+            raise ValueError("Completion cache entry requires simulation identity.")
+        cache_simulation_identity = cache_identity.to_payload()
         cache_preview_token = None
         if state.is_preview:
+            if state.preview_batch_cache_token is None:
+                raise ValueError("Preview completion cache entry requires preview batch cache token.")
             cache_preview_token = state.preview_batch_cache_token
         owned_species = ()
         if isinstance(state.ctx, Mapping):
@@ -358,8 +419,6 @@ class SimulationCompletionPublicationOwner:
             simulation_identity=cache_simulation_identity,
             solver_config=dict(completion.solver_config) if isinstance(completion.solver_config, dict) else None,
             preview_batch_cache_token=cache_preview_token,
-            fallback_occurred=bool(completion.fallback_occurred),
-            fallback_message=completion.fallback_message,
             solver_provenance=completion.solver_provenance,
             warnings=[
                 dict(warning)
@@ -452,13 +511,10 @@ class SimulationCompletionPublicationOwner:
         set_id = str(state.batch_set_id or "").strip()
         if not set_id:
             return None
-        workspace_provenance: Mapping[str, Any] | None = None
-        try:
-            candidate = self._ui.batch.current_workspace_preview_identity_payload(set_id=set_id)
-        except Exception:
-            candidate = None
-        if isinstance(candidate, Mapping):
-            workspace_provenance = dict(candidate)
+        workspace_provenance = state.fresh_preview_workspace_identity_payload
+        if not isinstance(workspace_provenance, Mapping):
+            workspace_provenance = self._fresh_preview_workspace_identity_payload(state)
+        workspace_provenance = dict(workspace_provenance)
         canonical_reference_entry: Mapping[str, Any] | None = None
         active_cache_key = str(self._batch_cache.active_cache_key or "").strip()
         active_valid_set_ids = {
@@ -511,6 +567,25 @@ class SimulationCompletionPublicationOwner:
             invalidation_context=reference_authority.invalidation_context,
             workspace_preview_provenance=workspace_provenance,
         )
+
+    def _fresh_preview_workspace_identity_payload(
+        self,
+        state: CompletionCallbackState,
+    ) -> Mapping[str, Any]:
+        set_id = str(state.batch_set_id or "").strip()
+        if not set_id:
+            raise _FreshPreviewIdentityUnavailable("Fresh preview identity requires a batch set id.")
+        try:
+            candidate = self._ui.batch.current_workspace_preview_identity_payload(set_id=set_id)
+        except Exception as exc:
+            raise _FreshPreviewIdentityUnavailable(
+                f"Fresh preview identity unavailable for set {set_id!r}: {exc}"
+            ) from exc
+        if not isinstance(candidate, Mapping):
+            raise _FreshPreviewIdentityUnavailable(
+                f"Fresh preview identity unavailable for set {set_id!r}: payload is missing."
+            )
+        return dict(candidate)
 
     def _deferred_display_outcome(
         self,
@@ -624,6 +699,17 @@ class SimulationCompletionPublicationOwner:
         completed_run_coverage = self._completed_run_display_coverage(state)
         completed_run_transaction = completed_run_coverage.transaction if completed_run_coverage is not None else None
         if state.cache_key and state.slider_triggered and not requires_completed_run_transaction:
+            try:
+                fresh_preview_entry = self._fresh_preview_display_entry(completion, state)
+            except _FreshPreviewIdentityUnavailable as exc:
+                self._deps.record_nonfatal_exception("Failed to build fresh preview display identity", exc)
+                set_id = str(state.batch_set_id or "").strip()
+                return self.publish_completed_run_display_unavailable(
+                    cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+                    affected_set_ids=([set_id] if set_id else []),
+                    requested_show_set_ids=([set_id] if set_id else []),
+                    semantic_unavailable_set_ids=([set_id] if set_id else []),
+                )
             self._deps.queue_slider_plot_update(
                 set_id=state.batch_set_id,
                 cache_key=str(state.cache_key),
@@ -631,7 +717,12 @@ class SimulationCompletionPublicationOwner:
                 run_id=state.run_id,
                 slider_triggered=bool(state.slider_triggered),
                 valid_set_ids=None,
-                fresh_preview_entry=self._fresh_preview_display_entry(completion, state),
+                fresh_preview_entry=fresh_preview_entry,
+                semantic_unavailable_set_ids=(
+                    [str(state.batch_set_id)]
+                    if fresh_preview_entry is None and str(state.batch_set_id or "").strip()
+                    else []
+                ),
             )
             return self._deferred_display_outcome()
 
@@ -825,7 +916,10 @@ class SimulationCompletionPublicationOwner:
             try:
                 mmeta = getattr(completion.mechanism, "metadata", {}) or {}
                 if isinstance(mmeta, dict) and mmeta.get("temperature_K") is not None:
-                    temperature_used = float(mmeta.get("temperature_K"))
+                    temperature_used = coerce_temperature_kelvin(
+                        mmeta.get("temperature_K"),
+                        field="mechanism temperature_K",
+                    )
                 if isinstance(mmeta, dict) and mmeta.get("energy_unit"):
                     energy_unit_used = str(mmeta.get("energy_unit"))
             except Exception as exc:
@@ -834,7 +928,10 @@ class SimulationCompletionPublicationOwner:
                     exc,
                 )
         if launch_provenance.get("temperature_K") is not None:
-            temperature_used = float(launch_provenance["temperature_K"])
+            temperature_used = coerce_temperature_kelvin(
+                launch_provenance["temperature_K"],
+                field="launch temperature_K",
+            )
         if temperature_used is None:
             raise ValueError("Completion provenance requires captured temperature_K.")
 
@@ -846,25 +943,23 @@ class SimulationCompletionPublicationOwner:
             except Exception as exc:
                 raise ValueError("Completion provenance requires captured simulation_time.") from exc
 
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
-
-        solver_label = str(
-            completion.solver_config.get("solver_label")
-            or completion.solver_config.get("solver")
-            or DEFAULT_SOLVER_NAME
-        ).strip() or DEFAULT_SOLVER_NAME
-        solver_method, solver_warning = normalize_solver_name(
-            str(completion.solver_config.get("solver") or solver_label)
+        solver_config = require_complete_internal_solver_config(
+            completion.solver_config,
+            stage="completion.solver_config",
         )
-        return {
+        grid_requested = normalize_time_grid_policy(solver_config["grid"])
+        actual_num_points = int(len(completion.t))
+        launch_num_points = launch_provenance.get("num_points_requested")
+        if launch_num_points is not None:
+            num_points_requested = int(launch_num_points)
+        elif grid_requested.get("N") is not None:
+            num_points_requested = int(grid_requested["N"])
+        else:
+            num_points_requested = actual_num_points
+        payload = {
             "mechanism_text": completion.mechanism_text,
-            "solver_method": str(solver_method),
-            "solver_label": str(solver_label),
-            "solver_warning": (str(solver_warning) if solver_warning else None),
-            "solver_config": {
-                "rtol": completion.solver_config.get("rtol", 1e-6),
-                "atol": completion.solver_config.get("atol", 1e-12),
-            },
+            "solver_config": solver_config,
+            "grid_requested": dict(grid_requested),
             "temperature_K": float(temperature_used),
             "temperature_source": (
                 str(launch_provenance.get("temperature_source"))
@@ -874,11 +969,7 @@ class SimulationCompletionPublicationOwner:
             "energy_unit": energy_unit_used,
             "energy_mode": bool(completion.energy_mode),
             "simulation_time": sim_time_prov,
-            "num_points_requested": (
-                int(launch_provenance["num_points_requested"])
-                if launch_provenance.get("num_points_requested") is not None
-                else int((completion.solver_config.get("grid") or {}).get("N") or len(completion.t))
-            ),
+            "num_points_requested": int(num_points_requested),
             "species_names": list(completion.species_names),
             "t": completion.t,
             "series": completion.series,
@@ -886,6 +977,7 @@ class SimulationCompletionPublicationOwner:
             "solver_provenance": completion.solver_provenance,
             "warnings": completion.warnings,
         }
+        return payload
 
     @staticmethod
     def _base_owned_species_from_completion(
@@ -919,7 +1011,10 @@ class SimulationCompletionPublicationOwner:
             return solver_config
         if launch_provenance.get("temperature_K") is None:
             return solver_config
-        solver_config["temperature_K"] = launch_provenance["temperature_K"]
+        solver_config["temperature_K"] = coerce_temperature_kelvin(
+            launch_provenance["temperature_K"],
+            field="launch temperature_K",
+        )
         return solver_config
 
     def advance_batch_success(

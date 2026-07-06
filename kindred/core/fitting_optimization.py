@@ -102,12 +102,13 @@ class FitResult:
     success: bool
     parameters: Dict[str, float]
     uncertainties: Optional[Dict[str, float]]
-    chi_squared: float
+    residual_mse: float
     r_squared: float
     residuals: np.ndarray
     nfev: int
     message: str
     covariance: Optional[np.ndarray] = None
+    identifiability_warning: Optional[str] = None
 
 
 def fit_parameters(
@@ -137,6 +138,7 @@ def fit_parameters(
         scipy_bounds = (-np.inf, np.inf)
 
     iteration_counter = [0]
+    identifiability_warning: Optional[str] = None
 
     def _vector_to_param_dict(vector: np.ndarray) -> Dict[str, float]:
         return {name: float(vector[i]) for i, name in enumerate(param_names)}
@@ -147,12 +149,13 @@ def fit_parameters(
             success=False,
             parameters=params,
             uncertainties=None,
-            chi_squared=np.inf,
+            residual_mse=np.inf,
             r_squared=float("nan"),
             residuals=np.array([]),
             nfev=iteration_counter[0],
             message=message,
             covariance=None,
+            identifiability_warning=None,
         )
 
     def wrapped_objective(params):
@@ -269,8 +272,6 @@ def fit_parameters(
             x_opt = result.x
             success = bool(result.success)
             message = str(result.message)
-            if not success and "maximum number of iterations has been exceeded" in message.lower():
-                success = True
             nfev = result.nfev
 
             try:
@@ -285,6 +286,22 @@ def fit_parameters(
             least_squares, _de = scipy_loader()
             if method.lower() == "lm":
                 scipy_method = "lm"
+                if bounds is not None:
+                    lower_arr = np.asarray(scipy_bounds[0], dtype=float).reshape(-1)
+                    upper_arr = np.asarray(scipy_bounds[1], dtype=float).reshape(-1)
+                    bounded_params = [
+                        name
+                        for idx, name in enumerate(param_names)
+                        if idx < lower_arr.size
+                        and idx < upper_arr.size
+                        and (np.isfinite(lower_arr[idx]) or np.isfinite(upper_arr[idx]))
+                    ]
+                    if bounded_params:
+                        raise ValueError(
+                            "Levenberg-Marquardt fitting does not support finite bounds. "
+                            "Use trf or dogbox, or remove bounds for: "
+                            + ", ".join(sorted(set(bounded_params)))
+                        )
                 scipy_bounds = (-np.inf, np.inf)
             elif method.lower() == "trf":
                 scipy_method = "trf"
@@ -332,13 +349,23 @@ def fit_parameters(
 
             try:
                 J = result.jac
-                JtJ = J.T @ J
-                residual_sum = np.sum(residuals**2)
-                dof = len(residuals) - len(x_opt)
-                if dof <= 0:
-                    dof = max(1, len(residuals))
-                residual_var = residual_sum / dof
-                covariance = np.linalg.pinv(JtJ) * residual_var
+                param_count = int(len(x_opt))
+                rank = int(np.linalg.matrix_rank(J))
+                if rank < param_count:
+                    identifiability_warning = (
+                        "Covariance and uncertainties were not reported because the Jacobian is "
+                        f"rank deficient (rank {rank} < {param_count})."
+                    )
+                    message = f"{message}; {identifiability_warning}"
+                    covariance = None
+                else:
+                    JtJ = J.T @ J
+                    residual_sum = np.sum(residuals**2)
+                    dof = len(residuals) - len(x_opt)
+                    if dof <= 0:
+                        dof = max(1, len(residuals))
+                    residual_var = residual_sum / dof
+                    covariance = np.linalg.pinv(JtJ) * residual_var
             except Exception as exc:
                 logger.debug("Failed to calculate covariance: %s", exc)
                 covariance = None
@@ -383,7 +410,7 @@ def fit_parameters(
         except Exception as exc:
             logger.debug("Failed to calculate uncertainties: %s", exc)
 
-    chi_squared = np.sum(residuals**2) / len(residuals) if len(residuals) > 0 else np.inf
+    residual_mse = np.sum(residuals**2) / len(residuals) if len(residuals) > 0 else np.inf
     if y_model_opt is not None and y_exp_arr is not None and y_exp_arr.size > 0:
         ss_res = np.sum((y_exp_arr - y_model_opt) ** 2)
         ss_tot = np.sum((y_exp_arr - np.mean(y_exp_arr)) ** 2)
@@ -395,10 +422,11 @@ def fit_parameters(
         success=success,
         parameters=fitted_params,
         uncertainties=uncertainties,
-        chi_squared=chi_squared,
+        residual_mse=residual_mse,
         r_squared=r_squared,
         residuals=residuals,
         nfev=nfev,
         message=message,
         covariance=covariance,
+        identifiability_warning=identifiability_warning,
     )

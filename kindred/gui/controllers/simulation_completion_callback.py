@@ -79,6 +79,7 @@ class SimulationCompletionCallbackOwner:
             )
             self._deps.freshness.mark_stale_dispatch_identity_callback_consumed(
                 batch_set_id=batch_set_id,
+                freshness=freshness,
                 context=ctx,
             )
             return
@@ -91,6 +92,20 @@ class SimulationCompletionCallbackOwner:
             )
             self._deps.freshness.mark_stale_runtime_input_callback_consumed(
                 batch_set_id=batch_set_id,
+                freshness=freshness,
+                context=ctx,
+            )
+            return
+
+        if freshness.shutdown_requested:
+            logger.debug(
+                "Finalizing simulation completion without display after close shutdown (run_id=%s, request_id=%s, set_id=%s)",
+                run_id,
+                request_id,
+                str(batch_set_id or ""),
+            )
+            self._deps.freshness.finalize_shutdown_callback_without_result(
+                freshness=freshness,
                 context=ctx,
             )
             return

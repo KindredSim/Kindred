@@ -11,6 +11,8 @@ from kindred.core.runtime_defaults import (
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 )
 from kindred.core.symbolic.identity import normalize_symbolic_identity_mapping
+from kindred.core.temperature import coerce_temperature_kelvin
+from kindred.core.time_grid import normalize_time_grid_policy
 
 __all__ = [
     "SimulationIdentity",
@@ -28,6 +30,16 @@ def _try_float(value: object, default: float) -> float:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError):
         return float(default)
+
+
+def _temperature_kelvin_from_mapping(
+    payload: Mapping[str, Any],
+    *,
+    default: float = 298.15,
+) -> float:
+    if "temperature_K" not in payload or payload.get("temperature_K") is None:
+        return coerce_temperature_kelvin(default, field="temperature_K")
+    return coerce_temperature_kelvin(payload.get("temperature_K"), field="temperature_K")
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
@@ -107,10 +119,22 @@ class SimulationSolverIdentity:
     solver: str
     rtol: float
     atol: float
-    grid_n: int
+    grid: Mapping[str, float | int]
     temperature_K: float
     use_sparse_jacobian: bool
     wegscheider_cyclicity_enabled: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "grid",
+            normalize_time_grid_policy(self.grid),
+        )
+        object.__setattr__(
+            self,
+            "temperature_K",
+            coerce_temperature_kelvin(self.temperature_K, field="temperature_K"),
+        )
 
     @classmethod
     def from_solver_config(cls, solver_config: Mapping[str, Any] | None) -> "SimulationSolverIdentity":
@@ -120,8 +144,8 @@ class SimulationSolverIdentity:
             solver=str(config.get("solver") or ""),
             rtol=_try_float(config.get("rtol", 1e-6), 1e-6),
             atol=_try_float(config.get("atol", 1e-12), 1e-12),
-            grid_n=int((grid.get("N") or 0) if isinstance(grid, Mapping) else 0),
-            temperature_K=_try_float(config.get("temperature_K", 298.15), 298.15),
+            grid=normalize_time_grid_policy(grid if isinstance(grid, Mapping) else {}),
+            temperature_K=_temperature_kelvin_from_mapping(config),
             use_sparse_jacobian=bool(
                 config.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
             ),
@@ -135,20 +159,23 @@ class SimulationSolverIdentity:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any] | None) -> "SimulationSolverIdentity":
+        payload_map = dict(payload or {})
         return cls(
-            solver=str((payload or {}).get("solver") or ""),
-            rtol=_try_float((payload or {}).get("rtol", 1e-6), 1e-6),
-            atol=_try_float((payload or {}).get("atol", 1e-12), 1e-12),
-            grid_n=int((payload or {}).get("grid_n") or 0),
-            temperature_K=_try_float((payload or {}).get("temperature_K", 298.15), 298.15),
+            solver=str(payload_map.get("solver") or ""),
+            rtol=_try_float(payload_map.get("rtol", 1e-6), 1e-6),
+            atol=_try_float(payload_map.get("atol", 1e-12), 1e-12),
+            grid=normalize_time_grid_policy(
+                payload_map.get("grid") if isinstance(payload_map.get("grid"), Mapping) else {}
+            ),
+            temperature_K=_temperature_kelvin_from_mapping(payload_map),
             use_sparse_jacobian=bool(
-                (payload or {}).get(
+                payload_map.get(
                     "use_sparse_jacobian",
                     USE_SPARSE_JACOBIAN_DEFAULT,
                 )
             ),
             wegscheider_cyclicity_enabled=bool(
-                (payload or {}).get(
+                payload_map.get(
                     "wegscheider_cyclicity_enabled",
                     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
                 )
@@ -160,7 +187,7 @@ class SimulationSolverIdentity:
             "solver": str(self.solver),
             "rtol": float(self.rtol),
             "atol": float(self.atol),
-            "grid_n": int(self.grid_n),
+            "grid": dict(self.grid),
             "temperature_K": float(self.temperature_K),
             "use_sparse_jacobian": bool(self.use_sparse_jacobian),
             "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled),

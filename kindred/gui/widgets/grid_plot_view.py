@@ -2,14 +2,14 @@
 """
 Grid view for displaying multiple dataset fits simultaneously.
 
-Shows all fitted datasets in a grid layout (e.g., 2x2, 3x2) for comparison.
+    Shows all fitted datasets in a grid layout (e.g., 2x2, 3x2) for comparison.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from typing import List, Tuple, Optional, Dict, Any, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import math
 
 import numpy as np
@@ -17,6 +17,11 @@ from PySide6 import QtCore, QtWidgets, QtGui
 
 from kindred.core.analysis.global_fit_projection import FitRenderDatasetProjection
 from kindred.gui.color_manager import ColorManager
+from kindred.gui.display_semantics import (
+    canonical_concentration_axis,
+    canonical_dataset_x_axis,
+    canonical_time_axis,
+)
 from kindred.gui.display_name_policy import PLOT_TITLE_LABEL_MAX_CHARS, compact_plot_title_label
 from kindred.gui.plot_config import try_import_pyqtgraph
 from kindred.gui.diagnostics import record_best_effort_failure
@@ -34,7 +39,7 @@ class GridPlotView(QtWidgets.QWidget):
     Display multiple dataset fits in a grid layout.
 
     Automatically arranges plots in an optimal grid (e.g., 2x2 for 4 datasets).
-    Each subplot shows data + fit + fit quality metric.
+    Each subplot shows data + fit + fit metrics.
     """
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
@@ -184,6 +189,10 @@ class GridPlotView(QtWidgets.QWidget):
             frozen["x_label"] = str(frozen.get("x_label") or "")
         if "x_units" in frozen:
             frozen["x_units"] = None if frozen.get("x_units") is None else str(frozen.get("x_units"))
+        if "y_label" in frozen:
+            frozen["y_label"] = str(frozen.get("y_label") or "")
+        if "y_units" in frozen:
+            frozen["y_units"] = None if frozen.get("y_units") is None else str(frozen.get("y_units"))
         return frozen
 
     @QtCore.Slot()
@@ -393,7 +402,15 @@ class GridPlotView(QtWidgets.QWidget):
         return (ids, int(n_rows), int(n_cols))
 
     def _configure_plot_static(self, plot: Any) -> None:
-        self._set_plot_axis_labels(plot, x_label="Time", x_units="s", y_label="Concentration", y_units="M")
+        x_axis = canonical_time_axis()
+        y_axis = canonical_concentration_axis()
+        self._set_plot_axis_labels(
+            plot,
+            x_label=x_axis.label,
+            x_units=x_axis.units,
+            y_label=y_axis.label,
+            y_units=y_axis.units,
+        )
         plot.showGrid(x=True, y=True, alpha=0.3)
         font = QtGui.QFont()
         font.setPointSize(7)
@@ -496,8 +513,12 @@ class GridPlotView(QtWidgets.QWidget):
             name = dataset.get("name")
             x_label = str(dataset.get("x_label") or "Time")
             x_units = dataset.get("x_units")
+            y_axis = canonical_concentration_axis(
+                dataset.get("y_label") or "Concentration",
+                units=dataset.get("y_units") if dataset.get("y_units") is not None else "M",
+            )
             data_x = np.asarray(dataset.get("data_x", []), dtype=float).reshape(-1)
-            chi_squared = dataset.get("chi_squared")
+            residual_mse = dataset.get("residual_mse")
             r_squared = dataset.get("r_squared")
             all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
             all_observations = dataset.get("all_observations", {}) if isinstance(dataset.get("all_observations", {}), dict) else {}
@@ -511,8 +532,8 @@ class GridPlotView(QtWidgets.QWidget):
                 plot,
                 x_label=x_label,
                 x_units=x_units,
-                y_label="Concentration",
-                y_units="M",
+                y_label=y_axis.label,
+                y_units=y_axis.units,
                 dataset_name=name,
             )
 
@@ -525,28 +546,31 @@ class GridPlotView(QtWidgets.QWidget):
             tooltip_parts = [str(full_name or compact_name.full or "").strip()]
             locked_layout = bool(getattr(self, "_autorange_locked", False))
             color = (51, 51, 51)
-            if chi_squared is not None:
-                try:
-                    chi_val = float(chi_squared)
-                except Exception:
-                    chi_val = None
-                if chi_val is not None:
-                    metric_text = f"χ² = {chi_val:.3e}"
-                    tooltip_parts.append(metric_text)
-                    if not locked_layout:
-                        title = f"{title} ({metric_text})"
-                        color = self._get_color_for_chi_squared(chi_val)
-            elif r_squared is not None:
+            r2_val = None
+            if r_squared is not None:
                 try:
                     r2_val = float(r_squared)
                 except Exception:
                     r2_val = None
-                if r2_val is not None:
-                    metric_text = f"R² = {r2_val:.3f}"
+            if residual_mse is not None:
+                try:
+                    mse_val = float(residual_mse)
+                except Exception:
+                    mse_val = None
+                if mse_val is not None:
+                    metric_text = f"MSE = {mse_val:.3e}"
                     tooltip_parts.append(metric_text)
+                    if r2_val is not None:
+                        tooltip_parts.append(f"R² = {r2_val:.3f}")
+                        color = self._get_color_for_r_squared(r2_val)
                     if not locked_layout:
                         title = f"{title} ({metric_text})"
-                        color = self._get_color_for_r_squared(r2_val)
+            elif r2_val is not None:
+                metric_text = f"R² = {r2_val:.3f}"
+                tooltip_parts.append(metric_text)
+                if not locked_layout:
+                    title = f"{title} ({metric_text})"
+                    color = self._get_color_for_r_squared(r2_val)
             title_tooltip = "\n".join(part for part in tooltip_parts if part)
             try:
                 title_state = (title, tuple(color), "10pt")
@@ -779,7 +803,7 @@ class GridPlotView(QtWidgets.QWidget):
         name: str,
         data_x: np.ndarray,
         data_y: np.ndarray,
-        chi_squared: Optional[float] = None,
+        residual_mse: Optional[float] = None,
         r_squared: Optional[float] = None,
         all_species: Optional[Dict[str, np.ndarray]] = None,
         current_species: Optional[str] = None,
@@ -793,8 +817,8 @@ class GridPlotView(QtWidgets.QWidget):
             Dataset name
         data_x, data_y : np.ndarray
             Experimental data
-        chi_squared, r_squared : float, optional
-            Fit quality metrics
+        residual_mse, r_squared : float, optional
+            Fit metrics
         all_species : dict, optional
             Dictionary of all species data {name: y_array}
         current_species : str, optional
@@ -807,7 +831,7 @@ class GridPlotView(QtWidgets.QWidget):
             'name': name,
             'data_x': np.asarray(data_x),
             'data_y': np.asarray(data_y),
-            'chi_squared': chi_squared,
+            'residual_mse': residual_mse,
             'r_squared': r_squared,
             'all_species': all_species if all_species else {current_species or 'Data': data_y},
             'current_species': current_species or 'Data',
@@ -848,6 +872,176 @@ class GridPlotView(QtWidgets.QWidget):
 
         self._datasets = frozen
         self._schedule_redraw()
+
+    def _available_export_species_names(self) -> List[str]:
+        species_names: set[str] = set()
+        for dataset in self._datasets:
+            fit_projection = dataset.get("fit_render_projection")
+            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
+                species_names.update(str(name) for name in fit_projection.observed_series.keys() if str(name))
+                species_names.update(str(name) for name in fit_projection.model_series.keys() if str(name))
+                continue
+            all_observations = dataset.get("all_observations", {})
+            if isinstance(all_observations, dict):
+                species_names.update(str(name) for name in all_observations.keys() if str(name))
+            all_species = dataset.get("all_species", {})
+            if isinstance(all_species, dict):
+                species_names.update(str(name) for name in all_species.keys() if str(name))
+        return sorted(species_names)
+
+    def _export_species_names(self, scope: str) -> List[str]:
+        available = self._available_export_species_names()
+        if str(scope or "") == "axis":
+            selected = [str(name) for name in self._selected_species_list if str(name) in available]
+            return selected
+        return available
+
+    @staticmethod
+    def _coerce_grid_export_series(
+        rows: List[List[object]],
+        *,
+        dataset_name: str,
+        species_name: str,
+        source: str,
+        x_values: object,
+        y_values: object,
+    ) -> str | None:
+        try:
+            x_array = np.asarray(x_values, dtype=float).reshape(-1)
+            y_array = np.asarray(y_values, dtype=float).reshape(-1)
+        except Exception as exc:
+            return (
+                f"{dataset_name} {species_name} {source}: "
+                f"values could not be converted to numeric arrays ({exc})"
+            )
+        if x_array.size == 0:
+            return f"{dataset_name} {species_name} {source}: empty x axis"
+        if x_array.size != y_array.size:
+            return (
+                f"{dataset_name} {species_name} {source}: "
+                f"x/value length mismatch ({x_array.size} != {y_array.size})"
+            )
+        for x_value, y_value in zip(x_array, y_array):
+            if not np.isfinite(x_value):
+                return f"{dataset_name} {species_name} {source}: non-finite x value"
+            if not np.isfinite(y_value):
+                return f"{dataset_name} {species_name} {source}: non-finite concentration value"
+            rows.append(
+                [
+                    dataset_name,
+                    species_name,
+                    source,
+                    float(x_value),
+                    float(y_value),
+                ]
+            )
+        return None
+
+    @staticmethod
+    def _dataset_x_header(dataset: Mapping[str, object]) -> str:
+        fit_projection = dataset.get("fit_render_projection")
+        if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
+            axis = canonical_dataset_x_axis(
+                fit_projection.observed_x_label,
+                units=fit_projection.observed_x_units,
+            )
+        else:
+            axis = canonical_dataset_x_axis(
+                dataset.get("x_label") or "Time",
+                units=dataset.get("x_units"),
+            )
+        return axis.header or "X"
+
+    def build_visible_export(self, scope: str) -> Tuple[List[str], List[List[object]]]:
+        if not self._datasets:
+            raise ValueError("No dataset grid data available to export.")
+        species_names = self._export_species_names(scope)
+        if not species_names:
+            raise ValueError("No series selected to export.")
+
+        rows: List[List[object]] = []
+        omitted: List[str] = []
+        x_headers: set[str] = set()
+        for dataset in self._datasets:
+            dataset_name = str(dataset.get("name") or "")
+            dataset_x_header = self._dataset_x_header(dataset)
+            data_x = np.asarray(dataset.get("data_x", []), dtype=float).reshape(-1)
+            all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
+            all_observations = dataset.get("all_observations", {}) if isinstance(dataset.get("all_observations", {}), dict) else {}
+            fit_projection = dataset.get("fit_render_projection")
+            projection_active = (
+                isinstance(fit_projection, FitRenderDatasetProjection)
+                and fit_projection.status == "ok"
+            )
+            for species_name in species_names:
+                if projection_active and species_name in fit_projection.observed_series:
+                    error = self._coerce_grid_export_series(
+                        rows,
+                        dataset_name=dataset_name,
+                        species_name=species_name,
+                        source="Observed",
+                        x_values=fit_projection.observed_x_for_species(species_name),
+                        y_values=fit_projection.observed_series[species_name],
+                    )
+                    if error:
+                        omitted.append(error)
+                    else:
+                        x_headers.add(dataset_x_header)
+                elif isinstance(all_observations.get(species_name), dict):
+                    observation_spec = all_observations[species_name]
+                    error = self._coerce_grid_export_series(
+                        rows,
+                        dataset_name=dataset_name,
+                        species_name=species_name,
+                        source="Observed",
+                        x_values=observation_spec.get("t", []),
+                        y_values=observation_spec.get("y", []),
+                    )
+                    if error:
+                        omitted.append(error)
+                    else:
+                        x_headers.add(dataset_x_header)
+                elif species_name in all_species:
+                    error = self._coerce_grid_export_series(
+                        rows,
+                        dataset_name=dataset_name,
+                        species_name=species_name,
+                        source="Observed",
+                        x_values=data_x,
+                        y_values=all_species[species_name],
+                    )
+                    if error:
+                        omitted.append(error)
+                    else:
+                        x_headers.add(dataset_x_header)
+                if projection_active and species_name in fit_projection.model_series:
+                    error = self._coerce_grid_export_series(
+                        rows,
+                        dataset_name=dataset_name,
+                        species_name=species_name,
+                        source="Model",
+                        x_values=fit_projection.model_x_for_species(species_name),
+                        y_values=fit_projection.model_series[species_name],
+                    )
+                    if error:
+                        omitted.append(error)
+                    else:
+                        x_headers.add(dataset_x_header)
+        if omitted:
+            detail = "; ".join(omitted)
+            raise ValueError(
+                "Cannot export All Datasets grid CSV because selected data are incomplete: "
+                + detail
+            )
+        if not rows:
+            raise ValueError("No dataset grid data available to export.")
+
+        concentration_axis = canonical_concentration_axis()
+        x_header = next(iter(x_headers)) if len(x_headers) == 1 else "X"
+        return (
+            ["Dataset", "Series", "Source", x_header, concentration_axis.header],
+            rows,
+        )
 
     def clear_datasets(self):
         """Remove all datasets from the grid."""
@@ -945,6 +1139,7 @@ class GridPlotView(QtWidgets.QWidget):
             self._locked_autorange_prev.clear()
             self._locked_left_axis_width = None
             self._locked_bottom_axis_height = None
+            self._schedule_redraw()
 
     def _snapshot_plot_view_ranges(self) -> None:
         if not self._plot_items:
@@ -1113,17 +1308,14 @@ class GridPlotView(QtWidgets.QWidget):
         self._selected_species_list = [item.text() for item in self._species_list.selectedItems()]
         self._species_list.blockSignals(False)
 
-    def _get_color_for_chi_squared(self, chi_squared: float) -> Tuple[int, int, int]:
-        """Get color based on chi-squared value."""
-        if chi_squared < 0.1:
-            return (34, 170, 85)  # Green
-        elif chi_squared < 1.0:
-            return (221, 170, 85)  # Yellow/orange
-        else:
-            return (221, 68, 68)  # Red
-
     def _get_color_for_r_squared(self, r_squared: float) -> Tuple[int, int, int]:
         """Get color based on R-squared value."""
+        if not isinstance(r_squared, (int, float)):
+            return (136, 136, 136)
+        if math.isnan(r_squared) or math.isinf(r_squared):
+            return (136, 136, 136)
+        if r_squared > 1:
+            return (136, 136, 136)
         if r_squared > 0.95:
             return (34, 170, 85)  # Green
         elif r_squared > 0.85:

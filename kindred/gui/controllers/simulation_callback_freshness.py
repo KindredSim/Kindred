@@ -11,11 +11,11 @@ class SimulationCallbackFreshnessDependencies:
     run_state: Any
     batch_context_owner: Any
     preview_ownership: Callable[[], Any]
-    shutdown_requested: Callable[[], bool]
+    shutdown_requested: Callable[[SimulationCallbackIdentity], bool]
     current_global_epoch: Callable[[], int]
     current_epoch: Callable[[], int]
     current_set_epoch: Callable[[str], int]
-    finalize_batch_queue_done_without_result: Callable[[Mapping[str, Any]], None]
+    finalize_batch_queue_done_without_result: Callable[[Mapping[str, Any], "SimulationCallbackFreshnessDecision"], None]
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,7 @@ class SimulationCallbackFreshnessOwner:
         return SimulationCallbackFreshnessDecision(
             active_run_id=active_run_id,
             latest_request_id=latest_request_id,
-            shutdown_requested=bool(self._deps.shutdown_requested()),
+            shutdown_requested=bool(self._deps.shutdown_requested(callback_identity)),
             current_global_epoch=current_global_epoch,
             callback_preview_owner_epoch=callback_preview_owner_epoch,
             stale_run=int(callback_identity.run_id) != active_run_id,
@@ -102,6 +102,7 @@ class SimulationCallbackFreshnessOwner:
         self,
         *,
         batch_set_id: Optional[str],
+        freshness: SimulationCallbackFreshnessDecision,
         context: Optional[Mapping[str, Any]] = None,
     ) -> None:
         set_id = str(batch_set_id or "").strip()
@@ -109,12 +110,13 @@ class SimulationCallbackFreshnessOwner:
             return
         if isinstance(context, Mapping) and not self._deps.batch_context_owner.context_matches_current_run_identity(context):
             return
-        self._mark_runtime_task_callback_consumed(set_id=set_id)
+        self._mark_runtime_task_callback_consumed(set_id=set_id, freshness=freshness)
 
     def mark_stale_dispatch_identity_callback_consumed(
         self,
         *,
         batch_set_id: Optional[str],
+        freshness: SimulationCallbackFreshnessDecision,
         context: Optional[Mapping[str, Any]] = None,
     ) -> None:
         set_id = str(batch_set_id or "").strip()
@@ -122,14 +124,33 @@ class SimulationCallbackFreshnessOwner:
             return
         if isinstance(context, Mapping) and not self._deps.batch_context_owner.context_matches_current_run_identity(context):
             return
-        self._mark_runtime_task_callback_consumed(set_id=set_id)
+        self._mark_runtime_task_callback_consumed(set_id=set_id, freshness=freshness)
 
-    def _mark_runtime_task_callback_consumed(self, *, set_id: str) -> None:
+    def finalize_shutdown_callback_without_result(
+        self,
+        *,
+        freshness: SimulationCallbackFreshnessDecision,
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        if not bool(freshness.shutdown_requested):
+            return
+        if not isinstance(context, Mapping):
+            return
+        if not self._deps.batch_context_owner.context_matches_current_run_identity(context):
+            return
+        self._deps.finalize_batch_queue_done_without_result(context, freshness)
+
+    def _mark_runtime_task_callback_consumed(
+        self,
+        *,
+        set_id: str,
+        freshness: SimulationCallbackFreshnessDecision,
+    ) -> None:
         transition = self._deps.batch_context_owner.record_runtime_task_stale_callback_consumed_if_active(set_id=set_id)
         if transition is None:
             return
         if transition.batch_done:
-            self._deps.finalize_batch_queue_done_without_result(transition.context)
+            self._deps.finalize_batch_queue_done_without_result(transition.context, freshness)
 
     def _preview_request_matches_current_preview_owner_epoch(
         self,

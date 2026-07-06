@@ -36,6 +36,7 @@ __all__ = [
     "TemperatureScheduleProtocol",
     "TemperatureScheduleDictProtocol",
     "coerce_temperature_schedule",
+    "coerce_temperature_kelvin",
 ]
 
 
@@ -47,6 +48,54 @@ class TemperatureScheduleProtocol(Protocol):
 @runtime_checkable
 class TemperatureScheduleDictProtocol(TemperatureScheduleProtocol, Protocol):
     def to_dict(self) -> Mapping[str, object]: ...
+
+
+def _finite_float(value: object, *, field: str) -> float:
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TemperatureScheduleError(f"{field} must be finite.") from exc
+    if not math.isfinite(out):
+        raise TemperatureScheduleError(f"{field} must be finite.")
+    return float(out)
+
+
+def coerce_temperature_kelvin(value: object, *, field: str = "temperature") -> float:
+    temperature = _finite_float(value, field=field)
+    if temperature <= 0.0:
+        raise TemperatureScheduleError(f"{field} must be positive, got {temperature} K")
+    return temperature
+
+
+def _coerce_nonnegative_time(value: object, *, field: str) -> float:
+    time_value = _finite_float(value, field=field)
+    if time_value < 0.0:
+        raise TemperatureScheduleError(f"{field} must be non-negative, got {time_value}")
+    return time_value
+
+
+class _ValidatedCallableTemperatureSchedule:
+    def __init__(self, schedule: Callable[[float], float]) -> None:
+        self._schedule = schedule
+
+    def __call__(self, t: float) -> float:
+        time_value = _coerce_nonnegative_time(t, field="temperature schedule time")
+        return coerce_temperature_kelvin(
+            self._schedule(time_value),
+            field="temperature schedule output",
+        )
+
+    def __repr__(self) -> str:
+        return f"validated_temperature_schedule({self._schedule!r})"
+
+
+class _ValidatedDictTemperatureSchedule(_ValidatedCallableTemperatureSchedule):
+    def __init__(self, schedule: TemperatureScheduleDictProtocol) -> None:
+        super().__init__(schedule)
+        self._dict_schedule = schedule
+
+    def to_dict(self) -> Mapping[str, object]:
+        return TemperatureSchedule.from_dict(dict(self._dict_schedule.to_dict())).to_dict()
 
 
 def coerce_temperature_schedule(value: object) -> TemperatureScheduleProtocol | None:
@@ -69,8 +118,10 @@ def coerce_temperature_schedule(value: object) -> TemperatureScheduleProtocol | 
                 "temperature_schedule mapping must contain a 'type' key (expected TemperatureSchedule.to_dict() format)"
             )
         return TemperatureSchedule.from_dict(dict(value))
+    if isinstance(value, TemperatureScheduleDictProtocol):
+        return _ValidatedDictTemperatureSchedule(value)
     if callable(value):
-        return value  # type: ignore[return-value]
+        return _ValidatedCallableTemperatureSchedule(value)  # type: ignore[arg-type]
     raise TypeError(
         f"temperature_schedule must be callable or a mapping (TemperatureSchedule.to_dict()), got {type(value)!r}"
     )
@@ -101,14 +152,13 @@ class TimeInterval:
 
     def __post_init__(self):
         """Validate interval."""
-        if self.t_start < 0:
-            raise TemperatureScheduleError(f"Interval start time must be non-negative, got {self.t_start}")
+        self.t_start = _coerce_nonnegative_time(self.t_start, field="interval start time")
+        self.t_end = _coerce_nonnegative_time(self.t_end, field="interval end time")
+        self.temperature = coerce_temperature_kelvin(self.temperature)
         if self.t_end <= self.t_start:
             raise TemperatureScheduleError(
                 f"Interval end time ({self.t_end}) must be greater than start time ({self.t_start})"
             )
-        if self.temperature <= 0:
-            raise TemperatureScheduleError(f"Temperature must be positive, got {self.temperature} K")
 
     def contains(self, t: float) -> bool:
         """Check if time is in this interval."""
@@ -212,7 +262,8 @@ class TemperatureSchedule:
         float
             Temperature in Kelvin
         """
-        return self._T_func(t)
+        time_value = _coerce_nonnegative_time(t, field="temperature schedule time")
+        return coerce_temperature_kelvin(self._T_func(time_value), field="temperature schedule output")
 
     @property
     def fingerprint(self) -> str:
@@ -255,14 +306,13 @@ class TemperatureSchedule:
         TemperatureScheduleError
             If temperature is non-positive
         """
-        if temperature <= 0:
-            raise TemperatureScheduleError(f"Temperature must be positive, got {temperature} K")
+        temperature_f = coerce_temperature_kelvin(temperature)
 
         def T_const(t: float) -> float:
-            return temperature
+            return temperature_f
 
         schedule = cls(T_const, schedule_type="constant")
-        logger.debug(f"Created constant temperature schedule: T = {temperature} K")
+        logger.debug(f"Created constant temperature schedule: T = {temperature_f} K")
         return schedule
 
     @classmethod
@@ -495,23 +545,35 @@ class TemperatureSchedule:
         TemperatureSchedule
             Temperature schedule
         """
-        schedule_type = data.get("type", "constant")
+        if not isinstance(data, Mapping):
+            raise TemperatureScheduleError("temperature schedule must be a mapping.")
+        if "type" not in data:
+            raise TemperatureScheduleError("temperature schedule must include a type.")
+        schedule_type = str(data["type"])
 
         if schedule_type == "constant":
-            temperature = data.get("temperature", 298.15)
-            return cls.constant(temperature)
+            if "temperature" not in data:
+                raise TemperatureScheduleError("constant temperature schedule must include temperature.")
+            return cls.constant(data["temperature"])
 
         elif schedule_type == "piecewise":
-            intervals_data = data.get("intervals", [])
+            if "intervals" not in data:
+                raise TemperatureScheduleError("piecewise temperature schedule must include intervals.")
+            intervals_data = data["intervals"]
             intervals = [
                 (item["t_start"], item["t_end"], item["temperature"])
                 for item in intervals_data
             ]
             return cls.piecewise(intervals)
         elif schedule_type == "response":
-            times = data.get("times", [])
-            temperatures = data.get("temperatures", [])
-            tau = data.get("tau", None)
+            missing = [key for key in ("times", "temperatures", "tau") if key not in data]
+            if missing:
+                raise TemperatureScheduleError(
+                    f"response temperature schedule missing required field(s): {', '.join(missing)}"
+                )
+            times = data["times"]
+            temperatures = data["temperatures"]
+            tau = data["tau"]
             return cls.response(times, temperatures, tau=float(tau))
 
         else:

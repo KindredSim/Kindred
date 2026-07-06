@@ -18,9 +18,9 @@ from ..equilibrium_rate_authority import (
 )
 from ..mechanism import Mechanism
 from ..mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
+from ..kinetics import K_from_deltaG_eq
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .errors import DSLError
-from .common import K_from_deltaG_eq
 from .parameter_namespace import _namespace_policy_from_step
 
 logger = logging.getLogger(__name__)

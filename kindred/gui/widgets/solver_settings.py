@@ -26,6 +26,8 @@ Returned schema
   "slider_preview_points": int,
   "parameter_preview_debounce_ms": int,
   "equilibrium_preview_debounce_ms": int,
+  "result_cache_cap": int,
+  "preview_cache_cap": int,
 }
 """
 
@@ -70,7 +72,6 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         self._cache_port = cache_port
         self.setWindowTitle("Simulation Settings")
         self.setModal(True)
-        self._cache_controls_ready = False
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -309,26 +310,9 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         layout.addWidget(button_box)
 
         self._wire_cache_controls()
-        self._cache_controls_ready = True
         self._refresh_cache_status()
 
     def _wire_cache_controls(self) -> None:
-        def _apply_caps() -> None:
-            if not bool(getattr(self, "_cache_controls_ready", False)):
-                return
-            ctrl = self._cache_port
-            if ctrl is None:
-                return
-            result = ctrl.set_simulation_cache_caps(
-                result_cap=int(self._spin_result_cache_cap.value()),
-                preview_cap=int(self._spin_preview_cache_cap.value()),
-                persist=True,
-            )
-            self._handle_cache_action_outcome(result)
-
-        self._spin_result_cache_cap.valueChanged.connect(lambda _v: _apply_caps())
-        self._spin_preview_cache_cap.valueChanged.connect(lambda _v: _apply_caps())
-
         self._btn_purge_results.clicked.connect(lambda: self._confirm_and_purge(which="result"))
         self._btn_purge_preview.clicked.connect(lambda: self._confirm_and_purge(which="preview"))
         self._btn_purge_all.clicked.connect(lambda: self._confirm_and_purge(which="all"))
@@ -503,6 +487,12 @@ class SolverSettingsDialog(QtWidgets.QDialog):
                 return False
             return bool(value)
 
+        def _solver_name_or_default(value: object) -> str:
+            try:
+                return str(normalize_solver_name(value))
+            except Exception:
+                return str(DEFAULT_SOLVER_NAME)
+
         cfg.setdefault("solver", str(DEFAULT_SOLVER_NAME))
         cfg.setdefault("rtol", 1e-6)
         cfg.setdefault("atol", 1e-12)
@@ -523,7 +513,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         cfg.setdefault("equilibrium_preview_debounce_ms", 150)
         cfg.setdefault("result_cache_cap", _DEFAULT_RESULT_CACHE_CAP)
         cfg.setdefault("preview_cache_cap", _DEFAULT_PREVIEW_CACHE_CAP)
-        solver_name, _warning = normalize_solver_name(cfg.get("solver", DEFAULT_SOLVER_NAME))
+        solver_name = _solver_name_or_default(cfg.get("solver", DEFAULT_SOLVER_NAME))
         self._combo_solver.setCurrentText(solver_name)
 
         self._spin_rtol.setValue(_coerce_positive_float(cfg.get("rtol"), default=1e-6))
@@ -547,7 +537,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         self._limit_blas_checkbox.setChecked(
             _coerce_bool(cfg.get("limit_blas_threads_per_worker", bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"])))
         )
-        slider_solver_name, _warning = normalize_solver_name(cfg.get("slider_preview_solver", DEFAULT_SOLVER_NAME))
+        slider_solver_name = _solver_name_or_default(cfg.get("slider_preview_solver", DEFAULT_SOLVER_NAME))
         self._combo_slider_preview_solver.setCurrentText(slider_solver_name)
         try:
             slider_preview_points = int(cfg.get("slider_preview_points", 100))

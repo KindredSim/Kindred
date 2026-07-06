@@ -197,7 +197,11 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
         execution_request = dict(execution_request)
         execution_request["prepared_payload"] = None
 
-    simulation_identity = dict(dispatch_input.simulation_identity or {})
+    simulation_identity = (
+        dict(dispatch_input.simulation_identity)
+        if isinstance(dispatch_input.simulation_identity, Mapping)
+        else {}
+    )
     intervention_schedule_payload: dict[str, Any] | None = None
     has_intervention_schedule_input = isinstance(dispatch_input.intervention_schedule, Mapping)
     effective_prepared_payload = (
@@ -286,6 +290,8 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
                     plan_identity = dict(identity_payload)
             if plan_identity:
                 simulation_identity = dict(plan_identity)
+            if not simulation_identity:
+                raise ValueError(f"Missing submitted simulation identity for set {dispatch_input.set_id!r}.")
             cache_identity_payload = _cache_identity_payload(
                 dispatch_input,
                 simulation_identity=simulation_identity,
@@ -313,6 +319,8 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
             simulation_identity=simulation_identity,
         )
 
+    if not simulation_identity:
+        raise ValueError(f"Missing submitted simulation identity for set {dispatch_input.set_id!r}.")
     return BatchSetDispatchPlan(
         plan_payload=None,
         execution_request=execution_request if isinstance(execution_request, dict) else None,
@@ -404,6 +412,9 @@ def build_serial_batch_dispatch_plan(
             plan_cache_key = plan_for_worker.cache_key()
             if plan_cache_key:
                 cache_key = str(plan_cache_key)
+    simulation_identity = dict(dispatch_plan.simulation_identity)
+    if not simulation_identity:
+        raise ValueError(f"Missing submitted simulation identity for set {set_id!r}.")
 
     return SerialBatchDispatchPlan(
         plan_payload=plan_payload if isinstance(plan_payload, dict) else None,
@@ -477,6 +488,8 @@ def _cache_identity_payload(
     simulation_identity: Mapping[str, Any],
     existing_cache_identity_payload: Mapping[str, Any] | None,
 ) -> Dict[str, Any]:
+    if not simulation_identity:
+        raise ValueError(f"Missing submitted simulation identity for set {dispatch_input.set_id!r}.")
     existing = dict(existing_cache_identity_payload or {})
     cache_key = str(dispatch_input.cache_key or existing.get("cache_key") or "")
     cache_identity_payload: Dict[str, Any] = {

@@ -7,18 +7,11 @@ This module provides low-level logging setup utilities and is intended for
 internal use by kindred.io.logging. External code should NOT import from this
 module directly.
 
-**Public API**: Use `kindred.io.logging` or `kindred.io` instead.
-
 Examples
 --------
-❌ Do NOT use::
+Use the logging owner module from internal callers::
 
-    from kindred.io.logging_config import setup_logging  # INTERNAL
-
-✅ Use instead::
-
-    from kindred.io.logging import setup_logging  # PUBLIC API
-    from kindred.io import setup_logging          # Also OK
+    from kindred.io.logging import setup_logging
 
 This module provides:
 - Rotating file handler with size-based rotation

@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt
 if TYPE_CHECKING:
     from kindred.core.analysis.global_fit_execution import GlobalFitResult
 
-from kindred.core.api.simulation import (
+from kindred.gui.fitting.simulation_builder_contract import (
     SimulationBuilder,
     SimulationBuilderContractError,
     coerce_simulation_builder,
@@ -39,6 +39,7 @@ from kindred.core.analysis.global_fit_projection import (
     FitRenderProjection,
     projection_from_global_fit_result,
 )
+from kindred.core.analysis.global_fit_execution import normalize_weights
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR,
     SerialFittingEvaluator,
@@ -94,7 +95,7 @@ from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
 from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices, compute_windowed_indices
-from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_SENTINEL, DEFAULT_PARALLEL_STARTS
+from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_SENTINEL
 from kindred.gui.display_name_policy import (
     FOOTER_SUMMARY_MAX_CHARS,
     INLINE_ERROR_MAX_CHARS,
@@ -127,7 +128,6 @@ _PROJECT_APPLY_OPTIONS: tuple[tuple[str, str], ...] = (
 
 
 __all__ = [
-    "DEFAULT_PARALLEL_STARTS",
     "FittingWindow",
     "GlobalFitWorker",
     "validate_de_bounds",
@@ -709,7 +709,7 @@ class FittingWindow(QtWidgets.QDialog):
         global_dataset_variable_params = launch_snapshot.global_dataset_variable_params
         dataset_selection = launch_snapshot.dataset_selection
         solver, rtol, atol = launch_snapshot.integration
-        requested_solver, _solver_warning = normalize_solver_name(str(solver or FITTING_DEFAULT_SOLVER))
+        requested_solver = normalize_solver_name(str(solver))
         mechanism_text = self._safe_text_from_getter(self._mechanism_text_getter)
         evaluator_components = self._fitting_evaluator_components_for_runtime_identity(
             mechanism_text=mechanism_text,
@@ -792,12 +792,21 @@ class FittingWindow(QtWidgets.QDialog):
                     mechanism_text=mechanism_text,
                 ),
             }
+        try:
+            objective_weights = normalize_weights(list(dataset_specs), weights)
+        except Exception as exc:
+            return None, FittingLaunchRejection(
+                title="Invalid Weights" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
+                message=str(exc) or "Fit weights are invalid.",
+                passive_status="Fitting runtime not ready: invalid weights",
+            )
         stamp = build_global_fit_run_stamp(
             dataset_rows=list(dataset_selection.rows),
             included_ids=list(dataset_selection.ids),
             applied_fit_targets=applied_targets,
             applied_target_weights=applied_target_weights,
-            weights_used=(dict(weights) if isinstance(weights, dict) else None),
+            weights_requested=(dict(weights) if isinstance(weights, dict) else None),
+            objective_weights_used=dict(objective_weights),
             weight_mode=("equal" if weights is None else "custom"),
             fit_config=dict(config or {}),
             mechanism_text=mechanism_text,
@@ -936,7 +945,7 @@ class FittingWindow(QtWidgets.QDialog):
     def _active_integration_defaults_for_ui(self) -> Tuple[str, float, float]:
         """Read fitting integration defaults from the persisted fitting preferences."""
         _solver_raw = self._config_defaults.get("solver")
-        solver_default, _warning = normalize_solver_name(
+        solver_default = normalize_solver_name(
             _solver_raw if _solver_raw is not None else FITTING_DEFAULT_SOLVER
         )
         try:
@@ -1695,7 +1704,7 @@ class FittingWindow(QtWidgets.QDialog):
         if integration is None:
             return False
         solver, rtol, atol = integration
-        requested_solver, _solver_warning = normalize_solver_name(str(solver or FITTING_DEFAULT_SOLVER))
+        requested_solver = normalize_solver_name(str(solver))
         if str(requested_solver) != str(identity.requested_solver):
             return False
         if not math.isclose(float(rtol), float(identity.requested_rtol), rel_tol=1e-9, abs_tol=1e-12):
@@ -2373,9 +2382,8 @@ class FittingWindow(QtWidgets.QDialog):
                 raise RuntimeError("Simulation builder unavailable.")
             integration = self._params_ics_tab.collect_integration_settings()
             if integration is None:
-                solver, rtol, atol = (FITTING_DEFAULT_SOLVER, 1e-6, 1e-12)
-            else:
-                solver, rtol, atol = integration
+                raise RuntimeError("Fitting integration settings are required.")
+            solver, rtol, atol = integration
             self._fit_evaluator_state.build_and_set(
                 mechanism_text=mechanism_text,
                 param_names=list(param_names),
@@ -3541,7 +3549,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _global_fit_completion_dialog_spec(self, result: GlobalFitResult) -> tuple[str, str, str]:
         """Return (severity, title, text) for the completion dialog."""
-        chi_sq = float(getattr(result, "global_chi_squared", float("nan")))
+        residual_mse = float(getattr(result, "global_residual_mse", float("nan")))
         completion = getattr(result, "completion", None)
         if completion is None:
             return (
@@ -3553,7 +3561,7 @@ class FittingWindow(QtWidgets.QDialog):
         dataset_failures = dict(completion.dataset_failures)
         warnings = dict(completion.dataset_warnings)
         optimizer_diagnostic = completion.optimizer_diagnostic
-        nonfinite_chi = bool(completion.nonfinite_metrics)
+        nonfinite_residual_mse = bool(completion.nonfinite_metrics)
         converged = bool(completion.optimizer_converged)
 
         if status == "fail":
@@ -3567,16 +3575,16 @@ class FittingWindow(QtWidgets.QDialog):
             else:
                 lines.append("- Global fit failed before replay completed.")
 
-            if nonfinite_chi:
+            if nonfinite_residual_mse:
                 lines.append("")
-                lines.append("Final χ² is non-finite; results are invalid.")
+                lines.append("Final residual MSE is non-finite; results are invalid.")
 
             return "fail", "Global Fit Failed", "Global fit failed.\n\n" + "\n".join(lines)
 
         param_section = self._format_params_for_completion_dialog(result)
 
         if status == "ok":
-            text_parts = [f"Final Chi-Squared (χ²): {chi_sq:.6g}"]
+            text_parts = [f"Final Residual MSE: {residual_mse:.6g}"]
             if param_section:
                 text_parts.append("")
                 text_parts.append(param_section)
@@ -3597,14 +3605,14 @@ class FittingWindow(QtWidgets.QDialog):
                 warn_lines.append(f"- {label}: {first_line}")
 
         if warn_lines:
-            text = [f"Final Chi-Squared (χ²): {chi_sq:.6g}"]
+            text = [f"Final Residual MSE: {residual_mse:.6g}"]
             if param_section:
                 text.append("")
                 text.append(param_section)
             text.extend(["", "Warnings:"])
             text.extend(warn_lines)
             return "warn", "Optimization Complete (Warnings)", "\n".join(text)
-        return "warn", "Optimization Complete (Warnings)", f"Final Chi-Squared (χ²): {chi_sq:.6g}"
+        return "warn", "Optimization Complete (Warnings)", f"Final Residual MSE: {residual_mse:.6g}"
 
     def _format_params_for_completion_dialog(self, result: GlobalFitResult) -> str:
         """Format fitted parameters as compact text for the completion dialog."""
@@ -3854,7 +3862,7 @@ class FittingWindow(QtWidgets.QDialog):
         dataset_vars = sum(len(specs) for specs in self._active_variable_specs.values())
         params = shared + dataset_vars
         ssq = sum(np.sum(info.residuals**2) for info in result.dataset_info)
-        weighted = float(np.sum(result.objective_residuals**2)) if result.objective_residuals is not None else ssq
+        objective_ssq = float(np.sum(result.objective_residuals**2)) if result.objective_residuals is not None else ssq
         return {
             "Datasets": len(result.dataset_info),
             "Series": series_count or len(result.dataset_info),
@@ -3862,8 +3870,7 @@ class FittingWindow(QtWidgets.QDialog):
             "Parameters": params,
             "DF": max(1, total_points - params),
             "SSQ": ssq,
-            "Weighted SSQ": weighted,
-            "-logL": 0.5 * weighted,
+            "Objective SSQ": objective_ssq,
         }
 
     def _update_statistics(self, stats: Dict[str, Any]) -> None:

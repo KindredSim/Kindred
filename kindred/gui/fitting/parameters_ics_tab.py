@@ -15,7 +15,6 @@ from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 from kindred.gui.fitting.constants import (
-    DEFAULT_PARALLEL_STARTS,
     FITTING_DEFAULT_SOLVER,
     FITTING_MAX_NFEV_RANGE,
     FITTING_METHODS,
@@ -492,7 +491,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._integration_solver_combo = QtWidgets.QComboBox(params_group)
         self._integration_solver_combo.setObjectName("global_fit_integration_solver")
         self._integration_solver_combo.addItems(list(FITTING_SOLVERS))
-        solver_name, _warning = normalize_solver_name(default_solver)
+        solver_name = normalize_solver_name(default_solver)
         self._integration_solver_combo.setCurrentText(solver_name)
 
         self._integration_rtol_edit = QtWidgets.QLineEdit(_fmt(default_rtol), params_group)
@@ -1636,7 +1635,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             "ftol": max(safe_float_parse(self._ftol_edit.text(), 1e-10), 1e-15),
             "xtol": max(safe_float_parse(self._xtol_edit.text(), 1e-10), 1e-15),
             "seed": self._seed_spin.value() if self._seed_check.isChecked() else None,
-            "parallel_starts": DEFAULT_PARALLEL_STARTS,
         }
         return config, global_dataset_params, global_dataset_variable_params
 
@@ -1737,25 +1735,45 @@ class ParametersIcsTab(QtWidgets.QWidget):
         from kindred.core.simulator.solvers import normalize_solver_name
 
         combo = getattr(self, "_integration_solver_combo", None)
-        solver_label = str(combo.currentText()).strip() if combo is not None else FITTING_DEFAULT_SOLVER
+        if combo is None:
+            if show_messages:
+                QtWidgets.QMessageBox.warning(
+                    self.window(),
+                    "Advanced Integration Settings",
+                    "Select a solver for Global Fit integration.",
+                )
+            return None
+        solver_label = str(combo.currentText()).strip()
         if solver_label not in FITTING_SOLVERS:
-            solver_label = FITTING_DEFAULT_SOLVER
-        solver_method, solver_warning = normalize_solver_name(solver_label)
-        if solver_warning and show_messages:
-            QtWidgets.QMessageBox.information(
-                self.window(),
-                "Solver Normalization",
-                f"{solver_warning}\n\nRequested: {solver_label}\nUsing: {solver_method}",
-            )
+            if show_messages:
+                QtWidgets.QMessageBox.warning(
+                    self.window(),
+                    "Advanced Integration Settings",
+                    "Select a valid solver for Global Fit integration.",
+                )
+            return None
+        solver_method = normalize_solver_name(solver_label)
 
         rtol_edit = getattr(self, "_integration_rtol_edit", None)
         atol_edit = getattr(self, "_integration_atol_edit", None)
-        rtol_text = str(rtol_edit.text()).strip() if rtol_edit is not None else "1e-6"
-        atol_text = str(atol_edit.text()).strip() if atol_edit is not None else "1e-12"
-        if not rtol_text:
-            rtol_text = "1e-6"
-        if not atol_text:
-            atol_text = "1e-12"
+        if rtol_edit is None or atol_edit is None:
+            if show_messages:
+                QtWidgets.QMessageBox.warning(
+                    self.window(),
+                    "Advanced Integration Settings",
+                    "Global Fit integration tolerances are required.",
+                )
+            return None
+        rtol_text = str(rtol_edit.text()).strip()
+        atol_text = str(atol_edit.text()).strip()
+        if not rtol_text or not atol_text:
+            if show_messages:
+                QtWidgets.QMessageBox.warning(
+                    self.window(),
+                    "Advanced Integration Settings",
+                    "rtol and atol are required.",
+                )
+            return None
 
         try:
             rtol = float(rtol_text)

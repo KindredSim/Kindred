@@ -6,18 +6,17 @@ SciPy is a hard dependency; all integration routes through `scipy.integrate.solv
 - Deterministic `t_eval` output grid
 - Optional TemperatureSchedule wrapper that injects T into RHS(T=...) calls
 - Optional progress callback wrapper
-- Optional positivity clamp (post-processing)
+- Non-negative concentration invariant enforcement at output boundaries
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import fields
+from dataclasses import replace
 from typing import (
     Any,
     Callable,
     Dict,
-    Iterable,
     List,
     Mapping,
     Optional,
@@ -30,16 +29,23 @@ import numpy as np
 from kindred.core.scipy_integrate import load_scipy_integrate
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 
-from kindred.core.temperature import TemperatureScheduleDictProtocol, TemperatureScheduleProtocol
+from kindred.core.temperature import (
+    TemperatureScheduleDictProtocol,
+    TemperatureScheduleProtocol,
+    coerce_temperature_schedule,
+)
 from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 from kindred.core.exceptions import (
     InitialConditionError,
     SimulationCancelled,
+    SolverError,
     TimeGridError,
     create_solver_error,
 )
 from kindred.core.time_grid import build_time_grid
+from .nonnegative_invariant import apply_nonnegative_trajectory_invariant
+from .solver_output import solver_trajectory_array
 from .intervention_schedule_execution import (
     InterventionScheduleExecutionOwner,
     ScheduleExecutionRequest,
@@ -95,7 +101,13 @@ def _normal_event_states(raw_states: object, *, count: int, species_count: int) 
                 arr = arr.reshape(-1, int(species_count))
             except Exception:
                 continue
-        states[idx] = [np.asarray(row, dtype=float).reshape(-1) for row in arr]
+        states[idx] = [
+            apply_nonnegative_trajectory_invariant(
+                np.asarray(row, dtype=float).reshape(-1, 1),
+                context="Simulation event state",
+            ).reshape(-1)
+            for row in arr
+        ]
     return states
 
 
@@ -114,7 +126,7 @@ def _attach_event_states(
     return output
 
 
-def _scipy_method_for(name: object) -> Tuple[str, Optional[str]]:
+def _scipy_method_for(name: object) -> str:
     """Map solver name to SciPy method name with correct capitalization."""
     n = str(name or "").strip().upper()
     scipy_methods = {
@@ -122,16 +134,16 @@ def _scipy_method_for(name: object) -> Tuple[str, Optional[str]]:
         "BDF": "BDF",
     }
     if n in scipy_methods:
-        return scipy_methods[n], None
-    return DEFAULT_SOLVER_NAME, f"Unknown solver name; using {DEFAULT_SOLVER_NAME}"
+        return scipy_methods[n]
+    allowed = ", ".join(sorted(scipy_methods.values()))
+    raise SolverError(f"Unsupported solver name {name!r}; expected one of: {allowed}.")
 
 
-def normalize_solver_name(name: object) -> Tuple[str, Optional[str]]:
+def normalize_solver_name(name: object) -> str:
     """
     Normalize a user-specified solver name to a SciPy `solve_ivp` method name.
 
-    Returns (method, warning). The warning is non-empty when an unknown
-    name is mapped to a supported solver.
+    Unknown names raise `SolverError`.
     """
     return _scipy_method_for(name)
 
@@ -139,7 +151,10 @@ def normalize_solver_name(name: object) -> Tuple[str, Optional[str]]:
 class _TemperatureInjectedRhs:
     def __init__(self, rhs: ODERhsWithTemp, schedule: TemperatureScheduleProtocol) -> None:
         self._rhs = rhs
-        self._schedule = schedule
+        schedule_obj = coerce_temperature_schedule(schedule)
+        if schedule_obj is None:
+            raise TypeError("temperature_schedule must not be None when injecting temperature.")
+        self._schedule = schedule_obj
 
     def __call__(self, t: float, y: np.ndarray) -> np.ndarray:
         T = float(self._schedule(t))
@@ -183,7 +198,12 @@ class _ProgressRhs:
 
 def _prepare_time_grid(req: SimulationRequest, *, t0: float, t1: float) -> np.ndarray:
     if req.t_eval is None:
-        return build_time_grid(t0, t1, req.grid or {"N": 2})
+        if not isinstance(req.grid, Mapping) or not req.grid:
+            raise TimeGridError("SimulationRequest.grid is required when t_eval is not provided")
+        try:
+            return build_time_grid(t0, t1, req.grid)
+        except ValueError as exc:
+            raise TimeGridError(str(exc)) from exc
     t_eval = np.asarray(req.t_eval, dtype=float).reshape(-1)
     if t_eval.size == 0:
         raise TimeGridError("t_eval must contain at least one time point")
@@ -227,8 +247,6 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
             "ml": getattr(req.rosenbrock_jacobian, "ml", None),
             "mu": getattr(req.rosenbrock_jacobian, "mu", None),
         },
-        "positivity": (req.positivity or None),
-        "pos_indices": (list(req.pos_indices) if req.pos_indices is not None else None),
         "has_temperature_schedule": req.temperature_schedule is not None,
     }
     prov.update(symbolic_jacobian.provenance_fields())
@@ -258,13 +276,11 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
         )
 
     if req.temperature_schedule is not None:
-        if isinstance(req.temperature_schedule, TemperatureScheduleDictProtocol):
-            try:
-                prov["temperature_schedule"] = req.temperature_schedule.to_dict()
-            except Exception:
-                prov["temperature_schedule"] = str(req.temperature_schedule)
+        temperature_schedule = coerce_temperature_schedule(req.temperature_schedule)
+        if isinstance(temperature_schedule, TemperatureScheduleDictProtocol):
+            prov["temperature_schedule"] = dict(temperature_schedule.to_dict())
         else:
-            prov["temperature_schedule"] = str(req.temperature_schedule)
+            prov["temperature_schedule"] = str(temperature_schedule)
 
     return prov
 
@@ -290,47 +306,6 @@ def _scrub_unused_jacobian_provenance(
     prov.update(disabled_symbolic_jacobian.provenance_fields())
 
 
-def _implicit_scipy_alternatives(primary: str) -> List[str]:
-    order = {
-        "BDF": ["Radau"],
-        "Radau": ["BDF"],
-    }
-    return [m for m in order.get(primary, []) if m != primary]
-
-
-def _apply_positivity_to_trajectory(
-    Y: np.ndarray,
-    *,
-    mode: Optional[str],
-    indices: Optional[Iterable[int]],
-) -> np.ndarray:
-    if not mode:
-        return Y
-    if indices is None:
-        return np.maximum(Y, 0.0)
-    Y2 = np.asarray(Y, float).copy()
-    for j in indices:
-        jj = int(j)
-        if 0 <= jj < Y2.shape[0]:
-            Y2[jj, :] = np.maximum(Y2[jj, :], 0.0)
-    return Y2
-
-
-def _solver_trajectory_array(sol_y: object, *, y0: np.ndarray, t_out: np.ndarray) -> np.ndarray:
-    sample_count = int(np.asarray(t_out, dtype=float).reshape(-1).size)
-    species_count = int(np.asarray(y0, dtype=float).reshape(-1).size)
-    Y = np.asarray(sol_y, dtype=float)
-    if Y.ndim == 2:
-        return Y
-    if sample_count == 0:
-        return np.empty((species_count, 0), dtype=float)
-    if Y.ndim == 1 and species_count == 1 and Y.size == sample_count:
-        return Y.reshape(1, sample_count)
-    if Y.ndim == 1 and sample_count == 1 and Y.size == species_count:
-        return Y.reshape(species_count, 1)
-    return Y.reshape(species_count, sample_count)
-
-
 def _execute_scipy(
     req: SimulationRequest,
     *,
@@ -342,11 +317,7 @@ def _execute_scipy(
     t_eval: np.ndarray,
     prov: Dict[str, object],
     method: str,
-    note: Optional[str],
 ) -> SimulationOutput:
-    if note:
-        prov["emulation_note"] = note
-
     base_kwargs: Dict[str, Any] = dict(t_eval=t_eval, rtol=float(req.rtol), atol=float(req.atol))
     if req.max_step is not None:
         base_kwargs["max_step"] = float(req.max_step)
@@ -382,11 +353,6 @@ def _execute_scipy(
             kwargs.pop("jac_sparsity", None)
         return kwargs
 
-    attempted_methods: List[str] = []
-    fallback_occurred = False
-    fallback_message: Optional[str] = None
-    primary_method = method
-
     def _looks_like_brentq_sign_error(exc: BaseException) -> bool:
         return "different signs" in str(exc).lower()
 
@@ -411,7 +377,6 @@ def _execute_scipy(
             raise
 
     sol = _solve_or_cancelled(method)
-    attempted_methods.append(method)
 
     if events_list and getattr(sol, "status", 0) == 1 and getattr(sol, "t_events", None):
         for idx, ev in enumerate(events_list):
@@ -423,33 +388,14 @@ def _execute_scipy(
 
     if not sol.success:
         prov["solver_failure"] = str(sol.message)
-        last_message = str(sol.message)
-        for alt_method in _implicit_scipy_alternatives(method):
-            alt_sol = _solve_or_cancelled(alt_method)
-            attempted_methods.append(alt_method)
-            if alt_sol.success:
-                sol = alt_sol
-                prov["solver_alternative_used"] = alt_method
-                fallback_occurred = True
-                fallback_message = f"{primary_method} failed; succeeded with {alt_method}"
-                method = alt_method
-                break
-            last_message = str(alt_sol.message)
-        if not sol.success:
-            t_fail = float(sol.t[-1]) if getattr(sol, "t", None) is not None and len(sol.t) > 0 else float(t0)
-            attempt_list = ", ".join(attempted_methods)
-            raise create_solver_error(
-                req.solver,
-                t_fail,
-                f"{last_message}; attempted methods: {attempt_list}",
-            )
+        t_fail = float(sol.t[-1]) if getattr(sol, "t", None) is not None and len(sol.t) > 0 else float(t0)
+        raise create_solver_error(req.solver, t_fail, str(sol.message))
 
     prov["solver_used"] = method
     t_out = np.asarray(sol.t, float)
-    Y_out = _apply_positivity_to_trajectory(
-        _solver_trajectory_array(sol.y, y0=y0, t_out=t_out),
-        mode=req.positivity,
-        indices=(list(req.pos_indices) if req.pos_indices is not None else None),
+    Y_out = apply_nonnegative_trajectory_invariant(
+        solver_trajectory_array(sol.y, y0=y0, t_out=t_out),
+        context="Simulation",
     )
     if hasattr(sol, "t_events") and sol.t_events:
         prov["events"] = [list(te) for te in sol.t_events]
@@ -457,8 +403,6 @@ def _execute_scipy(
         t=t_out,
         Y=Y_out,
         provenance=prov,
-        fallback_occurred=fallback_occurred,
-        fallback_message=fallback_message,
     )
     return _attach_event_states(
         output,
@@ -479,7 +423,6 @@ def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
         t_eval=request.t_eval,
         prov=request.provenance,
         method=request.method,
-        note=request.note,
     )
     events = output.provenance.get("events")
     return SegmentRunResult(
@@ -491,13 +434,6 @@ def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
             species_count=int(np.asarray(request.y0, dtype=float).reshape(-1).size),
         ),
         solver_used=str(output.provenance.get("solver_used") or request.method),
-        solver_alternative_used=(
-            str(output.provenance["solver_alternative_used"])
-            if output.provenance.get("solver_alternative_used")
-            else None
-        ),
-        fallback_occurred=bool(output.fallback_occurred),
-        fallback_message=output.fallback_message,
         symbolic_jacobian_used=bool(output.provenance.get("symbolic_jacobian")),
         jacobian_sparsity_hint=bool(output.provenance.get("jacobian_sparsity_hint")),
     )
@@ -558,36 +494,22 @@ def _normal_event_provenance(
             continue
     return out
 
-
-
-def _request_from_mapping(payload: Mapping[str, Any], *, allow_unknown_keys: bool) -> SimulationRequest:
-    field_names = {f.name for f in fields(SimulationRequest)}
-    payload_dict = dict(payload)
-    missing = [name for name in ("rhs", "t_span", "y0") if name not in payload_dict]
-    if missing:
-        raise TypeError(f"Missing required SimulationRequest field(s): {', '.join(missing)}")
-    unknown = sorted(set(payload_dict) - field_names)
-    if unknown and not allow_unknown_keys:
-        raise TypeError(f"Unknown SimulationRequest field(s): {', '.join(unknown)}")
-    filtered = {k: v for k, v in payload_dict.items() if k in field_names}
-    return SimulationRequest(**filtered)  # type: ignore[arg-type]
-
-
-def solve_ode(req: SimulationRequest | Mapping[str, Any], *, allow_unknown_keys: bool = False) -> SimulationOutput:
+def solve_ode(req: SimulationRequest) -> SimulationOutput:
     if not isinstance(req, SimulationRequest):
-        if isinstance(req, Mapping):
-            req = _request_from_mapping(req, allow_unknown_keys=bool(allow_unknown_keys))
-        else:
-            raise TypeError(f"solve_ode expects SimulationRequest or Mapping, got {type(req)!r}")
+        raise TypeError(f"solve_ode expects SimulationRequest, got {type(req)!r}")
+    if req.temperature_schedule is not None:
+        req = replace(req, temperature_schedule=coerce_temperature_schedule(req.temperature_schedule))
     y0 = np.asarray(req.y0, float)
     if y0.ndim != 1 or not np.all(np.isfinite(y0)):
         raise InitialConditionError("y0 must be a 1D finite array")
+    if np.any(y0 < 0.0):
+        raise InitialConditionError("y0 must contain non-negative concentrations")
     t0, t1 = map(float, req.t_span)
     t_eval = _prepare_time_grid(req, t0=t0, t1=t1)
     rhs, rhs_for_jac = _prepare_rhs(req, t0=t0, t1=t1)
     prov = _build_provenance(req, t_eval=t_eval)
 
-    method, note = _scipy_method_for(req.solver)
+    method = _scipy_method_for(req.solver)
     _scrub_unused_jacobian_provenance(prov, method=method, req=req)
     schedule = coerce_intervention_schedule(req.intervention_schedule)
     if schedule is not None:
@@ -604,7 +526,6 @@ def solve_ode(req: SimulationRequest | Mapping[str, Any], *, allow_unknown_keys:
                     t_eval=t_eval,
                     provenance=prov,
                     method=method,
-                    note=note,
                     schedule=compiled_schedule.executable_schedule,
                 )
             )
@@ -618,5 +539,4 @@ def solve_ode(req: SimulationRequest | Mapping[str, Any], *, allow_unknown_keys:
         t_eval=t_eval,
         prov=prov,
         method=method,
-        note=note,
     )

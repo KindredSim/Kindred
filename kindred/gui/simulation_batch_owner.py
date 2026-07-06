@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import math
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
@@ -32,6 +32,8 @@ from kindred.gui.ports import (
     RequestScopeRestoreTruth,
     ResolvedBatchDisplayRequestEntry,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -740,6 +742,9 @@ class SimulationBatchOwner:
         missing_workspace_entry = False
         missing_explicit_entry = False
         invalid_entry = False
+        missing_workspace_set_ids: list[str] = []
+        missing_explicit_set_ids: list[str] = []
+        semantic_unavailable_set_ids: list[str] = []
 
         for raw_set_id in requested_show_set_ids or ():
             set_id = str(raw_set_id or "").strip()
@@ -753,11 +758,12 @@ class SimulationBatchOwner:
                     preview_cache_key=preview_cache_key,
                 )
                 if preview_entry.entry is not None:
+                    try:
+                        workspace_preview_provenance = self.current_workspace_preview_identity_payload(set_id=set_id)
+                    except Exception:
+                        semantic_unavailable_set_ids.append(set_id)
+                        continue
                     has_resolved_workspace_preview = True
-                    workspace_preview_provenance = self.workspace_preview_display_provenance_for_entry(
-                        set_id,
-                        preview_entry.entry,
-                    )
                     reference_authority = resolve_canonical_reference_authority(
                         set_id=set_id,
                         active_cache_key=active_cache_key,
@@ -792,14 +798,19 @@ class SimulationBatchOwner:
                         focused_request_has_resolved_entry = True
                 elif preview_entry.state == "invalid":
                     invalid_entry = True
+                elif preview_entry.state == "identity_unavailable":
+                    semantic_unavailable_set_ids.append(set_id)
                 else:
+                    missing_workspace_set_ids.append(set_id)
                     missing_workspace_entry = True
                 continue
 
             if not active_cache_key:
+                missing_explicit_set_ids.append(set_id)
                 missing_explicit_entry = True
                 continue
             if active_valid_set_ids and set_id not in active_valid_set_ids:
+                missing_explicit_set_ids.append(set_id)
                 missing_explicit_entry = True
                 continue
             explicit_entry = batch_cache.entry_for_set(
@@ -838,6 +849,7 @@ class SimulationBatchOwner:
             elif explicit_entry.state == "invalid":
                 invalid_entry = True
             else:
+                missing_explicit_set_ids.append(set_id)
                 missing_explicit_entry = True
 
         coverage = (
@@ -851,6 +863,8 @@ class SimulationBatchOwner:
         unavailable_cause: DisplayTransitionCause | None = None
         if invalid_entry:
             unavailable_cause = DisplayTransitionCause.INVALID_CACHE_ENTRY
+        elif semantic_unavailable_set_ids:
+            unavailable_cause = DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE
         elif missing_workspace_entry:
             unavailable_cause = DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE
         elif missing_explicit_entry:
@@ -863,6 +877,8 @@ class SimulationBatchOwner:
             has_resolved_workspace_preview=bool(has_resolved_workspace_preview),
             focused_uses_workspace_controls=bool(focused_request_uses_workspace_controls),
             focused_has_resolved_entry=bool(focused_request_has_resolved_entry),
+            missing_intent_set_ids=tuple((*missing_workspace_set_ids, *missing_explicit_set_ids)),
+            semantic_unavailable_set_ids=tuple(semantic_unavailable_set_ids),
         )
 
     def workspace_display_request_resolution(
@@ -885,41 +901,38 @@ class SimulationBatchOwner:
         ).strip()
 
         try:
-            expected_source = self._mechanism_source_for_workspace_selection(set_id=str(set_id))
+            expected_source = self._mechanism_source_for_workspace_selection(
+                set_id=str(set_id),
+                apply_parameter_overrides=False,
+            )
             expected_mechanism_text = expected_source.full_dsl
+        except Exception:
+            return BatchCacheEntryReadResult("identity_unavailable")
+        try:
             expected_identity = self.current_workspace_preview_identity(set_id=str(set_id))
-            expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
+        except Exception:
+            return BatchCacheEntryReadResult("identity_unavailable")
+        try:
+            _expected_solver_config, _expected_t_end, _expected_overlay_token = self._current_workspace_preview_context(
                 set_id=str(set_id),
                 mechanism_text=str(expected_mechanism_text),
             )
         except Exception:
-            return BatchCacheEntryReadResult("missing")
+            return BatchCacheEntryReadResult("identity_unavailable")
 
         def _entry_matches_expected(result: BatchCacheEntryReadResult) -> bool:
             if result.entry is None:
                 return False
             entry_identity = coerce_simulation_identity(result.entry.get("simulation_identity"))
-            has_semantic_identity = entry_identity is not None
-            if entry_identity is not None:
-                if entry_identity != expected_identity:
-                    return False
-            else:
-                if str(result.entry.get("mechanism_text") or "") != str(expected_mechanism_text):
-                    return False
-                if dict(result.entry.get("solver_config") or {}) != dict(expected_solver_config):
-                    return False
-                if str(result.entry.get("preview_batch_cache_token") or "") != str(expected_overlay_token):
-                    return False
+            if entry_identity is None:
+                return False
+            if entry_identity != expected_identity:
+                return False
             entry_t_payload = result.entry.get("t")
             entry_t = np.asarray(entry_t_payload if entry_t_payload is not None else [], dtype=float).reshape(-1)
             if entry_t.size <= 0:
                 return False
-            if has_semantic_identity:
-                return True
-            expected_grid_n = int((expected_solver_config.get("grid") or {}).get("N") or 0)
-            if expected_grid_n > 0 and int(entry_t.size) != expected_grid_n:
-                return False
-            return math.isclose(float(entry_t[-1]), float(expected_t_end), rel_tol=1e-9, abs_tol=1e-12)
+            return True
 
         invalid_found = False
         direct = batch_cache.entry_for_set(
@@ -929,6 +942,8 @@ class SimulationBatchOwner:
         )
         if _entry_matches_expected(direct):
             return direct
+        if direct.entry is not None and coerce_simulation_identity(direct.entry.get("simulation_identity")) is None:
+            invalid_found = True
         if direct.state == "invalid":
             invalid_found = True
 
@@ -938,6 +953,8 @@ class SimulationBatchOwner:
         ):
             if _entry_matches_expected(result):
                 return result
+            if result.entry is not None and coerce_simulation_identity(result.entry.get("simulation_identity")) is None:
+                invalid_found = True
             invalid_found = invalid_found or result.state == "invalid"
 
         return BatchCacheEntryReadResult("invalid" if invalid_found else "missing")
@@ -948,42 +965,21 @@ class SimulationBatchOwner:
             return None
         try:
             identity = self.current_workspace_preview_identity(set_id=sid)
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "Workspace preview identity unavailable for set_id=%s: %s",
+                sid,
+                exc,
+                exc_info=True,
+            )
             return None
-        try:
-            return dict(identity.to_payload())
-        except Exception:
-            return None
-
-    def workspace_preview_display_provenance_for_entry(
-        self,
-        set_id: str,
-        entry: Mapping[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        sid = str(set_id or "").strip()
-        if not sid or not isinstance(entry, Mapping):
-            return None
-        if self._preview_has_local_mechanism_workspace(sid):
-            preview_entry = self.matching_preview_entry_for_workspace_set(set_id=sid)
-            if self._entry_matches_reference_payload(preview_entry.entry, entry):
-                return self.current_workspace_preview_identity_payload(set_id=sid)
-            return None
-        row = self._batch_row_for_set_id(sid)
-        if row is None:
-            return None
-        try:
-            has_preview_token = bool(self._preview_session.preview_batch_cache_token([int(row)]))
-        except Exception:
-            has_preview_token = False
-        if not has_preview_token:
-            return None
-        preview_entry = self.matching_preview_entry_for_workspace_set(set_id=sid)
-        if self._entry_matches_reference_payload(preview_entry.entry, entry):
-            return self.current_workspace_preview_identity_payload(set_id=sid)
-        return None
+        return dict(identity.to_payload())
 
     def current_workspace_preview_identity(self, *, set_id: str) -> SimulationIdentity:
-        mechanism_source = self._mechanism_source_for_workspace_selection(set_id=str(set_id))
+        mechanism_source = self._mechanism_source_for_workspace_selection(
+            set_id=str(set_id),
+            apply_parameter_overrides=False,
+        )
         mechanism_text = mechanism_source.full_dsl
         expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
             set_id=str(set_id),
@@ -1013,18 +1009,15 @@ class SimulationBatchOwner:
         initials_fingerprint = ""
         row = self._batch_row_for_set_id(str(set_id))
         if row is not None:
-            try:
-                baseline_initials = self.batch_initials_for_row(int(row))
-                set_name = self._batch_set_name_for_id(str(set_id))
-                pending_initials = self._mechanism_owner.pending_initials_for_run_source_set(
-                    self._mechanism_owner.mechanism_source_for_run(fast_mode=True),
-                    set_name=str(set_name or set_id),
-                )
-                baseline_initials = {**baseline_initials, **dict(pending_initials or {})}
-                preview_initials = self._preview_session.preview_initials_for_row(int(row), baseline_initials)
-                initials_fingerprint = canonical_initials_fingerprint(preview_initials)
-            except Exception:
-                initials_fingerprint = ""
+            baseline_initials = self.batch_initials_for_row(int(row))
+            set_name = self._batch_set_name_for_id(str(set_id))
+            pending_initials = self._mechanism_owner.pending_initials_for_run_source_set(
+                self._mechanism_owner.mechanism_source_for_run(fast_mode=True),
+                set_name=str(set_name or set_id),
+            )
+            baseline_initials = {**baseline_initials, **dict(pending_initials or {})}
+            preview_initials = self._preview_session.preview_initials_for_row(int(row), baseline_initials)
+            initials_fingerprint = canonical_initials_fingerprint(preview_initials)
         return SimulationIdentity.build(
             schema_id=self._mechanism_owner.simulation_schema_id(fast_mode=True),
             param_fingerprint=self._mechanism_owner.runtime_parameter_fingerprint_for_set(
@@ -1055,34 +1048,36 @@ class SimulationBatchOwner:
         set_id: str,
         solver_config: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        solver_name = str(dict(solver_config or {}).get("solver") or "").strip().lower()
+        solver_config_map = dict(solver_config or {})
+        solver_name = str(solver_config_map.get("solver") or "").strip().lower()
         if solver_name not in {"bdf", "radau"}:
             return {}
-        if not bool(dict(solver_config or {}).get("use_sparse_jacobian", False)):
+        if "use_sparse_jacobian" not in solver_config_map:
+            raise ValueError("Workspace symbolic Jacobian identity requires use_sparse_jacobian.")
+        if not bool(solver_config_map["use_sparse_jacobian"]):
             return {}
-        try:
-            mechanism_text = self._mechanism_source_for_workspace_selection(
-                set_id=str(set_id),
-                apply_parameter_overrides=False,
-            ).full_dsl
-            parameter_values = getattr(self._mechanism_owner, "local_runtime_parameter_overrides_for_set", None)
-            parameter_overrides = (
-                dict(parameter_values(set_id=str(set_id)))
-                if callable(parameter_values)
-                else {}
-            )
-            from kindred.core.simulation_preparation import (
-                symbolic_jacobian_identity_for_execution_text,
-            )
+        mechanism_text = self._mechanism_source_for_workspace_selection(
+            set_id=str(set_id),
+            apply_parameter_overrides=False,
+        ).full_dsl
+        parameter_values = getattr(self._mechanism_owner, "local_runtime_parameter_overrides_for_set", None)
+        parameter_overrides = (
+            dict(parameter_values(set_id=str(set_id)))
+            if callable(parameter_values)
+            else {}
+        )
+        from kindred.core.simulation_preparation import (
+            symbolic_jacobian_identity_for_execution_text,
+        )
 
-            payload = symbolic_jacobian_identity_for_execution_text(
-                mechanism_text=str(mechanism_text or ""),
-                solver_config=dict(solver_config or {}),
-                parameter_overrides=parameter_overrides,
-            )
-            return dict(payload or {})
-        except Exception:
+        payload = symbolic_jacobian_identity_for_execution_text(
+            mechanism_text=str(mechanism_text or ""),
+            solver_config=solver_config_map,
+            parameter_overrides=parameter_overrides,
+        )
+        if not payload:
             return {}
+        return dict(payload)
 
     def _workspace_symbolic_wegscheider_identity(
         self,
@@ -1091,20 +1086,24 @@ class SimulationBatchOwner:
         mechanism_text: str,
         solver_config: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        if not bool(dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)):
-            return {}
-        try:
-            from kindred.core.simulation_preparation import (
-                symbolic_wegscheider_identity_for_execution_text,
+        solver_config_map = dict(solver_config or {})
+        if "wegscheider_cyclicity_enabled" not in solver_config_map:
+            raise ValueError(
+                "Workspace symbolic Wegscheider identity requires wegscheider_cyclicity_enabled."
             )
+        if not bool(solver_config_map["wegscheider_cyclicity_enabled"]):
+            return {}
+        from kindred.core.simulation_preparation import (
+            symbolic_wegscheider_identity_for_execution_text,
+        )
 
-            payload = symbolic_wegscheider_identity_for_execution_text(
-                mechanism_text=str(mechanism_text or ""),
-                solver_config=dict(solver_config or {}),
-            )
-            return dict(payload or {})
-        except Exception:
+        payload = symbolic_wegscheider_identity_for_execution_text(
+            mechanism_text=str(mechanism_text or ""),
+            solver_config=solver_config_map,
+        )
+        if not payload:
             return {}
+        return dict(payload)
 
     def current_workspace_preview_context(
         self,
@@ -1213,12 +1212,11 @@ class SimulationBatchOwner:
         from kindred.gui.controllers.simulation_run_preparation import build_fast_preview_solver_grid_context
 
         solver_grid_context = build_fast_preview_solver_grid_context(
-            initial_solver_name=self._solver_owner.initial_solver_name(),
+            current_solver_name=self._solver_owner.current_solver_name(),
             num_points=int(self._solver_owner.num_points_spinbox_value()),
             fast_mode=True,
             slider_points_override=self._mechanism_owner.mechanism_slider_points_value(),
             slider_solver_override=self._mechanism_owner.mechanism_slider_solver_value(),
-            slider_drag_active=bool(self._preview_session.slider_drag_active()),
         )
         temperature_k = float(self._solver_owner.temperature_spinbox_value())
         t_override = self._solver_owner.dsl_global_temperature_K(str(mechanism_text))
@@ -1226,14 +1224,8 @@ class SimulationBatchOwner:
             temperature_k = float(t_override)
         solver_config = {
             "solver": str(solver_grid_context.get("solver") or ""),
-            "solver_label": str(solver_grid_context.get("solver_label") or ""),
-            "solver_warning": (
-                str(solver_grid_context.get("solver_warning"))
-                if solver_grid_context.get("solver_warning")
-                else None
-            ),
-            "rtol": self._solver_owner.initial_rtol() or 1e-6,
-            "atol": self._solver_owner.initial_atol() or 1e-12,
+            "rtol": self._solver_owner.current_rtol() or 1e-6,
+            "atol": self._solver_owner.current_atol() or 1e-12,
             "grid": dict(solver_grid_context.get("grid") or {"N": int(self._solver_owner.num_points_spinbox_value())}),
             "temperature_K": float(temperature_k),
             "use_sparse_jacobian": bool(self._solver_owner.use_sparse_jacobian()),
@@ -1242,10 +1234,7 @@ class SimulationBatchOwner:
         overlay_token = ""
         row = self._batch_row_for_set_id(str(set_id))
         if row is not None:
-            try:
-                overlay_token = str(self._preview_session.preview_batch_cache_token([int(row)]) or "")
-            except Exception:
-                overlay_token = ""
+            overlay_token = str(self._preview_session.preview_batch_cache_token([int(row)]) or "")
         return solver_config, float(self._solver_owner.parse_sim_time_seconds()), overlay_token
 
     def _batch_row_for_set_id(self, set_id: str) -> Optional[int]:

@@ -12,7 +12,6 @@ if TYPE_CHECKING:
     from PySide6.QtGui import QUndoStack
     from PySide6.QtWidgets import QDockWidget, QWidget
 
-    from kindred.config.profiles import ProfileManager
     from kindred.config.templates import TemplateManager
     from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
     from kindred.gui.controllers.config_controller import ConfigController
@@ -52,8 +51,7 @@ class SettingsControllers:
 
 
 @dataclass(frozen=True)
-class ProfileTemplateManagers:
-    profile_manager: ProfileManager
+class TemplateManagerBundle:
     template_manager: TemplateManager
 
 
@@ -92,7 +90,7 @@ class BottomDockComponents:
 @dataclass(frozen=True)
 class SolverContract:
     default_solver_name: str
-    normalize_solver_name: Callable[[str], tuple[str, str | None]]
+    normalize_solver_name: Callable[[str], str]
 
 
 @dataclass(frozen=True)
@@ -220,7 +218,7 @@ def build_simulation_plumbing(main_window: MainWindow) -> SimulationPlumbing:
         slider=main_window._preview_session,
         batch=main_window._simulation_batch_owner,
         mechanism=main_window._simulation_mechanism_owner,
-        solver=main_window._simulation_solver_owner,
+        solver=main_window._simulation_runtime_settings_owner,
         variable_runtime=main_window._variable_runtime,
         results=main_window.results_controller,
         provenance=main_window._simulation_provenance_owner,
@@ -271,24 +269,9 @@ def build_settings_and_controllers(main_window: MainWindow) -> SettingsControlle
         slider_preview_points=lambda: int(main_window._mechanism_editor.slider_points_value()),
         set_slider_preview_solver=lambda value: main_window._mechanism_editor.set_slider_solver_value(str(value)),
         slider_preview_solver=lambda: str(main_window._mechanism_editor.slider_solver_value()),
-        apply_solver_runtime_state=main_window.apply_solver_runtime_state,
-        has_explicit_startup_solver_override=main_window.has_explicit_startup_solver_override,
-        has_explicit_startup_rtol_override=main_window.has_explicit_startup_rtol_override,
-        has_explicit_startup_atol_override=main_window.has_explicit_startup_atol_override,
-        initial_solver_name=main_window._simulation_solver_owner.initial_solver_name,
-        explicit_startup_solver_name=main_window.explicit_startup_solver_name,
-        initial_rtol=main_window._simulation_solver_owner.initial_rtol,
-        explicit_startup_rtol=main_window.explicit_startup_rtol,
-        initial_atol=main_window._simulation_solver_owner.initial_atol,
-        explicit_startup_atol=main_window.explicit_startup_atol,
-        set_use_sparse_jacobian=lambda enabled: setattr(main_window, "_use_sparse_jacobian", bool(enabled)),
-        use_sparse_jacobian=main_window._simulation_solver_owner.use_sparse_jacobian,
-        set_wegscheider_cyclicity_enabled=lambda enabled: setattr(
-            main_window,
-            "_wegscheider_cyclicity_enabled",
-            bool(enabled),
-        ),
-        wegscheider_cyclicity_enabled=main_window._simulation_solver_owner.wegscheider_cyclicity_enabled,
+        apply_runtime_settings=main_window.apply_runtime_settings,
+        use_sparse_jacobian=main_window._simulation_runtime_settings_owner.use_sparse_jacobian,
+        wegscheider_cyclicity_enabled=main_window._simulation_runtime_settings_owner.wegscheider_cyclicity_enabled,
         max_parallel_batch_workers=lambda: int(main_window.simulation_controller.parallel_batch.max_parallel_workers),
         set_max_parallel_batch_workers=lambda value: setattr(
             main_window.simulation_controller.parallel_batch,
@@ -317,23 +300,18 @@ def build_settings_and_controllers(main_window: MainWindow) -> SettingsControlle
         ),
         result_cache_cap=lambda: int(main_window.simulation_controller.batch_cache.result_cache_max_entries()),
         preview_cache_cap=lambda: int(main_window.simulation_controller.batch_cache.preview_cache_max_entries()),
-        set_cache_caps=lambda *, result_cap, preview_cap, persist: main_window.set_simulation_cache_caps(
-            result_cap=int(result_cap),
-            preview_cap=int(preview_cap),
-            persist=bool(persist),
+        set_cache_caps=lambda *, result_cap, preview_cap, persist: (
+            main_window.simulation_controller.set_simulation_cache_caps(
+                result_cap=int(result_cap),
+                preview_cap=int(preview_cap),
+                persist=bool(persist),
+            )
         ),
-        set_ribbon_collapsed=main_window.set_ribbon_collapsed,
-        ribbon_collapsed=main_window.ribbon_collapsed,
         set_dark_mode=lambda enabled: setattr(main_window, "_dark_mode", bool(enabled)),
         dark_mode=lambda: bool(main_window._dark_mode),
         dark_mode_action=lambda: getattr(main_window, "_dark_mode_action", None),
         apply_theme=lambda enabled: main_window._theme_manager.apply(bool(enabled)),
-        profile_manager=lambda: main_window._profile_manager,
-        apply_profile=main_window._apply_profile,
-        set_profile_indicator_text=lambda text: main_window._profile_indicator.setText(str(text)),
         set_status_text=main_window.set_status_text,
-        update_profiles_menu=main_window._update_profiles_menu,
-        profiles_menu_available=lambda: main_window._profile_ports.profiles_menu_getter() is not None,
         load_custom_shortcuts=main_window._load_custom_shortcuts,
         recent_menu=lambda: getattr(main_window, "_recent_menu", None),
         set_recent_menu=lambda menu: setattr(main_window, "_recent_menu", menu),
@@ -347,15 +325,12 @@ def build_settings_and_controllers(main_window: MainWindow) -> SettingsControlle
     )
 
 
-def build_profile_and_template_managers() -> ProfileTemplateManagers:
-    from kindred.config.profiles import ProfileManager
+def build_template_manager() -> TemplateManagerBundle:
     from kindred.config.templates import TemplateManager
-
-    profile_manager = ProfileManager()
 
     template_manager = TemplateManager()
     template_manager.load_templates()
-    return ProfileTemplateManagers(profile_manager=profile_manager, template_manager=template_manager)
+    return TemplateManagerBundle(template_manager=template_manager)
 
 
 def build_window_shell(main_window: MainWindow) -> WindowShellComponents:
@@ -538,7 +513,7 @@ def build_batch_dock_panel(
     main_window: MainWindow,
     *,
     batch_model: BatchInitialConditionsTableModel,
-    initial_solver: str,
+    current_solver: str,
     on_add_batch_set: Callable[[], None],
     on_move_selected_batch_sets_up: Callable[[], None],
     on_move_selected_batch_sets_down: Callable[[], None],
@@ -553,7 +528,7 @@ def build_batch_dock_panel(
     panel = SimulationPanel(
         batch_model=batch_model,
         message_parent=main_window,
-        initial_solver=str(initial_solver),
+        current_solver=str(current_solver),
         on_add_batch_set=on_add_batch_set,
         on_move_selected_batch_sets_up=on_move_selected_batch_sets_up,
         on_move_selected_batch_sets_down=on_move_selected_batch_sets_down,

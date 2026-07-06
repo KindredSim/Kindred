@@ -44,8 +44,6 @@ class SimulationRequest:
     jac_sparsity: Optional[Any] = None
     events: Optional[Iterable[Callable[[float, np.ndarray], float]]] = None
     event_terminal: Optional[Iterable[bool]] = None
-    positivity: Optional[str] = None
-    pos_indices: Optional[Iterable[int]] = None
 
     progress_callback: Optional[Callable[[float, float, float], None]] = None
     temperature_schedule: TemperatureScheduleProtocol | None = None
@@ -60,5 +58,3 @@ class SimulationOutput:
     t: np.ndarray
     Y: np.ndarray
     provenance: dict[str, object]
-    fallback_occurred: bool = False
-    fallback_message: Optional[str] = None

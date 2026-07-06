@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Callable, Mapping, Optional, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 
@@ -33,7 +33,6 @@ class SegmentExecutionRequest:
     t_eval: np.ndarray
     provenance: dict[str, object]
     method: str
-    note: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -42,9 +41,6 @@ class SegmentRunResult:
     event_times: Sequence[Sequence[float]]
     event_states: Sequence[Sequence[np.ndarray]]
     solver_used: str
-    solver_alternative_used: str | None = None
-    fallback_occurred: bool = False
-    fallback_message: str | None = None
     symbolic_jacobian_used: bool = False
     jacobian_sparsity_hint: bool = False
 
@@ -64,7 +60,6 @@ class ScheduleExecutionRequest:
     t_eval: np.ndarray
     provenance: dict[str, object]
     method: str
-    note: Optional[str]
     schedule: InterventionSchedule
 
 
@@ -102,18 +97,14 @@ class InterventionScheduleExecutionOwner:
                     t_eval=t_eval,
                     provenance=prov,
                     method=request.method,
-                    note=request.note,
                 )
             ).output
 
         current_y = _apply_instant_events(request.y0, events_at_time(schedule, t0), species_index=species_index)
         outputs_t: list[np.ndarray] = []
         outputs_y: list[np.ndarray] = []
-        fallback_occurred = False
-        fallback_message = None
         segment_count = 0
         segment_solvers: list[str] = []
-        segment_alternatives: list[str] = []
         segment_symbolic_jacobians: list[bool] = []
         segment_sparsity_hints: list[bool] = []
         symbolic_jacobian_disabled = False
@@ -237,19 +228,14 @@ class InterventionScheduleExecutionOwner:
                         t_eval=internal_eval,
                         provenance=seg_prov,
                         method=request.method,
-                        note=request.note if segment_count == 0 else None,
                     )
                 )
                 seg_out = seg_result.output
                 segment_count += 1
-                fallback_occurred = fallback_occurred or bool(seg_result.fallback_occurred)
-                fallback_message = fallback_message or seg_result.fallback_message
                 symbolic_jacobian_used = symbolic_jacobian_used or bool(seg_result.symbolic_jacobian_used)
                 segment_symbolic_jacobians.append(bool(seg_result.symbolic_jacobian_used))
                 segment_sparsity_hints.append(bool(seg_result.jacobian_sparsity_hint))
                 segment_solvers.append(str(seg_result.solver_used or request.method))
-                if seg_result.solver_alternative_used:
-                    segment_alternatives.append(str(seg_result.solver_alternative_used))
                 seg_events_all = _normal_event_provenance(seg_result.event_times, count=len(segment_events))
                 seg_event_states_all = _normal_event_states(
                     seg_result.event_states,
@@ -276,8 +262,31 @@ class InterventionScheduleExecutionOwner:
                 )
                 seg_t = np.asarray(seg_out.t, dtype=float).reshape(-1)
                 seg_Y = np.asarray(seg_out.Y, dtype=float)
-                if seg_Y.ndim == 1:
-                    seg_Y = _solver_trajectory_array(seg_Y, y0=current_y, t_out=seg_t)
+                # Segment runners must return normalized solver output; schedule execution rejects malformed output.
+                if seg_Y.ndim != 2:
+                    raise create_solver_error(
+                        req.solver,
+                        sub_start,
+                        "Scheduled simulation segment produced non-2D output.",
+                    )
+                if seg_Y.shape[0] != int(np.asarray(current_y, dtype=float).reshape(-1).size):
+                    raise create_solver_error(
+                        req.solver,
+                        sub_start,
+                        "Scheduled simulation segment output species count does not match segment state.",
+                    )
+                if seg_Y.shape[1] != seg_t.size:
+                    raise create_solver_error(
+                        req.solver,
+                        sub_start,
+                        "Scheduled simulation segment output sample count does not match segment time grid.",
+                    )
+                _ensure_normalized_schedule_array(
+                    seg_Y,
+                    solver=req.solver,
+                    t=sub_start,
+                    context="Scheduled simulation segment output",
+                )
                 if seg_Y.shape[1]:
                     current_y = np.asarray(seg_Y[:, -1], dtype=float).reshape(-1)
                     current_y = _apply_fixed_interval_values(
@@ -383,13 +392,18 @@ class InterventionScheduleExecutionOwner:
         else:
             t_out = t_eval
             Y_out = np.repeat(current_y.reshape(-1, 1), repeats=t_out.size, axis=1)
+        _ensure_normalized_schedule_array(
+            Y_out,
+            solver=req.solver,
+            t=t0,
+            context="Scheduled simulation output",
+        )
         self._write_final_provenance(
             prov=prov,
             req=req,
             method=request.method,
             segment_solvers=segment_solvers,
             segment_sparsity_hints=segment_sparsity_hints,
-            segment_alternatives=segment_alternatives,
             symbolic_jacobian_disabled=symbolic_jacobian_disabled,
             segment_symbolic_jacobians=segment_symbolic_jacobians,
             symbolic_jacobian_used=symbolic_jacobian_used,
@@ -399,14 +413,8 @@ class InterventionScheduleExecutionOwner:
         )
         return SimulationOutput(
             t=t_out,
-            Y=_apply_positivity_to_trajectory(
-                Y_out,
-                mode=req.positivity,
-                indices=(list(req.pos_indices) if req.pos_indices is not None else None),
-            ),
+            Y=Y_out,
             provenance=prov,
-            fallback_occurred=fallback_occurred,
-            fallback_message=fallback_message,
         )
 
     def _run_segment(self, request: SegmentExecutionRequest) -> SegmentRunResult:
@@ -420,7 +428,6 @@ class InterventionScheduleExecutionOwner:
         method: str,
         segment_solvers: Sequence[str],
         segment_sparsity_hints: Sequence[bool],
-        segment_alternatives: Sequence[str],
         symbolic_jacobian_disabled: bool,
         segment_symbolic_jacobians: Sequence[bool],
         symbolic_jacobian_used: bool,
@@ -442,11 +449,6 @@ class InterventionScheduleExecutionOwner:
             prov["intervention_jacobian_sparsity_hint_partially_disabled"] = True
         elif segment_sparsity_hints:
             prov["jacobian_sparsity_hint"] = bool(segment_sparsity_hints[-1])
-        distinct_alternatives = list(dict.fromkeys(segment_alternatives))
-        if len(distinct_alternatives) == 1:
-            prov["solver_alternative_used"] = distinct_alternatives[0]
-        elif distinct_alternatives:
-            prov["solver_alternative_used"] = list(distinct_alternatives)
         if symbolic_jacobian_disabled:
             prov["intervention_symbolic_jacobian_disabled"] = True
             if segment_symbolic_jacobians:
@@ -613,7 +615,9 @@ def _apply_instant_events(
     *,
     species_index: Mapping[str, int],
 ) -> np.ndarray:
+    InterventionSchedule(instant_events=tuple(events))
     out = np.asarray(y, dtype=float).copy()
+    additive_delta_by_species: dict[str, float] = {}
     for event in events:
         idx = species_index.get(event.species)
         if idx is None:
@@ -623,17 +627,26 @@ def _apply_instant_events(
         elif event.op == "clear":
             out[idx] = 0.0
         elif event.op == "add":
-            out[idx] += float(event.amount if event.amount is not None else 0.0)
+            additive_delta_by_species[event.species] = (
+                additive_delta_by_species.get(event.species, 0.0)
+                + float(event.amount if event.amount is not None else 0.0)
+            )
+            continue
         elif event.op == "remove":
             amount = float(event.amount if event.amount is not None else 0.0)
-            next_value = out[idx] - amount
-            if next_value < 0.0:
-                raise InterventionScheduleError(
-                    f"remove intervention would make {event.species} negative at t={event.time:g}."
-                )
-            out[idx] = next_value
+            additive_delta_by_species[event.species] = (
+                additive_delta_by_species.get(event.species, 0.0) - amount
+            )
+            continue
         else:
             raise InterventionScheduleError(f"Unsupported instant intervention op: {event.op!r}.")
+        _ensure_nonnegative_state_value(out[idx], species=event.species, context=f"instant {event.op}")
+    for species, delta in additive_delta_by_species.items():
+        idx = species_index.get(species)
+        if idx is None:
+            raise InterventionScheduleError(f"Unknown intervention species: {species}")
+        out[idx] = float(out[idx]) + float(delta)
+        _ensure_nonnegative_state_value(out[idx], species=species, context="instant add/remove")
     return out
 
 
@@ -650,6 +663,11 @@ def _apply_fixed_interval_values(
         fixed_idx = species_index.get(interval.species)
         if fixed_idx is not None:
             out[fixed_idx] = float(interval.value if interval.value is not None else 0.0)
+            _ensure_nonnegative_state_value(
+                out[fixed_idx],
+                species=interval.species,
+                context=f"{interval.kind} interval",
+            )
     return out
 
 
@@ -882,34 +900,36 @@ def _append_segment_output_samples(
         outputs_y.append(emit_Y)
 
 
-def _apply_positivity_to_trajectory(
-    Y: np.ndarray,
+def _ensure_nonnegative_state_value(value: object, *, species: str, context: str) -> None:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InterventionScheduleError(f"{context} produced non-finite concentration for {species}.") from exc
+    if not np.isfinite(amount):
+        raise InterventionScheduleError(f"{context} produced non-finite concentration for {species}.")
+    if amount < 0.0:
+        raise InterventionScheduleError(
+            f"{context} would make {species} negative (value={amount:g})."
+        )
+
+
+def _ensure_normalized_schedule_array(
+    values: object,
     *,
-    mode: Optional[str],
-    indices: Optional[Sequence[int]],
-) -> np.ndarray:
-    if not mode:
-        return Y
-    if indices is None:
-        return np.maximum(Y, 0.0)
-    Y2 = np.asarray(Y, float).copy()
-    for j in indices:
-        jj = int(j)
-        if 0 <= jj < Y2.shape[0]:
-            Y2[jj, :] = np.maximum(Y2[jj, :], 0.0)
-    return Y2
-
-
-def _solver_trajectory_array(sol_y: object, *, y0: np.ndarray, t_out: np.ndarray) -> np.ndarray:
-    sample_count = int(np.asarray(t_out, dtype=float).reshape(-1).size)
-    species_count = int(np.asarray(y0, dtype=float).reshape(-1).size)
-    Y = np.asarray(sol_y, dtype=float)
-    if Y.ndim == 2:
-        return Y
-    if sample_count == 0:
-        return np.empty((species_count, 0), dtype=float)
-    if Y.ndim == 1 and species_count == 1 and Y.size == sample_count:
-        return Y.reshape(1, sample_count)
-    if Y.ndim == 1 and sample_count == 1 and Y.size == species_count:
-        return Y.reshape(species_count, 1)
-    return Y.reshape(species_count, sample_count)
+    solver: str,
+    t: float,
+    context: str,
+) -> None:
+    arr = np.asarray(values, dtype=float)
+    if not np.all(np.isfinite(arr)):
+        raise create_solver_error(
+            solver,
+            t,
+            f"{context} contains non-finite concentration values.",
+        )
+    if np.any(arr < 0.0):
+        raise create_solver_error(
+            solver,
+            t,
+            f"{context} contains negative concentration values.",
+        )

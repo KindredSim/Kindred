@@ -10,7 +10,7 @@ Current contract
   - metadata: dict includes declaration_order: list[str]
 - Species:
   - name: str
-  - initial_conc: float  (standard state basis)
+  - initial_conc: finite non-negative float  (standard state basis)
 - Reaction:
   - reactants/products: immutable Mapping[str, float] positive physical side maps
   - rate_orders: immutable Mapping[str, float] positive kinetic exponents;
@@ -48,7 +48,7 @@ from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Tuple, Union, Protocol, Optional
 
-from .species import Species, coerce_float
+from .species import Species
 from .validation import validate_name
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
@@ -70,6 +70,7 @@ from .equilibrium_rate_authority import (
 )
 from .kinetics import K_from_deltaG_eq
 from .mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
+from .temperature import coerce_temperature_kelvin
 
 class StructuredRate(Protocol):
     pass
@@ -81,6 +82,28 @@ __all__ = [
     "Mechanism",
     "derive_molecularity",
 ]
+
+
+class _SpeciesMap(OrderedDict):
+    def __init__(self, values: Mapping[str, Species] | Iterable[tuple[str, Species]] | None = None) -> None:
+        super().__init__()
+        if values is not None:
+            self.update(values)
+
+    def __setitem__(self, key: object, value: object) -> None:
+        name = validate_name(key)
+        if not isinstance(value, Species):
+            raise TypeError("mechanism species entries must be Species objects.")
+        if value.name != name:
+            raise ValueError("mechanism species map key must match Species.name.")
+        super().__setitem__(name, value)
+
+    def update(self, values: Mapping[str, Species] | Iterable[tuple[str, Species]] = (), **kwargs: Species) -> None:  # type: ignore[override]
+        items = values.items() if isinstance(values, MappingABC) else values
+        for key, value in items:
+            self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value
 
 
 # --------------------------------- helpers ----------------------------------
@@ -349,10 +372,20 @@ class Mechanism:
     """
 
     def __init__(self) -> None:
-        self.species: "OrderedDict[str, Species]" = OrderedDict()
+        self._species: "OrderedDict[str, Species]" = _SpeciesMap()
         self.reactions: List[Reaction] = []
         self.equilibria: List[Equilibrium] = []
         self.metadata: Dict[str, Any] = {"declaration_order": []}
+
+    @property
+    def species(self) -> "OrderedDict[str, Species]":
+        return self._species
+
+    @species.setter
+    def species(self, value: Mapping[str, Species] | Iterable[tuple[str, Species]] | None) -> None:
+        self._species = _SpeciesMap(value)
+        if hasattr(self, "metadata"):
+            self._sync_metadata_order()
 
     def clone(self) -> "Mechanism":
         """
@@ -363,7 +396,7 @@ class Mechanism:
         (rate expressions, compiled callables, etc.) as shared references.
         """
         cloned = copy.copy(self)
-        cloned.species = OrderedDict(self.species)
+        cloned.species = _SpeciesMap(self.species)
         cloned.reactions = [
             replace(
                 r,
@@ -388,6 +421,7 @@ class Mechanism:
             for e in self.equilibria
         ]
         cloned.metadata = copy.deepcopy(self.metadata)
+        cloned._sync_metadata_order()
         return cloned
 
     # ---------- species management ----------
@@ -396,7 +430,7 @@ class Mechanism:
         n = validate_name(name)
         if n in self.species:
             raise ValueError(f"species {n!r} already exists")
-        sp = Species(n, coerce_float(initial_conc))
+        sp = Species(n, initial_conc)
         self.species[n] = sp
         self._sync_metadata_order()
         return sp
@@ -405,7 +439,7 @@ class Mechanism:
         n = validate_name(name)
         if n not in self.species:
             raise KeyError(f"unknown species {n!r}")
-        self.species[n] = replace(self.species[n], initial_conc=coerce_float(initial_conc))
+        self.species[n] = replace(self.species[n], initial_conc=initial_conc)
 
     def rename_species(self, old: str, new: str) -> None:
         o = validate_name(old)
@@ -416,7 +450,7 @@ class Mechanism:
             raise ValueError(f"species {nn!r} already exists")
         if nn == o:
             return
-        new_map: "OrderedDict[str, Species]" = OrderedDict()
+        new_map: "OrderedDict[str, Species]" = _SpeciesMap()
         for k, sp in self.species.items():
             if k == o:
                 new_map[nn] = replace(sp, name=nn)
@@ -510,8 +544,8 @@ class Mechanism:
         Add an equilibrium pair.
 
         kf is required, plus exactly one reverse-side authority: kr or thermodynamic
-        Keq/dG_eq metadata. Numeric sanity (positivity, units) is the responsibility
-        of the simulator layer.
+        Keq/dG_eq metadata. Equilibrium authority and numeric sanity are validated
+        by the equilibrium-rate authority layer.
         """
         return self._add_equilibrium_with_authority_context(
             stoich_forward,
@@ -661,10 +695,10 @@ class Mechanism:
             }
             for r in self.reactions
         ]
-        try:
-            temperature_K = float(self.metadata.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15))
-        except (TypeError, ValueError, OverflowError):
-            temperature_K = 298.15
+        temperature_K = coerce_temperature_kelvin(
+            self.metadata.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15),
+            field=MechanismMetadataKeys.TEMPERATURE_K,
+        )
 
         equilibria_block = []
         for e in self.equilibria:

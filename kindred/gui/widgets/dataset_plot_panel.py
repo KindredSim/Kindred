@@ -20,6 +20,11 @@ from PySide6.QtCore import Qt, Signal
 
 from kindred.core.analysis.global_fit_projection import FitRenderDatasetProjection
 from kindred.core.datasets.observation_payload import export_rows_from_observations
+from kindred.gui.display_semantics import (
+    canonical_dataset_x_axis,
+    concentration_series_header,
+    dataset_axis_semantics,
+)
 from kindred.gui.plot_config import get_plot_panel_class
 
 logger = logging.getLogger(__name__)
@@ -68,7 +73,9 @@ class DatasetPlotPanel(QWidget):
         self._model_t_by_species: Dict[str, np.ndarray] = {}
         self._model_series: Dict[str, np.ndarray] = {}
         self._x_label = "Time"
+        self._x_units: Optional[str] = "s"
         self._y_label = "Concentration"
+        self._y_units: Optional[str] = "M"
         self._simulation_callback: Optional[Callable] = None
 
         self._setup_ui()
@@ -162,6 +169,8 @@ class DatasetPlotPanel(QWidget):
         confidence_lower: Optional[np.ndarray] = None,
         xlabel: str = "Time",
         ylabel: str = "Concentration",
+        x_units: object = None,
+        y_units: object = "M",
         all_species: Optional[Dict[str, np.ndarray]] = None,
         observations: Optional[Dict[str, object]] = None,
     ):
@@ -183,8 +192,16 @@ class DatasetPlotPanel(QWidget):
         self._dataset_data = {"t": np.asarray(data_x, dtype=float)}
         self._dataset_observations = {}
         self._projection_observations = {}
-        self._x_label = str(xlabel or "Time")
-        self._y_label = "Concentration"
+        x_axis, y_axis = dataset_axis_semantics(
+            x_label=xlabel,
+            x_units=x_units,
+            y_label=ylabel if ylabel == "Concentration" else "Concentration",
+            y_units=y_units,
+        )
+        self._x_label = x_axis.label
+        self._x_units = x_axis.units
+        self._y_label = y_axis.label
+        self._y_units = y_axis.units
 
         if observations:
             for species_name, spec in observations.items():
@@ -211,6 +228,7 @@ class DatasetPlotPanel(QWidget):
         self._model_t = None
         self._model_t_by_species = {}
         self._model_series = {}
+        self._clear_projection_statistics()
 
         # Create species checkboxes
         self._create_species_checkboxes()
@@ -267,6 +285,7 @@ class DatasetPlotPanel(QWidget):
 
     def apply_fit_render_projection(self, projection: FitRenderDatasetProjection) -> None:
         """Apply a typed fitting render projection as the dataset-tab fit overlay."""
+        self._clear_projection_statistics()
         if not isinstance(projection, FitRenderDatasetProjection):
             return
         if projection.status != "ok":
@@ -290,6 +309,50 @@ class DatasetPlotPanel(QWidget):
             for name, values in projection.model_series.items()
         }
         self._render_dataset_layers()
+        self._publish_projection_statistics(projection)
+
+    def _clear_projection_statistics(self) -> None:
+        set_statistics_results = getattr(self._plot_panel, "set_statistics_results", None)
+        if callable(set_statistics_results):
+            set_statistics_results({}, prefer="")
+
+    def _publish_projection_statistics(self, projection: FitRenderDatasetProjection) -> None:
+        stats = dict(projection.dataset_stats or {})
+        residual_mse = stats.get("residual_mse")
+        try:
+            residual_mse_value = float(residual_mse) if residual_mse is not None else None
+        except Exception:
+            residual_mse_value = None
+        update_statistics = getattr(self._plot_panel, "update_statistics", None)
+        if not callable(update_statistics):
+            return
+        observations = self._projection_observations or self._dataset_observations
+        if not observations:
+            return
+        t_by_species = {
+            str(name): np.asarray(spec.get("t", []), dtype=float).reshape(-1)
+            for name, spec in observations.items()
+            if str(name)
+        }
+        series = {
+            str(name): np.asarray(spec.get("y", []), dtype=float).reshape(-1)
+            for name, spec in observations.items()
+            if str(name)
+        }
+        if not series:
+            return
+        shared_t: np.ndarray | None = None
+        for name, values in series.items():
+            axis = t_by_species.get(name)
+            if axis is None or axis.size != values.size:
+                return
+            if shared_t is None:
+                shared_t = axis
+            elif axis.size != shared_t.size or not np.allclose(axis, shared_t):
+                return
+        if shared_t is None:
+            return
+        update_statistics(shared_t, series, residual_mse=residual_mse_value)
 
     def _render_dataset_layers(self) -> None:
         """Delegate dataset-tab rendering to the backend public contract."""
@@ -322,7 +385,9 @@ class DatasetPlotPanel(QWidget):
                 model_series=dict(self._model_series) if self._model_series else None,
                 visible_species=self._visible_species_names(),
                 xlabel=self._x_label,
+                x_units=self._x_units,
                 ylabel=self._y_label,
+                y_units=self._y_units,
             )
             logger.info(
                 "Rendered dataset layers for %s (%s species, %s model series)",
@@ -365,19 +430,11 @@ class DatasetPlotPanel(QWidget):
         """Get the dataset data."""
         return self._dataset_data
 
-    def export_payload(self) -> Optional[Dict[str, object]]:
-        """
-        Return a standardized payload for CSV exports.
-
-        Returns
-        -------
-        dict or None
-            {'t': np.ndarray, 'series': Dict[str, np.ndarray]}
-        """
+    def _visible_export_data(self) -> Optional[Dict[str, object]]:
         if self._projection_observations:
-            return {"observations": self._projection_observations, "x_header": self._x_label}
+            return {"observations": self._projection_observations, "x_header": self._x_header()}
         if self._dataset_observations:
-            return {"observations": self._dataset_observations, "x_header": "Time"}
+            return {"observations": self._dataset_observations, "x_header": self._x_header()}
         if not self._dataset_data or 't' not in self._dataset_data:
             return None
         t = np.asarray(self._dataset_data.get('t'))
@@ -388,10 +445,13 @@ class DatasetPlotPanel(QWidget):
         }
         if t.size == 0 or not species:
             return None
-        return {"t": t, "series": species}
+        return {"t": t, "series": species, "x_header": self._x_header()}
+
+    def _x_header(self) -> str:
+        return canonical_dataset_x_axis(self._x_label, units=self._x_units).header
 
     def build_visible_export(self, scope: str) -> Tuple[List[str], List[List[object]]]:
-        payload = self.export_payload()
+        payload = self._visible_export_data()
         if not payload:
             raise ValueError("No dataset data available to export.")
 
@@ -404,12 +464,17 @@ class DatasetPlotPanel(QWidget):
                     if bool(getattr(cb, "isChecked", lambda: False)())
                 ]
                 species_names = [name for name in species_names if name in visible]
+                if not species_names:
+                    raise ValueError("No series selected to export.")
             header, rows = export_rows_from_observations(
                 payload["observations"],
                 species_names=species_names,
             )
             if header:
-                header[0] = str(payload.get("x_header") or self._x_label or "Time")
+                header = [
+                    str(payload.get("x_header") or self._x_header()),
+                    *(concentration_series_header(name) for name in species_names),
+                ]
             return header, rows
 
         t_values = np.asarray(payload.get("t"), dtype=float).reshape(-1)
@@ -438,7 +503,7 @@ class DatasetPlotPanel(QWidget):
                 )
             arrays.append(arr)
 
-        header = ["Time"] + species_names
+        header = [self._x_header()] + [concentration_series_header(name) for name in species_names]
 
         def row_iter() -> Iterator[List[object]]:
             for idx in range(t_values.shape[0]):

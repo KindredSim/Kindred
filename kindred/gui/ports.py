@@ -801,6 +801,20 @@ class BatchDisplayRequestResolution:
     has_resolved_workspace_preview: bool = False
     focused_uses_workspace_controls: bool = False
     focused_has_resolved_entry: bool = False
+    missing_intent_set_ids: tuple[str, ...] = ()
+    semantic_unavailable_set_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "missing_intent_set_ids",
+            _normalized_str_tuple(self.missing_intent_set_ids),
+        )
+        object.__setattr__(
+            self,
+            "semantic_unavailable_set_ids",
+            _normalized_str_tuple(self.semantic_unavailable_set_ids),
+        )
 
 
 def _normalize_slider_replay_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
@@ -1098,11 +1112,11 @@ class SimulationMechanismPort(Protocol):
 
 
 class SimulationSolverPort(Protocol):
-    def initial_solver_name(self) -> Optional[str]: ...
+    def current_solver_name(self) -> str: ...
 
-    def initial_rtol(self) -> Optional[float]: ...
+    def current_rtol(self) -> float: ...
 
-    def initial_atol(self) -> Optional[float]: ...
+    def current_atol(self) -> float: ...
 
     def temperature_spinbox_value(self) -> float: ...
 
@@ -1259,9 +1273,6 @@ class SimulationProvenancePort(Protocol):
         self,
         *,
         mechanism_text: str,
-        solver_method: str,
-        solver_label: str,
-        solver_warning: Optional[str],
         solver_config: Mapping[str, Any],
         temperature_K: float,
         temperature_source: str,
@@ -1272,6 +1283,7 @@ class SimulationProvenancePort(Protocol):
         species_names: Sequence[str],
         t: Any,
         series: Mapping[str, Any],
+        grid_requested: Optional[Mapping[str, Any]] = None,
         algebra_scalars: Optional[Mapping[str, Any]] = None,
         dataset_overlays: Any = None,
         display_transaction: Optional[Mapping[str, Any]] = None,

@@ -1,20 +1,18 @@
+"""Internal fitting simulation-builder contract."""
+
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 import numpy as np
 
 from kindred.core.exceptions import SimulationBuilderContractError
 
-if TYPE_CHECKING:
-    from kindred.core.simulation_preparation import BoundMechanism
-
 __all__ = [
     "SimulationBuilder",
     "SimulationBuilderContractError",
     "coerce_simulation_builder",
-    "prepare_bound_mechanism",
 ]
 
 _REQUIRED_BUILDER_KWARGS = ("solver", "rtol", "atol")
@@ -101,9 +99,3 @@ def coerce_simulation_builder(builder: Callable[..., Any]) -> SimulationBuilder:
             raise
 
     return _wrapped
-
-
-def prepare_bound_mechanism(*args, **kwargs) -> "BoundMechanism":
-    from kindred.core.simulation_preparation import prepare_bound_mechanism as _impl
-
-    return _impl(*args, **kwargs)

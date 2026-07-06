@@ -13,6 +13,12 @@ from PySide6.QtCore import Qt
 
 from kindred.core.datasets.observation_payload import dense_view_from_observations, observations_from_payload
 from kindred.gui.color_manager import ColorManager
+from kindred.gui.display_semantics import (
+    canonical_concentration_axis,
+    canonical_time_axis,
+    concentration_series_header,
+    dataset_axis_semantics,
+)
 from kindred.gui.ports import (
     CopyAllDisplayBlock,
     CopyAllExportPlan,
@@ -27,7 +33,6 @@ from kindred.gui.widgets.axis_toolbar import AxisToolbar
 from kindred.gui.widgets.dataset_overlay_panel import DatasetOverlayPanel
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
-from ..ui_helpers import make_pyqtgraph_fallback_widget
 
 logger = logging.getLogger(__name__)
 
@@ -345,8 +350,10 @@ if PYQTGRAPH_AVAILABLE:
             self._plot_widget.setBackground('w')
 
             # Configure plot appearance
-            self._plot_item.setLabel('bottom', 'Time', units='s')
-            self._plot_item.setLabel('left', 'Concentration', units='M')
+            x_axis = canonical_time_axis()
+            y_axis = canonical_concentration_axis()
+            self._plot_item.setLabel("bottom", x_axis.label, units=x_axis.units)
+            self._plot_item.setLabel("left", y_axis.label, units=y_axis.units)
             self._plot_item.showGrid(x=True, y=True, alpha=0.3)
             self._legend = self._plot_item.addLegend()
             self._legend_visible = True
@@ -780,7 +787,9 @@ if PYQTGRAPH_AVAILABLE:
             model_series: Optional[Dict[str, np.ndarray]] = None,
             visible_species: Sequence[str],
             xlabel: str,
+            x_units: object = None,
             ylabel: str,
+            y_units: object = "M",
         ) -> None:
             """Render dataset-tab scatter/model layers without clearing unrelated backend state."""
             series_map = {
@@ -817,7 +826,14 @@ if PYQTGRAPH_AVAILABLE:
                 model_t_map = {}
                 model_t_arr = _try_1d_float_array(model_t) if model_t is not None else np.asarray([], dtype=float)
 
-            self._set_dataset_axis_labels(xlabel=xlabel, ylabel=ylabel)
+            x_axis, y_axis = dataset_axis_semantics(
+                x_label=xlabel,
+                x_units=x_units,
+                y_label=ylabel,
+                y_units=y_units,
+            )
+            self._plot_item.setLabel("bottom", x_axis.label, units=x_axis.units)
+            self._plot_item.setLabel("left", y_axis.label, units=y_axis.units)
 
             if (t_arr.size == 0 and not data_t_map) or not active_dataset:
                 self._prune_dataset_scatter_items(set())
@@ -936,48 +952,6 @@ if PYQTGRAPH_AVAILABLE:
                 return app.clipboard() if app is not None else None
             except Exception:
                 return None
-
-        def export_payload(self) -> Optional[Dict[str, object]]:
-            """
-            Return a standardized export payload for CSV export code.
-
-            Returns
-            -------
-            dict or None
-                {'t': np.ndarray, 'series': Dict[str, np.ndarray]}
-            """
-            if self._copy_all_export_plan_provider is not None:
-                return None
-            if self._t is None or not self._series:
-                return None
-            layers = [
-                dict(layer)
-                for layer in self.display_layer_snapshot().get("layers", [])
-                if not (
-                    isinstance(layer, Mapping)
-                    and str(layer.get("kind") or "") == PlotLayerKind.REFERENCE_SERIES.value
-                    and layer.get("visible") is False
-                )
-            ]
-            overlays = [
-                {
-                    "layer_id": self._overlay_layer_id(layer),
-                    "kind": layer.kind.value,
-                    "label": self._overlay_display_label(layer),
-                    "source_id": str(layer.source_id or ""),
-                    "visible": bool(layer.visible),
-                }
-                for layer in list(self._simulation_overlays or [])
-                if isinstance(layer, PlotDisplayLayer)
-                and bool(layer.visible)
-            ]
-            return {
-                "t": np.asarray(self._t, dtype=float).reshape(-1),
-                "series": dict(self._series),
-                "layers": layers,
-                "overlays": overlays,
-                "intervention_annotations": [dict(item) for item in self._intervention_annotations],
-            }
 
         def set_intervention_annotations_from_provenance(self, provenance: Mapping[str, object] | None) -> None:
             self._intervention_annotations = _intervention_annotations_from_provenance(provenance)
@@ -1102,7 +1076,7 @@ if PYQTGRAPH_AVAILABLE:
             return list(self._visible_selected_series_names())
 
         def _series_header_text(self, series_name: str) -> str:
-            return str(series_name)
+            return concentration_series_header(series_name)
 
         def _visible_overlay_copy_series_names(self) -> List[str]:
             return self._axis_scope_series_names()
@@ -1194,8 +1168,8 @@ if PYQTGRAPH_AVAILABLE:
             x_name = str(self._x_axis_name or "t")
             _, x_label = self._get_x_data()
             if x_name != "t" and x_name not in self._series:
-                return "t", "Time (s)"
-            return x_name, str(x_label or "Time (s)")
+                return "t", canonical_time_axis().header
+            return x_name, str(x_label or canonical_time_axis().header)
 
         def _build_visible_overlay_copy_blocks(
             self,
@@ -1320,7 +1294,7 @@ if PYQTGRAPH_AVAILABLE:
             display_columns: List[Tuple[str, np.ndarray]] = []
             self._append_copy_column(
                 display_columns,
-                header=self._qualified_copy_header(block_label, "Time (s)"),
+                header=self._qualified_copy_header(block_label, canonical_time_axis().header),
                 values=t_values,
             )
             if x_name != "t":
@@ -1455,7 +1429,7 @@ if PYQTGRAPH_AVAILABLE:
             if t_plot is not None:
                 self._append_copy_column(
                     primary_columns,
-                    header=self._qualified_copy_header(primary_label, "Time (s)"),
+                    header=self._qualified_copy_header(primary_label, canonical_time_axis().header),
                     values=t_plot,
                 )
             if x_name != "t":
@@ -1538,13 +1512,13 @@ if PYQTGRAPH_AVAILABLE:
                     raise ValueError("Clipboard is unavailable.")
                 clipboard.setText(self._rows_to_tsv(header, rows))
             except ValueError as exc:
-                QtWidgets.QMessageBox.warning(self, "Copy Visible Data", str(exc))
+                QtWidgets.QMessageBox.warning(self, "Copy Rendered Points", str(exc))
             except Exception as exc:
-                logger.exception("Failed to copy visible plot data: %s", exc)
+                logger.exception("Failed to copy rendered points: %s", exc)
                 QtWidgets.QMessageBox.warning(
                     self,
-                    "Copy Visible Data",
-                    f"Failed to copy visible plot data: {exc}",
+                    "Copy Rendered Points",
+                    f"Failed to copy rendered points: {exc}",
                 )
 
         def _copy_all(self) -> None:
@@ -1585,7 +1559,7 @@ if PYQTGRAPH_AVAILABLE:
             self,
             t: np.ndarray,
             series: Dict[str, np.ndarray],
-            chi_squared: Optional[float] = None,
+            residual_mse: Optional[float] = None,
         ) -> None:
             """Update the species statistics table with latest results."""
             label = str(getattr(self, "_simulation_set_label", "") or "").strip() or "Results"
@@ -1595,7 +1569,7 @@ if PYQTGRAPH_AVAILABLE:
                     layer_id: {
                         "t": t,
                         "series": series,
-                        "chi_squared": chi_squared,
+                        "residual_mse": residual_mse,
                         "label": label,
                         "layer_id": layer_id,
                         "kind": PlotLayerKind.PRIMARY_SERIES,
@@ -1715,13 +1689,13 @@ if PYQTGRAPH_AVAILABLE:
             if t_payload is None or not isinstance(series_payload, dict):
                 self._stats_table.setRowCount(0)
                 return
-            chi_squared_value: Optional[float] = None
-            raw_chi_squared = payload.get("chi_squared")
-            if raw_chi_squared is not None:
+            residual_mse_value: Optional[float] = None
+            raw_residual_mse = payload.get("residual_mse")
+            if raw_residual_mse is not None:
                 try:
-                    chi_squared_value = float(raw_chi_squared)
+                    residual_mse_value = float(raw_residual_mse)
                 except Exception:
-                    chi_squared_value = None
+                    residual_mse_value = None
 
             t_arr = _try_1d_float_array(t_payload)
             if t_arr.size == 0:
@@ -1739,7 +1713,7 @@ if PYQTGRAPH_AVAILABLE:
                 self._stats_table.setRowCount(0)
                 return
 
-            self._stats_table.update_results(t_arr, normalized_series, chi_squared=chi_squared_value)
+            self._stats_table.update_results(t_arr, normalized_series, residual_mse=residual_mse_value)
 
         def update_parameters(self, parameters: Dict[str, Tuple[float, str]]) -> None:
             """Update the solver parameter table."""
@@ -2238,11 +2212,15 @@ if PYQTGRAPH_AVAILABLE:
             # Update axis labels dynamically
             self._plot_item.setLabel('bottom', x_label)
             if not self._parametric_mode:
-                self._plot_item.setLabel('left', 'Concentration', units='M')
+                y_axis = canonical_concentration_axis()
+                self._plot_item.setLabel('left', y_axis.label, units=y_axis.units)
             else:
                 # In parametric mode, Y label depends on selected series
                 if selected_primary_series:
-                    self._plot_item.setLabel('left', f'{selected_primary_series[0]}', units='M')
+                    self._plot_item.setLabel(
+                        'left',
+                        concentration_series_header(selected_primary_series[0]),
+                    )
 
             # Add visible series (only those selected in toolbar)
             active_curve_keys: Set[str] = set()
@@ -2741,14 +2719,6 @@ if PYQTGRAPH_AVAILABLE:
 
             return header, rows
 
-        def _set_dataset_axis_labels(self, *, xlabel: str, ylabel: str) -> None:
-            x_text = str(xlabel or "Time")
-            y_text = str(ylabel or "Concentration")
-            x_units = "s" if x_text == "Time" else None
-            y_units = "M" if y_text == "Concentration" else None
-            self._plot_item.setLabel("bottom", x_text, units=x_units)
-            self._plot_item.setLabel("left", y_text, units=y_units)
-
         def _update_toolbar(self):
             """Update AxisToolbar with available variables."""
             if self._t is None:
@@ -2823,13 +2793,13 @@ if PYQTGRAPH_AVAILABLE:
                 (x_data array, x_label string)
             """
             if self._x_axis_name == "t":
-                return self._t, "Time (s)"
+                return self._t, canonical_time_axis().header
             elif self._x_axis_name in self._series:
                 # X-axis is one of the species
-                return self._series[self._x_axis_name], f"[{self._x_axis_name}] (M)"
+                return self._series[self._x_axis_name], concentration_series_header(self._x_axis_name)
             else:
                 # Unknown X-axis, fall back to time
-                return self._t, "Time (s)"
+                return self._t, canonical_time_axis().header
 
         def _on_x_axis_changed(self, name: str) -> None:
             """Handle X-axis selection change from toolbar."""
@@ -3108,11 +3078,10 @@ if PYQTGRAPH_AVAILABLE:
                 copy_all_action.triggered.connect(self._copy_all)
 
             if self._enable_copy_visible_data_action:
-                copy_visible_action = menu.addAction("Copy Visible Data")
+                copy_visible_action = menu.addAction("Copy Rendered Points")
+                copy_visible_action.setToolTip("Copies the currently rendered sampled points.")
                 copy_visible_action.triggered.connect(self._copy_visible_data)
 
-            export_action = menu.addAction("Export Plot...")
-            export_action.triggered.connect(self._export_plot)
             mouse_menu = menu.addMenu("Mouse Mode")
             vb = self._plot_item.getViewBox()
 
@@ -3297,12 +3266,6 @@ if PYQTGRAPH_AVAILABLE:
             self._annotations.clear()
             logger.info("Cleared all annotations")
 
-        def _export_plot(self):
-            """Open pyqtgraph's export dialog for the plot scene."""
-            scene = self._plot_item.scene()
-            scene.contextMenuItem = self._plot_item
-            scene.showExportDialog()
-
         def _reset_view(self):
             """Reset plot view to auto range."""
             self._auto_range_enabled = True
@@ -3347,113 +3310,3 @@ if PYQTGRAPH_AVAILABLE:
 
             # Refresh plot
             self._update_plot()
-
-else:
-    # PyQtGraph not available - provide a stub that warns users
-    class PyQtGraphPlotPanel(QtWidgets.QWidget):
-        """Stub class when PyQtGraph is not available."""
-
-        # Signal emitted when series visibility changes
-        seriesVisibilityChanged = QtCore.Signal(str, bool)
-        referenceLayerVisibilityRequested = QtCore.Signal(bool)
-
-        def __init__(
-            self,
-            parent: Optional[QtWidgets.QWidget] = None,
-            *,
-            embed_analysis_tabs: bool = True,
-            workspace_splitter_object_name: Optional[str] = None,
-            enable_axis_inversion_actions: bool = False,
-            enable_reference_layer_toggle_action: bool = False,
-            enable_copy_visible_data_action: bool = False,
-        ):
-            super().__init__(parent)
-            _ = workspace_splitter_object_name
-            _ = enable_axis_inversion_actions
-            _ = enable_reference_layer_toggle_action
-            _ = enable_copy_visible_data_action
-            layout = QtWidgets.QVBoxLayout(self)
-            layout.addWidget(make_pyqtgraph_fallback_widget(self))
-            self._main_splitter = None
-            self._details_tabs = None
-            self._analysis_tabs_detached = not bool(embed_analysis_tabs)
-
-        def set_data(self, t, series, **_kwargs):
-            """Stub method."""
-            pass
-
-        def set_display_layers(self, payload):
-            self.clear()
-
-        def request_reference_layers_visible(self, visible):
-            self.referenceLayerVisibilityRequested.emit(bool(visible))
-
-        def set_intervention_annotations_from_provenance(self, provenance):
-            """Stub method."""
-            pass
-
-        def set_intervention_annotations_visible(self, visible):
-            """Stub method."""
-            pass
-
-        def render_dataset_layers(
-            self,
-            *,
-            data_t,
-            dataset_series,
-            model_t=None,
-            model_series=None,
-            visible_species=(),
-            xlabel="Time",
-            ylabel="Concentration",
-        ):
-            """Stub method."""
-            pass
-
-        def clear(self):
-            """Stub method."""
-            pass
-
-        def set_theme(self, dark_mode=False):
-            """Stub method."""
-            pass
-
-        def visible_series(self):
-            """Stub method."""
-            return []
-
-        def set_series_visible(self, name: str, visible: bool) -> None:
-            """Stub method."""
-            pass
-
-        def visible(self, name: str) -> bool:
-            """Stub method."""
-            return False
-
-        def set_overlay_catalog(self, datasets):
-            """Stub method."""
-            pass
-
-        def active_overlays(self):
-            """Stub method."""
-            return []
-
-        def overlay_snapshot(self):
-            """Stub method."""
-            return {}
-
-        def build_visible_export(self, scope: str):
-            """Stub method."""
-            raise RuntimeError("PyQtGraph is required for overlay exports.")
-
-        def analysis_tabs_widget(self):
-            """Stub method."""
-            return None
-
-        def workspace_splitter(self):
-            """Stub method."""
-            return None
-
-        def detach_analysis_tabs_for_dock(self):
-            """Stub method."""
-            return None

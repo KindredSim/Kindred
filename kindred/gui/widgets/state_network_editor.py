@@ -381,6 +381,23 @@ class StateNetworkEditor(QWidget):
 
     # -------------------- Public API --------------------
 
+    def validate_state_network_dsl_loadable(self, dsl_text: str) -> None:
+        unsupported_lines = []
+        for line_no, raw_line in enumerate(str(dsl_text or "").splitlines(), start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lower = line.lower()
+            if lower.startswith("energy=") or lower.startswith("state:") or lower.startswith("edge:"):
+                continue
+            unsupported_lines.append((line_no, line))
+        if unsupported_lines:
+            first_line_no, first_line = unsupported_lines[0]
+            raise ValueError(
+                "State Network DSL contains unsupported line "
+                f"{first_line_no}: {first_line!r}."
+            )
+
     def get_state_network_dsl(self) -> str:
         """
         Export state network as DSL text.
@@ -439,6 +456,7 @@ class StateNetworkEditor(QWidget):
         dsl_text : str
             DSL text with state: and edge: lines
         """
+        self.validate_state_network_dsl_loadable(dsl_text)
         self._change_flush_timer.stop()
         self._updating = True
         try:

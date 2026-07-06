@@ -42,7 +42,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
     - Final concentration at t_end
     - Maximum concentration reached
     - Time at which maximum occurs
-    - Chi-squared goodness of fit (from fitting)
+    - Result-level residual mean square from fitting
     - CTC (Concentration-Time Curve) - baseline-corrected integral
 
     The CTC calculation uses smart logic:
@@ -66,7 +66,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         # Configure table
         self.setColumnCount(6)
         self.setHorizontalHeaderLabels([
-            "Species", "Final", "Max", "t@Max", "χ²", "CTC"
+            "Species", "Final", "Max", "t@Max", "Result MSE", "CTC"
         ])
 
         # Add tooltips to explain each column
@@ -76,7 +76,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         self.horizontalHeaderItem(1).setToolTip("Final concentration at t_end")
         self.horizontalHeaderItem(2).setToolTip("Maximum concentration reached")
         self.horizontalHeaderItem(3).setToolTip("Time at which maximum concentration occurs")
-        self.horizontalHeaderItem(4).setToolTip("Chi-squared goodness of fit (from fitting)")
+        self.horizontalHeaderItem(4).setToolTip("Result-level raw residual mean square from fitting")
         self.horizontalHeaderItem(5).setToolTip(
             "Concentration-Time Curve (baseline-corrected):\n"
             "• Species → 0: ∫C dt (area under curve)\n"
@@ -95,7 +95,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         )
 
     def update_results(self, t: np.ndarray, species_data: Dict[str, np.ndarray],
-                       chi_squared: Optional[float] = None):
+                       residual_mse: Optional[float] = None):
         """
         Update table with simulation results.
 
@@ -105,8 +105,8 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             Time array
         species_data : dict
             Dictionary of {species_name: concentration_array}
-        chi_squared : float, optional
-            Chi-squared value for fitting results
+        residual_mse : float, optional
+            Result-level raw residual mean square for fitting results
         """
         # Clear existing rows
         self.setRowCount(0)
@@ -139,9 +139,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             _item3.setTextAlignment(QtCore.Qt.AlignCenter)
             self.setItem(i, 3, _item3)
 
-            # Column 4: χ² (only if provided, from fitting)
-            if chi_squared is not None:
-                _item4 = QtWidgets.QTableWidgetItem(f"{chi_squared:.6g}")
+            # Column 4: result-level residual MSE (only if provided, from fitting)
+            if residual_mse is not None:
+                _item4 = QtWidgets.QTableWidgetItem(f"{residual_mse:.6g}")
             else:
                 _item4 = QtWidgets.QTableWidgetItem("—")
             _item4.setTextAlignment(QtCore.Qt.AlignCenter)

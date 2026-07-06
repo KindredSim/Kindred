@@ -307,8 +307,6 @@ _RESULT_KNOWN_FIELDS = {
     "mechanism_text",
     "solver_config",
     "provenance",
-    "fallback_occurred",
-    "fallback_message",
     "base_species_count",
     "mechanism",
 }
@@ -331,8 +329,6 @@ class SimulationExecutionResult:
     mechanism_text: str
     solver_config: Dict[str, Any]
     provenance: Any
-    fallback_occurred: bool
-    fallback_message: Any
     base_species_count: Optional[int] = None
     mechanism: Any = None
     extra_fields: Dict[str, Any] = field(default_factory=dict)
@@ -350,7 +346,6 @@ class SimulationExecutionResult:
         object.__setattr__(self, "mechanism_text", str(self.mechanism_text or ""))
         object.__setattr__(self, "solver_config", _copy_payload_value(dict(self.solver_config or {})))
         object.__setattr__(self, "provenance", _copy_payload_value(self.provenance))
-        object.__setattr__(self, "fallback_occurred", bool(self.fallback_occurred))
         if self.base_species_count is not None:
             object.__setattr__(self, "base_species_count", max(0, int(self.base_species_count)))
         object.__setattr__(self, "extra_fields", _copy_payload_value(dict(self.extra_fields or {})))
@@ -375,8 +370,6 @@ class SimulationExecutionResult:
                 "mechanism_text",
                 "solver_config",
                 "provenance",
-                "fallback_occurred",
-                "fallback_message",
             )
             if key not in payload
         ]
@@ -400,8 +393,6 @@ class SimulationExecutionResult:
             mechanism_text=str(payload.get("mechanism_text") or ""),
             solver_config=dict(payload.get("solver_config") or {}),
             provenance=payload.get("provenance"),
-            fallback_occurred=bool(payload.get("fallback_occurred")),
-            fallback_message=payload.get("fallback_message"),
             base_species_count=payload.get("base_species_count"),
             mechanism=payload.get("mechanism"),
             extra_fields=extra_fields,
@@ -422,8 +413,6 @@ class SimulationExecutionResult:
             "mechanism_text": str(self.mechanism_text),
             "solver_config": _copy_payload_value(self.solver_config),
             "provenance": _copy_payload_value(self.provenance),
-            "fallback_occurred": bool(self.fallback_occurred),
-            "fallback_message": self.fallback_message,
         }
         if self.base_species_count is not None:
             payload["base_species_count"] = int(self.base_species_count)

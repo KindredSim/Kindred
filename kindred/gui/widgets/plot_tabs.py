@@ -1,5 +1,5 @@
 # kindred/gui/widgets/plot_tabs.py
-"""Tabbed plot widget for multiple datasets with color-coded fit quality."""
+"""Tabbed plot widget for multiple datasets with fit metrics."""
 
 from __future__ import annotations
 
@@ -22,17 +22,13 @@ __all__ = ["PlotTabsWidget"]
 
 class PlotTabsWidget(QtWidgets.QWidget):
     """
-    Tabbed plot area for multiple datasets with color-coded fit quality.
+    Tabbed plot area for multiple datasets with fit metrics.
 
     Features:
     - Default "Simulation" tab with the configured PyQtGraph backend
     - "All Datasets" grid view for comparing multiple datasets
     - Dynamic dataset tabs with DatasetPlotPanel (enhanced plotting, species selection)
-    - Color-coded tab indicators based on fit quality:
-      * Green: Good fit (χ² < 0.1 or R² > 0.95)
-      * Yellow: Moderate fit (0.1 ≤ χ² < 1.0 or 0.85 < R² ≤ 0.95)
-      * Red: Poor fit (χ² ≥ 1.0 or R² ≤ 0.85)
-      * Gray: No fit statistics available
+    - Dataset residual MSE displayed neutrally; R² uses color-coded tab indicators.
     """
 
     def __init__(
@@ -92,6 +88,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
 
         # Track dataset plots for grid view updates
         self._dataset_plots: List[Tuple[str, DatasetPlotPanel]] = []
+        self._dataset_tab_names: Dict[int, str] = {}
 
         # P1 FIX: Track tab colors to maintain complete stylesheet
         # Maps tab_index -> color for proper multi-tab coloring
@@ -146,7 +143,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
     def add_dataset_tab(
         self,
         name: str,
-        chi_squared: Optional[float] = None,
+        residual_mse: Optional[float] = None,
         r_squared: Optional[float] = None,
     ):
         """
@@ -156,8 +153,8 @@ class PlotTabsWidget(QtWidgets.QWidget):
         ----------
         name : str
             Dataset name
-        chi_squared : float, optional
-            Chi-squared goodness of fit
+        residual_mse : float, optional
+            Raw residual mean square for the fit
         r_squared : float, optional
             R-squared goodness of fit
 
@@ -166,35 +163,25 @@ class PlotTabsWidget(QtWidgets.QWidget):
         DatasetPlotPanel
             The plot panel for this dataset with full plotting features
 
-        Notes
-        -----
-        Color coding:
-        - Green: Good fit (χ² < 0.1 or R² > 0.95)
-        - Yellow: Moderate fit (0.1 ≤ χ² < 1.0 or 0.85 < R² ≤ 0.95)
-        - Red: Poor fit (χ² ≥ 1.0 or R² ≤ 0.85)
-        - Gray: No fit statistics available
         """
         # Use DatasetPlotPanel for dataset tabs (simplified, no mechanism duplication)
         plot = DatasetPlotPanel(dataset_name=name)
 
-        # Create tab label with fit statistics
-        if chi_squared is not None:
-            tab_label = f"{name} (χ²={chi_squared:.3e})"
-            color = self._get_color_for_chi_squared(chi_squared)
-        elif r_squared is not None:
-            tab_label = f"{name} (R²={r_squared:.3f})"
-            color = self._get_color_for_r_squared(r_squared)
-        else:
-            tab_label = name
-            color = "#888888"  # Gray for no stats
+        tab_label, color, tooltip = self._fit_quality_tab_state(
+            name,
+            residual_mse=residual_mse,
+            r_squared=r_squared,
+        )
 
         tab_index = self._tabs.addTab(plot, tab_label)
+        self._tabs.setTabToolTip(tab_index, tooltip)
 
         # Apply color to tab
         self._set_tab_color(tab_index, color)
 
         # Track this dataset
         self._dataset_plots.append((name, plot))
+        self._dataset_tab_names[id(plot)] = name
 
         return plot
 
@@ -206,9 +193,11 @@ class PlotTabsWidget(QtWidgets.QWidget):
         data_y,
         ylabel: str = "Concentration",
         xlabel: str = "Time",
+        x_units: object = None,
+        y_units: object = "M",
         all_species: Optional[Dict[str, Any]] = None,
         observations: Optional[Dict[str, Any]] = None,
-        chi_squared: Optional[float] = None,
+        residual_mse: Optional[float] = None,
         r_squared: Optional[float] = None,
         fit_render_projection: Optional[FitRenderDatasetProjection] = None,
     ) -> DatasetPlotPanel:
@@ -217,13 +206,15 @@ class PlotTabsWidget(QtWidgets.QWidget):
         """
         panel = next((plot for dataset_name, plot in self._dataset_plots if dataset_name == name), None)
         if panel is None:
-            panel = self.add_dataset_tab(name, chi_squared=chi_squared, r_squared=r_squared)
+            panel = self.add_dataset_tab(name, residual_mse=residual_mse, r_squared=r_squared)
 
         panel.set_data(
             t,
             data_y,
             xlabel=xlabel,
             ylabel=ylabel,
+            x_units=x_units,
+            y_units=y_units,
             all_species=all_species,
             observations=observations,
         )
@@ -234,7 +225,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
         if tab_index != -1:
             self.update_tab_fit_quality(
                 tab_index,
-                chi_squared=chi_squared,
+                residual_mse=residual_mse,
                 r_squared=r_squared,
             )
         return panel
@@ -269,7 +260,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
     def update_tab_fit_quality(
         self,
         tab_index: int,
-        chi_squared: Optional[float] = None,
+        residual_mse: Optional[float] = None,
         r_squared: Optional[float] = None
     ):
         """
@@ -279,29 +270,65 @@ class PlotTabsWidget(QtWidgets.QWidget):
         ----------
         tab_index : int
             Index of tab to update
-        chi_squared : float, optional
-            Chi-squared goodness of fit
+        residual_mse : float, optional
+            Raw residual mean square for the fit
         r_squared : float, optional
             R-squared goodness of fit
         """
-        current_label = self._tabs.tabText(tab_index)
+        panel = self._tabs.widget(tab_index)
+        base_name = self._dataset_tab_names.get(id(panel)) if isinstance(panel, DatasetPlotPanel) else None
+        if not base_name:
+            base_name = self._tabs.tabText(tab_index)
 
-        # Extract base name (remove existing stats)
-        base_name = current_label.split('(')[0].strip() if '(' in current_label else current_label
-
-        # Update label and color
-        if chi_squared is not None:
-            new_label = f"{base_name} (χ²={chi_squared:.3e})"
-            color = self._get_color_for_chi_squared(chi_squared)
-        elif r_squared is not None:
-            new_label = f"{base_name} (R²={r_squared:.3f})"
-            color = self._get_color_for_r_squared(r_squared)
-        else:
-            new_label = base_name
-            color = "#888888"
+        new_label, color, tooltip = self._fit_quality_tab_state(
+            base_name,
+            residual_mse=residual_mse,
+            r_squared=r_squared,
+        )
 
         self._tabs.setTabText(tab_index, new_label)
+        self._tabs.setTabToolTip(tab_index, tooltip)
         self._set_tab_color(tab_index, color)
+
+    @staticmethod
+    def _finite_metric(value: object) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            metric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(metric) or math.isinf(metric):
+            return None
+        return metric
+
+    def _fit_quality_tab_state(
+        self,
+        base_name: str,
+        *,
+        residual_mse: Optional[float],
+        r_squared: Optional[float],
+    ) -> Tuple[str, str, str]:
+        base = str(base_name)
+        mse_val = self._finite_metric(residual_mse)
+        r2_val = self._finite_metric(r_squared)
+        tooltip_parts = [base]
+        if mse_val is not None:
+            label = f"{base} (MSE={mse_val:.3e})"
+            tooltip_parts.append(f"MSE = {mse_val:.3e}")
+            if r2_val is not None:
+                tooltip_parts.append(f"R² = {r2_val:.3f}")
+                color = self._get_color_for_r_squared(r2_val)
+            else:
+                color = "#666666"
+        elif r2_val is not None:
+            label = f"{base} (R²={r2_val:.3f})"
+            tooltip_parts.append(f"R² = {r2_val:.3f}")
+            color = self._get_color_for_r_squared(r2_val)
+        else:
+            label = base
+            color = "#888888"
+        return label, color, "\n".join(part for part in tooltip_parts if part)
 
     def show_batch_results(
         self,
@@ -364,40 +391,6 @@ class PlotTabsWidget(QtWidgets.QWidget):
 
         self._tabs.setCurrentWidget(self._grid_view)
 
-    def _get_color_for_chi_squared(self, chi_squared: float) -> str:
-        """
-        Get color code based on chi-squared value.
-
-        P1 FIX: Added validation for NaN, negative, or infinite values.
-
-        Parameters
-        ----------
-        chi_squared : float
-            Chi-squared value
-
-        Returns
-        -------
-        str
-            HTML color code
-        """
-        # Validate input
-        if not isinstance(chi_squared, (int, float)):
-            return "#888888"  # Gray for invalid type
-
-        if math.isnan(chi_squared) or math.isinf(chi_squared):
-            return "#888888"  # Gray for NaN/inf
-
-        if chi_squared < 0:
-            return "#888888"  # Gray for negative (invalid)
-
-        # Color based on quality
-        if chi_squared < 0.1:
-            return "#2a5"  # Green (good fit)
-        elif chi_squared < 1.0:
-            return "#da5"  # Yellow (moderate fit)
-        else:
-            return "#d44"  # Red (poor fit)
-
     def _get_color_for_r_squared(self, r_squared: float) -> str:
         """
         Get color code based on R-squared value.
@@ -421,7 +414,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
         if math.isnan(r_squared) or math.isinf(r_squared):
             return "#888888"  # Gray for NaN/inf
 
-        if r_squared < 0 or r_squared > 1:
+        if r_squared > 1:
             return "#888888"  # Gray for out of bounds
 
         # Color based on quality
@@ -432,30 +425,10 @@ class PlotTabsWidget(QtWidgets.QWidget):
         else:
             return "#d44"  # Red (poor fit)
 
-    def _set_tab_color(self, tab_index: int, color: str):
-        """
-        Apply color to a tab.
-
-        P1 FIX: This now maintains state for all tab colors and rebuilds
-        the complete stylesheet, fixing the bug where only the last tab
-        was colored (nth-child selector was being replaced each time).
-
-        Parameters
-        ----------
-        tab_index : int
-            Index of tab to color
-        color : str
-            HTML color code (e.g., "#2a5")
-        """
-        # Store color for this tab
-        self._tab_colors[tab_index] = color
-
-        # Build complete stylesheet for ALL colored tabs
+    def _apply_tab_color_stylesheet(self) -> None:
         tab_bar = self._tabs.tabBar()
         stylesheet_parts = []
-
         for idx, tab_color in self._tab_colors.items():
-            # Use nth-child selector (1-indexed in CSS)
             css_index = idx + 1
             stylesheet_parts.append(f"""
                 QTabBar::tab:nth-child({css_index}) {{
@@ -476,9 +449,35 @@ class PlotTabsWidget(QtWidgets.QWidget):
                 }}
             """)
 
-        # Apply complete stylesheet (all tabs at once)
         complete_stylesheet = "\n".join(stylesheet_parts)
         tab_bar.setStyleSheet(complete_stylesheet)
+
+    def _rebase_tab_colors_after_removal(self, removed_index: int) -> None:
+        rebased: Dict[int, str] = {}
+        for idx, color in self._tab_colors.items():
+            if idx == removed_index:
+                continue
+            rebased[idx - 1 if idx > removed_index else idx] = color
+        self._tab_colors = rebased
+        self._apply_tab_color_stylesheet()
+
+    def _set_tab_color(self, tab_index: int, color: str):
+        """
+        Apply color to a tab.
+
+        P1 FIX: This now maintains state for all tab colors and rebuilds
+        the complete stylesheet, fixing the bug where only the last tab
+        was colored (nth-child selector was being replaced each time).
+
+        Parameters
+        ----------
+        tab_index : int
+            Index of tab to color
+        color : str
+            HTML color code (e.g., "#2a5")
+        """
+        self._tab_colors[tab_index] = color
+        self._apply_tab_color_stylesheet()
 
     def _on_tab_close_requested(self, index: int):
         """
@@ -513,14 +512,14 @@ class PlotTabsWidget(QtWidgets.QWidget):
                 break
 
         if name_to_remove:
+            removed = [p for n, p in self._dataset_plots if n == name_to_remove]
             self._dataset_plots = [(n, p) for n, p in self._dataset_plots if n != name_to_remove]
-
-        # Remove tab color tracking
-        if index in self._tab_colors:
-            del self._tab_colors[index]
+            for panel in removed:
+                self._dataset_tab_names.pop(id(panel), None)
 
         # Remove the tab
         self._tabs.removeTab(index)
+        self._rebase_tab_colors_after_removal(index)
 
     def get_current_plot(self) -> QtWidgets.QWidget:
         """Get the currently visible plot."""

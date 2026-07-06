@@ -154,26 +154,30 @@ def detect_units_from_row_mapping(
 
 
 def rebuild_intent_for_target(
-    source_intent: SheetImportIntent,
+    template_intent: SheetImportIntent,
     target_detection: UnitDetection,
 ) -> SheetImportIntent:
     """Build a ``SheetImportIntent`` for a target sheet or file."""
     conc_units: Dict[str, str] = {}
-    for col in source_intent.species_columns:
-        if not source_intent.override_no_unit_row:
+    for col in template_intent.species_columns:
+        if not template_intent.override_no_unit_row:
             target_detected = target_detection.detected_conc_unit_by_column.get(col)
         else:
             target_detected = None
         if target_detected is not None:
             conc_units[col] = target_detected
         else:
-            conc_units[col] = source_intent.concentration_units[col]
+            conc_units[col] = template_intent.concentration_units[col]
+    if not template_intent.override_no_unit_row and target_detection.detected_time_unit:
+        time_unit = str(target_detection.detected_time_unit)
+    else:
+        time_unit = template_intent.time_unit
     return SheetImportIntent(
-        time_column=source_intent.time_column,
-        species_columns=source_intent.species_columns,
-        time_unit=source_intent.time_unit,
+        time_column=template_intent.time_column,
+        species_columns=template_intent.species_columns,
+        time_unit=time_unit,
         concentration_units=conc_units,
-        override_no_unit_row=source_intent.override_no_unit_row,
+        override_no_unit_row=template_intent.override_no_unit_row,
     )
 
 
@@ -235,7 +239,7 @@ def resolve_import_plans(
         sheet_intent = per_sheet_intents[sheet]
         species_columns = sheet_intent.species_columns
 
-        skip_unit_row = detection.has_unit_row
+        skip_unit_row = bool(detection.has_unit_row and not sheet_intent.override_no_unit_row)
 
         if sheet_intent.override_no_unit_row:
             time_unit = "s"

@@ -6,6 +6,7 @@ from typing import Any, Dict, Sequence
 import numpy as np
 
 from kindred.gui.controllers.results_display_builders import display_species_for_metadata
+from kindred.gui.display_semantics import canonical_time_axis, concentration_series_header
 from kindred.gui.ports import (
     ActiveDisplayKind,
     ActiveDisplayTransaction,
@@ -46,7 +47,7 @@ _COMPLETED_RUN_DISPLAY_SCOPE_REMOVED_STATUS = "Displayed completed run removed f
 _COMPLETED_RUN_DELETED_SET_STATUS = "Displayed completed run included a deleted set; display cleared."
 _COMPLETED_RUN_RUNTIME_INPUT_CHANGED_STATUS = "Runtime input changed; completed run display cleared."
 _COMPLETED_RUN_DISPLAY_UNAVAILABLE_STATUS = "Not displayed."
-_SEMANTIC_DISPLAY_UNAVAILABLE_STATUS = "Completed run has no semantic displayable result."
+_SEMANTIC_DISPLAY_UNAVAILABLE_STATUS = "Requested result has no displayable result."
 
 
 def ordered_display_transaction_metadata(
@@ -429,6 +430,8 @@ def cache_resolution_cause_for_transition(
         return DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE
     if cause is DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE:
         return DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE
+    if cause is DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE:
+        return DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE
     return default
 
 
@@ -577,6 +580,8 @@ def build_main_plot_csv_export(
     normalized_scope = str(scope or "axis")
     x_name = str(axis_state.get("x_name") or "t")
     x_header = str(axis_state.get("x_header") or x_name)
+    if x_name == "t" and x_header in {"", "t"}:
+        x_header = canonical_time_axis().header
     requested_y_names = tuple(str(name) for name in (axis_state.get("y_names") or ()) if str(name))
     columns: list[tuple[str, np.ndarray]] = []
     missing_display_sets: list[str] = []
@@ -630,7 +635,7 @@ def build_main_plot_csv_export(
             if values.shape[0] != expected_len:
                 invalid_series.append(species_name)
                 continue
-            metadata_columns.append((f"{prefix}[{species_name}]", values))
+            metadata_columns.append((f"{prefix}{concentration_series_header(species_name)}", values))
             valid_series = True
         if invalid_series:
             missing_display_sets.append(

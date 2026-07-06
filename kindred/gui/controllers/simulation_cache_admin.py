@@ -38,8 +38,6 @@ class SimulationCacheAdmin:
         simulation_identity: Mapping[str, Any] | None = None,
         solver_config: Mapping[str, Any] | None = None,
         preview_batch_cache_token: str | None = None,
-        fallback_occurred: bool = False,
-        fallback_message: Any = None,
         solver_provenance: Mapping[str, Any] | None = None,
         warnings: Sequence[Mapping[str, Any]] | None = None,
         completion_provenance: Mapping[str, Any] | None = None,
@@ -50,13 +48,10 @@ class SimulationCacheAdmin:
         normalized_key = str(cache_key or "").strip() or None
         normalized_token = str(cache_token or "").strip() or normalized_key
         normalized_set_id = str(set_id or "").strip() or None
-        if normalized_key and bool(is_preview):
-            self.cache.record_preview_completion_cache_key(
-                cache_key=normalized_key,
-                preview_scope_set_ids=preview_scope_set_ids,
-            )
         composite_key = None
         if normalized_token and normalized_set_id:
+            if bool(is_preview) and preview_batch_cache_token is None:
+                raise ValueError("Preview completion cache entry requires preview batch cache token.")
             composite_key = self.cache.put_completion_entry(
                 cache_key=normalized_token,
                 set_id=normalized_set_id,
@@ -69,13 +64,16 @@ class SimulationCacheAdmin:
                 simulation_identity=simulation_identity,
                 solver_config=solver_config,
                 preview_batch_cache_token=preview_batch_cache_token,
-                fallback_occurred=bool(fallback_occurred),
-                fallback_message=fallback_message,
                 solver_provenance=solver_provenance,
                 warnings=warnings,
                 completion_provenance=completion_provenance,
                 owned_species=owned_species,
                 display_species=display_species,
+            )
+        if normalized_key and bool(is_preview) and composite_key:
+            self.cache.record_preview_completion_cache_key(
+                cache_key=normalized_key,
+                preview_scope_set_ids=preview_scope_set_ids,
             )
         return SimulationCachePublicationResult(
             cache_key=normalized_key,

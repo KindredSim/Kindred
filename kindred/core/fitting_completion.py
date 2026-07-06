@@ -59,7 +59,7 @@ def infer_fit_diagnostic_remediation(failure: object) -> FitDiagnosticRemediatio
         return "x_axis_mapping"
     if (
         "non-finite" in message or "nonfinite" in message
-    ) and any(token in message for token in ("chi", "χ²", "metrics", "results are invalid")):
+    ) and any(token in message for token in ("residual mse", "metrics", "results are invalid")):
         return "nonfinite_metrics"
     return "generic_retry"
 

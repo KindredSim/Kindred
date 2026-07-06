@@ -64,6 +64,8 @@ class FitRenderDatasetProjection:
     observed_series: Mapping[str, np.ndarray]
     model_x: np.ndarray
     model_series: Mapping[str, np.ndarray]
+    observed_x_units: Optional[str] = None
+    observed_x_basis: str = ""
     observed_x_by_species: Mapping[str, np.ndarray] = field(default_factory=dict)
     model_x_by_species: Mapping[str, np.ndarray] = field(default_factory=dict)
     dataset_stats: Mapping[str, float] = field(default_factory=dict)
@@ -80,6 +82,12 @@ class FitRenderDatasetProjection:
         observed_x_label = str(self.observed_x_label or "").strip()
         if not observed_x_label:
             observed_x_label = "Time"
+        observed_x_basis = str(self.observed_x_basis or "").strip().lower()
+        if observed_x_basis not in {"time", "series"}:
+            observed_x_basis = "time" if observed_x_label.lower() == "time" else "series"
+        observed_x_units = None if self.observed_x_units is None else str(self.observed_x_units or "").strip() or None
+        if observed_x_units is None and observed_x_basis == "time":
+            observed_x_units = "s"
         model_x = _coerce_array(self.model_x, field_name=f"{dataset_id}.model_x")
         observed_axis_source = dict(self.observed_x_by_species or {})
         observed_x_by_species: Dict[str, np.ndarray] = {}
@@ -131,6 +139,8 @@ class FitRenderDatasetProjection:
         object.__setattr__(self, "dataset_id", dataset_id)
         object.__setattr__(self, "observed_x", observed_x)
         object.__setattr__(self, "observed_x_label", observed_x_label)
+        object.__setattr__(self, "observed_x_units", observed_x_units)
+        object.__setattr__(self, "observed_x_basis", observed_x_basis)
         object.__setattr__(self, "observed_series", observed_series)
         object.__setattr__(self, "observed_x_by_species", observed_x_by_species)
         object.__setattr__(self, "model_x", model_x)
@@ -230,6 +240,8 @@ def build_fit_render_projection(
     cost: Optional[float],
     observed_x_by_dataset: Mapping[str, object],
     observed_x_label_by_dataset: Optional[Mapping[str, object]] = None,
+    observed_x_units_by_dataset: Optional[Mapping[str, object]] = None,
+    observed_x_basis_by_dataset: Optional[Mapping[str, object]] = None,
     observed_series_by_dataset: Optional[Mapping[str, Mapping[str, object]]] = None,
     observed_x_by_species_by_dataset: Optional[Mapping[str, Mapping[str, object]]] = None,
     model_x_by_dataset: Mapping[str, object],
@@ -247,6 +259,8 @@ def build_fit_render_projection(
     for dataset_id in dataset_order:
         observed_x = observed_x_by_dataset.get(dataset_id)
         observed_x_label = (observed_x_label_by_dataset or {}).get(dataset_id, "Time")
+        observed_x_units = (observed_x_units_by_dataset or {}).get(dataset_id)
+        observed_x_basis = (observed_x_basis_by_dataset or {}).get(dataset_id, "")
         observed_series = (observed_series_by_dataset or {}).get(dataset_id)
         observed_x_by_species = (observed_x_by_species_by_dataset or {}).get(dataset_id)
         model_x = model_x_by_dataset.get(dataset_id)
@@ -267,6 +281,8 @@ def build_fit_render_projection(
                 model_x=np.asarray([], dtype=float),
                 model_series={},
                 model_x_by_species={},
+                observed_x_units=observed_x_units,
+                observed_x_basis=str(observed_x_basis or ""),
                 dataset_stats=(dataset_stats_by_dataset or {}).get(dataset_id, {}),
                 status="missing_projection",
                 diagnostics=("Render projection arrays were not available.",),
@@ -282,6 +298,8 @@ def build_fit_render_projection(
                 model_x=np.asarray([], dtype=float) if model_x is None else model_x,
                 model_series=model_series,
                 model_x_by_species=model_x_by_species or {},
+                observed_x_units=observed_x_units,
+                observed_x_basis=str(observed_x_basis or ""),
                 dataset_stats=(dataset_stats_by_dataset or {}).get(dataset_id, {}),
                 status="ok",
                 diagnostics=(),
@@ -296,6 +314,8 @@ def build_fit_render_projection(
                 model_x=np.asarray([], dtype=float),
                 model_series={},
                 model_x_by_species={},
+                observed_x_units=observed_x_units,
+                observed_x_basis=str(observed_x_basis or ""),
                 dataset_stats=(dataset_stats_by_dataset or {}).get(dataset_id, {}),
                 status="invalid_projection",
                 diagnostics=("Render projection arrays failed validation.",),
@@ -316,6 +336,20 @@ def projection_from_global_fit_result(
     phase: str = "final",
     cost: Optional[float] = None,
 ) -> FitRenderProjection:
+    resolved_cost = cost
+    if resolved_cost is None:
+        raw_objective = getattr(result, "objective_residuals", None)
+        if raw_objective is None:
+            objective = np.asarray([], dtype=float)
+        else:
+            try:
+                objective = np.asarray(raw_objective, dtype=float).reshape(-1)
+            except Exception:
+                objective = np.asarray([], dtype=float)
+        if objective.size:
+            resolved_cost = float(np.sum(objective**2))
+        else:
+            resolved_cost = float(getattr(result, "global_residual_mse", 0.0) or 0.0)
     dataset_ids = [
         str(info.dataset_id)
         for info in (getattr(result, "dataset_info", None) or [])
@@ -324,6 +358,8 @@ def projection_from_global_fit_result(
     dataset_stats: Dict[str, Dict[str, float]] = {}
     observed_x_by_dataset: Dict[str, np.ndarray] = {}
     observed_x_label_by_dataset: Dict[str, str] = {}
+    observed_x_units_by_dataset: Dict[str, Optional[str]] = {}
+    observed_x_basis_by_dataset: Dict[str, str] = {}
     observed_series_by_dataset = getattr(result, "plot_observed_series", {}) or {}
     observed_x_by_species_by_dataset = getattr(result, "plot_observed_x", {}) or {}
     model_x_by_dataset: Dict[str, np.ndarray] = {}
@@ -333,11 +369,13 @@ def projection_from_global_fit_result(
         if not dataset_id:
             continue
         dataset_stats[dataset_id] = {
-            "chi_squared": float(getattr(info, "chi_squared", 0.0)),
+            "residual_mse": float(getattr(info, "residual_mse", 0.0)),
             "r_squared": float(getattr(info, "r_squared", 0.0)),
         }
         x_name = str(getattr(info, "x_name", "t") or "t").strip() or "t"
         label = "Time" if x_name == "t" else x_name
+        observed_x_units_by_dataset[dataset_id] = "s" if x_name == "t" else None
+        observed_x_basis_by_dataset[dataset_id] = "time" if x_name == "t" else "series"
         shared_observed = _shared_axis_or_empty(observed_x_by_species_by_dataset.get(dataset_id))
         if shared_observed.size:
             observed_x_by_dataset[dataset_id] = shared_observed
@@ -356,9 +394,11 @@ def projection_from_global_fit_result(
         phase=phase,
         run_stamp_hash=run_stamp_hash,
         sequence=int(getattr(result, "nfev", 0) or 0),
-        cost=float(cost) if cost is not None else float(getattr(result, "global_chi_squared", 0.0) or 0.0),
+        cost=float(resolved_cost),
         observed_x_by_dataset=observed_x_by_dataset,
         observed_x_label_by_dataset=observed_x_label_by_dataset,
+        observed_x_units_by_dataset=observed_x_units_by_dataset,
+        observed_x_basis_by_dataset=observed_x_basis_by_dataset,
         observed_series_by_dataset=observed_series_by_dataset,
         observed_x_by_species_by_dataset=observed_x_by_species_by_dataset,
         model_x_by_dataset=model_x_by_dataset,

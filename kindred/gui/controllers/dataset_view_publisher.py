@@ -14,6 +14,7 @@ from kindred.core.analysis.global_fit_projection import (
 from kindred.core.datasets.observation_payload import dense_view_from_observations
 from kindred.gui.controllers.dataset_errors import DatasetOwnerError
 from kindred.gui.controllers.dataset_registry import DatasetRecord
+from kindred.gui.display_semantics import canonical_concentration_axis, canonical_dataset_x_axis
 
 logger = logging.getLogger(__name__)
 
@@ -228,10 +229,12 @@ class DatasetViewPublisher:
             t=payload["data_x"],
             data_y=payload["data_y"],
             xlabel=payload["x_label"],
+            x_units=payload["x_units"],
             ylabel=payload["current_species"],
+            y_units=payload["y_units"],
             all_species=species_map,
             observations=payload["all_observations"],
-            chi_squared=payload["chi_squared"],
+            residual_mse=payload["residual_mse"],
             r_squared=payload["r_squared"],
             fit_render_projection=payload["fit_render_projection"],
         )
@@ -260,12 +263,16 @@ class DatasetViewPublisher:
             species_map = projection_species or base_species
             data_x = projection.observed_x_for_species(str(entry.get("series_name") or ""))
             x_label = projection.observed_x_label
+            x_units = projection.observed_x_units
             stats = dict(projection.dataset_stats)
         else:
             species_map = base_species
             data_x = np.asarray(entry.get("t", []), dtype=float)
             x_label = "Time"
+            x_units = None
             stats = {}
+        x_axis = canonical_dataset_x_axis(x_label, units=x_units)
+        y_axis = canonical_concentration_axis()
 
         current_species = str(entry.get("series_name") or "")
         if current_species not in species_map and species_map:
@@ -282,13 +289,16 @@ class DatasetViewPublisher:
             data_y = species_map[current_species] if current_species in species_map else np.asarray([], dtype=float)
         return {
             "data_x": data_x,
-            "x_label": x_label,
+            "x_label": x_axis.label,
+            "x_units": x_axis.units,
             "data_y": data_y,
+            "y_label": y_axis.label,
+            "y_units": y_axis.units,
             "all_species": species_map,
             "all_observations": observation_map,
             "current_species": current_species,
             "fit_render_projection": projection,
-            "chi_squared": stats.get("chi_squared"),
+            "residual_mse": stats.get("residual_mse"),
             "r_squared": stats.get("r_squared"),
         }
 
@@ -309,9 +319,12 @@ class DatasetViewPublisher:
                     "t": entry["t"],
                     "data_x": payload["data_x"],
                     "x_label": payload["x_label"],
+                    "x_units": payload["x_units"],
                     "data_y": payload["data_y"],
+                    "y_label": payload["y_label"],
+                    "y_units": payload["y_units"],
                     "fit_render_projection": payload["fit_render_projection"],
-                    "chi_squared": payload["chi_squared"],
+                    "residual_mse": payload["residual_mse"],
                     "r_squared": payload["r_squared"],
                     "all_species": payload["all_species"],
                     "all_observations": payload["all_observations"],

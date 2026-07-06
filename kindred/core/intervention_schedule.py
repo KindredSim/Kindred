@@ -216,11 +216,32 @@ def _positive_int_from_payload(payload: Mapping[str, Any], *, field: str) -> int
     return value
 
 
+def _positive_int(value: object, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise InterventionScheduleError(f"{field} must be an integer.")
+    if isinstance(value, int):
+        out = int(value)
+    elif isinstance(value, str):
+        raw_s = value.strip()
+        if not raw_s.isdecimal():
+            raise InterventionScheduleError(f"{field} must be an integer.")
+        out = int(raw_s)
+    else:
+        raise InterventionScheduleError(f"{field} must be an integer.")
+    if out <= 0:
+        raise InterventionScheduleError(f"{field} must be greater than zero.")
+    return out
+
+
 def _parameter_name(value: object, *, field: str) -> str:
     name = str(value or "").strip()
     if not name:
         raise InterventionScheduleError(f"{field} must not be empty.")
     return name
+
+
+def _has_parameter(value: object) -> bool:
+    return bool(str(value or "").strip())
 
 
 def _payload_scalar(
@@ -267,6 +288,47 @@ def _resolve_scalar(
     return _finite_float(raw_value, field=field)
 
 
+def _canonical_scalar_pair(
+    value: float | None,
+    parameter: str | None,
+    *,
+    field: str,
+    nonnegative: bool = False,
+    positive: bool = False,
+) -> tuple[float | None, str | None]:
+    if _has_parameter(parameter):
+        parameter_name = _parameter_name(parameter, field=f"{field}_param")
+        if value is not None:
+            raise InterventionScheduleError(f"{field} and {field}_param are mutually exclusive.")
+        return None, parameter_name
+    if positive:
+        return _positive_float(value, field=field), None
+    if nonnegative:
+        return _nonnegative_float(value, field=field), None
+    return _finite_float(value, field=field), None
+
+
+def _reject_scalar_pair(
+    value: float | None,
+    parameter: str | None,
+    *,
+    field: str,
+    context: str,
+) -> None:
+    if value is not None or _has_parameter(parameter):
+        raise InterventionScheduleError(f"Unsupported {context} field: {field!r}.")
+
+
+def _canonical_clear_value(value: float | None, parameter: str | None, *, context: str) -> tuple[float, None]:
+    if _has_parameter(parameter):
+        raise InterventionScheduleError(f"Unsupported {context} field: 'value_param'.")
+    if value is None:
+        return 0.0, None
+    if _nonnegative_float(value, field="value") != 0.0:
+        raise InterventionScheduleError(f"{context} value must be 0.0 when provided.")
+    return 0.0, None
+
+
 def _write_scalar_payload(
     payload: dict[str, Any],
     *,
@@ -280,6 +342,22 @@ def _write_scalar_payload(
         payload[field] = float(value if value is not None else 0.0)
 
 
+def _store_metadata_entry(metadata: dict[str, str], key: object, value: object) -> None:
+    key_s = str(key).strip()
+    if key_s not in _METADATA_KEYS:
+        raise InterventionScheduleError(f"Unsupported intervention metadata key: {key_s!r}.")
+    if value is None:
+        return
+    metadata[key_s] = str(value)
+
+
+def _validated_metadata_tuple(metadata: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    quantity_kind = metadata.get("quantity_kind")
+    if quantity_kind is not None and quantity_kind not in _QUANTITY_KINDS:
+        raise InterventionScheduleError(f"Unsupported intervention quantity_kind: {quantity_kind!r}.")
+    return tuple(sorted(metadata.items()))
+
+
 def _metadata_from_payload(payload: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
     metadata: dict[str, str] = {}
     raw_metadata = payload.get("metadata")
@@ -287,19 +365,23 @@ def _metadata_from_payload(payload: Mapping[str, Any]) -> tuple[tuple[str, str],
         if not isinstance(raw_metadata, Mapping):
             raise InterventionScheduleError("metadata must be a mapping.")
         for key, value in raw_metadata.items():
-            key_s = str(key).strip()
-            if key_s not in _METADATA_KEYS:
-                raise InterventionScheduleError(f"Unsupported intervention metadata key: {key_s!r}.")
-            if value is None:
-                continue
-            metadata[key_s] = str(value)
+            _store_metadata_entry(metadata, key, value)
     for key in _METADATA_KEYS:
-        if key in payload and payload.get(key) is not None:
-            metadata[key] = str(payload.get(key))
-    quantity_kind = metadata.get("quantity_kind")
-    if quantity_kind is not None and quantity_kind not in _QUANTITY_KINDS:
-        raise InterventionScheduleError(f"Unsupported intervention quantity_kind: {quantity_kind!r}.")
-    return tuple(sorted(metadata.items()))
+        if key in payload:
+            _store_metadata_entry(metadata, key, payload.get(key))
+    return _validated_metadata_tuple(metadata)
+
+
+def _metadata_tuple(value: Mapping[str, str] | Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    if isinstance(value, Mapping):
+        value = tuple(value.items())
+    metadata: dict[str, str] = {}
+    try:
+        for key, item in value:
+            _store_metadata_entry(metadata, key, item)
+    except (TypeError, ValueError) as exc:
+        raise InterventionScheduleError("metadata entries must be key/value pairs.") from exc
+    return _validated_metadata_tuple(metadata)
 
 
 def _write_metadata_payload(payload: dict[str, Any], metadata: Sequence[tuple[str, str]]) -> None:
@@ -347,13 +429,65 @@ class InterventionInstantEvent:
     amount_param: str | None = None
     metadata: tuple[tuple[str, str], ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _metadata_tuple(self.metadata))
+        time, time_param = _canonical_scalar_pair(self.time, self.time_param, field="time", nonnegative=True)
+        object.__setattr__(self, "time", time)
+        object.__setattr__(self, "time_param", time_param)
+        object.__setattr__(self, "species", _species_name(self.species))
+        op = str(self.op).strip().lower()
+        if op not in _INSTANT_OPS:
+            raise InterventionScheduleError(f"Unsupported instant intervention op: {op!r}.")
+        object.__setattr__(self, "op", op)
+        if op == "set":
+            value, value_param = _canonical_scalar_pair(self.value, self.value_param, field="value", nonnegative=True)
+            object.__setattr__(self, "value", value)
+            object.__setattr__(self, "value_param", value_param)
+            _reject_scalar_pair(
+                self.amount,
+                self.amount_param,
+                field="amount",
+                context="set instant intervention",
+            )
+            object.__setattr__(self, "amount", None)
+            object.__setattr__(self, "amount_param", None)
+            return
+        if op == "clear":
+            value, value_param = _canonical_clear_value(
+                self.value,
+                self.value_param,
+                context="clear instant intervention",
+            )
+            object.__setattr__(self, "value", value)
+            object.__setattr__(self, "value_param", value_param)
+            _reject_scalar_pair(
+                self.amount,
+                self.amount_param,
+                field="amount",
+                context="clear instant intervention",
+            )
+            object.__setattr__(self, "amount", None)
+            object.__setattr__(self, "amount_param", None)
+            return
+        _reject_scalar_pair(
+            self.value,
+            self.value_param,
+            field="value",
+            context=f"{op} instant intervention",
+        )
+        object.__setattr__(self, "value", None)
+        object.__setattr__(self, "value_param", None)
+        amount, amount_param = _canonical_scalar_pair(self.amount, self.amount_param, field="amount", nonnegative=True)
+        object.__setattr__(self, "amount", amount)
+        object.__setattr__(self, "amount_param", amount_param)
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "InterventionInstantEvent":
         _reject_unknown_payload_keys(payload, _INSTANT_EVENT_PAYLOAD_KEYS, context="instant intervention")
         op = str(payload.get("op") or "").strip().lower()
         if op not in _INSTANT_OPS:
             raise InterventionScheduleError(f"Unsupported instant intervention op: {op!r}.")
-        time, time_param = _payload_scalar(payload, field="time")
+        time, time_param = _payload_scalar(payload, field="time", nonnegative=True)
         species = _species_name(payload.get("species"))
         metadata = _metadata_from_payload(payload)
         if op in {"set"}:
@@ -362,7 +496,7 @@ class InterventionInstantEvent:
                 frozenset({"amount", "amount_param"}),
                 context="set instant intervention",
             )
-            value, value_param = _payload_scalar(payload, field="value")
+            value, value_param = _payload_scalar(payload, field="value", nonnegative=True)
             return cls(
                 time=time,
                 species=species,
@@ -396,13 +530,19 @@ class InterventionInstantEvent:
         )
 
     def resolve_parameters(self, parameter_values: Mapping[str, Any]) -> "InterventionInstantEvent":
-        time = _resolve_scalar(self.time, self.time_param, parameter_values, field="time")
+        time = _resolve_scalar(self.time, self.time_param, parameter_values, field="time", nonnegative=True)
         if self.op == "set":
             return InterventionInstantEvent(
                 time=time,
                 species=self.species,
                 op=self.op,
-                value=_resolve_scalar(self.value, self.value_param, parameter_values, field="value"),
+                value=_resolve_scalar(
+                    self.value,
+                    self.value_param,
+                    parameter_values,
+                    field="value",
+                    nonnegative=True,
+                ),
                 metadata=tuple(self.metadata),
             )
         if self.op == "clear":
@@ -459,6 +599,24 @@ class InterventionRepeatedEvent:
     amount_param: str | None = None
     metadata: tuple[tuple[str, str], ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _metadata_tuple(self.metadata))
+        object.__setattr__(self, "count", _positive_int(self.count, field="count"))
+        op = str(self.op).strip().lower()
+        if op not in {"pulse", "add", "remove"}:
+            raise InterventionScheduleError(f"Unsupported repeated intervention op: {op!r}.")
+        object.__setattr__(self, "op", op)
+        object.__setattr__(self, "species", _species_name(self.species))
+        start, start_param = _canonical_scalar_pair(self.start, self.start_param, field="start", nonnegative=True)
+        every, every_param = _canonical_scalar_pair(self.every, self.every_param, field="every", positive=True)
+        amount, amount_param = _canonical_scalar_pair(self.amount, self.amount_param, field="amount", nonnegative=True)
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "start_param", start_param)
+        object.__setattr__(self, "every", every)
+        object.__setattr__(self, "every_param", every_param)
+        object.__setattr__(self, "amount", amount)
+        object.__setattr__(self, "amount_param", amount_param)
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "InterventionRepeatedEvent":
         _reject_unknown_payload_keys(payload, _REPEATED_EVENT_PAYLOAD_KEYS, context="repeated intervention")
@@ -466,7 +624,7 @@ class InterventionRepeatedEvent:
         op = str(payload.get("op") or "pulse").strip().lower()
         if op not in {"pulse", "add", "remove"}:
             raise InterventionScheduleError(f"Unsupported repeated intervention op: {op!r}.")
-        start, start_param = _payload_scalar(payload, field="start")
+        start, start_param = _payload_scalar(payload, field="start", nonnegative=True)
         every, every_param = _payload_scalar(payload, field="every", positive=True)
         amount, amount_param = _payload_scalar(payload, field="amount", nonnegative=True)
         return cls(
@@ -488,7 +646,7 @@ class InterventionRepeatedEvent:
 
     def resolve_parameters(self, parameter_values: Mapping[str, Any]) -> "InterventionRepeatedEvent":
         return InterventionRepeatedEvent(
-            start=_resolve_scalar(self.start, self.start_param, parameter_values, field="start"),
+            start=_resolve_scalar(self.start, self.start_param, parameter_values, field="start", nonnegative=True),
             every=_resolve_scalar(
                 self.every,
                 self.every_param,
@@ -556,6 +714,66 @@ class InterventionTriggerEvent:
     amount_param: str | None = None
     metadata: tuple[tuple[str, str], ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _metadata_tuple(self.metadata))
+        object.__setattr__(self, "trigger_species", _species_name(self.trigger_species))
+        object.__setattr__(self, "species", _species_name(self.species))
+        direction = str(self.direction).strip().lower()
+        if direction not in _TRIGGER_DIRECTIONS:
+            raise InterventionScheduleError("direction must be rising, falling, or either.")
+        object.__setattr__(self, "direction", direction)
+        op = str(self.op).strip().lower()
+        if op not in _INSTANT_OPS:
+            raise InterventionScheduleError(f"Unsupported trigger action: {op!r}.")
+        object.__setattr__(self, "op", op)
+        object.__setattr__(self, "max_count", _positive_int(self.max_count, field="max_count"))
+        object.__setattr__(self, "min_interval", _nonnegative_float(self.min_interval, field="min_interval"))
+        threshold, threshold_param = _canonical_scalar_pair(
+            self.threshold,
+            self.threshold_param,
+            field="threshold",
+            nonnegative=True,
+        )
+        object.__setattr__(self, "threshold", threshold)
+        object.__setattr__(self, "threshold_param", threshold_param)
+        if op == "set":
+            value, value_param = _canonical_scalar_pair(self.value, self.value_param, field="value", nonnegative=True)
+            object.__setattr__(self, "value", value)
+            object.__setattr__(self, "value_param", value_param)
+            _reject_scalar_pair(
+                self.amount,
+                self.amount_param,
+                field="amount",
+                context="set trigger intervention",
+            )
+            object.__setattr__(self, "amount", None)
+            object.__setattr__(self, "amount_param", None)
+            return
+        if op == "clear":
+            value, value_param = _canonical_clear_value(self.value, self.value_param, context="clear trigger intervention")
+            object.__setattr__(self, "value", value)
+            object.__setattr__(self, "value_param", value_param)
+            _reject_scalar_pair(
+                self.amount,
+                self.amount_param,
+                field="amount",
+                context="clear trigger intervention",
+            )
+            object.__setattr__(self, "amount", None)
+            object.__setattr__(self, "amount_param", None)
+            return
+        _reject_scalar_pair(
+            self.value,
+            self.value_param,
+            field="value",
+            context=f"{op} trigger intervention",
+        )
+        object.__setattr__(self, "value", None)
+        object.__setattr__(self, "value_param", None)
+        amount, amount_param = _canonical_scalar_pair(self.amount, self.amount_param, field="amount", nonnegative=True)
+        object.__setattr__(self, "amount", amount)
+        object.__setattr__(self, "amount_param", amount_param)
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "InterventionTriggerEvent":
         _reject_unknown_payload_keys(payload, _TRIGGER_EVENT_PAYLOAD_KEYS, context="trigger intervention")
@@ -567,7 +785,7 @@ class InterventionTriggerEvent:
             raise InterventionScheduleError(f"Unsupported trigger action: {action!r}.")
         max_count = _positive_int_from_payload(payload, field="max_count")
         min_interval = _nonnegative_float(payload.get("min_interval"), field="min_interval")
-        threshold, threshold_param = _payload_scalar(payload, field="threshold")
+        threshold, threshold_param = _payload_scalar(payload, field="threshold", nonnegative=True)
         base = dict(
             trigger_species=_species_name(payload.get("trigger_species")),
             threshold=threshold,
@@ -585,7 +803,7 @@ class InterventionTriggerEvent:
                 frozenset({"amount", "amount_param"}),
                 context="set trigger intervention",
             )
-            value, value_param = _payload_scalar(payload, field="value")
+            value, value_param = _payload_scalar(payload, field="value", nonnegative=True)
             return cls(**base, value=value, value_param=value_param)
         if action == "clear":
             _reject_payload_fields(
@@ -607,7 +825,13 @@ class InterventionTriggerEvent:
         return bool(self.threshold_param or self.value_param or self.amount_param)
 
     def resolve_parameters(self, parameter_values: Mapping[str, Any]) -> "InterventionTriggerEvent":
-        threshold = _resolve_scalar(self.threshold, self.threshold_param, parameter_values, field="threshold")
+        threshold = _resolve_scalar(
+            self.threshold,
+            self.threshold_param,
+            parameter_values,
+            field="threshold",
+            nonnegative=True,
+        )
         if self.op == "set":
             return InterventionTriggerEvent(
                 trigger_species=self.trigger_species,
@@ -617,7 +841,13 @@ class InterventionTriggerEvent:
                 op=self.op,
                 max_count=int(self.max_count),
                 min_interval=float(self.min_interval),
-                value=_resolve_scalar(self.value, self.value_param, parameter_values, field="value"),
+                value=_resolve_scalar(
+                    self.value,
+                    self.value_param,
+                    parameter_values,
+                    field="value",
+                    nonnegative=True,
+                ),
                 metadata=tuple(self.metadata),
             )
         if self.op == "clear":
@@ -707,14 +937,55 @@ class InterventionInterval:
     value_param: str | None = None
     metadata: tuple[tuple[str, str], ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _metadata_tuple(self.metadata))
+        start, start_param = _canonical_scalar_pair(self.start, self.start_param, field="start", nonnegative=True)
+        end, end_param = _canonical_scalar_pair(self.end, self.end_param, field="end", nonnegative=True)
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "start_param", start_param)
+        object.__setattr__(self, "end", end)
+        object.__setattr__(self, "end_param", end_param)
+        if not _has_parameter(self.start_param) and not _has_parameter(self.end_param):
+            if float(self.end if self.end is not None else 0.0) <= float(self.start if self.start is not None else 0.0):
+                raise InterventionScheduleError("end must be greater than start.")
+        object.__setattr__(self, "species", _species_name(self.species))
+        kind = str(self.kind).strip().lower()
+        if kind not in _INTERVAL_KINDS:
+            raise InterventionScheduleError(f"Unsupported intervention interval kind: {kind!r}.")
+        object.__setattr__(self, "kind", kind)
+        if kind in {"source", "sink"}:
+            rate, rate_param = _canonical_scalar_pair(self.rate, self.rate_param, field="rate", nonnegative=True)
+            object.__setattr__(self, "rate", rate)
+            object.__setattr__(self, "rate_param", rate_param)
+            _reject_scalar_pair(
+                self.value,
+                self.value_param,
+                field="value",
+                context=f"{kind} interval",
+            )
+            object.__setattr__(self, "value", None)
+            object.__setattr__(self, "value_param", None)
+            return
+        _reject_scalar_pair(
+            self.rate,
+            self.rate_param,
+            field="rate",
+            context=f"{kind} interval",
+        )
+        object.__setattr__(self, "rate", None)
+        object.__setattr__(self, "rate_param", None)
+        value, value_param = _canonical_scalar_pair(self.value, self.value_param, field="value", nonnegative=True)
+        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "value_param", value_param)
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "InterventionInterval":
         _reject_unknown_payload_keys(payload, _INTERVAL_PAYLOAD_KEYS, context="intervention interval")
         kind = str(payload.get("kind") or "").strip().lower()
         if kind not in _INTERVAL_KINDS:
             raise InterventionScheduleError(f"Unsupported intervention interval kind: {kind!r}.")
-        start, start_param = _payload_scalar(payload, field="start")
-        end, end_param = _payload_scalar(payload, field="end")
+        start, start_param = _payload_scalar(payload, field="start", nonnegative=True)
+        end, end_param = _payload_scalar(payload, field="end", nonnegative=True)
         if start_param is None and end_param is None and end <= start:
             raise InterventionScheduleError("end must be greater than start.")
         species = _species_name(payload.get("species"))
@@ -742,7 +1013,7 @@ class InterventionInterval:
             frozenset({"rate", "rate_param"}),
             context=f"{kind} interval",
         )
-        value, value_param = _payload_scalar(payload, field="value")
+        value, value_param = _payload_scalar(payload, field="value", nonnegative=True)
         return cls(
             start=start,
             end=end,
@@ -756,8 +1027,8 @@ class InterventionInterval:
         )
 
     def resolve_parameters(self, parameter_values: Mapping[str, Any]) -> "InterventionInterval":
-        start = _resolve_scalar(self.start, self.start_param, parameter_values, field="start")
-        end = _resolve_scalar(self.end, self.end_param, parameter_values, field="end")
+        start = _resolve_scalar(self.start, self.start_param, parameter_values, field="start", nonnegative=True)
+        end = _resolve_scalar(self.end, self.end_param, parameter_values, field="end", nonnegative=True)
         if end <= start:
             raise InterventionScheduleError("end must be greater than start.")
         if self.kind in {"source", "sink"}:
@@ -780,7 +1051,13 @@ class InterventionInterval:
             end=end,
             species=self.species,
             kind=self.kind,
-            value=_resolve_scalar(self.value, self.value_param, parameter_values, field="value"),
+            value=_resolve_scalar(
+                self.value,
+                self.value_param,
+                parameter_values,
+                field="value",
+                nonnegative=True,
+            ),
             metadata=tuple(self.metadata),
         )
 
@@ -820,6 +1097,53 @@ class InterventionRepeatedInterval:
     value_param: str | None = None
     metadata: tuple[tuple[str, str], ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _metadata_tuple(self.metadata))
+        object.__setattr__(self, "count", _positive_int(self.count, field="count"))
+        object.__setattr__(self, "species", _species_name(self.species))
+        kind = str(self.kind).strip().lower()
+        if kind not in _INTERVAL_KINDS:
+            raise InterventionScheduleError(f"Unsupported repeated interval kind: {kind!r}.")
+        object.__setattr__(self, "kind", kind)
+        start, start_param = _canonical_scalar_pair(self.start, self.start_param, field="start", nonnegative=True)
+        every, every_param = _canonical_scalar_pair(self.every, self.every_param, field="every", positive=True)
+        duration, duration_param = _canonical_scalar_pair(
+            self.duration,
+            self.duration_param,
+            field="duration",
+            positive=True,
+        )
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "start_param", start_param)
+        object.__setattr__(self, "every", every)
+        object.__setattr__(self, "every_param", every_param)
+        object.__setattr__(self, "duration", duration)
+        object.__setattr__(self, "duration_param", duration_param)
+        if kind in {"source", "sink"}:
+            rate, rate_param = _canonical_scalar_pair(self.rate, self.rate_param, field="rate", nonnegative=True)
+            object.__setattr__(self, "rate", rate)
+            object.__setattr__(self, "rate_param", rate_param)
+            _reject_scalar_pair(
+                self.value,
+                self.value_param,
+                field="value",
+                context=f"{kind} repeated interval",
+            )
+            object.__setattr__(self, "value", None)
+            object.__setattr__(self, "value_param", None)
+            return
+        _reject_scalar_pair(
+            self.rate,
+            self.rate_param,
+            field="rate",
+            context=f"{kind} repeated interval",
+        )
+        object.__setattr__(self, "rate", None)
+        object.__setattr__(self, "rate_param", None)
+        value, value_param = _canonical_scalar_pair(self.value, self.value_param, field="value", nonnegative=True)
+        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "value_param", value_param)
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "InterventionRepeatedInterval":
         _reject_unknown_payload_keys(payload, _REPEATED_INTERVAL_PAYLOAD_KEYS, context="repeated interval")
@@ -827,7 +1151,7 @@ class InterventionRepeatedInterval:
         if kind not in _INTERVAL_KINDS:
             raise InterventionScheduleError(f"Unsupported repeated interval kind: {kind!r}.")
         count = _positive_int_from_payload(payload, field="count")
-        start, start_param = _payload_scalar(payload, field="start")
+        start, start_param = _payload_scalar(payload, field="start", nonnegative=True)
         every, every_param = _payload_scalar(payload, field="every", positive=True)
         duration, duration_param = _payload_scalar(payload, field="duration", positive=True)
         base = dict(
@@ -855,7 +1179,7 @@ class InterventionRepeatedInterval:
             frozenset({"rate", "rate_param"}),
             context=f"{kind} repeated interval",
         )
-        value, value_param = _payload_scalar(payload, field="value")
+        value, value_param = _payload_scalar(payload, field="value", nonnegative=True)
         return cls(**base, value=value, value_param=value_param)
 
     @property
@@ -869,7 +1193,7 @@ class InterventionRepeatedInterval:
         )
 
     def resolve_parameters(self, parameter_values: Mapping[str, Any]) -> "InterventionRepeatedInterval":
-        start = _resolve_scalar(self.start, self.start_param, parameter_values, field="start")
+        start = _resolve_scalar(self.start, self.start_param, parameter_values, field="start", nonnegative=True)
         every = _resolve_scalar(self.every, self.every_param, parameter_values, field="every", positive=True)
         duration = _resolve_scalar(
             self.duration,
@@ -894,7 +1218,13 @@ class InterventionRepeatedInterval:
             )
         return InterventionRepeatedInterval(
             **base,
-            value=_resolve_scalar(self.value, self.value_param, parameter_values, field="value"),
+            value=_resolve_scalar(
+                self.value,
+                self.value_param,
+                parameter_values,
+                field="value",
+                nonnegative=True,
+            ),
         )
 
     def expand(self) -> tuple[InterventionInterval, ...]:
@@ -924,7 +1254,7 @@ class InterventionRepeatedInterval:
                 intervals.append(
                     InterventionInterval(
                         **base,
-                        value=_finite_float(self.value, field="value"),
+                        value=_nonnegative_float(self.value, field="value"),
                         metadata=tuple(self.metadata),
                     )
                 )
@@ -960,6 +1290,80 @@ class InterventionProtocolOperation:
     amount_param: str | None = None
     metadata: tuple[tuple[str, str], ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _metadata_tuple(self.metadata))
+        phase = str(self.phase).strip().lower()
+        if phase not in {"before", "during", "after"}:
+            raise InterventionScheduleError(f"Unsupported protocol operation phase: {phase!r}.")
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "species", _species_name(self.species))
+        op = str(self.op).strip().lower()
+        if phase == "during":
+            if op not in _INTERVAL_KINDS:
+                raise InterventionScheduleError(f"Unsupported protocol interval kind: {op!r}.")
+            object.__setattr__(self, "op", op)
+            _reject_scalar_pair(
+                self.amount,
+                self.amount_param,
+                field="amount",
+                context="protocol during operation",
+            )
+            object.__setattr__(self, "amount", None)
+            object.__setattr__(self, "amount_param", None)
+            if op in {"source", "sink"}:
+                rate, rate_param = _canonical_scalar_pair(self.rate, self.rate_param, field="rate", nonnegative=True)
+                object.__setattr__(self, "rate", rate)
+                object.__setattr__(self, "rate_param", rate_param)
+                _reject_scalar_pair(
+                    self.value,
+                    self.value_param,
+                    field="value",
+                    context=f"{op} protocol during",
+                )
+                object.__setattr__(self, "value", None)
+                object.__setattr__(self, "value_param", None)
+                return
+            _reject_scalar_pair(
+                self.rate,
+                self.rate_param,
+                field="rate",
+                context=f"{op} protocol during",
+            )
+            object.__setattr__(self, "rate", None)
+            object.__setattr__(self, "rate_param", None)
+            value, value_param = _canonical_scalar_pair(self.value, self.value_param, field="value", nonnegative=True)
+            object.__setattr__(self, "value", value)
+            object.__setattr__(self, "value_param", value_param)
+            return
+        if op not in _INSTANT_OPS:
+            raise InterventionScheduleError(f"Unsupported protocol instant op: {op!r}.")
+        object.__setattr__(self, "op", op)
+        _reject_scalar_pair(self.rate, self.rate_param, field="rate", context=f"protocol {phase} operation")
+        object.__setattr__(self, "rate", None)
+        object.__setattr__(self, "rate_param", None)
+        if op == "set":
+            value, value_param = _canonical_scalar_pair(self.value, self.value_param, field="value", nonnegative=True)
+            object.__setattr__(self, "value", value)
+            object.__setattr__(self, "value_param", value_param)
+            _reject_scalar_pair(self.amount, self.amount_param, field="amount", context=f"set protocol {phase}")
+            object.__setattr__(self, "amount", None)
+            object.__setattr__(self, "amount_param", None)
+            return
+        if op == "clear":
+            value, value_param = _canonical_clear_value(self.value, self.value_param, context=f"clear protocol {phase}")
+            object.__setattr__(self, "value", value)
+            object.__setattr__(self, "value_param", value_param)
+            _reject_scalar_pair(self.amount, self.amount_param, field="amount", context=f"clear protocol {phase}")
+            object.__setattr__(self, "amount", None)
+            object.__setattr__(self, "amount_param", None)
+            return
+        _reject_scalar_pair(self.value, self.value_param, field="value", context=f"{op} protocol {phase}")
+        object.__setattr__(self, "value", None)
+        object.__setattr__(self, "value_param", None)
+        amount, amount_param = _canonical_scalar_pair(self.amount, self.amount_param, field="amount", nonnegative=True)
+        object.__setattr__(self, "amount", amount)
+        object.__setattr__(self, "amount_param", amount_param)
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any], *, phase: str) -> "InterventionProtocolOperation":
         phase_s = str(phase)
@@ -986,7 +1390,7 @@ class InterventionProtocolOperation:
                 frozenset({"rate", "rate_param"}),
                 context=f"{op} protocol during",
             )
-            value, value_param = _payload_scalar(payload, field="value")
+            value, value_param = _payload_scalar(payload, field="value", nonnegative=True)
             return cls(**base, value=value, value_param=value_param)
         _reject_unknown_payload_keys(
             payload,
@@ -1003,7 +1407,7 @@ class InterventionProtocolOperation:
                 frozenset({"amount", "amount_param"}),
                 context=f"set protocol {phase_s}",
             )
-            value, value_param = _payload_scalar(payload, field="value")
+            value, value_param = _payload_scalar(payload, field="value", nonnegative=True)
             return cls(**base, value=value, value_param=value_param)
         if op == "clear":
             _reject_payload_fields(
@@ -1034,7 +1438,13 @@ class InterventionProtocolOperation:
         if self.phase == "during" or self.op == "set":
             return InterventionProtocolOperation(
                 **base,
-                value=_resolve_scalar(self.value, self.value_param, parameter_values, field="value"),
+                value=_resolve_scalar(
+                    self.value,
+                    self.value_param,
+                    parameter_values,
+                    field="value",
+                    nonnegative=True,
+                ),
             )
         if self.op == "clear":
             return InterventionProtocolOperation(**base, value=0.0)
@@ -1074,7 +1484,7 @@ class InterventionProtocolOperation:
             end=float(end),
             species=self.species,
             kind=self.op,
-            value=_finite_float(self.value, field="value"),
+            value=_nonnegative_float(self.value, field="value"),
             metadata=tuple(self.metadata),
         )
 
@@ -1124,6 +1534,46 @@ class InterventionProtocol:
     duration_param: str | None = None
     metadata: tuple[tuple[str, str], ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "before", tuple(sorted(tuple(self.before), key=_protocol_operation_sort_key)))
+        object.__setattr__(self, "during", tuple(sorted(tuple(self.during), key=_protocol_operation_sort_key)))
+        object.__setattr__(self, "after", tuple(sorted(tuple(self.after), key=_protocol_operation_sort_key)))
+        object.__setattr__(self, "metadata", _metadata_tuple(self.metadata))
+        kind = str(self.kind).strip().lower()
+        if kind != "repeat":
+            raise InterventionScheduleError(f"Unsupported intervention protocol kind: {self.kind!r}.")
+        object.__setattr__(self, "kind", kind)
+        name = str(self.name or "").strip()
+        if not name:
+            raise InterventionScheduleError("protocol name must not be empty.")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "count", _positive_int(self.count, field="count"))
+        start, start_param = _canonical_scalar_pair(self.start, self.start_param, field="start", nonnegative=True)
+        every, every_param = _canonical_scalar_pair(self.every, self.every_param, field="every", positive=True)
+        duration, duration_param = _canonical_scalar_pair(
+            self.duration,
+            self.duration_param,
+            field="duration",
+            positive=True,
+        )
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "start_param", start_param)
+        object.__setattr__(self, "every", every)
+        object.__setattr__(self, "every_param", every_param)
+        object.__setattr__(self, "duration", duration)
+        object.__setattr__(self, "duration_param", duration_param)
+        if not self.before and not self.during and not self.after:
+            raise InterventionScheduleError("protocol must include at least one before, during, or after operation.")
+        for op in self.before:
+            if not isinstance(op, InterventionProtocolOperation) or str(op.phase) != "before":
+                raise InterventionScheduleError("protocol before entries must be before operations.")
+        for op in self.during:
+            if not isinstance(op, InterventionProtocolOperation) or str(op.phase) != "during":
+                raise InterventionScheduleError("protocol during entries must be during operations.")
+        for op in self.after:
+            if not isinstance(op, InterventionProtocolOperation) or str(op.phase) != "after":
+                raise InterventionScheduleError("protocol after entries must be after operations.")
+
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "InterventionProtocol":
         _reject_unknown_payload_keys(payload, _PROTOCOL_PAYLOAD_KEYS, context="protocol")
@@ -1134,7 +1584,7 @@ class InterventionProtocol:
         if not name:
             raise InterventionScheduleError("protocol name must not be empty.")
         count = _positive_int_from_payload(payload, field="count")
-        start, start_param = _payload_scalar(payload, field="start")
+        start, start_param = _payload_scalar(payload, field="start", nonnegative=True)
         every, every_param = _payload_scalar(payload, field="every", positive=True)
         duration, duration_param = _payload_scalar(payload, field="duration", positive=True)
         before = _protocol_operations_from_payload(payload.get("before"), phase="before")
@@ -1173,7 +1623,7 @@ class InterventionProtocol:
         return InterventionProtocol(
             kind=self.kind,
             name=self.name,
-            start=_resolve_scalar(self.start, self.start_param, parameter_values, field="start"),
+            start=_resolve_scalar(self.start, self.start_param, parameter_values, field="start", nonnegative=True),
             every=_resolve_scalar(self.every, self.every_param, parameter_values, field="every", positive=True),
             duration=_resolve_scalar(
                 self.duration,
@@ -1217,6 +1667,10 @@ def _protocol_operations_from_payload(value: object, *, phase: str) -> tuple[Int
     return tuple(operations)
 
 
+def _protocol_operation_sort_key(operation: InterventionProtocolOperation) -> tuple[str, str, str, bytes]:
+    return (str(operation.phase), str(operation.species), str(operation.op), _sort_payload_bytes(operation))
+
+
 def _parse_protocol_operations(value: str, *, phase: str) -> list[dict[str, Any]]:
     operations: list[dict[str, Any]] = []
     for raw in str(value or "").split("|"):
@@ -1254,8 +1708,44 @@ class InterventionSchedule:
     metadata: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "instant_events", tuple(self.instant_events))
+        object.__setattr__(self, "repeated_events", tuple(self.repeated_events))
+        object.__setattr__(self, "trigger_events", tuple(self.trigger_events))
+        object.__setattr__(self, "intervals", tuple(self.intervals))
+        object.__setattr__(self, "repeated_intervals", tuple(self.repeated_intervals))
+        object.__setattr__(self, "protocols", tuple(self.protocols))
+        object.__setattr__(self, "metadata", _metadata_tuple(self.metadata))
+        for event in self.instant_events:
+            if not isinstance(event, InterventionInstantEvent):
+                raise InterventionScheduleError("instant_events entries must be InterventionInstantEvent.")
+        for event in self.repeated_events:
+            if not isinstance(event, InterventionRepeatedEvent):
+                raise InterventionScheduleError("repeated_events entries must be InterventionRepeatedEvent.")
+        for event in self.trigger_events:
+            if not isinstance(event, InterventionTriggerEvent):
+                raise InterventionScheduleError("trigger_events entries must be InterventionTriggerEvent.")
+        for interval in self.intervals:
+            if not isinstance(interval, InterventionInterval):
+                raise InterventionScheduleError("intervals entries must be InterventionInterval.")
+        for interval in self.repeated_intervals:
+            if not isinstance(interval, InterventionRepeatedInterval):
+                raise InterventionScheduleError("repeated_intervals entries must be InterventionRepeatedInterval.")
+        for protocol in self.protocols:
+            if not isinstance(protocol, InterventionProtocol):
+                raise InterventionScheduleError("protocols entries must be InterventionProtocol.")
+        object.__setattr__(self, "instant_events", tuple(sorted(self.instant_events, key=_instant_sort_key)))
+        object.__setattr__(self, "repeated_events", tuple(sorted(self.repeated_events, key=_repeated_sort_key)))
+        object.__setattr__(self, "trigger_events", tuple(sorted(self.trigger_events, key=_trigger_sort_key)))
+        object.__setattr__(self, "intervals", tuple(sorted(self.intervals, key=_interval_sort_key)))
+        object.__setattr__(
+            self,
+            "repeated_intervals",
+            tuple(sorted(self.repeated_intervals, key=_repeated_interval_sort_key)),
+        )
+        object.__setattr__(self, "protocols", tuple(sorted(self.protocols, key=_protocol_sort_key)))
         if self.metadata and self._has_no_operations():
             raise InterventionScheduleError("Intervention schedule metadata requires at least one intervention.")
+        self._validate_conflicts()
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any] | None) -> "InterventionSchedule":
@@ -1295,15 +1785,14 @@ class InterventionSchedule:
                 raise InterventionScheduleError("protocols entries must be mappings.")
             protocols.append(InterventionProtocol.from_payload(item))
         schedule = cls(
-            instant_events=tuple(sorted(instant_events, key=_instant_sort_key)),
-            repeated_events=tuple(sorted(repeated_events, key=_repeated_sort_key)),
-            trigger_events=tuple(sorted(trigger_events, key=_trigger_sort_key)),
-            intervals=tuple(sorted(intervals, key=_interval_sort_key)),
-            repeated_intervals=tuple(sorted(repeated_intervals, key=_repeated_interval_sort_key)),
-            protocols=tuple(sorted(protocols, key=_protocol_sort_key)),
+            instant_events=tuple(instant_events),
+            repeated_events=tuple(repeated_events),
+            trigger_events=tuple(trigger_events),
+            intervals=tuple(intervals),
+            repeated_intervals=tuple(repeated_intervals),
+            protocols=tuple(protocols),
             metadata=_metadata_from_payload(payload),
         )
-        schedule._validate_conflicts()
         return schedule
 
     def is_empty(self) -> bool:
@@ -1357,7 +1846,6 @@ class InterventionSchedule:
             protocols=tuple(protocol.resolve_parameters(values) for protocol in self.protocols),
             metadata=tuple(self.metadata),
         )
-        schedule._validate_conflicts()
         return schedule
 
     @property
@@ -1458,35 +1946,42 @@ def _format_scalar_identity(value: object) -> str:
     return str(value)
 
 
-def _instant_sort_key(event: InterventionInstantEvent) -> tuple[float, str, int, str]:
+def _sort_payload_bytes(value: object) -> bytes:
+    to_payload = getattr(value, "to_payload", None)
+    if callable(to_payload):
+        return _canonical_json_bytes(to_payload())
+    return _canonical_json_bytes(str(value))
+
+
+def _instant_sort_key(event: InterventionInstantEvent) -> tuple[float, str, int, str, bytes]:
     op_order = {"set": 0, "clear": 0, "remove": 1, "add": 2}
     time = float(event.time) if event.time is not None else math.inf
-    return (time, str(event.species), op_order.get(event.op, 99), str(event.op))
+    return (time, str(event.species), op_order.get(event.op, 99), str(event.op), _sort_payload_bytes(event))
 
 
-def _interval_sort_key(interval: InterventionInterval) -> tuple[float, float, str, str]:
+def _interval_sort_key(interval: InterventionInterval) -> tuple[float, float, str, str, bytes]:
     start = float(interval.start) if interval.start is not None else math.inf
     end = float(interval.end) if interval.end is not None else math.inf
-    return (start, end, str(interval.species), str(interval.kind))
+    return (start, end, str(interval.species), str(interval.kind), _sort_payload_bytes(interval))
 
 
-def _repeated_sort_key(event: InterventionRepeatedEvent) -> tuple[float, str, str]:
+def _repeated_sort_key(event: InterventionRepeatedEvent) -> tuple[float, str, str, bytes]:
     start = float(event.start) if event.start is not None else math.inf
-    return (start, str(event.species), str(event.op))
+    return (start, str(event.species), str(event.op), _sort_payload_bytes(event))
 
 
-def _trigger_sort_key(event: InterventionTriggerEvent) -> tuple[str, str, str, str]:
-    return (str(event.trigger_species), str(event.species), str(event.direction), str(event.op))
+def _trigger_sort_key(event: InterventionTriggerEvent) -> tuple[str, str, str, str, bytes]:
+    return (str(event.trigger_species), str(event.species), str(event.direction), str(event.op), _sort_payload_bytes(event))
 
 
-def _repeated_interval_sort_key(interval: InterventionRepeatedInterval) -> tuple[float, str, str]:
+def _repeated_interval_sort_key(interval: InterventionRepeatedInterval) -> tuple[float, str, str, bytes]:
     start = float(interval.start) if interval.start is not None else math.inf
-    return (start, str(interval.species), str(interval.kind))
+    return (start, str(interval.species), str(interval.kind), _sort_payload_bytes(interval))
 
 
-def _protocol_sort_key(protocol: InterventionProtocol) -> tuple[float, str]:
+def _protocol_sort_key(protocol: InterventionProtocol) -> tuple[float, str, bytes]:
     start = float(protocol.start) if protocol.start is not None else math.inf
-    return (start, str(protocol.name))
+    return (start, str(protocol.name), _sort_payload_bytes(protocol))
 
 
 def _expanded_instant_events(schedule: InterventionSchedule) -> tuple[InterventionInstantEvent, ...]:

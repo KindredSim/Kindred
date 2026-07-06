@@ -1,13 +1,9 @@
 """
-Canonical logging API for Kindred.
+Canonical logging helpers for Kindred internals.
 
-PUBLIC API
-----------
-This is the official logging module for Kindred. All external code should import
-logging functionality from this module (or from `kindred.io` which re-exports it).
-
-**DO NOT** import from `kindred.io.logging_config` directly - that module is for
-internal use only.
+This module is the logging owner used by the GUI entrypoint and internal
+modules. `kindred.io.logging_config` remains a lower-level implementation
+detail.
 
 Features
 --------
@@ -22,7 +18,6 @@ Usage Examples
 Basic logging::
 
     from kindred.io.logging import setup_logging, get_logger
-    # or: from kindred.io import setup_logging, get_logger
 
     setup_logging(level="INFO")
     logger = get_logger(__name__)
@@ -507,7 +502,7 @@ class LazyMessage:
         return str(self.func())
 
 
-# ------------------------------- Public API ------------------------------------
+# ------------------------------- helpers ---------------------------------------
 
 
 def get_logger(name: str) -> logging.Logger:

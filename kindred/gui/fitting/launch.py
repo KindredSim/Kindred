@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 import math
-import os
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -65,11 +64,44 @@ def validate_de_bounds(
     errors = []
 
     method = str(config.get("method", "")).lower()
-    if method not in {"differential_evolution", "de"}:
-        return True, []
-
     parameters = config.get("parameters", {})
     bounds = config.get("bounds", {})
+
+    if method == "lm":
+        bounded_params: List[str] = []
+        for param_name in parameters.keys():
+            bound_tuple = bounds.get(param_name)
+            if not isinstance(bound_tuple, tuple) or len(bound_tuple) != 2:
+                continue
+            try:
+                min_val = float(bound_tuple[0])
+                max_val = float(bound_tuple[1])
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(min_val) or np.isfinite(max_val):
+                bounded_params.append(str(param_name))
+        for dataset_id, spec_map in (dataset_variable_params or {}).items():
+            if not isinstance(spec_map, Mapping):
+                continue
+            for param_name, spec in spec_map.items():
+                if not isinstance(spec, Mapping):
+                    continue
+                try:
+                    min_val = float(spec.get("min"))
+                    max_val = float(spec.get("max"))
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(min_val) or np.isfinite(max_val):
+                    bounded_params.append(f"{dataset_id}::{param_name}")
+        if bounded_params:
+            return False, [
+                "Levenberg-Marquardt fitting does not support finite bounds. "
+                "Use trf or dogbox, or remove bounds for: "
+                + ", ".join(sorted(set(bounded_params)))
+            ]
+
+    if method not in {"differential_evolution", "de"}:
+        return True, []
 
     for param_name in parameters.keys():
         if param_name not in bounds:
@@ -164,9 +196,6 @@ class FittingLaunchSnapshot:
 
 @dataclass(frozen=True)
 class GlobalFitLaunchSettings:
-    solver: str
-    rtol: float
-    atol: float
     runtime_inputs: FittingRuntimeInputs
 
 
@@ -200,9 +229,6 @@ def _coerce_global_fit_launch_settings(raw_settings: object) -> GlobalFitLaunchS
     if not isinstance(raw_settings, GlobalFitLaunchSettings):
         raise RuntimeError("Global Fit launch settings provider must return GlobalFitLaunchSettings.")
     return GlobalFitLaunchSettings(
-        solver=_require_global_fit_launch_solver(raw_settings.solver),
-        rtol=_require_global_fit_positive_finite_float(raw_settings.rtol, "rtol"),
-        atol=_require_global_fit_positive_finite_float(raw_settings.atol, "atol"),
         runtime_inputs=_require_global_fit_runtime_inputs(raw_settings.runtime_inputs),
     )
 
@@ -377,7 +403,6 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
 
     defaults_by_dataset: Dict[str, Dict[str, float]] = {}
     batch_set_names = list(batch_store.set_names()) if batch_store is not None else []
-    running_under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
     for dataset_id in selected_dataset_ids:
         display_name = display_name_by_id.get(str(dataset_id), str(dataset_id))
@@ -395,8 +420,6 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                 title="Global Fit – Set Mapping",
                 skip_label="Cancel",
                 skip_description="Cancel global fit",
-                running_under_pytest=running_under_pytest,
-                pytest_default_action="create",
             )
             if action == "skip":
                 context.set_status("Global fit cancelled")
@@ -444,21 +467,18 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                     except Exception:
                         t0 = float("nan")
                     if not (abs(t0) <= T0_SEED_TOL_S):
-                        if running_under_pytest:
-                            resp2 = QtWidgets.QMessageBox.StandardButton.Ok
-                        else:
-                            resp2 = QtWidgets.QMessageBox.warning(
-                                context.parent,
-                                "Global Fit – Initial Conditions",
-                                (
-                                    f"Dataset '{display_name}' does not start at t\u22480 "
-                                    f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
-                                    "OK: Create set with zeros and continue\n"
-                                    "Cancel: Create set and edit manually (then restart Global Fit)"
-                                ),
-                                QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
-                                QtWidgets.QMessageBox.StandardButton.Ok,
-                            )
+                        resp2 = QtWidgets.QMessageBox.warning(
+                            context.parent,
+                            "Global Fit – Initial Conditions",
+                            (
+                                f"Dataset '{display_name}' does not start at t\u22480 "
+                                f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
+                                "OK: Create set with zeros and continue\n"
+                                "Cancel: Create set and edit manually (then restart Global Fit)"
+                            ),
+                            QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+                            QtWidgets.QMessageBox.StandardButton.Ok,
+                        )
                         if resp2 == QtWidgets.QMessageBox.StandardButton.Cancel:
                             select_batch_set(
                                 batch_store,
@@ -592,27 +612,19 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         mechanism_text_for_run: str,
         param_names_for_run: List[str],
         *,
-        solver: Optional[str] = None,
-        rtol: Optional[float] = None,
-        atol: Optional[float] = None,
+        solver: str,
+        rtol: float,
+        atol: float,
         temperature_K: Optional[float] = None,
         use_sparse_jacobian: Optional[bool] = None,
         wegscheider_cyclicity_enabled: Optional[bool] = None,
     ):
         from kindred.core.simulator.solvers import normalize_solver_name
 
-        solver_label = _require_global_fit_launch_solver(
-            solver if solver is not None else launch_settings.solver
-        )
-        solver_value, _solver_warning = normalize_solver_name(solver_label)
-        rtol_value = _require_global_fit_positive_finite_float(
-            rtol if rtol is not None else launch_settings.rtol,
-            "rtol",
-        )
-        atol_value = _require_global_fit_positive_finite_float(
-            atol if atol is not None else launch_settings.atol,
-            "atol",
-        )
+        solver_label = _require_global_fit_launch_solver(solver)
+        solver_value = normalize_solver_name(solver_label)
+        rtol_value = _require_global_fit_positive_finite_float(rtol, "rtol")
+        atol_value = _require_global_fit_positive_finite_float(atol, "atol")
         evaluator_inputs = launch_settings.runtime_inputs.evaluator
         runtime_settings = FittingEvaluatorRuntimeSettings(
             temperature_K=(

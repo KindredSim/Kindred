@@ -11,8 +11,8 @@ Design notes
 ------------
 - The registry enforces uniqueness and stable declaration order.
 - Renames preserve order.
-- Initial concentrations are real-valued floats (coerced); negative values are allowed
-  by the core model (chemistry may constrain later), but NaN/inf are rejected.
+- Initial concentrations are finite non-negative floats. The core model rejects
+  negative values before simulation, fitting, or export can consume them.
 """
 
 from __future__ import annotations
@@ -36,6 +36,10 @@ class Species:
     name: str
     initial_conc: float
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", validate_name(self.name))
+        object.__setattr__(self, "initial_conc", coerce_float(self.initial_conc))
+
 
 # --- helpers -----------------------------------------------------------------
 
@@ -49,13 +53,15 @@ def coerce_float(value) -> float:
         If the value is not convertible to a finite float.
     """
     try:
-         f = float(value)
-    except (ValueError, TypeError) as e:
-         raise TypeError(f"initial concentration must be a real number, got {value!r}") from e
+        f = float(value)
+    except (ValueError, TypeError, OverflowError) as e:
+        raise TypeError(f"initial concentration must be a real number, got {value!r}") from e
     if not (f == f):  # NaN check without importing math
         raise ValueError("initial concentration cannot be NaN")
     if f in (float("inf"), float("-inf")):
         raise ValueError("initial concentration must be finite")
+    if f < 0.0:
+        raise ValueError("initial concentration must be non-negative")
     return f
 
 
@@ -105,7 +111,7 @@ class SpeciesRegistry:
         n = validate_name(name)
         if n in self._data:
             raise ValueError(f"species {n!r} already exists")
-        sp = Species(n, coerce_float(initial_conc))
+        sp = Species(n, initial_conc)
         self._data[n] = sp
         return sp
 
@@ -147,7 +153,7 @@ class SpeciesRegistry:
         if n not in self._data:
             raise KeyError(f"unknown species {n!r}")
         sp = self._data[n]
-        self._data[n] = replace(sp, initial_conc=coerce_float(initial_conc))
+        self._data[n] = replace(sp, initial_conc=initial_conc)
 
     # --- accessors -----------------------------------------------------------
 

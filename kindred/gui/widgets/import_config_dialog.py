@@ -433,7 +433,6 @@ class ImportConfigDialog(QtWidgets.QDialog):
         for key in (
             "time_column",
             "species_checked",
-            "time_unit",
             "concentration_units",
             "combo_conc_unit",
             "override_no_unit_row",
@@ -446,6 +445,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     merged[key] = value
         if not bool(merged.get("no_unit_row_cb_enabled", False)):
             merged["override_no_unit_row"] = False
+        target_detected_time = merged.get("detected_time_unit")
+        if not bool(merged.get("override_no_unit_row", False)) and target_detected_time:
+            merged["time_unit"] = self._normalize_unit_for_combo(target_detected_time)
+        elif "time_unit" in override_state:
+            merged["time_unit"] = str(override_state.get("time_unit") or "s")
         return merged
 
     def _ensure_sheet_state(self, sheet_name: str) -> dict:
@@ -874,10 +878,16 @@ class ImportConfigDialog(QtWidgets.QDialog):
             else:
                 intent_conc_units[sp] = source_conc_units[sp]
 
+        detected_time_unit = state.get("detected_time_unit")
+        if not override_no_units and detected_time_unit:
+            time_unit = ImportConfigDialog._normalize_unit_for_combo(detected_time_unit)
+        else:
+            time_unit = str(state.get("time_unit", "s")) or "s"
+
         intent = SheetImportIntent(
             time_column=time_col,
             species_columns=species,
-            time_unit=str(state.get("time_unit", "s")) or "s",
+            time_unit=time_unit,
             concentration_units=intent_conc_units,
             override_no_unit_row=override_no_units,
         )

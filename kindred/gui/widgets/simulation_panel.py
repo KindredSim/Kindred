@@ -27,7 +27,7 @@ class SimulationPanel(QtWidgets.QWidget):
         *,
         batch_model: BatchInitialConditionsTableModel,
         message_parent: QtWidgets.QWidget,
-        initial_solver: str,
+        current_solver: str,
         on_add_batch_set: Callable[[], None],
         on_move_selected_batch_sets_up: Callable[[], None],
         on_move_selected_batch_sets_down: Callable[[], None],
@@ -71,7 +71,7 @@ class SimulationPanel(QtWidgets.QWidget):
 
         self.solver_method_combo = QtWidgets.QComboBox(controls_row_widget)
         self.solver_method_combo.addItems(["Radau", "BDF"])
-        solver_name, _warning = normalize_solver_name(initial_solver)
+        solver_name = normalize_solver_name(current_solver)
         self.solver_method_combo.setCurrentText(solver_name)
         self.solver_method_combo.setMaximumWidth(100)
         self.solver_method_combo.currentTextChanged.connect(on_solver_method_changed)

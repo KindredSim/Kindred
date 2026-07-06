@@ -79,7 +79,7 @@ class DatasetFitInfo:
     """Fit statistics for a single dataset within global fit."""
     dataset_id: str  # Identifier for this dataset
     r_squared: float  # Coefficient of determination
-    chi_squared: float  # Reduced chi-squared
+    residual_mse: float  # Raw residual mean square
     rmse: float  # Root mean square error
     mae: float  # Mean absolute error
     residuals: np.ndarray  # Residuals for this dataset
@@ -104,8 +104,8 @@ class GlobalFitResult:
         Dataset-specific parameters {dataset_id: {name: value}}
     uncertainties : dict, optional
         Parameter uncertainties {name: std_dev}
-    global_chi_squared : float
-        Weighted chi-squared across all datasets
+    global_residual_mse : float
+        Raw residual mean square across all datasets
     global_r_squared : float
         Overall R² (weighted by dataset sizes)
     dataset_info : list
@@ -120,7 +120,7 @@ class GlobalFitResult:
     shared_params: Dict[str, float]
     dataset_params: Dict[str, Dict[str, float]]
     uncertainties: Optional[Dict[str, float]]
-    global_chi_squared: float
+    global_residual_mse: float
     global_r_squared: float
     dataset_info: List[DatasetFitInfo]
     nfev: int
@@ -292,7 +292,7 @@ def completion_result_message(
             return f"Global fit failed for dataset '{dataset_id}'."
         return f"Global fit failed for datasets: {', '.join(dataset_ids)}."
     if completion.nonfinite_metrics:
-        return "Final χ² is non-finite; results are invalid."
+        return "Final residual MSE is non-finite; results are invalid."
     if optimizer_diagnostic is not None:
         detail = _compact_failure_message(optimizer_diagnostic.failure)
         if detail:
@@ -410,13 +410,24 @@ def _extract_simulation_payload(simulation: object) -> Tuple[Optional[np.ndarray
 def _align_series(series: np.ndarray, sim_time: Optional[np.ndarray], target_time: np.ndarray) -> np.ndarray:
     """Return model series aligned to the dataset time grid."""
     values = np.asarray(series, dtype=float).reshape(-1)
-    if values.size == target_time.size:
-        return values
     if sim_time is not None and values.size == sim_time.size:
+        sim_t = np.asarray(sim_time, dtype=float).reshape(-1)
+        target_t = np.asarray(target_time, dtype=float).reshape(-1)
+        if sim_t.size == target_t.size and np.allclose(sim_t, target_t, rtol=0.0, atol=1e-12):
+            return values
         return np.interp(target_time, sim_time, values)
+    if sim_time is None:
+        raise ValueError("Simulation output must include time coordinates for fitting alignment.")
     raise ValueError(
-        f"Simulation output has {values.size} points but dataset uses {target_time.size}.",
+        f"Simulation output has {values.size} values but {np.asarray(sim_time).size} time points.",
     )
+
+
+def _objective_dataset_weight_multiplier(weight: float) -> float:
+    value = float(weight)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("Objective dataset weight must be finite and positive.")
+    return float(np.sqrt(value))
 
 
 def _payload_observations(payload: FitDatasetSpec) -> Dict[str, Dict[str, np.ndarray]]:
@@ -1195,9 +1206,11 @@ class GlobalFitObjective:
                     logger.warning("Simulation failed for %s: %s", ds_id, exc)
                 for species_name in species_list:
                     target_weight = float(target_multipliers.get(species_name, 1.0))
+                    dataset_weight = _objective_dataset_weight_multiplier(weight)
                     y_exp = np.asarray(observations[species_name]["y"], dtype=float).reshape(-1)
                     all_residuals.extend(
-                        (float(weight) * float(target_weight) * self._penalty_value) * np.ones_like(y_exp, dtype=float)
+                        (float(dataset_weight) * float(target_weight) * self._penalty_value)
+                        * np.ones_like(y_exp, dtype=float)
                     )
                 if x_name != "t" and x_mode in ("auto", "time_guided"):
                     for species_name in species_list:
@@ -1209,8 +1222,9 @@ class GlobalFitObjective:
                         if species_x_obs.size == 0:
                             continue
                         target_weight = float(target_multipliers.get(species_name, 1.0))
+                        dataset_weight = _objective_dataset_weight_multiplier(weight)
                         all_residuals.extend(
-                            (float(weight) * float(target_weight) * self._penalty_value)
+                            (float(dataset_weight) * float(target_weight) * self._penalty_value)
                             * np.ones_like(species_x_obs, dtype=float)
                         )
                 continue
@@ -1231,7 +1245,7 @@ class GlobalFitObjective:
                     else None
                 )
                 target_weight = float(target_multipliers.get(str(species_name), 1.0))
-                effective_weight = float(weight) * float(target_weight)
+                effective_weight = _objective_dataset_weight_multiplier(weight) * float(target_weight)
                 model_series = sim_species.get(species_name)
                 if model_series is None:
                     err = FitSimulationError(
@@ -1720,7 +1734,7 @@ def assemble_global_fit_result(
         ss_tot = float(np.sum((y_exp_all - float(np.mean(y_exp_all)))**2)) if y_exp_all.size else 0.0
 
         r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-        chi_squared = ss_res / residuals.size if residuals.size else float(penalty_value**2)
+        residual_mse = ss_res / residuals.size if residuals.size else float(penalty_value**2)
         rmse = np.sqrt(np.mean(residuals**2)) if residuals.size else float(penalty_value)
         mae = np.mean(np.abs(residuals)) if residuals.size else float(penalty_value)
 
@@ -1733,7 +1747,7 @@ def assemble_global_fit_result(
             DatasetFitInfo(
                 dataset_id=ds_id,
                 r_squared=r_squared,
-                chi_squared=chi_squared,
+                residual_mse=residual_mse,
                 rmse=rmse,
                 mae=mae,
                 residuals=residuals,
@@ -1750,19 +1764,11 @@ def assemble_global_fit_result(
         total_ss_tot += ss_tot
         total_points += int(residuals.size)
 
-    global_ss_res = total_ss_res
-    global_points = total_points
-    if objective_residuals is not None:
-        objective_vector = np.asarray(objective_residuals, dtype=float).reshape(-1)
-        if objective_vector.size:
-            global_ss_res = float(np.sum(objective_vector**2))
-            global_points = int(objective_vector.size)
-
-    global_r_squared = 1.0 - (global_ss_res / total_ss_tot) if total_ss_tot > 0 else 0.0
-    global_chi_squared = global_ss_res / global_points if global_points > 0 else float(penalty_value**2)
+    global_r_squared = 1.0 - (total_ss_res / total_ss_tot) if total_ss_tot > 0 else 0.0
+    global_residual_mse = total_ss_res / total_points if total_points > 0 else float(penalty_value**2)
 
     metrics_finite = bool(
-        np.isfinite(global_ss_res) and np.isfinite(global_r_squared) and np.isfinite(global_chi_squared)
+        np.isfinite(total_ss_res) and np.isfinite(global_r_squared) and np.isfinite(global_residual_mse)
     )
     optimizer_converged = bool(success)
     completion_optimizer_diagnostic = optimizer_diagnostic
@@ -1770,6 +1776,14 @@ def assemble_global_fit_result(
         optimizer_converged
         and metrics_finite
         and not final_dataset_failures
+        and completion_optimizer_diagnostic is not None
+        and not bool(
+            (
+                completion_optimizer_diagnostic.failure.get("details", {})
+                if isinstance(completion_optimizer_diagnostic.failure, Mapping)
+                else {}
+            ).get("final_report_warning")
+        )
     ):
         completion_optimizer_diagnostic = None
     if final_dataset_failures or not metrics_finite:
@@ -1786,7 +1800,7 @@ def assemble_global_fit_result(
         if completion_status == "fail" and (not metrics_finite) and not final_dataset_failures:
             completion_optimizer_diagnostic = ensure_failure_diagnostic(
                 completion_optimizer_diagnostic,
-                message="Final χ² is non-finite; results are invalid.",
+                message="Final residual MSE is non-finite; results are invalid.",
             )
         completion_detail_sections = build_completion_detail_sections(
             status=completion_status,
@@ -1812,13 +1826,13 @@ def assemble_global_fit_result(
     )
 
     if completion.status == "ok":
-        logger.info("Global fit complete: R²=%.4f, χ²=%.4e", global_r_squared, global_chi_squared)
+        logger.info("Global fit complete: R²=%.4f, residual MSE=%.4e", global_r_squared, global_residual_mse)
     elif completion.status == "warn":
         logger.warning("Global fit complete with warnings: %s", completion_message)
     else:
         logger.warning(
-            "Global fit failed: χ²=%.4e datasets_failed=%s",
-            global_chi_squared,
+            "Global fit failed: residual MSE=%.4e datasets_failed=%s",
+            global_residual_mse,
             ",".join(sorted(final_dataset_failures.keys())),
         )
     for info in dataset_info:
@@ -1828,7 +1842,7 @@ def assemble_global_fit_result(
         shared_params=fitted_params,
         dataset_params=combined_dataset_params,
         uncertainties=uncertainties,
-        global_chi_squared=global_chi_squared,
+        global_residual_mse=global_residual_mse,
         global_r_squared=global_r_squared,
         dataset_info=dataset_info,
         nfev=nfev,

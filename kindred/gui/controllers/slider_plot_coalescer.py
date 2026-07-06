@@ -12,6 +12,7 @@ from kindred.gui.ports import FreshPreviewDisplayEntry
 class PendingSliderPlotUpdate:
     set_ids: Set[str] = field(default_factory=set)
     target_set_ids: tuple[str, ...] = ()
+    semantic_unavailable_set_ids: tuple[str, ...] = ()
     cache_key: Optional[str] = None
     cache_kind: Optional[str] = None
     request_id: Optional[int] = None
@@ -55,15 +56,20 @@ class SliderPlotCoalescer(QtCore.QObject):
     ) -> None:
         """Restore a pending update for a later flush.
 
-        Preview display is only valid once all targeted fresh-preview entries
-        have arrived.  The controller uses this to avoid publishing an older
-        cached display for a partially completed preview batch.
+        Preview display is only valid once all targeted preview outcomes have
+        arrived.  The controller uses this to avoid publishing an older cached
+        display for a partially completed preview batch.
         """
         if self.timer.isActive():
             self.timer.stop()
         self.pending = PendingSliderPlotUpdate(
             set_ids=set(pending.set_ids),
             target_set_ids=tuple(pending.target_set_ids or ()),
+            semantic_unavailable_set_ids=tuple(
+                str(set_id)
+                for set_id in (pending.semantic_unavailable_set_ids or ())
+                if str(set_id)
+            ),
             cache_key=pending.cache_key,
             cache_kind=pending.cache_kind,
             request_id=pending.request_id,
@@ -94,6 +100,7 @@ class SliderPlotCoalescer(QtCore.QObject):
         latest_request_id: int,
         valid_set_ids: Optional[Sequence[str]],
         fresh_preview_entry: Optional[FreshPreviewDisplayEntry],
+        semantic_unavailable_set_ids: Sequence[str],
         active_run_id: int,
         record_nonfatal_exception: Callable[[str, BaseException], None],
     ) -> None:
@@ -156,6 +163,18 @@ class SliderPlotCoalescer(QtCore.QObject):
             fresh_set_id = str(fresh_preview_entry.set_id or sid).strip()
             if fresh_set_id:
                 self.pending.fresh_preview_entries[fresh_set_id] = fresh_preview_entry
+        semantic_unavailable_ids = tuple(
+            str(set_id).strip()
+            for set_id in (semantic_unavailable_set_ids or ())
+            if str(set_id).strip()
+        )
+        if semantic_unavailable_ids:
+            self.pending.semantic_unavailable_set_ids = tuple(
+                dict.fromkeys((
+                    *self.pending.semantic_unavailable_set_ids,
+                    *semantic_unavailable_ids,
+                ))
+            )
         if incoming_cache_kind == "preview":
             self.pending.target_set_ids = normalized_targets
         else:
@@ -214,6 +233,7 @@ class SliderPlotCoalescer(QtCore.QObject):
             accepted_preview_owner_epoch=self.pending.accepted_preview_owner_epoch,
             valid_set_ids=self.pending.valid_set_ids,
             fresh_preview_entries=dict(self.pending.fresh_preview_entries),
+            semantic_unavailable_set_ids=tuple(self.pending.semantic_unavailable_set_ids),
         )
         self.pending = PendingSliderPlotUpdate()
         return pending

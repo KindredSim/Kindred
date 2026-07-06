@@ -12,7 +12,7 @@ Error Categories
 - **Validation**: Input validation failures (E200-E299)
 - **Simulation**: Runtime simulation errors (E300-E399)
 - **Fitting**: Parameter estimation errors (E400-E499)
-- **Configuration**: Settings and profile errors (E500-E599)
+- **Configuration**: Settings errors (E500-E599)
 - **Integration**: System integration errors (E600-E699)
 - **IO**: File and data handling errors (E700-E799)
 """
@@ -48,7 +48,6 @@ __all__ = [
     "DataMismatchError",
     # Configuration
     "ConfigurationError",
-    "ProfileError",
     "SettingsError",
     # Integration
     "IntegrationFailureError",
@@ -331,13 +330,6 @@ class ConfigurationError(KindredError):
     """Base class for configuration errors (E500-E599)."""
     def __init__(self, message: str, **kwargs):
         kwargs.setdefault("code", "E500")
-        super().__init__(message, **kwargs)
-
-
-class ProfileError(ConfigurationError):
-    """Error loading or applying configuration profiles."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E501")
         super().__init__(message, **kwargs)
 
 

@@ -239,13 +239,8 @@ def prompt_dataset_batch_mapping_choice(
     title: str,
     skip_label: str,
     skip_description: str,
-    running_under_pytest: bool = False,
-    pytest_default_action: str = "create",
     include_create_all: bool = False,
 ) -> str:
-    if running_under_pytest:
-        return str(pytest_default_action)
-
     box = QtWidgets.QMessageBox(parent)
     box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
     box.setWindowTitle(str(title))

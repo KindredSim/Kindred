@@ -18,8 +18,6 @@ class BatchCacheEntryV1(TypedDict):
     simulation_identity: Dict[str, Any]
     solver_config: Dict[str, Any]
     preview_batch_cache_token: str
-    fallback_occurred: bool
-    fallback_message: Any
     solver_provenance: Dict[str, Any]
     warnings: list[dict[str, Any]]
     completion_provenance: NotRequired[Dict[str, Any]]
@@ -39,7 +37,7 @@ class PlotOverlayEntryV1(TypedDict):
 
 @dataclass(frozen=True, slots=True)
 class BatchCacheEntryReadResult:
-    state: Literal["valid", "missing", "invalid"]
+    state: Literal["valid", "missing", "invalid", "identity_unavailable"]
     entry: Optional[BatchCacheEntryV1] = None
 
 
@@ -109,8 +107,6 @@ def build_batch_cache_entry(
     simulation_identity: Mapping[str, Any] | SimulationIdentity | None = None,
     solver_config: Optional[Mapping[str, Any]] = None,
     preview_batch_cache_token: Optional[str] = None,
-    fallback_occurred: bool = False,
-    fallback_message: Any = None,
     solver_provenance: Optional[Mapping[str, Any]] = None,
     warnings: Optional[Sequence[Mapping[str, Any]]] = None,
     completion_provenance: Optional[Mapping[str, Any]] = None,
@@ -126,6 +122,8 @@ def build_batch_cache_entry(
             scalars[str(k)] = float(scalar_value)
 
     identity = coerce_simulation_identity(simulation_identity)
+    if identity is None:
+        raise TypeError("simulation_identity is required")
 
     entry: BatchCacheEntryV1 = {
         "version": 1,
@@ -134,11 +132,9 @@ def build_batch_cache_entry(
         "algebra_scalars": scalars,
         "mechanism": mechanism,
         "mechanism_text": str(mechanism_text or ""),
-        "simulation_identity": identity.to_payload() if identity is not None else {},
+        "simulation_identity": identity.to_payload(),
         "solver_config": dict(solver_config or {}),
         "preview_batch_cache_token": str(preview_batch_cache_token or ""),
-        "fallback_occurred": bool(fallback_occurred),
-        "fallback_message": fallback_message,
         "solver_provenance": dict(solver_provenance or {}),
         "warnings": [dict(item) for item in (warnings or []) if isinstance(item, Mapping)],
     }
@@ -190,8 +186,6 @@ def read_batch_cache_entry(
             simulation_identity=cast(Optional[Mapping[str, Any]], payload.get("simulation_identity")),
             solver_config=cast(Optional[Mapping[str, Any]], payload.get("solver_config")),
             preview_batch_cache_token=cast(Optional[str], payload.get("preview_batch_cache_token")),
-            fallback_occurred=bool(payload.get("fallback_occurred")),
-            fallback_message=payload.get("fallback_message"),
             solver_provenance=cast(Optional[Mapping[str, Any]], payload.get("solver_provenance")),
             warnings=cast(Optional[Sequence[Mapping[str, Any]]], payload.get("warnings")),
             completion_provenance=cast(Optional[Mapping[str, Any]], completion_provenance),

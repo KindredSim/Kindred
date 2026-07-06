@@ -18,7 +18,6 @@ __all__ = [
     "make_bounded_label",
     "make_compact_label",
     "make_placeholder_label",
-    "make_pyqtgraph_fallback_widget",
     "make_scroll_area",
     "safe_float_parse",
     "set_bounded_label_text",
@@ -29,12 +28,6 @@ __all__ = [
 
 _PLACEHOLDER_LABEL_STYLE = (
     "QLabel { font-style: italic; background: transparent; padding: 0px; }"
-)
-_PYQTGRAPH_FALLBACK_LABEL_STYLE = "QLabel { font-weight: bold; font-size: 14px; }"
-_DEFAULT_PYQTGRAPH_FALLBACK_TEXT = (
-    "⚠️ PyQtGraph not available\n\n"
-    "Install with: pip install pyqtgraph\n\n"
-    "Plotting features require PyQtGraph."
 )
 DEFAULT_DYNAMIC_LABEL_MAX_WIDTH = 220
 DEFAULT_COMPACT_LABEL_MAX_CHARS = DATASET_LIST_LABEL_MAX_CHARS
@@ -155,17 +148,6 @@ def make_compact_label(
     label = QtWidgets.QLabel("", parent)
     set_compact_label_text(label, str(text), max_chars=max_chars, max_width=max_width, tooltip=tooltip)
     return label
-
-
-def make_pyqtgraph_fallback_widget(
-    parent: Optional[QtWidgets.QWidget] = None,
-    *,
-    text: Optional[str] = None,
-) -> QtWidgets.QWidget:
-    warning = QtWidgets.QLabel(_DEFAULT_PYQTGRAPH_FALLBACK_TEXT if text is None else str(text), parent)
-    warning.setAlignment(QtCore.Qt.AlignCenter)
-    warning.setStyleSheet(_PYQTGRAPH_FALLBACK_LABEL_STYLE)
-    return warning
 
 
 def safe_float_parse(val_str: str, default: float) -> float:

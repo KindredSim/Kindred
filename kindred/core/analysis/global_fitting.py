@@ -27,6 +27,7 @@ from kindred.core.analysis.global_fit_execution import (
     assemble_global_fit_result,
     build_dataset_payloads,
     build_completion_detail_sections,
+    build_fit_diagnostic_from_failure,
     build_fit_diagnostic_from_exception,
     build_parameter_layout,
     ensure_failure_diagnostic,
@@ -39,6 +40,7 @@ from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.fitting_evaluation import SerialFittingEvaluator, coerce_fitting_series_evaluator
 from kindred.core.fitting_runtime_session import FittingRuntimeSession
 from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
+from kindred.core.simulation_failure import build_simulation_failure
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +279,7 @@ def fit_global(
             shared_params=shared_snapshot,
             dataset_params=dataset_snapshot,
             uncertainties=None,
-            global_chi_squared=np.inf,
+            global_residual_mse=np.inf,
             global_r_squared=0.0,
             dataset_info=[],
             nfev=int(getattr(objective_impl, "_iteration", 0)),
@@ -356,6 +358,16 @@ def fit_global(
         covariance = fit_result.covariance
         objective_residuals = np.asarray(fit_result.residuals, dtype=float).reshape(-1)
         optimizer_diagnostic: Optional[FitDiagnostic] = None
+        identifiability_warning = str(getattr(fit_result, "identifiability_warning", "") or "").strip()
+        if identifiability_warning:
+            optimizer_diagnostic = build_fit_diagnostic_from_failure(
+                build_simulation_failure(
+                    kind="fitting_identifiability",
+                    message=identifiability_warning,
+                    details={"final_report_warning": True},
+                ),
+                phase="optimizer",
+            )
 
         if getattr(objective_wrapper, "last_error", None) is not None:
             ds_tag = None

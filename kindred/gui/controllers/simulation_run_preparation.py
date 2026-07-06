@@ -42,6 +42,10 @@ class _RuntimeParameterValuesUnavailableForReadiness(ValueError):
     pass
 
 
+class _SimulationIdentityUnavailableForReadiness(ValueError):
+    pass
+
+
 __all__ = [
     "RunDispatchContext",
     "RunMechanismContext",
@@ -134,17 +138,16 @@ class SimulationRunPreparationDependencies:
 
 def build_fast_preview_solver_grid_context(
     *,
-    initial_solver_name: Optional[str],
+    current_solver_name: Optional[str],
     num_points: int,
     fast_mode: bool,
     slider_points_override: Optional[int],
     slider_solver_override: Optional[str],
-    slider_drag_active: bool,
 ) -> Dict[str, Any]:
     from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
 
-    solver_label = str(initial_solver_name or DEFAULT_SOLVER_NAME).strip() or DEFAULT_SOLVER_NAME
-    solver, solver_warning = normalize_solver_name(solver_label)
+    solver_input = str(current_solver_name or DEFAULT_SOLVER_NAME).strip() or DEFAULT_SOLVER_NAME
+    solver = normalize_solver_name(solver_input)
     n_points = int(num_points)
 
     if fast_mode:
@@ -153,13 +156,11 @@ def build_fast_preview_solver_grid_context(
         else:
             n_points = max(50, n_points)
         if slider_solver_override is not None:
-            solver_label = str(slider_solver_override).strip() or solver_label
-            solver, solver_warning = normalize_solver_name(solver_label)
+            solver_input = str(slider_solver_override).strip() or solver_input
+            solver = normalize_solver_name(solver_input)
 
     return {
         "solver": str(solver),
-        "solver_label": str(solver_label),
-        "solver_warning": str(solver_warning) if solver_warning else None,
         "grid": {"N": int(n_points)},
     }
 
@@ -524,24 +525,15 @@ class SimulationRunSolverPreparationOwner:
         mechanism_context: RunMechanismContext,
     ) -> RunSolverContext | None:
         solver_grid_context = build_fast_preview_solver_grid_context(
-            initial_solver_name=self._ports.solver.initial_solver_name(),
+            current_solver_name=self._ports.solver.current_solver_name(),
             num_points=int(self._ports.solver.num_points_spinbox_value()),
             fast_mode=bool(fast_mode),
             slider_points_override=self._ports.mechanism.mechanism_slider_points_value(),
             slider_solver_override=self._ports.mechanism.mechanism_slider_solver_value(),
-            slider_drag_active=bool(self._ports.slider.slider_drag_active()),
         )
-        solver_label = str(solver_grid_context.get("solver_label") or "")
         solver = str(solver_grid_context.get("solver") or "")
-        solver_warning = solver_grid_context.get("solver_warning")
-        if solver_warning and not bool(runtime_readiness_only):
-            logger.warning("Solver normalization: %s (requested=%r)", solver_warning, solver_label)
-            try:
-                self._ports.run_ui.set_status_text(str(solver_warning))
-            except Exception:
-                pass
-        rtol = self._ports.solver.initial_rtol() or 1e-6
-        atol = self._ports.solver.initial_atol() or 1e-12
+        rtol = self._ports.solver.current_rtol() or 1e-6
+        atol = self._ports.solver.current_atol() or 1e-12
         temperature_K = float(self._ports.solver.temperature_spinbox_value())
         T_override = self._ports.solver.dsl_global_temperature_K(mechanism_context.full_dsl)
         if T_override is not None:
@@ -569,8 +561,6 @@ class SimulationRunSolverPreparationOwner:
 
         solver_config = {
             "solver": solver,
-            "solver_label": solver_label,
-            "solver_warning": str(solver_warning) if solver_warning else None,
             "rtol": rtol,
             "atol": atol,
             "grid": {"N": n_points},
@@ -633,15 +623,6 @@ class SimulationRunDispatchPreparationOwner:
         mechanism_text_by_set_id: Dict[str, str] = {}
         mechanism_signature_by_set_id: Dict[str, str] = {}
         preview_batch_cache_token_by_set_id: Dict[str, str] = {}
-        for index, set_id in enumerate(mechanism_context.queue_ids):
-            token = ""
-            if bool(fast_mode) and index < len(mechanism_context.batch_rows):
-                try:
-                    token = self._ports.slider.preview_batch_cache_token([int(mechanism_context.batch_rows[index])])
-                except Exception:
-                    token = ""
-            preview_batch_cache_token_by_set_id[str(set_id)] = str(token or "")
-
         simulation_identity_by_set_id: Dict[str, Dict[str, Any]] = {}
         initials_by_set_id: Dict[str, Dict[str, Any]] = {}
         intervention_schedule_by_set_id: Dict[str, Dict[str, Any]] = {}
@@ -653,14 +634,7 @@ class SimulationRunDispatchPreparationOwner:
         class _RuntimeParameterValuesUnavailable(RuntimeError):
             pass
 
-        def _abort_invalid_intervention_schedule(set_id_s: str, exc: BaseException) -> None:
-            if bool(runtime_readiness_only):
-                raise ValueError(f"Invalid intervention schedule for set {set_id_s!r}: {exc}") from exc
-            self._deps.record_nonfatal_exception("Failed to parse intervention schedule for run plan", exc)
-            self._ports.dialogs.message_box_warning(
-                "Invalid Intervention Schedule",
-                f"Fix intervention schedule directives before running:\n\n{exc}",
-            )
+        def _abort_run_preflight(*, fast_mode: bool) -> None:
             if bool(fast_mode):
                 self._deps.clear_failed_fast_preview_ownership()
             self._deps.set_simulation_running(False)
@@ -670,6 +644,41 @@ class SimulationRunDispatchPreparationOwner:
             self._deps.clear_slider_triggered_preflight_state(fast_mode=bool(fast_mode))
             if not bool(fast_mode):
                 self._deps.requeue_preserved_pending_slider_replay_after_preflight_abort()
+
+        def _abort_invalid_intervention_schedule(set_id_s: str, exc: BaseException) -> None:
+            if bool(runtime_readiness_only):
+                raise ValueError(f"Invalid intervention schedule for set {set_id_s!r}: {exc}") from exc
+            self._deps.record_nonfatal_exception("Failed to parse intervention schedule for run plan", exc)
+            self._ports.dialogs.message_box_warning(
+                "Invalid Intervention Schedule",
+                f"Fix intervention schedule directives before running:\n\n{exc}",
+            )
+            _abort_run_preflight(fast_mode=bool(fast_mode))
+
+        def _abort_simulation_identity_unavailable(set_id_s: str, exc: BaseException) -> None:
+            if bool(runtime_readiness_only):
+                raise _SimulationIdentityUnavailableForReadiness(
+                    f"Simulation identity unavailable for set {set_id_s!r}: {exc}"
+                ) from exc
+            self._deps.record_nonfatal_exception(
+                f"Failed to build simulation identity for set {set_id_s!r}",
+                exc,
+            )
+            self._ports.dialogs.message_box_warning(
+                "Simulation Identity Unavailable",
+                f"Runtime identity for set {set_id_s!r} could not be built before running:\n\n{exc}",
+            )
+            _abort_run_preflight(fast_mode=bool(fast_mode))
+
+        def _preview_batch_cache_token_for_set(index: int) -> str:
+            if (not bool(fast_mode)) or index >= len(mechanism_context.batch_rows):
+                return ""
+            return str(
+                self._ports.slider.preview_batch_cache_token(
+                    [int(mechanism_context.batch_rows[index])]
+                )
+                or ""
+            )
 
         def _abort_runtime_parameter_values_unavailable(set_id_s: str, exc: BaseException) -> None:
             if bool(runtime_readiness_only):
@@ -681,15 +690,7 @@ class SimulationRunDispatchPreparationOwner:
                 "Runtime Parameters Unavailable",
                 f"Runtime parameter values for set {set_id_s!r} could not be read before running:\n\n{exc}",
             )
-            if bool(fast_mode):
-                self._deps.clear_failed_fast_preview_ownership()
-            self._deps.set_simulation_running(False)
-            self._ports.run_ui.set_run_button_enabled(True)
-            self._ports.run_ui.set_stop_button_enabled(False)
-            self._deps.set_slider_simulation_active(False)
-            self._deps.clear_slider_triggered_preflight_state(fast_mode=bool(fast_mode))
-            if not bool(fast_mode):
-                self._deps.requeue_preserved_pending_slider_replay_after_preflight_abort()
+            _abort_run_preflight(fast_mode=bool(fast_mode))
 
         def _coerce_runtime_value_mapping(
             raw_values: object,
@@ -756,6 +757,11 @@ class SimulationRunDispatchPreparationOwner:
 
         for index, set_id in enumerate(mechanism_context.queue_ids):
             set_id_s = str(set_id)
+            try:
+                preview_batch_cache_token_by_set_id[set_id_s] = _preview_batch_cache_token_for_set(index)
+            except Exception as exc:
+                _abort_simulation_identity_unavailable(set_id_s, exc)
+                return None
             if index >= len(mechanism_context.batch_rows):
                 try:
                     prepared_execution_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id_s)
@@ -775,6 +781,13 @@ class SimulationRunDispatchPreparationOwner:
                         ),
                         parameter_overrides=runtime_parameter_overrides or None,
                     )
+                except _RuntimeParameterValuesUnavailable as exc:
+                    _abort_runtime_parameter_values_unavailable(set_id_s, exc)
+                    return None
+                except Exception as exc:
+                    _abort_invalid_intervention_schedule(set_id_s, exc)
+                    return None
+                try:
                     identity = self._deps.simulation_identity_for_set(
                         set_id=set_id_s,
                         solver_config=solver_context.solver_config,
@@ -788,13 +801,10 @@ class SimulationRunDispatchPreparationOwner:
                         ),
                         fast_mode=bool(fast_mode),
                     )
-                except _RuntimeParameterValuesUnavailable as exc:
-                    _abort_runtime_parameter_values_unavailable(set_id_s, exc)
-                    return None
+                    identity_payload = identity.to_payload()
                 except Exception as exc:
-                    _abort_invalid_intervention_schedule(set_id_s, exc)
+                    _abort_simulation_identity_unavailable(set_id_s, exc)
                     return None
-                identity_payload = identity.to_payload()
                 if intervention_schedule_payload is not None:
                     intervention_schedule_by_set_id[set_id_s] = dict(intervention_schedule_payload)
                 simulation_identity_by_set_id[set_id_s] = identity_payload
@@ -882,6 +892,13 @@ class SimulationRunDispatchPreparationOwner:
                     ),
                     parameter_overrides=runtime_parameter_overrides or None,
                 )
+            except _RuntimeParameterValuesUnavailable as exc:
+                _abort_runtime_parameter_values_unavailable(set_id_s, exc)
+                return None
+            except Exception as exc:
+                _abort_invalid_intervention_schedule(set_id_s, exc)
+                return None
+            try:
                 identity = self._deps.simulation_identity_for_set(
                     set_id=set_id_s,
                     solver_config=solver_context.solver_config,
@@ -896,13 +913,10 @@ class SimulationRunDispatchPreparationOwner:
                     ),
                     fast_mode=bool(fast_mode),
                 )
-            except _RuntimeParameterValuesUnavailable as exc:
-                _abort_runtime_parameter_values_unavailable(set_id_s, exc)
-                return None
+                identity_payload = identity.to_payload()
             except Exception as exc:
-                _abort_invalid_intervention_schedule(set_id_s, exc)
+                _abort_simulation_identity_unavailable(set_id_s, exc)
                 return None
-            identity_payload = identity.to_payload()
             if intervention_schedule_payload is not None:
                 intervention_schedule_by_set_id[set_id_s] = dict(intervention_schedule_payload)
             simulation_identity_by_set_id[set_id_s] = identity_payload
@@ -917,16 +931,10 @@ class SimulationRunDispatchPreparationOwner:
                         mechanism_text=str(request_mechanism_text),
                         temperature_K=solver_temperature_K,
                         use_sparse_jacobian=bool(
-                            solver_context.solver_config.get(
-                                "use_sparse_jacobian",
-                                PROJECT_DEFAULTS["use_sparse_jacobian"],
-                            )
+                            solver_context.solver_config["use_sparse_jacobian"]
                         ),
                         wegscheider_cyclicity_enabled=bool(
-                            solver_context.solver_config.get(
-                                "wegscheider_cyclicity_enabled",
-                                PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
-                            )
+                            solver_context.solver_config["wegscheider_cyclicity_enabled"]
                         ),
                     )
                 else:
@@ -1144,6 +1152,22 @@ class SimulationRunPreparationOwner:
                     source="dispatch",
                     code="runtime_parameters_unavailable",
                     message=f"Runtime Parameters Unavailable: {exc}",
+                    rows=tuple(rows),
+                    set_ids=tuple(mechanism_context.queue_ids),
+                    retryable=True,
+                ),
+            )
+        except _SimulationIdentityUnavailableForReadiness as exc:
+            if bool(fast_mode):
+                self._deps.clear_failed_fast_preview_ownership()
+                self._deps.set_slider_simulation_active(False)
+                self._deps.clear_slider_triggered_preflight_state(fast_mode=True)
+            return self._blocked_prepared_request_set(
+                intent=intent,
+                blocked_reason=RuntimePreparationBlockedReason(
+                    source="dispatch",
+                    code="simulation_identity_unavailable",
+                    message=f"Simulation Identity Unavailable: {exc}",
                     rows=tuple(rows),
                     set_ids=tuple(mechanism_context.queue_ids),
                     retryable=True,
@@ -1382,6 +1406,10 @@ class SimulationRunPreparationOwner:
             plan_payload = dispatch_context.simulation_plan_by_set_id.get(set_id)
             if not isinstance(plan_payload, Mapping):
                 continue
+            simulation_identity = dispatch_context.simulation_identity_by_set_id.get(set_id)
+            if not isinstance(simulation_identity, Mapping) or not simulation_identity:
+                raise ValueError(f"Missing submitted simulation identity for set {set_id!r}.")
+            simulation_identity_payload = dict(simulation_identity)
             parameter_overrides = {}
             prepared_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id)
             if isinstance(prepared_payload, Mapping):
@@ -1412,7 +1440,7 @@ class SimulationRunPreparationOwner:
                 "cache_key": str(dispatch_context.cache_key),
                 "mechanism_text": str(dispatch_context.mechanism_text_by_set_id.get(set_id) or ""),
                 "mechanism_signature": str(dispatch_context.mechanism_signature_by_set_id.get(set_id) or ""),
-                "simulation_identity": dict(dispatch_context.simulation_identity_by_set_id.get(set_id) or {}),
+                "simulation_identity": simulation_identity_payload,
                 "owned_species": list(owned_species),
                 "preview_batch_cache_token": preview_batch_cache_token,
                 "plan_payload": dict(plan_payload),
@@ -1443,7 +1471,7 @@ class SimulationRunPreparationOwner:
                     set_label=str(set_labels_by_row.get(int(row)) or set_id),
                     mechanism_text=str(dispatch_context.mechanism_text_by_set_id.get(set_id) or ""),
                     mechanism_signature=str(dispatch_context.mechanism_signature_by_set_id.get(set_id) or ""),
-                    simulation_identity=dict(dispatch_context.simulation_identity_by_set_id.get(set_id) or {}),
+                    simulation_identity=simulation_identity_payload,
                     owned_species=owned_species,
                     preview_batch_cache_token=preview_batch_cache_token,
                 )

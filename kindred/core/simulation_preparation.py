@@ -26,6 +26,7 @@ from kindred.core.mechanism_metadata import (
     MechanismMetadataView,
 )
 from kindred.core.temperature import TemperatureScheduleProtocol, coerce_temperature_schedule
+from kindred.core.time_grid import normalize_time_grid_policy
 from kindred.core.intervention_schedule import (
     InterventionSchedule,
     InterventionScheduleError,
@@ -458,7 +459,6 @@ class PreparedSimulationRun:
     y0: np.ndarray
     species_names: List[str]
     solver_input: str
-    solver_warning: Optional[str]
     temperature_schedule: TemperatureScheduleProtocol | None
     intervention_schedule: InterventionSchedule | None
     jacobian_func: Any
@@ -546,7 +546,6 @@ class PreparedSimulationMetadata:
     temperature_K: float
     solver_requested: str
     solver_normalized: str
-    solver_warning: Optional[str]
     rtol: float
     atol: float
     use_sparse_jacobian: bool
@@ -587,7 +586,6 @@ class PreparedSimulationMetadata:
             "temperature_K": float(self.temperature_K),
             "solver_requested": str(self.solver_requested),
             "solver_normalized": str(self.solver_normalized),
-            "solver_warning": str(self.solver_warning) if self.solver_warning else None,
             "rtol": float(self.rtol),
             "atol": float(self.atol),
             "use_sparse_jacobian": bool(self.use_sparse_jacobian),
@@ -623,18 +621,12 @@ class PreparedSimulationMetadata:
         param_names_raw = meta.get("param_names") or []
         if not isinstance(param_names_raw, (list, tuple)):
             param_names_raw = []
-        solver_requested = str(
-            meta.get("solver_requested")
-            or meta.get("solver_input")
-            or meta.get("solver")
-            or ""
-        ).strip()
-        solver_normalized = str(
-            meta.get("solver_normalized")
-            or meta.get("solver_used")
-            or meta.get("solver")
-            or ""
-        ).strip()
+        if "solver_requested" not in meta:
+            raise KeyError("solver_requested")
+        if "solver_normalized" not in meta:
+            raise KeyError("solver_normalized")
+        solver_requested = str(meta.get("solver_requested") or "").strip()
+        solver_normalized = str(meta.get("solver_normalized") or "").strip()
         return cls(
             version=int(meta.get("version") or 1),
             mechanism_text_sha256=str(meta.get("mechanism_text_sha256") or ""),
@@ -645,7 +637,6 @@ class PreparedSimulationMetadata:
             temperature_K=float(meta.get("temperature_K") or 0.0),
             solver_requested=solver_requested,
             solver_normalized=solver_normalized,
-            solver_warning=str(meta.get("solver_warning")) if meta.get("solver_warning") else None,
             rtol=float(meta.get("rtol") or 0.0),
             atol=float(meta.get("atol") or 0.0),
             use_sparse_jacobian=bool(
@@ -1247,7 +1238,6 @@ def coerce_prepared_simulation_metadata(
 class _PreparedSolverConfig:
     solver_input: str
     solver: str
-    solver_warning: Optional[str]
     rtol: float
     atol: float
     grid: Mapping[str, Any]
@@ -1290,7 +1280,7 @@ def _build_solver_config(
     wegscheider_cyclicity_enabled: bool,
 ) -> _PreparedSolverConfig:
     solver_label = str(solver_input or DEFAULT_SOLVER_NAME).strip() or DEFAULT_SOLVER_NAME
-    solver, solver_warning = normalize_solver_name(solver_label)
+    solver = normalize_solver_name(solver_label)
 
     rtol_f = float(rtol)
     atol_f = float(atol)
@@ -1300,20 +1290,60 @@ def _build_solver_config(
         raise ValueError("atol must be finite and > 0.")
 
     if not isinstance(grid, Mapping) or not grid:
-        grid_out: Mapping[str, Any] = {"N": 100}
-    else:
-        grid_out = dict(grid)
+        raise ValueError("grid must be {'dt': float} or {'N': int}")
+    grid_out: Mapping[str, Any] = normalize_time_grid_policy(grid)
 
     return _PreparedSolverConfig(
         solver_input=str(solver_label),
         solver=str(solver),
-        solver_warning=str(solver_warning) if solver_warning else None,
         rtol=float(rtol_f),
         atol=float(atol_f),
         grid=grid_out,
         use_sparse_jacobian=bool(use_sparse_jacobian),
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
+
+
+_REQUIRED_INTERNAL_SOLVER_CONFIG_KEYS = frozenset(
+    {
+        "solver",
+        "rtol",
+        "atol",
+        "grid",
+        MechanismMetadataKeys.TEMPERATURE_K,
+        "use_sparse_jacobian",
+        MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED,
+    }
+)
+
+
+def require_complete_internal_solver_config(
+    solver_config: Mapping[str, Any] | None,
+    *,
+    stage: str = "solver_config",
+) -> Dict[str, Any]:
+    if not isinstance(solver_config, Mapping):
+        raise SimulationPreparationError(stage, "Internal execution requires solver_config.")
+    solver_config_out = dict(solver_config)
+    missing = sorted(
+        key
+        for key in _REQUIRED_INTERNAL_SOLVER_CONFIG_KEYS
+        if key not in solver_config_out
+    )
+    if missing:
+        raise SimulationPreparationError(
+            stage,
+            "Internal execution solver_config is missing required keys: "
+            + ", ".join(missing),
+        )
+    grid = solver_config_out.get("grid")
+    if not isinstance(grid, Mapping) or not grid:
+        raise SimulationPreparationError(stage, "Internal execution solver_config.grid is required.")
+    try:
+        solver_config_out["grid"] = normalize_time_grid_policy(grid)
+    except Exception as exc:
+        raise SimulationPreparationError(stage, str(exc)) from exc
+    return solver_config_out
 
 
 def _metadata_view_for_mechanism(
@@ -2401,27 +2431,25 @@ def symbolic_jacobian_identity_for_execution_text(
     solver_config: Mapping[str, Any] | None,
     parameter_overrides: Mapping[str, Any] | None = None,
 ) -> Optional[Dict[str, Any]]:
-    solver_cfg = dict(solver_config or {})
+    solver_cfg = require_complete_internal_solver_config(
+        solver_config,
+        stage="symbolic_jacobian_identity",
+    )
     prepared_solver_config = _build_solver_config(
-        solver_input=str(solver_cfg.get("solver") or DEFAULT_SOLVER_NAME),
-        rtol=solver_cfg.get("rtol", 1e-6),
-        atol=solver_cfg.get("atol", 1e-12),
-        grid=solver_cfg.get("grid", {"N": 100}) or {"N": 100},
-        use_sparse_jacobian=bool(
-            solver_cfg.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
-        ),
+        solver_input=str(solver_cfg["solver"]),
+        rtol=solver_cfg["rtol"],
+        atol=solver_cfg["atol"],
+        grid=solver_cfg["grid"],
+        use_sparse_jacobian=bool(solver_cfg["use_sparse_jacobian"]),
         wegscheider_cyclicity_enabled=bool(
-            solver_cfg.get(
-                MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED,
-                WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
-            )
+            solver_cfg[MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED]
         ),
     )
     if not prepared_solver_config.use_sparse_jacobian:
         return None
     if str(prepared_solver_config.solver or "").upper() not in {"BDF", "RADAU"}:
         return None
-    temperature_K = float(solver_cfg.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15))
+    temperature_K = float(solver_cfg[MechanismMetadataKeys.TEMPERATURE_K])
     structure = _symbolic_jacobian_structure_cache_get(
         mechanism_text=str(mechanism_text or ""),
         prepared_solver_config=prepared_solver_config,
@@ -2464,9 +2492,9 @@ def _parse_symbolic_execution_mechanism(
         structured_prepared_request=False,
         prepared_solver_config=_build_solver_config(
             solver_input=str(prepared_solver_config.solver),
-            rtol=1e-6,
-            atol=1e-12,
-            grid={"N": 100},
+            rtol=prepared_solver_config.rtol,
+            atol=prepared_solver_config.atol,
+            grid=prepared_solver_config.grid,
             use_sparse_jacobian=True,
             wegscheider_cyclicity_enabled=bool(prepared_solver_config.wegscheider_cyclicity_enabled),
         ),
@@ -2650,20 +2678,18 @@ def symbolic_wegscheider_identity_for_execution_text(
     mechanism_text: str,
     solver_config: Mapping[str, Any] | None,
 ) -> Optional[Dict[str, Any]]:
-    solver_cfg = dict(solver_config or {})
+    solver_cfg = require_complete_internal_solver_config(
+        solver_config,
+        stage="symbolic_wegscheider_identity",
+    )
     prepared_solver_config = _build_solver_config(
-        solver_input=str(solver_cfg.get("solver") or DEFAULT_SOLVER_NAME),
-        rtol=solver_cfg.get("rtol", 1e-6),
-        atol=solver_cfg.get("atol", 1e-12),
-        grid=solver_cfg.get("grid", {"N": 100}) or {"N": 100},
-        use_sparse_jacobian=bool(
-            solver_cfg.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
-        ),
+        solver_input=str(solver_cfg["solver"]),
+        rtol=solver_cfg["rtol"],
+        atol=solver_cfg["atol"],
+        grid=solver_cfg["grid"],
+        use_sparse_jacobian=bool(solver_cfg["use_sparse_jacobian"]),
         wegscheider_cyclicity_enabled=bool(
-            solver_cfg.get(
-                MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED,
-                WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
-            )
+            solver_cfg[MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED]
         ),
     )
     if not prepared_solver_config.wegscheider_cyclicity_enabled:
@@ -2672,7 +2698,7 @@ def symbolic_wegscheider_identity_for_execution_text(
     from kindred.core.simulator.dsl import parse_dsl_to_mechanism
     from kindred.core.units import UnitsModel
 
-    units = UnitsModel(temperature_K=float(solver_cfg.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15)))
+    units = UnitsModel(temperature_K=float(solver_cfg[MechanismMetadataKeys.TEMPERATURE_K]))
     mechanism = parse_dsl_to_mechanism(str(mechanism_text or ""), initials={}, units=units)
     meta = getattr(mechanism, "metadata", None)
     if isinstance(meta, dict):
@@ -2717,7 +2743,10 @@ def prepare_simulation_worker_run(
         request_mechanism_text = str(request_payload.mechanism_text or "")
         initials = dict(request_payload.initials or {})
         t_span = (float(request_payload.t_span[0]), float(request_payload.t_span[1]))
-        solver_config = dict(request_payload.solver_config or {})
+        solver_config = require_complete_internal_solver_config(
+            request_payload.solver_config,
+            stage="execution_request.solver_config",
+        )
         if prepared_payload is None:
             prepared_payload = request_payload.prepared_payload
         structured_prepared_request = prepared_payload is not None and request_payload.prepared_payload is not None
@@ -2729,25 +2758,24 @@ def prepare_simulation_worker_run(
     if initials is None:
         initials = {}
     if solver_config is None:
-        solver_config = {}
+        raise SimulationPreparationError(
+            "solver_config",
+            "Direct worker preparation requires complete solver_config.",
+        )
+    solver_config = require_complete_internal_solver_config(
+        solver_config,
+        stage="solver_config",
+    )
 
     try:
         prepared_solver_config = _build_solver_config(
-            solver_input=str((solver_config or {}).get("solver") or DEFAULT_SOLVER_NAME),
-            rtol=(solver_config or {}).get("rtol", 1e-6),
-            atol=(solver_config or {}).get("atol", 1e-12),
-            grid=(solver_config or {}).get("grid", {"N": 100}) or {"N": 100},
-            use_sparse_jacobian=bool(
-                (solver_config or {}).get(
-                    "use_sparse_jacobian",
-                    USE_SPARSE_JACOBIAN_DEFAULT,
-                )
-            ),
+            solver_input=str(solver_config["solver"]),
+            rtol=solver_config["rtol"],
+            atol=solver_config["atol"],
+            grid=solver_config["grid"],
+            use_sparse_jacobian=bool(solver_config["use_sparse_jacobian"]),
             wegscheider_cyclicity_enabled=bool(
-                (solver_config or {}).get(
-                    MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED,
-                    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
-                )
+                solver_config[MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED]
             ),
         )
     except Exception as exc:
@@ -2957,7 +2985,6 @@ def prepare_simulation_worker_run(
         y0=np.asarray(y0, dtype=float).reshape(-1),
         species_names=list(species_names),
         solver_input=str(prepared_solver_config.solver_input),
-        solver_warning=str(prepared_solver_config.solver_warning) if prepared_solver_config.solver_warning else None,
         temperature_schedule=temperature_schedule,
         intervention_schedule=intervention_schedule,
         jacobian_func=prepared_context.jacobian_func,

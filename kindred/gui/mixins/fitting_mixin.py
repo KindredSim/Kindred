@@ -4,7 +4,6 @@ FittingMixin - Parameter fitting operations for MainWindow.
 
 Provides methods for:
 - Fitting configuration dialogs
-- Fitting diagnostics display
 - Parameter override/update in mechanism DSL
 """
 
@@ -16,7 +15,6 @@ import logging
 import math
 from typing import Callable, Dict, Mapping, Optional, TYPE_CHECKING
 
-import numpy as np
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.simulator.solvers import normalize_solver_name
@@ -459,10 +457,7 @@ class FittingMixin:
 
     def _current_fit_step_constraint_context(self) -> Dict[str, object]:
         ports = self._require_fitting_ports()
-        wegscheider_getter = getattr(self, "_get_wegscheider_cyclicity_enabled", None)
-        if not callable(wegscheider_getter):
-            raise RuntimeError("Fitting constraint context requires an explicit Wegscheider setting provider.")
-        wegscheider_enabled = wegscheider_getter()
+        wegscheider_enabled = ports.wegscheider_cyclicity_enabled_getter()
         if not isinstance(wegscheider_enabled, bool):
             raise RuntimeError("Fitting constraint context requires an explicit Wegscheider setting.")
         return {
@@ -759,7 +754,7 @@ class FittingMixin:
 
         solver_combo = QtWidgets.QComboBox()
         solver_combo.addItems(list(FITTING_SOLVERS))
-        solver_name, _warning = normalize_solver_name(defaults.get("solver", "BDF"))
+        solver_name = normalize_solver_name(defaults.get("solver", "BDF"))
         solver_combo.setCurrentText(solver_name)
         integration_layout.addRow("Solver:", solver_combo)
 
@@ -796,55 +791,6 @@ class FittingMixin:
                 self.config_controller.update_user_preference(key, value)
             logger.info("Fitting defaults updated")
             self._set_fitting_status("Fitting defaults updated")
-
-    def _show_fitting_diagnostics(self):
-        """Show fitting diagnostics dialog with statistical analysis."""
-        if not hasattr(self, '_last_fit_result') or self._last_fit_result is None:
-            QtWidgets.QMessageBox.information(
-                self,
-                "No Fit Results",
-                "No fitting results available.\n\n"
-                "Please run a global fit first using Fitting → Global Fit..."
-            )
-            return
-
-        fit_result = self._last_fit_result
-
-        def _array(value):
-            if value is None:
-                return np.array([])
-            if isinstance(value, np.ndarray):
-                return value
-            return np.asarray(value)
-
-        residuals = _array(fit_result.get('residuals'))
-        observed = _array(fit_result.get('observed'))
-        predicted = _array(fit_result.get('predicted'))
-
-        if predicted.size == 0 and observed.size == residuals.size and observed.size > 0:
-            predicted = observed + residuals
-
-        if observed.size == 0:
-            logger.debug("Fitting diagnostics payload did not include observed data; registry reconstruction is not attempted.")
-
-        result_dict = {
-            'parameters': fit_result.get('parameters', {}),
-            'residuals': residuals,
-            'predicted': predicted,
-            'observed': observed,
-            'jacobian': None,
-            'covariance': fit_result.get('covariance'),
-            'success': bool(fit_result.get('success')),
-            'message': fit_result.get('message', 'N/A'),
-            'nfev': int(fit_result.get('nfev', 0)),
-            'cost': float(fit_result.get('chi_squared', 0.0)),
-        }
-
-        from kindred.gui.widgets.fitting_diagnostics_dialog import FittingDiagnosticsDialog
-        dialog = FittingDiagnosticsDialog(result_dict, self)
-        dialog.show()  # Non-modal to allow comparison with plots
-
-        logger.info("Fitting diagnostics dialog opened")
 
     def _extract_mechanism_initials(self, mechanism_text: str) -> Dict[str, float]:
         """Return mechanism species initial concentrations without running a simulation."""

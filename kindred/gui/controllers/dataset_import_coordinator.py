@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Callable, Dict, List, Sequence
 
 import numpy as np
@@ -282,7 +281,6 @@ class DatasetImportCoordinator:
             batch_set_names,
             default_batch_set_name_for_dataset(dataset_name) or dataset_name,
         )
-        running_under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
         if force_create:
             action = "create"
         else:
@@ -293,8 +291,6 @@ class DatasetImportCoordinator:
                 title="Import Set Mapping",
                 skip_label="Skip",
                 skip_description="Leave this dataset unmapped",
-                running_under_pytest=running_under_pytest,
-                pytest_default_action="skip",
                 include_create_all=allow_create_all,
             )
         if action == "skip":
@@ -335,21 +331,18 @@ class DatasetImportCoordinator:
             except Exception:
                 t0 = float("nan")
             if not (abs(t0) <= T0_SEED_TOL_S):
-                if running_under_pytest:
-                    response = QtWidgets.QMessageBox.StandardButton.Cancel
-                else:
-                    response = QtWidgets.QMessageBox.warning(
-                        self._message_parent,
-                        "Import Set Mapping",
-                        (
-                            f"Dataset '{dataset_name}' does not start at t~=0 "
-                            f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
-                            "OK: Map this dataset to the new zeroed set\n"
-                            "Cancel: Leave this dataset unmapped and edit the new set manually"
-                        ),
-                        QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
-                        QtWidgets.QMessageBox.StandardButton.Cancel,
-                    )
+                response = QtWidgets.QMessageBox.warning(
+                    self._message_parent,
+                    "Import Set Mapping",
+                    (
+                        f"Dataset '{dataset_name}' does not start at t~=0 "
+                        f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
+                        "OK: Map this dataset to the new zeroed set\n"
+                        "Cancel: Leave this dataset unmapped and edit the new set manually"
+                    ),
+                    QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+                    QtWidgets.QMessageBox.StandardButton.Cancel,
+                )
                 if response == QtWidgets.QMessageBox.StandardButton.Cancel:
                     select_batch_set(
                         batch_store,
@@ -359,16 +352,15 @@ class DatasetImportCoordinator:
                         record_failure=self._record_failure,
                         failure_key_prefix="dataset_import.batch_mapping",
                     )
-                    if not running_under_pytest:
-                        QtWidgets.QMessageBox.information(
-                            self._message_parent,
-                            "Import Set Mapping",
-                            (
-                                f"Set '{create_set_name}' was created.\n\n"
-                                "Edit its initial concentrations in the Initial Conditions table, "
-                                "then map the dataset when it is ready."
-                            ),
-                        )
+                    QtWidgets.QMessageBox.information(
+                        self._message_parent,
+                        "Import Set Mapping",
+                        (
+                            f"Set '{create_set_name}' was created.\n\n"
+                            "Edit its initial concentrations in the Initial Conditions table, "
+                            "then map the dataset when it is ready."
+                        ),
+                    )
                     self._fit_settings_store.update_fit_settings(str(record.dataset_id), settings)
                     return str(action)
         apply_batch_mapping_to_settings(settings, batch_store, create_set_name)

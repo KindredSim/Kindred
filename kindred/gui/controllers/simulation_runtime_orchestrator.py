@@ -816,7 +816,12 @@ class SimulationRuntimeOrchestrator:
             replay_source = current_state if current_state is not None else (self._preview_replay_state() if callable(self._preview_replay_state) else None)
             if replay_source is not None:
                 replay_state = RuntimePreviewReplayState.from_pending(replay_source)
-                replay_decision = self.stale_fast_error_replay_decision(current_state=replay_state)
+                replay_decision = self.stale_fast_error_replay_decision(
+                    current_state=replay_state,
+                    shutdown_requested=bool(
+                        getattr(getattr(decision, "freshness", None), "shutdown_requested", False)
+                    ),
+                )
                 effects.extend(replay_decision.effects)
 
         if bool(getattr(runtime, "terminal_replay_needed", False)):
@@ -922,7 +927,10 @@ class SimulationRuntimeOrchestrator:
             force_terminate=bool(force_terminate),
             reason=RuntimeReleaseReason.SHUTDOWN,
         )
-        effects = [self._ready_reset_effect(stop_completion_polling=True)]
+        effects = [
+            *self.preview_replay_cleared(clear_plot_updates=True),
+            self._ready_reset_effect(stop_completion_polling=True),
+        ]
         if close_failure:
             effects.append(RuntimeUiEffect(surface_failure=close_failure))
         return effects
@@ -1118,9 +1126,10 @@ class SimulationRuntimeOrchestrator:
         self,
         *,
         current_state: object,
+        shutdown_requested: bool = False,
     ) -> RuntimePreviewReplayDecision:
         pending = RuntimePreviewReplayState.from_pending(current_state)
-        if not self.preview_replay_exists_for_state(pending):
+        if not self.preview_replay_exists_for_state(pending) or bool(shutdown_requested):
             return RuntimePreviewReplayDecision(
                 effects=tuple(self.preview_replay_cleared(clear_plot_updates=False)),
             )

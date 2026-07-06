@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 from PySide6 import QtCore
 
 from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome
+from kindred.core.temperature import coerce_temperature_kelvin
+from kindred.core.time_grid import normalize_time_grid_policy
 from kindred.core.simulation_identity import (
     SimulationIdentity,
     contained_simulation_owner_identity,
@@ -184,7 +186,7 @@ class SimulationController(QtCore.QObject):
                 record_run_cache_key=self._batch_cache.record_run_cache_key,
                 runtime_environment_key=self._runtime_lane_environment_key,
                 runtime_lane_budget=lambda: int(self.batch_runtime_lane_budget),
-                max_parallel_batch_workers=lambda: int(self.batch_runtime_lane_budget),
+                max_parallel_batch_workers=lambda: int(self.parallel_batch.max_parallel_workers),
             ),
         )
         self._batch_context_owner = BatchRunContextOwner()
@@ -222,6 +224,7 @@ class SimulationController(QtCore.QObject):
         self._nonfatal_exception_count: int = 0
         self._last_nonfatal_exception: Optional[str] = None
         self._shutdown_requested_for_close: bool = False
+        self._shutdown_requested_for_close_run_ids: set[int] = set()
         self._discarded_slider_preview_generation_id: Optional[int] = None
         self._batch_runtime_lane_budget = int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
         self._runtime_orchestrator = SimulationRuntimeOrchestrator(
@@ -286,12 +289,10 @@ class SimulationController(QtCore.QObject):
                 current_epoch=self._current_runtime_input_epoch,
                 current_set_epoch=self._runtime_input_set_epoch,
                 finalize_batch_queue_done_without_result=(
-                    lambda ctx: self._completion_publication_owner.finalize_without_result(
+                    lambda ctx, freshness: self._completion_publication_owner.finalize_without_result(
                         ctx,
                         status_text="Simulation complete",
-                        shutdown_requested=bool(
-                            getattr(self, "_shutdown_requested_for_close", False)
-                        ),
+                        shutdown_requested=bool(getattr(freshness, "shutdown_requested", False)),
                     )
                 ),
             )
@@ -871,8 +872,19 @@ class SimulationController(QtCore.QObject):
             **kwargs,
         )
 
-    def _shutdown_requested_for_completion_callbacks(self) -> bool:
-        return bool(getattr(self, "_shutdown_requested_for_close", False))
+    def _shutdown_requested_for_completion_callbacks(
+        self,
+        callback_identity: SimulationCallbackIdentity | None = None,
+    ) -> bool:
+        if bool(getattr(self, "_shutdown_requested_for_close", False)):
+            return True
+        if callback_identity is None:
+            return False
+        try:
+            run_id = int(callback_identity.run_id)
+        except Exception:
+            return False
+        return run_id in set(getattr(self, "_shutdown_requested_for_close_run_ids", set()) or set())
 
     def _current_runtime_input_global_epoch(self) -> int:
         return int(getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0)
@@ -910,7 +922,15 @@ class SimulationController(QtCore.QObject):
                 self._completion_publication_owner.finalize_without_result(
                     mutation_result.context,
                     status_text="Simulation complete",
-                    shutdown_requested=bool(getattr(self, "_shutdown_requested_for_close", False)),
+                    shutdown_requested=bool(
+                        getattr(
+                            decision.freshness,
+                            "shutdown_requested",
+                            self._shutdown_requested_for_completion_callbacks(
+                                decision.callback_identity
+                            ),
+                        )
+                    ),
                 )
             return
 
@@ -1089,6 +1109,7 @@ class SimulationController(QtCore.QObject):
         slider_triggered: bool = True,
         valid_set_ids: Optional[Sequence[str]] = None,
         fresh_preview_entry: Optional[FreshPreviewDisplayEntry] = None,
+        semantic_unavailable_set_ids: Sequence[str] = (),
     ) -> None:
         self._queue_slider_plot_update(
             set_id=set_id,
@@ -1098,6 +1119,7 @@ class SimulationController(QtCore.QObject):
             slider_triggered=slider_triggered,
             valid_set_ids=valid_set_ids,
             fresh_preview_entry=fresh_preview_entry,
+            semantic_unavailable_set_ids=semantic_unavailable_set_ids,
         )
 
     def next_sim_request_id(self) -> int:
@@ -1394,6 +1416,11 @@ class SimulationController(QtCore.QObject):
             submitted_plan = simulation_plan_from_payloadish(dict(descriptor.plan_payload or {}))
         except Exception:
             submitted_plan = None
+        if submitted_plan is None:
+            raise ValueError(f"Missing submitted simulation plan for set {descriptor.set_id!r}.")
+        simulation_identity = submitted_plan.simulation_identity_payload()
+        if not simulation_identity:
+            raise ValueError(f"Missing submitted simulation identity for set {descriptor.set_id!r}.")
         set_name = self.ui.batch.batch_set_name_for_id(descriptor.set_id) or descriptor.set_id
         assignment = dispatch_plan.assignment_for_task(descriptor.task_id)
         return SimulationCallbackIdentity.capture(
@@ -1404,11 +1431,7 @@ class SimulationController(QtCore.QObject):
             batch_set=str(set_name),
             batch_set_id=str(descriptor.set_id),
             cache_key=str(descriptor.cache_key),
-            simulation_identity=(
-                submitted_plan.simulation_identity_payload()
-                if submitted_plan is not None
-                else {}
-            ),
+            simulation_identity=simulation_identity,
             preview_batch_cache_token=descriptor.preview_batch_cache_token,
             launch_provenance=self._launch_provenance_for_plan(submitted_plan),
             allocation_id=str(dispatch_plan.launch_allocation.allocation_id),
@@ -1420,8 +1443,13 @@ class SimulationController(QtCore.QObject):
         )
 
     def _next_runtime_run_id(self) -> int:
+        return self._advance_active_run_identity()
+
+    def _advance_active_run_identity(self) -> int:
         self._run_sequence_id = int(getattr(self, "_run_sequence_id", 0)) + 1
         self._active_run_id = int(self._run_sequence_id)
+        self._shutdown_requested_for_close = False
+        self._shutdown_requested_for_close_run_ids.clear()
         return int(self._run_sequence_id)
 
     def set_preview_display_cache_invalidator(
@@ -1495,6 +1523,9 @@ class SimulationController(QtCore.QObject):
     def prepare_simulation_shutdown_for_close(self) -> bool:
         return self._prepare_simulation_shutdown_for_close()
 
+    def abort_simulation_shutdown_for_close(self) -> None:
+        self._abort_simulation_shutdown_for_close()
+
     def flush_slider_plot_updates(
         self,
         *,
@@ -1545,15 +1576,25 @@ class SimulationController(QtCore.QObject):
         solver_config = dict(request.solver_config or {})
         provenance: dict[str, Any] = {}
         if solver_config.get("temperature_K") is not None:
-            provenance["temperature_K"] = float(solver_config["temperature_K"])
+            provenance["temperature_K"] = coerce_temperature_kelvin(
+                solver_config["temperature_K"],
+                field="temperature_K",
+            )
         provenance["mechanism_text"] = str(request.mechanism_text or "")
         try:
             provenance["simulation_time"] = float(request.t_span[1])
         except Exception:
             pass
         grid = solver_config.get("grid")
-        if isinstance(grid, Mapping) and grid.get("N") is not None:
-            provenance["num_points_requested"] = int(grid["N"])
+        if isinstance(grid, Mapping):
+            try:
+                grid_requested = normalize_time_grid_policy(grid)
+            except Exception:
+                grid_requested = None
+            if grid_requested is not None:
+                provenance["grid_requested"] = dict(grid_requested)
+                if grid_requested.get("N") is not None:
+                    provenance["num_points_requested"] = int(grid_requested["N"])
         try:
             provenance["temperature_source"] = (
                 "dsl"
@@ -1611,13 +1652,25 @@ class SimulationController(QtCore.QObject):
         )
 
     def _prepare_simulation_shutdown_for_close(self) -> bool:
+        # Queued runtime callbacks still need to see close-shutdown truth after
+        # the backend has been closed. The global close flag clears during
+        # cleanup/close-veto; run-id tombstones clear only when a new run starts.
+        self._shutdown_requested_for_close = True
+        try:
+            active_run_id = int(getattr(self, "_active_run_id", 0) or 0)
+        except Exception:
+            active_run_id = 0
+        if active_run_id > 0:
+            self._shutdown_requested_for_close_run_ids.add(active_run_id)
         self._apply_runtime_lifecycle_ui_effects(
             self._runtime_orchestrator.close_requested(force_terminate=True)
         )
-        self._shutdown_requested_for_close = False
         return True
 
     def _clear_shutdown_request_after_close_cleanup(self) -> None:
+        self._shutdown_requested_for_close = False
+
+    def _abort_simulation_shutdown_for_close(self) -> None:
         self._shutdown_requested_for_close = False
 
     def _contained_child_blas_threads_limited(self) -> bool:
@@ -2017,8 +2070,7 @@ class SimulationController(QtCore.QObject):
     def _invalidate_active_explicit_simulation_for_authoritative_change(self) -> None:
         if not self._has_active_explicit_simulation():
             return
-        self._run_sequence_id = int(getattr(self, "_run_sequence_id", 0)) + 1
-        self._active_run_id = int(self._run_sequence_id)
+        self._advance_active_run_identity()
         self._cancel_active_run_for_restart()
 
     @staticmethod
@@ -2122,6 +2174,7 @@ class SimulationController(QtCore.QObject):
         slider_triggered: bool = True,
         valid_set_ids: Optional[Sequence[str]] = None,
         fresh_preview_entry: Optional[FreshPreviewDisplayEntry] = None,
+        semantic_unavailable_set_ids: Sequence[str] = (),
     ) -> None:
         preview_ownership = self._preview_ownership
         self._plot_coalescer.queue(
@@ -2136,6 +2189,7 @@ class SimulationController(QtCore.QObject):
             latest_request_id=int(getattr(self, "_latest_sim_request_id", 0)),
             valid_set_ids=valid_set_ids,
             fresh_preview_entry=fresh_preview_entry,
+            semantic_unavailable_set_ids=semantic_unavailable_set_ids,
             active_run_id=int(self._active_run_id),
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
@@ -2170,7 +2224,12 @@ class SimulationController(QtCore.QObject):
                 fresh_entries.keys() if isinstance(fresh_entries, Mapping) else ()
             )
         )
-        if target_ids.issubset(fresh_ids):
+        semantic_ids = set(
+            normalize_preview_target_set_ids(
+                getattr(pending, "semantic_unavailable_set_ids", ())
+            )
+        )
+        if target_ids.issubset(fresh_ids | semantic_ids):
             return False
         if not self._pending_preview_plot_update_is_current(pending):
             return False
@@ -2548,45 +2607,38 @@ class SimulationController(QtCore.QObject):
         solver_config: Mapping[str, Any],
         fast_mode: bool,
     ) -> Mapping[str, Any]:
-        solver_name = str(dict(solver_config or {}).get("solver") or "").strip().lower()
+        solver_config_map = dict(solver_config or {})
+        solver_name = str(solver_config_map.get("solver") or "").strip().lower()
         if solver_name not in {"bdf", "radau"}:
             return {}
-        if not bool(dict(solver_config or {}).get("use_sparse_jacobian", False)):
+        if "use_sparse_jacobian" not in solver_config_map:
+            raise ValueError("Runtime symbolic Jacobian identity requires use_sparse_jacobian.")
+        if not bool(solver_config_map["use_sparse_jacobian"]):
             return {}
-        try:
-            mechanism_source = self.ui.mechanism.mechanism_source_for_run_set(
-                self.ui.mechanism.mechanism_source_for_run(fast_mode=bool(fast_mode)),
-                set_id=str(set_id),
-                apply_parameter_overrides=False,
-                strip_initial_concentrations=True,
-            )
-            mechanism_text = mechanism_source.full_dsl
-            parameter_overrides = (
-                self._local_runtime_parameter_overrides_for_set(set_id=str(set_id))
-                if bool(fast_mode) and self.ui.mechanism.has_local_runtime_parameter_values()
-                else {}
-            )
-            from kindred.core.simulation_preparation import (
-                symbolic_jacobian_identity_for_execution_text,
-            )
+        mechanism_source = self.ui.mechanism.mechanism_source_for_run_set(
+            self.ui.mechanism.mechanism_source_for_run(fast_mode=bool(fast_mode)),
+            set_id=str(set_id),
+            apply_parameter_overrides=False,
+            strip_initial_concentrations=True,
+        )
+        mechanism_text = mechanism_source.full_dsl
+        parameter_overrides = (
+            self._local_runtime_parameter_overrides_for_set(set_id=str(set_id))
+            if bool(fast_mode) and self.ui.mechanism.has_local_runtime_parameter_values()
+            else {}
+        )
+        from kindred.core.simulation_preparation import (
+            symbolic_jacobian_identity_for_execution_text,
+        )
 
-            payload = symbolic_jacobian_identity_for_execution_text(
-                mechanism_text=str(mechanism_text or ""),
-                solver_config=dict(solver_config or {}),
-                parameter_overrides=parameter_overrides,
-            )
-            if not payload:
-                return {}
-            return dict(payload)
-        except (ValueError, TypeError):
-            raise
-        except Exception as exc:
-            if (
-                exc.__class__.__name__ == "SimulationPreparationError"
-                and str(getattr(exc, "stage", "")) == "parameter_overrides"
-            ):
-                raise
+        payload = symbolic_jacobian_identity_for_execution_text(
+            mechanism_text=str(mechanism_text or ""),
+            solver_config=solver_config_map,
+            parameter_overrides=parameter_overrides,
+        )
+        if not payload:
             return {}
+        return dict(payload)
 
     def _symbolic_wegscheider_identity_for_set(
         self,
@@ -2595,42 +2647,44 @@ class SimulationController(QtCore.QObject):
         solver_config: Mapping[str, Any],
         fast_mode: bool,
     ) -> Mapping[str, Any]:
-        if not bool(dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)):
+        solver_config_map = dict(solver_config or {})
+        if "wegscheider_cyclicity_enabled" not in solver_config_map:
+            raise ValueError(
+                "Runtime symbolic Wegscheider identity requires wegscheider_cyclicity_enabled."
+            )
+        if not bool(solver_config_map["wegscheider_cyclicity_enabled"]):
             return {}
-        try:
-            mechanism_source = self.ui.mechanism.mechanism_source_for_run_set(
-                self.ui.mechanism.mechanism_source_for_run(fast_mode=bool(fast_mode)),
-                set_id=str(set_id),
-                apply_parameter_overrides=bool(fast_mode) and self.ui.mechanism.has_local_runtime_parameter_values(),
-                strip_initial_concentrations=True,
-            )
-            mechanism_text = mechanism_source.full_dsl
-            solver_identity = repr(
-                {
-                    "temperature_K": dict(solver_config or {}).get("temperature_K"),
-                    "wegscheider_cyclicity_enabled": bool(
-                        dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)
-                    ),
-                }
-            )
-            cache_key = (str(mechanism_text or ""), solver_identity)
-            cached = self._symbolic_wegscheider_identity_cache.get(cache_key)
-            if cached is not None:
-                return dict(cached)
-            from kindred.core.simulation_preparation import (
-                symbolic_wegscheider_identity_for_execution_text,
-            )
+        mechanism_source = self.ui.mechanism.mechanism_source_for_run_set(
+            self.ui.mechanism.mechanism_source_for_run(fast_mode=bool(fast_mode)),
+            set_id=str(set_id),
+            apply_parameter_overrides=False,
+            strip_initial_concentrations=True,
+        )
+        mechanism_text = mechanism_source.full_dsl
+        solver_identity = repr(
+            {
+                "temperature_K": solver_config_map.get("temperature_K"),
+                "wegscheider_cyclicity_enabled": bool(
+                    solver_config_map["wegscheider_cyclicity_enabled"]
+                ),
+            }
+        )
+        cache_key = (str(mechanism_text or ""), solver_identity)
+        cached = self._symbolic_wegscheider_identity_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+        from kindred.core.simulation_preparation import (
+            symbolic_wegscheider_identity_for_execution_text,
+        )
 
-            payload = symbolic_wegscheider_identity_for_execution_text(
-                mechanism_text=str(mechanism_text or ""),
-                solver_config=dict(solver_config or {}),
-            )
-            if not payload:
-                return {}
-            self._symbolic_wegscheider_identity_cache[cache_key] = dict(payload)
-            return dict(payload)
-        except Exception:
+        payload = symbolic_wegscheider_identity_for_execution_text(
+            mechanism_text=str(mechanism_text or ""),
+            solver_config=solver_config_map,
+        )
+        if not payload:
             return {}
+        self._symbolic_wegscheider_identity_cache[cache_key] = dict(payload)
+        return dict(payload)
 
     def _simulation_identity_for_set(
         self,
