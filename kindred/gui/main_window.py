@@ -322,9 +322,6 @@ class MainWindow(
         plumbing = build_simulation_plumbing(self)
         self._sim_ui_port: SimulationUiPorts = plumbing.ui_port
         self._sim_controller = plumbing.controller
-        self._sim_controller.set_preview_display_cache_invalidator(
-            self.results_controller.invalidate_workspace_preview_display_and_cache
-        )
         self._sim_controller.runtime_readiness_render_requested.connect(
             self._apply_simulation_runtime_readiness_render_state
         )
@@ -1326,7 +1323,9 @@ class MainWindow(
                 return False
             return True
 
-        self._discard_pending_slider_edits_for_invalidation()
+        self._discard_pending_slider_edits_for_invalidation(
+            discard_entire_transaction=True,
+        )
         if bool(preview.has_dirty_transaction()):
             self._simulation_dialogs.message_box_warning(
                 "Pending Slider Changes",
@@ -1646,7 +1645,6 @@ class MainWindow(
         self._create_menus()
         self._init_mixin_ports()
         self._connect_signals()
-        self._simulation_runtime_availability_shutdown_started = False
 
     def _bootstrap_window_state(self) -> None:
         """Apply launch overrides and persisted startup state after composition prerequisites exist."""
@@ -5965,77 +5963,51 @@ class MainWindow(
 
     def _on_reset_runtime_parameters_clicked(self) -> None:
         """Reset staged runtime parameter values back to the baseline DSL values."""
-        target_set_ids = self._effective_slider_edit_target_set_ids()
-        if bool(self._preview_session.has_staged_concentration_overlays()):
-            replay_intent = self._preview_session.capture_reset_slider_replay_intent()
-            if replay_intent is not None:
-                target_set_ids = tuple(
-                    str(set_id)
-                    for set_id in getattr(replay_intent, "target_set_ids", ())
-                    if str(set_id)
+        replay_intent = self._preview_session.capture_reset_slider_replay_intent()
+        target_set_ids = tuple(
+            str(set_id)
+            for set_id in getattr(replay_intent, "target_set_ids", ())
+            if str(set_id)
+        )
+        if not target_set_ids:
+            target_set_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *tuple(self._preview_session.local_mechanism_workspace_set_ids()),
+                        *tuple(self._preview_session.staged_concentration_overlay_target_set_ids()),
+                    )
                 )
-            self._discard_pending_slider_edits_for_invalidation(
-                target_set_ids=target_set_ids,
             )
-            restore_cache_truth = getattr(
-                getattr(self, "_simulation_batch_owner", None),
-                "restore_active_result_cache_truth_for_reset_set_ids",
-                None,
-            )
-            if callable(restore_cache_truth):
-                restore_cache_truth(target_set_ids)
-            self._refresh_batch_display_from_request_scope()
-            return
-        else:
-            self._sim_controller.discard_slider_preview_work_preserving_runtime_owner(
-                target_set_ids=target_set_ids,
-            )
-            self._preview_session.reset_mechanism_workspaces(target_set_ids)
-
-            sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
-            if sliders is not None and hasattr(sliders, "end_live_drag"):
-                sliders.end_live_drag()
-
-            try:
-                self._variable_runtime.extract_and_populate_variables(
-                    preserve_visibility=True,
-                )
-            except Exception:
-                logger.exception("Failed to refresh sliders after override reset")
-            try:
-                self._variable_runtime.update_parameter_table_from_sliders()
-            except Exception:
-                logger.exception("Failed to update parameter table after override reset")
-                QtCore.QTimer.singleShot(
-                    0,
-                    self._variable_runtime.update_parameter_table_from_sliders,
-                )
-
-            try:
-                self._sync_cached_focus_to_current_batch_row()
-                panel = self._mechanism_editor.species_sliders_widget()
-                if panel is not None and hasattr(panel, "rebuild_from_current_row"):
-                    panel.rebuild_from_current_row()
-            except Exception:
-                logger.exception("Failed to reset species row")
-                self._species_panel_available = False
-            self._refresh_slider_transaction_button_state()
-            self._refresh_batch_display_from_request_scope()
-            return
+        if not target_set_ids:
+            target_set_ids = self._effective_slider_edit_target_set_ids()
+        self._discard_pending_slider_edits_for_invalidation(
+            target_set_ids=target_set_ids,
+            discard_entire_transaction=True,
+        )
+        self.results_controller.reset_preview_display_to_canonical(
+            target_set_ids=target_set_ids,
+        )
+        self._sim_controller.refresh_interactive_runtime_readiness()
+        return
 
     def _discard_pending_slider_edits_for_invalidation(
         self,
         *,
         target_set_ids: Sequence[str] | None = None,
         discard_species_preview: bool = True,
+        discard_entire_transaction: bool = False,
     ) -> bool:
         """Discard staged slider edits and leave the visible display recoverable."""
-        scoped_reset = target_set_ids is not None
         targets = target_set_ids or self._effective_slider_edit_target_set_ids()
         self._sim_controller.invalidate_slider_preview_work(
             target_set_ids=targets,
+            clear_plot=False,
+            clear_active_cache_identity=False,
+            clear_pending_replay=bool(discard_entire_transaction),
         )
-        if scoped_reset:
+        if bool(discard_entire_transaction):
+            self._preview_session.clear_working_transaction(invalidate_preview_work=False)
+        elif target_set_ids is not None:
             if bool(discard_species_preview):
                 self._preview_session.clear_working_transaction_for_set_ids(
                     targets,
@@ -6066,7 +6038,6 @@ class MainWindow(
             )
 
         try:
-            self._sync_cached_focus_to_current_batch_row()
             panel = self._mechanism_editor.species_sliders_widget()
             if panel is not None and hasattr(panel, "rebuild_from_current_row"):
                 panel.rebuild_from_current_row()
@@ -6080,9 +6051,6 @@ class MainWindow(
     # Species mode (Batch Initial Conditions sliders)
     # ------------------------------------------------------------------
 
-    def _sync_cached_focus_to_current_batch_row(self) -> None:
-        return
-
     def _select_initial_batch_row_if_needed(self) -> None:
         table = getattr(self, "_batch_table", None)
         model = getattr(self, "_batch_model", None)
@@ -6091,7 +6059,6 @@ class MainWindow(
         if int(model.rowCount()) <= 0:
             return
         if table.currentIndex().isValid() or self._batch_selected_rows():
-            self._sync_cached_focus_to_current_batch_row()
             return
         transaction = self._simulation_batch_owner.concentration_set_interaction_transaction(
             gesture="initial_default_selection",
@@ -6119,7 +6086,6 @@ class MainWindow(
             self._preview_session.deactivate_species_preview_timer()
             return
 
-        self._sync_cached_focus_to_current_batch_row()
         if panel is not None:
             if hasattr(panel, "activate"):
                 try:
@@ -6154,12 +6120,13 @@ class MainWindow(
         if changed:
             self.results_controller.clear_display_if_workspace_previews_were_displayed(
                 target_set_ids,
-                clear_plot=True,
+                clear_plot=False,
             )
             self._refresh_slider_transaction_button_state()
-            if self.results_controller.active_display_transaction() is None:
-                self._refresh_batch_display_from_request_scope()
-            self._queue_species_slider_simulation(label="init:reset", delay_ms=0)
+            self.results_controller.reset_preview_display_to_canonical(
+                target_set_ids=target_set_ids,
+            )
+            self._sim_controller.refresh_interactive_runtime_readiness()
 
     def _on_species_slider_edited(self, species: str, value: float) -> None:
         changed = self._preview_session.on_species_slider_value_changed(species, float(value))
@@ -6897,25 +6864,11 @@ class MainWindow(
         P3 ENHANCEMENT: Save user preferences before closing.
         """
         logger.info("Window close event - cleaning up")
-        self._simulation_runtime_availability_shutdown_started = True
 
         # P3 ENHANCEMENT: Save user preferences
         self._save_settings()
 
-        prepared_close_ready = getattr(
-            self,
-            "_simulation_close_prepared_before_close_event",
-            None,
-        )
-        self._simulation_close_prepared_before_close_event = None
-        if prepared_close_ready is None:
-            close_ready = self._sim_controller.prepare_simulation_shutdown_for_close()
-        else:
-            close_ready = bool(prepared_close_ready)
-        if not close_ready:
-            logger.warning("Deferring close event while simulation worker shutdown is still in progress")
-            event.ignore()
-            return
+        self._sim_controller.prepare_simulation_shutdown_for_close()
 
         fit_windows_ready = self._prepare_fit_window_shutdown_for_close()
         if not fit_windows_ready:
@@ -6929,18 +6882,6 @@ class MainWindow(
 
         logger.info("Cleanup complete, accepting close event")
         event.accept()
-
-    def close(self) -> bool:
-        if not self.isVisible():
-            self._simulation_runtime_availability_shutdown_started = True
-            try:
-                self._simulation_close_prepared_before_close_event = (
-                    self._sim_controller.prepare_simulation_shutdown_for_close()
-                )
-            except Exception:
-                self._simulation_close_prepared_before_close_event = None
-                logger.debug("Failed to prepare simulation shutdown for hidden close", exc_info=True)
-        return bool(super().close())
 
     def showEvent(self, event):
         super().showEvent(event)

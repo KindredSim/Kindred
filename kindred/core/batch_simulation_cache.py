@@ -110,21 +110,6 @@ class BatchSimulationCache:
         self.active_cache_preview_scope_set_ids = self.normalize_set_ids(preview_scope_set_ids) or None
         self.active_cache_preview_token = str(preview_token or "").strip() or None
 
-    def apply_run_start_cache_decision(
-        self,
-        *,
-        fast_mode: bool,
-        explicit_cache_valid_set_ids: Sequence[str] | None = None,
-        explicit_cache_invalidated_set_ids: Sequence[str] | None = None,
-        preview_scope_set_ids: Sequence[str] | None = None,
-    ) -> None:
-        if bool(fast_mode):
-            self.active_preview_scope_set_ids = self.normalize_set_ids(preview_scope_set_ids) or None
-            return
-        self.active_cache_preview_scope_set_ids = None
-        self.active_cache_valid_set_ids = self.normalize_set_ids(explicit_cache_valid_set_ids) or None
-        self.active_cache_invalidated_set_ids = self.normalize_set_ids(explicit_cache_invalidated_set_ids) or None
-
     def record_preview_completion_cache_key(
         self,
         *,
@@ -405,6 +390,8 @@ class BatchSimulationCache:
                     removed += 1
                 except KeyError:
                     continue
+        if removed:
+            self._reconcile_active_sidecars_after_set_purge(targets)
         return int(removed)
 
     def put_completion_entry(
@@ -481,9 +468,13 @@ class BatchSimulationCache:
 
     def purge_result_cache(self) -> None:
         self.result_cache.clear()
+        self.clear_active_result_cache_identity_state()
 
     def purge_preview_cache(self) -> None:
         self.preview_cache.clear()
+        self.clear_active_preview_cache_identity_state()
+        self.active_cache_preview_token = None
+        self.active_cache_preview_scope_set_ids = None
 
     def purge_all(self) -> None:
         self.purge_result_cache()
@@ -493,14 +484,48 @@ class BatchSimulationCache:
         self.active_preview_cache_key = None
         self.active_preview_scope_set_ids = None
 
-    def clear_active_cache_identity_state(self) -> None:
+    def clear_active_result_cache_identity_state(self) -> None:
         self.active_cache_key = None
         self.active_cache_preview_token = None
         self.active_cache_preview_scope_set_ids = None
         self.active_cache_valid_set_ids = None
         self.active_cache_invalidated_set_ids = None
+
+    def clear_active_cache_identity_state(self) -> None:
+        self.clear_active_result_cache_identity_state()
         self.clear_active_preview_cache_identity_state()
 
     def reset_runtime_state(self) -> None:
         self.purge_all()
         self.clear_active_cache_identity_state()
+
+    def _reconcile_active_sidecars_after_set_purge(self, targets: set[str]) -> None:
+        if not targets:
+            return
+
+        def _pruned(values: Sequence[str] | None) -> tuple[str, ...] | None:
+            kept = tuple(
+                set_id
+                for set_id in self.normalize_set_ids(values)
+                if set_id not in targets
+            )
+            return kept or None
+
+        self.active_cache_valid_set_ids = _pruned(self.active_cache_valid_set_ids)
+        self.active_cache_invalidated_set_ids = _pruned(self.active_cache_invalidated_set_ids)
+        self.active_cache_preview_scope_set_ids = _pruned(self.active_cache_preview_scope_set_ids)
+        self.active_preview_scope_set_ids = _pruned(self.active_preview_scope_set_ids)
+        if not self.active_cache_preview_scope_set_ids:
+            self.active_cache_preview_token = None
+
+        active_result_key = str(self.active_cache_key or "").strip()
+        if active_result_key and not tuple(
+            self.entries_for_cache_key(cache_key=active_result_key, is_preview=False)
+        ):
+            self.clear_active_result_cache_identity_state()
+
+        active_preview_key = str(self.active_preview_cache_key or "").strip()
+        if active_preview_key and not tuple(
+            self.entries_for_cache_key(cache_key=active_preview_key, is_preview=True)
+        ):
+            self.clear_active_preview_cache_identity_state()

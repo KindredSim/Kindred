@@ -136,6 +136,7 @@ class SimulationPlan:
             self._cache_identity_payload_with_materialized_schedule_identity(),
         )
         self._validate_cache_identity_schedule()
+        self._validate_parameter_override_cache_identity()
 
     @classmethod
     def from_execution_request(
@@ -290,6 +291,47 @@ class SimulationPlan:
             raise ValueError(
                 "SimulationPlan cache_identity_payload simulation_identity "
                 "intervention schedule fingerprints conflict with execution_request."
+            )
+
+    def _validate_parameter_override_cache_identity(self) -> None:
+        overrides = getattr(self.execution_request, "parameter_overrides", None)
+        if not isinstance(overrides, Mapping) or not overrides:
+            return
+        request_payload = self.execution_request.to_payload()
+        request_identity = request_payload.get("simulation_identity")
+        cache_identity = self.simulation_identity_payload()
+        if not isinstance(request_identity, Mapping) or not request_identity:
+            raise ValueError(
+                "SimulationPlan execution_request parameter_overrides require "
+                "execution_request simulation_identity authority."
+            )
+        if not cache_identity:
+            raise ValueError(
+                "SimulationPlan execution_request parameter_overrides require "
+                "cache_identity_payload simulation_identity authority."
+            )
+        request_fingerprint = str(request_identity.get("param_fingerprint") or "")
+        cache_fingerprint = str(cache_identity.get("param_fingerprint") or "")
+        if not request_fingerprint or not cache_fingerprint:
+            raise ValueError(
+                "SimulationPlan execution_request parameter_overrides require "
+                "request and cache simulation identities with param_fingerprint."
+            )
+        if request_fingerprint != cache_fingerprint:
+            raise ValueError(
+                "SimulationPlan execution_request parameter_overrides conflict "
+                "with cache_identity_payload simulation_identity param_fingerprint."
+            )
+        conflicts = [
+            str(key)
+            for key, value in dict(request_identity).items()
+            if key in cache_identity and cache_identity.get(key) != value
+        ]
+        if conflicts:
+            raise ValueError(
+                "SimulationPlan execution_request parameter_overrides require "
+                "execution_request and cache identity to share the same simulation_identity truth; "
+                f"conflicting field(s): {', '.join(sorted(conflicts))}."
             )
 
 

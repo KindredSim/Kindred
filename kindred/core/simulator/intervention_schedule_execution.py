@@ -114,6 +114,7 @@ class InterventionScheduleExecutionOwner:
         trigger_counts = [0 for _ in trigger_events]
         trigger_last_times: list[float | None] = [None for _ in trigger_events]
         trigger_provenance: list[dict[str, object]] = []
+        segment_nonnegative_projections: list[Mapping[str, object]] = []
 
         for idx in range(len(boundaries) - 1):
             seg_start = float(boundaries[idx])
@@ -236,6 +237,17 @@ class InterventionScheduleExecutionOwner:
                 segment_symbolic_jacobians.append(bool(seg_result.symbolic_jacobian_used))
                 segment_sparsity_hints.append(bool(seg_result.jacobian_sparsity_hint))
                 segment_solvers.append(str(seg_result.solver_used or request.method))
+                segment_projection = seg_out.provenance.get("nonnegative_projection")
+                if _projection_happened(segment_projection):
+                    segment_nonnegative_projections.append(dict(segment_projection))
+                event_state_projection = seg_out.provenance.get("event_state_nonnegative_projection")
+                if _projection_happened(event_state_projection):
+                    segment_nonnegative_projections.append(
+                        {
+                            **dict(event_state_projection),
+                            "source": "event_state",
+                        }
+                    )
                 seg_events_all = _normal_event_provenance(seg_result.event_times, count=len(segment_events))
                 seg_event_states_all = _normal_event_states(
                     seg_result.event_states,
@@ -410,6 +422,7 @@ class InterventionScheduleExecutionOwner:
             segment_count=segment_count,
             trigger_provenance=trigger_provenance,
             event_provenance=event_provenance,
+            segment_nonnegative_projections=segment_nonnegative_projections,
         )
         return SimulationOutput(
             t=t_out,
@@ -434,6 +447,7 @@ class InterventionScheduleExecutionOwner:
         segment_count: int,
         trigger_provenance: Sequence[Mapping[str, object]],
         event_provenance: Sequence[Sequence[float]],
+        segment_nonnegative_projections: Sequence[Mapping[str, object]],
     ) -> None:
         distinct_segment_solvers = list(dict.fromkeys(segment_solvers))
         if len(distinct_segment_solvers) == 1:
@@ -472,6 +486,9 @@ class InterventionScheduleExecutionOwner:
             prov["intervention_trigger_events"] = list(trigger_provenance)
         if event_provenance:
             prov["events"] = [list(values) for values in event_provenance]
+        nonnegative_projection = _combined_nonnegative_projection(segment_nonnegative_projections)
+        if nonnegative_projection is not None:
+            prov["nonnegative_projection"] = nonnegative_projection
 
 
 class _InterventionRhs:
@@ -541,6 +558,45 @@ def _normal_event_states(
                 continue
         states[idx] = [np.asarray(row, dtype=float).reshape(-1) for row in arr]
     return states
+
+
+def _combined_nonnegative_projection(
+    projections: Sequence[Mapping[str, object]],
+) -> dict[str, object] | None:
+    if not projections:
+        return None
+    total_count = 0
+    max_negative_magnitude = 0.0
+    projected = False
+    segments: list[dict[str, object]] = []
+    for projection in projections:
+        if not _projection_happened(projection):
+            continue
+        count = int(projection.get("count", 0) or 0)
+        magnitude = float(projection.get("max_negative_magnitude", 0.0) or 0.0)
+        is_projected = bool(projection.get("projected")) or count > 0
+        total_count += count
+        max_negative_magnitude = max(max_negative_magnitude, magnitude)
+        projected = projected or is_projected
+        segments.append(dict(projection))
+    if not segments:
+        return None
+    return {
+        "projected": bool(projected),
+        "count": int(total_count),
+        "max_negative_magnitude": float(max_negative_magnitude),
+        "segments": segments,
+    }
+
+
+def _projection_happened(projection: object) -> bool:
+    if not isinstance(projection, Mapping):
+        return False
+    try:
+        count = int(projection.get("count", 0) or 0)
+    except Exception:
+        count = 0
+    return bool(projection.get("projected")) or count > 0
 
 
 def _request_for_internal_segment(req: SimulationRequest, *, t0: float, t1: float) -> SimulationRequest:

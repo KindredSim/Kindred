@@ -100,27 +100,27 @@ class MainWindowPreviewSession:
     def is_mechanism_valid_for_preview(self) -> bool:
         return bool(self._mw.is_mechanism_valid_for_preview())
 
-    def _clear_active_preview_cache_state(self) -> None:
-        mw = self._mw
-        try:
-            controller = getattr(mw, "_sim_controller", None)
-            batch_cache = getattr(controller, "batch_cache", None)
-            if batch_cache is not None:
-                clear_preview = getattr(batch_cache, "clear_active_preview_cache_identity_state", None)
-                if callable(clear_preview):
-                    clear_preview()
-        except Exception:
-            logger.debug("Failed to clear active preview cache state", exc_info=True)
+    def _deauthorize_runtime_input_preview_state(
+        self,
+        set_ids: Sequence[str] = (),
+        *,
+        preserve_display: bool = False,
+    ) -> None:
+        self._require_slider_preview_lifecycle_port().deauthorize_runtime_input_preview_state(
+            target_set_ids=tuple(str(set_id) for set_id in (set_ids or ()) if str(set_id)),
+            clear_plot=False,
+            preserve_display=bool(preserve_display),
+        )
 
     def _show_invalid_preview_state(self) -> None:
         mw = self._mw
-        self._clear_active_preview_cache_state()
+        self._deauthorize_runtime_input_preview_state()
         mw._refresh_batch_display_from_request_scope()
         mw._status_label.setText("Mechanism invalid — no preview available.")
 
     def show_preview_unavailable_for_dirty_state(self, message: str) -> None:
         mw = self._mw
-        self._clear_active_preview_cache_state()
+        self._deauthorize_runtime_input_preview_state()
         mw._refresh_batch_display_from_request_scope()
         mw._status_label.setText(str(message or "Preview unavailable. Adjust sliders or run again."))
 
@@ -197,7 +197,7 @@ class MainWindowPreviewSession:
         if not removed:
             return False
         self._bump_dirty_state_generation([set_id_s])
-        self._clear_active_preview_cache_state()
+        self._deauthorize_runtime_input_preview_state([set_id_s])
         self._refresh_transaction_button_state()
         return True
 
@@ -208,7 +208,7 @@ class MainWindowPreviewSession:
         cleared_set_ids = self.local_mechanism_workspace_set_ids()
         self._param_store.clear_all_local_overrides()
         self._bump_dirty_state_generation(cleared_set_ids)
-        self._clear_active_preview_cache_state()
+        self._deauthorize_runtime_input_preview_state(cleared_set_ids)
         self._refresh_transaction_button_state()
 
     def reset_current_mechanism_workspace(self) -> bool:
@@ -626,7 +626,7 @@ class MainWindowPreviewSession:
             self.set_runtime_parameter_schema(str(schema_text or ""))
         overrides_changed = self._param_store.sync_shared_params(values or {})
         if overrides_changed:
-            self._clear_active_preview_cache_state()
+            self._deauthorize_runtime_input_preview_state()
         self._refresh_transaction_button_state()
 
     def clear_staged_slider_values(self) -> None:
@@ -658,38 +658,16 @@ class MainWindowPreviewSession:
                 changed_set_ids.append(set_id_s)
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
-            self._clear_active_preview_cache_state()
-            self._deauthorize_display_for_runtime_input_change(changed_set_ids)
+            # While any staged set is still dirty, keep the last preview
+            # visible until its replacement publishes; only when the values
+            # returned to canonical does the display revert to canonical.
+            self._deauthorize_runtime_input_preview_state(
+                changed_set_ids,
+                preserve_display=any(
+                    self.has_dirty_state_for_set(set_id) for set_id in changed_set_ids
+                ),
+            )
         self._refresh_transaction_button_state()
-
-    def _deauthorize_display_for_runtime_input_change(self, changed_set_ids: Sequence[str]) -> None:
-        set_ids = tuple(str(set_id) for set_id in (changed_set_ids or ()) if str(set_id))
-        if not set_ids:
-            return
-        try:
-            results_controller = getattr(self._mw, "results_controller", None)
-            clear_workspace_previews = getattr(
-                results_controller,
-                "clear_display_if_workspace_previews_were_displayed",
-                None,
-            )
-            if callable(clear_workspace_previews):
-                clear_workspace_previews(
-                    set_ids,
-                    clear_plot=True,
-                )
-            deauthorize_active_display = getattr(
-                results_controller,
-                "deauthorize_active_display_for_runtime_input_change",
-                None,
-            )
-            if callable(deauthorize_active_display):
-                deauthorize_active_display(
-                    affected_set_ids=set_ids,
-                    affected_scope_is_global=False,
-                )
-        except Exception:
-            logger.debug("Failed to deauthorize display after runtime parameter edit", exc_info=True)
 
     def runtime_parameter_values(self, set_id: Optional[str] = None) -> dict[str, float]:
         target_set_id = str(set_id or "").strip() or self._focused_mechanism_workspace_set_id()
@@ -754,8 +732,12 @@ class MainWindowPreviewSession:
                 changed_set_ids.append(str(set_id))
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
-            self._clear_active_preview_cache_state()
-            self._deauthorize_display_for_runtime_input_change(changed_set_ids)
+            self._deauthorize_runtime_input_preview_state(
+                changed_set_ids,
+                preserve_display=any(
+                    self.has_dirty_state_for_set(set_id) for set_id in changed_set_ids
+                ),
+            )
             self.stage_slider_replay_intent(
                 set_ids=changed_set_ids,
                 source="species_slider",
@@ -1056,15 +1038,19 @@ class MainWindowPreviewSession:
             return
         logger.debug("Variable %s changed to %s", name, value)
         target_set_ids = self._ensure_slider_gesture_target_snapshot()
-        intent = self.stage_slider_replay_intent(
-            set_ids=target_set_ids,
-            source="variable_slider",
-        )
-        self.submit_slider_replay_intent(
-            intent,
-            preserve_existing_request=True,
-        )
         self.stage_runtime_parameter_value(name, float(value), target_set_ids=target_set_ids)
+        targets_dirty = any(
+            self.has_dirty_state_for_set(set_id) for set_id in target_set_ids
+        )
+        if targets_dirty:
+            intent = self.stage_slider_replay_intent(
+                set_ids=target_set_ids,
+                source="variable_slider",
+            )
+            self.submit_slider_replay_intent(
+                intent,
+                preserve_existing_request=True,
+            )
         if self._slider_drag_active or self._slider_release_in_progress:
             self._pending_slider_values[name] = value
         mw._refresh_derived_parameters_display()
@@ -1081,18 +1067,26 @@ class MainWindowPreviewSession:
                 timer.start()
             return
 
+        if not targets_dirty:
+            # Values match the canonical baseline: staging already restored the
+            # canonical display, so no preview simulation is needed.
+            self._slider_triggered_simulation = False
+            timer = self._variable_update_timer
+            if timer is not None and timer.isActive():
+                timer.stop()
+            self.submit_slider_replay_intent(None)
+            if self._slider_drag_active:
+                mw._status_label.setText(f"Adjusting {name} = {value:.3g} (canonical value)")
+            else:
+                mw._status_label.setText(f"{name} = {value:.3g} matches the canonical value.")
+            return
+
         self._slider_triggered_simulation = True
         interval_ms = self.variable_preview_debounce_ms(name)
         if self._slider_drag_active:
             mw._status_label.setText(f"Adjusting {name} = {value:.3g}")
         else:
             mw._status_label.setText(f"Previewing {name} = {value:.3g}")
-        timer = self._ensure_variable_update_timer(interval_ms=interval_ms)
-        timer.stop()
-        timer.setInterval(interval_ms)
-        timer.start()
-
-        interval_ms = self.variable_preview_debounce_ms(name)
         timer = self._ensure_variable_update_timer(interval_ms=interval_ms)
         timer.stop()
         timer.setInterval(interval_ms)
@@ -1215,6 +1209,12 @@ class MainWindowPreviewSession:
         if not pending:
             return
 
+        if not any(self.has_dirty_state_for_set(set_id) for set_id in target_set_ids):
+            # The gesture ended on canonical values; staging already restored
+            # the canonical display and no replay is needed.
+            self.submit_slider_replay_intent(None)
+            return
+
         intent = self.stage_slider_replay_intent(
             set_ids=target_set_ids,
             source="drag_release",
@@ -1229,15 +1229,28 @@ class MainWindowPreviewSession:
         timer.setInterval(0)
         timer.start()
 
+    def _slider_replay_targets_are_clean(self) -> bool:
+        intent = self.current_slider_replay_intent()
+        target_ids = tuple(intent.target_set_ids) if intent is not None else ()
+        if not target_ids:
+            return False
+        return not any(self.has_dirty_state_for_set(set_id) for set_id in target_ids)
+
     def _dispatch_variable_slider_preview_if_valid(self) -> None:
         if not self.is_mechanism_valid_for_preview():
             self._show_invalid_preview_state()
+            return
+        if self._slider_replay_targets_are_clean():
+            self.submit_slider_replay_intent(None)
             return
         self._require_slider_preview_lifecycle_port().launch_pending_slider_preview_replay()
 
     def _dispatch_species_slider_preview_if_valid(self) -> None:
         if not self.is_mechanism_valid_for_preview():
             self._show_invalid_preview_state()
+            return
+        if self._slider_replay_targets_are_clean():
+            self.submit_slider_replay_intent(None)
             return
         self._require_slider_preview_lifecycle_port().launch_pending_slider_preview_replay()
 

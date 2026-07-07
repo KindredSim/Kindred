@@ -1370,11 +1370,15 @@ class BatchRunContextOwner:
             return CompletedRunDisplayCoverage(cause=DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS)
         run_target_ids_raw = tuple(str(set_id) for set_id in intent.run_target_set_ids if str(set_id))
         requested_show_ids = tuple(str(set_id) for set_id in intent.requested_show_set_ids if str(set_id))
-        intent_set_ids = requested_show_ids
+        intent_set_ids = requested_show_ids or run_target_ids_raw
         if not intent_set_ids:
             return CompletedRunDisplayCoverage(cause=DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS)
         all_run_target_members = set(run_target_ids_raw)
-        non_run_requested_ids = tuple(set_id for set_id in intent_set_ids if set_id not in all_run_target_members)
+        non_run_requested_ids = (
+            tuple(set_id for set_id in requested_show_ids if set_id not in all_run_target_members)
+            if requested_show_ids
+            else ()
+        )
         run_target_members = set(run_target_ids_raw)
         if run_target_members:
             run_target_set_ids = tuple(set_id for set_id in intent_set_ids if set_id in run_target_members)

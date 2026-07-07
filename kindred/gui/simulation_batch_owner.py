@@ -22,14 +22,13 @@ from kindred.core.batch_cache_contracts import (
 )
 from kindred.gui.display_authority import (
     compose_resolved_display_request_entry,
-    resolve_canonical_reference_authority,
 )
 from kindred.gui.ports import (
     BatchDisplayRequestCoverage,
     BatchDisplayRequestResolution,
     ConcentrationSetInteractionTransaction,
+    DisplayAuthorityInvalidationContext,
     DisplayTransitionCause,
-    RequestScopeRestoreTruth,
     ResolvedBatchDisplayRequestEntry,
 )
 
@@ -363,13 +362,10 @@ class SimulationBatchOwner:
         return str(value) if value else None
 
     def preview_initials_for_row(self, row: int, baseline: Dict[str, float]) -> Dict[str, float]:
-        preview = getattr(self._preview_session, "preview_initials_for_row", None)
-        if callable(preview):
-            try:
-                return dict(preview(int(row), dict(baseline or {})))
-            except Exception:
-                return dict(baseline or {})
-        return dict(baseline or {})
+        try:
+            return dict(self._preview_session.preview_initials_for_row(int(row), dict(baseline or {})))
+        except Exception:
+            return dict(baseline or {})
 
     def stage_concentration_value_for_rows(self, rows: Sequence[int], *, species: str, value: float) -> bool:
         stage = getattr(self._preview_session, "stage_concentration_value_for_rows", None)
@@ -732,6 +728,14 @@ class SimulationBatchOwner:
         invalidated_set_ids = {
             str(set_id) for set_id in (batch_cache.active_cache_invalidated_set_ids or ()) if str(set_id)
         }
+        active_valid_set_ids.update(
+            str(set_id)
+            for set_id, _entry in batch_cache.entries_for_cache_key(
+                cache_key=active_cache_key,
+                is_preview=False,
+            )
+            if str(set_id) and str(set_id) not in invalidated_set_ids
+        )
         focused_set_id = str(self.focused_batch_set_id() or "").strip()
 
         resolved_entries: list[ResolvedBatchDisplayRequestEntry] = []
@@ -764,32 +768,23 @@ class SimulationBatchOwner:
                         semantic_unavailable_set_ids.append(set_id)
                         continue
                     has_resolved_workspace_preview = True
-                    reference_authority = resolve_canonical_reference_authority(
-                        set_id=set_id,
-                        active_cache_key=active_cache_key,
-                        active_cache_valid_set_ids=active_valid_set_ids,
-                        active_cache_invalidated_set_ids=invalidated_set_ids,
-                        workspace_preview_provenance=workspace_preview_provenance,
-                        load_canonical_reference_candidate=lambda: batch_cache.entry_for_set(
-                            cache_key=active_cache_key,
-                            set_id=set_id,
-                            is_preview=False,
-                            require_completion_provenance=True,
-                        ).entry,
-                    )
                     resolved_entries.append(
                         compose_resolved_display_request_entry(
                             set_id=str(set_id),
                             label=str(label),
                             active_display_payload=preview_entry.entry,
-                            canonical_reference_candidate=(
-                                reference_authority.canonical_reference_candidate
+                            invalidation_context=DisplayAuthorityInvalidationContext(
+                                active_cache_key=active_cache_key,
+                                active_cache_set_is_valid=(
+                                    None
+                                    if not active_cache_key
+                                    else (
+                                        (not active_valid_set_ids and not invalidated_set_ids)
+                                        or set_id in active_valid_set_ids
+                                    )
+                                ),
+                                active_cache_set_is_invalidated=set_id in invalidated_set_ids,
                             ),
-                            canonical_reference_eligible_for_current_inputs=(
-                                reference_authority.canonical_reference_eligible_for_current_inputs
-                            ),
-                            invalidation_context=reference_authority.invalidation_context,
-                            request_scope_restore_truth=RequestScopeRestoreTruth.WORKSPACE_PREVIEW,
                             workspace_preview_provenance=workspace_preview_provenance,
                         )
                     )
@@ -820,27 +815,19 @@ class SimulationBatchOwner:
                 require_completion_provenance=True,
             )
             if explicit_entry.entry is not None:
-                explicit_authority = resolve_canonical_reference_authority(
-                    set_id=set_id,
-                    active_cache_key=active_cache_key,
-                    active_cache_valid_set_ids=active_valid_set_ids,
-                    active_cache_invalidated_set_ids=invalidated_set_ids,
-                    workspace_preview_provenance={"restore_truth": "explicit_cache"},
-                    load_canonical_reference_candidate=lambda: explicit_entry.entry,
-                )
                 resolved_entries.append(
                     compose_resolved_display_request_entry(
                         set_id=str(set_id),
                         label=str(label),
                         active_display_payload=explicit_entry.entry,
-                        canonical_reference_candidate=(
-                            explicit_authority.canonical_reference_candidate
+                        invalidation_context=DisplayAuthorityInvalidationContext(
+                            active_cache_key=active_cache_key,
+                            active_cache_set_is_valid=(
+                                (not active_valid_set_ids and not invalidated_set_ids)
+                                or set_id in active_valid_set_ids
+                            ),
+                            active_cache_set_is_invalidated=set_id in invalidated_set_ids,
                         ),
-                        canonical_reference_eligible_for_current_inputs=(
-                            explicit_authority.canonical_reference_eligible_for_current_inputs
-                        ),
-                        invalidation_context=explicit_authority.invalidation_context,
-                        request_scope_restore_truth=RequestScopeRestoreTruth.EXPLICIT_CACHE,
                     )
                 )
                 if set_id == focused_set_id:

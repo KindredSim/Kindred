@@ -185,14 +185,15 @@ def build_run_start_context(
 ) -> RunStartContext:
     queue_ids = list(mechanism_context.queue_ids)
     requested_show_intent_set_ids = _deduped_nonempty_set_ids(requested_show_set_ids)
+    display_lane_intent_set_ids = requested_show_intent_set_ids or _deduped_nonempty_set_ids(queue_ids)
     requested_show_intent_labels_by_set_id = _completed_run_display_labels_by_set_id(
-        requested_show_set_ids=requested_show_intent_set_ids,
+        requested_show_set_ids=display_lane_intent_set_ids,
         requested_show_labels_by_set_id=requested_show_labels_by_set_id,
         queue_ids=queue_ids,
         queue_names=mechanism_context.queue_names,
     )
     display_primary_set_id = _completed_run_display_primary_set_id(
-        requested_show_set_ids=requested_show_intent_set_ids,
+        requested_show_set_ids=display_lane_intent_set_ids,
         preferred_set_id=mechanism_context.primary_set_id,
     )
     parallel_mode = bool(int(effective_workers) > 1 and len(queue_ids) > 1)
@@ -273,7 +274,7 @@ def build_run_start_context(
             request_id=int(request_id),
             owned_species_by_set_id=_completed_run_display_owned_species_by_set_id(
                 dispatch_context=dispatch_context,
-                set_ids=requested_show_intent_set_ids,
+                set_ids=display_lane_intent_set_ids,
             ),
             run_target_set_ids=tuple(str(set_id) for set_id in queue_ids if str(set_id)),
         ),
@@ -998,7 +999,6 @@ class SimulationRunDispatchPreparationOwner:
                     initials=dict(initials_dict),
                     mechanism_text=mechanism_text_by_set_id.get(set_id_s, mechanism_context.owner_full_dsl),
                     simulation_identity=simulation_identity_by_set_id.get(set_id_s),
-                    plan_payload=None,
                     preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(set_id_s, ""),
                     prepared_payload=(
                         dict(prepared_execution_payload)

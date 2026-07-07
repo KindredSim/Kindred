@@ -109,6 +109,7 @@ class FitResult:
     message: str
     covariance: Optional[np.ndarray] = None
     identifiability_warning: Optional[str] = None
+    parameter_space: str = "optimizer"
 
 
 def fit_parameters(
@@ -143,8 +144,16 @@ def fit_parameters(
     def _vector_to_param_dict(vector: np.ndarray) -> Dict[str, float]:
         return {name: float(vector[i]) for i, name in enumerate(param_names)}
 
-    def _build_failed_result(message: str, *, failed_params: Optional[Dict[str, float]] = None) -> FitResult:
+    def _build_failed_result(
+        message: str,
+        *,
+        failed_params: Optional[Dict[str, float]] = None,
+        parameter_space: str = "optimizer",
+    ) -> FitResult:
         params = failed_params or _vector_to_param_dict(x0)
+        space = str(parameter_space or "optimizer").strip().lower()
+        if space not in {"optimizer", "physical"}:
+            raise ValueError(f"Unknown failed parameter space: {parameter_space!r}")
         return FitResult(
             success=False,
             parameters=params,
@@ -156,6 +165,7 @@ def fit_parameters(
             message=message,
             covariance=None,
             identifiability_warning=None,
+            parameter_space=space,
         )
 
     def wrapped_objective(params):
@@ -280,7 +290,17 @@ def fit_parameters(
                 raise
             except FitSimulationError as exc:
                 logger.error("Simulation failed when evaluating DE optimum: %s", exc)
-                return _build_failed_result(str(exc), failed_params=exc.failed_params or _vector_to_param_dict(x_opt))
+                if exc.failed_params:
+                    return _build_failed_result(
+                        str(exc),
+                        failed_params=exc.failed_params,
+                        parameter_space="physical",
+                    )
+                return _build_failed_result(
+                    str(exc),
+                    failed_params=_vector_to_param_dict(x_opt),
+                    parameter_space="optimizer",
+                )
             covariance = None
         else:
             least_squares, _de = scipy_loader()
@@ -343,7 +363,17 @@ def fit_parameters(
                 raise
             except FitSimulationError as exc:
                 logger.error("Simulation failed when evaluating optimal parameters: %s", exc)
-                return _build_failed_result(str(exc), failed_params=exc.failed_params or _vector_to_param_dict(x_opt))
+                if exc.failed_params:
+                    return _build_failed_result(
+                        str(exc),
+                        failed_params=exc.failed_params,
+                        parameter_space="physical",
+                    )
+                return _build_failed_result(
+                    str(exc),
+                    failed_params=_vector_to_param_dict(x_opt),
+                    parameter_space="optimizer",
+                )
             except Exception:
                 residuals = result.fun
 
@@ -373,7 +403,13 @@ def fit_parameters(
         raise
     except FitSimulationError as exc:
         logger.error("Simulation failed during fitting: %s", exc)
-        return _build_failed_result(str(exc), failed_params=exc.failed_params)
+        if exc.failed_params:
+            return _build_failed_result(
+                str(exc),
+                failed_params=exc.failed_params,
+                parameter_space="physical",
+            )
+        return _build_failed_result(str(exc), parameter_space="optimizer")
     except RuntimeError as exc:
         if _is_cancelled_error(exc):
             raise FittingCancelled() from exc
@@ -429,4 +465,5 @@ def fit_parameters(
         message=message,
         covariance=covariance,
         identifiability_warning=identifiability_warning,
+        parameter_space="optimizer",
     )

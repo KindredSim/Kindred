@@ -321,6 +321,7 @@ if PYQTGRAPH_AVAILABLE:
             self._invert_y_axis: bool = False
             self._enable_axis_inversion_actions = bool(enable_axis_inversion_actions)
             self._enable_reference_layer_toggle_action = bool(enable_reference_layer_toggle_action)
+            self._reference_layers_visible_requested = True
             self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
             self._copy_all_export_plan_provider: Optional[Callable[[], Optional[CopyAllExportPlan]]] = None
             self._copy_status_text_callback: Optional[Callable[[str], None]] = None
@@ -584,9 +585,17 @@ if PYQTGRAPH_AVAILABLE:
                 if isinstance(annotation, Mapping)
             ]
             self._show_intervention_annotations = bool(payload.show_intervention_annotations)
+            reference_layers = [
+                layer
+                for layer in self._simulation_overlays
+                if isinstance(layer, PlotDisplayLayer) and self._is_reference_layer(layer)
+            ]
+            if reference_layers:
+                self._reference_layers_visible_requested = all(bool(layer.visible) for layer in reference_layers)
             self._refresh_simulation_display()
 
         def request_reference_layers_visible(self, visible: bool) -> None:
+            self._reference_layers_visible_requested = bool(visible)
             self.referenceLayerVisibilityRequested.emit(bool(visible))
 
         @staticmethod
@@ -754,17 +763,29 @@ if PYQTGRAPH_AVAILABLE:
                 )
             return {"layers": layers}
 
-        def clear_display_transaction_state(self, *, preserve_y_selection_state: bool = False) -> None:
+        def clear_display_transaction_state(
+            self,
+            *,
+            preserve_y_selection_state: bool = False,
+            preserve_range_state: bool = False,
+        ) -> None:
             preserved_visibility = (
                 dict(self._visible)
                 if bool(preserve_y_selection_state) and bool(self._y_selection_user_touched)
                 else {}
             )
             preserved_touched = bool(preserve_y_selection_state) and bool(self._y_selection_user_touched)
+            preserved_auto_range = bool(self._auto_range_enabled)
+            preserved_manual_ranges = tuple(self._manual_range_values)
             self.clear()
             if preserved_touched:
                 self._y_selection_user_touched = True
                 self._preserved_y_selection_visibility = preserved_visibility
+            if bool(preserve_range_state):
+                self._auto_range_enabled = preserved_auto_range
+                self._manual_range_values = preserved_manual_ranges
+                self._toolbar.set_manual_ranges(*preserved_manual_ranges)
+                self._project_toolbar_auto_range(preserved_auto_range)
             self.set_statistics_results({}, prefer="")
 
         def has_display_data(self) -> bool:
@@ -3047,7 +3068,7 @@ if PYQTGRAPH_AVAILABLE:
                 ghost_action = menu.addAction("Show Canonical Reference Lines")
                 ghost_action.setCheckable(True)
                 ghost_action.setChecked(self._reference_layers_visible_from_projection())
-                ghost_action.setEnabled(self._has_reference_layers() or self.has_display_data())
+                ghost_action.setEnabled(True)
                 ghost_action.toggled.connect(self.request_reference_layers_visible)
                 menu.addSeparator()
 
@@ -3110,11 +3131,9 @@ if PYQTGRAPH_AVAILABLE:
                     continue
                 if self._is_reference_layer(layer):
                     return True
-            # Reference overlays can be hydrated lazily by the results
-            # controller from the active display/cache transaction.  The menu
-            # action therefore remains available whenever a simulation payload
-            # is present, even if no REFERENCE_OVERLAY metadata has been
-            # materialized yet.
+            # Reference visibility is a projection preference.  The menu action
+            # remains available while a simulation payload is present even when
+            # the current projection has no reference layer.
             return self._t is not None and bool(self._series)
 
         def _reference_layers_visible_from_projection(self) -> bool:
@@ -3124,7 +3143,7 @@ if PYQTGRAPH_AVAILABLE:
                 if isinstance(layer, PlotDisplayLayer) and self._is_reference_layer(layer)
             ]
             if not reference_layers:
-                return False
+                return bool(self._reference_layers_visible_requested)
             return all(bool(layer.visible) for layer in reference_layers)
 
         def _apply_axis_inversion_state(self) -> None:

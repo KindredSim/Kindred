@@ -216,6 +216,7 @@ def active_transaction_for_display_commit(
     active_kind: ActiveDisplayKind,
     status: DisplayStatus,
     additional_metadata: Sequence[DisplaySetMetadata] = (),
+    cache_key: str = "",
     request_id: int | None = None,
     run_id: int | None = None,
     intervention_annotations: Sequence[Mapping[str, Any]] = (),
@@ -250,6 +251,7 @@ def active_transaction_for_display_commit(
             additional_metadata=additional_metadata,
         ),
         status=status,
+        cache_key=str(cache_key or "").strip(),
         intervention_annotations=tuple(
             dict(item)
             for item in (intervention_annotations or ())

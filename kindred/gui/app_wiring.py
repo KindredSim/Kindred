@@ -382,6 +382,7 @@ def build_window_shell(main_window: MainWindow) -> WindowShellComponents:
         batch_id_for_name=main_window.batch_set_id_for_name,
         batch_set_ids_for_scope=main_window.batch_set_ids_for_scope,
         requested_show_batch_set_ids=main_window.requested_show_batch_set_ids,
+        effective_display_request_set_ids=main_window.effective_display_request_set_ids,
         explicit_slider_target_set_ids=main_window._slider_edit_target_set_ids,
         effective_slider_target_set_ids=main_window._effective_slider_edit_target_set_ids,
         focused_batch_set_id=main_window.focused_batch_set_id,

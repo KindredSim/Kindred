@@ -351,7 +351,6 @@ def fit_global(
         fit_parameters_completed = True
 
         opt_param_keys = layout.opt_param_keys()
-        x_opt = np.asarray([fit_result.parameters[key] for key in opt_param_keys], dtype=float)
         success = bool(fit_result.success)
         message = str(fit_result.message)
         nfev = int(fit_result.nfev)
@@ -381,6 +380,14 @@ def fit_global(
                     dataset_id=str(ds_tag) if ds_tag is not None else None,
                 )
 
+        if (not success) and str(getattr(fit_result, "parameter_space", "optimizer")) == "physical":
+            return _failed_result(
+                message,
+                failed_params=dict(fit_result.parameters or {}),
+                optimizer_diagnostic=optimizer_diagnostic,
+            )
+
+        x_opt = np.asarray([fit_result.parameters[key] for key in opt_param_keys], dtype=float)
         fitted_params = layout.shared_param_dict_from_vector(x_opt)
 
         combined_dataset_params: Dict[str, Dict[str, float]] = {

@@ -431,11 +431,13 @@ class ActiveDisplayTransaction:
     primary_display_set_id: str
     sets: Mapping[str, DisplaySetMetadata]
     status: DisplayStatus
+    cache_key: str = ""
     intervention_annotations: tuple[Mapping[str, Any], ...] = ()
     show_intervention_annotations: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "transaction_id", str(self.transaction_id or "").strip())
+        object.__setattr__(self, "cache_key", str(self.cache_key or "").strip())
         object.__setattr__(self, "display_set_ids", _normalized_str_tuple(self.display_set_ids))
         object.__setattr__(
             self,
@@ -560,18 +562,6 @@ class BatchDisplayRefreshOutcome:
     transition_outcome: DisplayTransitionOutcome | None = None
 
 
-class CanonicalReferenceEligibility(Enum):
-    UNAVAILABLE = "unavailable"
-    PROVEN = "proven"
-    SAME_AS_ACTIVE_RESULT = "same_as_active_result"
-
-
-class RequestScopeRestoreTruth(Enum):
-    NONE = "none"
-    WORKSPACE_PREVIEW = "workspace_preview"
-    EXPLICIT_CACHE = "explicit_cache"
-
-
 @dataclass(frozen=True, slots=True)
 class DisplayAuthorityInvalidationContext:
     active_cache_key: str = ""
@@ -582,24 +572,9 @@ class DisplayAuthorityInvalidationContext:
 @dataclass(frozen=True, slots=True)
 class DisplayAuthorityBundle:
     active_display_payload: Mapping[str, Any]
-    canonical_reference_payload: Mapping[str, Any] | None = None
-    canonical_reference_eligible_for_current_inputs: bool = False
-    canonical_reference_eligibility: CanonicalReferenceEligibility = (
-        CanonicalReferenceEligibility.UNAVAILABLE
-    )
     invalidation_context: DisplayAuthorityInvalidationContext = field(
         default_factory=DisplayAuthorityInvalidationContext
     )
-    request_scope_restore_truth: RequestScopeRestoreTruth = RequestScopeRestoreTruth.NONE
-
-    @property
-    def canonical_reference_entry(self) -> Mapping[str, Any] | None:
-        if self.canonical_reference_eligibility not in {
-            CanonicalReferenceEligibility.PROVEN,
-            CanonicalReferenceEligibility.SAME_AS_ACTIVE_RESULT,
-        }:
-            return None
-        return self.canonical_reference_payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -612,10 +587,6 @@ class ResolvedBatchDisplayRequestEntry:
     @property
     def entry(self) -> Mapping[str, Any]:
         return self.authority.active_display_payload
-
-    @property
-    def canonical_entry(self) -> Mapping[str, Any] | None:
-        return self.authority.canonical_reference_entry
 
 
 @dataclass(frozen=True, slots=True)
@@ -765,10 +736,6 @@ class FreshPreviewDisplayEntry:
             if str(name)
         )
 
-    @property
-    def canonical_reference_entry(self) -> Mapping[str, Any] | None:
-        return self.authority.canonical_reference_entry
-
     def to_display_payload(self) -> Dict[str, Any]:
         return dict(self.authority.active_display_payload or {})
 
@@ -865,6 +832,17 @@ class SliderPreviewLifecyclePort(Protocol):
         self,
         *,
         target_set_ids: Sequence[str] = (),
+        clear_plot: bool = False,
+        clear_active_cache_identity: bool | None = False,
+        clear_pending_replay: bool = False,
+    ) -> None: ...
+
+    def deauthorize_runtime_input_preview_state(
+        self,
+        *,
+        target_set_ids: Sequence[str] = (),
+        clear_plot: bool = False,
+        preserve_display: bool = False,
     ) -> None: ...
 
     def launch_pending_slider_preview_replay(self) -> None: ...
@@ -1236,6 +1214,14 @@ class SimulationResultsPort(Protocol):
         request_id: Optional[int] = None,
         run_id: Optional[int] = None,
         status_text: str = "",
+    ) -> DisplayTransitionOutcome | None: ...
+
+    def deauthorize_active_display_for_runtime_input_change(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        affected_scope_is_global: bool,
+        clear_plot: bool = False,
     ) -> DisplayTransitionOutcome | None: ...
 
 

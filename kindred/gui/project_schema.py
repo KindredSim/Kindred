@@ -22,6 +22,7 @@ from kindred.core.runtime_defaults import (
     USE_SPARSE_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 )
+from kindred.core.exceptions import SolverError
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
 from kindred.gui.fitting.constants import (
     FITTING_DEFAULT_SOLVER,
@@ -241,7 +242,18 @@ def _require_choice_field(
 ) -> None:
     value = str(data[field]).strip()
     if normalize_solver:
-        normalized = normalize_solver_name(value)
+        try:
+            normalized = normalize_solver_name(value)
+        except SolverError as exc:
+            if value.strip().upper() == "LSODA":
+                raise ValueError(
+                    f"project payload field {field!r} uses unsupported saved solver 'LSODA'; "
+                    f"supported solvers are {choices!r}."
+                ) from exc
+            raise ValueError(
+                f"project payload field {field!r} uses unsupported saved solver {value!r}; "
+                f"supported solvers are {choices!r}."
+            ) from exc
         if str(normalized) not in choices:
             raise ValueError(f"project payload field {field!r} must be one of {choices!r}.")
         return

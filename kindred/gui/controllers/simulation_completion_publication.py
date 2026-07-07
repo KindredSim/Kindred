@@ -9,10 +9,8 @@ from kindred.core.simulation_preparation import require_complete_internal_solver
 from kindred.core.simulation_identity import coerce_simulation_identity
 from kindred.core.temperature import coerce_temperature_kelvin
 from kindred.core.time_grid import normalize_time_grid_policy
-from kindred.gui.display_authority import (
-    compose_fresh_preview_display_entry,
-    resolve_canonical_reference_authority,
-)
+from kindred.gui.display_authority import compose_fresh_preview_display_entry
+from kindred.gui.ports import DisplayAuthorityInvalidationContext
 from kindred.gui.controllers.simulation_lifecycle_effects import SimulationLifecycleEffects
 from kindred.gui.controllers.simulation_completion_policy import CacheAuthorityState, CompletionPolicyContext
 from kindred.gui.controllers.simulation_result_materialization import MaterializedDisplayResult
@@ -87,7 +85,7 @@ class SimulationCompletionPublicationDependencies:
     flush_slider_plot_updates: Callable[..., None]
     show_scoped_batch_failure_summary: Callable[..., None]
     request_completion_preview_replay: Callable[..., None]
-    clear_pending_progress_status: Callable[[], None] = lambda: None
+    clear_pending_progress_status: Callable[[], None]
 
 
 class SimulationCompletionPublicationOwner:
@@ -515,7 +513,6 @@ class SimulationCompletionPublicationOwner:
         if not isinstance(workspace_provenance, Mapping):
             workspace_provenance = self._fresh_preview_workspace_identity_payload(state)
         workspace_provenance = dict(workspace_provenance)
-        canonical_reference_entry: Mapping[str, Any] | None = None
         active_cache_key = str(self._batch_cache.active_cache_key or "").strip()
         active_valid_set_ids = {
             str(candidate_set_id)
@@ -527,20 +524,6 @@ class SimulationCompletionPublicationOwner:
             for candidate_set_id in (self._batch_cache.active_cache_invalidated_set_ids or ())
             if str(candidate_set_id)
         }
-        reference_authority = resolve_canonical_reference_authority(
-            set_id=set_id,
-            active_cache_key=active_cache_key,
-            active_cache_valid_set_ids=active_valid_set_ids,
-            active_cache_invalidated_set_ids=active_invalidated_set_ids,
-            workspace_preview_provenance=workspace_provenance,
-            load_canonical_reference_candidate=lambda: self._batch_cache.entry_for_set(
-                cache_key=active_cache_key,
-                set_id=set_id,
-                is_preview=False,
-                require_completion_provenance=True,
-            ).entry,
-        )
-        canonical_reference_entry = reference_authority.canonical_reference_candidate
         owned_species = self._base_owned_species_from_completion(completion)
         materialized = self._materialize_completion_display(
             completion,
@@ -560,11 +543,18 @@ class SimulationCompletionPublicationOwner:
                 "owned_species": materialized.owned_species,
                 "display_species": materialized.display_species,
             },
-            canonical_reference_candidate=canonical_reference_entry,
-            canonical_reference_eligible_for_current_inputs=(
-                reference_authority.canonical_reference_eligible_for_current_inputs
+            invalidation_context=DisplayAuthorityInvalidationContext(
+                active_cache_key=active_cache_key,
+                active_cache_set_is_valid=(
+                    None
+                    if not active_cache_key
+                    else (
+                        (not active_valid_set_ids and not active_invalidated_set_ids)
+                        or set_id in active_valid_set_ids
+                    )
+                ),
+                active_cache_set_is_invalidated=set_id in active_invalidated_set_ids,
             ),
-            invalidation_context=reference_authority.invalidation_context,
             workspace_preview_provenance=workspace_provenance,
         )
 
@@ -1093,8 +1083,10 @@ class SimulationCompletionPublicationOwner:
         completion: CompletionResultState,
         state: CompletionCallbackState,
         *,
-        display_outcome: SimulationCompletionDisplayOutcome | None = None,
+        display_outcome: SimulationCompletionDisplayOutcome,
     ) -> None:
+        if not isinstance(display_outcome, SimulationCompletionDisplayOutcome):
+            raise TypeError("display_outcome must be a SimulationCompletionDisplayOutcome.")
         if (not state.is_preview) and isinstance(state.ctx, dict):
             state.ctx = self._deps.finalize_explicit_batch_dirty_reset(
                 state.ctx,

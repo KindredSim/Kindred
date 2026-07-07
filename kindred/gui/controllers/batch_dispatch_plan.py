@@ -24,7 +24,7 @@ class BatchSetDispatchInput:
     initials: Mapping[str, Any]
     mechanism_text: str
     simulation_identity: Mapping[str, Any] | None
-    plan_payload: Mapping[str, Any] | None
+    plan_payload: Mapping[str, Any] | None = None
     preview_batch_cache_token: str = ""
     prepared_payload: Mapping[str, Any] | None = None
     parameter_overrides: Mapping[str, Any] | None = None
@@ -35,8 +35,8 @@ class BatchSetDispatchInput:
 
 @dataclass(frozen=True)
 class BatchSetDispatchPlan:
-    plan_payload: Dict[str, Any] | None
-    execution_request: Dict[str, Any] | None
+    plan_payload: Dict[str, Any]
+    execution_request: Dict[str, Any]
     simulation_identity: Dict[str, Any]
 
 
@@ -51,7 +51,7 @@ class SerialBatchDispatchInput:
 
 @dataclass(frozen=True)
 class SerialBatchDispatchPlan:
-    plan_payload: Dict[str, Any] | None
+    plan_payload: Dict[str, Any]
     cache_key: str
 
 
@@ -319,13 +319,7 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
             simulation_identity=simulation_identity,
         )
 
-    if not simulation_identity:
-        raise ValueError(f"Missing submitted simulation identity for set {dispatch_input.set_id!r}.")
-    return BatchSetDispatchPlan(
-        plan_payload=None,
-        execution_request=execution_request if isinstance(execution_request, dict) else None,
-        simulation_identity=simulation_identity,
-    )
+    raise ValueError(f"Missing simulation plan payload for set {dispatch_input.set_id!r}.")
 
 
 def build_serial_batch_dispatch_plan(
@@ -417,7 +411,7 @@ def build_serial_batch_dispatch_plan(
         raise ValueError(f"Missing submitted simulation identity for set {set_id!r}.")
 
     return SerialBatchDispatchPlan(
-        plan_payload=plan_payload if isinstance(plan_payload, dict) else None,
+        plan_payload=dict(plan_payload),
         cache_key=str(cache_key),
     )
 

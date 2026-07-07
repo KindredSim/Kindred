@@ -412,13 +412,14 @@ class SimulationFailurePolicyOwner:
             context=context,
             freshness=freshness,
             fast_mode=active_fast_mode,
+            policy_context=policy_context,
         )
 
     def _current_preview_failure_display_target_set_ids(
         self,
         *,
         policy_context: CompletionPolicyContext | None,
-        callback_identity: SimulationCallbackIdentity,
+        callback_identity: SimulationCallbackIdentity | None,
     ) -> tuple[str, ...]:
         for raw_values in (
             getattr(policy_context, "preview_scope_set_ids", None),
@@ -435,6 +436,12 @@ class SimulationFailurePolicyOwner:
             ownership = None
         owner_request_id = getattr(ownership, "request_id", None)
         owner_epoch = getattr(ownership, "epoch", None)
+        if callback_identity is None:
+            # Unattributable preview failure: the current preview ownership is
+            # the best available scope truth.
+            if owner_request_id is not None:
+                return normalize_preview_target_set_ids(getattr(ownership, "target_set_ids", ()) or ())
+            return ()
         callback_epoch = getattr(callback_identity, "preview_owner_epoch", None)
         if owner_request_id is not None and int(owner_request_id) == int(callback_identity.request_id):
             epoch_matches = callback_epoch is None or owner_epoch is None or int(owner_epoch) == int(callback_epoch)
@@ -593,6 +600,7 @@ class SimulationFailurePolicyOwner:
         freshness: Any,
         fast_mode: bool,
         missing_context_reason: str = "",
+        policy_context: CompletionPolicyContext | None = None,
     ) -> SimulationFailureDecision:
         envelope = SimulationFailureEnvelope.from_payload(
             payload,
@@ -603,6 +611,28 @@ class SimulationFailurePolicyOwner:
         )
         cancelled = bool(envelope.cancelled)
         runtime_kind = "stop" if cancelled else "terminal_failure"
+        display_consequence = FailureDisplayConsequenceRequest.none()
+        if bool(fast_mode) and not cancelled:
+            # A terminally failed preview must not leave the previous (stale)
+            # preview on screen; fall back to the canonical display lane. With
+            # no attributable scope the empty target tuple means "the entire
+            # preview lane".
+            display_consequence = FailureDisplayConsequenceRequest(
+                kind="deauthorize_current_preview_failure",
+                target_set_ids=self._current_preview_failure_display_target_set_ids(
+                    policy_context=policy_context,
+                    callback_identity=callback_identity,
+                ),
+                request_id=(
+                    int(callback_identity.request_id) if callback_identity is not None else None
+                ),
+                run_id=int(callback_identity.run_id) if callback_identity is not None else None,
+                preview_owner_epoch=(
+                    callback_identity.preview_owner_epoch if callback_identity is not None else None
+                ),
+                status_text="",
+                failure_payload=envelope.payload,
+            )
         return SimulationFailureDecision(
             disposition="terminal_failure",
             envelope=envelope,
@@ -618,6 +648,7 @@ class SimulationFailurePolicyOwner:
                 replay_fast_mode=bool(fast_mode),
                 terminal_replay_needed=not cancelled,
             ),
+            display_consequence=display_consequence,
             ui_consequence=FailureUiConsequenceRequest(kind="terminal_failure"),
             accepted_runtime_completion=False,
             consumed_runtime_completion=False,

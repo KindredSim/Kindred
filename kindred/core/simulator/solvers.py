@@ -44,7 +44,7 @@ from kindred.core.exceptions import (
     create_solver_error,
 )
 from kindred.core.time_grid import build_time_grid
-from .nonnegative_invariant import apply_nonnegative_trajectory_invariant
+from .nonnegative_invariant import project_nonnegative_trajectory
 from .solver_output import solver_trajectory_array
 from .intervention_schedule_execution import (
     InterventionScheduleExecutionOwner,
@@ -78,12 +78,19 @@ __all__ = [
 ]
 
 
-def _normal_event_states(raw_states: object, *, count: int, species_count: int) -> list[list[np.ndarray]]:
+def _normal_event_states_with_projection(
+    raw_states: object,
+    *,
+    count: int,
+    species_count: int,
+) -> tuple[list[list[np.ndarray]], dict[str, object]]:
     states: list[list[np.ndarray]] = [[] for _ in range(max(0, int(count)))]
+    projection_count = 0
+    max_negative_magnitude = 0.0
     if raw_states is None or count <= 0:
-        return states
+        return states, {"projected": False, "count": 0, "max_negative_magnitude": 0.0}
     if not isinstance(raw_states, Sequence):
-        return states
+        return states, {"projected": False, "count": 0, "max_negative_magnitude": 0.0}
     for idx in range(min(int(count), len(raw_states))):
         raw = raw_states[idx]
         arr = np.asarray(raw, dtype=float)
@@ -101,13 +108,32 @@ def _normal_event_states(raw_states: object, *, count: int, species_count: int) 
                 arr = arr.reshape(-1, int(species_count))
             except Exception:
                 continue
-        states[idx] = [
-            apply_nonnegative_trajectory_invariant(
+        projected_rows: list[np.ndarray] = []
+        for row in arr:
+            projected, provenance = project_nonnegative_trajectory(
                 np.asarray(row, dtype=float).reshape(-1, 1),
                 context="Simulation event state",
-            ).reshape(-1)
-            for row in arr
-        ]
+            )
+            projected_rows.append(projected.reshape(-1))
+            projection_count += int(provenance.get("count", 0) or 0)
+            max_negative_magnitude = max(
+                max_negative_magnitude,
+                float(provenance.get("max_negative_magnitude", 0.0) or 0.0),
+            )
+        states[idx] = projected_rows
+    return states, {
+        "projected": bool(projection_count),
+        "count": int(projection_count),
+        "max_negative_magnitude": float(max_negative_magnitude),
+    }
+
+
+def _normal_event_states(raw_states: object, *, count: int, species_count: int) -> list[list[np.ndarray]]:
+    states, _provenance = _normal_event_states_with_projection(
+        raw_states,
+        count=count,
+        species_count=species_count,
+    )
     return states
 
 
@@ -118,10 +144,23 @@ def _attach_event_states(
     count: int,
     species_count: int,
 ) -> SimulationOutput:
+    event_states, event_projection = _normal_event_states_with_projection(
+        raw_states,
+        count=count,
+        species_count=species_count,
+    )
+    if bool(event_projection.get("projected")):
+        provenance = dict(output.provenance)
+        provenance["event_state_nonnegative_projection"] = event_projection
+        output = SimulationOutput(
+            t=output.t,
+            Y=output.Y,
+            provenance=provenance,
+        )
     object.__setattr__(
         output,
         "_kindred_event_states",
-        _normal_event_states(raw_states, count=count, species_count=species_count),
+        event_states,
     )
     return output
 
@@ -393,10 +432,12 @@ def _execute_scipy(
 
     prov["solver_used"] = method
     t_out = np.asarray(sol.t, float)
-    Y_out = apply_nonnegative_trajectory_invariant(
+    Y_out, nonnegative_projection = project_nonnegative_trajectory(
         solver_trajectory_array(sol.y, y0=y0, t_out=t_out),
         context="Simulation",
     )
+    if bool(nonnegative_projection.get("projected")):
+        prov["nonnegative_projection"] = nonnegative_projection
     if hasattr(sol, "t_events") and sol.t_events:
         prov["events"] = [list(te) for te in sol.t_events]
     output = SimulationOutput(

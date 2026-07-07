@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 import logging
 import os
 from time import perf_counter
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from PySide6 import QtCore
 
@@ -238,7 +238,6 @@ class SimulationController(QtCore.QObject):
             preview_replay_state=self._runtime_preview_replay_state,
             dirty_generation_by_set_id=self._runtime_dirty_generation_facts,
         )
-        self._preview_display_cache_invalidator: Callable[..., object] | None = None
         self._runtime_dispatch_owner = SimulationRuntimeDispatchOwner(
             ui=self.ui,
             batch_executor=self._batch_parallel,
@@ -656,6 +655,23 @@ class SimulationController(QtCore.QObject):
     def _clear_preview_ownership(self) -> PreviewOwnershipState:
         return self._set_preview_ownership(request_id=None, target_set_ids=())
 
+    def _runtime_input_change_intersects_preview_owner(
+        self,
+        target_set_ids: Sequence[str],
+    ) -> bool:
+        owner = getattr(self, "_preview_ownership", None)
+        if getattr(owner, "request_id", None) is None:
+            return False
+        normalized_targets = normalize_preview_target_set_ids(target_set_ids)
+        if not normalized_targets:
+            return True
+        owner_targets = normalize_preview_target_set_ids(
+            getattr(owner, "target_set_ids", ()) or ()
+        )
+        if not owner_targets:
+            return True
+        return bool(set(normalized_targets).intersection(owner_targets))
+
     def _mark_request_started(self, request_id: int) -> int:
         request_id_i = int(request_id)
         if request_id_i > int(getattr(self, "_latest_sim_request_id", 0)):
@@ -1000,8 +1016,6 @@ class SimulationController(QtCore.QObject):
             return
         if consequence.kind != "deauthorize_current_preview_failure":
             return
-        if not consequence.target_set_ids:
-            return
         try:
             self.ui.results.deauthorize_current_preview_failure(
                 target_set_ids=consequence.target_set_ids,
@@ -1303,8 +1317,7 @@ class SimulationController(QtCore.QObject):
                 set_id = str(raw_set_id or "").strip()
                 if set_id and set_id not in ordered:
                     ordered.append(set_id)
-            if ordered:
-                return tuple(ordered)
+            return tuple(ordered)
         for raw_set_id in fallback_set_ids or ():
             set_id = str(raw_set_id or "").strip()
             if set_id and set_id not in ordered:
@@ -1452,12 +1465,6 @@ class SimulationController(QtCore.QObject):
         self._shutdown_requested_for_close_run_ids.clear()
         return int(self._run_sequence_id)
 
-    def set_preview_display_cache_invalidator(
-        self,
-        invalidator: Callable[..., object] | None,
-    ) -> None:
-        self._preview_display_cache_invalidator = invalidator
-
     def stop_simulation(self) -> None:
         self._stop_simulation()
 
@@ -1465,10 +1472,58 @@ class SimulationController(QtCore.QObject):
         self,
         *,
         target_set_ids: Sequence[str] = (),
+        clear_plot: bool = False,
+        clear_active_cache_identity: bool | None = False,
+        clear_pending_replay: bool = False,
     ) -> None:
         self._invalidate_slider_preview_work(
             target_set_ids=target_set_ids,
+            clear_plot=bool(clear_plot),
+            clear_active_cache_identity=clear_active_cache_identity,
+            clear_pending_replay=bool(clear_pending_replay),
         )
+
+    def deauthorize_runtime_input_preview_state(
+        self,
+        *,
+        target_set_ids: Sequence[str] = (),
+        clear_plot: bool = False,
+        preserve_display: bool = False,
+    ) -> None:
+        normalized_targets = normalize_preview_target_set_ids(target_set_ids)
+        if self._runtime_input_change_intersects_preview_owner(normalized_targets):
+            invalidation_request_id = int(self._next_sim_request_id())
+            self._discarded_slider_preview_generation_id = int(invalidation_request_id)
+            self._clear_preview_ownership()
+            self._clear_pending_preview_slider_plot_updates()
+        self._batch_cache.clear_active_preview_cache_identity_state()
+        if preserve_display:
+            # Mid-gesture staging: the displayed preview stays visible until
+            # the replacement preview publishes atomically. Only the preview
+            # ownership/cache identity above is invalidated.
+            return
+        try:
+            self.ui.results.invalidate_workspace_preview_display_and_cache(
+                normalized_targets,
+                clear_plot=bool(clear_plot),
+                clear_active_cache_identity=False,
+            )
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to deauthorize preview display/cache state",
+                exc,
+            )
+        try:
+            self.ui.results.deauthorize_active_display_for_runtime_input_change(
+                affected_set_ids=normalized_targets,
+                affected_scope_is_global=not bool(normalized_targets),
+                clear_plot=bool(clear_plot),
+            )
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to deauthorize active display after runtime input change",
+                exc,
+            )
 
     def slider_preview_work_intersects_target_scope(self, target_set_ids: Sequence[str]) -> bool:
         return bool(self._preview_work_intersects_runtime_input_scope(target_set_ids))
@@ -2021,13 +2076,18 @@ class SimulationController(QtCore.QObject):
         *,
         target_set_ids: Sequence[str] = (),
         close_runtime_owner: bool = True,
+        clear_plot: bool = False,
+        clear_active_cache_identity: bool | None = False,
+        clear_pending_replay: bool = False,
     ) -> None:
         invalidation_request_id = int(self._next_sim_request_id())
         self._discarded_slider_preview_generation_id = int(invalidation_request_id)
         normalized_targets = normalize_preview_target_set_ids(target_set_ids)
         if bool(close_runtime_owner):
             self._clear_preview_ownership()
-        if normalized_targets:
+        if bool(clear_pending_replay):
+            self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+        elif normalized_targets:
             self._apply_runtime_lifecycle_ui_effects(
                 self._runtime_orchestrator.preview_replay_after_canonical_reset(
                     current_state=self._pending_slider_preview_launch,
@@ -2037,18 +2097,17 @@ class SimulationController(QtCore.QObject):
         else:
             self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._clear_pending_preview_slider_plot_updates()
-        preview_invalidator = self._preview_display_cache_invalidator
-        if callable(preview_invalidator):
-            try:
-                preview_invalidator(
-                    target_set_ids=normalized_targets,
-                    clear_plot=True,
-                )
-            except Exception as exc:
-                self._record_nonfatal_exception(
-                    "Failed to invalidate preview display/cache owner state",
-                    exc,
-                )
+        try:
+            self.ui.results.invalidate_workspace_preview_display_and_cache(
+                normalized_targets,
+                clear_plot=bool(clear_plot),
+                clear_active_cache_identity=clear_active_cache_identity,
+            )
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to invalidate preview display/cache owner state",
+                exc,
+            )
         state = self._batch_context_owner.active_batch_state()
         active_fast_runtime = bool(
             state is not None
