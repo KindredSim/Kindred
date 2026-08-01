@@ -34,56 +34,6 @@ def _is_cancelled_error(exc: BaseException) -> bool:
     return "cancelled" in message or "canceled" in message or "cancel" in message
 
 
-def _extract_failure_time(exc: BaseException) -> Optional[float]:
-    """Best-effort extraction of a solver failure time from exception causes."""
-    seen: set[int] = set()
-    cur: Optional[BaseException] = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        details = getattr(cur, "details", None)
-        if isinstance(details, dict):
-            for key in ("time", "t_fail"):
-                raw = details.get(key)
-                if isinstance(raw, (int, float, np.integer, np.floating)):
-                    return float(raw)
-        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
-    return None
-
-
-def _objective_time_span(objective: object) -> Optional[Tuple[float, float]]:
-    span = getattr(objective, "_kindred_t_span", None) or getattr(objective, "t_span", None)
-    if span is None:
-        return None
-    try:
-        t0 = float(span[0])
-        t1 = float(span[1])
-    except Exception:
-        return None
-    return (t0, t1)
-
-
-def _scaled_de_penalty(*, base_penalty: float, exc: BaseException, objective: object) -> float:
-    t_fail = _extract_failure_time(exc)
-    if t_fail is None:
-        return float(base_penalty)
-    span = _objective_time_span(objective)
-    if span is None:
-        return float(base_penalty)
-    t0, t1 = span
-    denom = float(t1 - t0)
-    if not np.isfinite(denom) or denom <= 0.0:
-        return float(base_penalty)
-    frac = (float(t_fail) - float(t0)) / denom
-    if frac < 0.0:
-        frac = 0.0
-    elif frac > 1.0:
-        frac = 1.0
-    scaled = float(base_penalty) * (2.0 - frac)
-    if not np.isfinite(scaled):
-        return float(base_penalty)
-    return float(scaled)
-
-
 @dataclass
 class FitProgress:
     """Progress information during fitting."""
@@ -208,12 +158,6 @@ def fit_parameters(
                 )
 
             effective_penalty = float(de_penalty) if de_penalty is not None else 1e12
-            if de_penalty is None and getattr(objective_func, "_kindred_vector_objective", False):
-                try:
-                    penalty_len = int(np.asarray(getattr(objective_func, "y_exp")).size)
-                    effective_penalty = float((1e6**2) * max(1, penalty_len))
-                except Exception:
-                    effective_penalty = 1e12
 
             def de_objective(params):
                 if cancellation_check is not None and cancellation_check():
@@ -222,47 +166,20 @@ def fit_parameters(
                     residuals = np.asarray(wrapped_objective(params), dtype=float).reshape(-1)
                 except FittingCancelled:
                     raise
-                except FitSimulationError as exc:
-                    de_objective.last_error = exc  # type: ignore[attr-defined]
-                    t_fail = _extract_failure_time(exc)
-                    de_objective.last_error_provenance = (  # type: ignore[attr-defined]
-                        {"time": t_fail} if t_fail is not None else None
-                    )
-                    return _scaled_de_penalty(
-                        base_penalty=effective_penalty, exc=exc, objective=objective_func
-                    )
+                except FitSimulationError:
+                    return float(effective_penalty)
                 except RuntimeError as exc:
                     if _is_cancelled_error(exc):
                         raise FittingCancelled() from exc
-                    de_objective.last_error = FitSimulationError(str(exc))  # type: ignore[attr-defined]
-                    t_fail = _extract_failure_time(exc)
-                    de_objective.last_error_provenance = (  # type: ignore[attr-defined]
-                        {"time": t_fail} if t_fail is not None else None
-                    )
-                    return _scaled_de_penalty(
-                        base_penalty=effective_penalty, exc=exc, objective=objective_func
-                    )
+                    return float(effective_penalty)
                 except Exception as exc:
                     if _is_cancelled_error(exc):
                         raise FittingCancelled() from exc
-                    de_objective.last_error = FitSimulationError(str(exc))  # type: ignore[attr-defined]
-                    t_fail = _extract_failure_time(exc)
-                    de_objective.last_error_provenance = (  # type: ignore[attr-defined]
-                        {"time": t_fail} if t_fail is not None else None
-                    )
-                    return _scaled_de_penalty(
-                        base_penalty=effective_penalty, exc=exc, objective=objective_func
-                    )
+                    return float(effective_penalty)
 
                 if residuals.size == 0 or not np.all(np.isfinite(residuals)):
-                    err = FitSimulationError("Non-finite residuals encountered in DE objective.")
-                    de_objective.last_error = err  # type: ignore[attr-defined]
-                    de_objective.last_error_provenance = None  # type: ignore[attr-defined]
                     return float(effective_penalty)
                 return float(np.sum(residuals**2))
-
-            de_objective.last_error = None  # type: ignore[attr-defined]
-            de_objective.last_error_provenance = None  # type: ignore[attr-defined]
 
             dim = max(1, len(x0))
             budget = max(1, int(max_nfev))
@@ -423,21 +340,6 @@ def fit_parameters(
 
     fitted_params = {name: val for name, val in zip(param_names, x_opt)}
 
-    y_model_opt = None
-    y_exp_data = getattr(objective_func, "y_exp", None)
-    y_exp_arr = None
-    if y_exp_data is not None:
-        try:
-            y_exp_arr = np.asarray(y_exp_data, dtype=float).reshape(-1)
-        except Exception:
-            y_exp_arr = None
-    try:
-        residuals_arr = np.asarray(residuals, dtype=float).reshape(-1)
-    except Exception:
-        residuals_arr = None
-    if y_exp_arr is not None and residuals_arr is not None and y_exp_arr.shape == residuals_arr.shape:
-        y_model_opt = y_exp_arr + residuals_arr
-
     uncertainties = None
     if covariance is not None:
         try:
@@ -447,19 +349,13 @@ def fit_parameters(
             logger.debug("Failed to calculate uncertainties: %s", exc)
 
     residual_mse = np.sum(residuals**2) / len(residuals) if len(residuals) > 0 else np.inf
-    if y_model_opt is not None and y_exp_arr is not None and y_exp_arr.size > 0:
-        ss_res = np.sum((y_exp_arr - y_model_opt) ** 2)
-        ss_tot = np.sum((y_exp_arr - np.mean(y_exp_arr)) ** 2)
-        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-    else:
-        r_squared = float("nan")
 
     return FitResult(
         success=success,
         parameters=fitted_params,
         uncertainties=uncertainties,
         residual_mse=residual_mse,
-        r_squared=r_squared,
+        r_squared=float("nan"),
         residuals=residuals,
         nfev=nfev,
         message=message,

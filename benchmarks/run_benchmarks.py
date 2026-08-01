@@ -29,11 +29,16 @@ import numpy as np
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
+from kindred.core.intervention_schedule_compiler import (
+    compile_intervention_schedule,
+)
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.solvers import solve_ode, SimulationRequest
 
 logger = logging.getLogger(__name__)
+
+_EMPTY_INTERVENTION_EXECUTION = compile_intervention_schedule(None)
 
 
 @dataclass
@@ -66,7 +71,10 @@ def load_mechanism_from_file(filepath: Path):
         with open(filepath, 'r') as f:
             dsl_text = f.read()
 
-        mechanism = parse_dsl_to_mechanism(dsl_text, initials={})
+        mechanism = prepare_dsl_request_set(
+            dsl_text,
+            initials={},
+        ).mechanism_for_execution()
         return mechanism
 
     except Exception as exc:
@@ -131,6 +139,7 @@ def benchmark_simulation(
             rhs=rhs,
             t_span=t_span,
             y0=y0,
+            intervention_execution=_EMPTY_INTERVENTION_EXECUTION,
             solver=solver,
             rtol=rtol,
             atol=atol,

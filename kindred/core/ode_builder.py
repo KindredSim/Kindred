@@ -12,32 +12,43 @@ from __future__ import annotations
 
 import math
 import logging
-from collections.abc import Mapping as MappingABC
-from typing import Callable, Dict, List, Optional, Tuple, Sequence
+from dataclasses import dataclass
+from typing import Callable, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from .constants import R, h, k_B
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
-    GeneratedEquilibriumAuthorityKind,
     GENERATED_RATE_MODEL_ERROR,
     effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     generated_equilibrium_authority_kind,
-    generated_equilibrium_forward_rate_from_metadata,
-    generated_equilibrium_reverse_rate_from_metadata,
+    json_safe_equilibrium_authority_payload,
     normalize_existing_equilibrium_rate_authority,
 )
-from .mechanism import Mechanism, Reaction, Equilibrium
-from .rate_binding import RateBinding
-from .kinetics import arrhenius_rate, eyring_rate, K_from_deltaG_eq
-from .simulator.fast_eq import derive_equilibrium_rates
+from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
+from .rate_binding import ForwardRateBinding, RateBinding
+from .kinetics import (
+    ArrheniusRateModel,
+    ConstantRateModel,
+    EyringRateModel,
+    ForwardRateModel,
+    forward_rate_at_temperature,
+    forward_rate_family,
+    forward_rate_model_for_equilibrium,
+    forward_rate_model_for_reaction,
+)
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["RateBinding", "build_ode_rhs_from_mechanism"]
+__all__ = [
+    "EffectiveRateCoefficients",
+    "EffectiveRateCoefficientEvaluator",
+    "RateBinding",
+    "build_effective_rate_coefficient_evaluator",
+    "build_ode_rhs_from_mechanism",
+]
 
 
 def _stoichiometric_flux_product(
@@ -59,6 +70,287 @@ def _stoichiometric_flux_product(
         return np.sum(products, axis=1, dtype=float)
     np.sum(products, axis=1, out=out)
     return out.copy()
+
+
+def _evaluate_rate_binding(binding: RateBinding, temperature_K: float) -> float:
+    if bool(getattr(binding, "accepts_runtime_temperature", False)):
+        return float(binding(float(temperature_K)))  # type: ignore[call-arg]
+    return float(binding())
+
+
+def _forward_rate_model_payload(model: ForwardRateModel) -> dict[str, object]:
+    family = forward_rate_family(model)
+    if isinstance(model, ConstantRateModel):
+        fields: dict[str, object] = {"k": float(model.k)}
+    elif isinstance(model, ArrheniusRateModel):
+        fields = {
+            "A": float(model.A),
+            "Ea_J_per_mol": float(model.Ea_J_per_mol),
+        }
+    elif isinstance(model, EyringRateModel):
+        fields = {
+            "dG_act_J_per_mol": float(model.dG_act_J_per_mol),
+            "kappa": float(model.kappa),
+            "standard_conc_M": float(model.standard_conc_M),
+            "molecularity": int(model.molecularity),
+        }
+    else:
+        raise TypeError("Unsupported typed forward-rate model.")
+    return {"family": family, **fields}
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveRateCoefficients:
+    """Immutable effective forward/reverse coefficients for one temperature."""
+
+    temperature_K: float
+    forward: tuple[float, ...]
+    reverse: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveRateCoefficientEvaluator:
+    """One typed per-mechanism runtime coefficient authority."""
+
+    nominal_temperature_K: float
+    step_kinds: tuple[str, ...]
+    authority_snapshot: tuple[Mapping[str, object], ...]
+    _evaluators: tuple[Callable[[float], tuple[float, float]], ...]
+
+    def __post_init__(self) -> None:
+        frozen_snapshot: list[Mapping[str, object]] = []
+        for item in self.authority_snapshot:
+            if not isinstance(item, Mapping):
+                raise TypeError(
+                    "Effective rate authority snapshots must be mappings."
+                )
+            frozen_snapshot.append(
+                item if isinstance(item, FrozenDict) else FrozenDict(item)
+            )
+        object.__setattr__(
+            self,
+            "authority_snapshot",
+            tuple(frozen_snapshot),
+        )
+        object.__setattr__(self, "step_kinds", tuple(self.step_kinds))
+        object.__setattr__(self, "_evaluators", tuple(self._evaluators))
+
+    def __call__(self, temperature_K: float) -> EffectiveRateCoefficients:
+        temperature = float(temperature_K)
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("Runtime temperature must be positive and finite.")
+        pairs = tuple(evaluator(temperature) for evaluator in self._evaluators)
+        forward = tuple(float(pair[0]) for pair in pairs)
+        reverse = tuple(float(pair[1]) for pair in pairs)
+        values = (*forward, *reverse)
+        if any(not math.isfinite(value) or value < 0.0 for value in values):
+            raise ValueError(
+                "Effective rate coefficients must be finite and nonnegative."
+            )
+        return EffectiveRateCoefficients(
+            temperature_K=temperature,
+            forward=forward,
+            reverse=reverse,
+        )
+
+
+def build_effective_rate_coefficient_evaluator(
+    mechanism: Mechanism,
+) -> EffectiveRateCoefficientEvaluator:
+    """Build the sole effective-rate authority consumed by RHS and Jacobian."""
+
+    from .mechanism_metadata import MechanismMetadataView
+
+    mech_meta = MechanismMetadataView.from_metadata(
+        getattr(mechanism, "metadata", {}) or {}
+    )
+    nominal_temperature = float(mech_meta.temperature_K)
+    default_standard_conc = float(mech_meta.standard_conc_M)
+    default_kappa = float(mech_meta.kappa_global)
+    evaluators: list[Callable[[float], tuple[float, float]]] = []
+    step_kinds: list[str] = []
+    snapshots: list[Mapping[str, object]] = []
+
+    for reaction in mechanism.reactions:
+        binding = (
+            reaction.rate
+            if isinstance(reaction.rate, RateBinding)
+            else None
+        )
+        if binding is not None:
+            if isinstance(binding, ForwardRateBinding):
+                snapshot = {
+                    "kind": "reaction",
+                    "binding_name": str(binding.name),
+                    "forward_model": _forward_rate_model_payload(
+                        binding.model
+                    ),
+                }
+            else:
+                snapshot = {
+                    "kind": "reaction",
+                    "binding_name": str(binding.name),
+                    "binding_value": float(binding()),
+                }
+
+            def reaction_coefficients(
+                temperature_K: float,
+                *,
+                _binding: RateBinding = binding,
+            ) -> tuple[float, float]:
+                return (
+                    _evaluate_rate_binding(_binding, temperature_K),
+                    0.0,
+                )
+
+        else:
+            model = forward_rate_model_for_reaction(
+                reaction,
+                default_kappa=default_kappa,
+                default_standard_conc_M=default_standard_conc,
+            )
+            snapshot = {
+                "kind": "reaction",
+                "forward_model": _forward_rate_model_payload(model),
+            }
+
+            def reaction_coefficients(
+                temperature_K: float,
+                *,
+                _model: ForwardRateModel = model,
+            ) -> tuple[float, float]:
+                return (
+                    forward_rate_at_temperature(_model, temperature_K),
+                    0.0,
+                )
+
+        evaluators.append(reaction_coefficients)
+        step_kinds.append("reaction")
+        snapshots.append(snapshot)
+
+    for equilibrium in mechanism.equilibria:
+        metadata = getattr(equilibrium, "metadata", {}) or {}
+        generated_kind = generated_equilibrium_authority_kind(metadata)
+        if generated_kind:
+            snapshot = {
+                "kind": "equilibrium",
+                "generated_authority": str(generated_kind),
+                "authority": json_safe_equilibrium_authority_payload(
+                    metadata
+                ),
+            }
+
+            def equilibrium_coefficients(
+                temperature_K: float,
+                *,
+                _equilibrium: Equilibrium = equilibrium,
+            ) -> tuple[float, float]:
+                forward = effective_equilibrium_forward_rate(
+                    _equilibrium,
+                    temperature_K=temperature_K,
+                )
+                reverse = effective_equilibrium_reverse_rate(
+                    _equilibrium,
+                    temperature_K=temperature_K,
+                )
+                if forward is None or reverse is None:
+                    raise ValueError(GENERATED_RATE_MODEL_ERROR)
+                return float(forward), float(reverse)
+
+        else:
+            authority = normalize_existing_equilibrium_rate_authority(
+                equilibrium
+            )
+            forward_binding = (
+                equilibrium.kf
+                if isinstance(equilibrium.kf, RateBinding)
+                else None
+            )
+            if isinstance(forward_binding, ForwardRateBinding):
+                forward_model = forward_binding.model
+            else:
+                forward_model = forward_rate_model_for_equilibrium(
+                    equilibrium,
+                    temperature_K=nominal_temperature,
+                    default_kappa=default_kappa,
+                    default_standard_conc_M=default_standard_conc,
+                )
+            snapshot = {
+                "kind": "equilibrium",
+                "forward_model": _forward_rate_model_payload(forward_model),
+                "forward_binding_name": (
+                    str(forward_binding.name)
+                    if isinstance(forward_binding, RateBinding)
+                    else None
+                ),
+                "authority": json_safe_equilibrium_authority_payload(
+                    dict(authority.identity_items())
+                ),
+                "reverse_binding_name": (
+                    str(authority.kr.name)
+                    if isinstance(authority.kr, RateBinding)
+                    else None
+                ),
+                "reverse_model": (
+                    _forward_rate_model_payload(authority.kr.model)
+                    if isinstance(authority.kr, ForwardRateBinding)
+                    else None
+                ),
+            }
+
+            def equilibrium_coefficients(
+                temperature_K: float,
+                *,
+                _equilibrium: Equilibrium = equilibrium,
+                _authority=authority,
+                _forward_binding: RateBinding | None = forward_binding,
+                _forward_model: ForwardRateModel = forward_model,
+            ) -> tuple[float, float]:
+                forward = (
+                    _evaluate_rate_binding(
+                        _forward_binding,
+                        temperature_K,
+                    )
+                    if _forward_binding is not None
+                    else forward_rate_at_temperature(
+                        _forward_model,
+                        temperature_K,
+                    )
+                )
+                if _authority.kind == EquilibriumRateAuthorityKind.KR:
+                    reverse = _authority.effective_reverse_rate()
+                    if isinstance(reverse, RateBinding):
+                        reverse = _evaluate_rate_binding(
+                            reverse,
+                            temperature_K,
+                        )
+                    elif callable(reverse):
+                        reverse = float(reverse())
+                else:
+                    equilibrium_constant = effective_equilibrium_keq(
+                        _equilibrium,
+                        temperature_K=temperature_K,
+                    )
+                    if equilibrium_constant is None:
+                        raise ValueError(
+                            "Equilibrium missing usable Keq/dG_eq authority."
+                        )
+                    reverse = _authority.effective_reverse_rate(
+                        Keq=equilibrium_constant,
+                        kf=forward,
+                    )
+                return float(forward), float(reverse)
+
+        evaluators.append(equilibrium_coefficients)
+        step_kinds.append("equilibrium")
+        snapshots.append(snapshot)
+
+    return EffectiveRateCoefficientEvaluator(
+        nominal_temperature_K=nominal_temperature,
+        step_kinds=tuple(step_kinds),
+        authority_snapshot=tuple(snapshots),
+        _evaluators=tuple(evaluators),
+    )
 
 
 def build_ode_rhs_from_mechanism(
@@ -90,242 +382,12 @@ def build_ode_rhs_from_mechanism(
     species_names = mechanism.species_names()
     n_species = len(species_names)
     species_index = {name: idx for idx, name in enumerate(species_names)}
-    from .mechanism_metadata import MechanismMetadataView
-
-    mech_meta = MechanismMetadataView.from_metadata(getattr(mechanism, "metadata", {}) or {})
-    default_temperature = float(mech_meta.temperature_K)
-    default_standard_conc = float(mech_meta.standard_conc_M)
-
-    def _evaluate_scalar(value: Optional[float | Callable[[], float]]) -> Optional[float]:
-        if value is None:
-            return None
-        return float(value()) if callable(value) else float(value)
-
-    def _eval_model(model_data: Optional[Dict[str, object]], T: float, molecularity: float) -> Optional[float]:
-        if not model_data:
-            return None
-        model_type = model_data.get("type") or model_data.get("model")
-        if model_type == "Arrhenius":
-            A = model_data.get("A")
-            Ea = model_data.get("Ea_J_per_mol") or model_data.get("Ea")
-            if A is None or Ea is None:
-                return None
-            return arrhenius_rate(float(A), float(Ea), T)
-        if model_type == "Eyring":
-            dG = model_data.get("dG_act_J_per_mol")
-            if dG is None:
-                return None
-            kappa = float(model_data.get("kappa", 1.0))
-            std_c = float(model_data.get("standard_conc_M", default_standard_conc))
-            return eyring_rate(float(dG), T, kappa=kappa, molecularity=int(round(molecularity)), standard_conc_M=std_c)
-        return None
-
-    def _compute_equilibrium_constant(meta: Dict[str, object], eq_obj: Equilibrium, T: float) -> Optional[float]:
-        if generated_equilibrium_authority_kind(meta):
-            return effective_equilibrium_keq(eq_obj, temperature_K=T)
-        authority = normalize_existing_equilibrium_rate_authority(eq_obj)
-        if (
-            authority.kind == EquilibriumRateAuthorityKind.KEQ
-            and authority.dG_eq_J_per_mol is not None
-            and not authority.has_explicit_keq_param
-        ):
-            val = _evaluate_scalar(authority.dG_eq_J_per_mol)
-            return K_from_deltaG_eq(float(val), T) if val is not None else None
-        keq_input = meta.get("Keq_input")
-        if callable(keq_input):
-            val = _evaluate_scalar(keq_input)
-            return float(val) if val is not None else None
-        if meta.get("dG_eq_J_per_mol") is not None:
-            val = _evaluate_scalar(meta["dG_eq_J_per_mol"])
-            return K_from_deltaG_eq(float(val), T) if val is not None else None
-        if keq_input is not None:
-            val = _evaluate_scalar(keq_input)
-            return float(val) if val is not None else None
-        if eq_obj.Keq is not None:
-            val = _evaluate_scalar(eq_obj.Keq)
-            return float(val) if val is not None else None
-        return None
-
-    def _evaluate_rate_binding(binding: RateBinding, T: float) -> float:
-        if bool(getattr(binding, "accepts_runtime_temperature", False)):
-            return float(binding(T))  # type: ignore[call-arg]
-        return float(binding())
-
-    def _require_positive_finite_runtime_Keq(Keq_value: float) -> float:
-        Keq_float = float(Keq_value)
-        if not (Keq_float > 0.0) or not math.isfinite(Keq_float):
-            raise ValueError("Equilibrium Keq must be positive and finite for runtime anchoring")
-        return Keq_float
-
-    class EquilibriumRateEvaluator:
-        """
-        Stateful evaluator for equilibrium forward/reverse rates.
-
-        Replaces the previous nested `eq_rate_pair` closure to avoid fragile late-binding and
-        to keep the equilibrium-rate policy testable and type-checkable.
-        """
-
-        def __init__(
-            self,
-            *,
-            eq_obj: Equilibrium,
-            meta: Dict[str, object],
-            forward_model: Optional[Dict[str, object]],
-            reverse_model: Optional[Dict[str, object]],
-            explicit_rates_meta: Sequence[float],
-            user_kf: bool,
-            user_kr: bool,
-            fast_flag: bool,
-            fwd_mol: float,
-            rev_mol: float,
-            kf_binding: Optional[RateBinding],
-            kr_binding: Optional[RateBinding],
-            Keq_binding: Optional[RateBinding],
-            kf_const: Optional[float],
-            kr_const: Optional[float],
-            Keq_const: Optional[float],
-        ) -> None:
-            self._eq = eq_obj
-            self._meta = meta
-            self._forward_model = forward_model
-            self._reverse_model = reverse_model
-            self._explicit_rates_meta = tuple(float(v) for v in explicit_rates_meta)
-            self._user_kf = bool(user_kf)
-            self._user_kr = bool(user_kr)
-            self._fast_flag = bool(fast_flag)
-            self._fwd_mol = float(fwd_mol)
-            self._rev_mol = float(rev_mol)
-            self._kf_binding = kf_binding
-            self._kr_binding = kr_binding
-            self._Keq_binding = Keq_binding
-            self._kf_const = kf_const
-            self._kr_const = kr_const
-            self._Keq_const = Keq_const
-            self._authority = normalize_existing_equilibrium_rate_authority(eq_obj)
-            self._authority_kind = self._authority.kind
-            self._generated_authority_kind = generated_equilibrium_authority_kind(self._meta)
-            self._generated_ts_authority = (
-                self._generated_authority_kind == GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES
-            )
-
-        def __call__(self, T: float) -> Tuple[float, float]:
-            if self._generated_authority_kind:
-                kf_generated = effective_equilibrium_forward_rate(self._eq, temperature_K=T)
-                kr_generated = effective_equilibrium_reverse_rate(self._eq, temperature_K=T)
-                if kf_generated is None or kr_generated is None:
-                    raise ValueError(GENERATED_RATE_MODEL_ERROR)
-                return float(kf_generated), float(kr_generated)
-
-            Keq_T = _compute_equilibrium_constant(self._meta, self._eq, T)
-            kf_val = _eval_model(self._forward_model, T, self._fwd_mol)
-            if kf_val is None:
-                kf_val = generated_equilibrium_forward_rate_from_metadata(self._meta, temperature_K=T)
-            if kf_val is None and self._generated_ts_authority:
-                raise ValueError(GENERATED_RATE_MODEL_ERROR)
-            if kf_val is None and self._kf_binding is not None:
-                kf_val = _evaluate_rate_binding(self._kf_binding, T)
-            elif kf_val is None and callable(getattr(self._eq, "kf", None)):
-                kf_val = _evaluate_scalar(getattr(self._eq, "kf", None))
-            elif kf_val is None and self._user_kf:
-                kf_val = self._kf_const
-            if (
-                kf_val is None
-                and self._kf_const is not None
-                and (not self._user_kf)
-                and self._forward_model is None
-            ):
-                kf_val = self._kf_const
-
-            kr_val = _eval_model(self._reverse_model, T, self._rev_mol)
-            if kr_val is None:
-                kr_val = generated_equilibrium_reverse_rate_from_metadata(self._meta, temperature_K=T)
-            if kr_val is None and self._generated_ts_authority:
-                raise ValueError(GENERATED_RATE_MODEL_ERROR)
-            if kr_val is None and self._kr_binding is not None:
-                kr_val = _evaluate_rate_binding(self._kr_binding, T)
-            elif kr_val is None and callable(getattr(self._eq, "kr", None)):
-                kr_val = _evaluate_scalar(getattr(self._eq, "kr", None))
-            elif kr_val is None and self._user_kr:
-                kr_val = self._kr_const
-            if (
-                kr_val is None
-                and self._kr_const is not None
-                and (not self._user_kr)
-                and self._reverse_model is None
-                and self._authority_kind != EquilibriumRateAuthorityKind.KEQ
-            ):
-                kr_val = self._kr_const
-
-            explicit: List[float] = list(self._explicit_rates_meta)
-            if kf_val is not None:
-                explicit.append(float(kf_val))
-            if kr_val is not None:
-                explicit.append(float(kr_val))
-
-            thermo_Keq = Keq_T if Keq_T is not None else self._Keq_const
-            if thermo_Keq is None and self._Keq_binding is not None:
-                thermo_Keq = _evaluate_rate_binding(self._Keq_binding, T)
-
-            if self._authority_kind == EquilibriumRateAuthorityKind.KR:
-                thermo_Keq = None
-            elif self._authority_kind == EquilibriumRateAuthorityKind.KEQ:
-                kr_val = None
-
-            if (
-                self._authority_kind != EquilibriumRateAuthorityKind.KEQ
-                and self._fast_flag
-                and (kf_val is None or kr_val is None)
-                and (
-                    self._meta.get("dG_eq_J_per_mol") is not None or thermo_Keq is not None
-                )
-            ):
-                fe = derive_equilibrium_rates(
-                    Keq=thermo_Keq,
-                    dG_eq_J_per_mol=self._meta.get("dG_eq_J_per_mol"),
-                    T=T,
-                    explicit_rates=explicit or None,
-                )
-                if kf_val is None:
-                    kf_val = fe.kf
-                if kr_val is None:
-                    kr_val = fe.kr
-                if Keq_T is None:
-                    Keq_T = fe.Keq
-
-            if (
-                self._authority_kind == EquilibriumRateAuthorityKind.KEQ
-                and kr_val is None
-                and kf_val is not None
-                and Keq_T is not None
-            ):
-                Keq_T = _require_positive_finite_runtime_Keq(Keq_T)
-                kr_val = self._authority.effective_reverse_rate(float(Keq_T), kf=float(kf_val))
-
-            if kf_val is None and kr_val is None and Keq_T is None:
-                raise ValueError(
-                    "Equilibrium missing usable kinetic and thermodynamic data "
-                    "(need Keq/dG_eq or rates)"
-                )
-            if kf_val is None:
-                if self._kf_const is not None:
-                    kf_val = self._kf_const
-                else:
-                    raise ValueError("Equilibrium missing usable kf and thermodynamic data to derive it")
-            if kr_val is None:
-                if self._authority_kind == EquilibriumRateAuthorityKind.KR and self._kr_const is not None:
-                    kr_val = self._kr_const
-                elif self._authority_kind == EquilibriumRateAuthorityKind.KEQ and Keq_T is not None:
-                    Keq_T = _require_positive_finite_runtime_Keq(Keq_T)
-                    kr_val = self._authority.effective_reverse_rate(float(Keq_T), kf=float(kf_val))
-                else:
-                    raise ValueError("Equilibrium missing usable kr and thermodynamic data to derive it")
-            return float(kf_val), float(kr_val)
-
-        def forward_rate(self, T: float) -> float:
-            return self(T)[0]
-
-        def reverse_rate(self, T: float) -> float:
-            return self(T)[1]
+    coefficient_evaluator = build_effective_rate_coefficient_evaluator(
+        mechanism
+    )
+    default_temperature = float(
+        coefficient_evaluator.nominal_temperature_K
+    )
 
     # Build list of all steps (irreversible reactions + equilibria)
     steps: List[Tuple[str, Reaction | Equilibrium]] = []
@@ -338,78 +400,12 @@ def build_ode_rhs_from_mechanism(
     S = np.zeros((n_species, n_steps))
     exp_forward = np.zeros((n_steps, n_species), dtype=float)
     exp_reverse = np.zeros((n_steps, n_species), dtype=float)
-    k_forward_base = np.zeros(n_steps, dtype=float)
-    forward_dynamic: List[Tuple[int, Callable[[float], float]]] = []
-    arrhenius_idx: List[int] = []
-    arrhenius_A: List[float] = []
-    arrhenius_Ea: List[float] = []
-    eyring_idx: List[int] = []
-    eyring_dG: List[float] = []
-    eyring_scale: List[float] = []
-    equilibrium_evaluators: List[Tuple[int, EquilibriumRateEvaluator]] = []
 
     for i_step, (step_type, step_obj) in enumerate(steps):
         if step_type == "reaction":
             rxn = step_obj  # type: ignore[assignment]
             vec = rxn.net_stoich_vector(species_names)
             S[:, i_step] = vec
-
-            overrides = getattr(rxn, "overrides", {}) or {}
-            model = overrides.get("model")
-            rate_binding = rxn.rate if isinstance(rxn.rate, RateBinding) else None
-
-            if rate_binding is not None:
-
-                def rate_func(T: float, *, _binding=rate_binding) -> float:
-                    return float(_binding())
-
-                forward_dynamic.append((i_step, rate_func))
-            elif model == "Arrhenius" and overrides.get("A") is not None and (
-                overrides.get("Ea_J_per_mol") is not None or overrides.get("Ea") is not None
-            ):
-                A = float(overrides["A"])
-                Ea = float(overrides.get("Ea_J_per_mol") or overrides.get("Ea"))
-
-                arrhenius_idx.append(i_step)
-                arrhenius_A.append(A)
-                arrhenius_Ea.append(Ea)
-
-            elif model == "Eyring" and overrides.get("dG_act_J_per_mol") is not None:
-                dG_act = float(overrides["dG_act_J_per_mol"])
-                kappa = float(overrides.get("kappa", 1.0))
-                std_c = float(overrides.get("standard_conc_M", default_standard_conc))
-                molecularity = rxn.order
-
-                if std_c <= 0.0 or not np.isfinite(std_c):
-                    raise ValueError("standard_conc_M must be positive and finite")
-                if kappa <= 0.0 or not np.isfinite(kappa):
-                    raise ValueError("kappa must be positive and finite")
-                if int(molecularity) < 1:
-                    raise ValueError("molecularity must be >= 1")
-
-                n_mol = int(molecularity)
-                scale = kappa / (float(std_c) ** (n_mol - 1) if n_mol >= 2 else 1.0)
-                eyring_idx.append(i_step)
-                eyring_dG.append(dG_act)
-                eyring_scale.append(float(scale))
-
-            else:
-                # IMPORTANT: if rxn.rate is a mutable binding/callable (e.g. RateBinding),
-                # preserve the callable so updates are reflected without rebuilding the RHS.
-                rate_obj = rxn.rate
-                if callable(rate_obj):
-                    def rate_func(T: float, *, _rate=rate_obj) -> float:
-                        v = _rate()
-                        if v is None:
-                            raise ValueError("Reaction missing rate constant")
-                        return float(v)
-                    forward_dynamic.append((i_step, rate_func))
-                else:
-                    k_const = _evaluate_scalar(rate_obj)
-                    if k_const is None:
-                        raise ValueError("Reaction missing rate constant")
-
-                    k_forward_base[i_step] = float(k_const)
 
             for sp_name, order in rxn.rate_orders.items():
                 idx = species_index[sp_name]
@@ -420,51 +416,6 @@ def build_ode_rhs_from_mechanism(
             fwd_vec = np.array(eq.forward_vector(species_names))
             back_vec = np.array(eq.back_vector(species_names))
             S[:, i_step] = back_vec - fwd_vec
-
-            meta: Dict[str, object] = getattr(eq, "metadata", {}) or {}
-            from .mechanism_metadata import EquilibriumMetadataView
-
-            eq_meta = EquilibriumMetadataView.from_metadata(meta, default_fast=bool(eq.fast))
-            forward_model = eq_meta.forward_model
-            reverse_model_raw = meta.get("reverse_model")
-            reverse_model = dict(reverse_model_raw) if isinstance(reverse_model_raw, MappingABC) else None
-            explicit_rates_meta = list(eq_meta.explicit_rates)
-            user_kf = bool(eq_meta.user_provided_kf)
-            user_kr = bool(eq_meta.user_provided_kr)
-            fast_flag = bool(eq_meta.fast_equilibrium)
-            fwd_mol = float(sum(eq.stoich_forward.values()))
-            rev_mol = float(sum(eq.stoich_back.values()))
-
-            kf_binding = eq.kf if isinstance(eq.kf, RateBinding) else None
-            kr_binding = eq.kr if isinstance(eq.kr, RateBinding) else None
-            Keq_binding = eq.Keq if isinstance(eq.Keq, RateBinding) else None
-
-            # IMPORTANT: if we are in prepared/bound mode, eq.kf/eq.kr/eq.Keq can be
-            # RateBinding objects that must be queried dynamically. Do not capture
-            # their values at RHS-build time.
-            kf_const = _evaluate_scalar(eq.kf) if kf_binding is None and not callable(eq.kf) else None
-            kr_const = _evaluate_scalar(eq.kr) if kr_binding is None and not callable(eq.kr) else None
-            Keq_const = _evaluate_scalar(eq.Keq) if Keq_binding is None and not callable(eq.Keq) else None
-
-            evaluator = EquilibriumRateEvaluator(
-                eq_obj=eq,
-                meta=meta,
-                forward_model=forward_model,
-                reverse_model=reverse_model,
-                explicit_rates_meta=explicit_rates_meta,
-                user_kf=user_kf,
-                user_kr=user_kr,
-                fast_flag=fast_flag,
-                fwd_mol=fwd_mol,
-                rev_mol=rev_mol,
-                kf_binding=kf_binding,
-                kr_binding=kr_binding,
-                Keq_binding=Keq_binding,
-                kf_const=kf_const,
-                kr_const=kr_const,
-                Keq_const=Keq_const,
-            )
-            equilibrium_evaluators.append((i_step, evaluator))
 
             for sp_name, stoich_coef in eq.stoich_forward.items():
                 exp_forward[i_step, species_index[sp_name]] = stoich_coef
@@ -478,39 +429,9 @@ def build_ode_rhs_from_mechanism(
     forward_buffer = np.ones_like(exp_forward)
     reverse_buffer = np.ones_like(exp_reverse)
 
-    # Keep dynamic arrays stable across RHS calls; update only the entries that vary.
-    k_forward_dyn = k_forward_base.copy()
+    k_forward_dyn = np.zeros(n_steps, dtype=float)
     k_reverse_dyn = np.zeros(n_steps, dtype=float)
-    has_reverse_terms = bool(equilibrium_evaluators)
-
-    if forward_dynamic:
-        forward_dynamic_idx_arr = np.fromiter(
-            (idx for idx, _fn in forward_dynamic),
-            dtype=int,
-            count=len(forward_dynamic),
-        )
-        forward_dynamic_fns = [fn for _idx, fn in forward_dynamic]
-    else:
-        forward_dynamic_idx_arr = np.zeros(0, dtype=int)
-        forward_dynamic_fns: List[Callable[[float], float]] = []
-
-    if equilibrium_evaluators:
-        equilibrium_idx_arr = np.fromiter(
-            (idx for idx, _ev in equilibrium_evaluators),
-            dtype=int,
-            count=len(equilibrium_evaluators),
-        )
-        equilibrium_fns = [ev for _idx, ev in equilibrium_evaluators]
-    else:
-        equilibrium_idx_arr = np.zeros(0, dtype=int)
-        equilibrium_fns: List[EquilibriumRateEvaluator] = []
-
-    arrhenius_idx_arr = np.asarray(arrhenius_idx, dtype=int)
-    arrhenius_A_arr = np.asarray(arrhenius_A, dtype=float)
-    arrhenius_Ea_arr = np.asarray(arrhenius_Ea, dtype=float)
-    eyring_idx_arr = np.asarray(eyring_idx, dtype=int)
-    eyring_dG_arr = np.asarray(eyring_dG, dtype=float)
-    eyring_scale_arr = np.asarray(eyring_scale, dtype=float)
+    has_reverse_terms = bool(mechanism.equilibria)
 
     # Buffers for stable reversible net rate evaluation (avoids overflow and inf-inf cancellation).
     log_y = np.empty(n_species, dtype=float)
@@ -549,37 +470,14 @@ def build_ode_rhs_from_mechanism(
         """ODE right-hand side from stoichiometry and reaction rates."""
         y_arr = y
         T_eval = default_temperature if T is None else float(T)
-        k_forward = k_forward_dyn
-
-        if arrhenius_idx_arr.size:
-            if T_eval <= 0.0 or not np.isfinite(T_eval):
-                raise ValueError("T must be positive and finite")
-            k_forward[arrhenius_idx_arr] = arrhenius_A_arr * np.exp(-arrhenius_Ea_arr / (R * T_eval))
-
-        if eyring_idx_arr.size:
-            if T_eval <= 0.0 or not np.isfinite(T_eval):
-                raise ValueError("T must be positive and finite")
-            prefactor = (k_B * T_eval) / h
-            k_forward[eyring_idx_arr] = eyring_scale_arr * prefactor * np.exp(-eyring_dG_arr / (R * T_eval))
-
-        fwd_idx = forward_dynamic_idx_arr
-        fwd_fns = forward_dynamic_fns
-        for i in range(fwd_idx.size):
-            k_forward[fwd_idx[i]] = fwd_fns[i](T_eval)
-
-        if has_reverse_terms:
-            eq_idx = equilibrium_idx_arr
-            eq_fns = equilibrium_fns
-            for i in range(eq_idx.size):
-                idx = eq_idx[i]
-                kf_val, kr_val = eq_fns[i](T_eval)
-                k_forward[idx] = kf_val
-                k_reverse_dyn[idx] = kr_val
+        coefficients = coefficient_evaluator(T_eval)
+        k_forward_dyn[:] = coefficients.forward
+        k_reverse_dyn[:] = coefficients.reverse
 
         if not has_reverse_terms:
             forward_buffer.fill(1.0)
             np.power(y_arr, exp_forward, out=forward_buffer, where=forward_mask)
-            rates_forward = k_forward * forward_buffer.prod(axis=1)
+            rates_forward = k_forward_dyn * forward_buffer.prod(axis=1)
             return _stoichiometric_flux_product(
                 S,
                 rates_forward,

@@ -1,1352 +1,306 @@
-# kindred/gui/widgets/grid_plot_view.py
-"""
-Grid view for displaying multiple dataset fits simultaneously.
-
-    Shows all fitted datasets in a grid layout (e.g., 2x2, 3x2) for comparison.
-"""
+"""Lean Fit-local grid plot with injected species-color resolution."""
 
 from __future__ import annotations
 
-import logging
-import threading
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+import hashlib
+import io
 import math
+from collections.abc import Callable, Iterable
 
-import numpy as np
-from PySide6 import QtCore, QtWidgets, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.core.analysis.global_fit_projection import FitRenderDatasetProjection
-from kindred.gui.color_manager import ColorManager
-from kindred.gui.display_semantics import (
-    canonical_concentration_axis,
-    canonical_dataset_x_axis,
-    canonical_time_axis,
-)
-from kindred.gui.display_name_policy import PLOT_TITLE_LABEL_MAX_CHARS, compact_plot_title_label
+from kindred.gui.fitting.worker import FitCurveDataset
 from kindred.gui.plot_config import try_import_pyqtgraph
-from kindred.gui.diagnostics import record_best_effort_failure
-
-logger = logging.getLogger(__name__)
-
-_LOCKED_LEFT_AXIS_WIDTH = 92
-_LOCKED_BOTTOM_AXIS_HEIGHT = 48
 
 __all__ = ["GridPlotView"]
 
+ColorResolver = Callable[[str], object]
+_FIT_COPY_COLUMNS = 10
+_MAX_FIT_COPY_CELLS = 1_000_000
+_MAX_FIT_COPY_CHARACTERS = 64 * 1024 * 1024
+_FIT_COPY_ROWS_PER_CHUNK = 2048
+
+
+def _default_color(name: str) -> str:
+    digest = hashlib.sha256(str(name).encode("utf-8")).digest()
+    hue = int.from_bytes(digest[:2], "big") % 360
+    return QtGui.QColor.fromHsv(hue, 180, 220).name()
+
+
+def _color_value(value: object) -> object:
+    if isinstance(value, QtGui.QColor):
+        return value
+    if isinstance(value, (str, tuple, list)):
+        return value
+    return str(value)
+
 
 class GridPlotView(QtWidgets.QWidget):
-    """
-    Display multiple dataset fits in a grid layout.
+    """Render immutable live/terminal Fit curves without shared plot authority."""
 
-    Automatically arranges plots in an optimal grid (e.g., 2x2 for 4 datasets).
-    Each subplot shows data + fit + fit metrics.
-    """
-
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(
+        self,
+        *,
+        color_resolver: ColorResolver | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-
-        # Establish core state up front so constructor error paths are safe.
-        self._legend_visible = True
-        self._selected_species_list: List[str] = []  # List of selected species for display
+        if color_resolver is not None and not callable(color_resolver):
+            raise TypeError("color_resolver must be callable.")
+        self._color_resolver = color_resolver or _default_color
+        self._curves: tuple[FitCurveDataset, ...] = ()
         self._pg = None
-        self._graphics_layout = None
-
-        # Store dataset information
-        self._datasets: List[Dict[str, Any]] = []
-        self._plot_items: List[Any] = []
-        self._plot_series_items: List[Dict[str, Any]] = []
-        self._plot_legends: List[Any] = []
-        self._structure_key: Optional[Tuple[Tuple[str, ...], int, int]] = None
-        self._available_species_cache: Optional[Tuple[str, ...]] = None
-        self._pending_datasets_lock = threading.Lock()
-        self._pending_datasets_update: Optional[List[Dict[str, Any]]] = None
-        self._pending_datasets_invoke_scheduled = False
-        self._warned_off_thread_update = False
-        self._redraw_pending = False
-        self._redraw_timer = QtCore.QTimer(self)
-        self._redraw_timer.setSingleShot(True)
-        self._redraw_timer.setInterval(0)
-        self._redraw_timer.timeout.connect(self._apply_scheduled_redraw)
-
-        # When locked, prevent PyQtGraph autorange from changing view ranges during live updates.
-        self._autorange_locked = False
-        self._locked_view_ranges: Dict[int, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
-        self._locked_autorange_prev: Dict[int, Tuple[bool, bool]] = {}
-        self._locked_left_axis_width: Optional[int] = None
-        self._locked_bottom_axis_height: Optional[int] = None
-        self._scrollbar_policies_prev: Optional[Tuple[QtCore.Qt.ScrollBarPolicy, QtCore.Qt.ScrollBarPolicy]] = None
-        self._warned_shape_mismatches: set[tuple[str, str, int, int]] = set()
-        self._best_effort_failures: set[str] = set()
-        self._best_effort_failure_counts: dict[str, int] = {}
+        self._canvas = None
+        self._message = None
+        self._copy_chunks = None
+        self._copy_output: io.StringIO | None = None
+        self._copy_timer = QtCore.QTimer(self)
+        self._copy_timer.setInterval(0)
+        self._copy_timer.timeout.connect(self._continue_copy)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-
-        self._controls_widget = QtWidgets.QWidget(self)
-        self._controls_widget.setObjectName("grid_plot_view_controls")
-        controls_layout = QtWidgets.QHBoxLayout(self._controls_widget)
-        controls_layout.setContentsMargins(2, 2, 2, 0)
-        controls_layout.setSpacing(6)
-
-        self._legend_toggle_btn = QtWidgets.QCheckBox("Show Legend")
-        self._legend_toggle_btn.setChecked(True)
-        self._legend_toggle_btn.toggled.connect(self._toggle_legend)
-        controls_layout.addWidget(self._legend_toggle_btn)
-
-        species_label = QtWidgets.QLabel("Species")
-        controls_layout.addWidget(species_label)
-        self._species_list = QtWidgets.QListWidget()
-        self._species_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
-        self._species_list.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Minimum,
-        )
-        self._species_list.itemSelectionChanged.connect(self._on_species_selection_changed)
-        species_label.setBuddy(self._species_list)
-        controls_layout.addWidget(self._species_list)
-
-        controls_layout.addStretch()
-        layout.addWidget(self._controls_widget)
-
-        ok, pg, _exc = try_import_pyqtgraph()
-        self._pg = pg if ok else None
-
-        if self._pg is None:
-            # Fallback if PyQtGraph not available
-            label = QtWidgets.QLabel("PyQtGraph not available\nInstall with: pip install pyqtgraph")
-            label.setAlignment(QtWidgets.Qt.AlignmentFlag.AlignCenter)
-            label.setStyleSheet("padding: 20px;")
-            layout.addWidget(label)
-            return
-
-        # Create PyQtGraph GraphicsLayoutWidget
-        self._graphics_layout = self._pg.GraphicsLayoutWidget()
-        # Always force a non-OpenGL viewport for this grid. On Windows, QOpenGLWidget/native
-        # viewports can exhibit z-order / clipping glitches during splitter and run-state
-        # transitions (e.g., "sliding under" sibling panels). This view updates frequently
-        # during Global Fit, so stability is preferred over OpenGL acceleration here.
-        try:
-            self._graphics_layout.useOpenGL(False)
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "disable_opengl_viewport",
-                message="GridPlotView: unable to disable OpenGL viewport",
-                exc=exc,
-            )
-        layout.addWidget(self._graphics_layout)
-
-        # Initialize with empty state
-        self._schedule_redraw()
-
-    def _record_best_effort_failure(
-        self,
-        key: str,
-        *,
-        message: str,
-        exc: Optional[BaseException] = None,
-        max_logs: int = 3,
-    ) -> None:
-        record_best_effort_failure(self, str(key), message=message, exc=exc, log=logger, max_logs=int(max_logs))
-
-    def _is_gui_thread(self) -> bool:
-        try:
-            return QtCore.QThread.currentThread() == self.thread()
-        except Exception:  # pragma: no cover - defensive
-            return True
-
-    @staticmethod
-    def _freeze_dataset_payload(dataset: Dict[str, Any]) -> Dict[str, Any]:
-        def _freeze_1d(values: object) -> np.ndarray:
+        ok, pg, _error = try_import_pyqtgraph()
+        if ok:
+            self._pg = pg
+            self._canvas = pg.GraphicsLayoutWidget(self)
             try:
-                return np.asarray(values, dtype=float).reshape(-1).copy()
-            except Exception:
-                return np.asarray([], dtype=float)
-
-        frozen = dict(dataset or {})
-        frozen["name"] = str(frozen.get("name") or "")
-        frozen.pop("model_x", None)
-        frozen.pop("model_series", None)
-        for key in ("data_x", "data_y"):
-            if key in frozen and frozen.get(key) is not None:
-                frozen[key] = _freeze_1d(frozen.get(key))
-        all_species = frozen.get("all_species")
-        if isinstance(all_species, dict):
-            frozen["all_species"] = {str(k): _freeze_1d(v) for k, v in all_species.items()}
-        all_observations = frozen.get("all_observations")
-        if isinstance(all_observations, dict):
-            frozen["all_observations"] = {
-                str(name): {
-                    "t": _freeze_1d((spec or {}).get("t", [])),
-                    "y": _freeze_1d((spec or {}).get("y", [])),
-                }
-                for name, spec in all_observations.items()
-                if str(name)
-            }
-        if "current_species" in frozen:
-            frozen["current_species"] = str(frozen.get("current_species") or "")
-        if "x_label" in frozen:
-            frozen["x_label"] = str(frozen.get("x_label") or "")
-        if "x_units" in frozen:
-            frozen["x_units"] = None if frozen.get("x_units") is None else str(frozen.get("x_units"))
-        if "y_label" in frozen:
-            frozen["y_label"] = str(frozen.get("y_label") or "")
-        if "y_units" in frozen:
-            frozen["y_units"] = None if frozen.get("y_units") is None else str(frozen.get("y_units"))
-        return frozen
-
-    @QtCore.Slot()
-    def _schedule_redraw(self) -> None:
-        if self._pg is None or self._graphics_layout is None:
-            return
-        if not self._is_gui_thread():
-            # Only schedule timers from the owning Qt thread.
-            QtCore.QMetaObject.invokeMethod(
+                self._canvas.useOpenGL(False)
+            except (AttributeError, RuntimeError):
+                pass
+            layout.addWidget(self._canvas)
+        else:
+            self._message = QtWidgets.QLabel(
+                "Plotting is unavailable; Fit values and Apply remain usable.",
                 self,
-                "_schedule_redraw",
-                QtCore.Qt.ConnectionType.QueuedConnection,
             )
+            self._message.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(self._message)
+
+    def set_curves(self, curves: Iterable[FitCurveDataset]) -> None:
+        values = tuple(curves)
+        if any(not isinstance(item, FitCurveDataset) for item in values):
+            raise TypeError("curves must contain FitCurveDataset values.")
+        self._curves = values
+        self._redraw()
+
+    def clear(self) -> None:
+        self._curves = ()
+        self._redraw()
+
+    def copy_all_to_clipboard(self) -> None:
+        if self._copy_timer.isActive():
             return
-        self._redraw_pending = True
-        if not self._redraw_timer.isActive():
-            self._redraw_timer.start()
+        self._copy_chunks = iter(self._iter_copy_chunks())
+        self._copy_output = io.StringIO()
+        self._copy_timer.start()
 
-    @QtCore.Slot()
-    def _apply_pending_datasets_update_on_gui_thread(self) -> None:
-        if not self._is_gui_thread():
-            return
-        pending: Optional[List[Dict[str, Any]]] = None
-        with self._pending_datasets_lock:
-            pending = self._pending_datasets_update
-            self._pending_datasets_update = None
-            self._pending_datasets_invoke_scheduled = False
-        if pending is None:
-            return
-        self._datasets = pending
-        self._schedule_redraw()
-
-    @QtCore.Slot()
-    def _apply_scheduled_redraw(self) -> None:
-        if not self._is_gui_thread():
-            return
-        if not self._redraw_pending:
-            return
-        self._redraw_pending = False
-        self._update_species_selector()
-        self._update_grid()
-
-    def _set_scrollbars_locked(self, locked: bool) -> None:
-        if self._graphics_layout is None:
-            return
-        locked = bool(locked)
-        if locked:
-            if self._scrollbar_policies_prev is None:
-                try:
-                    self._scrollbar_policies_prev = (
-                        self._graphics_layout.horizontalScrollBarPolicy(),
-                        self._graphics_layout.verticalScrollBarPolicy(),
-                    )
-                except Exception:
-                    self._scrollbar_policies_prev = None
-            try:
-                self._graphics_layout.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-                self._graphics_layout.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "lock_scrollbars",
-                    message="GridPlotView: failed to lock scrollbars",
-                    exc=exc,
-                )
-            return
-
-        # unlocked: restore prior policies (if captured)
-        if self._scrollbar_policies_prev is not None:
-            h_policy, v_policy = self._scrollbar_policies_prev
-            try:
-                self._graphics_layout.setHorizontalScrollBarPolicy(h_policy)
-                self._graphics_layout.setVerticalScrollBarPolicy(v_policy)
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "restore_scrollbars",
-                    message="GridPlotView: failed to restore scrollbar policies",
-                    exc=exc,
-                )
-        self._scrollbar_policies_prev = None
-
-    def _snapshot_locked_axis_geometry(self) -> None:
-        """
-        Pick stable axis gutter sizes for the duration of a running/locked session.
-
-        GridPlotView rebuilds PlotItems (and thus AxisItems) on each refresh; without
-        fixed gutters, AxisItem text-space expansion can shift the viewport and cause
-        a brief "compress" flicker as layout settles.
-        """
-        left_w = 0.0
-        bottom_h = 0.0
-        for plot in list(self._plot_items or []):
-            try:
-                left_axis = plot.getAxis("left")
-                bottom_axis = plot.getAxis("bottom")
-            except (AttributeError, KeyError, RuntimeError) as exc:
-                self._record_best_effort_failure(
-                    "measure_axes_missing",
-                    message="GridPlotView: missing axis on plot item while snapshotting locked axis geometry",
-                    exc=exc,
-                )
-                continue
-            try:
-                left_w = max(left_w, float(left_axis.boundingRect().width()))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "measure_left_axis_width",
-                    message="GridPlotView: failed to measure left axis width while snapshotting locked axis geometry",
-                    exc=exc,
-                )
-            try:
-                bottom_h = max(bottom_h, float(bottom_axis.boundingRect().height()))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "measure_bottom_axis_height",
-                    message="GridPlotView: failed to measure bottom axis height while snapshotting locked axis geometry",
-                    exc=exc,
-                )
-
-        # Conservative defaults + headroom, clamped to avoid absurd gutters.
-        if left_w <= 1.0:
-            left_w = float(_LOCKED_LEFT_AXIS_WIDTH)
-        else:
-            left_w = min(140.0, max(float(_LOCKED_LEFT_AXIS_WIDTH), left_w + 12.0))
-        if bottom_h <= 1.0:
-            bottom_h = float(_LOCKED_BOTTOM_AXIS_HEIGHT)
-        else:
-            bottom_h = min(95.0, max(float(_LOCKED_BOTTOM_AXIS_HEIGHT), bottom_h + 8.0))
-
-        self._locked_left_axis_width = int(math.ceil(left_w))
-        self._locked_bottom_axis_height = int(math.ceil(bottom_h))
-
-    def _apply_locked_axis_style(self, plot: Any) -> None:
-        if not bool(getattr(self, "_autorange_locked", False)):
-            return
-        try:
-            left_axis = plot.getAxis("left")
-            bottom_axis = plot.getAxis("bottom")
-        except Exception:
-            return
-
-        for axis in (left_axis, bottom_axis):
-            try:
-                axis.setStyle(autoExpandTextSpace=False)
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "locked_axis_style",
-                    message="GridPlotView: failed to apply locked axis style",
-                    exc=exc,
-                )
-
-        if self._locked_left_axis_width is None:
-            self._locked_left_axis_width = _LOCKED_LEFT_AXIS_WIDTH
-        if self._locked_bottom_axis_height is None:
-            self._locked_bottom_axis_height = _LOCKED_BOTTOM_AXIS_HEIGHT
-        try:
-            left_axis.setWidth(float(self._locked_left_axis_width))
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "locked_left_axis_width",
-                message="GridPlotView: failed to set locked left axis width",
-                exc=exc,
-            )
-        try:
-            bottom_axis.setHeight(float(self._locked_bottom_axis_height))
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "locked_bottom_axis_height",
-                message="GridPlotView: failed to set locked bottom axis height",
-                exc=exc,
-            )
-
-    def _set_plot_axis_labels(
-        self,
-        plot: Any,
-        *,
-        x_label: str,
-        x_units: object = None,
-        y_label: str = "Concentration",
-        y_units: object = "M",
-        dataset_name: object = "",
-    ) -> None:
-        state = (str(x_label or ""), None if x_units is None else str(x_units), str(y_label or ""), None if y_units is None else str(y_units))
-        if getattr(plot, "_kindred_axis_label_state", None) == state:
-            return
-        try:
-            if state[1]:
-                plot.setLabel("bottom", state[0], units=state[1])
-            else:
-                plot.setLabel("bottom", state[0])
-            if state[3]:
-                plot.setLabel("left", state[2], units=state[3])
-            else:
-                plot.setLabel("left", state[2])
-            setattr(plot, "_kindred_axis_label_state", state)
-            if bool(getattr(self, "_autorange_locked", False)):
-                self._apply_locked_axis_style(plot)
-        except Exception as exc:
-            self._record_best_effort_failure(
-                "plot_labels",
-                message=f"GridPlotView: failed to update plot labels for dataset={dataset_name!r}",
-                exc=exc,
-            )
-
-    def _dataset_structure_key(self, datasets: Sequence[Dict[str, Any]]) -> Tuple[Tuple[str, ...], int, int]:
-        ids = tuple(str((ds or {}).get("name") or "") for ds in (datasets or []))
-        n_rows, n_cols = self._calculate_grid_size(len(ids))
-        return (ids, int(n_rows), int(n_cols))
-
-    def _configure_plot_static(self, plot: Any) -> None:
-        x_axis = canonical_time_axis()
-        y_axis = canonical_concentration_axis()
-        self._set_plot_axis_labels(
-            plot,
-            x_label=x_axis.label,
-            x_units=x_axis.units,
-            y_label=y_axis.label,
-            y_units=y_axis.units,
+    def _iter_copy_chunks(self) -> Iterable[str]:
+        row_count = sum(
+            len(values)
+            for dataset in self._curves
+            for values_by_kind in (dataset.model_y, dataset.observed_y)
+            for _species, values in values_by_kind
         )
-        plot.showGrid(x=True, y=True, alpha=0.3)
-        font = QtGui.QFont()
-        font.setPointSize(7)
-        for axis in ["left", "bottom"]:
-            try:
-                plot.getAxis(axis).setStyle(tickFont=font)
-                plot.getAxis(axis).setTickFont(font)
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    f"tick_font:{axis}",
-                    message=f"GridPlotView: failed to set tick font for axis={axis}",
-                    exc=exc,
-                )
-
-    def _ensure_legend_state(self, plot: Any, idx: int) -> None:
-        want = bool(self._legend_visible and len(self._selected_species_list) > 1)
-        legend = self._plot_legends[idx] if idx < len(self._plot_legends) else None
-        if want:
-            if legend is None:
-                try:
-                    legend = plot.addLegend(offset=(5, 5))
-                except Exception:
-                    legend = None
-                if idx < len(self._plot_legends):
-                    self._plot_legends[idx] = legend
-            if legend is not None:
-                try:
-                    legend.setVisible(True)
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "legend_show",
-                        message="GridPlotView: failed to show legend",
-                        exc=exc,
-                    )
-        else:
-            if legend is not None:
-                try:
-                    legend.setVisible(False)
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "legend_hide",
-                        message="GridPlotView: failed to hide legend",
-                        exc=exc,
-                    )
-
-    def _ensure_curve_item(self, plot: Any, idx: int, key: str, *, is_model: bool, species_name: str, color: Tuple[int, int, int]) -> Any:
-        series_map = self._plot_series_items[idx]
-        item = series_map.get(key)
-        if item is not None:
-            return item
-        if self._pg is None:
-            return None
-
-        if is_model:
-            item = plot.plot(
-                [],
-                [],
-                pen=self._pg.mkPen(color=color, width=2),
-                name=species_name,
-            )
-        else:
-            item = plot.plot(
-                [],
-                [],
-                pen=None,
-                symbol="o",
-                symbolSize=5,
-                symbolBrush=self._pg.mkBrush(*color, 150),
-                symbolPen=self._pg.mkPen(color=color, width=1),
-                name=None,
-            )
-        series_map[key] = item
-        return item
-
-    def _update_plot_data_in_place(self) -> None:
-        if self._pg is None or self._graphics_layout is None:
-            return
-        if not self._plot_items or len(self._plot_items) != len(self._datasets):
-            return
-        if len(self._plot_series_items) != len(self._plot_items):
-            return
-
-        color_manager = ColorManager.instance()
-        available_species = []
-        for dataset in self._datasets:
-            fit_projection = dataset.get("fit_render_projection")
-            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
-                available_species.extend(str(name) for name in fit_projection.observed_series.keys() if str(name))
-                continue
-            all_observations = dataset.get("all_observations", {}) if isinstance(dataset.get("all_observations", {}), dict) else {}
-            available_species.extend(str(name) for name in all_observations.keys() if str(name))
-            all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
-            available_species.extend(str(name) for name in all_species.keys() if str(name))
-        color_manager.seed_species(available_species)
-
-        for idx, dataset in enumerate(self._datasets):
-            plot = self._plot_items[idx]
-            self._ensure_legend_state(plot, idx)
-
-            name = dataset.get("name")
-            x_label = str(dataset.get("x_label") or "Time")
-            x_units = dataset.get("x_units")
-            y_axis = canonical_concentration_axis(
-                dataset.get("y_label") or "Concentration",
-                units=dataset.get("y_units") if dataset.get("y_units") is not None else "M",
-            )
-            data_x = np.asarray(dataset.get("data_x", []), dtype=float).reshape(-1)
-            residual_mse = dataset.get("residual_mse")
-            r_squared = dataset.get("r_squared")
-            all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
-            all_observations = dataset.get("all_observations", {}) if isinstance(dataset.get("all_observations", {}), dict) else {}
-            fit_projection = dataset.get("fit_render_projection")
-            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
-                model_series = fit_projection.model_series
-            else:
-                model_series = {}
-
-            self._set_plot_axis_labels(
-                plot,
-                x_label=x_label,
-                x_units=x_units,
-                y_label=y_axis.label,
-                y_units=y_axis.units,
-                dataset_name=name,
-            )
-
-            # Title with fit quality. Keep subplot titles short so grid cells prioritize data area.
-            # During an active fit, freeze layout-bearing title text/color as well; live metric
-            # changes belong in the tracker/details, not in geometry that can resize the plot grid.
-            full_name = str(dataset.get("full_name") or name or "")
-            compact_name = compact_plot_title_label(name or full_name, max_chars=PLOT_TITLE_LABEL_MAX_CHARS)
-            title = str(compact_name.display or "")
-            tooltip_parts = [str(full_name or compact_name.full or "").strip()]
-            locked_layout = bool(getattr(self, "_autorange_locked", False))
-            color = (51, 51, 51)
-            r2_val = None
-            if r_squared is not None:
-                try:
-                    r2_val = float(r_squared)
-                except Exception:
-                    r2_val = None
-            if residual_mse is not None:
-                try:
-                    mse_val = float(residual_mse)
-                except Exception:
-                    mse_val = None
-                if mse_val is not None:
-                    metric_text = f"MSE = {mse_val:.3e}"
-                    tooltip_parts.append(metric_text)
-                    if r2_val is not None:
-                        tooltip_parts.append(f"R² = {r2_val:.3f}")
-                        color = self._get_color_for_r_squared(r2_val)
-                    if not locked_layout:
-                        title = f"{title} ({metric_text})"
-            elif r2_val is not None:
-                metric_text = f"R² = {r2_val:.3f}"
-                tooltip_parts.append(metric_text)
-                if not locked_layout:
-                    title = f"{title} ({metric_text})"
-                    color = self._get_color_for_r_squared(r2_val)
-            title_tooltip = "\n".join(part for part in tooltip_parts if part)
-            try:
-                title_state = (title, tuple(color), "10pt")
-                if getattr(plot, "_kindred_title_state", None) != title_state:
-                    plot.setTitle(title, color=color, size="10pt")
-                    setattr(plot, "_kindred_title_state", title_state)
-                if hasattr(plot, "setToolTip"):
-                    plot.setToolTip(str(title_tooltip or ""))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "plot_title",
-                    message=f"GridPlotView: failed to set plot title for dataset={name!r}",
-                    exc=exc,
-                )
-
-            active_keys: set[str] = set()
-            for species_name in list(self._selected_species_list or []):
-                color_rgb = color_manager.get_species_rgb(species_name, known_species=tuple(available_species))
-
-                data_key = f"{species_name}::data"
-                model_key = f"{species_name}::model"
-
-                projection_active = isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok"
-                observation_spec = all_observations.get(species_name) if isinstance(all_observations.get(species_name), dict) else None
-                if projection_active and species_name in fit_projection.observed_series:
-                    y_data = np.asarray(fit_projection.observed_series[species_name], dtype=float).reshape(-1)
-                    species_data_x = fit_projection.observed_x_for_species(species_name)
-                elif observation_spec is not None:
-                    y_data = np.asarray(observation_spec.get("y", []), dtype=float).reshape(-1)
-                    species_data_x = np.asarray(observation_spec.get("t", []), dtype=float).reshape(-1)
-                elif species_name in all_species:
-                    y_data = np.asarray(all_species[species_name], dtype=float).reshape(-1)
-                    species_data_x = (
-                        fit_projection.observed_x_for_species(species_name)
-                        if projection_active
-                        else data_x
-                    )
-                else:
-                    y_data = None
-                    species_data_x = np.asarray([], dtype=float)
-                if y_data is not None:
-                    data_item = self._ensure_curve_item(
-                        plot,
-                        idx,
-                        data_key,
-                        is_model=False,
-                        species_name=species_name,
-                        color=color_rgb,
-                    )
-                    if data_item is not None:
-                        try:
-                            data_item.setSymbol("o")
-                            data_item.setSymbolSize(5)
-                            data_item.setSymbolBrush(self._pg.mkBrush(*color_rgb, 150))
-                            data_item.setSymbolPen(self._pg.mkPen(color=color_rgb, width=1))
-                            if species_data_x.size == y_data.size:
-                                data_item.setData(species_data_x, y_data)
-                                data_item.setVisible(True)
-                            else:
-                                warn_key = (str(name or ""), data_key, int(species_data_x.size), int(y_data.size))
-                                if warn_key not in self._warned_shape_mismatches:
-                                    self._warned_shape_mismatches.add(warn_key)
-                                    logger.warning(
-                                        "GridPlotView: skip data curve with shape mismatch dataset=%s series=%s x_len=%d y_len=%d",
-                                        name,
-                                        species_name,
-                                        int(species_data_x.size),
-                                        int(y_data.size),
-                                    )
-                                try:
-                                    data_item.setVisible(False)
-                                except Exception as exc:
-                                    self._record_best_effort_failure(
-                                        "hide_data_curve",
-                                        message=(
-                                            f"GridPlotView: failed to hide data curve dataset={name!r} "
-                                            f"species={species_name!r}"
-                                        ),
-                                        exc=exc,
-                                    )
-                        except Exception as exc:
-                            self._record_best_effort_failure(
-                                "update_data_curve",
-                                message=(
-                                    f"GridPlotView: failed to update data curve dataset={name!r} "
-                                    f"species={species_name!r}"
-                                ),
-                                exc=exc,
-                            )
-                    active_keys.add(data_key)
-
-                    # Model overlay from the typed multi-series projection.
-                    y_model = None
-                    if isinstance(model_series, dict) and species_name in model_series:
-                        y_model = model_series[species_name]
-
-                    if y_model is not None:
-                        try:
-                            y_model_arr = np.asarray(y_model, dtype=float).reshape(-1)
-                        except Exception:
-                            y_model_arr = None
-                        if y_model_arr is not None:
-                            x_model_arr = fit_projection.model_x_for_species(species_name) if projection_active else None
-                            if x_model_arr is None:
-                                continue
-                            model_item = self._ensure_curve_item(
-                                plot,
-                                idx,
-                                model_key,
-                                is_model=True,
-                                species_name=species_name,
-                                color=color_rgb,
-                            )
-                            if model_item is not None:
-                                try:
-                                    model_item.setPen(self._pg.mkPen(color=color_rgb, width=2))
-                                    if x_model_arr.size == y_model_arr.size:
-                                        model_item.setData(x_model_arr, y_model_arr)
-                                        model_item.setVisible(True)
-                                    else:
-                                        warn_key = (str(name or ""), model_key, int(x_model_arr.size), int(y_model_arr.size))
-                                        if warn_key not in self._warned_shape_mismatches:
-                                            self._warned_shape_mismatches.add(warn_key)
-                                            logger.warning(
-                                                "GridPlotView: skip model curve with shape mismatch dataset=%s series=%s x_len=%d y_len=%d",
-                                                name,
-                                                species_name,
-                                                int(x_model_arr.size),
-                                                int(y_model_arr.size),
-                                            )
-                                        try:
-                                            model_item.setVisible(False)
-                                        except Exception as exc:
-                                            self._record_best_effort_failure(
-                                                "hide_model_curve",
-                                                message=(
-                                                    f"GridPlotView: failed to hide model curve dataset={name!r} "
-                                                    f"species={species_name!r}"
-                                                ),
-                                                exc=exc,
-                                            )
-                                except Exception as exc:
-                                    self._record_best_effort_failure(
-                                        "update_model_curve",
-                                        message=(
-                                            f"GridPlotView: failed to update model curve dataset={name!r} "
-                                            f"species={species_name!r}"
-                                        ),
-                                        exc=exc,
-                                    )
-                            active_keys.add(model_key)
-
-            # Hide any previously created curves not active in this update.
-            for key, item in list(self._plot_series_items[idx].items()):
-                if key in active_keys:
-                    continue
-                try:
-                    item.setVisible(False)
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "hide_inactive_curve",
-                        message=f"GridPlotView: failed to hide inactive curve {key!r}",
-                        exc=exc,
-                    )
-
-    def _rebuild_structure(self) -> None:
-        if self._pg is None or self._graphics_layout is None:
-            return
-        self._graphics_layout.setUpdatesEnabled(False)
-        try:
-            self._graphics_layout.clear()
-            self._plot_items.clear()
-            self._plot_series_items.clear()
-            self._plot_legends.clear()
-
-            n_datasets = len(self._datasets)
-            if n_datasets == 0:
-                text = self._pg.TextItem(
-                    "No datasets loaded\n\nAdd datasets using the Data Manager",
-                    color=(150, 150, 150),
-                    anchor=(0.5, 0.5),
-                )
-                placeholder_plot = self._graphics_layout.addPlot()
-                placeholder_plot.hideAxis("left")
-                placeholder_plot.hideAxis("bottom")
-                placeholder_plot.addItem(text)
-                text.setPos(0.5, 0.5)
-                self._structure_key = self._dataset_structure_key([])
-                return
-
-            _n_rows, n_cols = self._calculate_grid_size(n_datasets)
-            for idx in range(n_datasets):
-                row = idx // n_cols
-                col = idx % n_cols
-                plot = self._graphics_layout.addPlot(row=row, col=col)
-                self._plot_items.append(plot)
-                self._plot_series_items.append({})
-                self._plot_legends.append(None)
-                self._configure_plot_static(plot)
-
-                if bool(getattr(self, "_autorange_locked", False)):
-                    self._apply_locked_axis_style(plot)
-                    vb = plot.getViewBox()
-                    try:
-                        vb.enableAutoRange(x=False, y=False)
-                    except Exception as exc:
-                        self._record_best_effort_failure(
-                            "disable_autorange_rebuild",
-                            message=f"GridPlotView: failed to disable autorange while rebuilding subplot={idx}",
-                            exc=exc,
-                        )
-                    frozen = self._locked_view_ranges.get(idx)
-                    if frozen:
-                        try:
-                            plot.setXRange(float(frozen[0][0]), float(frozen[0][1]), padding=0)
-                            plot.setYRange(float(frozen[1][0]), float(frozen[1][1]), padding=0)
-                        except Exception as exc:
-                            self._record_best_effort_failure(
-                                "restore_frozen_range",
-                                message=f"GridPlotView: failed to restore frozen view range for subplot={idx}",
-                                exc=exc,
-                            )
-
-            self._structure_key = self._dataset_structure_key(self._datasets)
-        finally:
-            self._graphics_layout.setUpdatesEnabled(True)
-
-    def add_dataset(
-        self,
-        name: str,
-        data_x: np.ndarray,
-        data_y: np.ndarray,
-        residual_mse: Optional[float] = None,
-        r_squared: Optional[float] = None,
-        all_species: Optional[Dict[str, np.ndarray]] = None,
-        current_species: Optional[str] = None,
-    ):
-        """
-        Add a dataset to the grid view.
-
-        Parameters
-        ----------
-        name : str
-            Dataset name
-        data_x, data_y : np.ndarray
-            Experimental data
-        residual_mse, r_squared : float, optional
-            Fit metrics
-        all_species : dict, optional
-            Dictionary of all species data {name: y_array}
-        current_species : str, optional
-            Name of the currently displayed species
-        """
-        if self._pg is None or self._graphics_layout is None:
-            return
-
-        dataset = {
-            'name': name,
-            'data_x': np.asarray(data_x),
-            'data_y': np.asarray(data_y),
-            'residual_mse': residual_mse,
-            'r_squared': r_squared,
-            'all_species': all_species if all_species else {current_species or 'Data': data_y},
-            'current_species': current_species or 'Data',
-        }
-        # Defensive copy: never retain references to caller-owned buffers.
-        self._datasets.append(self._freeze_dataset_payload(dataset))
-        self._schedule_redraw()
-
-    def set_datasets(self, datasets: Sequence[Dict[str, Any]]) -> None:
-        """Replace all datasets and redraw once (avoids per-dataset redraw churn)."""
-        if self._pg is None or self._graphics_layout is None:
-            return
-
-        normalized: List[Dict[str, Any]] = []
-        for dataset in datasets or []:
-            if not isinstance(dataset, dict):
-                continue
-            normalized.append(dict(dataset))
-
-        # Defensive copy: ensure all payload arrays are owned/contiguous and detached from caller memory.
-        frozen = [self._freeze_dataset_payload(ds) for ds in normalized]
-
-        if not self._is_gui_thread():
-            if not self._warned_off_thread_update:
-                self._warned_off_thread_update = True
-                logger.warning("GridPlotView.set_datasets called off GUI thread; marshaling update to GUI thread.")
-            with self._pending_datasets_lock:
-                self._pending_datasets_update = frozen
-                schedule = not self._pending_datasets_invoke_scheduled
-                self._pending_datasets_invoke_scheduled = True
-            if schedule:
-                QtCore.QMetaObject.invokeMethod(
-                    self,
-                    "_apply_pending_datasets_update_on_gui_thread",
-                    QtCore.Qt.ConnectionType.QueuedConnection,
-                )
-            return
-
-        self._datasets = frozen
-        self._schedule_redraw()
-
-    def _available_export_species_names(self) -> List[str]:
-        species_names: set[str] = set()
-        for dataset in self._datasets:
-            fit_projection = dataset.get("fit_render_projection")
-            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
-                species_names.update(str(name) for name in fit_projection.observed_series.keys() if str(name))
-                species_names.update(str(name) for name in fit_projection.model_series.keys() if str(name))
-                continue
-            all_observations = dataset.get("all_observations", {})
-            if isinstance(all_observations, dict):
-                species_names.update(str(name) for name in all_observations.keys() if str(name))
-            all_species = dataset.get("all_species", {})
-            if isinstance(all_species, dict):
-                species_names.update(str(name) for name in all_species.keys() if str(name))
-        return sorted(species_names)
-
-    def _export_species_names(self, scope: str) -> List[str]:
-        available = self._available_export_species_names()
-        if str(scope or "") == "axis":
-            selected = [str(name) for name in self._selected_species_list if str(name) in available]
-            return selected
-        return available
-
-    @staticmethod
-    def _coerce_grid_export_series(
-        rows: List[List[object]],
-        *,
-        dataset_name: str,
-        species_name: str,
-        source: str,
-        x_values: object,
-        y_values: object,
-    ) -> str | None:
-        try:
-            x_array = np.asarray(x_values, dtype=float).reshape(-1)
-            y_array = np.asarray(y_values, dtype=float).reshape(-1)
-        except Exception as exc:
-            return (
-                f"{dataset_name} {species_name} {source}: "
-                f"values could not be converted to numeric arrays ({exc})"
-            )
-        if x_array.size == 0:
-            return f"{dataset_name} {species_name} {source}: empty x axis"
-        if x_array.size != y_array.size:
-            return (
-                f"{dataset_name} {species_name} {source}: "
-                f"x/value length mismatch ({x_array.size} != {y_array.size})"
-            )
-        for x_value, y_value in zip(x_array, y_array):
-            if not np.isfinite(x_value):
-                return f"{dataset_name} {species_name} {source}: non-finite x value"
-            if not np.isfinite(y_value):
-                return f"{dataset_name} {species_name} {source}: non-finite concentration value"
-            rows.append(
-                [
-                    dataset_name,
-                    species_name,
-                    source,
-                    float(x_value),
-                    float(y_value),
-                ]
-            )
-        return None
-
-    @staticmethod
-    def _dataset_x_header(dataset: Mapping[str, object]) -> str:
-        fit_projection = dataset.get("fit_render_projection")
-        if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
-            axis = canonical_dataset_x_axis(
-                fit_projection.observed_x_label,
-                units=fit_projection.observed_x_units,
-            )
-        else:
-            axis = canonical_dataset_x_axis(
-                dataset.get("x_label") or "Time",
-                units=dataset.get("x_units"),
-            )
-        return axis.header or "X"
-
-    def build_visible_export(self, scope: str) -> Tuple[List[str], List[List[object]]]:
-        if not self._datasets:
-            raise ValueError("No dataset grid data available to export.")
-        species_names = self._export_species_names(scope)
-        if not species_names:
-            raise ValueError("No series selected to export.")
-
-        rows: List[List[object]] = []
-        omitted: List[str] = []
-        x_headers: set[str] = set()
-        for dataset in self._datasets:
-            dataset_name = str(dataset.get("name") or "")
-            dataset_x_header = self._dataset_x_header(dataset)
-            data_x = np.asarray(dataset.get("data_x", []), dtype=float).reshape(-1)
-            all_species = dataset.get("all_species", {}) if isinstance(dataset.get("all_species", {}), dict) else {}
-            all_observations = dataset.get("all_observations", {}) if isinstance(dataset.get("all_observations", {}), dict) else {}
-            fit_projection = dataset.get("fit_render_projection")
-            projection_active = (
-                isinstance(fit_projection, FitRenderDatasetProjection)
-                and fit_projection.status == "ok"
-            )
-            for species_name in species_names:
-                if projection_active and species_name in fit_projection.observed_series:
-                    error = self._coerce_grid_export_series(
-                        rows,
-                        dataset_name=dataset_name,
-                        species_name=species_name,
-                        source="Observed",
-                        x_values=fit_projection.observed_x_for_species(species_name),
-                        y_values=fit_projection.observed_series[species_name],
-                    )
-                    if error:
-                        omitted.append(error)
-                    else:
-                        x_headers.add(dataset_x_header)
-                elif isinstance(all_observations.get(species_name), dict):
-                    observation_spec = all_observations[species_name]
-                    error = self._coerce_grid_export_series(
-                        rows,
-                        dataset_name=dataset_name,
-                        species_name=species_name,
-                        source="Observed",
-                        x_values=observation_spec.get("t", []),
-                        y_values=observation_spec.get("y", []),
-                    )
-                    if error:
-                        omitted.append(error)
-                    else:
-                        x_headers.add(dataset_x_header)
-                elif species_name in all_species:
-                    error = self._coerce_grid_export_series(
-                        rows,
-                        dataset_name=dataset_name,
-                        species_name=species_name,
-                        source="Observed",
-                        x_values=data_x,
-                        y_values=all_species[species_name],
-                    )
-                    if error:
-                        omitted.append(error)
-                    else:
-                        x_headers.add(dataset_x_header)
-                if projection_active and species_name in fit_projection.model_series:
-                    error = self._coerce_grid_export_series(
-                        rows,
-                        dataset_name=dataset_name,
-                        species_name=species_name,
-                        source="Model",
-                        x_values=fit_projection.model_x_for_species(species_name),
-                        y_values=fit_projection.model_series[species_name],
-                    )
-                    if error:
-                        omitted.append(error)
-                    else:
-                        x_headers.add(dataset_x_header)
-        if omitted:
-            detail = "; ".join(omitted)
+        cell_count = (row_count + 1) * _FIT_COPY_COLUMNS
+        if cell_count > _MAX_FIT_COPY_CELLS:
             raise ValueError(
-                "Cannot export All Datasets grid CSV because selected data are incomplete: "
-                + detail
+                "Fit Copy payload exceeds the bounded full-resolution cell "
+                f"limit ({_MAX_FIT_COPY_CELLS:,})."
             )
-        if not rows:
-            raise ValueError("No dataset grid data available to export.")
-
-        concentration_axis = canonical_concentration_axis()
-        x_header = next(iter(x_headers)) if len(x_headers) == 1 else "X"
-        return (
-            ["Dataset", "Series", "Source", x_header, concentration_axis.header],
-            rows,
+        header = (
+            "dataset\tkind\tseries\traw_observation_id\tsource_row"
+            "\tsegment_id\tdiscontinuity\tx_name\tx\ty"
         )
-
-    def clear_datasets(self):
-        """Remove all datasets from the grid."""
-        if self._pg is None or self._graphics_layout is None:
-            return
-
-        if not self._is_gui_thread():
-            with self._pending_datasets_lock:
-                self._pending_datasets_update = []
-                schedule = not self._pending_datasets_invoke_scheduled
-                self._pending_datasets_invoke_scheduled = True
-            if schedule:
-                QtCore.QMetaObject.invokeMethod(
-                    self,
-                    "_apply_pending_datasets_update_on_gui_thread",
-                    QtCore.Qt.ConnectionType.QueuedConnection,
+        total_characters = 0
+        output = io.StringIO()
+        output.write(header)
+        rows_in_chunk = 0
+        for dataset in self._curves:
+            for kind, axes, values in (
+                ("model", dict(dataset.model_x), dict(dataset.model_y)),
+                (
+                    "observed",
+                    dict(dataset.observed_x),
+                    dict(dataset.observed_y),
+                ),
+            ):
+                segment_ids = (
+                    dict(dataset.model_segment_ids)
+                    if kind == "model"
+                    else {}
                 )
-            return
-
-        self._datasets.clear()
-        self._plot_items.clear()
-        self._plot_series_items.clear()
-        self._plot_legends.clear()
-        self._structure_key = None
-        self._selected_species_list = []
-        self._species_list.blockSignals(True)
-        self._species_list.clear()
-        self._species_list.blockSignals(False)
-        self._schedule_redraw()
-
-    def set_controls_visible(self, visible: bool) -> None:
-        """Show or hide the built-in legend/species control row."""
-        self._controls_widget.setVisible(bool(visible))
-
-    def set_autorange_locked(self, locked: bool) -> None:
-        """
-        When locked, disable PyQtGraph autorange on all subplots and preserve the current
-        view ranges across redraws (prevents visible "zoom blips" during live updates).
-        """
-        locked = bool(locked)
-        if locked == bool(getattr(self, "_autorange_locked", False)):
-            return
-
-        self._autorange_locked = locked
-        if locked:
-            self._set_scrollbars_locked(True)
-            self._snapshot_plot_view_ranges()
-            self._snapshot_locked_axis_geometry()
-            for idx, plot in enumerate(list(self._plot_items)):
-                vb = getattr(plot, "getViewBox", lambda: None)()
-                if vb is None:
-                    continue
-                self._apply_locked_axis_style(plot)
-                try:
-                    self._locked_autorange_prev[idx] = tuple(bool(x) for x in vb.autoRangeEnabled())
-                except Exception:
-                    self._locked_autorange_prev[idx] = (True, True)
-                try:
-                    vb.enableAutoRange(x=False, y=False)
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "disable_autorange_lock",
-                        message=f"GridPlotView: failed to disable autorange while locking subplot={idx}",
-                        exc=exc,
-                    )
-        else:
-            self._set_scrollbars_locked(False)
-            for idx, plot in enumerate(list(self._plot_items)):
-                vb = getattr(plot, "getViewBox", lambda: None)()
-                if vb is None:
-                    continue
-                try:
-                    left_axis = plot.getAxis("left")
-                    bottom_axis = plot.getAxis("bottom")
-                    left_axis.setStyle(autoExpandTextSpace=True)
-                    bottom_axis.setStyle(autoExpandTextSpace=True)
-                    left_axis.setWidth(None)
-                    bottom_axis.setHeight(None)
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "restore_axis_styles",
-                        message=f"GridPlotView: failed to restore axis styles while unlocking subplot={idx}",
-                        exc=exc,
-                    )
-                prev = self._locked_autorange_prev.get(idx, (True, True))
-                try:
-                    vb.enableAutoRange(x=bool(prev[0]), y=bool(prev[1]))
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "restore_autorange",
-                        message=f"GridPlotView: failed to restore autorange while unlocking subplot={idx}",
-                        exc=exc,
-                    )
-            self._locked_view_ranges.clear()
-            self._locked_autorange_prev.clear()
-            self._locked_left_axis_width = None
-            self._locked_bottom_axis_height = None
-            self._schedule_redraw()
-
-    def _snapshot_plot_view_ranges(self) -> None:
-        if not self._plot_items:
-            return
-        for idx, plot in enumerate(list(self._plot_items)):
-            vb = getattr(plot, "getViewBox", lambda: None)()
-            if vb is None:
-                continue
-            try:
-                view = vb.viewRange()
-                x0, x1 = view[0]
-                y0, y1 = view[1]
-                x_range = (float(x0), float(x1))
-                y_range = (float(y0), float(y1))
-            except (TypeError, ValueError, IndexError):
-                continue
-            self._locked_view_ranges[idx] = (x_range, y_range)
-
-    def _restore_locked_view_ranges(self) -> None:
-        if not bool(getattr(self, "_autorange_locked", False)):
-            return
-        for idx, plot in enumerate(list(self._plot_items)):
-            frozen = self._locked_view_ranges.get(idx)
-            if not frozen:
-                continue
-            try:
-                plot.setXRange(float(frozen[0][0]), float(frozen[0][1]), padding=0)
-                plot.setYRange(float(frozen[1][0]), float(frozen[1][1]), padding=0)
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "restore_locked_view_range",
-                    message=f"GridPlotView: failed to restore locked view range for subplot={idx}",
-                    exc=exc,
+                source_rows = (
+                    dict(dataset.observed_source_rows)
+                    if kind == "observed"
+                    else {}
                 )
+                raw_ids = (
+                    dict(dataset.observed_raw_ids)
+                    if kind == "observed"
+                    else {}
+                )
+                for species, y_values in values.items():
+                    x_values = axes.get(species, ())
+                    for index, (x_value, y_value) in enumerate(
+                        zip(x_values, y_values, strict=True)
+                    ):
+                        segment_id = (
+                            segment_ids[species][index]
+                            if species in segment_ids
+                            else ""
+                        )
+                        discontinuity = bool(
+                            kind == "model"
+                            and index > 0
+                            and segment_ids[species][index]
+                            != segment_ids[species][index - 1]
+                        )
+                        output.write("\n")
+                        output.write(
+                            "\t".join(
+                                (
+                                    dataset.display_name,
+                                    kind,
+                                    species,
+                                    raw_ids.get(species, ""),
+                                    (
+                                        str(source_rows[species][index])
+                                        if species in source_rows
+                                        else ""
+                                    ),
+                                    str(segment_id),
+                                    "1" if discontinuity else "0",
+                                    dataset.x_name,
+                                    f"{float(x_value):.17g}",
+                                    f"{float(y_value):.17g}",
+                                )
+                            )
+                        )
+                        rows_in_chunk += 1
+                        if rows_in_chunk >= _FIT_COPY_ROWS_PER_CHUNK:
+                            chunk = output.getvalue()
+                            total_characters += len(chunk)
+                            if total_characters > _MAX_FIT_COPY_CHARACTERS:
+                                raise ValueError(
+                                    "Fit Copy payload exceeds the bounded "
+                                    "output-size limit "
+                                    f"({_MAX_FIT_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+                                )
+                            yield chunk
+                            output = io.StringIO()
+                            rows_in_chunk = 0
+        chunk = output.getvalue()
+        total_characters += len(chunk)
+        if total_characters > _MAX_FIT_COPY_CHARACTERS:
+            raise ValueError(
+                "Fit Copy payload exceeds the bounded output-size limit "
+                f"({_MAX_FIT_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+            )
+        if chunk:
+            yield chunk
 
-    def set_species_selection(self, species_names: Sequence[str]) -> None:
-        """
-        Update the multi-select list with the provided species names.
-
-        Parameters
-        ----------
-        species_names : Sequence[str]
-            Names to select in the list. Non-existent names are ignored.
-        """
-        if not species_names or self._species_list.count() == 0:
+    @QtCore.Slot()
+    def _continue_copy(self) -> None:
+        chunks = self._copy_chunks
+        output = self._copy_output
+        if chunks is None or output is None:
+            self._copy_timer.stop()
             return
-
-        names_lower = {name.lower(): name for name in species_names if isinstance(name, str)}
-        if not names_lower:
-            return
-
-        prev_selected = list(getattr(self, "_selected_species_list", []) or [])
-        prev_lower = {str(name).lower() for name in prev_selected if str(name).strip()}
-        if prev_lower and prev_lower == set(names_lower.keys()):
-            return
-        self._species_list.blockSignals(True)
         try:
-            for idx in range(self._species_list.count()):
-                item = self._species_list.item(idx)
-                item.setSelected(False)
-                item_lower = item.text().lower()
-                if item_lower in names_lower:
-                    item.setSelected(True)
-            if not self._species_list.selectedItems() and self._species_list.count() > 0:
-                self._species_list.item(0).setSelected(True)
-        finally:
-            self._species_list.blockSignals(False)
+            output.write(next(chunks))
+        except StopIteration:
+            self._copy_timer.stop()
+            text = output.getvalue()
+            self._copy_chunks = None
+            self._copy_output = None
+            application = QtWidgets.QApplication.instance()
+            if application is None:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Copy Fit Data",
+                    "A QApplication is required to copy Fit data.",
+                )
+                return
+            application.clipboard().setText(text)
+        except Exception as exc:
+            self._copy_timer.stop()
+            self._copy_chunks = None
+            self._copy_output = None
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Copy Fit Data",
+                str(exc),
+            )
 
-        new_selected = [item.text() for item in self._species_list.selectedItems()]
-        self._selected_species_list = new_selected
-        if new_selected != prev_selected:
-            self._schedule_redraw()
-
-    def _calculate_grid_size(self, n_datasets: int) -> Tuple[int, int]:
-        """
-        Calculate optimal grid dimensions for n datasets.
-
-        Returns (n_rows, n_cols)
-        """
-        if n_datasets == 0:
-            return (1, 1)
-        elif n_datasets == 1:
-            return (1, 1)
-        elif n_datasets == 2:
-            return (1, 2)
-        elif n_datasets <= 4:
-            return (2, 2)
-        elif n_datasets <= 6:
-            return (2, 3)
-        elif n_datasets <= 9:
-            return (3, 3)
-        else:
-            # General case: aim for roughly square grid
-            cols = math.ceil(math.sqrt(n_datasets))
-            rows = math.ceil(n_datasets / cols)
-            return (rows, cols)
-
-    def _update_grid(self):
-        """Update grid plots, rebuilding structure only when necessary."""
-        if self._pg is None or self._graphics_layout is None:
+    def _redraw(self) -> None:
+        if self._canvas is None or self._pg is None:
+            if self._message is not None:
+                self._message.setText(
+                    "No Fit curves yet."
+                    if not self._curves
+                    else "Plotting is unavailable; Fit values and Apply remain usable."
+                )
             return
-
-        if bool(getattr(self, "_autorange_locked", False)):
-            self._snapshot_plot_view_ranges()
-
-        desired_key = self._dataset_structure_key(self._datasets)
-        needs_rebuild = (
-            self._structure_key != desired_key
-            or len(self._plot_items) != len(self._datasets)
-            or len(self._plot_series_items) != len(self._datasets)
-        )
-        if needs_rebuild:
-            self._rebuild_structure()
-        self._update_plot_data_in_place()
-        self._restore_locked_view_ranges()
-
-    def _toggle_legend(self, visible: bool) -> None:
-        """Toggle legend visibility and redraw grid."""
-        self._legend_visible = visible
-        self._schedule_redraw()
-
-    def _on_species_selection_changed(self) -> None:
-        """Handle species multi-selection change."""
-        selected_items = self._species_list.selectedItems()
-        self._selected_species_list = [item.text() for item in selected_items]
-
-        # Redraw grid with new species selection
-        self._schedule_redraw()
-
-    def _update_species_selector(self) -> None:
-        """Update species selector with all available species across datasets."""
-        all_species_names = set()
-
-        for dataset in self._datasets:
-            fit_projection = dataset.get("fit_render_projection")
-            if isinstance(fit_projection, FitRenderDatasetProjection) and fit_projection.status == "ok":
-                all_species_names.update(str(name) for name in fit_projection.observed_series.keys() if str(name))
-                continue
-            all_observations = dataset.get("all_observations", {})
-            if isinstance(all_observations, dict):
-                all_species_names.update(str(name) for name in all_observations.keys() if str(name))
-            all_species = dataset.get('all_species', {})
-            all_species_names.update(all_species.keys())
-
-        if not all_species_names:
+        self._canvas.clear()
+        if not self._curves:
+            plot = self._canvas.addPlot(row=0, col=0, title="No Fit curves yet")
+            plot.hideAxis("left")
+            plot.hideAxis("bottom")
             return
-
-        sorted_species = tuple(sorted(all_species_names))
-        if sorted_species == tuple(getattr(self, "_available_species_cache", None) or ()):
-            return
-        self._available_species_cache = sorted_species
-
-        # Update list widget (block signals to prevent recursion)
-        self._species_list.blockSignals(True)
-        current_selection = self._selected_species_list.copy()
-        self._species_list.clear()
-
-        for species in list(sorted_species):
-            item = QtWidgets.QListWidgetItem(species)
-            self._species_list.addItem(item)
-            # Restore selection or select first species by default
-            if species in current_selection or (not current_selection and species == sorted_species[0]):
-                item.setSelected(True)
-
-        # Update selected list
-        self._selected_species_list = [item.text() for item in self._species_list.selectedItems()]
-        self._species_list.blockSignals(False)
-
-    def _get_color_for_r_squared(self, r_squared: float) -> Tuple[int, int, int]:
-        """Get color based on R-squared value."""
-        if not isinstance(r_squared, (int, float)):
-            return (136, 136, 136)
-        if math.isnan(r_squared) or math.isinf(r_squared):
-            return (136, 136, 136)
-        if r_squared > 1:
-            return (136, 136, 136)
-        if r_squared > 0.95:
-            return (34, 170, 85)  # Green
-        elif r_squared > 0.85:
-            return (221, 170, 85)  # Yellow/orange
-        else:
-            return (221, 68, 68)  # Red
-
-    def set_dark_mode(self, enabled: bool):
-        """
-        Set dark mode for the grid.
-
-        Parameters
-        ----------
-        enabled : bool
-            If True, use dark theme. Otherwise, use light theme.
-        """
-        if self._pg is None or self._graphics_layout is None:
-            return
-
-        if enabled:
-            bg_color = (30, 30, 30)
-            text_color = (224, 224, 224)
-        else:
-            bg_color = (248, 248, 248)
-            text_color = (0, 0, 0)
-
-        # Set background on the GraphicsLayoutWidget (not individual PlotItems)
-        self._graphics_layout.setBackground(bg_color)
-
-        # Update axis colors for all plots
-        for plot in self._plot_items:
-            for axis in ['left', 'bottom']:
-                plot.getAxis(axis).setTextPen(text_color)
-                plot.getAxis(axis).setPen(text_color)
+        columns = max(1, int(math.ceil(math.sqrt(len(self._curves)))))
+        for index, dataset in enumerate(self._curves):
+            row, column = divmod(index, columns)
+            plot = self._canvas.addPlot(
+                row=row,
+                col=column,
+                title=dataset.display_name,
+            )
+            plot.showGrid(x=True, y=True, alpha=0.25)
+            plot.setLabel(
+                "bottom",
+                "Time" if dataset.x_name == "t" else dataset.x_name,
+            )
+            plot.setLabel("left", "Value")
+            model_x = dict(dataset.model_x)
+            observed_x = dict(dataset.observed_x)
+            displayed_series_count = (
+                len(dataset.model_y) + len(dataset.observed_y)
+            )
+            if displayed_series_count > 1:
+                plot.addLegend()
+            model_segments = dict(dataset.model_segment_ids)
+            for species, values in dataset.model_y:
+                color = _color_value(self._color_resolver(species))
+                x_values = model_x.get(species, ())
+                segment_values = model_segments[species]
+                start = 0
+                for index in range(1, len(values) + 1):
+                    if (
+                        index < len(values)
+                        and segment_values[index] == segment_values[start]
+                    ):
+                        continue
+                    plot.plot(
+                        list(x_values[start:index]),
+                        list(values[start:index]),
+                        pen=self._pg.mkPen(color=color, width=2),
+                        name=(
+                            f"{species} — model"
+                            if start == 0
+                            else None
+                        ),
+                    )
+                    start = index
+            for species, values in dataset.observed_y:
+                color = _color_value(self._color_resolver(species))
+                plot.plot(
+                    list(observed_x.get(species, ())),
+                    list(values),
+                    pen=None,
+                    symbol="o",
+                    symbolSize=6,
+                    symbolBrush=self._pg.mkBrush(color),
+                    symbolPen=self._pg.mkPen(color=color),
+                    name=f"{species} — observed",
+                )

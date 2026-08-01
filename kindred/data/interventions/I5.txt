@@ -1,7 +1,10 @@
 # title: Light-dark photocatalysis cycle
 # Alternates illumination and dark periods to probe light-dependent catalysis.
-reaction: Substrate + Light -> Product + Light; k=0.6
 intervention_set1 = {
-  initial: Substrate=1.0, Light=0.0, Product=0.0
+  [Substrate] = 1.0
+  [Light] = 0.0
+  [Product] = 0.0
 }
-intervention: op=protocol; kind=repeat; name=user_light_cycle; start=0.0; every=2.0; duration=1.0; count=3; during=reservoir:Light:value=1.0; after=clear:Light
+
+reaction: Substrate + Light -> Product + Light; k=0.6
+intervention: op=protocol; kind=repeat; start_time=0.0; every=2.0; count=3; duration=1.0; during={op=hold,species=Light,value=1.0}; after={op=set,species=Light,value=0.0}

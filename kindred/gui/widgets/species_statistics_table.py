@@ -7,31 +7,10 @@ from typing import Dict, Optional
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
-try:
-    from scipy.integrate import trapezoid as _scipy_trapezoid
-except Exception:  # pragma: no cover - scipy is a dependency but keep a safe fallback
-    _scipy_trapezoid = None
+
+from kindred.core.results import integrate_ctc
 
 __all__ = ["SpeciesStatisticsTable"]
-
-# P3 ENHANCEMENT: Named constants for CTC calculation thresholds
-# Minimum absolute threshold for considering a species "converged to zero"
-CTC_ABSOLUTE_THRESHOLD = 1e-10
-
-# Relative threshold as fraction of maximum concentration
-CTC_RELATIVE_THRESHOLD = 0.01  # 1% of max concentration
-
-
-def _trapezoid_integral(y: np.ndarray, x: np.ndarray) -> float:
-    """Integrate y(x) using the best available trapezoid implementation."""
-    for fn in (getattr(np, "trapezoid", None), getattr(np, "trapz", None), _scipy_trapezoid):
-        if callable(fn):
-            return float(fn(y, x))
-    raise AttributeError(
-        "No trapezoid integration function available; expected numpy.trapezoid, "
-        "numpy.trapz, or scipy.integrate.trapezoid."
-    )
-
 
 class SpeciesStatisticsTable(QtWidgets.QTableWidget):
     """
@@ -152,19 +131,21 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             # - Species → 0: ∫C dt (area under curve)
             # - Species → C_final ≠ 0: ∫|C - C_final| dt (deviation from baseline)
 
-            # P3 FIX: Use named constants instead of magic numbers
-            # Check if species converges to near-zero
-            threshold = max(CTC_ABSOLUTE_THRESHOLD,
-                          CTC_RELATIVE_THRESHOLD * np.max(np.abs(concentrations)))
-
-            if abs(final_conc) < threshold:
-                # Converges to zero → area under curve (no baselining needed)
-                ctc = _trapezoid_integral(concentrations, t)
-            else:
-                # Converges to non-zero → baseline-corrected area
-                # Measures total deviation from equilibrium (finite even for long times)
-                deviation = np.abs(concentrations - final_conc)
-                ctc = _trapezoid_integral(deviation, t)
+            threshold = max(
+                1e-10,
+                0.01 * float(np.max(np.abs(concentrations))),
+            )
+            integrand = (
+                concentrations
+                if abs(float(final_conc)) < threshold
+                else np.abs(concentrations - final_conc)
+            )
+            ctc, _method, _uniform, _eps, _tail = integrate_ctc(
+                t,
+                integrand,
+                uniformity_eps=1e-6,
+                tail_strategy="38",
+            )
 
             _item5 = QtWidgets.QTableWidgetItem(f"{ctc:.6g}")
             _item5.setTextAlignment(QtCore.Qt.AlignCenter)

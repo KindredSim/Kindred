@@ -1,10 +1,7 @@
-"""Shared constants for the fitting UI subsystem."""
+"""Small Fit-local UI constants; simulation science comes from each mapped set."""
 
 INITIAL_PREFIX = "init:"
-FITTING_DEFAULT_SOLVER = "BDF"
-FITTING_SOLVERS = ("Radau", "BDF")
 FITTING_METHODS = ("trf", "dogbox", "differential_evolution")
 FITTING_MAX_NFEV_RANGE = (10, 10_000)
 FITTING_SEED_RANGE = (0, 999_999)
-FITTING_SCIENTIFIC_VALUE_MAX = 1e300
-_SAMPLING_ALL_POINTS_SENTINEL = 0
+SIMULATION_SOLVERS = ("Radau", "BDF")

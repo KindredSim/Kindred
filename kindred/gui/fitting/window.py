@@ -1,3906 +1,3003 @@
-"""
-Fitting window and adjacent package-local UI helpers.
-
-This module is the physical implementation root for the fitting subsystem UI.
-"""
+"""Four-tab application-modal Fit window with local-only state and plots."""
 
 from __future__ import annotations
 
-import hashlib
-import logging
 import math
-import weakref
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING
+import time
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import replace
 
 import numpy as np
-from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt
+from PySide6 import QtCore, QtWidgets
 
-if TYPE_CHECKING:
-    from kindred.core.analysis.global_fit_execution import GlobalFitResult
-
-from kindred.gui.fitting.simulation_builder_contract import (
-    SimulationBuilder,
-    SimulationBuilderContractError,
-    coerce_simulation_builder,
+from kindred.core.analysis.dataset_sampling import compute_sampled_indices
+from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.project_document import (
+    FitDefaults,
+    SimulationExecutionSettings,
 )
-from kindred.core.analysis.fit_dataset_payload import (
-    FitDatasetPayloadResult,
-    coerce_fit_dataset_payload_result,
-    coerce_fit_dataset_specs,
-    read_fit_dataset_payload,
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.gui.fitting.constants import (
+    FITTING_MAX_NFEV_RANGE,
+    FITTING_METHODS,
+    FITTING_SEED_RANGE,
+    SIMULATION_SOLVERS,
 )
-from kindred.core.datasets.observation_payload import copy_observations_map, dense_view_from_observations
-from kindred.core.analysis.dataset_parameter_overrides import (
-    coerce_fit_dataset_parameter_overrides,
-    split_fit_dataset_parameter_overrides,
+from kindred.gui.fitting.contracts import (
+    FitRunIdentity,
+    FitTargetSelection,
+    copy_target_selection,
 )
-from kindred.core.analysis.global_fit_projection import (
-    FitRenderProjection,
-    projection_from_global_fit_result,
-)
-from kindred.core.analysis.global_fit_execution import normalize_weights
-from kindred.core.fitting_evaluation import (
-    FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR,
-    SerialFittingEvaluator,
-    coerce_fitting_series_evaluator,
-    evaluate_fitting_series,
-)
-from kindred.core.fitting_runtime_session import FittingRuntimeLedger, FittingRuntimeSession
-from kindred.core.simulator.solvers import normalize_solver_name
-from kindred.core.simulation_preparation import PreparedSimulationMetadata
-from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 from kindred.gui.fitting.launch import (
-    FittingLaunchDatasetSelection,
-    FittingLaunchPurpose,
-    FittingLaunchRejection,
-    FittingLaunchResult,
-    FittingLaunchSnapshot,
-    validate_de_bounds,
+    FitOriginSnapshot,
+    FitParameterVariable,
+    FitSetupSnapshot,
+    pre_boundary_fit_row_candidates,
+    resolve_pre_boundary_fit_rows,
 )
-from kindred.gui.fitting.completed_apply_authority import (
-    CompletedFitApplyAuthority,
-    CompletedFitApplyAuthorityOwner,
+from kindred.gui.fitting.worker import (
+    FitCandidate,
+    FitCurveDataset,
+    FitLiveUpdate,
 )
-from kindred.gui.ports import AuthoritativeRewriteOutcome
-from kindred.core.simulation_failure import (
-    coerce_simulation_failure,
-    simulation_failure_detail_text,
-    simulation_failure_user_message,
+from kindred.gui.widgets.grid_plot_view import GridPlotView
+from kindred.gui.widgets.mechanism_inspector import MechanismInspectorDialog
+
+__all__ = ["FittingWindow"]
+
+
+def _check_item(checked: bool) -> QtWidgets.QTableWidgetItem:
+    item = QtWidgets.QTableWidgetItem()
+    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+    item.setCheckState(
+        QtCore.Qt.CheckState.Checked
+        if checked
+        else QtCore.Qt.CheckState.Unchecked
+    )
+    return item
+
+
+def _text_item(value: object, *, editable: bool = True) -> QtWidgets.QTableWidgetItem:
+    item = QtWidgets.QTableWidgetItem(str(value))
+    if not editable:
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+    return item
+
+
+def _float_text(value: float) -> str:
+    return f"{float(value):.12g}"
+
+
+def _read_float(text: object, field: str) -> float:
+    value = float(str(text))
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite.")
+    return value
+
+
+_PARAMETER_SHARED_BASELINE_ROLE = (
+    QtCore.Qt.ItemDataRole.UserRole + 20
 )
-from kindred.gui.fitting.run_stamp import (
-    build_global_fit_run_stamp,
-    hash_global_fit_run_stamp,
-)
-from kindred.gui.fitting.runtime_readiness import (
-    FittingRuntimeAcceptedLaunch,
-    FittingRuntimeIdentity,
-    PreparedFitEvaluator,
-    FittingRuntimeReadinessController,
-    FittingRuntimeLaunchDecisionState,
-    FittingRuntimeReadinessState,
-)
-from kindred.gui.fitting.data_tab import DataTab
-from kindred.gui.fitting.data_targets_tab import DataTargetsTab
-from kindred.gui.fitting.evaluator_state import (
-    FittingEvaluatorStateOwner,
-    prepared_simulation_matches_runtime_inputs,
-)
-from kindred.gui.fitting.runtime_inputs import FittingRuntimeInputs
-from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
-from kindred.gui.fitting.run_results_tab import RunResultsTab
-from kindred.gui.fitting.run_state import FittingRunStateOwner
-from kindred.gui.fitting.runtime_preparation import FittingRuntimePreparationOwner
-from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
-from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
-from kindred.gui.fitting.worker import GlobalFitWorker
-from kindred.core.analysis.dataset_sampling import compute_sampled_indices, compute_windowed_indices
-from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_SENTINEL
-from kindred.gui.display_name_policy import (
-    FOOTER_SUMMARY_MAX_CHARS,
-    INLINE_ERROR_MAX_CHARS,
-    STATUS_ITEM_LABEL_MAX_CHARS,
-    compact_diagnostic_text,
-    compact_dataset_label,
-    summarize_named_count,
-)
-from kindred.gui.ui_helpers import set_compact_label_text
-
-logger = logging.getLogger(__name__)
-
-
-class _ObservableRewriteAborted(RuntimeError):
-    pass
-
-
-class _EvaluateSeriesEvaluatorLike(Protocol):
-    def evaluate_series(self, params: Mapping[str, float]) -> Dict[str, Any]:
-        ...
-
-_PROJECT_APPLY_SCOPE_PARAMETERS = "parameters"
-_PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS = "initial_conditions"
-_PROJECT_APPLY_SCOPE_BOTH = "both"
-_PROJECT_APPLY_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("Parameters only", _PROJECT_APPLY_SCOPE_PARAMETERS),
-    ("Initial conditions only", _PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS),
-    ("Parameters and initial conditions", _PROJECT_APPLY_SCOPE_BOTH),
-)
-
-
-__all__ = [
-    "FittingWindow",
-    "GlobalFitWorker",
-    "validate_de_bounds",
-]
-
-
-class _FitDialogWorkerRegistry(QtCore.QObject):
-    """Owns detached fit-worker wrappers until they finish and can be deleted safely."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._retained_threads: List[QtCore.QThread] = []
-        self._release_watchers: Dict[int, QtCore.QTimer] = {}
-
-    @staticmethod
-    def _is_running(worker: QtCore.QThread) -> bool:
-        try:
-            return bool(getattr(worker, "isRunning", lambda: False)())
-        except Exception:
-            return False
-
-    def contains_thread(self, worker: QtCore.QThread) -> bool:
-        return any(item is worker for item in self._retained_threads)
-
-    def register_thread(self, worker: QtCore.QThread) -> None:
-        if worker is None or self.contains_thread(worker):
-            return
-        self._retained_threads.append(worker)
-        finished = getattr(worker, "finished", None)
-        if finished is not None and hasattr(finished, "connect"):
-            try:
-                finished.connect(lambda *_args, w=worker: self.release_thread(w))
-            except Exception as exc:
-                logger.debug("Failed to connect fit-worker registry release hook: %s", exc, exc_info=True)
-        self._start_release_watch(worker)
-        if not self._is_running(worker):
-            self.release_thread(worker)
-
-    def release_thread(self, worker: QtCore.QThread) -> None:
-        if worker is None:
-            return
-        self._stop_release_watch(worker)
-        self._retained_threads = [item for item in self._retained_threads if item is not worker]
-        self.schedule_cleanup(worker)
-
-    def _start_release_watch(self, worker: QtCore.QThread) -> None:
-        key = id(worker)
-        watcher = self._release_watchers.get(key)
-        if watcher is None:
-            watcher = QtCore.QTimer(self)
-            watcher.setInterval(50)
-            watcher.setSingleShot(False)
-            watcher.timeout.connect(lambda w=worker: self._poll_worker_release(w))
-            self._release_watchers[key] = watcher
-        if not watcher.isActive():
-            watcher.start()
-
-    def _stop_release_watch(self, worker: QtCore.QThread) -> None:
-        watcher = self._release_watchers.pop(id(worker), None)
-        if watcher is None:
-            return
-        if watcher.isActive():
-            watcher.stop()
-        watcher.deleteLater()
-
-    def _poll_worker_release(self, worker: QtCore.QThread) -> None:
-        if worker is None:
-            return
-        if self._is_running(worker):
-            return
-        self.release_thread(worker)
-
-    def schedule_cleanup(self, worker: QtCore.QThread) -> None:
-        if worker is None:
-            return
-
-        def _attempt_delete() -> None:
-            if self._is_running(worker):
-                QtCore.QTimer.singleShot(50, _attempt_delete)
-                return
-            try:
-                worker.deleteLater()
-            except Exception:
-                return
-
-        QtCore.QTimer.singleShot(0, _attempt_delete)
-
-
-class _FitRuntimePreparationNotifier(QtCore.QObject):
-    completed = QtCore.Signal()
-
-
-# ============================================================================
-# VALIDATION FUNCTIONS
-# ============================================================================
-
-class _SimulationWithFixedParams:
-    def __init__(self, base_evaluator: object, fixed_params: Dict[str, float]):
-        self.base_evaluator = coerce_fitting_series_evaluator(base_evaluator)
-        self.fixed_params = dict(fixed_params)
-
-    @property
-    def prepared_metadata(self) -> Optional[PreparedSimulationMetadata]:
-        try:
-            return getattr(self.base_evaluator, "prepared_metadata", None)
-        except Exception:
-            return None
-
-    def __call__(self, params: Dict[str, float]):
-        return self.evaluate_series(params)
-
-    def evaluate_series(self, params: Dict[str, float]):
-        origins = {
-            str(name): FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
-            for name in dict(params or {})
-            if str(name).strip()
-        }
-        return self.evaluate_series_with_parameter_origins(params, origins)
-
-    def evaluate_series_with_parameter_origins(
-        self,
-        params: Dict[str, float],
-        origins: Optional[Dict[str, str]] = None,
-        *,
-        failed_params: Optional[Dict[str, float]] = None,
-    ):
-        merged = dict(self.fixed_params)
-        merged_origins = {
-            str(name): FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
-            for name in merged
-            if str(name).strip()
-        }
-        merged.update(dict(params or {}))
-        for raw_name in dict(params or {}):
-            name = str(raw_name)
-            if not name.strip():
-                continue
-            merged_origins[name] = str((origins or {}).get(name, FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR))
-        return evaluate_fitting_series(
-            self.base_evaluator,
-            merged,
-            origins=merged_origins,
-            failed_params=failed_params,
-        )
 
 
 class FittingWindow(QtWidgets.QDialog):
-    """
-    Persistent fitting window that drives global fits.
+    """Physical editor/view; the FitSessionOwner builds and retains typed requests."""
 
-    The window combines three workflow tabs:
-        - Data and Targets (datasets, sampling, targets & weights, initial conditions)
-        - Parameters (parameter table and integration settings)
-        - Results (fit diagnostics and run stamp review)
-
-    It owns the lifetime of GlobalFitWorker instances and updates plots +
-    parameter tables after each run, enabling iterative workflows.
-    """
-
-    WINDOW_MODES = {"global"}
+    executeRequested = QtCore.Signal()
+    cancelRequested = QtCore.Signal()
+    pauseRequested = QtCore.Signal()
+    resumeRequested = QtCore.Signal()
+    applyRequested = QtCore.Signal(object)
+    addObservableRequested = QtCore.Signal(str, str, str, str, str)
+    restoreSetupRequested = QtCore.Signal(object)
+    projectDefaultsRequested = QtCore.Signal(object)
 
     def __init__(
         self,
+        origin: FitOriginSnapshot,
         *,
-        mode: str,
-        parameter_defs: Sequence[Dict[str, Any]],
-        dataset_entries: Sequence[Dict[str, Any]],
-        dataset_fit_settings_store: Any,
-        dataset_view_publisher: Any,
-        mechanism_parameter_scan_owner: Any,
-        simulation_func: Optional[
-            Callable[[Dict[str, float]], Dict[str, np.ndarray]] | _EvaluateSeriesEvaluatorLike
-        ] = None,
-        fit_func: Optional[Callable[..., "GlobalFitResult"]] = None,
-        mechanism_species: Optional[Sequence[str]] = None,
-        mechanism_text_getter: Optional[Callable[[], str]] = None,
-        reactions_text_getter: Optional[Callable[[], str]] = None,
-        reactions_text_rewriter: Optional[Callable[..., AuthoritativeRewriteOutcome]] = None,
-        simulation_builder: Optional[SimulationBuilder] = None,
-        runtime_inputs: Optional[FittingRuntimeInputs] = None,
-        dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
-        dataset_variable_params: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
-        dataset_payloads: Optional[Sequence[Dict[str, Any]]] = None,
-        dataset_payload_results: Optional[Dict[str, object]] = None,
-        dataset_weights: Optional[Dict[str, float]] = None,
-        project_apply_callback: Optional[Callable[[str, Dict[str, float], Dict[str, Dict[str, float]]], None]] = None,
-        config_defaults: Optional[Dict[str, Any]] = None,
-        parent: Optional[QtWidgets.QWidget] = None,
-    ):
+        close_handler: Callable[[float], bool],
+        color_resolver: Callable[[str], object] | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        normalized_mode = str(mode or "global").lower()
-        if normalized_mode not in self.WINDOW_MODES:
-            raise ValueError(f"Unsupported fitting mode: {mode!r}")
-
-        self._mode = normalized_mode
-        if not dataset_fit_settings_store:
-            raise ValueError("FittingWindow requires a committed dataset fit-settings store.")
-        if dataset_view_publisher is None:
-            raise ValueError("FittingWindow requires a committed dataset view publisher.")
-        if not mechanism_parameter_scan_owner:
-            raise ValueError("FittingWindow requires a mechanism parameter scan owner.")
-        self._dataset_fit_settings_store = dataset_fit_settings_store
-        self._dataset_view_publisher = dataset_view_publisher
-        self._mechanism_parameter_scan_owner = mechanism_parameter_scan_owner
-        if fit_func is None:
-            from kindred.core.analysis.global_fitting import fit_global as default_fit_global
-
-            fit_func = default_fit_global
-        self._fit_func = fit_func
-        self._mechanism_species = [str(x) for x in (mechanism_species or []) if str(x).strip()]
-        self._mechanism_text_getter = mechanism_text_getter
-        self._reactions_text_getter = reactions_text_getter
-        self._reactions_text_rewriter = reactions_text_rewriter
-        self._simulation_builder = (
-            coerce_simulation_builder(simulation_builder)
-            if callable(simulation_builder)
-            else None
-        )
-        if not isinstance(runtime_inputs, FittingRuntimeInputs):
-            raise ValueError("FittingWindow requires explicit typed runtime inputs.")
-
-        self._fit_evaluator_state = FittingEvaluatorStateOwner(
-            base_evaluator=simulation_func,
-            simulation_builder=self._simulation_builder,
-        )
-        self._last_launch_result: Optional[FittingLaunchResult] = None
-        self._runtime_inputs = runtime_inputs
-        self._project_apply_callback = project_apply_callback
-        self._config_defaults = dict(config_defaults or {})
-
-        self._global_dataset_params = dict(dataset_params or {})
-        self._global_dataset_variable_params = dict(dataset_variable_params or {})
-        self._global_payload_results: Dict[str, FitDatasetPayloadResult] = {
-            str(payload["id"]): FitDatasetPayloadResult.valid(payload)
-            for payload in (dataset_payloads or [])
-            if "id" in payload
-        }
-        for ds_id, result in (dataset_payload_results or {}).items():
-            self._global_payload_results[str(ds_id)] = coerce_fit_dataset_payload_result(result)
-        self._global_payload_lookup = {
-            ds_id: dict(result.payload)
-            for ds_id, result in self._global_payload_results.items()
-            if result.state == "valid" and isinstance(result.payload, dict)
-        }
-        self._global_weights = dict(dataset_weights or {})
-        self._active_variable_specs: Dict[str, Dict[str, Dict[str, float]]] = {}
-
-        self._fixed_shared_params: Dict[str, float] = {}
-        self._prepared_param_names = [
-            str(d.get("name") or "")
-            for d in (parameter_defs or [])
-            if isinstance(d, dict) and str(d.get("name") or "").strip()
-        ]
-        self._parameter_state = ParametersIcsTab._build_parameter_state(self, parameter_defs)
-        self._initial_parameter_snapshot = [dict(row) for row in self._parameter_state]
-        self._dataset_entries = self._normalize_dataset_entries(dataset_entries)
-        if not self._dataset_entries:
-            raise ValueError("At least one dataset entry is required for fitting.")
-
-        self._load_dataset_pool_from_entries()
-
-        # Per-dataset sampling/X-axis state (applied only; UI edits are pending until Apply).
-        self._sampling_applied: Dict[str, Dict[str, float | int | str]] = {}
-
-        self._init_fit_run_state()
-
-        self.setWindowTitle("Fitting Window")
-        self.resize(1280, 720)
-        self.setWindowFlags(
-            self.windowFlags()
-            | Qt.WindowMinMaxButtonsHint
-        )
-
-        self._build_ui()
-        # _apply_config_defaults and _populate_parameter_table are handled
-        # internally by ParametersIcsTab during construction
-        self._mark_fit_window_state_mechanism_current(
-            self._safe_text_from_getter(self._mechanism_text_getter)
-        )
-        self._init_sampling_state()
-        self._populate_dataset_table()
-        self._species_table.on_tab_activated(
-            seed_dataset_id=self._selected_data_table_dataset_id()
-        )
-        self._on_targets_validity_changed()
-        self._refresh_sampling_validity_ui()
-        ds_id = self._data_targets_tab.unified_list.selected_dataset_id()
-        if ds_id:
-            self._data_tab.select_dataset(ds_id)
-        self._refresh_plot_baselines()
-        self._fit_runtime_preparation_owner.schedule_refresh()
-
-
-    def _load_dataset_pool_from_entries(self) -> None:
-        # Snapshot of datasets available to this Global Fit session (already-loaded at window launch).
-        # This enables in-window add/remove without mutating the project's dataset list.
-        self._loaded_dataset_pool = {}
-        self._loaded_dataset_order = []
-        self._loaded_dataset_series_parse_failures = {}
-        self._teardown_disable_failures = set()
-        self._best_effort_failures = set()
-
-        for entry in self._dataset_entries:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id or ds_id in self._loaded_dataset_pool:
-                continue
-            observations = (
-                copy_observations_map(entry.get("observations"))
-                if isinstance(entry.get("observations"), dict)
-                else {}
-            )
-            try:
-                t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1).copy()
-            except Exception:
-                t_values = np.asarray([], dtype=float)
-            if observations:
-                t_values, raw_series = dense_view_from_observations(observations)
-            else:
-                raw_series = entry.get("species_data") or entry.get("species") or {}
-            series_map: dict[str, np.ndarray] = {}
-            series_failures: list[str] = []
-            if isinstance(raw_series, dict):
-                for name, values in raw_series.items():
-                    key = str(name).strip()
-                    if not key:
-                        continue
-                    try:
-                        series_map[key] = np.asarray(values, dtype=float).reshape(-1).copy()
-                    except Exception as exc:
-                        series_failures.append(key)
-                        if len(series_failures) <= 3:
-                            logger.debug(
-                                "Skipping invalid global-fit dataset '%s' series '%s' while loading: %s",
-                                ds_id,
-                                key,
-                                exc,
-                                exc_info=True,
-                            )
-                        continue
-            if series_failures:
-                self._loaded_dataset_series_parse_failures[ds_id] = list(series_failures)
-            self._loaded_dataset_pool[ds_id] = {
-                "id": ds_id,
-                "label": str(entry.get("label") or ds_id),
-                "observations": observations,
-                "t": t_values,
-                "species_data": series_map,
-            }
-            self._loaded_dataset_order.append(ds_id)
-
-    def _init_fit_run_state(self) -> None:
-        self._worker = None
-        self._results_rebuild_pending = False
-        self._worker_registry = _FitDialogWorkerRegistry()
-        self_ref = weakref.ref(self)
-        self._worker_stop_policy = FitWorkerStopPolicy(
-            record_failure=lambda key: (
-                getattr(self_ref(), "_best_effort_failures", set()).add(str(key))
-                if self_ref() is not None
-                else None
-            )
-        )
+        if not isinstance(origin, FitOriginSnapshot):
+            raise TypeError("origin must be FitOriginSnapshot.")
+        if not callable(close_handler):
+            raise TypeError("close_handler must be callable.")
+        if color_resolver is not None and not callable(color_resolver):
+            raise TypeError("color_resolver must be callable.")
+        self._origin = origin
+        self._effective_source = origin.mechanism_source
+        self._effective_prepared_dsl = origin.prepared_dsl
+        self._close_handler = close_handler
+        self._color_resolver = color_resolver
+        self._closing_after_cleanup = False
+        self._dataset_view_by_id: dict[str, GridPlotView] = {}
         self._paused = False
-        self._best_cost = None
-        self._pre_run_parameter_state: Optional[List[Dict[str, Any]]] = None
-        self._pre_run_staged_dataset_params: Optional[Dict[str, Dict[str, float]]] = None
-        self._last_result = None
-        self._apply_authority_owner = CompletedFitApplyAuthorityOwner()
-        self._fit_run_state_owner = FittingRunStateOwner()
-        self._fit_runtime_prepare_notifier = _FitRuntimePreparationNotifier(self)
-        self._fit_runtime_readiness = FittingRuntimeReadinessController(
-            session_factory=self._create_fit_runtime_session,
-            finished_callback=self._fit_runtime_prepare_notifier.completed.emit,
-        )
-        self._fit_runtime_preparation_owner = FittingRuntimePreparationOwner(self)
-        self._fit_window_state_refreshing = False
-        self._fit_runtime_prepare_notifier.completed.connect(
-            self._fit_runtime_preparation_owner.poll_preparation,
-            QtCore.Qt.ConnectionType.QueuedConnection,
-        )
-        self._closing = False
+        self._initial_setup: FitSetupSnapshot | None = None
+        self._last_fit_setup: FitSetupSnapshot | None = None
+        self._snapshot_capture_id: str | None = None
+        self._effective_source = origin.mechanism_source
+        self._effective_prepared_dsl = origin.prepared_dsl
+        self._run_identity = None
+        self._candidate_curves: tuple[FitCurveDataset, ...] = ()
+        self._species_filter_initialized = False
+        self._refreshing_dataset_controls = False
+        self._syncing_scopes = False
+        self._committed_targets: dict[tuple[str, str], bool] = {}
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        self.setModal(True)
+        self.setWindowTitle(f"Global Fit — {origin.tab_name}")
+        self.resize(1080, 760)
+        self._build_ui()
+        self.rebase(origin)
 
-    @property
-    def _is_fit_running(self) -> bool:
-        return bool(self._worker and hasattr(self._worker, "isRunning") and self._worker.isRunning())
-
-    @property
-    def is_closing(self) -> bool:
-        return bool(self._closing)
-
-    def is_fit_running(self) -> bool:
-        return self._is_fit_running
-
-    @property
-    def fit_run_state_owner(self) -> FittingRunStateOwner:
-        return self._fit_run_state_owner
-
-    @property
-    def fit_runtime_preparation_owner(self) -> FittingRuntimePreparationOwner:
-        return self._fit_runtime_preparation_owner
-
-    @property
-    def fit_runtime_readiness(self) -> FittingRuntimeReadinessController:
-        return self._fit_runtime_readiness
-
-    def _runtime_lane_count_for_dataset_count(self, dataset_count: int) -> int:
-        return int(self._runtime_inputs.lane_count_for_dataset_count(max(1, int(dataset_count))))
-
-    def collect_dataset_selection(self) -> FittingLaunchDatasetSelection:
-        rows = []
-        included_ids: List[str] = []
-        for entry in list(self._dataset_entries):
-            dataset_id = str(entry.get("id") or "").strip()
-            include = bool(entry.get("include", True))
-            label = str(entry.get("label") or dataset_id)
-            species = ", ".join(entry.get("selected_species", []))
-            weight = self._dataset_weight_for_id(dataset_id)
-            entry["weight"] = weight
-            entry["include"] = include
-            rows.append(
-                {
-                    "id": dataset_id,
-                    "label": label,
-                    "species": species,
-                    "include": include,
-                    "weight": weight,
-                }
-            )
-            if include:
-                included_ids.append(dataset_id)
-        return FittingLaunchDatasetSelection(rows=tuple(rows), ids=tuple(included_ids))
-
-    def build_current_launch_snapshot(
-        self,
-        *,
-        integration_settings: Optional[tuple[str, float, float]] = None,
-        purpose: Optional[FittingLaunchPurpose] = None,
-        refresh_current_mechanism: bool = True,
-    ) -> Optional[FittingLaunchSnapshot]:
-        launch_purpose = purpose or FittingLaunchPurpose.PASSIVE_READINESS
-        explicit = launch_purpose is FittingLaunchPurpose.EXPLICIT_RUN
-        if self._fit_window_state_refreshing:
-            return None
-        if refresh_current_mechanism and not self._refresh_fit_window_state_for_current_mechanism(
-            show_errors=explicit
-        ):
-            return None
-        collected_config_bundle = self._params_ics_tab.collect_parameter_config_bundle(show_errors=explicit)
-        if collected_config_bundle is None:
-            return None
-        config, global_dataset_params, global_dataset_variable_params = collected_config_bundle
-        dataset_selection = self.collect_dataset_selection()
-        if explicit:
-            self._fit_run_state_owner.set_active_dataset_ids(list(dataset_selection.ids))
-        if not dataset_selection.ids:
-            if explicit:
-                QtWidgets.QMessageBox.warning(self, "No Datasets", "Select at least one dataset to include.")
-            return None
-        invalid = self._invalid_applied_used_dataset_ids_for_run()
-        if invalid:
-            if explicit:
-                summary = self._dataset_count_summary_for_ids(invalid)
-                self._show_diagnostic_warning(
-                    "Global Fit",
-                    f"Run Fit is disabled due to invalid applied settings for {summary.display}.",
-                    details=summary.tooltip,
-                )
-            else:
-                self._set_fit_status("Fitting runtime not ready: invalid applied settings")
-            return None
-        if integration_settings is not None:
-            integration = integration_settings
-        elif explicit:
-            integration = self._params_ics_tab.collect_integration_settings()
-        else:
-            collect_integration_settings = getattr(
-                self._params_ics_tab,
-                "collect_integration_settings_silent",
-                self._params_ics_tab.collect_integration_settings,
-            )
-            integration = collect_integration_settings()
-        if integration is None:
-            return None
-        return FittingLaunchSnapshot(
-            config=dict(config or {}),
-            global_dataset_params=dict(global_dataset_params or {}),
-            global_dataset_variable_params=dict(global_dataset_variable_params or {}),
-            dataset_selection=dataset_selection,
-            integration=integration,
-        )
-
-    def build_current_launch_result(
-        self,
-        *,
-        purpose: FittingLaunchPurpose,
-        integration_settings: Optional[tuple[str, float, float]] = None,
-        refresh_current_mechanism: bool = True,
-    ) -> FittingLaunchResult:
-        identity, rejection = self._build_current_fit_runtime_identity(
-            purpose=purpose,
-            integration_settings=integration_settings,
-            refresh_current_mechanism=refresh_current_mechanism,
-        )
-        result = FittingLaunchResult(identity=identity, rejection=rejection)
-        self._last_launch_result = result
-        return result
-
-    def current_launch_result(self) -> Optional[FittingLaunchResult]:
-        return self._last_launch_result
-
-    def payloads_available_for_identity(self, identity: Optional[FittingRuntimeIdentity]) -> bool:
-        if identity is None:
-            return False
-        for spec in identity.datasets:
-            dataset_id = str(getattr(spec, "dataset_id", "") or "")
-            result = self._global_payload_results.get(dataset_id)
-            if isinstance(result, FitDatasetPayloadResult) and result.state == "invalid":
-                return False
-            if dataset_id not in self._global_payload_lookup:
-                return False
-        return True
-
-    def build_current_fit_runtime_identity(
-        self,
-        *,
-        integration_settings: Optional[tuple[str, float, float]] = None,
-        refresh_current_mechanism: bool = True,
-    ) -> Optional[FittingRuntimeIdentity]:
-        result = self.build_current_launch_result(
-            purpose=FittingLaunchPurpose.PASSIVE_READINESS,
-            integration_settings=integration_settings,
-            refresh_current_mechanism=refresh_current_mechanism,
-        )
-        return result.identity
-
-    def render_launch_rejection(
-        self,
-        result: FittingLaunchResult,
-        *,
-        purpose: FittingLaunchPurpose,
-    ) -> None:
-        rejection = result.rejection
-        if rejection is None:
-            return
-        if purpose is FittingLaunchPurpose.EXPLICIT_RUN and rejection.title:
-            self._show_diagnostic_warning(rejection.title, rejection.message, details=getattr(rejection, "detailed_message", ""))
-        elif rejection.passive_status:
-            self._set_fit_status(rejection.passive_status)
-
-    def _build_current_fit_runtime_identity(
-        self,
-        *,
-        purpose: FittingLaunchPurpose,
-        integration_settings: Optional[tuple[str, float, float]] = None,
-        refresh_current_mechanism: bool = True,
-    ) -> tuple[Optional[FittingRuntimeIdentity], Optional[FittingLaunchRejection]]:
-        launch_snapshot = self.build_current_launch_snapshot(
-            integration_settings=integration_settings,
-            purpose=purpose,
-            refresh_current_mechanism=refresh_current_mechanism,
-        )
-        if launch_snapshot is None:
-            if purpose is FittingLaunchPurpose.EXPLICIT_RUN:
-                return None, None
-            if self._invalid_applied_used_dataset_ids_for_run():
-                return None, FittingLaunchRejection(
-                    title="",
-                    message="Fitting launch inputs have invalid applied settings.",
-                    passive_status="Fitting runtime not ready: invalid applied settings",
-                )
-            return None, FittingLaunchRejection(
-                title="",
-                message="Fitting launch inputs are not valid.",
-                passive_status="Fitting runtime not ready",
-            )
-        config = launch_snapshot.config
-        global_dataset_params = launch_snapshot.global_dataset_params
-        global_dataset_variable_params = launch_snapshot.global_dataset_variable_params
-        dataset_selection = launch_snapshot.dataset_selection
-        solver, rtol, atol = launch_snapshot.integration
-        requested_solver = normalize_solver_name(str(solver))
-        mechanism_text = self._safe_text_from_getter(self._mechanism_text_getter)
-        evaluator_components = self._fitting_evaluator_components_for_runtime_identity(
-            mechanism_text=mechanism_text,
-            config=config,
-            requested_solver=str(requested_solver),
-            requested_rtol=float(rtol),
-            requested_atol=float(atol),
-        )
-        if evaluator_components is None:
-            return None, FittingLaunchRejection(
-                title="Global Fit" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
-                message="Failed to build fitting evaluator.",
-                passive_status="Fitting runtime not ready",
-            )
-        simulation_func = evaluator_components.base_evaluator
-        simulation_factory = evaluator_components.evaluator_factory
-        prepared_simulation = evaluator_components.prepared_simulation
-        readiness_required = evaluator_components.readiness_required
-
-        datasets, rejection = self._dataset_payloads_for_launch(dataset_selection.ids)
-        if datasets is None:
-            return None, rejection
-        try:
-            dataset_specs = coerce_fit_dataset_specs(datasets)
-        except Exception as exc:
-            return None, FittingLaunchRejection(
-                title="Global Fit" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
-                message=str(exc) or "Dataset payloads are invalid.",
-                passive_status="Fitting runtime not ready: invalid dataset payloads",
-            )
-
-        weights = self._weights_for_run(dataset_selection.as_mapping())
-        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
-        shared_param_keys = self._shared_param_keys_for_run(config)
-        dataset_params_for_run = self._dataset_params_for_run(
-            list(dataset_selection.ids),
-            shared_param_keys,
-            staged_params,
-            global_dataset_params=global_dataset_params,
-            evaluator=simulation_func,
-        )
-        variable_params = self._variable_params_for_run(
-            list(dataset_selection.ids),
-            shared_param_keys,
-            staged_params,
-            global_dataset_variable_params=global_dataset_variable_params,
-            evaluator=simulation_func,
-        )
-        ok, errors = validate_de_bounds(config, dataset_variable_params=variable_params)
-        if not ok:
-            return None, FittingLaunchRejection(
-                title="Invalid Bounds" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
-                message="\n".join(errors),
-                passive_status="Fitting runtime not ready: invalid bounds",
-            )
-        dataset_overrides = coerce_fit_dataset_parameter_overrides(
-            dataset_ids=list(dataset_selection.ids),
-            dataset_params=dataset_params_for_run,
-            dataset_variable_params=variable_params,
-        )
-        reactions_text = self._safe_text_from_getter(self._reactions_text_getter)
-        applied_targets = {
-            str(ds_id): list(values or [])
-            for ds_id, values in (self._species_table.fit_targets_selection_applied or {}).items()
-        }
-        applied_target_weights = {
-            str(ds_id): self._species_table.applied_target_weights_for_dataset(str(ds_id))
-            for ds_id in applied_targets.keys()
-        }
-        runtime_identity = None
-        if prepared_simulation is None:
-            runtime_identity = {
-                "inputs": self._runtime_inputs.to_stamp_payload(),
-                "solver": str(requested_solver),
-                "rtol": float(rtol),
-                "atol": float(atol),
-                "param_names": self._param_names_for_readiness_identity(
-                    config=config,
-                    prepared_simulation=prepared_simulation,
-                    mechanism_text=mechanism_text,
-                ),
-            }
-        try:
-            objective_weights = normalize_weights(list(dataset_specs), weights)
-        except Exception as exc:
-            return None, FittingLaunchRejection(
-                title="Invalid Weights" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
-                message=str(exc) or "Fit weights are invalid.",
-                passive_status="Fitting runtime not ready: invalid weights",
-            )
-        stamp = build_global_fit_run_stamp(
-            dataset_rows=list(dataset_selection.rows),
-            included_ids=list(dataset_selection.ids),
-            applied_fit_targets=applied_targets,
-            applied_target_weights=applied_target_weights,
-            weights_requested=(dict(weights) if isinstance(weights, dict) else None),
-            objective_weights_used=dict(objective_weights),
-            weight_mode=("equal" if weights is None else "custom"),
-            fit_config=dict(config or {}),
-            mechanism_text=mechanism_text,
-            reactions_text=reactions_text,
-            prepared_simulation=prepared_simulation,
-            runtime_identity=runtime_identity,
-            dataset_specs=list(dataset_specs),
-            dataset_overrides=list(dataset_overrides),
-        )
-        stamp_hash = hash_global_fit_run_stamp(stamp)
-        stamp_short = str(stamp_hash)[:12]
-        fixed_params = self._fixed_params_for_run(config)
-        fit_evaluator = self._simulation_with_fixed_params(simulation_func, fixed_params) if simulation_func is not None else None
-        fit_evaluator_factory = None
-        if callable(simulation_factory):
-            fixed_snapshot = dict(fixed_params)
-
-            def fit_evaluator_factory():
-                base_evaluator = simulation_factory()
-                return PreparedFitEvaluator(
-                    base_evaluator=base_evaluator,
-                    fit_evaluator=self._simulation_with_fixed_params(base_evaluator, fixed_snapshot),
-                )
-
-        lane_budget = self._runtime_lane_count_for_dataset_count(len(dataset_specs))
-        return FittingRuntimeIdentity(
-            datasets=tuple(dataset_specs),
-            config=config,
-            dataset_overrides=tuple(dataset_overrides),
-            weights=dict(weights) if weights is not None else None,
-            requested_solver=str(requested_solver),
-            requested_rtol=float(rtol),
-            requested_atol=float(atol),
-            fit_evaluator=fit_evaluator,
-            stamp=stamp,
-            stamp_hash=str(stamp_hash),
-            stamp_short=str(stamp_short),
-            lane_count=int(lane_budget),
-            readiness_required=bool(readiness_required),
-            fit_evaluator_factory=fit_evaluator_factory,
-            base_evaluator=simulation_func,
-        ), None
-
-    def _dataset_payloads_for_launch(
-        self,
-        selected_ids: Sequence[str],
-    ) -> tuple[Optional[list[dict[str, Any]]], Optional[FittingLaunchRejection]]:
-        datasets: list[dict[str, Any]] = []
-        for dataset_id in selected_ids:
-            ds_id = str(dataset_id)
-            result = self._global_payload_results.get(ds_id)
-            if isinstance(result, FitDatasetPayloadResult) and result.state == "invalid":
-                reason = str(result.error or "Dataset payload is invalid.")
-                dataset_label = self._dataset_label_for_id(ds_id) or ds_id
-                dataset_identity = (
-                    f"{dataset_label} [{ds_id}]"
-                    if str(dataset_label).strip() != ds_id
-                    else ds_id
-                )
-                return None, FittingLaunchRejection(
-                    title="Global Fit",
-                    message=f"Dataset '{dataset_identity}' has invalid payload:\n{reason}",
-                    passive_status="Fitting runtime not ready: invalid dataset payloads",
-                )
-            if ds_id not in self._global_payload_lookup:
-                dataset_label = self._dataset_label_for_id(ds_id) or ds_id
-                dataset_identity = (
-                    f"{dataset_label} [{ds_id}]"
-                    if str(dataset_label).strip() != ds_id
-                    else ds_id
-                )
-                return None, FittingLaunchRejection(
-                    title="Global Fit",
-                    message=f"Dataset '{dataset_identity}' is missing payloads.",
-                    passive_status="Fitting runtime not ready: missing dataset payloads",
-                )
-            datasets.append(dict(self._global_payload_lookup[ds_id]))
-        return datasets, None
-
-    def _set_fit_status(self, text: str) -> None:
-        if hasattr(self, "_status_label"):
-            set_compact_label_text(
-                self._status_label,
-                str(text),
-                max_chars=FOOTER_SUMMARY_MAX_CHARS,
-                max_width=620,
-                diagnostic=True,
-            )
-
-    def _show_diagnostic_warning(
-        self,
-        title: str,
-        message: str,
-        *,
-        details: str = "",
-    ) -> None:
-        full_message = str(message or "")
-        compact = compact_diagnostic_text(full_message, max_chars=INLINE_ERROR_MAX_CHARS)
-        dialog = QtWidgets.QMessageBox(self)
-        dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        dialog.setWindowTitle(str(title or "Kindred"))
-        dialog.setText(compact.display)
-        detail_parts = []
-        if compact.was_elided or compact.display != full_message:
-            detail_parts.append(full_message)
-        details_s = str(details or "")
-        if details_s and details_s not in detail_parts:
-            detail_parts.append(details_s)
-        if detail_parts:
-            dialog.setDetailedText("\n\n".join(detail_parts))
-        dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
-        dialog.exec()
-
-    def _set_fit_stop_enabled(self, enabled: bool) -> None:
-        if hasattr(self, "_stop_button"):
-            self._stop_button.setEnabled(bool(enabled))
-
-    def set_fit_status(self, text: str) -> None:
-        self._set_fit_status(text)
-
-    def set_fit_stop_enabled(self, enabled: bool) -> None:
-        self._set_fit_stop_enabled(enabled)
-
-    def set_fit_controls_locked(self, locked: bool) -> None:
-        self._set_fit_controls_locked(locked)
-
-    def refresh_run_button_enabled_state(self) -> None:
-        self._refresh_run_button_enabled_state()
-
-    def _request_rebuild_subtabs(self) -> None:
-        if self._is_fit_running:
-            self._results_rebuild_pending = True
-        else:
-            self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
-
-    def _active_integration_defaults_for_ui(self) -> Tuple[str, float, float]:
-        """Read fitting integration defaults from the persisted fitting preferences."""
-        _solver_raw = self._config_defaults.get("solver")
-        solver_default = normalize_solver_name(
-            _solver_raw if _solver_raw is not None else FITTING_DEFAULT_SOLVER
-        )
-        try:
-            _rtol_raw = self._config_defaults.get("rtol")
-            rtol_default = float(_rtol_raw) if _rtol_raw is not None else 1e-6
-        except (TypeError, ValueError):
-            rtol_default = 1e-6
-        try:
-            _atol_raw = self._config_defaults.get("atol")
-            atol_default = float(_atol_raw) if _atol_raw is not None else 1e-12
-        except (TypeError, ValueError):
-            atol_default = 1e-12
-
-        if not (np.isfinite(rtol_default) and rtol_default > 0.0):
-            rtol_default = 1e-6
-        if not (np.isfinite(atol_default) and atol_default > 0.0):
-            atol_default = 1e-12
-        return str(solver_default), float(rtol_default), float(atol_default)
-
-    def _modeled_series_names_for_x_axis(self) -> set[str]:
-        modeled = {str(x) for x in (self._params_ics_tab.get_mechanism_species() or []) if str(x).strip()}
-        if callable(getattr(self, "_mechanism_text_getter", None)):
-            try:
-                from kindred.core.algebra.observable_introspection import extract_observables_from_algebra_text
-                from kindred.core.simulator.algebra_section import extract_algebra_section_text
-                from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-                from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
-
-                mechanism_text = str(self._mechanism_text_getter() or "")
-                algebra_text = extract_algebra_section_text(mechanism_text)
-                mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(mechanism_text, initials={}))
-                observables = extract_observables_from_algebra_text(
-                    algebra_text,
-                    mechanism_namespace=mechanism_namespace,
-                )
-                if isinstance(observables, dict):
-                    modeled |= {str(k) for k in observables.keys() if str(k).strip()}
-            except Exception:
-                return modeled
-        return modeled
-
-    def _sampling_default_config_for_time_axis(self, t_values: np.ndarray) -> Dict[str, float | int | str]:
-        t_axis = np.asarray(t_values, dtype=float).reshape(-1)
-        if t_axis.size == 0:
-            return {
-                "t_min": 0.0,
-                "t_max": 0.0,
-                "n_points": int(_SAMPLING_ALL_POINTS_SENTINEL),
-                "x_name": "t",
-                "x_mapping_mode": "auto",
-            }
-        return {
-            "t_min": float(np.min(t_axis)),
-            "t_max": float(np.max(t_axis)),
-            "n_points": int(_SAMPLING_ALL_POINTS_SENTINEL),
-            "x_name": "t",
-            "x_mapping_mode": "auto",
-        }
-
-    def _sampling_applied_config_for_dataset(self, dataset_id: str) -> Dict[str, float | int | str]:
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return {
-                "t_min": 0.0,
-                "t_max": 0.0,
-                "n_points": int(_SAMPLING_ALL_POINTS_SENTINEL),
-                "x_name": "t",
-                "x_mapping_mode": "auto",
-            }
-        cfg = self._sampling_applied.get(ds_id)
-        if isinstance(cfg, dict) and cfg:
-            return {
-                "t_min": float(cfg.get("t_min", 0.0)),
-                "t_max": float(cfg.get("t_max", 0.0)),
-                "n_points": int(cfg.get("n_points", int(_SAMPLING_ALL_POINTS_SENTINEL))),
-                "x_name": str(cfg.get("x_name") or "t").strip() or "t",
-                "x_mapping_mode": str(cfg.get("x_mapping_mode") or "auto").strip() or "auto",
-            }
-        full_t = self._species_table.full_t_by_dataset.get(ds_id, np.asarray([]))
-        return self._sampling_default_config_for_time_axis(full_t)
-
-    def _init_sampling_state(self) -> None:
-        full_t_map = self._species_table.full_t_by_dataset
-        applied: Dict[str, Dict[str, float | int | str]] = {}
-        for entry in self._dataset_entries or []:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            full_t = full_t_map.get(ds_id, np.asarray(entry.get("t", [])))
-            applied[ds_id] = self._sampling_default_config_for_time_axis(full_t)
-        self._sampling_applied = applied
-        self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
-        self._rebuild_selected_payload_lookup()
-
-    def _refresh_dataset_entries_from_applied_fit_targets_and_sampling(self) -> None:
-        applied_sel = self._species_table.fit_targets_selection_applied
-        full_t_map = self._species_table.full_t_by_dataset
-        full_series_map = self._species_table.full_series_by_dataset
-        for entry in self._dataset_entries or []:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            selection = list(applied_sel.get(ds_id, []))
-            entry["selected_species"] = list(selection)
-            entry["target_weights"] = self._species_table.applied_target_weights_for_dataset(ds_id)
-
-            full_t = full_t_map.get(ds_id, np.asarray(entry.get("t", []), dtype=float).reshape(-1))
-            cfg = self._sampling_applied_config_for_dataset(ds_id)
-            t_min = float(cfg.get("t_min", 0.0))
-            t_max = float(cfg.get("t_max", 0.0))
-            n_points_raw = int(cfg.get("n_points", int(_SAMPLING_ALL_POINTS_SENTINEL)))
-            n_points = None if n_points_raw == int(_SAMPLING_ALL_POINTS_SENTINEL) else int(n_points_raw)
-            try:
-                idx = compute_sampled_indices(t=full_t, t_min=t_min, t_max=t_max, n_points=n_points)
-            except Exception:
-                idx = compute_windowed_indices(t=full_t, t_min=t_min, t_max=t_max)
-
-            sampled_t = np.asarray(full_t[idx], dtype=float).reshape(-1) if idx.size else np.asarray([], dtype=float)
-            entry["t"] = sampled_t
-
-            full_series = full_series_map.get(ds_id, {})
-            sampled_series: Dict[str, np.ndarray] = {}
-            if selection and isinstance(full_series, dict) and idx.size:
-                for name in selection:
-                    if name not in full_series:
-                        continue
-                    series = np.asarray(full_series[name], dtype=float).reshape(-1)
-                    if series.size != full_t.size:
-                        continue
-                    sampled_series[name] = np.asarray(series[idx], dtype=float).reshape(-1)
-            entry["species_data"] = sampled_series
-
-            x_name = str(cfg.get("x_name") or "t").strip() or "t"
-            entry["x_name"] = x_name
-            x_mode = str(cfg.get("x_mapping_mode") or "auto").strip().lower().replace("-", "_").replace(" ", "_") or "auto"
-            if x_mode in ("monotone_only", "monotoneonly"):
-                x_mode = "monotone"
-            if x_mode not in ("auto", "monotone", "time_guided"):
-                x_mode = "auto"
-            entry["x_mapping_mode"] = x_mode
-            if x_name != "t" and isinstance(full_series, dict) and idx.size and x_name in full_series:
-                try:
-                    x_series = np.asarray(full_series[x_name], dtype=float).reshape(-1)
-                except Exception:
-                    x_series = np.asarray([], dtype=float)
-                if x_series.size == full_t.size:
-                    entry["x_obs"] = np.asarray(x_series[idx], dtype=float).reshape(-1)
-                else:
-                    entry.pop("x_obs", None)
-            else:
-                entry.pop("x_obs", None)
-
-    def _rebuild_selected_payload_lookup(self) -> None:
-        rebuilt: Dict[str, Dict[str, Any]] = {}
-        rebuilt_results: Dict[str, FitDatasetPayloadResult] = {}
-        for ds_id, selection in (self._species_table.fit_targets_selection_applied or {}).items():
-            entry = next((e for e in (self._dataset_entries or []) if str(e.get("id") or "").strip() == str(ds_id)), None)
-            if not isinstance(entry, dict):
-                rebuilt_results[str(ds_id)] = FitDatasetPayloadResult.absent()
-                continue
-            if not selection:
-                existing = self._global_payload_results.get(str(ds_id))
-                rebuilt_results[str(ds_id)] = (
-                    existing if isinstance(existing, FitDatasetPayloadResult) and existing.state == "invalid"
-                    else FitDatasetPayloadResult.absent()
-                )
-                continue
-            observations = (
-                copy_observations_map(entry.get("observations"))
-                if isinstance(entry.get("observations"), dict)
-                else None
-            )
-            series_map = entry.get("species_data") or {}
-            t_values = entry.get("t", np.asarray([]))
-            x_name = str(entry.get("x_name") or "t").strip() or "t"
-            x_obs = entry.get("x_obs")
-            x_mapping_mode = str(entry.get("x_mapping_mode") or "auto").strip() or "auto"
-            result = read_fit_dataset_payload(
-                dataset_id=ds_id,
-                observations=observations,
-                t=t_values,
-                species_data=series_map,
-                selected_species=selection,
-                target_weights=self._species_table.applied_target_weights_for_dataset(ds_id),
-                x_name=x_name,
-                x_obs=x_obs,  # already sampled against the same indices as t/y
-                x_mapping_mode=x_mapping_mode,
-            )
-            rebuilt_results[str(ds_id)] = result
-            if result.state != "valid" or result.payload is None:
-                continue
-            rebuilt[ds_id] = dict(result.payload)
-        self._global_payload_results = rebuilt_results
-        self._global_payload_lookup = rebuilt
-
-    # ------------------------------------------------------------------
-    # Initialization helpers
-    # ------------------------------------------------------------------
-    def _normalize_dataset_entries(self, entries: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        normalized: List[Dict[str, Any]] = []
-        for entry in entries or []:
-            dataset_id = str(entry.get("id", entry.get("label", "dataset")))
-            observations = (
-                copy_observations_map(entry.get("observations"))
-                if isinstance(entry.get("observations"), dict)
-                else {}
-            )
-            if observations:
-                t_values, species_data_raw = dense_view_from_observations(observations)
-            else:
-                t_values = np.asarray(entry.get("t", []), dtype=float).reshape(-1)
-                species_data_raw = entry.get("species_data") or entry.get("species") or {}
-            species_data: Dict[str, np.ndarray] = {}
-            for species_name, values in species_data_raw.items():
-                try:
-                    species_data[str(species_name)] = np.asarray(values, dtype=float).reshape(-1)
-                except Exception as exc:
-                    logger.debug(
-                        "Skipping invalid dataset entry series '%s' while normalizing global-fit data: %s",
-                        species_name,
-                        exc,
-                        exc_info=True,
-                    )
-                    continue
-            selected_species = entry.get("selected_species") or []
-            entry_target_weights = dict(entry.get("target_weights")) if isinstance(entry.get("target_weights"), dict) else None
-            seeded_payload = self._global_payload_lookup.get(dataset_id, {}) if isinstance(self._global_payload_lookup, dict) else {}
-            payload_target_weights = (
-                dict(seeded_payload.get("target_weights"))
-                if isinstance(seeded_payload, dict) and isinstance(seeded_payload.get("target_weights"), dict)
-                else {}
-            )
-            normalized.append(
-                {
-                    "id": dataset_id,
-                    "label": str(entry.get("label", "") or "").strip() or dataset_id,
-                    "observations": observations,
-                    "t": t_values,
-                    "species_data": species_data,
-                    "selected_species": list(selected_species),
-                    "target_weights": dict(entry_target_weights) if entry_target_weights is not None else dict(payload_target_weights),
-                    "weight": float(entry.get("weight", 1.0)),
-                    "include": bool(entry.get("include", True)),
-                }
-            )
-        return normalized
-
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(8)
-        # Use a weak reference to avoid reference cycles through callable getters
-        # (FittingWindow -> DataTab -> getter -> FittingWindow). Without this,
-        # Qt C++ destruction proceeds but the Python wrappers survive due to the
-        # cycle, causing RuntimeError on double-close during test teardown.
-        _w = weakref.ref(self)
-        _empty_cfg = {"t_min": 0.0, "t_max": 0.0, "n_points": 0, "x_name": "t", "x_mapping_mode": "auto"}
-        self._species_table = UnifiedSpeciesTable(
-            dataset_entries=list(self._dataset_entries),
-            mechanism_species=list(self.__dict__.get("_mechanism_species", [])),
-            dataset_entries_getter=lambda: list(_w()._dataset_entries) if _w() is not None else [],
-            included_dataset_ids_getter=lambda: _w()._included_dataset_ids() if _w() is not None else [],
-            dataset_label_getter=lambda ds_id: _w()._dataset_label_for_id(ds_id) if _w() is not None else str(ds_id),
-            dataset_weight_getter=lambda ds_id: _w()._dataset_weight_for_id(ds_id) if _w() is not None else 1.0,
-            persist_dataset_weight_callback=lambda ds_id, w: _w()._persist_dataset_weight(ds_id, w) if _w() is not None else None,
-            dataset_fit_settings_store_getter=lambda: _w()._dataset_fit_settings_store if _w() is not None else None,
-            worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
-            modeled_series_getter=lambda: _w()._modeled_series_names_for_x_axis() if _w() is not None else set(),
-            parent=self,
+        self._origin_label = QtWidgets.QLabel(self)
+        layout.addWidget(self._origin_label)
+        self._tabs = QtWidgets.QTabWidget(self)
+        layout.addWidget(self._tabs, 1)
+
+        self._data_tab = QtWidgets.QWidget(self._tabs)
+        self._parameters_tab = QtWidgets.QWidget(self._tabs)
+        self._initials_tab = QtWidgets.QWidget(self._tabs)
+        self._results_tab = QtWidgets.QWidget(self._tabs)
+        self._tabs.addTab(self._data_tab, "Data and Targets")
+        self._tabs.addTab(self._parameters_tab, "Parameters")
+        self._tabs.addTab(
+            self._initials_tab,
+            "Initial Conditions and Simulation",
         )
-        # Rewrite dataset_entries species_data to match applied fit-target selection
-        # before result views are built, so they see only applied species.
-        self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
-        self._data_tab = DataTab(
-            sampling_applied_config_getter=lambda ds_id: _w()._sampling_applied_config_for_dataset(ds_id) if _w() is not None else dict(_empty_cfg),
-            sampling_default_config_getter=lambda t_values: _w()._sampling_default_config_for_time_axis(t_values) if _w() is not None else dict(_empty_cfg),
-            fit_targets_full_t_getter=lambda ds_id: _w()._species_table.full_t_by_dataset.get(ds_id, np.asarray([])) if _w() is not None else np.asarray([]),
-            fit_targets_available_getter=lambda ds_id: list(_w()._species_table.available_by_dataset.get(ds_id, [])) if _w() is not None else [],
-            fit_targets_full_series_getter=lambda ds_id: _w()._species_table.full_series_by_dataset.get(ds_id, {}) if _w() is not None else {},
-            fit_targets_selection_applied_getter=lambda ds_id: list(_w()._species_table.fit_targets_selection_applied.get(ds_id, [])) if _w() is not None else [],
-            modeled_series_getter=lambda: _w()._modeled_series_names_for_x_axis() if _w() is not None else set(),
-            worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
-            parent=self,
-        )
-        self._params_ics_tab = ParametersIcsTab(
-            parameter_state=self.__dict__.pop("_parameter_state"),
-            initial_parameter_snapshot=self.__dict__.pop("_initial_parameter_snapshot"),
-            global_dataset_params=self.__dict__.pop("_global_dataset_params"),
-            global_dataset_variable_params=self.__dict__.pop("_global_dataset_variable_params"),
-            fixed_shared_params=self.__dict__.pop("_fixed_shared_params"),
-            shared_param_definitions=self.__dict__.pop("_shared_param_definitions"),
-            mechanism_species=self.__dict__.pop("_mechanism_species"),
-            dataset_entries=list(self._dataset_entries),
-            prepared_param_names=self.__dict__.pop("_prepared_param_names"),
-            selected_dataset_ids_getter=lambda: _w()._selected_dataset_ids() if _w() is not None else [],
-            dataset_entries_getter=lambda: list(_w()._dataset_entries) if _w() is not None else [],
-            worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
-            dataset_fit_settings_store_getter=lambda: _w()._dataset_fit_settings_store if _w() is not None else None,
-            mechanism_parameter_scan_owner_getter=lambda: _w()._mechanism_parameter_scan_owner if _w() is not None else None,
-            mechanism_text_getter=lambda: str(_w()._mechanism_text_getter() or "") if _w() is not None and callable(getattr(_w(), "_mechanism_text_getter", None)) else "",
-            integration_defaults=self._active_integration_defaults_for_ui(),
-            config_defaults=self._config_defaults,
-            initial_parameter_defaults_getter=self._species_table.initial_parameter_defaults_for_species,
-            parent=self,
-        )
-        self._params_ics_tab.addAlgebraicObservableRequested.connect(self._on_algebraic_observable_requested)
-        self._run_results_tab = RunResultsTab(parent=self)
-        self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
-        self._data_targets_tab = DataTargetsTab(
-            data_tab=self._data_tab,
-            species_table=self._species_table,
-            parent=self,
-        )
+        self._tabs.addTab(self._results_tab, "Results")
+        self._build_data_tab()
+        self._build_parameters_tab()
+        self._build_initials_tab()
+        self._build_results_tab()
 
-        self._tabs = QtWidgets.QTabBar(self)
-        self._tabs.setObjectName("global_fit_top_tabs")
-        self._tabs.setDocumentMode(True)
-        self._tabs.setDrawBase(False)
-        self._tabs.addTab("Data and Targets")
-        self._tabs.addTab("Parameters")
-        self._results_tab_index = self._tabs.addTab("Results")
-        layout.addWidget(self._tabs, stretch=0)
-
-        # Right: current tab content
-        self._current_tab_stack = QtWidgets.QStackedWidget(self)
-        self._current_tab_stack.setObjectName("global_fit_current_tab_stack")
-        self._current_tab_stack.setMinimumWidth(320)
-        self._current_tab_stack.addWidget(self._data_targets_tab)
-        self._current_tab_stack.addWidget(self._params_ics_tab)
-        self._current_tab_stack.addWidget(self._run_results_tab)
-        layout.addWidget(self._current_tab_stack, stretch=1)
-
-        self._tabs.currentChanged.connect(self._current_tab_stack.setCurrentIndex)
-        self._tabs.currentChanged.connect(self._on_right_tabs_current_changed)
-        self._current_tab_stack.setCurrentIndex(self._tabs.currentIndex())
-        layout.addWidget(self._create_footer(), stretch=0)
-        self._species_table.icApplied.connect(self._params_ics_tab._on_ic_applied)
-        self._species_table.targetsApplied.connect(self._on_targets_applied)
-        self._species_table.validityChanged.connect(self._on_targets_validity_changed)
-        self._species_table.statusMessage.connect(self._on_targets_status_message)
-        self._params_ics_tab.statusMessage.connect(self._set_fit_status)
-        self._params_ics_tab.runtimeInputsChanged.connect(self._on_fit_runtime_inputs_changed)
-        self._connect_fit_runtime_input_signals()
-        self._run_results_tab.statusMessage.connect(self._set_fit_status)
-        self._data_tab.statusMessage.connect(self._set_fit_status)
-        self._data_targets_tab.unified_list.datasetIncludeChanged.connect(self._on_data_tab_include_changed)
-        self._data_targets_tab.unified_list.addRequested.connect(self._open_add_datasets_dialog)
-        self._data_targets_tab.unified_list.removeRequested.connect(self._remove_datasets_from_session)
-        self._data_tab.samplingApplied.connect(self._on_data_tab_sampling_applied)
-        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
-        self._refresh_project_apply_controls()
-
-    def _connect_fit_runtime_input_signals(self) -> None:
-        tab = self._params_ics_tab
-        table = getattr(tab, "_param_table", None)
-        if table is not None:
-            table.itemChanged.connect(self._on_fit_runtime_inputs_changed)
-        for signal_owner, signal_name in (
-            (getattr(tab, "_method_combo", None), "currentTextChanged"),
-            (getattr(tab, "_max_eval_spin", None), "valueChanged"),
-            (getattr(tab, "_seed_spin", None), "valueChanged"),
-            (getattr(tab, "_seed_check", None), "stateChanged"),
-            (getattr(tab, "_ftol_edit", None), "editingFinished"),
-            (getattr(tab, "_xtol_edit", None), "editingFinished"),
-            (getattr(tab, "_integration_solver_combo", None), "currentTextChanged"),
-            (getattr(tab, "_integration_rtol_edit", None), "textChanged"),
-            (getattr(tab, "_integration_atol_edit", None), "textChanged"),
-            (getattr(self._species_table, "_weight_mode_combo", None), "currentIndexChanged"),
-        ):
-            signal = getattr(signal_owner, signal_name, None) if signal_owner is not None else None
-            if signal is not None:
-                signal.connect(self._on_fit_runtime_inputs_changed)
-
-    def _on_fit_runtime_inputs_changed(self, *_args) -> None:
-        if getattr(self, "_closing", False):
-            return
-        self._invalidate_fit_result_authority()
-        worker = getattr(self, "_worker", None)
-        if worker is not None and self._worker_is_running(worker):
-            self._supersede_active_fit_worker_for_runtime_input_change()
-        else:
-            if worker is not None:
-                self._fit_run_state_owner.mark_superseded()
-                self._clear_worker_ref_if_stopped(worker)
-                self._discard_fit_runtime_session(kill=True)
-                self._set_running_state(False)
-                if hasattr(self, "_status_label"):
-                    self._set_fit_status("Fitting runtime inputs changed; fit cancelled")
-            else:
-                self._fit_run_state_owner.clear_superseded()
-            self._fit_runtime_readiness.set_desired_identity(None)
-        self._fit_run_state_owner.clear_active_run_stamp_hash()
-        self._refresh_project_apply_controls(prefer_broadest=True)
-        self._refresh_run_button_enabled_state()
-        self._fit_runtime_preparation_owner.schedule_refresh()
-
-    def apply_runtime_inputs(self, runtime_inputs: FittingRuntimeInputs) -> None:
-        if not isinstance(runtime_inputs, FittingRuntimeInputs):
-            raise RuntimeError("FittingWindow requires typed runtime inputs.")
-        self._runtime_inputs = runtime_inputs
-        self._on_fit_runtime_inputs_changed()
-
-    def handle_external_datasets_removed(self, dataset_ids: Sequence[str]) -> None:
-        remove_set = {
-            str(dataset_id).strip()
-            for dataset_id in (dataset_ids or [])
-            if str(dataset_id).strip()
-        }
-        if not remove_set:
-            return
-        self._deauthorize_project_datasets(remove_set)
-
-    def _deauthorize_project_datasets(self, dataset_ids: Sequence[str]) -> None:
-        """Purge project-deleted datasets from this fit window's authorized pool."""
-        remove_set = {str(x).strip() for x in (dataset_ids or []) if str(x).strip()}
-        if not remove_set:
-            return
-        invalidated_authority = self._apply_authority_owner.clear_if_depends_on_any(remove_set)
-        authority_invalidated = invalidated_authority is not None
-        if invalidated_authority is not None:
-            self._clear_fit_render_projection_authority(invalidated_authority.dataset_ids)
-
-        had_entry = any(str(entry.get("id") or "").strip() in remove_set for entry in (self._dataset_entries or []))
-        had_pool = any(ds_id in self._loaded_dataset_pool for ds_id in remove_set)
-        had_order = any(ds_id in remove_set for ds_id in (self._loaded_dataset_order or []))
-        had_state = any(
-            ds_id in mapping
-            for ds_id in remove_set
-            for mapping in (
-                self._loaded_dataset_series_parse_failures,
-                self._global_payload_results,
-                self._global_payload_lookup,
-                self._active_variable_specs,
-                self._sampling_applied,
-                self._global_weights,
-            )
-        )
-
-        self._dataset_entries = [
-            entry for entry in self._dataset_entries if str(entry.get("id") or "").strip() not in remove_set
-        ]
-        for ds_id in remove_set:
-            self._loaded_dataset_pool.pop(ds_id, None)
-            self._loaded_dataset_series_parse_failures.pop(ds_id, None)
-            self._sampling_applied.pop(ds_id, None)
-            self._global_payload_results.pop(ds_id, None)
-            self._global_payload_lookup.pop(ds_id, None)
-            self._active_variable_specs.pop(ds_id, None)
-            self._global_weights.pop(ds_id, None)
-        self._loaded_dataset_order = [
-            ds_id for ds_id in (self._loaded_dataset_order or []) if str(ds_id).strip() not in remove_set
-        ]
-
-        self._species_table.remove_dataset_state(remove_set)
-        self._params_ics_tab.remove_dataset_parameter_rows(remove_set)
-
-        if had_entry or had_pool or had_order or had_state:
-            self._sync_after_session_dataset_change()
-            self._set_fit_status("Project datasets removed")
-            return
-        if authority_invalidated:
-            self._refresh_project_apply_controls(prefer_broadest=True)
-            self._set_fit_status("Project datasets removed")
-
-    def _on_algebraic_observable_requested(self, selection: dict) -> None:
-        """Handle algebraic observable add request from ParametersIcsTab."""
-        obs_name = str(selection.get("name") or "").strip()
-        obs_expr = str(selection.get("expr") or "").strip()
-        dataset_ids = selection.get("dataset_ids") or []
-        scalar_scope = str(selection.get("scalar_scope") or "shared")
-        persist = bool(selection.get("persist", False))
-        if not obs_name or not obs_expr:
-            return
-        self._add_algebraic_observable(obs_name, obs_expr, dataset_ids, scalar_scope=scalar_scope, persist_observable=persist)
-        self._params_ics_tab.repaint_parameter_table()
-        self._on_fit_runtime_inputs_changed()
-
-    def _create_footer(self) -> QtWidgets.QWidget:
-        footer = QtWidgets.QWidget(self)
-        footer.setObjectName("global_fit_footer")
-        control_row = QtWidgets.QHBoxLayout(footer)
-        control_row.setContentsMargins(0, 0, 0, 0)
-        control_row.setSpacing(8)
-
-        status_col_widget = QtWidgets.QWidget(footer)
-        status_col = QtWidgets.QVBoxLayout(status_col_widget)
-        status_col.setContentsMargins(0, 0, 0, 0)
-        status_col.setSpacing(2)
-        self._status_label = QtWidgets.QLabel("Ready")
-        self._status_label.setWordWrap(False)
-        self._status_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
-        status_col.addWidget(self._status_label)
-        self._run_block_reason_label = QtWidgets.QLabel(status_col_widget)
-        self._run_block_reason_label.setObjectName("global_fit_run_block_reason_label")
-        self._run_block_reason_label.setWordWrap(False)
-        self._run_block_reason_label.setStyleSheet("font-size: 11px;")
-        self._run_block_reason_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
-        self._run_block_reason_label.hide()
-        status_col.addWidget(self._run_block_reason_label)
-        control_row.addWidget(status_col_widget, stretch=3)
-
-        self._progress_bar = QtWidgets.QProgressBar()
-        self._progress_bar.setRange(0, 100)
-        self._progress_bar.setValue(0)
-        control_row.addWidget(self._progress_bar, stretch=2)
-
-        self._run_button = QtWidgets.QPushButton("Run Fit")
-        self._run_button.clicked.connect(self.run_fit)
-        self._stop_button = QtWidgets.QPushButton("Stop")
-        self._stop_button.setEnabled(False)
-        self._stop_button.clicked.connect(self._cancel_fit)
-        self._pause_button = QtWidgets.QPushButton("Pause")
+        self._progress = QtWidgets.QProgressBar(self)
+        self._progress.setRange(0, 100)
+        layout.addWidget(self._progress)
+        self._status = QtWidgets.QLabel("Ready.", self)
+        self._status.setWordWrap(True)
+        layout.addWidget(self._status)
+        buttons = QtWidgets.QHBoxLayout()
+        self._run_button = QtWidgets.QPushButton("Run Fit", self)
+        self._pause_button = QtWidgets.QPushButton("Pause", self)
+        self._cancel_button = QtWidgets.QPushButton("Cancel Fit", self)
+        self._close_button = QtWidgets.QPushButton("Close", self)
+        self._cancel_button.setEnabled(False)
         self._pause_button.setEnabled(False)
-        self._pause_button.setToolTip(
-            "Pause a running global fit. Takes effect at evaluation boundaries; "
-            "the current simulation may finish before pausing."
+        self._run_button.clicked.connect(self.executeRequested)
+        self._cancel_button.clicked.connect(self.cancelRequested)
+        self._pause_button.clicked.connect(self._toggle_pause)
+        self._close_button.clicked.connect(self.close)
+        buttons.addWidget(self._run_button)
+        buttons.addWidget(self._pause_button)
+        buttons.addWidget(self._cancel_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self._close_button)
+        layout.addLayout(buttons)
+
+    def _build_data_tab(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self._data_tab)
+        note = QtWidgets.QLabel(
+            "t min, t max, and Points select existing observation rows only.",
+            self._data_tab,
         )
-        self._pause_button.clicked.connect(self._pause_fit)
-        self._resume_button = QtWidgets.QPushButton("Resume")
-        self._resume_button.setEnabled(False)
-        self._resume_button.setToolTip("Resume a paused global fit (continues the current run).")
-        self._resume_button.clicked.connect(self._resume_fit)
-
-        actions_row = QtWidgets.QHBoxLayout()
-        actions_row.setContentsMargins(0, 0, 0, 0)
-        actions_row.setSpacing(6)
-        actions_row.addWidget(self._run_button)
-        actions_row.addWidget(self._stop_button)
-        actions_row.addWidget(self._pause_button)
-        actions_row.addWidget(self._resume_button)
-
-        self._results_summary_button = QtWidgets.QPushButton("Results Summary")
-        self._results_summary_button.setObjectName("global_fit_results_summary_footer_button")
-        self._results_summary_button.setEnabled(False)
-        self._results_summary_button.clicked.connect(self._run_results_tab.open_results_summary_dialog)
-        actions_row.addWidget(self._results_summary_button)
-
-        self._apply_scope_combo = QtWidgets.QComboBox(footer)
-        self._apply_scope_combo.setObjectName("global_fit_apply_scope_combo")
-        for label, scope in _PROJECT_APPLY_OPTIONS:
-            self._apply_scope_combo.addItem(label, userData=scope)
-        self._apply_scope_combo.setEnabled(False)
-        self._apply_to_project_button = QtWidgets.QPushButton("Apply to Project")
-        self._apply_to_project_button.setObjectName("global_fit_apply_to_project_button")
-        self._apply_to_project_button.setEnabled(False)
-        self._apply_to_project_button.clicked.connect(self._apply_to_project)
-        actions_row.addWidget(self._apply_scope_combo)
-        actions_row.addWidget(self._apply_to_project_button)
-
-        control_row.addLayout(actions_row)
-        return footer
-
-    def _selected_data_table_dataset_id(self) -> Optional[str]:
-        return self._data_targets_tab.unified_list.selected_dataset_id()
-
-    def _on_right_tabs_current_changed(self, index: int) -> None:
-        # Targets panel is always visible in unified layout; activate on tab switch.
-        if int(index) == 0:
-            self._species_table.on_tab_activated(
-                seed_dataset_id=self._selected_data_table_dataset_id()
+        layout.addWidget(note)
+        self._dataset_table = QtWidgets.QTableWidget(0, 11, self._data_tab)
+        self._dataset_table.setHorizontalHeaderLabels(
+            (
+                "Use",
+                "Dataset",
+                "Mapped set",
+                "t min",
+                "t max",
+                "Points",
+                "Used",
+                "Weight",
+                "X",
+                "X Mapping",
+                "Resolved X Mapping",
             )
+        )
+        self._dataset_table.itemChanged.connect(
+            self._on_dataset_item_changed
+        )
+        self._dataset_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self._dataset_table, 1)
+        targets_header = QtWidgets.QHBoxLayout()
+        targets_header.addWidget(QtWidgets.QLabel("Observation targets", self._data_tab))
+        self._targets_all = QtWidgets.QPushButton("All", self._data_tab)
+        self._targets_none = QtWidgets.QPushButton("None", self._data_tab)
+        self._targets_invert = QtWidgets.QPushButton("Invert", self._data_tab)
+        self._targets_copy = QtWidgets.QPushButton("Copy Targets…", self._data_tab)
+        self._targets_apply = QtWidgets.QPushButton("Apply", self._data_tab)
+        self._targets_revert = QtWidgets.QPushButton("Revert", self._data_tab)
+        self._targets_all.clicked.connect(lambda: self._bulk_targets("all"))
+        self._targets_none.clicked.connect(lambda: self._bulk_targets("none"))
+        self._targets_invert.clicked.connect(lambda: self._bulk_targets("invert"))
+        self._targets_copy.clicked.connect(self._copy_targets)
+        self._targets_apply.clicked.connect(self._apply_target_changes)
+        self._targets_revert.clicked.connect(self._revert_target_changes)
+        targets_header.addWidget(self._targets_all)
+        targets_header.addWidget(self._targets_none)
+        targets_header.addWidget(self._targets_invert)
+        targets_header.addWidget(self._targets_copy)
+        targets_header.addWidget(self._targets_apply)
+        targets_header.addWidget(self._targets_revert)
+        targets_header.addStretch(1)
+        self._add_observable_button = QtWidgets.QPushButton(
+            "Add Observable…",
+            self._data_tab,
+        )
+        self._add_observable_button.clicked.connect(
+            self._show_add_observable_dialog
+        )
+        targets_header.addWidget(self._add_observable_button)
+        layout.addLayout(targets_header)
+        self._target_table = QtWidgets.QTableWidget(0, 6, self._data_tab)
+        self._target_table.setHorizontalHeaderLabels(
+            (
+                "Use",
+                "Dataset",
+                "Observed column",
+                "Model target",
+                "Weight",
+                "Pre-boundary source rows",
+            )
+        )
+        self._target_table.itemChanged.connect(
+            lambda _item: self._refresh_dataset_controls()
+        )
+        self._target_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self._target_table, 1)
 
-    def _results_fit_targets_by_dataset(self) -> Dict[str, List[str]]:
-        if not hasattr(self, "_species_table"):
-            return {}
-        applied = dict(self._species_table.fit_targets_selection_applied or {})
-        out: Dict[str, List[str]] = {}
-        for entry in self._dataset_entries or []:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            selected = applied.get(ds_id)
-            if selected is None:
-                selected = entry.get("selected_species") or []
-            out[ds_id] = [str(name).strip() for name in selected if str(name).strip()]
-        return out
+    def _build_parameters_tab(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self._parameters_tab)
+        view_steps = QtWidgets.QPushButton("View Steps…", self._parameters_tab)
+        view_steps.clicked.connect(self._show_current_steps)
+        layout.addWidget(view_steps)
+        self._parameter_table = QtWidgets.QTableWidget(
+            0,
+            7,
+            self._parameters_tab,
+        )
+        self._parameter_table.setHorizontalHeaderLabels(
+            ("Fit", "Parameter", "Initial", "Minimum", "Maximum", "Log10", "Scope")
+        )
+        self._parameter_table.itemChanged.connect(
+            self._on_parameter_value_item_changed
+        )
+        self._parameter_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self._parameter_table, 1)
+        self._parameter_local_table = QtWidgets.QTableWidget(
+            0,
+            3,
+            self._parameters_tab,
+        )
+        self._parameter_local_table.setHorizontalHeaderLabels(
+            ("Parameter", "Dataset", "Per-dataset value")
+        )
+        self._parameter_local_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self._parameter_local_table)
+        optimizer = QtWidgets.QGroupBox("Optimizer", self._parameters_tab)
+        form = QtWidgets.QFormLayout(optimizer)
+        self._method = QtWidgets.QComboBox(optimizer)
+        self._method.addItems(FITTING_METHODS)
+        self._max_nfev = QtWidgets.QSpinBox(optimizer)
+        self._max_nfev.setRange(*FITTING_MAX_NFEV_RANGE)
+        self._ftol = QtWidgets.QDoubleSpinBox(optimizer)
+        self._xtol = QtWidgets.QDoubleSpinBox(optimizer)
+        for editor in (self._ftol, self._xtol):
+            editor.setDecimals(15)
+            editor.setRange(1e-15, 1.0)
+        self._use_seed = QtWidgets.QCheckBox("Use deterministic seed", optimizer)
+        self._seed = QtWidgets.QSpinBox(optimizer)
+        self._seed.setRange(*FITTING_SEED_RANGE)
+        self._save_project_defaults = QtWidgets.QPushButton(
+            "Use as Project Defaults",
+            optimizer,
+        )
+        self._save_project_defaults.clicked.connect(
+            self._emit_project_defaults
+        )
+        form.addRow("Method", self._method)
+        form.addRow("Maximum evaluations", self._max_nfev)
+        form.addRow("Function tolerance", self._ftol)
+        form.addRow("Step tolerance", self._xtol)
+        form.addRow(self._use_seed)
+        form.addRow("Seed", self._seed)
+        form.addRow(self._save_project_defaults)
+        layout.addWidget(optimizer)
 
-    def _current_results_dark_mode(self) -> bool:
-        for candidate in (self.parentWidget(), self.parent()):
-            if candidate is not None and hasattr(candidate, "_dark_mode"):
-                return bool(getattr(candidate, "_dark_mode"))
-        app = QtWidgets.QApplication.instance()
-        if app is None:
-            return False
-        window_color = app.palette().color(QtGui.QPalette.ColorRole.Window)
-        return int(window_color.lightness()) < 128
+    def _emit_project_defaults(self) -> None:
+        self.projectDefaultsRequested.emit(
+            FitDefaults(
+                method=self._method.currentText(),
+                max_nfev=self._max_nfev.value(),
+                ftol=self._ftol.value(),
+                xtol=self._xtol.value(),
+                use_seed=self._use_seed.isChecked(),
+                seed=self._seed.value(),
+            )
+        )
 
-    def changeEvent(self, event: QtCore.QEvent) -> None:
-        super().changeEvent(event)
-        if hasattr(self, "_run_results_tab") and event.type() in (
-            QtCore.QEvent.Type.PaletteChange,
-            QtCore.QEvent.Type.ApplicationPaletteChange,
-            QtCore.QEvent.Type.StyleChange,
+    def _show_current_steps(self) -> None:
+        MechanismInspectorDialog(
+            self._effective_prepared_dsl,
+            self,
+        ).exec()
+
+    def _build_initials_tab(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self._initials_tab)
+        layout.addWidget(QtWidgets.QLabel("Fit-local initial concentrations", self._initials_tab))
+        snapshot_buttons = QtWidgets.QHBoxLayout()
+        self._view_initial = QtWidgets.QPushButton(
+            "Reset to Initial",
+            self._initials_tab,
+        )
+        self._view_last_fit = QtWidgets.QPushButton(
+            "Reset to Last Fit",
+            self._initials_tab,
+        )
+        self._view_initial.clicked.connect(lambda: self._restore_named_snapshot("initial"))
+        self._view_last_fit.clicked.connect(lambda: self._restore_named_snapshot("last_fit"))
+        self._view_last_fit.setEnabled(False)
+        snapshot_buttons.addWidget(self._view_initial)
+        snapshot_buttons.addWidget(self._view_last_fit)
+        snapshot_buttons.addStretch(1)
+        layout.addLayout(snapshot_buttons)
+        self._initial_table = QtWidgets.QTableWidget(0, 9, self._initials_tab)
+        self._initial_table.setHorizontalHeaderLabels(
+            (
+                "Fit",
+                "Dataset",
+                "Mapped set",
+                "Species",
+                "Initial",
+                "Minimum",
+                "Maximum",
+                "Log10",
+                "Scope",
+            )
+        )
+        self._initial_table.itemChanged.connect(
+            self._on_initial_value_item_changed
+        )
+        layout.addWidget(self._initial_table, 1)
+        layout.addWidget(
+            QtWidgets.QLabel(
+                "Complete Fit-local simulation setup (outside optimizer vector)",
+                self._initials_tab,
+            )
+        )
+        self._execution_table = QtWidgets.QTableWidget(0, 6, self._initials_tab)
+        self._execution_table.setHorizontalHeaderLabels(
+            (
+                "Dataset",
+                "Mapped set",
+                "Solver",
+                "t start",
+                "t end",
+                "Integration points",
+            )
+        )
+        self._execution_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self._execution_table, 1)
+
+    def _build_results_tab(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self._results_tab)
+        self._tracker_summary = QtWidgets.QLabel(
+            "Run a fit to see the best candidate.",
+            self._results_tab,
+        )
+        self._tracker_summary.setWordWrap(True)
+        self._tracker_parameters = QtWidgets.QPlainTextEdit(self._results_tab)
+        self._tracker_parameters.setReadOnly(True)
+        self._tracker_parameters.setMaximumHeight(110)
+        layout.addWidget(self._tracker_summary)
+        layout.addWidget(self._tracker_parameters)
+        self._result_views = QtWidgets.QTabWidget(self._results_tab)
+        layout.addWidget(self._result_views, 1)
+        self._all_datasets_view = GridPlotView(
+            color_resolver=self._color_resolver,
+            parent=self._result_views,
+        )
+        self._result_views.addTab(self._all_datasets_view, "All Datasets")
+        self._result_summary = QtWidgets.QPlainTextEdit(self._results_tab)
+        self._result_summary.setReadOnly(True)
+        self._result_summary.setMaximumHeight(120)
+        layout.addWidget(self._result_summary)
+        self._species_filter = QtWidgets.QListWidget(self._results_tab)
+        self._species_filter.setMaximumHeight(90)
+        self._species_filter.itemChanged.connect(self._apply_species_filter)
+        layout.addWidget(self._species_filter)
+        scopes = QtWidgets.QHBoxLayout()
+        scopes.addWidget(QtWidgets.QLabel("Apply:", self._results_tab))
+        self._apply_parameters = QtWidgets.QCheckBox("Parameters", self._results_tab)
+        self._apply_initials = QtWidgets.QCheckBox(
+            "Initial Concentrations",
+            self._results_tab,
+        )
+        self._apply_setup = QtWidgets.QCheckBox(
+            "Simulation Setup",
+            self._results_tab,
+        )
+        self._apply_observables = QtWidgets.QCheckBox(
+            "Observable Definitions",
+            self._results_tab,
+        )
+        self._apply_button = QtWidgets.QPushButton(
+            "Apply to Project",
+            self._results_tab,
+        )
+        self._copy_button = QtWidgets.QPushButton(
+            "Copy Fit Curves",
+            self._results_tab,
+        )
+        self._copy_run_json = QtWidgets.QPushButton(
+            "Copy Run JSON",
+            self._results_tab,
+        )
+        self._copy_button.setEnabled(False)
+        self._copy_run_json.setEnabled(False)
+        self._copy_button.clicked.connect(
+            self._all_datasets_view.copy_all_to_clipboard
+        )
+        self._copy_run_json.clicked.connect(self._copy_run_identity_json)
+        self._apply_button.clicked.connect(self._emit_apply)
+        for widget in (
+            self._apply_parameters,
+            self._apply_initials,
+            self._apply_setup,
+            self._apply_observables,
+            self._apply_button,
         ):
-            self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
+            widget.setEnabled(False)
+        scopes.addWidget(self._apply_parameters)
+        scopes.addWidget(self._apply_initials)
+        scopes.addWidget(self._apply_setup)
+        scopes.addWidget(self._apply_observables)
+        scopes.addStretch(1)
+        scopes.addWidget(self._copy_button)
+        scopes.addWidget(self._copy_run_json)
+        scopes.addWidget(self._apply_button)
+        layout.addLayout(scopes)
 
-    def _dataset_entry_for_id(self, dataset_id: str) -> Optional[Dict[str, Any]]:
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return None
-        for entry in self._dataset_entries:
-            if str(entry.get("id") or "").strip() == ds_id:
-                return entry
-        return None
-
-    def _dataset_weight_for_id(self, dataset_id: str) -> float:
-        entry = self._dataset_entry_for_id(dataset_id)
-        if isinstance(entry, dict):
-            try:
-                value = float(entry.get("weight", 1.0))
-            except Exception:
-                value = 1.0
-            if np.isfinite(value):
-                return max(0.0, float(value))
-        try:
-            settings = self._dataset_fit_settings_store.get_fit_settings(str(dataset_id))
-            persisted = float(getattr(settings, "weight", 1.0))
-        except Exception:
-            persisted = None
-        if persisted is not None and np.isfinite(persisted):
-            return max(0.0, float(persisted))
-        try:
-            fallback = float(self._global_weights.get(str(dataset_id), 1.0))
-        except Exception:
-            fallback = 1.0
-        return max(0.0, fallback) if np.isfinite(fallback) else 1.0
-
-    def _persist_dataset_weight(self, dataset_id: str, weight: float) -> None:
-        ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return
-        normalized_weight = max(0.0, float(weight))
-        previous_weight = self._dataset_weight_for_id(ds_id)
-        entry = self._dataset_entry_for_id(ds_id)
-        if isinstance(entry, dict):
-            entry["weight"] = float(normalized_weight)
-        self._global_weights[ds_id] = float(normalized_weight)
-        try:
-            settings = self._dataset_fit_settings_store.get_fit_settings(ds_id)
-            setattr(settings, "weight", float(normalized_weight))
-            self._dataset_fit_settings_store.update_fit_settings(ds_id, settings)
-        except Exception:
-            pass
-        if not math.isclose(float(previous_weight), float(normalized_weight), rel_tol=1e-12, abs_tol=1e-12):
-            self._on_fit_runtime_inputs_changed()
-
-    def _invalid_sampling_applied_used_dataset_ids(self) -> List[str]:
-        used = set(self._included_dataset_ids())
-        invalid: List[str] = []
-        for ds_id in sorted(used):
-            cfg = self._sampling_applied_config_for_dataset(ds_id)
-            err = self._data_tab.sampling_validation_error(dataset_id=ds_id, config=cfg)
-            if err:
-                invalid.append(ds_id)
-        return invalid
-
-    def _refresh_sampling_validity_ui(self) -> None:
-        if not hasattr(self, "_data_tab"):
-            return
-        invalid = self._invalid_sampling_applied_used_dataset_ids()
-        if invalid:
-            summary = self._dataset_count_summary_for_ids(invalid)
-            message = (
-                f"Run Fit disabled: {summary.display} has invalid applied sampling. Adjust sampling and Apply, or uncheck Use."
-            )
-            tooltip = (
-                f"Run Fit disabled: {summary.full}\n\n"
-                "Invalid applied sampling. Adjust sampling and Apply, or uncheck Use."
-            )
-            self._data_tab.set_sampling_secondary_error(message, tooltip_text=tooltip)
-        else:
-            self._data_tab.set_sampling_secondary_error(None)
-        self._refresh_run_button_enabled_state()
-
-    def _included_dataset_ids(self) -> List[str]:
-        return [
-            str(e.get("id") or "").strip()
-            for e in (self._dataset_entries or [])
-            if e.get("include", True) and str(e.get("id") or "").strip()
-        ]
-
-    def _dataset_label_for_id(self, dataset_id: str) -> str:
-        ds_id = str(dataset_id or "").strip()
-        for entry in self._dataset_entries or []:
-            if str(entry.get("id") or "").strip() == ds_id:
-                return str(entry.get("label", "") or "").strip() or str(dataset_id)
-        return str(dataset_id)
-
-    def _dataset_identity_label_for_id(self, dataset_id: str) -> str:
-        ds_id = str(dataset_id or "").strip()
-        label = self._dataset_label_for_id(ds_id) or ds_id
-        label_s = str(label or "").strip()
-        if not ds_id or label_s == ds_id:
-            return label_s or ds_id
-        return f"{label_s} [{ds_id}]"
-
-    def _dataset_count_summary_for_ids(self, dataset_ids: Sequence[str]):
-        return summarize_named_count(
-            [self._dataset_identity_label_for_id(ds_id) for ds_id in dataset_ids],
-            singular="dataset",
-            item_max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
-        )
-
-    def _invalid_applied_used_dataset_ids_for_run(self) -> List[str]:
-        invalid = set(self._species_table.invalid_applied_used_dataset_ids())
-        try:
-            invalid |= set(self._invalid_sampling_applied_used_dataset_ids())
-        except Exception:
-            invalid |= set()
-        return sorted(invalid)
-
-    def _refresh_run_button_enabled_state(self) -> None:
-        if not hasattr(self, "_run_button"):
-            return
-        running = bool(self._worker and hasattr(self._worker, "isRunning") and self._worker.isRunning())
-        readiness = self._fit_runtime_readiness.snapshot()
-        preparing = readiness.state is FittingRuntimeReadinessState.PREPARING
-        invalid = bool(self._invalid_applied_used_dataset_ids_for_run())
-        launchable = self._fit_runtime_launchable_for_run_button()
-        self._run_button.setEnabled((not running) and (not preparing) and not invalid and launchable)
-
-    def _fit_runtime_ready_for_run_button(self) -> bool:
-        snapshot = self._fit_runtime_readiness.snapshot()
-        if snapshot.state is not FittingRuntimeReadinessState.READY:
-            return False
-        identity = snapshot.identity
-        if not self._fit_runtime_identity_matches_current_noncollecting_inputs(identity):
-            return False
-        return self._fit_runtime_readiness.is_ready_for(identity)
-
-    def _fit_runtime_launchable_for_run_button(self) -> bool:
-        if self._fit_runtime_ready_for_run_button():
-            return True
-        try:
-            launch_result = self.build_current_launch_result(
-                purpose=FittingLaunchPurpose.PASSIVE_READINESS,
-            )
-        except RuntimeError:
-            return False
-        return launch_result.identity is not None
-
-    def _fit_runtime_identity_matches_current_noncollecting_inputs(self, identity: Optional[FittingRuntimeIdentity]) -> bool:
-        if identity is None:
-            return False
-        if not self.payloads_available_for_identity(identity):
-            return False
-        current_selection = self.collect_dataset_selection()
-        current_dataset_ids = tuple(str(ds_id) for ds_id in current_selection.ids)
-        identity_dataset_ids = tuple(str(getattr(spec, "dataset_id", "") or "") for spec in identity.datasets)
-        if current_dataset_ids != identity_dataset_ids:
-            return False
-        integration = self._params_ics_tab.collect_integration_settings_silent()
-        if integration is None:
-            return False
-        solver, rtol, atol = integration
-        requested_solver = normalize_solver_name(str(solver))
-        if str(requested_solver) != str(identity.requested_solver):
-            return False
-        if not math.isclose(float(rtol), float(identity.requested_rtol), rel_tol=1e-9, abs_tol=1e-12):
-            return False
-        if not math.isclose(float(atol), float(identity.requested_atol), rel_tol=1e-9, abs_tol=1e-12):
-            return False
-        try:
-            current_lane_count = self._runtime_lane_count_for_dataset_count(len(identity.datasets))
-        except Exception:
-            return False
-        if int(current_lane_count) != int(identity.lane_count):
-            return False
-        return self._fit_runtime_identity_matches_runtime_inputs(identity)
-
-    def _fit_runtime_identity_matches_runtime_inputs(self, identity: FittingRuntimeIdentity) -> bool:
-        if not callable(getattr(self, "_simulation_builder", None)):
-            return True
-        stamp = dict(identity.stamp or {})
-        prepared_simulation = stamp.get("prepared_simulation")
-        if isinstance(prepared_simulation, Mapping):
-            try:
-                return self._prepared_simulation_matches_runtime_inputs(
-                    PreparedSimulationMetadata.from_mapping(prepared_simulation)
-                )
-            except Exception:
-                return False
-        runtime_identity = stamp.get("runtime_identity")
-        if not isinstance(runtime_identity, Mapping):
-            return False
-        stamped_inputs = runtime_identity.get("inputs")
-        if not isinstance(stamped_inputs, Mapping):
-            return False
-        try:
-            return FittingRuntimeInputs.from_stamp_payload(stamped_inputs).identity_key() == self._runtime_inputs.identity_key()
-        except RuntimeError:
-            return False
-
-    def _fitting_evaluator_components_for_runtime_identity(
+    def rebase(
         self,
+        origin: FitOriginSnapshot,
         *,
-        mechanism_text: str,
-        config: Dict[str, Any],
-        requested_solver: str,
-        requested_rtol: float,
-        requested_atol: float,
-    ):
-        return self._fit_evaluator_state.components_for_runtime_identity(
-            mechanism_text=mechanism_text,
-            config=config,
-            requested_solver=requested_solver,
-            requested_rtol=requested_rtol,
-            requested_atol=requested_atol,
-            runtime_inputs=self._runtime_inputs.evaluator,
-            param_names_for_readiness=self._param_names_for_readiness_identity,
-        )
-
-    def _prepared_simulation_matches_runtime_inputs(
-        self,
-        prepared_simulation: Optional[PreparedSimulationMetadata],
-    ) -> bool:
-        return prepared_simulation_matches_runtime_inputs(
-            prepared_simulation,
-            self._runtime_inputs.evaluator,
-        )
-
-    def _runtime_inputs_for_builder_kwargs(self) -> dict[str, object]:
-        return self._runtime_inputs.evaluator.builder_kwargs()
-
-    def _param_names_for_readiness_identity(
-        self,
-        *,
-        config: Dict[str, Any],
-        prepared_simulation: Optional[PreparedSimulationMetadata],
-        mechanism_text: str = "",
-    ) -> list[str]:
-        if prepared_simulation is not None and prepared_simulation.param_names:
-            return [str(x) for x in prepared_simulation.param_names if str(x).strip()]
-        scan_defs = getattr(self._params_ics_tab, "_scan_parameter_definitions_for_mechanism", None)
-        if callable(scan_defs) and str(mechanism_text or "").strip():
-            try:
-                names = [str(d.get("name")) for d in (scan_defs(str(mechanism_text)) or []) if d.get("name")]
-            except Exception:
-                names = []
-            if names:
-                return [name for name in names if name.strip()]
-        param_names = list(self._params_ics_tab.get_prepared_param_names() or [])
-        if param_names:
-            return [str(x) for x in param_names if str(x).strip()]
-        names = set()
-        names |= {str(k) for k in (config.get("parameters") or {}).keys() if str(k).strip()}
-        names |= {str(k) for k in (config.get("fixed_params") or {}).keys() if str(k).strip()}
-        return sorted(names)
-
-    def _on_targets_validity_changed(self) -> None:
-        if not hasattr(self, "_run_button"):
-            return
-        invalid_pending = set(self._species_table.invalid_pending_used_dataset_ids())
-        invalid_pending_weights = set(self._species_table.invalid_pending_target_weight_dataset_ids())
-        invalid_applied = set(self._species_table.invalid_applied_used_dataset_ids())
-
-        # Row highlighting: applied-invalid is stronger than pending-invalid.
-        for entry in self._dataset_entries:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            if ds_id in invalid_applied:
-                state = "invalid_applied"
-            elif ds_id in invalid_pending or ds_id in invalid_pending_weights:
-                state = "invalid_pending"
-            else:
-                state = ""
-            self._data_targets_tab.unified_list.set_validation_state(ds_id, state)
-
-        # Run Fit disabling while invalid applied.
-        if invalid_applied:
-            summary = self._dataset_count_summary_for_ids(sorted(invalid_applied))
-            message = (
-                f"Run Fit disabled: {summary.display} has no applied fit targets. Select targets and Apply, or uncheck Use."
-            )
-            if hasattr(self, "_run_block_reason_label"):
-                full_message = (
-                    f"Run Fit disabled: {summary.full}\n\n"
-                    "No applied fit targets. Select targets and Apply, or uncheck Use. "
-                    "Open Data and Targets to apply targets."
-                )
-                set_compact_label_text(
-                    self._run_block_reason_label,
-                    message,
-                    max_chars=FOOTER_SUMMARY_MAX_CHARS,
-                    max_width=620,
-                    diagnostic=True,
-                    tooltip_text=full_message,
-                )
-                self._run_block_reason_label.show()
-        else:
-            if hasattr(self, "_run_block_reason_label"):
-                self._run_block_reason_label.hide()
-
-        self._refresh_run_button_enabled_state()
-
-    def _on_targets_status_message(self, msg: str) -> None:
-        self._set_fit_status(msg)
-
-    def _on_targets_applied(self) -> None:
-        self._on_fit_runtime_inputs_changed()
-        self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
-        self._rebuild_selected_payload_lookup()
-        self._populate_dataset_table()
-        self._on_targets_validity_changed()
-        self._request_rebuild_subtabs()
-        self._refresh_sampling_validity_ui()
-
-    def _on_data_tab_include_changed(self, row: int, dataset_id: str, included: bool) -> None:
-        self._on_fit_runtime_inputs_changed()
-        entry = self._dataset_entry_for_id(dataset_id)
-        if entry is not None:
-            entry["include"] = included
-        self._species_table.refresh_dataset_list()
-        self._on_targets_validity_changed()
-        self._refresh_sampling_validity_ui()
-        self._request_rebuild_subtabs()
-
-    def _on_data_tab_sampling_applied(self, dataset_id: str, config: dict) -> None:
-        self._on_fit_runtime_inputs_changed()
-        self._sampling_applied[str(dataset_id)] = dict(config)
-        self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
-        self._rebuild_selected_payload_lookup()
-        self._request_rebuild_subtabs()
-        self._refresh_sampling_validity_ui()
-        self._set_fit_status("Sampling applied")
-
-    def _open_add_datasets_dialog(self) -> None:
-        present = {str(entry.get("id") or "").strip() for entry in (self._dataset_entries or []) if entry.get("id")}
-        candidates = [ds_id for ds_id in (self._loaded_dataset_order or []) if ds_id and ds_id not in present]
-        if not candidates:
-            self._set_fit_status("No additional loaded datasets to add.")
-            return
-
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Add Datasets to Global Fit")
-        dialog.setModal(True)
-        layout = QtWidgets.QVBoxLayout(dialog)
-
-        hint = QtWidgets.QLabel("Select loaded datasets to add to this Global Fit session.", dialog)
-        hint.setWordWrap(True)
-        hint.setStyleSheet("font-size: 11px;")
-        layout.addWidget(hint)
-
-        list_widget = QtWidgets.QListWidget(dialog)
-        list_widget.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        list_widget.setUniformItemSizes(True)
-        list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        for ds_id in candidates:
-            pool_entry = self._loaded_dataset_pool.get(ds_id) or {}
-            label = str(pool_entry.get("label") or ds_id)
-            compact = compact_dataset_label(label)
-            item = QtWidgets.QListWidgetItem(compact.display, list_widget)
-            item.setToolTip(compact.full)
-            item.setData(Qt.UserRole, ds_id)
-            item.setData(Qt.UserRole + 1, compact.full)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            item.setCheckState(Qt.Unchecked)
-        layout.addWidget(list_widget, stretch=1)
-
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, dialog)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-
-        chosen: List[str] = []
-        for i in range(list_widget.count()):
-            item = list_widget.item(i)
-            if item is None:
-                continue
-            if item.checkState() != Qt.Checked:
-                continue
-            ds_id = str(item.data(Qt.UserRole) or "").strip()
-            if ds_id:
-                chosen.append(ds_id)
-        self._add_datasets_to_session(chosen)
-
-    def _add_datasets_to_session(self, dataset_ids: Sequence[str]) -> None:
-        """Add datasets into this Global Fit session (from already-loaded pool only)."""
-        present = {str(entry.get("id") or "").strip() for entry in (self._dataset_entries or []) if entry.get("id")}
-        added = False
-        for ds_id in [str(x).strip() for x in (dataset_ids or []) if str(x).strip()]:
-            if ds_id in present:
-                continue
-            pool_entry = self._loaded_dataset_pool.get(ds_id)
-            if not isinstance(pool_entry, dict):
-                continue
-            observations = (
-                copy_observations_map(pool_entry.get("observations"))
-                if isinstance(pool_entry.get("observations"), dict)
-                else {}
-            )
-            t_values = np.asarray(pool_entry.get("t", []), dtype=float).reshape(-1).copy()
-            full_series = pool_entry.get("species_data") or {}
-            series_map: Dict[str, np.ndarray] = {}
-            series_failures: List[str] = []
-            if isinstance(full_series, dict):
-                for name, values in full_series.items():
-                    key = str(name).strip()
-                    if not key:
-                        continue
-                    try:
-                        series_map[key] = np.asarray(values, dtype=float).reshape(-1).copy()
-                    except Exception as exc:
-                        series_failures.append(key)
-                        if len(series_failures) <= 3:
-                            logger.debug(
-                                "Skipping invalid series '%s' for dataset '%s' when adding to global-fit session: %s",
-                                key,
-                                ds_id,
-                                exc,
-                                exc_info=True,
-                            )
-                        continue
-
-            self._dataset_entries.append(
-                {
-                    "id": ds_id,
-                    "label": str(pool_entry.get("label", "") or "").strip() or ds_id,
-                    "observations": observations,
-                    "t": t_values,
-                    "species_data": {},  # applied selection starts empty
-                    "selected_species": [],
-                    "target_weights": {},
-                    "weight": self._dataset_weight_for_id(ds_id),
-                    "include": True,
-                }
-            )
-
-            self._species_table.add_dataset_state(
-                ds_id,
-                full_series=dict(series_map),
-                full_t=t_values,
-                available=sorted(series_map.keys()),
-            )
-            self._sampling_applied[ds_id] = self._sampling_default_config_for_time_axis(t_values)
-
-            # Seed per-dataset initial parameter maps from persisted fit settings (best-effort).
-            self._params_ics_tab.seed_dataset_initial_params(ds_id)
-
-            present.add(ds_id)
-            added = True
-
-        if not added:
-            return
-        self._sync_after_session_dataset_change()
-        self._set_fit_status("Datasets added to session")
-
-    def _remove_datasets_from_session(self, dataset_ids: Sequence[str]) -> None:
-        """Remove datasets from this Global Fit session (does not delete from project)."""
-        remove_set = {str(x).strip() for x in (dataset_ids or []) if str(x).strip()}
-        if not remove_set:
-            return
-
-        self._dataset_entries = [entry for entry in self._dataset_entries if entry.get("id") not in remove_set]
-
-        # Remove fit-target session state (keep loaded pool intact).
-        self._species_table.remove_dataset_state(remove_set)
-        for ds_id in list(remove_set):
-            self._sampling_applied.pop(ds_id, None)
-            self._global_payload_results.pop(ds_id, None)
-            self._global_payload_lookup.pop(ds_id, None)
-            self._active_variable_specs.pop(ds_id, None)
-
-        # Delegate param/IC state cleanup and table repaint to the tab
-        self._params_ics_tab.remove_dataset_parameter_rows(remove_set)
-
-        self._sync_after_session_dataset_change()
-        self._set_fit_status("Datasets removed from session")
-
-    def _sync_after_session_dataset_change(self) -> None:
-        self._populate_dataset_table()
-        ds_id = self._data_targets_tab.unified_list.selected_dataset_id()
-        self._data_tab.select_dataset(ds_id or "")
-        self._species_table.refresh_dataset_list()
-        self._species_table.refresh_dataset_entries(self._dataset_entries)
-        self._params_ics_tab.refresh_dataset_entries(self._dataset_entries)
-        self._on_targets_validity_changed()
-        self._refresh_sampling_validity_ui()
-        self._request_rebuild_subtabs()
-        self._on_fit_runtime_inputs_changed()
-
-    # ------------------------------------------------------------------
-    # Table population
-    # ------------------------------------------------------------------
-    def _populate_dataset_table(self) -> None:
-        self._data_tab.populate_table(self._dataset_entries)
-        self._data_targets_tab.unified_list.populate(self._dataset_entries)
-
-    # ------------------------------------------------------------------
-    # Actions
-    # ------------------------------------------------------------------
-    def _selected_dataset_ids(self) -> List[str]:
-        selection = self.collect_dataset_selection()
-        return list(selection.ids)
-
-    def _add_algebraic_observable(
-        self,
-        name: str,
-        expr: str,
-        dataset_ids: Sequence[str],
-        *,
-        scalar_scope: str,
-        persist_observable: bool,
+        preserved: Mapping[str, object] | None = None,
+        canonicalized_scopes: frozenset[str] = frozenset(),
+        supplemental_parameters: Iterable[FitParameterVariable] = (),
+        preserve_snapshots: bool = False,
     ) -> None:
-        from kindred.core.algebra.symbols import SymbolTable
-        from kindred.core.simulator.algebra_section import (
-            upsert_lines_into_algebra_section,
-        )
-        from kindred.core.validation import validate_name
-
-        if not self._observable_dsl_edit_available():
-            return
-
-        normalized = self._normalize_observable_inputs(name, expr, validate_name=validate_name)
-        if normalized is None:
-            return
-        obs_name, obs_expr = normalized
-
-        if not self._validate_observable_name_rules(obs_name, mechanism_species=set(), symbol_table=SymbolTable()):
-            return
-        persisted = self._persist_observable_updates(
-            obs_name=obs_name,
-            obs_expr=obs_expr,
-            persist_observable=persist_observable,
-            upsert_lines_into_algebra_section=upsert_lines_into_algebra_section,
-        )
-        if persisted is None:
-            return
-        _updated_reactions_text, missing_scalars = persisted
-
-        if not self._refresh_simulation_after_reactions_update():
-            return
-
-        self._params_ics_tab.add_missing_scalars_as_parameters(
-            missing_scalars=missing_scalars,
-            dataset_ids=dataset_ids,
-            scalar_scope=scalar_scope,
-        )
-
-    def _observable_dsl_edit_available(self) -> bool:
-        if not callable(getattr(self, "_reactions_text_getter", None)) or not callable(getattr(self, "_reactions_text_rewriter", None)):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                "Mechanism Reactions editor is unavailable in this window. Close and reopen Global Fit from the main window.",
+        if not isinstance(origin, FitOriginSnapshot):
+            raise TypeError("origin must be FitOriginSnapshot.")
+        supplemental = tuple(supplemental_parameters)
+        if any(
+            not isinstance(item, FitParameterVariable)
+            for item in supplemental
+        ):
+            raise TypeError(
+                "supplemental_parameters must contain FitParameterVariable "
+                "values."
             )
-            return False
-        if not callable(self._mechanism_text_getter) or not callable(self._simulation_builder):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                "Cannot refresh simulation/plumbing in this window. Close and reopen Global Fit from the main window.",
-            )
-            return False
-        return True
+        supplemental_names = [item.name for item in supplemental]
+        if len(supplemental_names) != len(set(supplemental_names)):
+            raise ValueError("Supplemental Fit parameter identities repeat.")
+        if self._snapshot_capture_id != origin.capture_id:
+            if preserve_snapshots:
+                retained_dataset_ids = {
+                    item.dataset_id for item in origin.mapped_datasets
+                }
+                retained_set_ids = {
+                    item.set_id for item in origin.mapped_datasets
+                }
 
-    def _normalize_observable_inputs(
-        self,
-        name: str,
-        expr: str,
-        *,
-        validate_name,
-    ) -> Optional[tuple[str, str]]:
-        import re
-
-        try:
-            obs_name = validate_name(str(name))
-        except Exception:
-            obs_name = str(name).strip()
-        obs_expr = str(expr).strip()
-        if not obs_name or not obs_expr:
-            QtWidgets.QMessageBox.warning(self, "Add Observable", "Observable name and expression are required.")
-            return None
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", obs_name):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                "Observable name must be a valid identifier: [A-Za-z_][A-Za-z0-9_]*",
-            )
-            return None
-        return str(obs_name), str(obs_expr)
-
-    def _validate_observable_name_rules(
-        self,
-        obs_name: str,
-        *,
-        mechanism_species: set[str],
-        symbol_table,
-    ) -> bool:
-        if obs_name in symbol_table.protected_names() or obs_name in symbol_table.functions().keys():
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                f"Observable name '{obs_name}' is reserved (built-in/protected). Choose a different name.",
-            )
-            return False
-        if mechanism_species and obs_name in mechanism_species:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                f"Observable name '{obs_name}' conflicts with a mechanism species name.",
-            )
-            return False
-        from kindred.core.simulator.parameter_algebra_spec import (
-            is_protected_indexed_parameter_identifier,
-            is_protected_step_key_identifier,
-        )
-
-        if is_protected_step_key_identifier(obs_name):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                f"'{obs_name}' is a step-local DSL key. Choose a different observable name.",
-            )
-            return False
-        if is_protected_indexed_parameter_identifier(obs_name):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                f"'{obs_name}' looks like a mechanism parameter name. Choose a different observable name.",
-            )
-            return False
-        return True
-
-    def _validate_observable_existence(
-        self,
-        obs_name: str,
-        *,
-        existing_observables: set[str],
-        persist_observable: bool,
-    ) -> bool:
-        if not persist_observable and obs_name not in existing_observables:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                f"Observable '{obs_name}' was not found in the Reactions text. Use ‘Define new…’ to add it.",
-            )
-            return False
-        if persist_observable and obs_name in existing_observables:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                f"An algebraic observable named '{obs_name}' already exists.",
-            )
-            return False
-        return True
-
-    def _validate_observable_expression_analysis(
-        self,
-        analysis,
-        *,
-        obs_expr: str,
-        mechanism_species: set[str],
-    ) -> bool:
-        if analysis.has_time_ref:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                "Algebra baseline references like [A](T0) are not supported for fitting (v1).",
-            )
-            return False
-        bare_species = set(getattr(analysis, "identifiers", set()) or set()) & mechanism_species
-        if bare_species:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Add Observable",
-                "Species must be referenced using brackets. Replace bare names with [name].\n\n"
-                f"Bare species found: {', '.join(sorted(bare_species))}",
-            )
-            return False
-        return True
-
-    def _known_identifiers_for_observable(self, *, existing_observables: set[str]) -> set[str]:
-        known: set[str] = set()
-        known |= {str(k) for k in (self._params_ics_tab.get_shared_param_definitions() or {}).keys() if str(k).strip()}
-        known |= {str(k) for k in (self._params_ics_tab.get_fixed_shared_params() or {}).keys() if str(k).strip()}
-        known |= {
-            str(entry.get("param_name") or "")
-            for entry in (self._params_ics_tab.get_parameter_state() or [])
-            if str(entry.get("param_name") or "").strip()
-        }
-        for _ds_id, specs in (self._params_ics_tab.get_global_dataset_variable_params() or {}).items():
-            if not isinstance(specs, dict):
-                continue
-            known |= {str(k) for k in specs.keys() if str(k).strip()}
-        known |= set(existing_observables)
-        return known
-
-    @staticmethod
-    def _reactions_text_has_param_decl(reactions_text: str, name: str) -> bool:
-        import re
-
-        if not name:
-            return False
-        pat = rf"(?im)^\s*param\s+{re.escape(str(name))}\s*="
-        return bool(re.search(pat, reactions_text or ""))
-
-    def _persist_observable_updates(
-        self,
-        *,
-        obs_name: str,
-        obs_expr: str,
-        persist_observable: bool,
-        upsert_lines_into_algebra_section,
-    ) -> Optional[tuple[str, tuple[str, ...]]]:
-        from kindred.core.algebra.observable_introspection import (
-            analyze_observable_expression,
-            detect_unknown_scalar_identifiers,
-            extract_observables_from_algebra_text,
-        )
-        from kindred.core.algebra.symbols import SymbolTable
-        from kindred.core.simulator.algebra_section import extract_algebra_section_text
-        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-        from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
-
-        rewriter = getattr(self, "_reactions_text_rewriter", None)
-        if not callable(rewriter):
-            QtWidgets.QMessageBox.warning(self, "Add Observable", "Mechanism Reactions editor is unavailable.")
-            return None
-
-        updated_holder: dict[str, object] = {"text": "", "missing_scalars": tuple()}
-
-        def _rewrite(current_reactions_text: str) -> str:
-            current_text = str(current_reactions_text or "")
-            try:
-                mechanism_text = str(self._mechanism_text_getter() or "")
-                mechanism = parse_dsl_to_mechanism(mechanism_text, initials={})
-                mechanism_namespace = build_namespace_from_mechanism(mechanism)
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, "Add Observable", f"Mechanism source is invalid:\n\n{exc}")
-                raise _ObservableRewriteAborted() from exc
-            mechanism_species = {str(x) for x in (mechanism.species_names() or []) if str(x).strip()}
-            algebra_text = extract_algebra_section_text(current_text)
-            existing_obs_map = extract_observables_from_algebra_text(
-                algebra_text,
-                mechanism_namespace=mechanism_namespace,
-            )
-            existing_observables = {str(x) for x in (existing_obs_map or {}).keys() if str(x).strip()}
-            if not self._validate_observable_name_rules(
-                obs_name,
-                mechanism_species=mechanism_species,
-                symbol_table=SymbolTable(),
-            ):
-                raise _ObservableRewriteAborted()
-            if not self._validate_observable_existence(
-                obs_name,
-                existing_observables=existing_observables,
-                persist_observable=persist_observable,
-            ):
-                raise _ObservableRewriteAborted()
-            try:
-                analysis = analyze_observable_expression(obs_expr)
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, "Add Observable", f"Invalid expression:\n\n{exc}")
-                raise _ObservableRewriteAborted() from exc
-            if not self._validate_observable_expression_analysis(
-                analysis,
-                obs_expr=obs_expr,
-                mechanism_species=mechanism_species,
-            ):
-                raise _ObservableRewriteAborted()
-            known_identifiers = self._known_identifiers_for_observable(existing_observables=existing_observables)
-            if obs_name in known_identifiers:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Add Observable",
-                    f"Name '{obs_name}' is already used by a fit/solver parameter. Choose a different observable name.",
-                )
-                raise _ObservableRewriteAborted()
-            known_identifiers |= {obs_name}
-            try:
-                missing_scalars = tuple(
-                    sorted(
-                        detect_unknown_scalar_identifiers(
-                            obs_expr,
-                            observable_name=obs_name,
-                            known_identifiers=known_identifiers,
-                            mechanism_species=mechanism_species,
-                            mechanism_namespace=mechanism_namespace,
-                        )
+                def retained_snapshot(
+                    snapshot: FitSetupSnapshot,
+                ) -> FitSetupSnapshot:
+                    return replace(
+                        snapshot,
+                        origin_tab_id=origin.tab_id,
+                        origin_capture_id=origin.capture_id,
+                        datasets=tuple(
+                            item
+                            for item in snapshot.datasets
+                            if item.dataset_id in retained_dataset_ids
+                        ),
+                        parameters=tuple(
+                            replace(
+                                item,
+                                dataset_values=tuple(
+                                    (dataset_id, value)
+                                    for dataset_id, value
+                                    in item.dataset_values
+                                    if dataset_id in retained_dataset_ids
+                                ),
+                            )
+                            for item in snapshot.parameters
+                        ),
+                        initials=tuple(
+                            item
+                            for item in snapshot.initials
+                            if item.set_id in retained_set_ids
+                        ),
                     )
-                )
-            except ValueError as exc:
-                QtWidgets.QMessageBox.warning(self, "Add Observable", f"Invalid expression:\n\n{exc}")
-                raise _ObservableRewriteAborted() from exc
-            updated_reactions_text = current_text
-            to_add: list[str] = []
-            for scalar in missing_scalars:
-                if self._reactions_text_has_param_decl(current_text, str(scalar)):
-                    continue
-                to_add.append(f"param {scalar} = 1.0")
-            if persist_observable:
-                to_add.append(f"let {obs_name} = {obs_expr}")
-            if to_add:
-                updated_reactions_text = upsert_lines_into_algebra_section(current_text, to_add)
-            updated_holder["text"] = str(updated_reactions_text)
-            updated_holder["missing_scalars"] = tuple(str(scalar) for scalar in missing_scalars)
-            return str(updated_reactions_text)
 
-        try:
-            outcome = rewriter(
-                action_label="Updating Global Fit Reactions",
-                description="Global Fit: update Reactions",
-                rewrite_text=_rewrite,
-                record_undo=True,
-                transition_source="global_fit_observable",
-            )
-        except _ObservableRewriteAborted:
-            return None
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Failed to update Reactions DSL:\n\n{exc}")
-            return None
-        if not outcome.may_continue:
-            return None
-        return str(updated_holder["text"]), tuple(updated_holder["missing_scalars"])
-
-    def _refresh_simulation_after_reactions_update(self) -> bool:
-        try:
-            mechanism_text = str(self._mechanism_text_getter() or "")
-            param_names = self._refresh_parameter_definitions_for_mechanism(mechanism_text)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Failed to rescan mechanism parameters:\n\n{exc}")
-            return False
-
-        try:
-            if not callable(self._simulation_builder):
-                raise RuntimeError("Simulation builder unavailable.")
-            integration = self._params_ics_tab.collect_integration_settings()
-            if integration is None:
-                raise RuntimeError("Fitting integration settings are required.")
-            solver, rtol, atol = integration
-            self._fit_evaluator_state.build_and_set(
-                mechanism_text=mechanism_text,
-                param_names=list(param_names),
-                requested_solver=str(solver),
-                requested_rtol=float(rtol),
-                requested_atol=float(atol),
-                runtime_inputs=self._runtime_inputs.evaluator,
-            )
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Failed to refresh simulation:\n\n{exc}")
-            return False
-        return True
-
-    # ------------------------------------------------------------------
-    # Fit lifecycle
-    # ------------------------------------------------------------------
-    def _reset_fit_run_cached_state(self) -> None:
-        self._invalidate_fit_result_authority()
-        self._fit_run_state_owner.reset_for_new_run()
-        self._pre_run_parameter_state = None
-        self._pre_run_staged_dataset_params = None
-        self._best_cost = None
-        self._best_effort_failures.clear()
-        self._teardown_disable_failures.clear()
-
-    def _mark_fit_window_state_mechanism_current(self, mechanism_text: str) -> None:
-        text = str(mechanism_text or "")
-        self._fit_window_state_mechanism_text_sha256 = self._mechanism_text_sha256(text)
-        self._fit_window_state_mechanism_text_len = len(text)
-
-    def _fit_window_state_matches_mechanism(self, mechanism_text: str) -> bool:
-        expected_hash = str(getattr(self, "_fit_window_state_mechanism_text_sha256", "") or "")
-        if not expected_hash:
-            return False
-        try:
-            expected_len = int(getattr(self, "_fit_window_state_mechanism_text_len"))
-        except Exception:
-            return False
-        text = str(mechanism_text or "")
-        return expected_hash == self._mechanism_text_sha256(text) and expected_len == len(text)
-
-    def _refresh_fit_window_state_for_current_mechanism(self, *, show_errors: bool = True) -> bool:
-        mechanism_text = self._safe_text_from_getter(getattr(self, "_mechanism_text_getter", None))
-        simulation_func = self._fit_evaluator_state.current_base_evaluator()
-        prepared_simulation = self._prepared_simulation_meta(simulation_func)
-        mechanism_matches = self._prepared_simulation_matches_mechanism(prepared_simulation, mechanism_text)
-        table_matches = self._fit_window_state_matches_mechanism(mechanism_text)
-        if not callable(getattr(self, "_simulation_builder", None)):
-            return True
-        if not callable(getattr(self, "_mechanism_text_getter", None)):
-            return True
-        if (prepared_simulation is None or mechanism_matches) and table_matches:
-            return True
-        if getattr(self, "_fit_window_state_refreshing", False):
-            return False
-        from kindred.gui.controllers.dataset_errors import DatasetOwnerError
-
-        self._fit_window_state_refreshing = True
-        try:
-            self._params_ics_tab.rebuild_for_mechanism(mechanism_text, list(self._dataset_entries))
-            self._species_table.set_mechanism_species(list(self._params_ics_tab.get_mechanism_species()))
-            self._species_table.refresh_dataset_entries(list(self._dataset_entries))
-            self._capture_failed_fit_restore_baseline()
-            self._mark_fit_window_state_mechanism_current(mechanism_text)
-        except DatasetOwnerError as exc:
-            if show_errors:
-                self._clear_failed_run_visual_state()
-                QtWidgets.QMessageBox.warning(self, "Global Fit", str(exc))
-            elif hasattr(self, "_status_label"):
-                self._set_fit_status(f"Fitting runtime not ready: {exc}")
-            return False
-        except Exception as exc:
-            logger.exception("Failed to refresh fit-window state before running fit.")
-            if show_errors:
-                self._clear_failed_run_visual_state()
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Simulation Error",
-                    f"Failed to refresh fit-window state:\n{exc}",
-                )
-            elif hasattr(self, "_status_label"):
-                self._set_fit_status(f"Fitting runtime not ready: {exc}")
-            return False
-        finally:
-            self._fit_window_state_refreshing = False
-        return True
-
-    def run_fit(self) -> None:
-        if self._is_fit_running:
-            QtWidgets.QMessageBox.information(self, "Fit Running", "A fit is already in progress.")
-            return
-        self._reset_fit_run_cached_state()
-        self._species_table.flush_visible_weight_edits()
-        self._species_table.flush_dataset_weight_editor()
-        try:
-            launch_result = self.build_current_launch_result(
-                purpose=FittingLaunchPurpose.EXPLICIT_RUN,
-            )
-        except RuntimeError as exc:
-            self._fit_runtime_readiness.clear_pending_fit_run()
-            self._fit_runtime_readiness.set_blocked(exc)
-            self._set_fit_status(f"Fitting runtime not ready: {exc}")
-            self._refresh_run_button_enabled_state()
-            return
-        identity = launch_result.identity
-        if identity is None:
-            self._fit_runtime_readiness.clear_pending_fit_run()
-            self._fit_runtime_readiness.set_blocked()
-            self.render_launch_rejection(
-                launch_result,
-                purpose=FittingLaunchPurpose.EXPLICIT_RUN,
-            )
-            self._clear_failed_run_visual_state()
-            self._refresh_run_button_enabled_state()
-            return
-        self._capture_failed_fit_restore_baseline()
-        launch_decision = self._fit_runtime_readiness.prepare_or_accept_launch(identity)
-        if launch_decision.state is not FittingRuntimeLaunchDecisionState.ACCEPTED:
-            snapshot = launch_decision.snapshot or self._fit_runtime_readiness.snapshot()
-            if snapshot.state is FittingRuntimeReadinessState.PREPARING:
-                self._fit_runtime_readiness.mark_pending_fit_run(identity)
-                self._set_fit_status("Preparing fitting runtime...")
-                self._set_fit_stop_enabled(True)
+                if self._initial_setup is not None:
+                    self._initial_setup = retained_snapshot(
+                        self._initial_setup
+                    )
+                if self._last_fit_setup is not None:
+                    self._last_fit_setup = retained_snapshot(
+                        self._last_fit_setup
+                    )
             else:
-                self._fit_runtime_readiness.clear_pending_fit_run()
-                self._set_fit_status("Fitting runtime is not ready")
-            self._refresh_run_button_enabled_state()
-            return
-        accepted_launch = launch_decision.accepted_launch
-        if accepted_launch is None:
-            self._fit_runtime_readiness.clear_pending_fit_run()
-            self._refresh_run_button_enabled_state()
-            return
-        self._fit_runtime_readiness.clear_pending_fit_run()
-        self._start_accepted_fit_runtime_launch(accepted_launch)
-
-    def _start_accepted_fit_runtime_launch(self, accepted_launch: FittingRuntimeAcceptedLaunch) -> None:
-        ready_identity = accepted_launch.identity
-        self._fit_run_state_owner.set_active_dataset_ids(
-            [spec.dataset_id for spec in ready_identity.datasets]
+                self._initial_setup = None
+                self._last_fit_setup = None
+                self._view_last_fit.setEnabled(False)
+            self._snapshot_capture_id = origin.capture_id
+        self._origin = origin
+        self._origin_label.setText(
+            f"Origin: {origin.tab_name} ({len(origin.mapped_datasets)} mapped datasets)"
         )
-        _dataset_params_map, variable_params_map = split_fit_dataset_parameter_overrides(ready_identity.dataset_overrides)
-        self._active_variable_specs = {
-            str(ds_id): {str(name): dict(spec) for name, spec in spec_map.items()}
-            for ds_id, spec_map in dict(variable_params_map or {}).items()
-            if isinstance(spec_map, Mapping)
-        }
-        self._run_results_tab.set_run_stamp(
-            dict(accepted_launch.stamp),
-            str(accepted_launch.stamp_hash),
-            str(accepted_launch.stamp_short),
-        )
-        self._results_summary_button.setEnabled(True)
-        self._start_fit_worker_from_accepted_launch(accepted_launch)
-
-    def _start_fit_worker_from_accepted_launch(self, accepted_launch: FittingRuntimeAcceptedLaunch) -> None:
-        datasets = list(accepted_launch.datasets)
-        config = accepted_launch.config
-        dataset_overrides = list(accepted_launch.dataset_overrides)
-        weights = accepted_launch.weights
-        fit_evaluator = accepted_launch.fit_evaluator
-        runtime_session = accepted_launch.session
-        stamp = accepted_launch.stamp
-        stamp_hash = accepted_launch.stamp_hash
-        stamp_short = accepted_launch.stamp_short
-        self._fit_run_state_owner.set_active_run_stamp_hash(str(stamp_hash or ""))
-        fit_runtime_ledger = runtime_session.ledger if runtime_session is not None else None
-        worker = GlobalFitWorker(
-            datasets,
-            dict(config["parameters"]),
-            dataset_overrides=list(dataset_overrides),
-            bounds=config.get("bounds"),
-            weights=weights,
-            method=config["method"],
-            max_nfev=config["max_nfev"],
-            ftol=config["ftol"],
-            xtol=config["xtol"],
-            seed=config.get("seed"),
-            log10_params=config["log10_params"],
-            fit_evaluator=fit_evaluator,
-            fit_runtime_session=runtime_session,
-            fit_runtime_max_lanes=int(accepted_launch.lane_count),
-            fit_runtime_ledger=fit_runtime_ledger,
-            fit_func=self._fit_func,
-            solver=str(accepted_launch.identity.requested_solver),
-            rtol=float(accepted_launch.identity.requested_rtol),
-            atol=float(accepted_launch.identity.requested_atol),
-            run_stamp=dict(stamp),
-            run_stamp_hash=str(stamp_hash),
-            run_stamp_short=str(stamp_short),
-            parent=None,
-        )
-        self._worker = worker
-        worker.progress.connect(self._dispatch_fit_worker_progress)
-        worker.bestUpdated.connect(
-            self._dispatch_fit_worker_best_update,
-            QtCore.Qt.ConnectionType.QueuedConnection,
-        )
-        worker.finished.connect(self._dispatch_fit_worker_finished)
-        worker.error.connect(self._dispatch_fit_worker_error)
-        worker.start()
-        if self._worker_is_running(worker):
-            self._set_running_state(True)
-        self._paused = False
-        self._pause_button.setEnabled(True)
-        self._resume_button.setEnabled(False)
-
-    @staticmethod
-    def _shared_param_keys_for_run(config: Dict[str, Any]) -> set[str]:
-        keys = {str(k) for k in (config.get("parameters") or {}).keys() if str(k).strip()}
-        keys |= {str(k) for k in (config.get("fixed_params") or {}).keys() if str(k).strip()}
-        return keys
-
-    @staticmethod
-    def _prepared_species_names_from_evaluator(evaluator: object) -> set[str]:
-        candidates = [evaluator]
-        try:
-            base_evaluator = getattr(evaluator, "base_evaluator", None)
-        except Exception:
-            base_evaluator = None
-        if base_evaluator is not None:
-            candidates.append(base_evaluator)
-
-        for candidate in candidates:
-            try:
-                context = getattr(candidate, "context", None)
-            except Exception:
-                context = None
-            if context is None:
-                try:
-                    context = getattr(candidate, "_kindred_fitting_execution_context", None)
-                except Exception:
-                    context = None
-            request = getattr(context, "execution_request", None)
-            if request is None:
-                continue
-            payload = None
-            to_payload = getattr(request, "to_payload", None)
-            if callable(to_payload):
-                try:
-                    payload = to_payload()
-                except Exception:
-                    payload = None
-            elif isinstance(request, Mapping):
-                payload = request
-            if not isinstance(payload, Mapping):
-                continue
-            prepared_payload = payload.get("prepared_payload")
-            if not isinstance(prepared_payload, Mapping):
-                continue
-            species_names = {
-                str(name)
-                for name in (prepared_payload.get("species_names") or [])
-                if str(name).strip()
-            }
-            if species_names:
-                return species_names
-        return set()
-
-    def _consumable_dataset_param_names_for_run(self, evaluator: object | None = None) -> tuple[set[str], Optional[set[str]]]:
-        evaluator = self._fit_evaluator_state.current_base_evaluator() if evaluator is None else evaluator
-        species_names = self._prepared_species_names_from_evaluator(evaluator)
-        if not species_names:
-            species_names = {
-                str(name)
-                for name in (self._params_ics_tab.get_mechanism_species() or [])
-                if str(name).strip()
-            }
-        prepared_simulation = self._prepared_simulation_meta(evaluator)
-        if prepared_simulation is not None:
-            prepared_param_names = {
-                str(name)
-                for name in (prepared_simulation.param_names or [])
-                if str(name).strip()
-            }
-            return species_names, prepared_param_names
-        return species_names, None
-
-    @staticmethod
-    def _dataset_param_consumable(
-        name: str,
-        *,
-        mechanism_species: set[str],
-        prepared_param_names: Optional[set[str]],
-    ) -> bool:
-        if name.startswith(INITIAL_PREFIX):
-            species_name = name[len(INITIAL_PREFIX) :]
-            return not mechanism_species or species_name in mechanism_species
-        return prepared_param_names is None or name in prepared_param_names
-
-    def _dataset_params_for_run(
-        self,
-        selected_ids: Sequence[str],
-        shared_param_keys: set[str],
-        staged_params: Dict[str, Dict[str, float]],
-        *,
-        global_dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
-        evaluator: object | None = None,
-    ) -> dict[str, dict[str, float]]:
-        global_ds_params = (
-            {str(k): dict(v) for k, v in global_dataset_params.items()}
-            if isinstance(global_dataset_params, dict)
-            else self._params_ics_tab.get_global_dataset_params()
-        )
-        dataset_params_for_run: dict[str, dict[str, float]] = {}
-        mechanism_species, prepared_param_names = self._consumable_dataset_param_names_for_run(evaluator)
-        for ds_id in selected_ids:
-            merged = dict(global_ds_params.get(ds_id, {}))
-            stage_map = staged_params.get(ds_id)
-            if isinstance(stage_map, dict):
-                merged.update(stage_map)
-            for key in shared_param_keys:
-                merged.pop(key, None)
-            merged = {
-                str(key): value
-                for key, value in merged.items()
-                if self._dataset_param_consumable(
-                    str(key),
-                    mechanism_species=mechanism_species,
-                    prepared_param_names=prepared_param_names,
+        self.setWindowTitle(f"Global Fit — {origin.tab_name}")
+        self._populate_origin()
+        self._load_defaults()
+        existing_parameter_names = {
+            str(
+                self._parameter_table.item(row, 1).data(
+                    QtCore.Qt.ItemDataRole.UserRole
                 )
-            }
-            dataset_params_for_run[ds_id] = merged
-        return dataset_params_for_run
+                or self._parameter_table.item(row, 1).text()
+            )
+            for row in range(self._parameter_table.rowCount())
+        }
+        for parameter in supplemental:
+            if parameter.name not in existing_parameter_names:
+                self._append_parameter_row(parameter)
+                existing_parameter_names.add(parameter.name)
+        if preserved:
+            self._restore_raw_state(
+                preserved,
+                canonicalized_scopes=canonicalized_scopes,
+            )
+        self._refresh_dataset_controls()
 
-    def _variable_params_for_run(
+    def install_initial_snapshot(self, snapshot: FitSetupSnapshot) -> None:
+        if not isinstance(snapshot, FitSetupSnapshot):
+            raise TypeError("snapshot must be FitSetupSnapshot.")
+        if (
+            snapshot.origin_tab_id != self._origin.tab_id
+            or snapshot.origin_capture_id != self._origin.capture_id
+        ):
+            raise ValueError("Initial Fit snapshot does not match this origin.")
+        self._initial_setup = snapshot
+        self._snapshot_capture_id = snapshot.origin_capture_id
+
+    def set_effective_source(
         self,
-        selected_ids: Sequence[str],
-        shared_param_keys: set[str],
-        staged_params: Dict[str, Dict[str, float]],
-        *,
-        global_dataset_variable_params: Optional[Dict[str, Dict[str, Dict]]] = None,
-        evaluator: object | None = None,
-    ) -> dict[str, dict[str, dict[str, float]]]:
-        global_ds_var_params = (
-            {
-                str(k): {str(kk): dict(vv) for kk, vv in v.items()} if isinstance(v, dict) else v
-                for k, v in global_dataset_variable_params.items()
-            }
-            if isinstance(global_dataset_variable_params, dict)
-            else self._params_ics_tab.get_global_dataset_variable_params()
+        source: MechanismAuthoringSource,
+        prepared_dsl: PreparedDslRequestSet,
+    ) -> None:
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be MechanismAuthoringSource.")
+        if not isinstance(prepared_dsl, PreparedDslRequestSet):
+            raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+        if prepared_dsl.analysis.normalized_text != source.full_dsl.strip():
+            raise ValueError(
+                "Fit effective prepared DSL must exactly match its source."
+            )
+        self._effective_source = source
+        self._effective_prepared_dsl = prepared_dsl
+
+    def restore_snapshot(
+        self,
+        snapshot: FitSetupSnapshot,
+    ) -> FitSetupSnapshot:
+        """Atomically project one typed setup back into the physical editors."""
+
+        if not isinstance(snapshot, FitSetupSnapshot):
+            raise TypeError("snapshot must be FitSetupSnapshot.")
+        if (
+            snapshot.origin_tab_id != self._origin.tab_id
+            or snapshot.origin_capture_id != self._origin.capture_id
+        ):
+            raise ValueError("Fit snapshot does not match this origin.")
+        restoring_initial = snapshot is self._initial_setup
+        restoring_last_fit = snapshot is self._last_fit_setup
+        current_dataset_ids = {
+            str(
+                self._dataset_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or ""
+            )
+            for row in range(self._dataset_table.rowCount())
+        }
+        current_parameter_names = {
+            str(
+                self._parameter_table.item(row, 1).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or self._parameter_table.item(row, 1).text()
+            )
+            for row in range(self._parameter_table.rowCount())
+        }
+        current_parameter_local_keys = {
+            (
+                str(
+                    self._parameter_local_table.item(row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                    or self._parameter_local_table.item(row, 0).text()
+                ),
+                str(
+                    self._parameter_local_table.item(row, 2).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                    or ""
+                ),
+            )
+            for row in range(self._parameter_local_table.rowCount())
+        }
+        current_initial_keys = {
+            (
+                str(
+                    self._initial_table.item(row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    )
+                    or ""
+                ),
+                self._initial_table.item(row, 3).text(),
+            )
+            for row in range(self._initial_table.rowCount())
+        }
+        origin_dataset_ids = {
+            item.dataset_id for item in self._origin.mapped_datasets
+        }
+        restored_datasets = tuple(
+            item
+            for item in snapshot.datasets
+            if (
+                item.dataset_id in current_dataset_ids
+                and item.dataset_id in origin_dataset_ids
+            )
         )
-        variable_params: dict[str, dict[str, dict[str, float]]] = {}
-        mechanism_species, prepared_param_names = self._consumable_dataset_param_names_for_run(evaluator)
-        for ds_id in selected_ids:
-            specs = global_ds_var_params.get(ds_id)
-            if not isinstance(specs, dict) or not specs:
-                continue
-            stage_map = staged_params.get(ds_id) if isinstance(staged_params.get(ds_id), dict) else {}
-            ds_specs: dict[str, dict[str, float]] = {}
-            for param_name, spec in specs.items():
-                if not isinstance(spec, dict):
-                    continue
-                if str(param_name) in shared_param_keys:
-                    continue
-                if not self._dataset_param_consumable(
-                    str(param_name),
-                    mechanism_species=mechanism_species,
-                    prepared_param_names=prepared_param_names,
+        restored_dataset_ids = {
+            item.dataset_id for item in restored_datasets
+        }
+        restored_parameters = tuple(
+            replace(
+                item,
+                dataset_values=tuple(
+                    (dataset_id, value)
+                    for dataset_id, value in item.dataset_values
+                    if (
+                        dataset_id in restored_dataset_ids
+                        and (
+                            item.name,
+                            dataset_id,
+                        )
+                        in current_parameter_local_keys
+                    )
+                ),
+            )
+            for item in snapshot.parameters
+            if item.name in current_parameter_names
+        )
+        restored_parameter_names = {
+            item.name for item in restored_parameters
+        }
+        restored_observables = tuple(
+            observable
+            for observable in snapshot.local_observables
+            if all(
+                scalar.name in restored_parameter_names
+                for scalar in observable.scalar_parameters
+            )
+        )
+        restored_snapshot = replace(
+            snapshot,
+            datasets=restored_datasets,
+            parameters=restored_parameters,
+            initials=tuple(
+                item
+                for item in snapshot.initials
+                if (item.set_id, item.species) in current_initial_keys
+            ),
+            local_observables=restored_observables,
+        )
+        restored_raw = self._snapshot_raw_state(restored_snapshot)
+        tables = (
+            self._dataset_table,
+            self._target_table,
+            self._parameter_table,
+            self._parameter_local_table,
+            self._initial_table,
+            self._execution_table,
+        )
+        self.setUpdatesEnabled(False)
+        self._syncing_scopes = True
+        for table in tables:
+            table.blockSignals(True)
+        try:
+            restored_parameter_names = {
+                item.name for item in restored_snapshot.parameters
+            }
+            origin_parameter_names = {
+                item.name for item in self._origin.parameter_defaults
+            }
+            for row in reversed(range(self._parameter_table.rowCount())):
+                item = self._parameter_table.item(row, 1)
+                name = str(
+                    item.data(QtCore.Qt.ItemDataRole.UserRole)
+                    or item.text()
+                )
+                if (
+                    name in origin_parameter_names
+                    or name in restored_parameter_names
                 ):
                     continue
-                spec_copy = dict(spec)
-                spec_copy.setdefault("log10", False)
-                staged_value = stage_map.get(param_name) if isinstance(stage_map, dict) else None
-                if staged_value is not None:
-                    try:
-                        staged_float = float(staged_value)
-                    except (TypeError, ValueError):
-                        staged_float = None
-                    if staged_float is not None and np.isfinite(staged_float):
-                        if bool(spec_copy.get("log10")):
-                            if staged_float > 0.0:
-                                spec_copy["initial"] = staged_float
-                        else:
-                            spec_copy["initial"] = staged_float
-                ds_specs[str(param_name)] = spec_copy
-            if ds_specs:
-                variable_params[ds_id] = ds_specs
-        return variable_params
-
-    def _weights_for_run(self, dataset_selection: Dict[str, Any]) -> Optional[dict[str, float]]:
-        if self._species_table.weight_mode_is_implicit():
-            return None
-        return {row["id"]: row["weight"] for row in dataset_selection.get("rows") or [] if row.get("include")}
-
-    @staticmethod
-    def _safe_text_from_getter(getter) -> str:
-        if not callable(getter):
-            return ""
-        try:
-            return str(getter() or "")
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _prepared_simulation_meta(simulation_func) -> Optional[PreparedSimulationMetadata]:
-        return FittingEvaluatorStateOwner.prepared_simulation_meta_for(simulation_func)
-
-    @staticmethod
-    def _simulation_with_fixed_params(simulation_func, fixed_params: Dict[str, float]):
-        if simulation_func is None:
-            return None
-        normalized = coerce_fitting_series_evaluator(simulation_func)
-        with_fixed_params = getattr(simulation_func, "with_fixed_params", None)
-        if callable(with_fixed_params):
-            return coerce_fitting_series_evaluator(with_fixed_params(fixed_params))
-        return _SimulationWithFixedParams(normalized, fixed_params)
-
-    @staticmethod
-    def _prepared_solver_normalized(prepared_simulation: Optional[PreparedSimulationMetadata]) -> str:
-        if prepared_simulation is None:
-            return ""
-        return str(prepared_simulation.solver_normalized).strip()
-
-    @staticmethod
-    def _mechanism_text_sha256(mechanism_text: str) -> str:
-        return hashlib.sha256(str(mechanism_text or "").encode("utf-8")).hexdigest()
-
-    @classmethod
-    def _prepared_simulation_matches_mechanism(
-        cls,
-        prepared_simulation: Optional[PreparedSimulationMetadata],
-        mechanism_text: str,
-    ) -> bool:
-        if prepared_simulation is None:
-            return False
-        expected_hash = str(getattr(prepared_simulation, "mechanism_text_sha256", "") or "")
-        if not expected_hash:
-            return False
-        try:
-            expected_len = int(getattr(prepared_simulation, "mechanism_text_len"))
-        except Exception:
-            return False
-        text = str(mechanism_text or "")
-        return expected_hash == cls._mechanism_text_sha256(text) and expected_len == len(text)
-
-    def _refresh_parameter_definitions_for_mechanism(self, mechanism_text: str) -> list[str]:
-        param_defs = self._params_ics_tab._scan_parameter_definitions_for_mechanism(mechanism_text)
-        self._params_ics_tab.set_shared_param_definitions({str(d.get("name")): dict(d) for d in (param_defs or []) if d.get("name")})
-        param_names = [str(d.get("name")) for d in (param_defs or []) if d.get("name")]
-        self._params_ics_tab.set_prepared_param_names(list(param_names))
-        return list(param_names)
-
-    def _param_names_for_fit_run(self, prepared_simulation: Optional[PreparedSimulationMetadata]) -> list[str]:
-        param_names = list(self._params_ics_tab.get_prepared_param_names() or [])
-        if prepared_simulation is not None and prepared_simulation.param_names:
-            try:
-                param_names = [str(x) for x in prepared_simulation.param_names if str(x).strip()]
-            except Exception:
-                param_names = list(self._params_ics_tab.get_prepared_param_names() or [])
-        return list(param_names)
-
-    def _ensure_simulation_for_integration_settings(
-        self,
-        *,
-        mechanism_text: str,
-        param_names: Sequence[str],
-        requested_solver: str,
-        requested_rtol: float,
-        requested_atol: float,
-        prepared_simulation: Optional[PreparedSimulationMetadata],
-    ) -> tuple[bool, Optional[PreparedSimulationMetadata]]:
-        should_rebuild_sim = False
-        if callable(getattr(self, "_simulation_builder", None)) and callable(getattr(self, "_mechanism_text_getter", None)):
-            if prepared_simulation is None:
-                should_rebuild_sim = True
-            else:
-                mechanism_matches = self._prepared_simulation_matches_mechanism(
-                    prepared_simulation,
-                    mechanism_text,
-                )
-                current_solver = self._prepared_solver_normalized(prepared_simulation)
-                try:
-                    current_rtol = float(prepared_simulation.rtol)
-                except Exception:
-                    current_rtol = float("nan")
-                try:
-                    current_atol = float(prepared_simulation.atol)
-                except Exception:
-                    current_atol = float("nan")
-                should_rebuild_sim = not (
-                    mechanism_matches
-                    and
-                    current_solver == requested_solver
-                    and self._prepared_simulation_matches_runtime_inputs(prepared_simulation)
-                    and np.isfinite(current_rtol)
-                    and np.isfinite(current_atol)
-                    and math.isclose(float(current_rtol), float(requested_rtol), rel_tol=1e-9, abs_tol=1e-12)
-                    and math.isclose(float(current_atol), float(requested_atol), rel_tol=1e-9, abs_tol=1e-12)
-                )
-        if not should_rebuild_sim:
-            return True, prepared_simulation
-
-        try:
-            if not callable(self._simulation_builder):
-                raise RuntimeError("Simulation builder unavailable.")
-            current_param_names = list(self._params_ics_tab.get_prepared_param_names() or [])
-            if not current_param_names:
-                current_param_names = self._refresh_parameter_definitions_for_mechanism(mechanism_text)
-            if not current_param_names:
-                current_param_names = list(param_names)
-            _base_simulation, prepared_simulation = self._fit_evaluator_state.build_and_set(
-                mechanism_text=mechanism_text,
-                param_names=list(current_param_names),
-                requested_solver=str(requested_solver),
-                requested_rtol=float(requested_rtol),
-                requested_atol=float(requested_atol),
-                runtime_inputs=self._runtime_inputs.evaluator,
+                for local_row in reversed(
+                    self._parameter_local_rows(name)
+                ):
+                    self._parameter_local_table.removeRow(local_row)
+                self._parameter_table.removeRow(row)
+            self._restore_raw_state(
+                restored_raw,
+                canonicalized_scopes=frozenset(),
             )
-        except SimulationBuilderContractError as exc:
-            logger.error("Simulation builder contract mismatch: %s", exc)
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Simulation Error",
-                f"{exc}\n\n"
-                "This is an internal integration error (the simulation builder must accept solver, rtol, atol).",
+            self._syncing_scopes = False
+            self._reconcile_parameter_local_rows()
+            self._syncing_scopes = True
+            self._restore_parameter_rows(
+                restored_raw,
+                frozenset(),
             )
-            return False, prepared_simulation
-        except Exception as exc:
-            logger.exception("Failed to build simulation for fitting.")
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Simulation Error",
-                f"Failed to build simulation for fitting:\n{exc}",
-            )
-            return False, prepared_simulation
-
-        return True, prepared_simulation
-
-    @staticmethod
-    def _fixed_params_for_run(config: Dict[str, Any]) -> dict[str, float]:
-        fixed_params = config.get("fixed_params") or {}
-        if not isinstance(fixed_params, dict):
-            return {}
-        out: dict[str, float] = {}
-        for k, v in fixed_params.items():
-            if not str(k).strip():
-                continue
-            try:
-                out[str(k)] = float(v)
-            except (TypeError, ValueError, OverflowError):
-                continue
-        return out
-
-    def _discard_fit_runtime_session(self, *, kill: bool = False) -> None:
-        self._fit_runtime_readiness.cancel(kill=bool(kill))
-
-    def _set_fit_controls_locked(self, locked: bool) -> None:
-        running = bool(locked)
-        try:
-            self._params_ics_tab.set_running_state(running)
-            table = getattr(self._params_ics_tab, "_param_table", None)
-            if table is not None:
-                table.setEnabled(not running)
-        except Exception as exc:
-            self._best_effort_failures.add("fit_controls_locked.params_ics_tab")
-            logger.debug("Failed to update Parameters/IC controls during fitting runtime preparation: %s", exc, exc_info=True)
-        try:
-            self._data_targets_tab.unified_list.set_running_state(running)
-        except Exception as exc:
-            self._best_effort_failures.add("fit_controls_locked.dataset_list")
-            logger.debug("Failed to update dataset controls during fitting runtime preparation: %s", exc, exc_info=True)
-        try:
-            self._species_table.set_running_state(running)
-        except Exception as exc:
-            self._best_effort_failures.add("fit_controls_locked.species_table")
-            logger.debug("Failed to update target controls during fitting runtime preparation: %s", exc, exc_info=True)
-        self._refresh_project_apply_controls(running=running)
-
-    def _create_fit_runtime_session(self, fit_evaluator, lane_count: int) -> Optional[FittingRuntimeSession]:
-        if type(fit_evaluator) is not SerialFittingEvaluator:
-            return None
-        ledger = FittingRuntimeLedger()
-        return FittingRuntimeSession.from_serial_evaluator(
-            fit_evaluator,
-            max_lanes=int(lane_count),
-            ledger=ledger,
-        )
-
-    def _schedule_worker_cleanup(self, worker: QtCore.QThread) -> None:
-        if worker is None:
-            return
-        self._worker_registry.schedule_cleanup(worker)
-
-    def _hard_teardown_worker(self, *, reason: str, disable_ui: bool) -> None:
-        worker = getattr(self, "_worker", None)
-        if worker is None or not self._worker_is_running(worker):
-            return
-
-        self._disconnect_fit_worker_signals(worker)
-
-        self._last_teardown_reason = str(reason)
-        self._set_teardown_status_label(str(reason))
-        self._disable_ui_for_worker_teardown(disable_ui=bool(disable_ui))
-
-        self._cancel_worker_best_effort(worker)
-
-        still_running = self._wait_for_worker_stop(worker, timeout_ms=2000, context="hard_teardown.wait")
-        if still_running:
-            still_running = self._terminate_worker_and_wait(worker, timeout_ms=2000)
-
-        self._finalize_worker_after_teardown(worker, still_running=still_running)
-        self._clear_worker_ref_if_stopped(worker)
-
-    @staticmethod
-    def _worker_is_running(worker: QtCore.QThread) -> bool:
-        try:
-            return bool(getattr(worker, "isRunning", lambda: False)())
-        except Exception:
-            return False
-
-    def _active_fit_worker_running(self) -> bool:
-        worker = getattr(self, "_worker", None)
-        return bool(worker is not None and self._worker_is_running(worker))
-
-    def _supersede_active_fit_worker_for_runtime_input_change(self) -> None:
-        self._fit_run_state_owner.mark_superseded()
-        self._hard_teardown_worker(
-            reason="Fitting runtime inputs changed; fit cancelled",
-            disable_ui=False,
-        )
-        self._discard_fit_runtime_session(kill=True)
-        self._set_running_state(False)
-        if hasattr(self, "_status_label"):
-            self._set_fit_status("Fitting runtime inputs changed; fit cancelled")
-
-    def _set_teardown_status_label(self, reason: str) -> None:
-        status_label = getattr(self, "_status_label", None)
-        if status_label is None:
-            return
-        try:
-            self._set_fit_status(str(reason))
-        except RuntimeError as exc:
-            logger.debug("Failed to set teardown status label: %s", exc, exc_info=True)
-            self._status_label = None
-
-    def _disable_ui_for_worker_teardown(self, *, disable_ui: bool) -> None:
-        if disable_ui:
-            try:
-                self.setEnabled(False)
-                return
-            except RuntimeError as exc:
-                logger.debug("Failed to disable FitDialog during worker teardown: %s", exc, exc_info=True)
-
-        for attr in ("_stop_button", "_pause_button", "_resume_button", "_run_button"):
-            btn = getattr(self, attr, None)
-            if btn is None:
-                continue
-            try:
-                btn.setEnabled(False)
-            except Exception as exc:
-                self._teardown_disable_failures.add(attr)
-                logger.debug("Failed to disable FitDialog button '%s' during worker teardown: %s", attr, exc, exc_info=True)
-
-    def _cancel_worker_best_effort(self, worker: QtCore.QThread) -> None:
-        self._worker_stop_policy.request_stop(worker, context="hard_teardown")
-
-    def _wait_for_worker_stop(self, worker: QtCore.QThread, *, timeout_ms: int, context: str) -> bool:
-        return self._worker_stop_policy.wait_for_stop(worker, timeout_ms=int(timeout_ms), context=context)
-
-    def _terminate_worker_and_wait(self, worker: QtCore.QThread, *, timeout_ms: int) -> bool:
-        return self._worker_stop_policy.terminate_if_needed(worker, timeout_ms=int(timeout_ms), context="hard_teardown")
-
-    def _finalize_worker_after_teardown(self, worker: QtCore.QThread, *, still_running: bool) -> None:
-        running_after = bool(still_running)
-        if not running_after:
-            self._worker_registry.schedule_cleanup(worker)
-            return
-
-        detached = False
-        try:
-            worker.setParent(None)
-            detached = True
-        except Exception as exc:
-            logger.debug("Failed to detach worker parent during hard teardown: %s", exc, exc_info=True)
-            detached = False
-        if not detached:
-            self._best_effort_failures.add("hard_teardown.detach_parent")
-        self._worker_registry.register_thread(worker)
-
-    def _clear_worker_ref_if_stopped(self, worker: QtCore.QThread) -> None:
-        if getattr(self, "_worker", None) is not worker:
-            return
-        if not self._worker_is_running(worker):
-            self._worker = None
-
-    def _cancel_fit(self) -> None:
-        self._invalidate_fit_result_authority()
-        self._fit_run_state_owner.mark_superseded()
-        self._fit_run_state_owner.clear_active_dataset_ids()
-        self._refresh_project_apply_controls(prefer_broadest=True, running=True)
-        readiness = self._fit_runtime_readiness.snapshot()
-        if readiness.state is FittingRuntimeReadinessState.PREPARING:
-            self._fit_runtime_readiness.clear_pending_fit_run()
-            self._fit_runtime_preparation_owner.cancel_preparation(kill=True)
-            try:
-                self._stop_button.setEnabled(False)
-                self._set_fit_status("Fitting runtime preparation cancelled")
-                self._set_fit_controls_locked(False)
-                self._fit_runtime_preparation_owner.refresh_pending = False
-                self._refresh_run_button_enabled_state()
-            except Exception as exc:
-                self._best_effort_failures.add("cancel_fit_runtime_preparation.status_label")
-                logger.debug("Failed to set fitting preparation cancellation status: %s", exc, exc_info=True)
-            return
-        worker = getattr(self, "_worker", None)
-        if worker is None:
-            return
-        try:
-            running = bool(getattr(worker, "isRunning", lambda: False)())
-        except Exception:
-            running = False
-        if not running:
-            return
-        self._hard_teardown_worker(reason="Fit cancelled", disable_ui=False)
-        self._discard_fit_runtime_session(kill=True)
-        try:
-            self._set_running_state(False)
-            self._set_fit_status("Fit cancelled")
-            self._fit_runtime_preparation_owner.schedule_refresh()
-        except Exception as exc:
-            self._best_effort_failures.add("cancel_fit.status_label")
-            logger.debug("Failed to set cancellation status label: %s", exc, exc_info=True)
-
-    def _pause_fit(self) -> None:
-        if self._worker and self._worker.isRunning() and not self._paused:
-            if hasattr(self._worker, "pause"):
-                self._worker.pause()
-                self._paused = True
-                self._pause_button.setEnabled(False)
-                self._resume_button.setEnabled(True)
-                self._set_fit_status("Pause requested (after current evaluation)")
-
-    def _resume_fit(self) -> None:
-        if self._worker and self._worker.isRunning() and self._paused:
-            if hasattr(self._worker, "resume"):
-                self._worker.resume()
-                self._paused = False
-                self._pause_button.setEnabled(True)
-                self._resume_button.setEnabled(False)
-                self._set_fit_status("Resuming...")
-
-    def _set_running_state(self, running: bool) -> None:
-        invalid_applied = bool(self._invalid_applied_used_dataset_ids_for_run())
-        preparing = self._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.PREPARING
-        if running:
-            self._run_button.setEnabled(False)
-        else:
-            self._run_button.setEnabled((not preparing) and not invalid_applied and self._fit_runtime_launchable_for_run_button())
-        self._stop_button.setEnabled(bool(running) or preparing)
-        try:
-            self._run_results_tab.set_view_autorange_locked(running)
-        except Exception as exc:
-            self._best_effort_failures.add("set_running_state.results_autorange_lock")
-            logger.debug("Failed to update Results tab autorange lock state: %s", exc, exc_info=True)
-        self._params_ics_tab.set_running_state(running)
-        self._data_targets_tab.unified_list.set_running_state(running)
-        self._species_table.set_running_state(running)
-        self._paused = False
-        self._pause_button.setEnabled(False)
-        self._resume_button.setEnabled(False)
-        if not running:
-            self._worker = None
-            self._progress_bar.setValue(0)
-        self._species_table.refresh_validity_ui()
-        self._refresh_sampling_validity_ui()
-        if not running:
-            self._refresh_run_button_enabled_state()
-        self._refresh_project_apply_controls(running=running)
-
-    # ------------------------------------------------------------------
-    # Worker callbacks
-    # ------------------------------------------------------------------
-    def _fit_worker_sender(self) -> Optional[QtCore.QThread]:
-        try:
-            worker = self.sender()
-        except Exception:
-            return None
-        return worker if worker is not None else None
-
-    def _dispatch_fit_worker_target(self) -> Optional[QtCore.QThread]:
-        worker = self._fit_worker_sender()
-        if worker is not None:
-            return worker
-        current_worker = getattr(self, "_worker", None)
-        return current_worker if current_worker is not None else None
-
-    def _disconnect_fit_worker_signals(self, worker: Optional[QtCore.QThread]) -> None:
-        if worker is None:
-            return
-        signal = getattr(worker, "progress", None)
-        if signal is not None and hasattr(signal, "disconnect"):
-            try:
-                signal.disconnect(self._dispatch_fit_worker_progress)
-            except (RuntimeError, TypeError):
-                pass
-        signal = getattr(worker, "bestUpdated", None)
-        if signal is not None and hasattr(signal, "disconnect"):
-            try:
-                signal.disconnect(self._dispatch_fit_worker_best_update)
-            except (RuntimeError, TypeError):
-                pass
-        signal = getattr(worker, "finished", None)
-        if signal is not None and hasattr(signal, "disconnect"):
-            try:
-                signal.disconnect(self._dispatch_fit_worker_finished)
-            except (RuntimeError, TypeError):
-                pass
-        signal = getattr(worker, "error", None)
-        if signal is not None and hasattr(signal, "disconnect"):
-            try:
-                signal.disconnect(self._dispatch_fit_worker_error)
-            except (RuntimeError, TypeError):
-                pass
-
-    def _stop_finished_worker(self, worker: Optional[QtCore.QThread]) -> None:
-        if worker is None:
-            return
-        quit_worker = getattr(worker, "quit", None)
-        if callable(quit_worker):
-            try:
-                quit_worker()
-            except Exception:
-                pass
-        wait_for_worker = getattr(worker, "wait", None)
-        if callable(wait_for_worker):
-            try:
-                wait_for_worker(2000)
-            except Exception:
-                pass
-
-    @QtCore.Slot(int, str)
-    def _dispatch_fit_worker_progress(self, percent: int, message: str) -> None:
-        self._on_worker_progress(percent, message, worker=self._fit_worker_sender())
-
-    @QtCore.Slot(dict)
-    def _dispatch_fit_worker_best_update(self, payload: Dict[str, Any]) -> None:
-        self._handle_global_best_update(payload, worker=self._fit_worker_sender())
-
-    @QtCore.Slot(dict)
-    def _dispatch_fit_worker_finished(self, payload: Dict[str, Any]) -> None:
-        worker = self._dispatch_fit_worker_target()
-        current_worker = getattr(self, "_worker", None)
-        if worker is not None and current_worker is None:
-            self._disconnect_fit_worker_signals(worker)
-            self._stop_finished_worker(worker)
-            self._schedule_worker_cleanup(worker)
-            return
-        if worker is not None and current_worker is not None and worker is not current_worker:
-            self._disconnect_fit_worker_signals(worker)
-            self._stop_finished_worker(worker)
-            self._schedule_worker_cleanup(worker)
-            return
-        old_worker = current_worker if current_worker is not None else worker
-        self._disconnect_fit_worker_signals(old_worker)
-        if getattr(self, "_worker", None) is old_worker:
-            self._worker = None
-        self._stop_finished_worker(old_worker)
-        try:
-            self._handle_global_fit_complete(payload, worker=old_worker)
+            self._effective_source = restored_snapshot.mechanism_source
+            self._effective_prepared_dsl = restored_snapshot.prepared_dsl
+            self._committed_targets = self._current_target_state()
         finally:
-            self._schedule_worker_cleanup(old_worker)
-
-    @QtCore.Slot(object)
-    def _dispatch_fit_worker_error(self, error: object) -> None:
-        worker = self._dispatch_fit_worker_target()
-        current_worker = getattr(self, "_worker", None)
-        if worker is not None and current_worker is None:
-            self._disconnect_fit_worker_signals(worker)
-            self._stop_finished_worker(worker)
-            self._schedule_worker_cleanup(worker)
-            return
-        if worker is not None and current_worker is not None and worker is not current_worker:
-            self._disconnect_fit_worker_signals(worker)
-            self._stop_finished_worker(worker)
-            self._schedule_worker_cleanup(worker)
-            return
-        old_worker = current_worker if current_worker is not None else worker
-        self._disconnect_fit_worker_signals(old_worker)
-        if getattr(self, "_worker", None) is old_worker:
-            self._worker = None
-        self._stop_finished_worker(old_worker)
-        try:
-            self._on_worker_error(error, worker=old_worker)
-        finally:
-            self._schedule_worker_cleanup(old_worker)
-
-    def _is_active_worker_callback(self, worker: Optional[QtCore.QThread]) -> bool:
-        if self._fit_run_state_owner.active_run_superseded:
-            return False
-        if worker is None:
-            return True
-        return getattr(self, "_worker", None) is worker
-
-    def _terminal_payload_matches_active_run(self, payload: object, *, worker: Optional[QtCore.QThread]) -> bool:
-        if self._fit_run_state_owner.active_run_superseded:
-            return False
-        current_worker = getattr(self, "_worker", None)
-        if worker is not None and current_worker is not None and current_worker is not worker:
-            return False
-        payload_hash = ""
-        if isinstance(payload, Mapping):
-            payload_hash = str(payload.get("run_stamp_hash") or "")
-        active_hash = self._fit_run_state_owner.active_run_stamp_hash
-        if not payload_hash or not active_hash:
-            return False
-        return payload_hash == active_hash
-
-    def _live_payload_matches_active_run(self, payload: object, *, worker: Optional[QtCore.QThread]) -> bool:
-        if not self._is_active_worker_callback(worker):
-            return False
-        if not isinstance(payload, Mapping):
-            return False
-        payload_hash = str(payload.get("run_stamp_hash") or "")
-        active_hash = str(self._fit_run_state_owner.active_run_stamp_hash or "")
-        return bool(payload_hash and active_hash and payload_hash == active_hash)
-
-    def _render_projection_matches_active_run(self, projection: object) -> bool:
-        if self._fit_run_state_owner.active_run_superseded:
-            return False
-        if not isinstance(projection, FitRenderProjection):
-            return False
-        active_hash = str(self._fit_run_state_owner.active_run_stamp_hash or "")
-        if not active_hash or projection.run_stamp_hash != active_hash:
-            return False
-        active_dataset_ids = set(self._fit_run_state_owner.active_dataset_ids)
-        projection_dataset_ids = set(projection.dataset_ids)
-        if not active_dataset_ids or not projection_dataset_ids:
-            return False
-        return projection_dataset_ids == active_dataset_ids
-
-    def _on_worker_progress(self, percent: int, message: str, *, worker: Optional[QtCore.QThread] = None) -> None:
-        if not self._is_active_worker_callback(worker):
-            return
-        if self._closing:
-            return
-        self._progress_bar.setValue(percent)
-        self._set_fit_status(message)
-
-    def _handle_global_fit_complete(
-        self,
-        payload: Dict[str, Any],
-        *,
-        worker: Optional[QtCore.QThread] = None,
-    ) -> None:
-        if not self._terminal_payload_matches_active_run(payload, worker=worker):
-            return
-        if self._closing:
-            return
-        result: GlobalFitResult = payload.get("result")
-        if result is None:
-            self._clear_failed_run_visual_state(None)
-            self._set_fit_status("Global fit failed")
-            return
-        self._last_result = result
-        self._best_cost = None
-        severity, title, text = self._global_fit_completion_dialog_spec(result)
-        if self._results_rebuild_pending:
-            self._results_rebuild_pending = False
-            if severity != "fail":
-                self._run_results_tab.rebuild_subtabs(
-                    self._dataset_entries,
-                    self._results_fit_targets_by_dataset(),
-                )
-        if severity == "fail":
-            self._clear_failed_run_visual_state(result)
-            self._set_running_state(False)
-        else:
-            self._params_ics_tab.push_fit_results(
-                dict(result.shared_params),
-                {k: dict(v) for k, v in (result.dataset_params or {}).items()},
-            )
-            result_dataset_ids = self._result_dataset_ids(result)
-            authority_hash = str(payload.get("run_stamp_hash") or "")
-            self._apply_authority_owner.set_from_result(
-                result,
-                dataset_ids=result_dataset_ids,
-                run_stamp_hash=authority_hash,
-            )
-        if severity == "fail":
-            pass
-        else:
-            self._run_results_tab.push_final_result(result, self._dataset_entries)
-            self._publish_fit_render_projection(
-                projection_from_global_fit_result(result, run_stamp_hash=authority_hash),
-                dataset_ids=result_dataset_ids,
-                refresh_all=True,
-            )
-        if severity == "fail":
-            pass
-        else:
-            self._update_statistics(self._build_global_stats(result))
-        self._refresh_project_apply_controls(prefer_broadest=True)
-        if severity == "fail":
-            pass
-        else:
-            self._fit_run_state_owner.clear_active_dataset_ids()
-            self._pre_run_parameter_state = None
-            self._pre_run_staged_dataset_params = None
-        completion = getattr(result, "completion", None)
-        rendered_detail_sections: list[str] = []
-        if completion is not None:
-            for section in completion.detail_sections:
-                detail_text = simulation_failure_detail_text(section.failure)
-                if not detail_text:
-                    detail_text = " ".join(
-                        part.strip()
-                        for part in str(simulation_failure_user_message(section.failure)).splitlines()
-                        if part.strip()
+            for table in tables:
+                table.blockSignals(False)
+            self._syncing_scopes = False
+            self.setUpdatesEnabled(True)
+        self._refresh_dataset_controls()
+        if restoring_initial:
+            self._initial_setup = restored_snapshot
+        if restoring_last_fit:
+            self._last_fit_setup = restored_snapshot
+            resolved_by_id = {
+                item.dataset_id: item.parametric.resolved_mode
+                for item in restored_snapshot.datasets
+                if item.parametric is not None
+            }
+            for row in range(self._dataset_table.rowCount()):
+                dataset_id = str(
+                    self._dataset_table.item(row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole
                     )
-                if not detail_text:
-                    continue
-                dataset_id = section.dataset_id
-                if dataset_id is None:
-                    rendered_detail_sections.append(detail_text)
-                    continue
-                label = self._dataset_label_for_id(str(dataset_id))
-                rendered_detail_sections.append(f"{label}\n{detail_text}")
-        combined_detail = "\n\n---\n\n".join(rendered_detail_sections)
-        failure_message = str(result.message or "Unknown error")
-        if severity == "ok":
-            status = "Global fit complete"
-        elif severity == "warn":
-            status = "Global fit complete (warnings)"
-            logger.warning("Global fit completed with warnings: %s", failure_message)
-        else:
-            status = (
-                failure_message
-                if failure_message.lower().startswith("global fit failed")
-                else f"Global fit failed: {failure_message}"
-            )
-            logger.warning("%s", status)
-        if combined_detail:
-            logger.warning("%s", combined_detail)
+                    or ""
+                )
+                resolved = resolved_by_id.get(dataset_id)
+                if resolved is not None:
+                    self._dataset_table.item(row, 10).setText(
+                        "Time-guided"
+                        if resolved == "time_guided"
+                        else "Monotone"
+                    )
+        return restored_snapshot
 
-        self._set_fit_status(status)
-        if severity != "fail":
-            self._set_running_state(False)
-            self._fit_runtime_preparation_owner.schedule_refresh()
-        if self.isVisible() and not self._closing:
-            if severity == "ok":
-                icon = QtWidgets.QMessageBox.Icon.Information
-            else:
-                icon = QtWidgets.QMessageBox.Icon.Warning
-            dialog = QtWidgets.QMessageBox(self)
-            dialog.setIcon(icon)
-            dialog.setWindowTitle(title)
-            dialog.setText(text)
-            dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
-            dialog.setDetailedText(combined_detail)
-            dialog.exec()
-
-    @staticmethod
-    def _failure_remediation_text(remediation: str) -> str:
-        messages = {
-            "x_axis_mapping": "Fix X axis / mapping and adjust t_min/t_max, then run again.",
-            "nonfinite_metrics": "Inspect the fit objective and inputs for non-finite values, then run again.",
-            "preparation": "Fix the preparation or parameter algebra error, then run again.",
-            "generic_retry": "Fix the reported failure, then run again.",
+    def _snapshot_raw_state(
+        self,
+        snapshot: FitSetupSnapshot,
+    ) -> dict[str, object]:
+        mapped_by_id = {
+            item.dataset_id: item
+            for item in self._origin.mapped_datasets
         }
-        return messages.get(str(remediation), messages["generic_retry"])
-
-    def _capture_failed_fit_restore_baseline(self) -> None:
-        self._pre_run_parameter_state = self._params_ics_tab.get_parameter_state()
-        self._pre_run_staged_dataset_params = self._params_ics_tab.get_staged_dataset_params()
-
-    def _clear_failed_fit_apply_state(self) -> None:
-        self._params_ics_tab._restore_failed_fit_state(
-            self._pre_run_parameter_state,
-            self._pre_run_staged_dataset_params,
-        )
-
-    def _result_dataset_ids(self, result: Optional[GlobalFitResult]) -> List[str]:
-        if result is None:
-            return []
-        ordered: List[str] = []
-        seen: set[str] = set()
-
-        def _add(dataset_id: object) -> None:
-            ds_id = str(dataset_id or "").strip()
-            if not ds_id or ds_id in seen:
-                return
-            seen.add(ds_id)
-            ordered.append(ds_id)
-
-        for info in getattr(result, "dataset_info", None) or []:
-            _add(getattr(info, "dataset_id", None))
-
-        completion = getattr(result, "completion", None)
-        if completion is not None:
-            for dataset_id in getattr(completion, "dataset_failures", {}).keys():
-                _add(dataset_id)
-            for dataset_id in getattr(completion, "dataset_warnings", {}).keys():
-                _add(dataset_id)
-            for section in getattr(completion, "detail_sections", []) or []:
-                _add(getattr(section, "dataset_id", None))
-
-        return ordered
-
-    def _active_or_result_dataset_ids(self, result: Optional[GlobalFitResult] = None) -> List[str]:
-        active_dataset_ids = self._fit_run_state_owner.active_dataset_ids
-        if active_dataset_ids:
-            return list(active_dataset_ids)
-        return self._result_dataset_ids(result)
-
-    def _invalidate_fit_result_authority(self, dataset_ids: Optional[Sequence[str]] = None) -> None:
-        if dataset_ids is None:
-            invalidated_ids = self._current_render_authority_dataset_ids()
-        else:
-            invalidated_ids = [str(dataset_id).strip() for dataset_id in dataset_ids if str(dataset_id).strip()]
-        self._apply_authority_owner.clear()
-        self._clear_fit_render_projection_authority(invalidated_ids)
-
-    def _current_render_authority_dataset_ids(self) -> List[str]:
-        ordered: list[str] = []
-        seen: set[str] = set()
-
-        def _add(dataset_id: object) -> None:
-            ds_id = str(dataset_id or "").strip()
-            if not ds_id or ds_id in seen:
-                return
-            seen.add(ds_id)
-            ordered.append(ds_id)
-
-        for dataset_id in self._fit_run_state_owner.active_dataset_ids:
-            _add(dataset_id)
-        authority = self._apply_authority_owner.peek()
-        if authority is not None:
-            for dataset_id in sorted(authority.dataset_ids):
-                _add(dataset_id)
-        return ordered
-
-    def _clear_fit_render_projection_authority(self, dataset_ids: Sequence[str]) -> None:
-        normalized_ids = [str(dataset_id).strip() for dataset_id in dataset_ids if str(dataset_id).strip()]
-        if not normalized_ids:
-            return
-        self._dataset_view_publisher.clear_fit_result_views(normalized_ids)
-        self._run_results_tab.clear_render_projection(normalized_ids, refresh_all=True)
-
-    def _disable_results_summary_button(self) -> None:
-        self._results_summary_button.setEnabled(False)
-
-    def _clear_failed_run_visual_state(self, result: Optional[GlobalFitResult] = None) -> None:
-        self._invalidate_fit_result_authority(self._active_or_result_dataset_ids(result))
-        self._clear_failed_fit_apply_state()
-        self._run_results_tab._clear_failed_run_state(
-            self._dataset_entries,
-            self._results_fit_targets_by_dataset(),
-        )
-        self._disable_results_summary_button()
-        self._refresh_project_apply_controls(prefer_broadest=True)
-        self._fit_run_state_owner.clear_active_dataset_ids()
-        self._pre_run_parameter_state = None
-        self._pre_run_staged_dataset_params = None
-        self._set_running_state(False)
-
-    def _failure_summary_lines(self, diagnostic: Any, *, label: str | None = None) -> list[str]:
-        raw_message = simulation_failure_user_message(diagnostic.failure)
-        compact_message = " ".join(part.strip() for part in str(raw_message).splitlines() if part.strip())
-        summary_line = compact_message or "Global fit failed."
-        prefix = f"- {label}: {summary_line}" if label else f"- {summary_line}"
-        return [prefix, f"  {self._failure_remediation_text(diagnostic.remediation)}"]
-
-    def _global_fit_completion_dialog_spec(self, result: GlobalFitResult) -> tuple[str, str, str]:
-        """Return (severity, title, text) for the completion dialog."""
-        residual_mse = float(getattr(result, "global_residual_mse", float("nan")))
-        completion = getattr(result, "completion", None)
-        if completion is None:
-            return (
-                "fail",
-                "Global Fit Failed",
-                "Global fit failed.\n\n- Missing completion metadata.",
-            )
-        status = completion.status
-        dataset_failures = dict(completion.dataset_failures)
-        warnings = dict(completion.dataset_warnings)
-        optimizer_diagnostic = completion.optimizer_diagnostic
-        nonfinite_residual_mse = bool(completion.nonfinite_metrics)
-        converged = bool(completion.optimizer_converged)
-
-        if status == "fail":
-            lines: List[str] = []
-            if dataset_failures:
-                for ds_id, diagnostic in sorted(dataset_failures.items(), key=lambda kv: str(kv[0])):
-                    label = self._dataset_label_for_id(str(ds_id))
-                    lines.extend(self._failure_summary_lines(diagnostic, label=label))
-            elif optimizer_diagnostic is not None:
-                lines.extend(self._failure_summary_lines(optimizer_diagnostic))
-            else:
-                lines.append("- Global fit failed before replay completed.")
-
-            if nonfinite_residual_mse:
-                lines.append("")
-                lines.append("Final residual MSE is non-finite; results are invalid.")
-
-            return "fail", "Global Fit Failed", "Global fit failed.\n\n" + "\n".join(lines)
-
-        param_section = self._format_params_for_completion_dialog(result)
-
-        if status == "ok":
-            text_parts = [f"Final Residual MSE: {residual_mse:.6g}"]
-            if param_section:
-                text_parts.append("")
-                text_parts.append(param_section)
-            return "ok", "Optimization Complete", "\n".join(text_parts)
-
-        warn_lines: List[str] = []
-        if not converged:
-            warn_lines.append("- Optimizer did not report convergence; results may be suboptimal.")
-        if optimizer_diagnostic is not None:
-            msg = simulation_failure_user_message(optimizer_diagnostic.failure)
-            compact_message = " ".join(part.strip() for part in str(msg).splitlines() if part.strip())
-            if compact_message:
-                warn_lines.append(f"- {compact_message}")
-        if warnings:
-            for ds_id, msg in sorted(warnings.items(), key=lambda kv: str(kv[0])):
-                label = self._dataset_label_for_id(str(ds_id))
-                first_line = str(msg).strip().splitlines()[0] if str(msg).strip() else "Warning"
-                warn_lines.append(f"- {label}: {first_line}")
-
-        if warn_lines:
-            text = [f"Final Residual MSE: {residual_mse:.6g}"]
-            if param_section:
-                text.append("")
-                text.append(param_section)
-            text.extend(["", "Warnings:"])
-            text.extend(warn_lines)
-            return "warn", "Optimization Complete (Warnings)", "\n".join(text)
-        return "warn", "Optimization Complete (Warnings)", f"Final Residual MSE: {residual_mse:.6g}"
-
-    def _format_params_for_completion_dialog(self, result: GlobalFitResult) -> str:
-        """Format fitted parameters as compact text for the completion dialog."""
-        shared = dict(getattr(result, "shared_params", None) or {})
-        dataset_params = dict(getattr(result, "dataset_params", None) or {})
-        all_items: list[tuple[str, float]] = sorted(
-            shared.items(), key=lambda kv: str(kv[0])
-        )
-        for ds_id in sorted(dataset_params, key=str):
-            ds_vals = dataset_params[ds_id]
-            if not isinstance(ds_vals, dict) or not ds_vals:
+        datasets: list[dict[str, object]] = []
+        for local in snapshot.datasets:
+            mapped = mapped_by_id.get(local.dataset_id)
+            if mapped is None:
                 continue
-            label = self._dataset_label_for_id(str(ds_id))
-            for name, value in sorted(ds_vals.items(), key=lambda kv: str(kv[0])):
-                all_items.append((f"{label}: {name}", float(value)))
-        if not all_items:
-            return ""
-        max_shown = 10
-        lines = ["Fitted Parameters:"]
-        for name, value in all_items[:max_shown]:
-            lines.append(f"  {name} = {value:.6g}")
-        remaining = len(all_items) - max_shown
-        if remaining > 0:
-            lines.append(f"  ...and {remaining} more")
-        return "\n".join(lines)
-
-    def _handle_global_best_update(
-        self,
-        payload: Dict[str, Any],
-        *,
-        worker: Optional[QtCore.QThread] = None,
-    ) -> None:
-        """Live best-so-far updates during global fitting."""
-        if self._closing:
-            return
-        if not self._live_payload_matches_active_run(payload, worker=worker):
-            return
-        try:
-            cost = float(payload.get("cost"))
-        except Exception:
-            cost = None
-        self._best_cost = cost
-
-        tracker_panel = getattr(self._run_results_tab, "_tracker_panel", None)
-        if tracker_panel is not None and any(key in payload for key in ("iteration", "cost", "shared_params")):
-            tracker_panel.update_from_best(payload)
-
-        shared_params = payload.get("shared_params") or {}
-        dataset_params = payload.get("dataset_params") or {}
-        if isinstance(shared_params, dict):
-            ds_params = {str(ds_id): dict(pm) for ds_id, pm in dataset_params.items() if isinstance(pm, dict)} if isinstance(dataset_params, dict) else None
-            self._params_ics_tab.push_best_update(
-                {str(k): float(v) for k, v in shared_params.items()},
-                ds_params,
+            targets = {
+                raw_id: (raw_column, model_target)
+                for raw_id, raw_column, model_target
+                in local.observation_targets
+            }
+            weights = dict(local.target_weights)
+            selected = set(local.target_species)
+            datasets.append(
+                {
+                    "dataset_id": local.dataset_id,
+                    "included": local.included,
+                    "sample_t_min": local.sample_t_min,
+                    "sample_t_max": local.sample_t_max,
+                    "sample_points": local.sample_points,
+                    "weight": local.weight,
+                    "execution": {
+                        "set_id": mapped.set_id,
+                        "solver": local.execution.solver,
+                        "t_start": local.execution.t_start,
+                        "t_end": local.execution.t_end,
+                        "integration_points": (
+                            local.execution.integration_points
+                        ),
+                    },
+                    "targets": [
+                        {
+                            "use": targets.get(
+                                observation.raw_observation_id,
+                                (
+                                    observation.raw_column,
+                                    observation.model_species,
+                                ),
+                            )[1] in selected,
+                            "raw_observation_id": (
+                                observation.raw_observation_id
+                            ),
+                            "raw_column": observation.raw_column,
+                            "model_target": targets.get(
+                                observation.raw_observation_id,
+                                (
+                                    observation.raw_column,
+                                    observation.model_species,
+                                ),
+                            )[1],
+                            "weight": weights.get(
+                                targets.get(
+                                    observation.raw_observation_id,
+                                    (
+                                        observation.raw_column,
+                                        observation.model_species,
+                                    ),
+                                )[1],
+                                1.0,
+                            ),
+                            "pre_boundary_segment_keys": [
+                                {
+                                    "source_row": source_row,
+                                    "segment_key": segment_key,
+                                }
+                                for raw_id, source_row, segment_key
+                                in local.pre_boundary_segment_keys
+                                if raw_id
+                                == observation.raw_observation_id
+                            ],
+                        }
+                        for observation in mapped.observations
+                    ],
+                    "x_name": (
+                        local.parametric.x_name
+                        if local.parametric is not None
+                        else "t"
+                    ),
+                    "x_mapping_mode": (
+                        {
+                            "auto": "Auto",
+                            "monotone": "Monotone",
+                            "time_guided": "Time-guided",
+                        }[local.parametric.requested_mode]
+                        if local.parametric is not None
+                        else "Auto"
+                    ),
+                }
             )
-
-        render_projection = payload.get("render_projection")
-        if self._render_projection_matches_active_run(render_projection):
-            self._publish_fit_render_projection(render_projection, refresh_all=False)
-
-        running = bool(self._worker and hasattr(self._worker, "isRunning") and self._worker.isRunning())
-        self._refresh_project_apply_controls(prefer_broadest=True, running=running)
-        if not running:
-            self._params_ics_tab.repaint_parameter_table()
-
-    def _available_project_apply_scopes(self) -> set[str]:
-        authority = self._current_project_apply_authority()
-        if authority is None:
-            return set()
-        return authority.available_scopes()
-
-    def _current_project_apply_authority(self) -> Optional[CompletedFitApplyAuthority]:
-        authority_before = self._apply_authority_owner.peek()
-        authority = self._apply_authority_owner.current_for_run_stamp(
-            self._fit_run_state_owner.active_run_stamp_hash
-        )
-        if authority is None and authority_before is not None:
-            self._clear_fit_render_projection_authority(authority_before.dataset_ids)
-            return None
-        return authority
-
-    @staticmethod
-    def _preferred_project_apply_scope(scopes: set[str]) -> Optional[str]:
-        for scope in (
-            _PROJECT_APPLY_SCOPE_BOTH,
-            _PROJECT_APPLY_SCOPE_PARAMETERS,
-            _PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS,
-        ):
-            if scope in scopes:
-                return scope
-        return None
-
-    def _selected_project_apply_scope(self) -> Optional[str]:
-        combo = getattr(self, "_apply_scope_combo", None)
-        if combo is None:
-            return None
-        current_data = combo.currentData()
-        if isinstance(current_data, str) and current_data:
-            return current_data
-        current_label = str(combo.currentText() or "")
-        for label, scope in _PROJECT_APPLY_OPTIONS:
-            if label == current_label:
-                return scope
-        return None
-
-    def _refresh_project_apply_controls(
-        self,
-        *,
-        prefer_broadest: bool = False,
-        running: Optional[bool] = None,
-    ) -> None:
-        combo = getattr(self, "_apply_scope_combo", None)
-        button = getattr(self, "_apply_to_project_button", None)
-        if combo is None or button is None:
-            return
-        if running is None:
-            worker = getattr(self, "_worker", None)
-            running = bool(worker and hasattr(worker, "isRunning") and worker.isRunning())
-        scopes = self._available_project_apply_scopes()
-        model = combo.model()
-        for index, (_label, scope) in enumerate(_PROJECT_APPLY_OPTIONS):
-            item = model.item(index) if hasattr(model, "item") else None
-            if item is not None:
-                item.setEnabled(scope in scopes)
-        selected_scope = self._selected_project_apply_scope()
-        if prefer_broadest or selected_scope not in scopes:
-            selected_scope = self._preferred_project_apply_scope(scopes)
-            if selected_scope is not None:
-                combo_index = combo.findData(selected_scope)
-                if combo_index >= 0:
-                    combo.setCurrentIndex(combo_index)
-        can_dispatch = bool(self._project_apply_callback)
-        combo.setEnabled(bool(scopes) and not bool(running))
-        button.setEnabled(bool(scopes) and can_dispatch and not bool(running))
-
-    def _mirror_authority_initial_condition_values(self, authority: CompletedFitApplyAuthority) -> int:
-        global_params = self._params_ics_tab.get_global_dataset_params()
-        global_variable_params = self._params_ics_tab.get_global_dataset_variable_params()
-        total_updates = 0
-        for dataset_id, param_map in authority.initial_condition_params().items():
-            ds_id = str(dataset_id)
-            for key, value in param_map.items():
-                key_str = str(key)
-                if not key_str.startswith(INITIAL_PREFIX):
-                    continue
-                global_params.setdefault(ds_id, {})[key_str] = float(value)
-                spec = global_variable_params.get(ds_id, {}).get(key_str)
-                if isinstance(spec, dict):
-                    spec["initial"] = float(value)
-                total_updates += 1
-        self._params_ics_tab.set_global_dataset_params(global_params)
-        self._params_ics_tab.set_global_dataset_variable_params(global_variable_params)
-        return total_updates
-
-    def _apply_to_project(self) -> None:
-        authority = self._current_project_apply_authority()
-        if authority is None:
-            self._refresh_project_apply_controls(prefer_broadest=True)
-            return
-        if not self._project_apply_callback:
-            self._refresh_project_apply_controls(prefer_broadest=True)
-            return
-        scope = self._selected_project_apply_scope()
-        scopes = authority.available_scopes()
-        if not scope or scope not in scopes:
-            return
-        shared_params = authority.shared_params()
-        dataset_params = authority.dataset_params()
-        apply_warning_text = ""
-        try:
-            callback_result = self._project_apply_callback(scope, shared_params, dataset_params)
-            if callback_result is False:
-                return
-            if isinstance(callback_result, str):
-                apply_warning_text = str(callback_result).strip()
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Apply to Project", str(exc))
-            return
-        if scope in {_PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS, _PROJECT_APPLY_SCOPE_BOTH}:
-            self._mirror_authority_initial_condition_values(authority)
-        if apply_warning_text:
-            QtWidgets.QMessageBox.warning(self, "Apply to Project", apply_warning_text)
-            return
-        QtWidgets.QMessageBox.information(
-            self,
-            "Apply to Project",
-            f"{self._apply_scope_combo.currentText() or 'Selected scope'} applied to project.",
-        )
-
-    def _publish_fit_render_projection(
-        self,
-        projection: FitRenderProjection,
-        *,
-        dataset_ids: Optional[Sequence[str]] = None,
-        refresh_all: bool = False,
-    ) -> None:
-        if not self._render_projection_matches_active_run(projection):
-            return
-        self._run_results_tab.push_render_projection(projection, refresh_all=refresh_all)
-        self._dataset_view_publisher.sync_fit_render_projection(
-            projection,
-            dataset_ids=dataset_ids,
-        )
-
-    def _on_worker_error(self, error: object, *, worker: Optional[QtCore.QThread] = None) -> None:
-        if not self._terminal_payload_matches_active_run(error, worker=worker):
-            return
-        if self._closing:
-            return
-        if self._results_rebuild_pending:
-            self._results_rebuild_pending = False
-        payload = coerce_simulation_failure(error)
-        if str(payload.get("kind") or "") == "cancelled":
-            self._invalidate_fit_result_authority()
-            self._fit_run_state_owner.mark_superseded()
-            self._fit_run_state_owner.clear_active_dataset_ids()
-            self._set_running_state(False)
-            self._set_fit_status("Fit cancelled")
-            self._refresh_project_apply_controls(prefer_broadest=True, running=False)
-            return
-        self._clear_failed_run_visual_state()
-        stack_trace = simulation_failure_detail_text(payload)
-        has_stack_trace = bool(stack_trace)
-        message = simulation_failure_user_message(payload)
-        if message:
-            logger.warning("Fitting worker reported error: %s", payload)
-        if has_stack_trace:
-            logger.warning("%s", stack_trace)
-        if message and self.isVisible() and not self._closing:
-            self._show_diagnostic_warning("Fitting", message, details=stack_trace if has_stack_trace else "")
-        self._set_fit_status(message or "Fit error")
-
-    # ------------------------------------------------------------------
-    # Plot + stats helpers
-    # ------------------------------------------------------------------
-    def _refresh_plot_baselines(self) -> None:
-        self._request_rebuild_subtabs()
-
-    def _build_global_stats(self, result: GlobalFitResult) -> Dict[str, float]:
-        total_points = sum(info.n_points for info in result.dataset_info)
-        fit_targets = self._results_fit_targets_by_dataset()
-        series_count = sum(
-            len(fit_targets.get(str(info.dataset_id), []))
-            for info in result.dataset_info
-        )
-        shared = len(result.shared_params)
-        dataset_vars = sum(len(specs) for specs in self._active_variable_specs.values())
-        params = shared + dataset_vars
-        ssq = sum(np.sum(info.residuals**2) for info in result.dataset_info)
-        objective_ssq = float(np.sum(result.objective_residuals**2)) if result.objective_residuals is not None else ssq
         return {
-            "Datasets": len(result.dataset_info),
-            "Series": series_count or len(result.dataset_info),
-            "Points": total_points,
-            "Parameters": params,
-            "DF": max(1, total_points - params),
-            "SSQ": ssq,
-            "Objective SSQ": objective_ssq,
+            "datasets": datasets,
+            "parameters": [
+                {
+                    "name": item.name,
+                    "fit": item.fit,
+                    "initial": item.initial,
+                    "minimum": item.minimum,
+                    "maximum": item.maximum,
+                    "log10": item.log10,
+                    "scope": (
+                        "Per-dataset"
+                        if item.scope == "per_dataset"
+                        else "Shared"
+                    ),
+                    "dataset_values": [
+                        {"dataset_id": dataset_id, "value": value}
+                        for dataset_id, value in item.dataset_values
+                    ],
+                }
+                for item in snapshot.parameters
+            ],
+            "initials": [
+                {
+                    "set_id": item.set_id,
+                    "species": item.species,
+                    "fit": item.fit,
+                    "initial": item.initial,
+                    "minimum": item.minimum,
+                    "maximum": item.maximum,
+                    "log10": item.log10,
+                    "scope": (
+                        "Local" if item.scope == "local" else "Global"
+                    ),
+                }
+                for item in snapshot.initials
+            ],
+            "defaults": {
+                "method": snapshot.defaults.method,
+                "max_nfev": snapshot.defaults.max_nfev,
+                "ftol": snapshot.defaults.ftol,
+                "xtol": snapshot.defaults.xtol,
+                "use_seed": snapshot.defaults.use_seed,
+                "seed": snapshot.defaults.seed,
+            },
         }
 
-    def _update_statistics(self, stats: Dict[str, Any]) -> None:
-        self._run_results_tab.update_statistics(stats)
+    def _populate_origin(self) -> None:
+        self._refreshing_dataset_controls = True
+        self._dataset_table.setRowCount(0)
+        self._target_table.setRowCount(0)
+        self._parameter_table.setRowCount(0)
+        self._parameter_local_table.setRowCount(0)
+        self._initial_table.setRowCount(0)
+        self._execution_table.setRowCount(0)
+        while self._result_views.count() > 1:
+            widget = self._result_views.widget(1)
+            self._result_views.removeTab(1)
+            widget.deleteLater()
+        self._dataset_view_by_id.clear()
+        self._committed_targets.clear()
 
-    # ------------------------------------------------------------------
-    # Qt overrides
-    # ------------------------------------------------------------------
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[name-defined]
-        self._closing = True
-        self._fit_run_state_owner.mark_superseded()
-        self._invalidate_fit_result_authority()
-        self._fit_run_state_owner.clear_active_dataset_ids()
-        self._hard_teardown_worker(reason="Cancelling...", disable_ui=True)
-        if not self._fit_runtime_readiness.close(kill=True):
-            self._fit_runtime_readiness.request_close_after_prepare()
+        for mapped in self._origin.mapped_datasets:
+            times = [
+                value
+                for observation in mapped.observations
+                for value in observation.t
+            ]
+            low = min(times) if times else mapped.execution.t_start
+            high = max(times) if times else mapped.execution.t_end
+            row = self._dataset_table.rowCount()
+            self._dataset_table.insertRow(row)
+            use_item = _check_item(mapped.included_at_launch)
+            use_item.setData(QtCore.Qt.ItemDataRole.UserRole, mapped.dataset_id)
+            self._dataset_table.setItem(row, 0, use_item)
+            self._dataset_table.setItem(row, 1, _text_item(mapped.display_name, editable=False))
+            self._dataset_table.setItem(row, 2, _text_item(mapped.set_name, editable=False))
+            self._dataset_table.setItem(row, 3, _text_item(_float_text(low)))
+            self._dataset_table.setItem(row, 4, _text_item(_float_text(high)))
+            self._dataset_table.setItem(row, 5, _text_item("All"))
+            self._dataset_table.setItem(
+                row,
+                6,
+                _text_item("0", editable=False),
+            )
+            self._dataset_table.setItem(row, 7, _text_item("1"))
+            x_selector = QtWidgets.QComboBox(self._dataset_table)
+            x_selector.addItem("Time", "t")
+            for model_name in dict.fromkeys(
+                item.model_species for item in mapped.observations
+            ):
+                x_selector.addItem(model_name, model_name)
+            x_selector.currentIndexChanged.connect(
+                lambda _index: self._refresh_dataset_controls()
+            )
+            self._dataset_table.setCellWidget(row, 8, x_selector)
+            mapping_selector = QtWidgets.QComboBox(self._dataset_table)
+            mapping_selector.addItems(("Auto", "Monotone", "Time-guided"))
+            mapping_selector.currentTextChanged.connect(
+                lambda _text: self._refresh_dataset_controls()
+            )
+            self._dataset_table.setCellWidget(row, 9, mapping_selector)
+            self._dataset_table.setItem(
+                row,
+                10,
+                _text_item("Time", editable=False),
+            )
+
+            execution_row = self._execution_table.rowCount()
+            self._execution_table.insertRow(execution_row)
+            identity = _text_item(mapped.display_name, editable=False)
+            identity.setData(QtCore.Qt.ItemDataRole.UserRole, mapped.dataset_id)
+            identity.setData(QtCore.Qt.ItemDataRole.UserRole + 1, mapped.set_id)
+            self._execution_table.setItem(execution_row, 0, identity)
+            self._execution_table.setItem(execution_row, 1, _text_item(mapped.set_name, editable=False))
+            solver = QtWidgets.QComboBox(self._execution_table)
+            solver.addItems(SIMULATION_SOLVERS)
+            solver.setCurrentText(mapped.execution.solver)
+            self._execution_table.setCellWidget(execution_row, 2, solver)
+            self._execution_table.setItem(execution_row, 3, _text_item(_float_text(mapped.execution.t_start)))
+            self._execution_table.setItem(execution_row, 4, _text_item(_float_text(mapped.execution.t_end)))
+            self._execution_table.setItem(execution_row, 5, _text_item(str(mapped.execution.integration_points)))
+
+            view = GridPlotView(
+                color_resolver=self._color_resolver,
+                parent=self._result_views,
+            )
+            self._dataset_view_by_id[mapped.dataset_id] = view
+            self._result_views.addTab(view, mapped.display_name)
+
+            for observation in mapped.observations:
+                target_row = self._target_table.rowCount()
+                self._target_table.insertRow(target_row)
+                use_target = _check_item(True)
+                use_target.setData(QtCore.Qt.ItemDataRole.UserRole, mapped.dataset_id)
+                self._target_table.setItem(target_row, 0, use_target)
+                self._target_table.setItem(target_row, 1, _text_item(mapped.display_name, editable=False))
+                raw_item = _text_item(observation.raw_column, editable=False)
+                raw_item.setData(QtCore.Qt.ItemDataRole.UserRole, mapped.dataset_id)
+                raw_item.setData(
+                    QtCore.Qt.ItemDataRole.UserRole + 1,
+                    observation.raw_observation_id,
+                )
+                self._target_table.setItem(target_row, 2, raw_item)
+                self._target_table.setItem(
+                    target_row,
+                    3,
+                    _text_item(
+                        observation.model_species,
+                        editable=False,
+                    ),
+                )
+                self._target_table.setItem(target_row, 4, _text_item("1"))
+                boundary_rows = _text_item("")
+                try:
+                    available_rows = tuple(
+                        row
+                        for row, _segment_key
+                        in pre_boundary_fit_row_candidates(
+                            self._origin,
+                            dataset_id=mapped.dataset_id,
+                            raw_observation_id=(
+                                observation.raw_observation_id
+                            ),
+                        )
+                    )
+                except ValueError:
+                    available_rows = ()
+                boundary_rows.setToolTip(
+                    (
+                        "Comma-separated physical source rows. Exact "
+                        "pre-boundary rows available: "
+                        + ", ".join(str(value) for value in available_rows)
+                    )
+                    if available_rows
+                    else (
+                        "No exact statically resolvable pre-boundary rows "
+                        "are available for this captured execution."
+                    )
+                )
+                self._target_table.setItem(
+                    target_row,
+                    5,
+                    boundary_rows,
+                )
+                self._committed_targets[
+                    (mapped.dataset_id, observation.raw_observation_id)
+                ] = True
+
+            existing_initial_keys = {
+                (
+                    str(self._initial_table.item(existing, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    ) or ""),
+                    self._initial_table.item(existing, 3).text(),
+                )
+                for existing in range(self._initial_table.rowCount())
+            }
+            for species, value in mapped.initial_values:
+                if (mapped.set_id, species) in existing_initial_keys:
+                    continue
+                row = self._initial_table.rowCount()
+                self._initial_table.insertRow(row)
+                fit_item = _check_item(False)
+                fit_item.setData(QtCore.Qt.ItemDataRole.UserRole, mapped.dataset_id)
+                fit_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, mapped.set_id)
+                self._initial_table.setItem(row, 0, fit_item)
+                self._initial_table.setItem(row, 1, _text_item(mapped.display_name, editable=False))
+                self._initial_table.setItem(row, 2, _text_item(mapped.set_name, editable=False))
+                self._initial_table.setItem(row, 3, _text_item(species, editable=False))
+                self._initial_table.setItem(row, 4, _text_item(_float_text(value)))
+                self._initial_table.setItem(row, 5, _text_item("0"))
+                self._initial_table.setItem(row, 6, _text_item(_float_text(max(1.0, value * 10.0))))
+                self._initial_table.setItem(row, 7, _check_item(False))
+                scope = QtWidgets.QComboBox(self._initial_table)
+                scope.addItems(("Global", "Local"))
+                scope.currentTextChanged.connect(
+                    lambda text, species_name=species: self._on_initial_scope_changed(
+                        species_name,
+                        text,
+                    )
+                )
+                self._initial_table.setCellWidget(row, 8, scope)
+                existing_initial_keys.add((mapped.set_id, species))
+
+        included_set_ids = self._included_set_ids()
+        for row in range(self._initial_table.rowCount()):
+            set_id = str(
+                self._initial_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole + 1
+                )
+                or ""
+            )
+            if set_id in included_set_ids:
+                continue
+            selector = self._initial_table.cellWidget(row, 8)
+            if isinstance(selector, QtWidgets.QComboBox):
+                blocker = QtCore.QSignalBlocker(selector)
+                selector.setCurrentText("Local")
+                del blocker
+
+        for species in {
+            self._initial_table.item(row, 3).text()
+            for row in range(self._initial_table.rowCount())
+        }:
+            rows = self._initial_rows_for_species(species)
+            active_rows = tuple(
+                row
+                for row in rows
+                if str(
+                    self._initial_table.item(row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    )
+                    or ""
+                )
+                in included_set_ids
+            )
+            values = {
+                _read_float(
+                    self._initial_table.item(row, 4).text(),
+                    f"{species} initial value",
+                )
+                for row in active_rows
+            }
+            if active_rows and len(values) == 1:
+                self._on_initial_scope_changed(species, "Global")
+                continue
+            self._syncing_scopes = True
             try:
-                self.setEnabled(False)
-            except Exception:
-                pass
-            event.ignore()
+                for row in active_rows:
+                    selector = self._initial_table.cellWidget(row, 8)
+                    if isinstance(selector, QtWidgets.QComboBox):
+                        selector.setCurrentText("Local")
+            finally:
+                self._syncing_scopes = False
+
+        for parameter in self._origin.parameter_defaults:
+            self._append_parameter_row(parameter)
+        self._refreshing_dataset_controls = False
+        self._refresh_dataset_controls()
+        self._committed_targets = self._current_target_state()
+
+    def _append_parameter_row(
+        self,
+        parameter: FitParameterVariable,
+    ) -> None:
+        row = self._parameter_table.rowCount()
+        self._parameter_table.insertRow(row)
+        self._parameter_table.setItem(row, 0, _check_item(parameter.fit))
+        parameter_item = _text_item(
+            parameter.display_name,
+            editable=False,
+        )
+        parameter_item.setData(
+            QtCore.Qt.ItemDataRole.UserRole,
+            parameter.name,
+        )
+        self._parameter_table.setItem(row, 1, parameter_item)
+        self._parameter_table.setItem(
+            row,
+            2,
+            _text_item(_float_text(parameter.initial)),
+        )
+        self._parameter_table.setItem(
+            row,
+            3,
+            _text_item(_float_text(parameter.minimum)),
+        )
+        self._parameter_table.setItem(
+            row,
+            4,
+            _text_item(_float_text(parameter.maximum)),
+        )
+        self._parameter_table.setItem(row, 5, _check_item(parameter.log10))
+        scope = QtWidgets.QComboBox(self._parameter_table)
+        scope.addItems(("Shared", "Per-dataset"))
+        scope.currentTextChanged.connect(
+            lambda text, parameter_name=parameter.name: (
+                self._on_parameter_scope_changed(
+                    parameter_name,
+                    text,
+                )
+            )
+        )
+        self._parameter_table.setCellWidget(row, 6, scope)
+        scope.setCurrentText(
+            "Per-dataset"
+            if parameter.scope == "per_dataset"
+            else "Shared"
+        )
+
+    def _load_defaults(self) -> None:
+        defaults = self._origin.fit_defaults
+        self._method.setCurrentText(defaults.method)
+        self._max_nfev.setValue(defaults.max_nfev)
+        self._ftol.setValue(defaults.ftol)
+        self._xtol.setValue(defaults.xtol)
+        self._use_seed.setChecked(defaults.use_seed)
+        self._seed.setValue(defaults.seed)
+
+    def _initial_rows_for_species(self, species: str) -> tuple[int, ...]:
+        return tuple(
+            row
+            for row in range(self._initial_table.rowCount())
+            if self._initial_table.item(row, 3).text() == species
+        )
+
+    def _parameter_row(self, name: str) -> int:
+        for row in range(self._parameter_table.rowCount()):
+            item = self._parameter_table.item(row, 1)
+            identity = str(
+                item.data(QtCore.Qt.ItemDataRole.UserRole)
+                or item.text()
+            )
+            if identity == name:
+                return row
+        return -1
+
+    def _parameter_local_rows(self, name: str) -> tuple[int, ...]:
+        return tuple(
+            row
+            for row in range(self._parameter_local_table.rowCount())
+            if str(
+                self._parameter_local_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or self._parameter_local_table.item(row, 0).text()
+            )
+            == name
+        )
+
+    def _included_dataset_ids(self) -> tuple[str, ...]:
+        return tuple(
+            str(
+                self._dataset_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or ""
+            )
+            for row in range(self._dataset_table.rowCount())
+            if (
+                self._dataset_table.item(row, 0).checkState()
+                == QtCore.Qt.CheckState.Checked
+            )
+        )
+
+    def _included_set_ids(self) -> frozenset[str]:
+        included = set(self._included_dataset_ids())
+        return frozenset(
+            mapped.set_id
+            for mapped in self._origin.mapped_datasets
+            if mapped.dataset_id in included
+        )
+
+    def _reconcile_parameter_local_rows(
+        self,
+        names: Iterable[str] | None = None,
+    ) -> None:
+        """Retain local scalar rows for every still-existing dataset identity."""
+
+        if self._syncing_scopes:
             return
-        event.accept()
+        requested_names = (
+            None
+            if names is None
+            else {str(name) for name in names}
+        )
+        retained_ids = tuple(
+            mapped.dataset_id for mapped in self._origin.mapped_datasets
+        )
+        display_by_id = {
+            mapped.dataset_id: mapped.display_name
+            for mapped in self._origin.mapped_datasets
+        }
+        existing: dict[tuple[str, str], list[str]] = {}
+        names_with_rows: set[str] = set()
+        for local_row in range(self._parameter_local_table.rowCount()):
+            parameter_item = self._parameter_local_table.item(local_row, 0)
+            value_item = self._parameter_local_table.item(local_row, 2)
+            name = str(
+                parameter_item.data(QtCore.Qt.ItemDataRole.UserRole)
+                or parameter_item.text()
+            )
+            if requested_names is not None and name not in requested_names:
+                continue
+            dataset_id = str(
+                value_item.data(QtCore.Qt.ItemDataRole.UserRole)
+                or ""
+            )
+            names_with_rows.add(name)
+            existing.setdefault((name, dataset_id), []).append(
+                value_item.text()
+            )
+
+        parameter_rows: list[tuple[int, str]] = []
+        for row in range(self._parameter_table.rowCount()):
+            item = self._parameter_table.item(row, 1)
+            name = str(
+                item.data(QtCore.Qt.ItemDataRole.UserRole)
+                or item.text()
+            )
+            if requested_names is not None and name not in requested_names:
+                continue
+            selector = self._parameter_table.cellWidget(row, 6)
+            if (
+                name in names_with_rows
+                or (
+                    isinstance(selector, QtWidgets.QComboBox)
+                    and selector.currentText() == "Per-dataset"
+                )
+            ):
+                parameter_rows.append((row, name))
+        target_names = {name for _row, name in parameter_rows}
+        if not target_names and requested_names is not None:
+            target_names = set(requested_names)
+
+        self._syncing_scopes = True
         try:
-            super().closeEvent(event)
-        except Exception as exc:
-            self._best_effort_failures.add("closeEvent.super_closeEvent")
-            logger.exception("Error executing super().closeEvent in FittingWindow: %s", exc)
+            for local_row in reversed(
+                range(self._parameter_local_table.rowCount())
+            ):
+                item = self._parameter_local_table.item(local_row, 0)
+                name = str(
+                    item.data(QtCore.Qt.ItemDataRole.UserRole)
+                    or item.text()
+                )
+                if name in target_names:
+                    self._parameter_local_table.removeRow(local_row)
+            for parameter_row, name in parameter_rows:
+                shared_item = self._parameter_table.item(
+                    parameter_row,
+                    2,
+                )
+                shared_text = shared_item.text()
+                try:
+                    _read_float(shared_text, f"{name} shared value")
+                except ValueError:
+                    remembered = shared_item.data(
+                        _PARAMETER_SHARED_BASELINE_ROLE
+                    )
+                    if remembered is not None:
+                        shared_text = _float_text(
+                            _read_float(
+                                remembered,
+                                f"{name} remembered shared value",
+                            )
+                        )
+                display = self._parameter_table.item(
+                    parameter_row,
+                    1,
+                ).text()
+                for dataset_id in retained_ids:
+                    prior_values = existing.get((name, dataset_id), ())
+                    value_text = shared_text
+                    if prior_values:
+                        try:
+                            numeric_values = {
+                                _read_float(
+                                    value,
+                                    f"{name} per-dataset value",
+                                )
+                                for value in prior_values
+                            }
+                        except ValueError:
+                            numeric_values = set()
+                        value_text = (
+                            _float_text(numeric_values.pop())
+                            if len(numeric_values) == 1
+                            else "Multiple values"
+                        )
+                    local_row = self._parameter_local_table.rowCount()
+                    self._parameter_local_table.insertRow(local_row)
+                    parameter_item = _text_item(
+                        display,
+                        editable=False,
+                    )
+                    parameter_item.setData(
+                        QtCore.Qt.ItemDataRole.UserRole,
+                        name,
+                    )
+                    self._parameter_local_table.setItem(
+                        local_row,
+                        0,
+                        parameter_item,
+                    )
+                    self._parameter_local_table.setItem(
+                        local_row,
+                        1,
+                        _text_item(
+                            display_by_id.get(dataset_id, dataset_id),
+                            editable=False,
+                        ),
+                    )
+                    value_item = _text_item(value_text)
+                    value_item.setData(
+                        QtCore.Qt.ItemDataRole.UserRole,
+                        dataset_id,
+                    )
+                    self._parameter_local_table.setItem(
+                        local_row,
+                        2,
+                        value_item,
+                    )
+        finally:
+            self._syncing_scopes = False
+
+    def _project_shared_parameter_from_local_rows(
+        self,
+        name: str,
+    ) -> None:
+        row = self._parameter_row(name)
+        if row < 0:
+            return
+        selector = self._parameter_table.cellWidget(row, 6)
+        if (
+            not isinstance(selector, QtWidgets.QComboBox)
+            or selector.currentText() != "Shared"
+        ):
+            return
+        local_rows = self._parameter_local_rows(name)
+        included_ids = set(self._included_dataset_ids())
+        values = [
+            self._parameter_local_table.item(local_row, 2).text()
+            for local_row in local_rows
+            if str(
+                self._parameter_local_table.item(local_row, 2).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or ""
+            )
+            in included_ids
+        ]
         try:
-            self.deleteLater()
+            parsed_values = {
+                _read_float(
+                    value,
+                    f"{name} per-dataset value",
+                )
+                for value in values
+            }
+        except ValueError:
+            parsed_values = set()
+        item = self._parameter_table.item(row, 2)
+        self._syncing_scopes = True
+        try:
+            if len(parsed_values) == 1:
+                value = parsed_values.pop()
+                item.setText(_float_text(value))
+                item.setData(
+                    _PARAMETER_SHARED_BASELINE_ROLE,
+                    value,
+                )
+            elif values:
+                try:
+                    prior = _read_float(
+                        item.text(),
+                        f"{name} shared value",
+                    )
+                except ValueError:
+                    pass
+                else:
+                    item.setData(
+                        _PARAMETER_SHARED_BASELINE_ROLE,
+                        prior,
+                    )
+                item.setText("Multiple values")
+        finally:
+            self._syncing_scopes = False
+
+    def _on_parameter_scope_changed(self, name: str, text: str) -> None:
+        if self._syncing_scopes:
+            return
+        row = self._parameter_row(name)
+        if row < 0:
+            return
+        shared_item = self._parameter_table.item(row, 2)
+        try:
+            shared_value = _read_float(
+                shared_item.text(),
+                f"{name} shared value",
+            )
+        except ValueError:
+            pass
+        else:
+            shared_item.setData(
+                _PARAMETER_SHARED_BASELINE_ROLE,
+                shared_value,
+            )
+        self._reconcile_parameter_local_rows((name,))
+        if str(text).lower() == "per-dataset":
+            return
+        self._project_shared_parameter_from_local_rows(name)
+
+    def _on_parameter_value_item_changed(
+        self,
+        item: QtWidgets.QTableWidgetItem,
+    ) -> None:
+        if self._syncing_scopes or item.column() != 2:
+            return
+        selector = self._parameter_table.cellWidget(item.row(), 6)
+        if not isinstance(selector, QtWidgets.QComboBox) or selector.currentText() != "Shared":
+            return
+        try:
+            value = _read_float(
+                item.text(),
+                "shared parameter value",
+            )
+        except ValueError:
+            return
+        item.setData(
+            _PARAMETER_SHARED_BASELINE_ROLE,
+            value,
+        )
+        name_item = self._parameter_table.item(item.row(), 1)
+        name = str(
+            name_item.data(QtCore.Qt.ItemDataRole.UserRole)
+            or name_item.text()
+        )
+        self._syncing_scopes = True
+        try:
+            included_ids = set(self._included_dataset_ids())
+            for row in self._parameter_local_rows(name):
+                local_item = self._parameter_local_table.item(row, 2)
+                if str(
+                    local_item.data(QtCore.Qt.ItemDataRole.UserRole)
+                    or ""
+                ) in included_ids:
+                    local_item.setText(item.text())
+        finally:
+            self._syncing_scopes = False
+
+    def _on_initial_scope_changed(self, species: str, text: str) -> None:
+        if self._syncing_scopes:
+            return
+        rows = self._initial_rows_for_species(species)
+        if not rows:
+            return
+        included_set_ids = self._included_set_ids()
+        sender = self.sender()
+        if isinstance(sender, QtWidgets.QComboBox):
+            source_row = next(
+                (
+                    row
+                    for row in rows
+                    if self._initial_table.cellWidget(row, 8) is sender
+                ),
+                None,
+            )
+            source_set_id = (
+                ""
+                if source_row is None
+                else str(
+                    self._initial_table.item(source_row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    )
+                    or ""
+                )
+            )
+            if source_set_id not in included_set_ids:
+                blocker = QtCore.QSignalBlocker(sender)
+                sender.setCurrentText("Local")
+                del blocker
+                return
+        active_rows = [
+            row
+            for row in rows
+            if str(
+                self._initial_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole + 1
+                )
+                or ""
+            )
+            in included_set_ids
+        ]
+        if not active_rows:
+            return
+        self._syncing_scopes = True
+        try:
+            scope_text = "Local" if str(text).lower() == "local" else "Global"
+            for row in active_rows:
+                selector = self._initial_table.cellWidget(row, 8)
+                if isinstance(selector, QtWidgets.QComboBox):
+                    selector.blockSignals(True)
+                    selector.setCurrentText(scope_text)
+                    selector.blockSignals(False)
+            if scope_text == "Local":
+                pending = any(
+                    self._initial_table.item(row, 4).text() == "Multiple values"
+                    for row in active_rows
+                )
+                if pending:
+                    for row in active_rows:
+                        item = self._initial_table.item(row, 4)
+                        saved = item.data(QtCore.Qt.ItemDataRole.UserRole + 10)
+                        if saved is not None:
+                            item.setText(str(saved))
+                return
+            values = [
+                self._initial_table.item(row, 4).text()
+                for row in active_rows
+            ]
+            try:
+                parsed_values = {
+                    _read_float(
+                        value,
+                        f"{species} initial value",
+                    )
+                    for value in values
+                }
+            except ValueError:
+                parsed_values = set()
+            if len(parsed_values) == 1:
+                value = _float_text(parsed_values.pop())
+                for row in active_rows:
+                    self._initial_table.item(row, 4).setText(value)
+                return
+            for row, value in zip(active_rows, values):
+                item = self._initial_table.item(row, 4)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole + 10, value)
+                item.setText("Multiple values")
+        finally:
+            self._syncing_scopes = False
+
+    def _on_initial_value_item_changed(
+        self,
+        item: QtWidgets.QTableWidgetItem,
+    ) -> None:
+        if (
+            self._syncing_scopes
+            or item.column() not in {0, 4, 5, 6, 7}
+        ):
+            return
+        row = item.row()
+        selector = self._initial_table.cellWidget(row, 8)
+        if not isinstance(selector, QtWidgets.QComboBox) or selector.currentText() != "Global":
+            return
+        included_set_ids = self._included_set_ids()
+        source_set_id = str(
+            self._initial_table.item(row, 0).data(
+                QtCore.Qt.ItemDataRole.UserRole + 1
+            )
+            or ""
+        )
+        if source_set_id not in included_set_ids:
+            return
+        if item.column() in {4, 5, 6}:
+            try:
+                float(item.text())
+            except ValueError:
+                return
+        species = self._initial_table.item(row, 3).text()
+        self._syncing_scopes = True
+        try:
+            for target_row in self._initial_rows_for_species(species):
+                target_set_id = str(
+                    self._initial_table.item(target_row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    )
+                    or ""
+                )
+                if target_set_id not in included_set_ids:
+                    continue
+                target = self._initial_table.item(
+                    target_row,
+                    item.column(),
+                )
+                if item.column() in {0, 7}:
+                    target.setCheckState(item.checkState())
+                else:
+                    target.setText(item.text())
+                if item.column() == 4:
+                    target.setData(
+                        QtCore.Qt.ItemDataRole.UserRole + 10,
+                        None,
+                    )
+        finally:
+            self._syncing_scopes = False
+
+    def raw_request_values(self) -> dict[str, object]:
+        execution_by_dataset: dict[str, dict[str, object]] = {}
+        for row in range(self._execution_table.rowCount()):
+            identity = self._execution_table.item(row, 0)
+            dataset_id = str(identity.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            set_id = str(identity.data(QtCore.Qt.ItemDataRole.UserRole + 1) or "")
+            solver = self._execution_table.cellWidget(row, 2)
+            execution_by_dataset[dataset_id] = {
+                "set_id": set_id,
+                "solver": solver.currentText() if isinstance(solver, QtWidgets.QComboBox) else "",
+                "t_start": self._execution_table.item(row, 3).text(),
+                "t_end": self._execution_table.item(row, 4).text(),
+                "integration_points": self._execution_table.item(row, 5).text(),
+            }
+        targets_by_dataset: dict[str, list[dict[str, object]]] = {}
+        for row in range(self._target_table.rowCount()):
+            use_item = self._target_table.item(row, 0)
+            dataset_id = str(use_item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            raw_observation_id = str(
+                self._target_table.item(row, 2).data(
+                    QtCore.Qt.ItemDataRole.UserRole + 1
+                )
+                or ""
+            )
+            boundary_text = self._target_table.item(row, 5).text().strip()
+            requested_boundary_rows = (
+                ()
+                if not boundary_text
+                else tuple(
+                    int(value.strip())
+                    for value in boundary_text.split(",")
+                    if value.strip()
+                )
+            )
+            raw_execution = execution_by_dataset[dataset_id]
+            captured_execution = SimulationExecutionSettings(
+                solver=str(raw_execution["solver"]),
+                t_start=_read_float(
+                    raw_execution["t_start"],
+                    "simulation t start",
+                ),
+                t_end=_read_float(
+                    raw_execution["t_end"],
+                    "simulation t end",
+                ),
+                integration_points=int(
+                    str(raw_execution["integration_points"])
+                ),
+            )
+            resolved_pre_boundary = resolve_pre_boundary_fit_rows(
+                self._origin,
+                dataset_id=dataset_id,
+                raw_observation_id=raw_observation_id,
+                source_rows=requested_boundary_rows,
+                execution=captured_execution,
+            )
+            targets_by_dataset.setdefault(dataset_id, []).append(
+                {
+                    "use": use_item.checkState() == QtCore.Qt.CheckState.Checked,
+                    "raw_observation_id": raw_observation_id,
+                    "raw_column": self._target_table.item(row, 2).text(),
+                    "model_target": self._target_table.item(row, 3).text(),
+                    "weight": self._target_table.item(row, 4).text(),
+                    "pre_boundary_segment_keys": [
+                        {
+                            "source_row": source_row,
+                            "segment_key": segment_key,
+                        }
+                        for source_row, segment_key
+                        in resolved_pre_boundary
+                    ],
+                }
+            )
+        datasets: list[dict[str, object]] = []
+        for row in range(self._dataset_table.rowCount()):
+            use_item = self._dataset_table.item(row, 0)
+            dataset_id = str(use_item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            points_text = self._dataset_table.item(row, 5).text().strip()
+            x_selector = self._dataset_table.cellWidget(row, 8)
+            mapping_selector = self._dataset_table.cellWidget(row, 9)
+            datasets.append(
+                {
+                    "dataset_id": dataset_id,
+                    "included": use_item.checkState() == QtCore.Qt.CheckState.Checked,
+                    "sample_t_min": self._dataset_table.item(row, 3).text(),
+                    "sample_t_max": self._dataset_table.item(row, 4).text(),
+                    "sample_points": None if points_text.lower() == "all" else points_text,
+                    "weight": self._dataset_table.item(row, 7).text(),
+                    "execution": execution_by_dataset[dataset_id],
+                    "targets": targets_by_dataset.get(dataset_id, []),
+                    "x_name": (
+                        str(x_selector.currentData() or "t")
+                        if isinstance(x_selector, QtWidgets.QComboBox)
+                        else "t"
+                    ),
+                    "x_mapping_mode": (
+                        str(mapping_selector.currentText() or "Auto")
+                        if isinstance(mapping_selector, QtWidgets.QComboBox)
+                        else "Auto"
+                    ),
+                }
+            )
+        parameters = [
+            {
+                "fit": self._parameter_table.item(row, 0).checkState() == QtCore.Qt.CheckState.Checked,
+                "name": str(
+                    self._parameter_table.item(row, 1).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                    or self._parameter_table.item(row, 1).text()
+                ),
+                "initial": self._parameter_table.item(row, 2).text(),
+                "minimum": self._parameter_table.item(row, 3).text(),
+                "maximum": self._parameter_table.item(row, 4).text(),
+                "log10": self._parameter_table.item(row, 5).checkState() == QtCore.Qt.CheckState.Checked,
+                "scope": (
+                    str(scope.currentText())
+                    if isinstance(
+                        (scope := self._parameter_table.cellWidget(row, 6)),
+                        QtWidgets.QComboBox,
+                    )
+                    else "Shared"
+                ),
+                "dataset_values": [
+                    {
+                        "dataset_id": str(
+                            self._parameter_local_table.item(local_row, 2).data(
+                                QtCore.Qt.ItemDataRole.UserRole
+                            )
+                            or ""
+                        ),
+                        "value": self._parameter_local_table.item(
+                            local_row,
+                            2,
+                        ).text(),
+                    }
+                    for local_row in self._parameter_local_rows(
+                        str(
+                            self._parameter_table.item(row, 1).data(
+                                QtCore.Qt.ItemDataRole.UserRole
+                            )
+                            or self._parameter_table.item(row, 1).text()
+                        )
+                    )
+                ],
+            }
+            for row in range(self._parameter_table.rowCount())
+        ]
+        initials = [
+            {
+                "fit": self._initial_table.item(row, 0).checkState() == QtCore.Qt.CheckState.Checked,
+                "set_id": self._initial_table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole + 1),
+                "species": self._initial_table.item(row, 3).text(),
+                "initial": self._initial_table.item(row, 4).text(),
+                "minimum": self._initial_table.item(row, 5).text(),
+                "maximum": self._initial_table.item(row, 6).text(),
+                "log10": self._initial_table.item(row, 7).checkState() == QtCore.Qt.CheckState.Checked,
+                "scope": (
+                    str(scope.currentText())
+                    if isinstance(
+                        (scope := self._initial_table.cellWidget(row, 8)),
+                        QtWidgets.QComboBox,
+                    )
+                    else "Global"
+                ),
+            }
+            for row in range(self._initial_table.rowCount())
+        ]
+        return {
+            "datasets": datasets,
+            "parameters": parameters,
+            "initials": initials,
+            "defaults": {
+                "method": self._method.currentText(),
+                "max_nfev": self._max_nfev.value(),
+                "ftol": self._ftol.value(),
+                "xtol": self._xtol.value(),
+                "use_seed": self._use_seed.isChecked(),
+                "seed": self._seed.value(),
+            },
+        }
+
+    def _restore_raw_state(
+        self,
+        preserved: Mapping[str, object],
+        *,
+        canonicalized_scopes: frozenset[str],
+    ) -> None:
+        datasets = {
+            str(item.get("dataset_id")): item
+            for item in list(preserved.get("datasets") or ())
+            if isinstance(item, Mapping)
+        }
+        for row in range(self._dataset_table.rowCount()):
+            identity = self._dataset_table.item(row, 0)
+            dataset_id = str(identity.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            prior = datasets.get(dataset_id)
+            if prior is None:
+                continue
+            identity.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if bool(prior.get("included"))
+                else QtCore.Qt.CheckState.Unchecked
+            )
+            for column, key in (
+                (3, "sample_t_min"),
+                (4, "sample_t_max"),
+                (7, "weight"),
+            ):
+                self._dataset_table.item(row, column).setText(str(prior.get(key)))
+            self._dataset_table.item(row, 5).setText(
+                "All" if prior.get("sample_points") is None else str(prior.get("sample_points"))
+            )
+            x_selector = self._dataset_table.cellWidget(row, 8)
+            if isinstance(x_selector, QtWidgets.QComboBox):
+                index = x_selector.findData(str(prior.get("x_name") or "t"))
+                if index >= 0:
+                    blocker = QtCore.QSignalBlocker(x_selector)
+                    x_selector.setCurrentIndex(index)
+                    del blocker
+            mapping_selector = self._dataset_table.cellWidget(row, 9)
+            if isinstance(mapping_selector, QtWidgets.QComboBox):
+                blocker = QtCore.QSignalBlocker(mapping_selector)
+                mapping_selector.setCurrentText(
+                    str(prior.get("x_mapping_mode") or "Auto")
+                )
+                del blocker
+        target_lookup = {
+            (
+                str(item.get("dataset_id")),
+                str(target.get("raw_observation_id")),
+            ): target
+            for item in list(preserved.get("datasets") or ())
+            if isinstance(item, Mapping)
+            for target in list(item.get("targets") or ())
+            if isinstance(target, Mapping)
+        }
+        for row in range(self._target_table.rowCount()):
+            use = self._target_table.item(row, 0)
+            key = (
+                str(use.data(QtCore.Qt.ItemDataRole.UserRole) or ""),
+                str(
+                    self._target_table.item(row, 2).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    )
+                    or ""
+                ),
+            )
+            prior = target_lookup.get(key)
+            if prior is None:
+                continue
+            identities = list(
+                prior.get("pre_boundary_segment_keys") or ()
+            )
+            if any(not isinstance(identity, Mapping) for identity in identities):
+                raise ValueError(
+                    "Pre-boundary Fit identity must be a mapping."
+                )
+            self._target_table.item(row, 5).setText(
+                ", ".join(
+                    str(int(identity.get("source_row")))
+                    for identity in identities
+                )
+            )
+            use.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if bool(prior.get("use"))
+                else QtCore.Qt.CheckState.Unchecked
+            )
+            self._target_table.item(row, 3).setText(str(prior.get("model_target")))
+            self._target_table.item(row, 4).setText(str(prior.get("weight")))
+        self._restore_parameter_rows(preserved, canonicalized_scopes)
+        self._restore_initial_rows(preserved, canonicalized_scopes)
+        self._restore_execution_rows(datasets, canonicalized_scopes)
+        defaults = preserved.get("defaults")
+        if isinstance(defaults, Mapping):
+            self._method.setCurrentText(str(defaults.get("method")))
+            self._max_nfev.setValue(int(defaults.get("max_nfev")))
+            self._ftol.setValue(float(defaults.get("ftol")))
+            self._xtol.setValue(float(defaults.get("xtol")))
+            self._use_seed.setChecked(bool(defaults.get("use_seed")))
+            self._seed.setValue(int(defaults.get("seed")))
+        self._refresh_dataset_controls()
+
+    def _restore_parameter_rows(
+        self,
+        preserved: Mapping[str, object],
+        canonicalized_scopes: frozenset[str],
+    ) -> None:
+        previous = {
+            str(item.get("name")): item
+            for item in list(preserved.get("parameters") or ())
+            if isinstance(item, Mapping)
+        }
+        for row in range(self._parameter_table.rowCount()):
+            name_item = self._parameter_table.item(row, 1)
+            name = str(
+                name_item.data(QtCore.Qt.ItemDataRole.UserRole)
+                or name_item.text()
+            )
+            prior = previous.get(name)
+            if prior is None:
+                continue
+            self._parameter_table.item(row, 0).setCheckState(
+                QtCore.Qt.CheckState.Checked if bool(prior.get("fit")) else QtCore.Qt.CheckState.Unchecked
+            )
+            for column, key in ((3, "minimum"), (4, "maximum")):
+                self._parameter_table.item(row, column).setText(str(prior.get(key)))
+            if "parameters" not in canonicalized_scopes:
+                self._parameter_table.item(row, 2).setText(str(prior.get("initial")))
+            self._parameter_table.item(row, 5).setCheckState(
+                QtCore.Qt.CheckState.Checked if bool(prior.get("log10")) else QtCore.Qt.CheckState.Unchecked
+            )
+            scope = self._parameter_table.cellWidget(row, 6)
+            if isinstance(scope, QtWidgets.QComboBox):
+                scope.setCurrentText(str(prior.get("scope") or "Shared"))
+            local_values = {
+                str(item.get("dataset_id")): str(item.get("value"))
+                for item in list(prior.get("dataset_values") or ())
+                if isinstance(item, Mapping)
+            }
+            for local_row in self._parameter_local_rows(name):
+                value_item = self._parameter_local_table.item(local_row, 2)
+                dataset_id = str(
+                    value_item.data(QtCore.Qt.ItemDataRole.UserRole) or ""
+                )
+                if dataset_id in local_values:
+                    value_item.setText(local_values[dataset_id])
+
+    def _restore_initial_rows(
+        self,
+        preserved: Mapping[str, object],
+        canonicalized_scopes: frozenset[str],
+    ) -> None:
+        previous = {
+            (str(item.get("set_id")), str(item.get("species"))): item
+            for item in list(preserved.get("initials") or ())
+            if isinstance(item, Mapping)
+        }
+        for row in range(self._initial_table.rowCount()):
+            identity = self._initial_table.item(row, 0)
+            key = (
+                str(identity.data(QtCore.Qt.ItemDataRole.UserRole + 1) or ""),
+                self._initial_table.item(row, 3).text(),
+            )
+            prior = previous.get(key)
+            if prior is None:
+                continue
+            identity.setCheckState(
+                QtCore.Qt.CheckState.Checked if bool(prior.get("fit")) else QtCore.Qt.CheckState.Unchecked
+            )
+            for column, field in ((5, "minimum"), (6, "maximum")):
+                self._initial_table.item(row, column).setText(str(prior.get(field)))
+            if "initial_concentrations" not in canonicalized_scopes:
+                self._initial_table.item(row, 4).setText(str(prior.get("initial")))
+            self._initial_table.item(row, 7).setCheckState(
+                QtCore.Qt.CheckState.Checked if bool(prior.get("log10")) else QtCore.Qt.CheckState.Unchecked
+            )
+            if "initial_concentrations" not in canonicalized_scopes:
+                scope = self._initial_table.cellWidget(row, 8)
+                if isinstance(scope, QtWidgets.QComboBox):
+                    scope.setCurrentText(
+                        str(prior.get("scope") or "Global")
+                    )
+
+    def _restore_execution_rows(
+        self,
+        datasets: Mapping[str, object],
+        canonicalized_scopes: frozenset[str],
+    ) -> None:
+        if "simulation_setup" in canonicalized_scopes:
+            return
+        for row in range(self._execution_table.rowCount()):
+            identity = self._execution_table.item(row, 0)
+            dataset_id = str(identity.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            prior_dataset = datasets.get(dataset_id)
+            if not isinstance(prior_dataset, Mapping):
+                continue
+            execution = prior_dataset.get("execution")
+            if not isinstance(execution, Mapping):
+                continue
+            solver = self._execution_table.cellWidget(row, 2)
+            if isinstance(solver, QtWidgets.QComboBox):
+                solver.setCurrentText(str(execution.get("solver")))
+            for column, key in ((3, "t_start"), (4, "t_end"), (5, "integration_points")):
+                self._execution_table.item(row, column).setText(str(execution.get(key)))
+
+    def install_local_observable(
+        self,
+        *,
+        dataset_id: str,
+        raw_column: str,
+        observable_name: str,
+        scalar_parameters: tuple[object, ...] = (),
+    ) -> None:
+        for row in range(self._target_table.rowCount()):
+            identity = self._target_table.item(row, 0)
+            if (
+                str(identity.data(QtCore.Qt.ItemDataRole.UserRole) or "") == dataset_id
+                and self._target_table.item(row, 2).text() == raw_column
+            ):
+                self._target_table.item(row, 3).setText(observable_name)
+                identity.setCheckState(QtCore.Qt.CheckState.Checked)
+                self.set_status(
+                    f"Observable {observable_name!r} is local to this Fit until Apply."
+                )
+                for scalar in scalar_parameters:
+                    scalar_name = str(getattr(scalar, "name"))
+                    if self._parameter_row(scalar_name) >= 0:
+                        continue
+                    self._append_parameter_row(
+                        FitParameterVariable(
+                            name=scalar_name,
+                            display_name=scalar_name,
+                            initial=float(getattr(scalar, "value", 1.0)),
+                            minimum=float(
+                                getattr(scalar, "minimum", float("-inf"))
+                            ),
+                            maximum=float(
+                                getattr(scalar, "maximum", float("inf"))
+                            ),
+                            fit=True,
+                            log10=False,
+                            scope=str(
+                                getattr(scalar, "scope", "shared")
+                            ),
+                            family="scalar",
+                            role="scalar",
+                            unit="1",
+                        )
+                    )
+                return
+        raise KeyError("Selected dataset observation is no longer available.")
+
+    def _show_add_observable_dialog(self) -> None:
+        if not self._origin.mapped_datasets:
+            self.set_status("Map a dataset before adding a Fit observable.")
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Add Fit-local Observable")
+        form = QtWidgets.QFormLayout(dialog)
+        name = QtWidgets.QLineEdit(dialog)
+        expression = QtWidgets.QLineEdit(dialog)
+        dataset = QtWidgets.QComboBox(dialog)
+        for mapped in self._origin.mapped_datasets:
+            dataset.addItem(mapped.display_name, mapped.dataset_id)
+        column = QtWidgets.QComboBox(dialog)
+        scalar_scope = QtWidgets.QComboBox(dialog)
+        scalar_scope.addItems(("Shared", "Per-dataset"))
+
+        def refresh_columns() -> None:
+            column.clear()
+            dataset_id = str(dataset.currentData() or "")
+            mapped = next(
+                item for item in self._origin.mapped_datasets
+                if item.dataset_id == dataset_id
+            )
+            for observation in mapped.observations:
+                column.addItem(observation.raw_column, observation.raw_column)
+
+        dataset.currentIndexChanged.connect(refresh_columns)
+        refresh_columns()
+        form.addRow("Name", name)
+        form.addRow("Expression", expression)
+        form.addRow("Dataset", dataset)
+        form.addRow("Observed column", column)
+        form.addRow("New scalar scope", scalar_scope)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self.addObservableRequested.emit(
+            name.text(),
+            expression.text(),
+            str(dataset.currentData() or ""),
+            str(column.currentData() or ""),
+            scalar_scope.currentText(),
+        )
+
+    def _current_target_dataset_id(self) -> str:
+        row = self._target_table.currentRow()
+        if row < 0:
+            return ""
+        return str(
+            self._target_table.item(row, 0).data(
+                QtCore.Qt.ItemDataRole.UserRole
+            )
+            or ""
+        )
+
+    def _dataset_x_name(self, dataset_id: str) -> str:
+        for row in range(self._dataset_table.rowCount()):
+            identity = self._dataset_table.item(row, 0)
+            if str(
+                identity.data(QtCore.Qt.ItemDataRole.UserRole) or ""
+            ) != dataset_id:
+                continue
+            selector = self._dataset_table.cellWidget(row, 8)
+            if isinstance(selector, QtWidgets.QComboBox):
+                return str(selector.currentData() or "t")
+        return "t"
+
+    def _target_row_is_eligible(self, row: int) -> bool:
+        identity = self._target_table.item(row, 0)
+        dataset_id = str(
+            identity.data(QtCore.Qt.ItemDataRole.UserRole) or ""
+        )
+        raw_column = self._target_table.item(row, 2).text()
+        raw_observation_id = str(
+            self._target_table.item(row, 2).data(
+                QtCore.Qt.ItemDataRole.UserRole + 1
+            )
+            or ""
+        )
+        model_target = self._target_table.item(row, 3).text().strip()
+        try:
+            mapped = next(
+                item
+                for item in self._origin.mapped_datasets
+                if item.dataset_id == dataset_id
+            )
+            observation = next(
+                item
+                for item in mapped.observations
+                if item.raw_observation_id == raw_observation_id
+            )
+        except StopIteration:
+            return False
+        duplicate_target = any(
+            other_row != row
+            and str(
+                self._target_table.item(other_row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or ""
+            )
+            == dataset_id
+            and self._target_table.item(other_row, 3).text().strip()
+            == model_target
+            for other_row in range(self._target_table.rowCount())
+        )
+        return bool(
+            model_target
+            and observation.raw_column == raw_column
+            and not duplicate_target
+            and len(observation.t) == len(observation.y)
+            == len(observation.source_rows)
+            and bool(observation.t)
+            and all(row_number > 0 for row_number in observation.source_rows)
+            and len(set(observation.source_rows))
+            == len(observation.source_rows)
+            and model_target != self._dataset_x_name(dataset_id)
+        )
+
+    def _target_selection(
+        self,
+        dataset_id: str,
+    ) -> FitTargetSelection:
+        return FitTargetSelection(
+            dataset_id=dataset_id,
+            eligible_targets=tuple(
+                self._target_table.item(row, 3).text()
+                for row in range(self._target_table.rowCount())
+                if str(
+                    self._target_table.item(row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                    or ""
+                )
+                == dataset_id
+                and self._target_row_is_eligible(row)
+            ),
+            selected_targets=tuple(
+                self._target_table.item(row, 3).text()
+                for row in range(self._target_table.rowCount())
+                if str(
+                    self._target_table.item(row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                    or ""
+                )
+                == dataset_id
+                and self._target_row_is_eligible(row)
+                and self._target_table.item(row, 0).checkState()
+                == QtCore.Qt.CheckState.Checked
+            ),
+        )
+
+    def _install_target_selection(
+        self,
+        selection: FitTargetSelection,
+    ) -> None:
+        selected = set(selection.selected_targets)
+        for row in range(self._target_table.rowCount()):
+            item = self._target_table.item(row, 0)
+            if (
+                str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                != selection.dataset_id
+                or not self._target_row_is_eligible(row)
+            ):
+                continue
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if self._target_table.item(row, 3).text() in selected
+                else QtCore.Qt.CheckState.Unchecked
+            )
+
+    def _on_dataset_item_changed(
+        self,
+        item: QtWidgets.QTableWidgetItem,
+    ) -> None:
+        if (
+            item.column() == 0
+            and not self._refreshing_dataset_controls
+        ):
+            self._reconcile_parameter_local_rows()
+            included_set_ids = self._included_set_ids()
+            for initial_row in range(self._initial_table.rowCount()):
+                set_id = str(
+                    self._initial_table.item(initial_row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    )
+                    or ""
+                )
+                if set_id in included_set_ids:
+                    continue
+                selector = self._initial_table.cellWidget(initial_row, 8)
+                if isinstance(selector, QtWidgets.QComboBox):
+                    blocker = QtCore.QSignalBlocker(selector)
+                    selector.setCurrentText("Local")
+                    del blocker
+            for row in range(self._parameter_table.rowCount()):
+                name_item = self._parameter_table.item(row, 1)
+                self._project_shared_parameter_from_local_rows(
+                    str(
+                        name_item.data(
+                            QtCore.Qt.ItemDataRole.UserRole
+                        )
+                        or name_item.text()
+                    )
+                )
+        self._refresh_dataset_controls()
+
+    def _refresh_dataset_controls(self) -> None:
+        if self._refreshing_dataset_controls:
+            return
+        self._refreshing_dataset_controls = True
+        try:
+            for row in range(self._target_table.rowCount()):
+                item = self._target_table.item(row, 0)
+                eligible = self._target_row_is_eligible(row)
+                flags = item.flags()
+                if eligible:
+                    item.setFlags(
+                        flags
+                        | QtCore.Qt.ItemFlag.ItemIsEnabled
+                        | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                    )
+                else:
+                    item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                    item.setFlags(
+                        flags
+                        & ~QtCore.Qt.ItemFlag.ItemIsEnabled
+                    )
+            mapped_by_id = {
+                item.dataset_id: item
+                for item in self._origin.mapped_datasets
+            }
+            for row in range(self._dataset_table.rowCount()):
+                identity = self._dataset_table.item(row, 0)
+                dataset_id = str(
+                    identity.data(QtCore.Qt.ItemDataRole.UserRole) or ""
+                )
+                x_selector = self._dataset_table.cellWidget(row, 8)
+                mapping_selector = self._dataset_table.cellWidget(row, 9)
+                x_name = (
+                    str(x_selector.currentData() or "t")
+                    if isinstance(x_selector, QtWidgets.QComboBox)
+                    else "t"
+                )
+                if isinstance(mapping_selector, QtWidgets.QComboBox):
+                    mapping_selector.setEnabled(x_name != "t")
+                resolved = self._dataset_table.item(row, 10)
+                if x_name == "t":
+                    resolved.setText("Time")
+                elif (
+                    isinstance(mapping_selector, QtWidgets.QComboBox)
+                    and mapping_selector.currentText() == "Auto"
+                ):
+                    resolved.setText("Pending")
+                elif isinstance(mapping_selector, QtWidgets.QComboBox):
+                    resolved.setText(mapping_selector.currentText())
+                used = 0
+                valid = True
+                try:
+                    t_min = _read_float(
+                        self._dataset_table.item(row, 3).text(),
+                        "t min",
+                    )
+                    t_max = _read_float(
+                        self._dataset_table.item(row, 4).text(),
+                        "t max",
+                    )
+                    points_text = (
+                        self._dataset_table.item(row, 5).text().strip()
+                    )
+                    points = (
+                        None
+                        if points_text.casefold() == "all"
+                        else int(points_text)
+                    )
+                    mapped = mapped_by_id[dataset_id]
+                    observations = {
+                        item.raw_observation_id: item
+                        for item in mapped.observations
+                    }
+                    for target_row in range(
+                        self._target_table.rowCount()
+                    ):
+                        target_item = self._target_table.item(
+                            target_row,
+                            0,
+                        )
+                        if (
+                            str(
+                                target_item.data(
+                                    QtCore.Qt.ItemDataRole.UserRole
+                                )
+                                or ""
+                            )
+                            != dataset_id
+                            or target_item.checkState()
+                            != QtCore.Qt.CheckState.Checked
+                            or not self._target_row_is_eligible(target_row)
+                        ):
+                            continue
+                        observation = observations[
+                            str(
+                                self._target_table.item(
+                                    target_row,
+                                    2,
+                                ).data(
+                                    QtCore.Qt.ItemDataRole.UserRole + 1
+                                )
+                                or ""
+                            )
+                        ]
+                        used += int(
+                            compute_sampled_indices(
+                                t=np.asarray(
+                                    observation.t,
+                                    dtype=float,
+                                ),
+                                t_min=t_min,
+                                t_max=t_max,
+                                n_points=points,
+                            ).size
+                        )
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    valid = False
+                self._dataset_table.item(row, 6).setText(
+                    str(used) if valid else "Invalid"
+                )
+        finally:
+            self._refreshing_dataset_controls = False
+
+    def _bulk_targets(self, operation: str) -> None:
+        dataset_id = self._current_target_dataset_id()
+        if not dataset_id:
+            self.set_status("Select a target row first.")
+            return
+        selection = self._target_selection(dataset_id)
+        if operation == "all":
+            selection = selection.all()
+        elif operation == "none":
+            selection = selection.none()
+        else:
+            selection = selection.invert()
+        self._install_target_selection(selection)
+        self._refresh_dataset_controls()
+
+    def _copy_targets(self) -> None:
+        source_id = self._current_target_dataset_id()
+        if not source_id:
+            self.set_status("Select a source target row first.")
+            return
+        source = self._target_selection(source_id)
+        if not source.selected_targets:
+            self.set_status("Copy Targets: 0 copied, 0 skipped.")
+            return
+        included_ids = tuple(
+            str(
+                self._dataset_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or ""
+            )
+            for row in range(self._dataset_table.rowCount())
+            if self._dataset_table.item(row, 0).checkState()
+            == QtCore.Qt.CheckState.Checked
+            and str(
+                self._dataset_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or ""
+            )
+            != source_id
+        )
+        destinations = tuple(
+            self._target_selection(dataset_id)
+            for dataset_id in included_ids
+        )
+        copied, matched, unmatched = copy_target_selection(
+            source,
+            destinations,
+        )
+        copied_by_id = {
+            item.dataset_id: set(item.selected_targets)
+            for item in copied
+        }
+        compatible_ids = {
+            item.dataset_id
+            for original, item in zip(destinations, copied)
+            if original != item
+            or set(source.selected_targets).issubset(
+                original.eligible_targets
+            )
+        }
+        for row in range(self._target_table.rowCount()):
+            item = self._target_table.item(row, 0)
+            dataset_id = str(
+                item.data(QtCore.Qt.ItemDataRole.UserRole) or ""
+            )
+            if (
+                dataset_id not in compatible_ids
+                or not self._target_row_is_eligible(row)
+            ):
+                continue
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if self._target_table.item(row, 3).text()
+                in copied_by_id[dataset_id]
+                else QtCore.Qt.CheckState.Unchecked
+            )
+        self._refresh_dataset_controls()
+        self.set_status(
+            f"Copy Targets: {matched} copied, {unmatched} skipped."
+        )
+
+    def _apply_target_changes(self) -> None:
+        self._committed_targets = self._current_target_state()
+        self._refresh_dataset_controls()
+        self.set_status("Pending Fit target selections applied locally.")
+
+    def _current_target_state(
+        self,
+    ) -> dict[tuple[str, str], bool]:
+        return {
+            (
+                str(
+                    self._target_table.item(row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                    or ""
+                ),
+                str(
+                    self._target_table.item(row, 2).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    )
+                    or ""
+                ),
+            ): self._target_table.item(row, 0).checkState()
+            == QtCore.Qt.CheckState.Checked
+            for row in range(self._target_table.rowCount())
+        }
+
+    @property
+    def has_pending_target_changes(self) -> bool:
+        return self._current_target_state() != self._committed_targets
+
+    def commit_current_target_selection(self) -> None:
+        self._committed_targets = self._current_target_state()
+
+    def _revert_target_changes(self) -> None:
+        for row in range(self._target_table.rowCount()):
+            item = self._target_table.item(row, 0)
+            key = (
+                str(item.data(QtCore.Qt.ItemDataRole.UserRole) or ""),
+                str(
+                    self._target_table.item(row, 2).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    )
+                    or ""
+                ),
+            )
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if self._committed_targets.get(key, False)
+                else QtCore.Qt.CheckState.Unchecked
+            )
+        self._refresh_dataset_controls()
+        self.set_status("Pending Fit target selections reverted.")
+
+    def _toggle_pause(self) -> None:
+        self._paused = not self._paused
+        self._pause_button.setText("Resume" if self._paused else "Pause")
+        if self._paused:
+            self.pauseRequested.emit()
+        else:
+            self.resumeRequested.emit()
+
+    def _restore_named_snapshot(self, name: str) -> None:
+        snapshot = self._initial_setup if name == "initial" else self._last_fit_setup
+        if snapshot is None:
+            self.set_status("That Fit setup snapshot is unavailable.")
+            return
+        self.restoreSetupRequested.emit(snapshot)
+
+    def set_executing(self, executing: bool) -> None:
+        self._run_button.setEnabled(not executing)
+        self._cancel_button.setEnabled(executing)
+        self._pause_button.setEnabled(executing)
+        if not executing:
+            self._paused = False
+            self._pause_button.setText("Pause")
+        for widget in (
+            self._data_tab,
+            self._parameters_tab,
+            self._initials_tab,
+            self._add_observable_button,
+            self._targets_all,
+            self._targets_none,
+            self._targets_invert,
+            self._targets_copy,
+            self._targets_apply,
+            self._targets_revert,
+        ):
+            widget.setEnabled(not executing)
+
+    def set_detailed_balance_correction_pending(self) -> None:
+        self.set_executing(True)
+        self._pause_button.setEnabled(False)
+        self._cancel_button.setEnabled(True)
+
+    def set_progress(self, value: int, text: str) -> None:
+        self._progress.setValue(max(0, min(100, int(value))))
+        self.set_status(text)
+
+    def set_status(self, text: str) -> None:
+        self._status.setText(self._display_text(text))
+
+    def _display_text(self, text: object) -> str:
+        rendered = str(text)
+        for mapped in sorted(
+            self._origin.mapped_datasets,
+            key=lambda item: max(
+                len(item.dataset_id),
+                len(item.set_id),
+            ),
+            reverse=True,
+        ):
+            rendered = rendered.replace(
+                mapped.dataset_id,
+                mapped.display_name,
+            )
+            rendered = rendered.replace(
+                mapped.set_id,
+                mapped.set_name,
+            )
+        return rendered
+
+    def show_origin_conflict(self, requested_tab_name: str) -> None:
+        self.set_status(
+            f"This modal Fit belongs to {self._origin.tab_name}; "
+            f"close it before fitting {requested_tab_name}."
+        )
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def set_live_best(self, update: FitLiveUpdate) -> None:
+        if not isinstance(update, FitLiveUpdate):
+            raise TypeError("update must be FitLiveUpdate.")
+        self._tracker_summary.setText(
+            f"Best iteration {update.iteration}; objective SSQ={update.cost:.8g}"
+        )
+        parameter_labels = {
+            item.name: item.display_name
+            for item in self._origin.parameter_defaults
+        }
+        set_labels = {
+            item.set_id: item.set_name
+            for item in self._origin.mapped_datasets
+        }
+        dataset_labels = {
+            item.dataset_id: item.display_name
+            for item in self._origin.mapped_datasets
+        }
+        lines = [
+            f"{parameter_labels.get(name, name)} = {value:.12g}"
+            for name, value in update.parameters
+        ]
+        for dataset_id, values in update.scalar_values_by_dataset:
+            lines.append(f"[{dataset_labels.get(dataset_id, 'Dataset')}]")
+            lines.extend(
+                f"{parameter_labels.get(name, name)} = {value:.12g}"
+                for name, value in values
+            )
+        for set_id, values in update.initial_values_by_set:
+            lines.append(f"[{set_labels.get(set_id, 'Mapped set')}]")
+            lines.extend(f"{name} = {value:.12g}" for name, value in values)
+        self._tracker_parameters.setPlainText("\n".join(lines))
+
+    def set_live_curves(self, curves: tuple[FitCurveDataset, ...]) -> None:
+        self._all_datasets_view.set_curves(curves)
+        by_id = {item.dataset_id: item for item in curves}
+        for dataset_id, view in self._dataset_view_by_id.items():
+            curve = by_id.get(dataset_id)
+            view.set_curves(()) if curve is None else view.set_curves((curve,))
+
+    def set_resolved_auto_modes(
+        self,
+        modes: tuple[tuple[str, str], ...],
+    ) -> None:
+        resolved_modes = dict(modes)
+        blocker = QtCore.QSignalBlocker(self._dataset_table)
+        for row in range(self._dataset_table.rowCount()):
+            dataset_id = str(
+                self._dataset_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or ""
+            )
+            resolved = resolved_modes.get(dataset_id)
+            if resolved is not None:
+                self._dataset_table.item(row, 10).setText(
+                    "Time-guided"
+                    if resolved == "time_guided"
+                    else "Monotone"
+                )
+        del blocker
+
+    def set_run_identity(self, identity: FitRunIdentity) -> None:
+        if not isinstance(identity, FitRunIdentity):
+            raise TypeError("identity must be a FitRunIdentity.")
+        self._run_identity = identity
+        self._copy_run_json.setEnabled(True)
+
+    def set_candidate(self, candidate: FitCandidate) -> bool:
+        if not isinstance(candidate, FitCandidate):
+            raise TypeError("candidate must be FitCandidate.")
+        available = set(candidate.available_scopes)
+        for checkbox, scope in (
+            (self._apply_parameters, "parameters"),
+            (self._apply_initials, "initial_concentrations"),
+            (self._apply_setup, "simulation_setup"),
+            (self._apply_observables, "observable_definitions"),
+        ):
+            checkbox.setEnabled(scope in available)
+            checkbox.setChecked(scope in available)
+        self._apply_button.setEnabled(bool(available))
+        result = candidate.result
+        dataset_labels = {
+            item.dataset_id: item.display_name
+            for item in self._origin.mapped_datasets
+        }
+        set_labels = {
+            item.set_id: item.set_name
+            for item in self._origin.mapped_datasets
+        }
+        parameter_labels = {
+            item.name: item.display_name
+            for item in candidate.setup_snapshot.parameters
+        }
+        set_id_by_dataset = {
+            item.dataset_id: item.set_id
+            for item in self._origin.mapped_datasets
+        }
+        execution_by_set: dict[
+            str,
+            SimulationExecutionSettings,
+        ] = {}
+        execution_apply_conflict = False
+        for local in candidate.setup_snapshot.datasets:
+            if not local.included:
+                continue
+            set_id = set_id_by_dataset[local.dataset_id]
+            previous = execution_by_set.get(set_id)
+            if previous is not None and previous != local.execution:
+                execution_apply_conflict = True
+            execution_by_set[set_id] = local.execution
+        self._result_summary.setPlainText(
+            "\n".join(
+                (
+                    f"Run: {candidate.run_identity.short_hash}",
+                    self._display_text(result.message),
+                    f"Global R²: {float(result.global_r_squared):.8g}",
+                    f"Residual MSE: {float(result.global_residual_mse):.8g}",
+                    f"Function evaluations: {int(result.nfev)}",
+                    f"Pending local observables: {len(candidate.local_observables)}",
+                    *((
+                        (
+                            "Simulation Setup Apply is unavailable because "
+                            "datasets mapped to one set used different settings."
+                        ),
+                    ) if execution_apply_conflict else ()),
+                    *(
+                        f"{dataset_labels.get(info.dataset_id, 'Dataset')}: "
+                        f"R²={info.r_squared:.8g}, "
+                        f"residual MSE={info.residual_mse:.8g}, "
+                        f"RMSE={info.rmse:.8g}, MAE={info.mae:.8g}, "
+                        f"weight={info.weight:.8g}, points={info.n_points}"
+                        for info in result.dataset_info
+                    ),
+                    *(
+                        f"shared {parameter_labels.get(name, name)}={value:.12g}"
+                        for name, value in candidate.parameters
+                    ),
+                    *(
+                        f"{dataset_labels.get(dataset_id, 'Dataset')} "
+                        f"{parameter_labels.get(name, name)}={value:.12g}"
+                        for dataset_id, values in candidate.scalar_values_by_dataset
+                        for name, value in values
+                    ),
+                    *(
+                        f"{set_labels.get(set_id, 'Mapped set')} "
+                        f"init {name}={value:.12g}"
+                        for set_id, values in candidate.initial_values_by_set
+                        for name, value in values
+                    ),
+                )
+            )
+        )
+        selected_before = {
+            self._species_filter.item(index).text()
+            for index in range(self._species_filter.count())
+            if self._species_filter.item(index).checkState()
+            == QtCore.Qt.CheckState.Checked
+        }
+        available_species = tuple(
+            dict.fromkeys(
+                species
+                for curve in candidate.curves
+                for species, _values in curve.model_y
+            )
+        )
+        self._species_filter.blockSignals(True)
+        self._species_filter.clear()
+        for species in available_species:
+            item = QtWidgets.QListWidgetItem(species)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if (
+                    not self._species_filter_initialized
+                    or species in selected_before
+                )
+                else QtCore.Qt.CheckState.Unchecked
+            )
+            self._species_filter.addItem(item)
+        self._species_filter.blockSignals(False)
+        self._species_filter_initialized = True
+        self._candidate_curves = candidate.curves
+        self._last_fit_setup = candidate.setup_snapshot
+        self._view_last_fit.setEnabled(True)
+        self._effective_source = candidate.mechanism_source
+        self._effective_prepared_dsl = candidate.prepared_dsl
+        self.set_run_identity(candidate.run_identity)
+        self._copy_button.setEnabled(True)
+        self.set_resolved_auto_modes(candidate.resolved_auto_modes)
+        try:
+            self._apply_species_filter()
         except Exception as exc:
-            self._best_effort_failures.add("closeEvent.deleteLater")
-            logger.debug("Failed to schedule FittingWindow deleteLater during closeEvent: %s", exc, exc_info=True)
+            self.set_status(
+                f"Fit completed, but plotting failed: {exc}. "
+                "The candidate remains available to Apply."
+            )
+            return False
+        self._tabs.setCurrentWidget(self._results_tab)
+        return True
+
+    def clear_candidate(self) -> None:
+        for checkbox in (
+            self._apply_parameters,
+            self._apply_initials,
+            self._apply_setup,
+            self._apply_observables,
+        ):
+            checkbox.setChecked(False)
+            checkbox.setEnabled(False)
+        self._apply_button.setEnabled(False)
+        self._run_identity = None
+        self._copy_button.setEnabled(False)
+        self._copy_run_json.setEnabled(False)
+        self._candidate_curves = ()
+        self.set_live_curves(())
+        self._tracker_summary.setText(
+            "Run a fit to see the best candidate."
+        )
+        self._tracker_parameters.clear()
+        self._result_summary.clear()
+        self._refresh_dataset_controls()
+
+    def _copy_run_identity_json(self) -> None:
+        identity = self._run_identity
+        if identity is None:
+            self.set_status("No completed Fit run is available to copy.")
+            return
+        clipboard = QtWidgets.QApplication.clipboard()
+        clipboard.setText(identity.readable_json())
+        self.set_status("Copied the complete Fit run JSON.")
+
+    def _emit_apply(self) -> None:
+        scopes = frozenset(
+            scope
+            for checkbox, scope in (
+                (self._apply_parameters, "parameters"),
+                (self._apply_initials, "initial_concentrations"),
+                (self._apply_setup, "simulation_setup"),
+                (self._apply_observables, "observable_definitions"),
+            )
+            if checkbox.isEnabled() and checkbox.isChecked()
+        )
+        if not scopes:
+            self.set_status("Select at least one Apply scope.")
+            return
+        self.applyRequested.emit(scopes)
+
+    def _apply_species_filter(self, _item: object = None) -> None:
+        curves = getattr(self, "_candidate_curves", ())
+        selected = {
+            self._species_filter.item(index).text()
+            for index in range(self._species_filter.count())
+            if self._species_filter.item(index).checkState()
+            == QtCore.Qt.CheckState.Checked
+        }
+        filtered = tuple(
+            FitCurveDataset(
+                dataset_id=curve.dataset_id,
+                display_name=curve.display_name,
+                model_x=tuple(item for item in curve.model_x if item[0] in selected),
+                model_y=tuple(item for item in curve.model_y if item[0] in selected),
+                observed_x=tuple(item for item in curve.observed_x if item[0] in selected),
+                observed_y=tuple(item for item in curve.observed_y if item[0] in selected),
+                model_segment_ids=tuple(
+                    item
+                    for item in curve.model_segment_ids
+                    if item[0] in selected
+                ),
+                model_segment_keys=tuple(
+                    item
+                    for item in curve.model_segment_keys
+                    if item[0] in selected
+                ),
+                observed_source_rows=tuple(
+                    item
+                    for item in curve.observed_source_rows
+                    if item[0] in selected
+                ),
+                observed_raw_ids=tuple(
+                    item
+                    for item in curve.observed_raw_ids
+                    if item[0] in selected
+                ),
+                x_name=curve.x_name,
+            )
+            for curve in curves
+            if any(name in selected for name, _values in curve.model_y)
+        )
+        self.set_live_curves(filtered)
+
+    def force_close_after_cleanup(self) -> None:
+        self._closing_after_cleanup = True
+        self.close()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._closing_after_cleanup:
+            event.accept()
+            return
+        if self._close_handler(time.monotonic() + 2.0):
+            self._closing_after_cleanup = True
+            event.accept()
+        else:
+            self.set_status("Fit is still stopping; close was deferred.")
+            event.ignore()

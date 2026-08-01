@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
-from kindred.core.batch_initial_conditions import strip_named_reaction_dsl_initial_concentration_sets
-from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.parameter_algebra import (
+    apply_parameter_algebra_spec_to_mechanism,
+)
 from kindred.core.symbolic.calculator import (
     SymbolicCalculatorError,
     evaluate_symbolic_query,
@@ -29,7 +31,6 @@ class SymbolicCalculatorHistoryEntry:
 @dataclass(frozen=True, slots=True)
 class SymbolicCalculatorSnapshot:
     source: str
-    parse_source: str
     mechanism: Any
 
 
@@ -50,9 +51,11 @@ class SymbolicCalculatorOwner:
     def __init__(
         self,
         *,
-        mechanism_session_owner: Any,
+        canonical_prepared_dsl: Callable[[], PreparedDslRequestSet | None],
     ) -> None:
-        self._mechanism_session_owner = mechanism_session_owner
+        if not callable(canonical_prepared_dsl):
+            raise TypeError("canonical_prepared_dsl must be callable.")
+        self._canonical_prepared_dsl = canonical_prepared_dsl
         self._snapshot: SymbolicCalculatorSnapshot | None = None
         self._history: list[SymbolicCalculatorHistoryEntry] = []
         self._available = False
@@ -147,7 +150,7 @@ class SymbolicCalculatorOwner:
     def _display_entry(self) -> SymbolicCalculatorHistoryEntry | None:
         if self._available:
             return self._latest_entry_for_current_snapshot()
-        if bool(getattr(self, "_hide_history_while_unavailable", False)):
+        if self._hide_history_while_unavailable:
             return None
         return self._history[-1] if self._history else None
 
@@ -166,25 +169,21 @@ class SymbolicCalculatorOwner:
         return None
 
     def _build_snapshot(self) -> tuple[SymbolicCalculatorSnapshot | None, bool, str]:
-        owner = self._mechanism_session_owner
-        if owner is None:
-            return None, False, "Canonical mechanism unavailable."
-        validate = getattr(owner, "validate_canonical", None)
-        if not callable(validate):
-            return None, False, "Canonical mechanism validation is unavailable."
-        validation = validate()
-        if not bool(getattr(validation, "valid", False)):
-            reason = str(getattr(validation, "error_message", "") or "Canonical mechanism is invalid.")
-            return None, False, reason
-        ready_for_run = getattr(owner, "is_ready_for_explicit_run", None)
-        if not callable(ready_for_run):
-            return None, False, "Canonical mechanism run readiness is unavailable."
-        if not bool(ready_for_run()):
-            return None, False, "Canonical mechanism is not ready for explicit runs."
-        source = str(getattr(owner, "canonical_full_dsl", "") or "")
+        prepared_dsl = self._canonical_prepared_dsl()
+        if prepared_dsl is None:
+            return None, False, "Canonical mechanism is empty."
+        if not isinstance(prepared_dsl, PreparedDslRequestSet):
+            raise TypeError(
+                "Canonical symbolic input must be PreparedDslRequestSet or None."
+            )
+        source = prepared_dsl.analysis.normalized_text
         try:
-            parse_source = str(strip_named_reaction_dsl_initial_concentration_sets(source) or "")
-            mechanism = parse_dsl_to_mechanism(parse_source, initials={})
+            mechanism = prepared_dsl.mechanism_for_execution()
+            apply_parameter_algebra_spec_to_mechanism(
+                prepared_dsl.parameter_algebra_spec_for_execution(),
+                mechanism=mechanism,
+                require_mutable=False,
+            )
             available, reason = symbolic_calculator_available(mechanism)
         except (DSLError, SymbolicCalculatorError) as exc:
             return None, False, str(exc) or "Symbolic calculator unavailable."
@@ -195,7 +194,6 @@ class SymbolicCalculatorOwner:
             return None, False, str(reason or "Symbolic calculator unavailable.")
         snapshot = SymbolicCalculatorSnapshot(
             source=source,
-            parse_source=parse_source,
             mechanism=mechanism,
         )
         return snapshot, True, ""

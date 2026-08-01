@@ -1,495 +1,1871 @@
-"""
-Global fitting worker thread.
-
-This module owns worker orchestration and best-payload emission separately from
-the fitting window UI implementation.
-"""
+"""One pausable/cancellable Fit QThread over immutable typed captures."""
 
 from __future__ import annotations
 
-import logging
-import threading
+import math
 import time
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING, TypedDict
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from threading import Condition, Event
 
 import numpy as np
 from PySide6 import QtCore
-from PySide6.QtCore import Signal
 
+from kindred.core.algebra.observable_introspection import FitLocalObservable
+from kindred.core.analysis.dataset_parameter_overrides import (
+    FitCoupledVariableParamSpec,
+    FitDatasetParameterOverrides,
+    FitDatasetVariableParamSpec,
+    FitSharedVariableParamSpec,
+)
 from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetSpec,
-    coerce_fit_dataset_specs,
+    FitObservationSeries,
 )
-from kindred.core.analysis.dataset_parameter_overrides import (
-    FitDatasetParameterOverrides,
-    coerce_fit_dataset_parameter_overrides,
-    split_fit_dataset_parameter_overrides,
+from kindred.core.analysis.global_fitting import GlobalFitResult, fit_global
+from kindred.core.analysis.parametric_alignment import (
+    DeterministicParametricResolutionError,
+    align_y_on_x_obs,
 )
-from kindred.core.analysis.global_fit_execution import (
-    assemble_global_fit_result,
-    build_parameter_layout,
-    normalize_weights,
-)
-from kindred.core.analysis.global_fit_projection import (
-    FitRenderProjection,
-    projection_from_global_fit_result,
-)
-from kindred.core.fitting_evaluation import SerialFittingEvaluator, coerce_fitting_series_evaluator
 from kindred.core.exceptions import FitSimulationError, FittingCancelled
-from kindred.core.simulation_failure import build_simulation_failure, coerce_simulation_failure
-from kindred.core.simulator.solvers import normalize_solver_name
-from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
-
-if TYPE_CHECKING:
-    from kindred.core.analysis.global_fit_execution import GlobalFitResult
-
-
-logger = logging.getLogger(__name__)
-
+from kindred.core.fitting_evaluation import (
+    FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
+    SerialFittingEvaluator,
+    prepare_fitting_execution_context,
+)
+from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.project_document import SimulationExecutionSettings
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulator.wegscheider_symbolic import (
+    UnresolvedWegscheiderCyclicityError,
+)
+from kindred.gui.fitting.constants import INITIAL_PREFIX
+from kindred.gui.fitting.contracts import (
+    FitRunIdentity,
+)
+from kindred.gui.fitting.launch import (
+    FitDatasetLocalSettings,
+    FitExecutionRequest,
+    FitMappedDatasetSnapshot,
+    FitSelectedObservation,
+    FitSetupSnapshot,
+    selected_observations,
+)
+from kindred.gui.widgets.mechanism_editor import (
+    DetailedBalanceCorrectionRequest,
+)
 
 __all__ = [
+    "FitCandidate",
+    "FitCurveDataset",
+    "FitLiveUpdate",
     "GlobalFitWorker",
 ]
 
-
-class GlobalFitFinishedPayloadV1(TypedDict):
-    version: int
-    result: "GlobalFitResult"
-    weights: Dict[str, float]
-    run_stamp: Dict[str, Any]
-    run_stamp_hash: str
-    run_stamp_short: str
+_BEST_INTERVAL_SECONDS = 0.25
+_CURVE_INTERVAL_SECONDS = 2.0
 
 
-class GlobalFitBestUpdatedPayloadV1(TypedDict):
-    version: int
+class _DetailedBalanceCorrectionRequired(RuntimeError):
+    def __init__(self, request: DetailedBalanceCorrectionRequest) -> None:
+        super().__init__(request.issue)
+        self.request = request
+
+
+def _unresolved_detailed_balance_error(
+    error: BaseException,
+) -> UnresolvedWegscheiderCyclicityError | None:
+    """Find only the typed core correction requirement in one cause chain."""
+
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, UnresolvedWegscheiderCyclicityError):
+            return current
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return None
+
+
+def _finite_items(
+    values: Mapping[str, object],
+    *,
+    field: str,
+) -> tuple[tuple[str, float], ...]:
+    normalized: list[tuple[str, float]] = []
+    for raw_name, raw_value in values.items():
+        name = str(raw_name or "").strip()
+        value = float(raw_value)
+        if not name or not math.isfinite(value):
+            raise ValueError(f"{field} contains an invalid value.")
+        normalized.append((name, value))
+    normalized.sort()
+    return tuple(normalized)
+
+
+def _stamp_bound(value: float) -> float | None:
+    number = float(value)
+    if math.isfinite(number):
+        return number
+    return None
+
+
+def _curve_items(
+    items: tuple[tuple[str, tuple[float, ...]], ...],
+    *,
+    field: str,
+) -> tuple[tuple[str, tuple[float, ...]], ...]:
+    normalized: list[tuple[str, tuple[float, ...]]] = []
+    for raw_name, raw_values in items:
+        name = str(raw_name or "").strip()
+        values = tuple(float(value) for value in raw_values)
+        if not name or not values or any(
+            not math.isfinite(value) for value in values
+        ):
+            raise ValueError(f"{field} contains an invalid curve.")
+        normalized.append((name, values))
+    names = [name for name, _values in normalized]
+    if len(names) != len(set(names)):
+        raise ValueError(f"{field} repeats a curve series.")
+    return tuple(normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class FitCurveDataset:
+    dataset_id: str
+    display_name: str
+    model_x: tuple[tuple[str, tuple[float, ...]], ...]
+    model_y: tuple[tuple[str, tuple[float, ...]], ...]
+    observed_x: tuple[tuple[str, tuple[float, ...]], ...]
+    observed_y: tuple[tuple[str, tuple[float, ...]], ...]
+    model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...]
+    model_segment_keys: tuple[tuple[str, tuple[str, ...]], ...]
+    observed_source_rows: tuple[tuple[str, tuple[int, ...]], ...]
+    observed_raw_ids: tuple[tuple[str, str], ...]
+    x_name: str = "t"
+
+    def __post_init__(self) -> None:
+        dataset_id = str(self.dataset_id or "").strip()
+        display_name = str(self.display_name or "").strip()
+        x_name = str(self.x_name or "").strip()
+        if not dataset_id or not display_name or not x_name:
+            raise ValueError("Fit curve dataset identity must be complete.")
+        model_x = _curve_items(self.model_x, field="model X")
+        model_y = _curve_items(self.model_y, field="model Y")
+        observed_x = _curve_items(self.observed_x, field="observed X")
+        observed_y = _curve_items(self.observed_y, field="observed Y")
+        model_segment_ids = tuple(
+            (str(name), tuple(int(value) for value in values))
+            for name, values in self.model_segment_ids
+        )
+        model_segment_keys = tuple(
+            (
+                str(name),
+                tuple(str(value or "").strip() for value in values),
+            )
+            for name, values in self.model_segment_keys
+        )
+        observed_source_rows = tuple(
+            (str(name), tuple(int(value) for value in values))
+            for name, values in self.observed_source_rows
+        )
+        observed_raw_ids = tuple(
+            (str(name), str(raw_id))
+            for name, raw_id in self.observed_raw_ids
+        )
+        names = tuple(name for name, _values in model_y)
+        segment_names = tuple(name for name, _values in model_segment_ids)
+        segment_key_names = tuple(
+            name for name, _values in model_segment_keys
+        )
+        source_row_names = tuple(name for name, _values in observed_source_rows)
+        raw_id_names = tuple(name for name, _raw_id in observed_raw_ids)
+        if (
+            not names
+            or set(names) != {name for name, _values in model_x}
+            or set(names) != {name for name, _values in observed_x}
+            or set(names) != {name for name, _values in observed_y}
+            or set(names) != set(segment_names)
+            or set(names) != set(segment_key_names)
+            or set(names) != set(source_row_names)
+            or set(names) != set(raw_id_names)
+            or len(segment_names) != len(set(segment_names))
+            or len(segment_key_names) != len(set(segment_key_names))
+            or len(source_row_names) != len(set(source_row_names))
+            or len(raw_id_names) != len(set(raw_id_names))
+        ):
+            raise ValueError(
+                "Fit curves require complete model and observation axes "
+                "for every selected series."
+            )
+        for axis, values, field in (
+            (dict(model_x), dict(model_y), "model"),
+            (dict(observed_x), dict(observed_y), "observed"),
+        ):
+            if any(
+                len(axis[name]) != len(values[name])
+                for name in names
+            ):
+                raise ValueError(f"Fit {field} curve X/Y lengths do not align.")
+        model_y_by_name = dict(model_y)
+        observed_y_by_name = dict(observed_y)
+        segments_by_name = dict(model_segment_ids)
+        segment_keys_by_name = dict(model_segment_keys)
+        rows_by_name = dict(observed_source_rows)
+        raw_ids_by_name = dict(observed_raw_ids)
+        if any(
+            len(segments_by_name[name]) != len(model_y_by_name[name])
+            or any(value < 0 for value in segments_by_name[name])
+            or len(segment_keys_by_name[name]) != len(model_y_by_name[name])
+            or any(not value for value in segment_keys_by_name[name])
+            or len(rows_by_name[name]) != len(observed_y_by_name[name])
+            or any(value <= 0 for value in rows_by_name[name])
+            or not raw_ids_by_name[name].strip()
+            for name in names
+        ):
+            raise ValueError(
+                "Fit curves require exact nonnegative segment identity and "
+                "positive source-row/raw-observation provenance."
+            )
+        object.__setattr__(self, "dataset_id", dataset_id)
+        object.__setattr__(self, "display_name", display_name)
+        object.__setattr__(self, "x_name", x_name)
+        object.__setattr__(self, "model_x", model_x)
+        object.__setattr__(self, "model_y", model_y)
+        object.__setattr__(self, "observed_x", observed_x)
+        object.__setattr__(self, "observed_y", observed_y)
+        object.__setattr__(self, "model_segment_ids", model_segment_ids)
+        object.__setattr__(
+            self,
+            "model_segment_keys",
+            model_segment_keys,
+        )
+        object.__setattr__(
+            self,
+            "observed_source_rows",
+            observed_source_rows,
+        )
+        object.__setattr__(self, "observed_raw_ids", observed_raw_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class FitLiveUpdate:
     iteration: int
     cost: float
-    shared_params: Dict[str, float]
-    dataset_params: Dict[str, Dict[str, float]]
-    run_stamp: Dict[str, Any]
-    run_stamp_hash: str
-    run_stamp_short: str
-    render_projection: Any
+    parameters: tuple[tuple[str, float], ...]
+    scalar_values_by_dataset: tuple[
+        tuple[str, tuple[tuple[str, float], ...]], ...
+    ]
+    initial_values_by_set: tuple[
+        tuple[str, tuple[tuple[str, float], ...]], ...
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class FitCandidate:
+    """Scientifically valid terminal result, still local to the Fit window."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    mechanism_source: MechanismAuthoringSource
+    prepared_dsl: PreparedDslRequestSet
+    parameters: tuple[tuple[str, float], ...]
+    scalar_values_by_dataset: tuple[
+        tuple[str, tuple[tuple[str, float], ...]], ...
+    ]
+    initial_values_by_set: tuple[
+        tuple[str, tuple[tuple[str, float], ...]], ...
+    ]
+    execution_by_set: tuple[tuple[str, SimulationExecutionSettings], ...]
+    local_observables: tuple[FitLocalObservable, ...]
+    result: GlobalFitResult
+    curves: tuple[FitCurveDataset, ...]
+    run_identity: FitRunIdentity
+    setup_snapshot: FitSetupSnapshot
+    resolved_auto_modes: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
+            raise TypeError("Fit candidate prepared_dsl must be retained.")
+        if (
+            self.prepared_dsl.analysis.normalized_text
+            != self.mechanism_source.full_dsl.strip()
+        ):
+            raise ValueError(
+                "Fit candidate prepared DSL must exactly match its source."
+            )
+
+    @property
+    def available_scopes(self) -> tuple[str, ...]:
+        scopes: list[str] = []
+        if self.parameters:
+            scopes.append("parameters")
+        if self.initial_values_by_set:
+            scopes.append("initial_concentrations")
+        if self.execution_by_set:
+            scopes.append("simulation_setup")
+        if self.local_observables:
+            scopes.append("observable_definitions")
+        return tuple(scopes)
+
+
+def _observed_curve_parts(
+    observations: tuple[FitSelectedObservation, ...],
+    *,
+    x_by_target: Mapping[str, np.ndarray] | None = None,
+) -> tuple[
+    tuple[tuple[str, tuple[float, ...]], ...],
+    tuple[tuple[str, tuple[float, ...]], ...],
+]:
+    axes = dict(x_by_target or {})
+    return (
+        tuple(
+            (
+                item.model_species,
+                tuple(
+                    float(value)
+                    for value in axes.get(
+                        item.model_species,
+                        np.asarray(item.t, dtype=float),
+                    )
+                ),
+            )
+            for item in observations
+        ),
+        tuple((item.model_species, item.y) for item in observations),
+    )
+
+
+def _observed_x_by_target(
+    mapped: FitMappedDatasetSnapshot,
+    observations: tuple[FitSelectedObservation, ...],
+    local: FitDatasetLocalSettings,
+) -> dict[str, np.ndarray]:
+    parametric = local.parametric
+    if parametric is None:
+        return {}
+    if any(item.model_species == parametric.x_name for item in observations):
+        raise ValueError(
+            f"Dataset {mapped.display_name!r}: selected X={parametric.x_name!r} "
+            "cannot also be a fitted Y target."
+        )
+    sources = [
+        item for item in mapped.observations
+        if item.model_species == parametric.x_name
+    ]
+    if len(sources) != 1:
+        raise ValueError(
+            f"Dataset {mapped.display_name!r} requires exactly one observed "
+            f"source for X={parametric.x_name!r}."
+        )
+    source = sources[0]
+    x_by_row = {
+        int(row): float(value)
+        for row, value in zip(source.source_rows, source.y, strict=True)
+    }
+    aligned: dict[str, np.ndarray] = {}
+    for observation in observations:
+        missing = [
+            row for row in observation.source_rows if int(row) not in x_by_row
+        ]
+        if missing:
+            raise ValueError(
+                f"Dataset {mapped.display_name!r}: X={parametric.x_name!r} "
+                f"is missing {len(missing)} physical source rows for "
+                f"Y={observation.model_species!r}."
+            )
+        aligned[observation.model_species] = np.asarray(
+            [x_by_row[int(row)] for row in observation.source_rows],
+            dtype=float,
+        )
+    return aligned
+
+
+def _dataset_spec(
+    mapped: FitMappedDatasetSnapshot,
+    local: FitDatasetLocalSettings,
+) -> FitDatasetSpec:
+    selected = selected_observations(mapped, local)
+    if local.parametric is not None and any(
+        item.pre_boundary_segment_keys_by_source_row
+        for item in selected
+    ):
+        raise ValueError(
+            "Explicit pre-boundary segment identity is supported only for "
+            "time-X Fit observations."
+        )
+    observation_map = {
+        item.model_species: FitObservationSeries(
+            raw_observation_id=item.raw_observation_id,
+            t=np.asarray(item.t, dtype=float),
+            y=np.asarray(item.y, dtype=float),
+            source_rows=item.source_rows,
+            pre_boundary_segment_keys_by_source_row=(
+                item.pre_boundary_segment_keys_by_source_row
+            ),
+        )
+        for item in selected
+    }
+    x_by_target = _observed_x_by_target(mapped, selected, local)
+    return FitDatasetSpec(
+        dataset_id=mapped.dataset_id,
+        species_list=tuple(item.model_species for item in selected),
+        observations=observation_map,
+        target_weights=dict(local.target_weights),
+        x_name=local.parametric.x_name if local.parametric is not None else "t",
+        x_mode=(
+            local.parametric.resolved_mode
+            if local.parametric is not None
+            else "monotone"
+        ),
+        x_obs_by_species=x_by_target,
+    )
+
+
+def _initial_values_from_result(
+    request: FitExecutionRequest,
+    result: GlobalFitResult,
+) -> tuple[tuple[str, tuple[tuple[str, float], ...]], ...]:
+    fitted_by_key: dict[tuple[str, str], object] = {}
+    for initial in request.initials:
+        if initial.fit:
+            key = (initial.set_id, initial.species)
+            if key in fitted_by_key:
+                raise ValueError(
+                    "Fit result projection repeats a fitted initial row."
+                )
+            fitted_by_key[key] = initial
+    included_ids = {
+        item.dataset_id for item in request.datasets if item.included
+    }
+    datasets_by_set: dict[str, list[str]] = {}
+    for mapped in request.origin.mapped_datasets:
+        if mapped.dataset_id in included_ids:
+            datasets_by_set.setdefault(mapped.set_id, []).append(
+                mapped.dataset_id
+            )
+    values_by_set: dict[str, dict[str, float]] = {}
+    global_values: dict[str, set[float]] = {}
+    for (set_id, species), initial in sorted(fitted_by_key.items()):
+        dataset_ids = sorted(datasets_by_set.get(set_id, ()))
+        if not dataset_ids:
+            continue
+        parameter_name = f"{INITIAL_PREFIX}{species}"
+        coupled_values: set[float] = set()
+        for dataset_id in dataset_ids:
+            dataset_result = result.dataset_params.get(dataset_id)
+            if dataset_result is None or parameter_name not in dataset_result:
+                raise ValueError(
+                    f"Fit result omitted coupled initial {species!r} for "
+                    f"included dataset {dataset_id!r}."
+                )
+            value = float(dataset_result[parameter_name])
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Fit result contains a non-finite initial {species!r}."
+                )
+            coupled_values.add(value)
+        if len(coupled_values) != 1:
+            raise ValueError(
+                f"Fit result disagrees across coupled datasets for initial "
+                f"{species!r} in set {set_id!r}."
+            )
+        value = coupled_values.pop()
+        values_by_set.setdefault(set_id, {})[species] = value
+        if getattr(initial, "scope", "") == "global":
+            global_values.setdefault(species, set()).add(value)
+    inconsistent_global = sorted(
+        species
+        for species, values in global_values.items()
+        if len(values) != 1
+    )
+    if inconsistent_global:
+        raise ValueError(
+            "Fit result disagrees across globally coupled initial rows: "
+            + ", ".join(inconsistent_global)
+        )
+    return tuple(
+        (
+            set_id,
+            _finite_items(values, field=f"Fit initials {set_id}"),
+        )
+        for set_id, values in sorted(values_by_set.items())
+    )
+
+
+def _terminal_setup_snapshot(
+    setup_snapshot: FitSetupSnapshot,
+    *,
+    request: FitExecutionRequest,
+    result: GlobalFitResult,
+    effective_datasets: Mapping[str, FitDatasetLocalSettings],
+    initial_values_by_set: tuple[
+        tuple[str, tuple[tuple[str, float], ...]], ...
+    ],
+) -> FitSetupSnapshot:
+    """Overlay only successful terminal values onto immutable launch rows."""
+
+    included_ids = {
+        item.dataset_id for item in request.datasets if item.included
+    }
+    included_set_ids = {
+        mapped.set_id
+        for mapped in request.origin.mapped_datasets
+        if mapped.dataset_id in included_ids
+    }
+    shared_results = {
+        str(name): float(value)
+        for name, value in result.shared_params.items()
+    }
+    dataset_results = {
+        dataset_id: {
+            str(name): float(value)
+            for name, value in values.items()
+        }
+        for dataset_id, values in result.dataset_params.items()
+        if dataset_id in included_ids
+    }
+    request_parameters = {
+        parameter.name: parameter
+        for parameter in request.parameters
+    }
+    parameters = []
+    for parameter in setup_snapshot.parameters:
+        requested = request_parameters.get(parameter.name)
+        if requested is None:
+            raise ValueError(
+                f"Terminal Fit setup contains unknown parameter "
+                f"{parameter.name!r}."
+            )
+        dataset_values = tuple(parameter.dataset_values)
+        if not requested.fit:
+            parameters.append(
+                replace(parameter, dataset_values=dataset_values)
+            )
+            continue
+        if requested.scope == "shared":
+            if parameter.name not in shared_results:
+                raise ValueError(
+                    f"Fit result omitted shared parameter {parameter.name!r}."
+                )
+            value = shared_results[parameter.name]
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Fit result contains non-finite parameter "
+                    f"{parameter.name!r}."
+                )
+            parameters.append(
+                replace(
+                    parameter,
+                    initial=value,
+                    dataset_values=dataset_values,
+                )
+            )
+            continue
+        expected_ids = {
+            dataset_id
+            for dataset_id, _value in requested.dataset_values
+        }
+        if not included_ids.issubset(expected_ids):
+            raise ValueError(
+                f"Per-dataset parameter {parameter.name!r} no longer "
+                "matches the included dataset identities."
+            )
+        fitted_by_id = dict(requested.dataset_values)
+        for dataset_id, _launch_value in requested.dataset_values:
+            if dataset_id not in included_ids:
+                continue
+            values = dataset_results.get(dataset_id)
+            if values is None or parameter.name not in values:
+                raise ValueError(
+                    f"Fit result omitted per-dataset parameter "
+                    f"{parameter.name!r} for {dataset_id!r}."
+                )
+            value = values[parameter.name]
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Fit result contains non-finite parameter "
+                    f"{parameter.name!r} for {dataset_id!r}."
+                )
+            fitted_by_id[dataset_id] = value
+        fitted_values = [
+            (dataset_id, fitted_by_id[dataset_id])
+            for dataset_id, _value in requested.dataset_values
+        ]
+        fitted_unique_values = {
+            value for _dataset_id, value in fitted_values
+        }
+        parameters.append(
+            replace(
+                parameter,
+                initial=(
+                    fitted_unique_values.pop()
+                    if len(fitted_unique_values) == 1
+                    else parameter.initial
+                ),
+                dataset_values=tuple(fitted_values),
+            )
+        )
+
+    initial_results = {
+        (set_id, species): value
+        for set_id, values in initial_values_by_set
+        for species, value in values
+    }
+    global_initial_results: dict[str, float] = {}
+    for initial in request.initials:
+        if not initial.fit or initial.scope != "global":
+            continue
+        values = {
+            value
+            for (set_id, species), value in initial_results.items()
+            if species == initial.species
+        }
+        if len(values) != 1:
+            raise ValueError(
+                f"Fit result did not resolve one global value for initial "
+                f"{initial.species!r}."
+            )
+        global_initial_results[initial.species] = values.pop()
+    initials = tuple(
+        replace(
+            initial,
+            initial=(
+                global_initial_results[initial.species]
+                if (
+                    initial.scope == "global"
+                    and initial.set_id in included_set_ids
+                )
+                else initial_results[(initial.set_id, initial.species)]
+            ),
+        )
+        if (
+            initial.fit
+            and initial.set_id in included_set_ids
+            and (
+                initial.species in global_initial_results
+                or (initial.set_id, initial.species) in initial_results
+            )
+        )
+        else initial
+        for initial in setup_snapshot.initials
+    )
+    parameter_by_name = {
+        parameter.name: parameter
+        for parameter in parameters
+    }
+    terminal_scalar_values: dict[str, float] = {}
+    for name, parameter in parameter_by_name.items():
+        if parameter.fit and parameter.scope == "per_dataset":
+            values = {
+                float(value)
+                for _dataset_id, value in parameter.dataset_values
+            }
+            if len(values) == 1:
+                terminal_scalar_values[name] = values.pop()
+                continue
+        terminal_scalar_values[name] = parameter.initial
+    local_observables = tuple(
+        replace(
+            observable,
+            scalar_parameters=tuple(
+                replace(
+                    scalar,
+                    value=terminal_scalar_values[scalar.name],
+                    minimum=parameter_by_name[scalar.name].minimum,
+                    maximum=parameter_by_name[scalar.name].maximum,
+                    scope=parameter_by_name[scalar.name].scope,
+                )
+                for scalar in observable.scalar_parameters
+            ),
+        )
+        for observable in setup_snapshot.local_observables
+    )
+    return replace(
+        setup_snapshot,
+        datasets=tuple(
+            effective_datasets.get(item.dataset_id, item)
+            for item in setup_snapshot.datasets
+        ),
+        parameters=tuple(parameters),
+        initials=initials,
+        local_observables=local_observables,
+    )
+
+
+def _curves_from_result(
+    request: FitExecutionRequest,
+    result: GlobalFitResult,
+) -> tuple[FitCurveDataset, ...]:
+    mapped_by_id = {item.dataset_id: item for item in request.origin.mapped_datasets}
+    local_by_id = {item.dataset_id: item for item in request.datasets}
+    curves: list[FitCurveDataset] = []
+    for dataset_id, model_series in result.plot_model_series.items():
+        mapped = mapped_by_id[dataset_id]
+        local = local_by_id[dataset_id]
+        selected = selected_observations(mapped, local)
+        observed_x, observed_y = _observed_curve_parts(
+            selected,
+            x_by_target=result.plot_observed_x.get(dataset_id),
+        )
+        axes = result.plot_model_x_by_species.get(dataset_id, {})
+        curves.append(
+            FitCurveDataset(
+                dataset_id=dataset_id,
+                display_name=mapped.display_name,
+                model_x=tuple(
+                    (
+                        species,
+                        tuple(float(value) for value in np.asarray(axes[species])),
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
+                model_y=tuple(
+                    (
+                        species,
+                        tuple(float(value) for value in np.asarray(values)),
+                    )
+                    for species, values in model_series.items()
+                    if species in axes
+                ),
+                observed_x=observed_x,
+                observed_y=observed_y,
+                model_segment_ids=tuple(
+                    (
+                        species,
+                        tuple(
+                            int(value)
+                            for value in np.asarray(
+                                result.plot_model_segment_ids[
+                                    dataset_id
+                                ][species],
+                                dtype=np.int64,
+                            )
+                        ),
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
+                model_segment_keys=tuple(
+                    (
+                        species,
+                        tuple(
+                            result.plot_model_segment_keys[
+                                dataset_id
+                            ][species]
+                        ),
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
+                observed_source_rows=tuple(
+                    (
+                        species,
+                        tuple(
+                            result.plot_observed_source_rows[
+                                dataset_id
+                            ][species]
+                        ),
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
+                observed_raw_ids=tuple(
+                    (
+                        species,
+                        result.plot_observed_raw_ids[
+                            dataset_id
+                        ][species],
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
+                x_name=(
+                    local.parametric.x_name
+                    if local.parametric is not None
+                    else "t"
+                ),
+            )
+        )
+    return tuple(curves)
+
+
+def _curves_from_evaluations(
+    request: FitExecutionRequest,
+    evaluations: Mapping[str, object],
+    effective_local: Mapping[str, FitDatasetLocalSettings],
+) -> tuple[FitCurveDataset, ...]:
+    """Build Fit-local live curves from exact typed evaluator payloads."""
+
+    mapped_by_id = {
+        item.dataset_id: item for item in request.origin.mapped_datasets
+    }
+    curves: list[FitCurveDataset] = []
+    for dataset_id, raw_evaluation in evaluations.items():
+        if not hasattr(raw_evaluation, "series") or not hasattr(
+            raw_evaluation,
+            "segment_ids",
+        ):
+            raise TypeError("Live Fit evaluation lost its typed series payload.")
+        evaluation = raw_evaluation
+        local = effective_local[dataset_id]
+        mapped = mapped_by_id[dataset_id]
+        selected = selected_observations(mapped, local)
+        observed_axes = _observed_x_by_target(mapped, selected, local)
+        observed_x, observed_y = _observed_curve_parts(
+            selected,
+            x_by_target=observed_axes,
+        )
+        series = evaluation.series
+        segment_ids = tuple(
+            int(value)
+            for value in np.asarray(
+                evaluation.segment_ids,
+                dtype=np.int64,
+            ).reshape(-1)
+        )
+        segment_keys = tuple(
+            str(value)
+            for value in evaluation.segment_keys
+        )
+        x_name = (
+            local.parametric.x_name
+            if local.parametric is not None
+            else "t"
+        )
+        model_axis = (
+            np.asarray(series.t, dtype=float)
+            if x_name == "t"
+            else np.asarray(series.species[x_name], dtype=float)
+        )
+        curves.append(
+            FitCurveDataset(
+                dataset_id=dataset_id,
+                display_name=mapped.display_name,
+                model_x=tuple(
+                    (
+                        item.model_species,
+                        tuple(float(value) for value in model_axis),
+                    )
+                    for item in selected
+                ),
+                model_y=tuple(
+                    (
+                        item.model_species,
+                        tuple(
+                            float(value)
+                            for value in np.asarray(
+                                series.species[item.model_species],
+                                dtype=float,
+                            )
+                        ),
+                    )
+                    for item in selected
+                ),
+                observed_x=observed_x,
+                observed_y=observed_y,
+                model_segment_ids=tuple(
+                    (item.model_species, segment_ids)
+                    for item in selected
+                ),
+                model_segment_keys=tuple(
+                    (item.model_species, segment_keys)
+                    for item in selected
+                ),
+                observed_source_rows=tuple(
+                    (item.model_species, item.source_rows)
+                    for item in selected
+                ),
+                observed_raw_ids=tuple(
+                    (
+                        item.model_species,
+                        item.raw_observation_id,
+                    )
+                    for item in selected
+                ),
+                x_name=x_name,
+            )
+        )
+    return tuple(curves)
 
 
 class GlobalFitWorker(QtCore.QThread):
-    """Worker that drives multi-dataset fitting via an injected fitter."""
+    """Run one immutable request and retain every evaluator until terminal."""
 
-    progress = Signal(int, str)
-    bestUpdated = Signal(dict)
-    finished = Signal(dict)
-    error = Signal(object)
+    progress = QtCore.Signal(int, str)
+    auto_modes_resolved = QtCore.Signal(object)
+    best_updated = QtCore.Signal(object)
+    curves_updated = QtCore.Signal(object)
+    run_identity_ready = QtCore.Signal(object)
+    succeeded = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+    detailed_balance_correction_required = QtCore.Signal(object)
 
     def __init__(
         self,
-        datasets: List[object],
-        shared_params: Dict[str, float],
+        request: FitExecutionRequest,
         *,
-        dataset_overrides: Optional[List[object]] = None,
-        dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
-        dataset_variable_params: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
-        bounds: Optional[Dict[str, Tuple[float, float]]] = None,
-        weights: Optional[Dict[str, float]] = None,
-        method: str = "trf",
-        max_nfev: int = 1000,
-        ftol: float = 1e-10,
-        xtol: float = 1e-10,
-        seed: Optional[int] = None,
-        log10_params: Optional[Dict[str, bool]] = None,
-        fit_evaluator: Optional[object] = None,
-        fit_runtime_session: Optional[object] = None,
-        fit_runtime_max_lanes: Optional[int] = None,
-        fit_runtime_ledger: Optional[object] = None,
-        fit_func: Optional[Callable[..., "GlobalFitResult"]] = None,
-        solver: str = FITTING_DEFAULT_SOLVER,
-        rtol: float = 1e-6,
-        atol: float = 1e-12,
-        best_update_interval_s: float = 0.25,
-        render_projection_interval_s: float = 2.0,
-        run_stamp: Optional[Dict[str, Any]] = None,
-        run_stamp_hash: Optional[str] = None,
-        run_stamp_short: Optional[str] = None,
-        parent: Optional[QtCore.QObject] = None,
-    ):
+        setup_snapshot: FitSetupSnapshot | None = None,
+        parent: QtCore.QObject | None = None,
+    ) -> None:
         super().__init__(parent)
-        self._dataset_specs: list[FitDatasetSpec] = coerce_fit_dataset_specs(list(datasets))
-        self._datasets: list[FitDatasetSpec] = list(self._dataset_specs)
-        self._shared_params = dict(shared_params)
-        self._dataset_overrides: list[FitDatasetParameterOverrides] = coerce_fit_dataset_parameter_overrides(
-            dataset_ids=[spec.dataset_id for spec in self._dataset_specs],
-            dataset_overrides=dataset_overrides,
-            dataset_params=dataset_params,
-            dataset_variable_params=dataset_variable_params,
+        if not isinstance(request, FitExecutionRequest):
+            raise TypeError("request must be FitExecutionRequest.")
+        self._request = request
+        self._setup_snapshot = (
+            setup_snapshot or FitSetupSnapshot.from_request(request)
         )
-        dataset_params_map, dataset_variable_params_map = split_fit_dataset_parameter_overrides(self._dataset_overrides)
-        self._dataset_params = {
-            ds_id: {name: float(value) for name, value in param_map.items()}
-            for ds_id, param_map in dataset_params_map.items()
-        }
-        self._dataset_variable_params = {
-            ds_id: {
-                name: {
-                    "initial": float(spec["initial"]),
-                    "min": float(spec["min"]),
-                    "max": float(spec["max"]),
-                    "log10": bool(spec.get("log10", False)),
-                }
-                for name, spec in param_map.items()
-            }
-            for ds_id, param_map in dataset_variable_params_map.items()
-        }
-        self._bounds = dict(bounds or {})
-        self._weights = dict(weights or {})
-        self._method = method
-        self._max_nfev = max(1, int(max_nfev))
-        self._ftol = float(ftol)
-        self._xtol = float(xtol)
-        self._seed = seed
-        self._log10_params = {str(k): bool(v) for k, v in (log10_params or {}).items()}
-        self._fit_evaluator = coerce_fitting_series_evaluator(fit_evaluator) if fit_evaluator is not None else None
-        self._fit_runtime_session = fit_runtime_session
-        self._fit_runtime_max_lanes = None if fit_runtime_max_lanes is None else max(1, int(fit_runtime_max_lanes))
-        self._fit_runtime_ledger = fit_runtime_ledger
-        if fit_func is None:
-            from kindred.core.analysis.global_fitting import fit_global as default_fit_global
-
-            fit_func = default_fit_global
-        self._fit_func = fit_func
-        solver_label = str(solver or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
-        solver_method = normalize_solver_name(solver_label)
-        self._solver = str(solver_method)
-        # Tolerances are baked into the simulation closure; kwargs accepted here for API consistency.
-        self._best_update_interval_s = max(0.0, float(best_update_interval_s))
-        self._render_projection_interval_s = max(0.0, float(render_projection_interval_s))
-        self._cancelled = False
-        self._pause_event = threading.Event()
-        self._pause_event.set()
-        self._run_thread_ident: int | None = None
-        self._run_stamp = dict(run_stamp or {}) if isinstance(run_stamp, dict) else {}
-        self._run_stamp_hash = str(run_stamp_hash or "")
-        self._run_stamp_short = str(run_stamp_short or "")
-
-        self._best_cost = float("inf")
+        self._cancelled = Event()
+        self._pause_condition = Condition()
+        self._paused = False
+        self._last_best_emit = 0.0
+        self._last_curve_emit = 0.0
+        self._best_cost = math.inf
         self._best_iteration = 0
-        self._best_params: Dict[str, float] = {}
-        self._pending_best = False
-        self._last_best_emit_ts = 0.0
-        self._last_render_projection_attempt_ts = 0.0
-        self._last_render_projection_success_ts = 0.0
-
-    def cancel(self) -> None:
-        """Request cancellation from the worker."""
-        self._cancelled = True
-        self._pause_event.set()
-        cancel_runtime = getattr(self._fit_runtime_session, "cancel_run", None)
-        if callable(cancel_runtime):
-            cancel_runtime()
+        self._best_params: dict[str, float] = {}
+        self._resolved_auto_modes: tuple[tuple[str, str], ...] = ()
+        self._run_identity: FitRunIdentity | None = None
+        self._detailed_balance_condition = Condition()
+        self._detailed_balance_response: tuple[
+            FitExecutionRequest,
+            FitSetupSnapshot,
+        ] | None = None
+        self._detailed_balance_answered = False
+        self._pending_detailed_balance_request_id: str | None = None
+        self._detailed_balance_rejection_message: str | None = None
 
     def pause(self) -> None:
-        """Pause optimization at the next cooperative boundary."""
-        self._pause_event.clear()
+        with self._pause_condition:
+            self._paused = True
+
+    @property
+    def resolved_auto_modes(self) -> tuple[tuple[str, str], ...]:
+        return self._resolved_auto_modes
+
+    @property
+    def run_identity(self) -> FitRunIdentity | None:
+        return self._run_identity
+
+    @property
+    def publication_fenced(self) -> bool:
+        return self._cancelled.is_set() or self.isInterruptionRequested()
 
     def resume(self) -> None:
-        """Resume a paused optimization run."""
-        self._pause_event.set()
+        with self._pause_condition:
+            self._paused = False
+            self._pause_condition.notify_all()
 
-    def _wait_if_paused(self) -> None:
-        if self._cancelled:
-            return
-        self._pause_event.wait()
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._pause_condition:
+            self._paused = False
+            self._pause_condition.notify_all()
+        with self._detailed_balance_condition:
+            self._detailed_balance_answered = True
+            self._detailed_balance_response = None
+            self._detailed_balance_condition.notify_all()
+        self.requestInterruption()
+
+    def submit_detailed_balance_correction(
+        self,
+        request_id: str,
+        corrected_request: FitExecutionRequest | None,
+        corrected_snapshot: FitSetupSnapshot | None = None,
+        *,
+        rejection_message: str | None = None,
+    ) -> None:
+        with self._detailed_balance_condition:
+            if self._detailed_balance_answered:
+                return
+            if str(request_id) != self._pending_detailed_balance_request_id:
+                raise ValueError(
+                    "Detailed-balance correction request identity does not match."
+                )
+            if corrected_request is None:
+                self._detailed_balance_response = None
+                self._detailed_balance_rejection_message = (
+                    str(rejection_message or "").strip()
+                    or "Detailed-balance correction was not accepted; Fit aborted."
+                )
+            else:
+                if corrected_snapshot is None:
+                    raise TypeError("A corrected Fit setup snapshot is required.")
+                if rejection_message is not None:
+                    raise ValueError(
+                        "An accepted detailed-balance correction cannot carry "
+                        "a rejection message."
+                    )
+                self._detailed_balance_response = (
+                    corrected_request,
+                    corrected_snapshot,
+                )
+                self._detailed_balance_rejection_message = None
+            self._detailed_balance_answered = True
+            self._detailed_balance_condition.notify_all()
+
+    def _checkpoint(self) -> bool:
+        with self._pause_condition:
+            while self._paused and not self._cancelled.is_set():
+                self._pause_condition.wait()
+        return self._cancelled.is_set()
 
     def run(self) -> None:
-        self._run_thread_ident = threading.get_ident()
         try:
-            payload = self._execute()
-        except FittingCancelled as exc:
-            self.error.emit(self._failure_payload_from_exception(exc))
-            return
-        except RuntimeError as exc:  # pragma: no cover - defensive boundary
-            self.error.emit(self._failure_payload_from_exception(exc))
-        except Exception as exc:  # pragma: no cover - defensive guard
-            logger.error("Global fit failed: %s", exc, exc_info=True)
-            self.error.emit(self._failure_payload_from_exception(exc))
+            try:
+                candidate = self._execute(
+                    allow_detailed_balance_correction=True
+                )
+            except _DetailedBalanceCorrectionRequired as correction:
+                with self._detailed_balance_condition:
+                    self._detailed_balance_answered = False
+                    self._detailed_balance_response = None
+                    self._detailed_balance_rejection_message = None
+                    self._pending_detailed_balance_request_id = (
+                        correction.request.request_id
+                    )
+                if self._checkpoint():
+                    raise FittingCancelled()
+                self.detailed_balance_correction_required.emit(
+                    correction.request
+                )
+                if self._checkpoint():
+                    raise FittingCancelled()
+                with self._detailed_balance_condition:
+                    while (
+                        not self._detailed_balance_answered
+                        and not self._cancelled.is_set()
+                    ):
+                        self._detailed_balance_condition.wait()
+                    response = self._detailed_balance_response
+                    rejection_message = (
+                        self._detailed_balance_rejection_message
+                    )
+                    self._pending_detailed_balance_request_id = None
+                if self._cancelled.is_set():
+                    raise FittingCancelled()
+                if response is None:
+                    raise RuntimeError(
+                        rejection_message
+                        or "Detailed-balance correction was not accepted; "
+                        "Fit aborted."
+                    )
+                self._request, self._setup_snapshot = response
+                self._best_cost = math.inf
+                self._best_iteration = 0
+                self._best_params = {}
+                self._resolved_auto_modes = ()
+                self._run_identity = None
+                candidate = self._execute(
+                    allow_detailed_balance_correction=False
+                )
+        except FittingCancelled:
+            self.failed.emit("Fit cancelled.")
+        except BaseException as exc:  # noqa: BLE001
+            self.failed.emit(str(exc) or type(exc).__name__)
         else:
-            if payload is not None:
-                self.finished.emit(payload)
-        finally:
-            self._run_thread_ident = None
-
-    def _failure_payload_from_exception(self, exc: BaseException) -> dict[str, Any]:
-        def _with_run_stamp(payload: dict[str, Any]) -> dict[str, Any]:
-            payload["run_stamp"] = dict(self._run_stamp)
-            payload["run_stamp_hash"] = str(self._run_stamp_hash)
-            payload["run_stamp_short"] = str(self._run_stamp_short)
-            return payload
-
-        if isinstance(exc, FitSimulationError):
-            nested = exc.details.get("failure") if isinstance(getattr(exc, "details", None), Mapping) else None
-            if isinstance(nested, Mapping) and "kind" in nested and "message" in nested:
-                return _with_run_stamp(coerce_simulation_failure(nested))
-            return _with_run_stamp(
-                build_simulation_failure(
-                    "fitting_error",
-                    str(getattr(exc, "message", None) or str(exc)),
-                    code=getattr(exc, "code", None),
-                    context=getattr(exc, "context", None),
-                    details=getattr(exc, "details", None),
-                    exc_type=exc.__class__.__name__,
-                )
-            )
-        if isinstance(exc, FittingCancelled):
-            details = dict(getattr(exc, "details", None) or {})
-            original_message = str(getattr(exc, "message", None) or str(exc) or "")
-            if original_message and original_message != "Fit cancelled by user":
-                details.setdefault("origin_message", original_message)
-            return _with_run_stamp(
-                build_simulation_failure(
-                    "cancelled",
-                    "Fit cancelled by user",
-                    code=getattr(exc, "code", None),
-                    context=getattr(exc, "context", None),
-                    details=details,
-                    exc_type=exc.__class__.__name__,
-                )
-            )
-        return _with_run_stamp(
-            build_simulation_failure(
-                "fitting_error",
-                str(exc) or exc.__class__.__name__,
-                exc_type=exc.__class__.__name__,
-            )
-        )
-
-    def _execute(self) -> Optional[GlobalFitFinishedPayloadV1]:
-        """Execute fit_global with progress and cancellation hooks."""
-        if not self._datasets:
-            raise RuntimeError("No datasets were provided.")
-        if self._fit_evaluator is None:
-            raise RuntimeError("Fit evaluator is not configured.")
-        if type(self._fit_evaluator) is SerialFittingEvaluator and not self._runtime_session_ready_for_fit():
-            raise RuntimeError("A required fitting runtime session is not ready for this global fit worker.")
-
-        def progress_callback(iteration: int, cost: float, params: Dict[str, float]) -> None:
-            self._wait_if_paused()
-            if self._cancelled:
-                raise FittingCancelled()
-            fraction = int(100 * iteration / max(1, self._max_nfev))
-            percent = min(95, max(5, fraction))
-            message = f"Iteration {iteration}: Objective SSQ={cost:.4g}"
-            self.progress.emit(percent, message)
-            self._maybe_emit_best(iteration, cost, params)
-
-        def cancellation_check() -> bool:
-            self._wait_if_paused()
-            return self._cancelled
-
-        def wait_for_resume(timeout_s: float) -> bool:
-            if self._cancelled:
-                return True
-            return bool(self._pause_event.wait(timeout=float(timeout_s)))
-
-        cancellation_check._kindred_nonblocking_cancelled = lambda: self._cancelled
-        cancellation_check._kindred_nonblocking_paused = lambda: not self._pause_event.is_set()
-        cancellation_check._kindred_wait_for_resume = wait_for_resume
-
-        self._best_cost = float("inf")
-        self._best_iteration = 0
-        self._best_params = {}
-        self._pending_best = False
-        self._last_best_emit_ts = 0.0
-        self._last_render_projection_attempt_ts = 0.0
-        self._last_render_projection_success_ts = 0.0
-
-        self.progress.emit(5, f"Running global fit... [{self._solver}]")
-        result = self._fit_func(
-            self._fit_evaluator,
-            self._datasets,
-            dict(self._shared_params),
-            dataset_overrides=list(self._dataset_overrides),
-            bounds=self._bounds,
-            weights=self._weights,
-            method=self._method,
-            max_nfev=self._max_nfev,
-            ftol=self._ftol,
-            xtol=self._xtol,
-            seed=self._seed,
-            log10_params=self._log10_params,
-            progress_callback=progress_callback,
-            cancellation_check=cancellation_check,
-            runtime_session=self._fit_runtime_session,
-            max_runtime_lanes=self._fit_runtime_max_lanes,
-            runtime_ledger=self._fit_runtime_ledger,
-        )
-        if self._cancelled:
-            raise FittingCancelled()
-
-        self._flush_pending_best()
-        self.progress.emit(100, "Fit complete")
-        return self._build_finished_payload(result)
-
-    def _runtime_session_ready_for_fit(self) -> bool:
-        runtime_session = self._fit_runtime_session
-        if runtime_session is None:
-            return False
-        is_ready = getattr(runtime_session, "is_ready", None)
-        if not callable(is_ready):
-            return False
-        try:
-            if self._fit_runtime_max_lanes is None:
-                lane_count = None
+            if self._checkpoint():
+                self.failed.emit("Fit cancelled.")
             else:
-                lane_count = max(1, int(self._fit_runtime_max_lanes))
-            return bool(is_ready(lane_count=lane_count))
-        except Exception:
-            return False
+                self.succeeded.emit(candidate)
+                if self._checkpoint():
+                    return
 
-    def _build_finished_payload(self, result: "GlobalFitResult") -> GlobalFitFinishedPayloadV1:
-        return {
-            "version": 1,
-            "result": result,
-            "weights": dict(self._weights),
-            "run_stamp": dict(self._run_stamp),
-            "run_stamp_hash": str(self._run_stamp_hash),
-            "run_stamp_short": str(self._run_stamp_short),
-        }
-
-    def _maybe_emit_best(self, iteration: int, cost: float, params: Dict[str, float]) -> None:
-        """Emit bestUpdated when cost improves (throttled)."""
-        try:
-            cost_val = float(cost)
-        except Exception:
-            return
-        if not np.isfinite(cost_val):
-            return
-        if cost_val >= self._best_cost:
-            return
-
-        self._best_cost = cost_val
-        self._best_iteration = int(iteration)
-        self._best_params = {str(k): float(v) for k, v in (params or {}).items()}
-        self._pending_best = True
-        now = time.monotonic()
-        if self._best_update_interval_s <= 0.0 or (now - self._last_best_emit_ts) >= self._best_update_interval_s:
-            self._emit_best_payload()
-
-    def _flush_pending_best(self) -> None:
-        if not self._best_params:
-            return
-        self._pending_best = True
-        self._emit_best_payload()
-
-    def _emit_best_payload(self) -> None:
-        self._wait_if_paused()
-        if self._cancelled or not self._pending_best or not self._best_params:
-            self._pending_best = False
-            return
-
-        now = time.monotonic()
-        shared_params = self._best_payload_shared_params()
-        dataset_params = self._best_payload_dataset_params()
-        render_projection = self._maybe_build_live_render_projection(
-            now=now,
-            shared_params=shared_params,
-            dataset_params=dataset_params,
-        )
-
-        payload: GlobalFitBestUpdatedPayloadV1 = {
-            "version": 1,
-            "iteration": int(self._best_iteration),
-            "cost": float(self._best_cost),
-            "shared_params": dict(shared_params),
-            "dataset_params": dataset_params,
-            "run_stamp": dict(self._run_stamp),
-            "run_stamp_hash": str(self._run_stamp_hash),
-            "run_stamp_short": str(self._run_stamp_short),
-            "render_projection": render_projection,
-        }
-        self._pending_best = False
-        self._last_best_emit_ts = now
-        self.bestUpdated.emit(payload)
-
-    def _maybe_build_live_render_projection(
+    def _execute(
         self,
         *,
-        now: float,
-        shared_params: Dict[str, float],
-        dataset_params: Dict[str, Dict[str, float]],
-    ) -> Optional[FitRenderProjection]:
-        if self._cancelled or not self._run_stamp_hash:
-            return None
-        if self._fit_evaluator is None:
-            return None
-        elapsed = float(now) - float(self._last_render_projection_attempt_ts)
-        if self._last_render_projection_attempt_ts > 0.0 and elapsed < self._render_projection_interval_s:
-            return None
-        self._last_render_projection_attempt_ts = float(now)
-        try:
-            layout = build_parameter_layout(
-                payloads=list(self._dataset_specs),
-                shared_params=dict(self._shared_params),
-                dataset_variable_params=dict(self._dataset_variable_params),
-                bounds=dict(self._bounds),
-                log10_params=dict(self._log10_params),
-            )
-            weights = normalize_weights(list(self._dataset_specs), dict(self._weights))
-            fit_evaluator = self._live_projection_evaluator()
-            result = assemble_global_fit_result(
-                fit_evaluator=fit_evaluator,
-                payloads=list(self._dataset_specs),
-                layout=layout,
-                fitted_params=dict(shared_params),
-                combined_dataset_params={str(ds_id): dict(values) for ds_id, values in dataset_params.items()},
-                weights=weights,
-                penalty_value=1e6,
-                cancellation_check=lambda: bool(self._cancelled),
-                success=True,
-                message="Live best projection",
-                nfev=int(self._best_iteration),
-                covariance=None,
-                objective_residuals=None,
-                uncertainties=None,
-                optimizer_diagnostic=None,
-            )
-            projection = projection_from_global_fit_result(
-                result,
-                run_stamp_hash=str(self._run_stamp_hash),
-                phase="live",
-                cost=float(self._best_cost),
-            )
-        except Exception as exc:
-            logger.debug("Skipping live fit render projection: %s", exc)
-            return None
-        self._last_render_projection_success_ts = float(now)
-        return projection
+        allow_detailed_balance_correction: bool,
+    ) -> FitCandidate:
+        request = self._request
+        included = [item for item in request.datasets if item.included]
+        mapped_by_id = {item.dataset_id: item for item in request.origin.mapped_datasets}
+        if not included:
+            raise ValueError("Select at least one mapped dataset for fitting.")
+        included_ids = tuple(item.dataset_id for item in included)
 
-    def _live_projection_evaluator(self) -> object:
-        runtime_session = self._fit_runtime_session
-        if runtime_session is not None:
-            evaluator = getattr(runtime_session, "evaluator", None)
-            if callable(evaluator):
-                return evaluator(cancellation_check=lambda: bool(self._cancelled))
-        return self._fit_evaluator
-
-    def _best_payload_shared_params(self) -> dict[str, float]:
-        shared_params = dict(self._shared_params)
-        for name in list(shared_params.keys()):
-            if name in self._best_params:
-                shared_params[name] = float(self._best_params[name])
-        return {str(k): float(v) for k, v in shared_params.items()}
-
-    def _best_payload_dataset_params(self) -> dict[str, dict[str, float]]:
-        dataset_params: dict[str, dict[str, float]] = {
-            str(spec.dataset_id): dict(self._dataset_params.get(spec.dataset_id, {}))
-            for spec in self._dataset_specs
-            if str(getattr(spec, "dataset_id", "") or "").strip()
+        shared_variables: list[FitSharedVariableParamSpec] = []
+        coupled_variables: list[FitCoupledVariableParamSpec] = []
+        variable_by_dataset: dict[str, list[FitDatasetVariableParamSpec]] = {
+            dataset_id: [] for dataset_id in included_ids
         }
-        for key, value in self._best_params.items():
-            if "::" not in key:
+        fixed_by_dataset: dict[str, dict[str, float]] = {
+            dataset_id: {} for dataset_id in included_ids
+        }
+
+        for parameter in request.parameters:
+            dataset_values = dict(parameter.dataset_values)
+            if parameter.fit and parameter.scope == "shared":
+                shared_variables.append(
+                    FitSharedVariableParamSpec(
+                        name=parameter.name,
+                        initial=parameter.initial,
+                        minimum=parameter.minimum,
+                        maximum=parameter.maximum,
+                        log10=parameter.log10,
+                    )
+                )
+            elif parameter.fit:
+                for dataset_id in included_ids:
+                    variable_by_dataset[dataset_id].append(
+                        FitDatasetVariableParamSpec(
+                            name=parameter.name,
+                            initial=dataset_values[dataset_id],
+                            minimum=parameter.minimum,
+                            maximum=parameter.maximum,
+                            log10=parameter.log10,
+                        )
+                    )
+            elif parameter.scope == "per_dataset":
+                for dataset_id in included_ids:
+                    fixed_by_dataset[dataset_id][parameter.name] = float(
+                        dataset_values[dataset_id]
+                    )
+            else:
+                for dataset_id in included_ids:
+                    fixed_by_dataset[dataset_id][parameter.name] = float(
+                        parameter.initial
+                    )
+
+        datasets_for_set: dict[str, tuple[str, ...]] = {}
+        for mapped in request.origin.mapped_datasets:
+            if mapped.dataset_id in included_ids:
+                datasets_for_set.setdefault(mapped.set_id, ())
+                datasets_for_set[mapped.set_id] = (
+                    *datasets_for_set[mapped.set_id],
+                    mapped.dataset_id,
+                )
+        initials_by_species: dict[str, list[object]] = {}
+        for initial in request.initials:
+            initials_by_species.setdefault(initial.species, []).append(initial)
+        for species, rows in initials_by_species.items():
+            active_rows = [
+                item
+                for item in rows
+                if datasets_for_set.get(item.set_id)
+            ]
+            global_rows = [
+                item for item in active_rows if item.scope == "global"
+            ]
+            if global_rows:
+                if len(global_rows) != len(active_rows):
+                    raise ValueError(
+                        f"Initial {species!r} mixes Global and Local scope."
+                    )
+                signatures = {
+                    (
+                        item.initial,
+                        item.minimum,
+                        item.maximum,
+                        item.fit,
+                        item.log10,
+                    )
+                    for item in global_rows
+                }
+                if len(signatures) != 1:
+                    raise ValueError(
+                        f"Global initial {species!r} has inconsistent "
+                        "coupled setup rows."
+                    )
+                (
+                    initial_value,
+                    minimum,
+                    maximum,
+                    fitted,
+                    log10,
+                ) = signatures.pop()
+                if fitted:
+                    coupled_variables.append(
+                        FitCoupledVariableParamSpec(
+                            variable_id=f"initial:global:{species}",
+                            parameter_name=f"{INITIAL_PREFIX}{species}",
+                            dataset_ids=included_ids,
+                            initial=initial_value,
+                            minimum=minimum,
+                            maximum=maximum,
+                            log10=log10,
+                        )
+                    )
+                else:
+                    for dataset_id in included_ids:
+                        fixed_by_dataset[dataset_id][f"{INITIAL_PREFIX}{species}"] = (
+                            initial_value
+                        )
                 continue
-            ds_id, param_name = key.split("::", 1)
-            if not ds_id or not param_name:
+            for initial in active_rows:
+                target_datasets = datasets_for_set.get(initial.set_id, ())
+                if not target_datasets:
+                    continue
+                value = initial.initial
+                if initial.fit:
+                    coupled_variables.append(
+                        FitCoupledVariableParamSpec(
+                            variable_id=f"initial:{initial.set_id}:{species}",
+                            parameter_name=f"{INITIAL_PREFIX}{species}",
+                            dataset_ids=target_datasets,
+                            initial=value,
+                            minimum=initial.minimum,
+                            maximum=initial.maximum,
+                            log10=initial.log10,
+                        )
+                    )
+                else:
+                    for dataset_id in target_datasets:
+                        fixed_by_dataset[dataset_id][f"{INITIAL_PREFIX}{species}"] = value
+
+        overrides = tuple(
+            FitDatasetParameterOverrides(
+                dataset_id=dataset_id,
+                fixed_params=tuple(sorted(fixed_by_dataset[dataset_id].items())),
+                variable_params=tuple(variable_by_dataset[dataset_id]),
+            )
+            for dataset_id in included_ids
+        )
+        candidate_names = sorted(
+            parameter.name
+            for parameter in request.parameters
+            if not parameter.name.startswith(INITIAL_PREFIX)
+        )
+        evaluators: dict[str, SerialFittingEvaluator] = {}
+        prepared_ids: dict[str, dict[str, object]] = {}
+        for local in included:
+            if self._checkpoint():
+                raise FittingCancelled()
+            science = request.origin.scientific_settings
+            execution = local.execution
+            try:
+                context = prepare_fitting_execution_context(
+                    prepared_dsl=request.prepared_dsl,
+                    param_names=candidate_names,
+                    t_start=float(execution.t_start),
+                    t_end=float(execution.t_end),
+                    num_points=int(execution.integration_points),
+                    solver=execution.solver,
+                    rtol=float(science.rtol),
+                    atol=float(science.atol),
+                    use_sparse_jacobian=bool(science.sparse_jacobian_policy),
+                    wegscheider_cyclicity_enabled=bool(
+                        science.wegscheider_policy
+                    ),
+                    initial_prefix=INITIAL_PREFIX,
+                )
+            except BaseException as exc:
+                unresolved = _unresolved_detailed_balance_error(exc)
+                if (
+                    allow_detailed_balance_correction
+                    and unresolved is not None
+                ):
+                    issue = str(unresolved)
+                    identity = FitRunIdentity.build(
+                        {
+                            "kind": "detailed_balance_correction",
+                            "schema_version": 1,
+                            "origin_capture_id": request.origin.capture_id,
+                            "tab_id": request.origin.tab_id,
+                            "source": (
+                                request.origin.mechanism_source.reactions_text
+                            ),
+                            "temperature_K": float(science.temperature),
+                            "wegscheider_cyclicity_enabled": bool(
+                                science.wegscheider_policy
+                            ),
+                            "issue": issue,
+                        }
+                    )
+                    raise _DetailedBalanceCorrectionRequired(
+                        DetailedBalanceCorrectionRequest(
+                            request_id=identity.short_hash,
+                            origin="Fit",
+                            tab_id=request.origin.tab_id,
+                            source=(
+                                request.origin.mechanism_source.reactions_text
+                            ),
+                            issue=issue,
+                            temperature_K=float(science.temperature),
+                        )
+                    ) from exc
+                raise
+            evaluator = SerialFittingEvaluator(
+                context,
+                fixed_param_origins={
+                    name: FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
+                    for name in fixed_by_dataset[local.dataset_id]
+                },
+            )
+            evaluator.set_cancellation_check(self._checkpoint)
+            evaluators[local.dataset_id] = evaluator
+            metadata = evaluator.prepared_metadata
+            prepared_ids[local.dataset_id] = {
+                "prepared_simulation": metadata.to_serializable_dict(),
+                "declarative_analysis_identity": (
+                    request.prepared_dsl.analysis.identity
+                ),
+                "execution": {
+                    "solver": execution.solver,
+                    "t_start": float(execution.t_start),
+                    "t_end": float(execution.t_end),
+                    "integration_points": int(execution.integration_points),
+                },
+            }
+
+        effective_local: dict[str, FitDatasetLocalSettings] = {}
+        resolved_mode_items: list[tuple[str, str]] = []
+        starting_evaluations = {}
+        for local in included:
+            chosen = local
+            dataset_id = local.dataset_id
+            mapped = mapped_by_id[dataset_id]
+            starting_values = {
+                parameter.name: (
+                    dict(parameter.dataset_values)[dataset_id]
+                    if parameter.scope == "per_dataset"
+                    else parameter.initial
+                )
+                for parameter in request.parameters
+            }
+            starting_values.update(fixed_by_dataset[dataset_id])
+            for initial in request.initials:
+                if initial.set_id != mapped.set_id:
+                    continue
+                starting_values[
+                    f"{INITIAL_PREFIX}{initial.species}"
+                ] = initial.initial
+            evaluation = evaluators[
+                dataset_id
+            ].evaluate_series_with_parameter_origins(
+                starting_values,
+                {
+                    name: FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
+                    for name in starting_values
+                },
+            )
+            starting_evaluations[dataset_id] = evaluation
+            prepared_ids[dataset_id]["validated_executable_schedule"] = (
+                evaluation.intervention_execution.provenance_projection()
+            )
+            if (
+                local.parametric is not None
+                and local.parametric.requested_mode == "auto"
+            ):
+                provisional = _dataset_spec(
+                    mapped,
+                    replace(
+                        local,
+                        parametric=replace(
+                            local.parametric,
+                            resolved_mode="monotone",
+                        ),
+                    ),
+                )
+                series = evaluation.series
+                try:
+                    for target_name, observation in provisional.observations.items():
+                        align_y_on_x_obs(
+                            t_obs=observation.t,
+                            x_obs=provisional.x_obs_by_species[target_name],
+                            t_sim=series.t,
+                            x_model=series.species[provisional.x_name],
+                            y_model=series.species[target_name],
+                            segment_ids=evaluation.segment_ids,
+                            segment_keys=evaluation.segment_keys,
+                            dataset_label=dataset_id,
+                            x_name=provisional.x_name,
+                            y_name=target_name,
+                        )
+                except DeterministicParametricResolutionError:
+                    resolved_mode = "time_guided"
+                else:
+                    resolved_mode = "monotone"
+                chosen = replace(
+                    local,
+                    parametric=replace(
+                        local.parametric,
+                        resolved_mode=resolved_mode,
+                    ),
+                )
+            if chosen.parametric is not None:
+                resolved_mode_items.append(
+                    (
+                        chosen.dataset_id,
+                        chosen.parametric.resolved_mode,
+                    )
+                )
+            effective_local[local.dataset_id] = chosen
+        datasets = [
+            _dataset_spec(mapped_by_id[item.dataset_id], effective_local[item.dataset_id])
+            for item in included
+        ]
+        resolved_modes = tuple(
+            sorted(resolved_mode_items)
+        )
+        self._resolved_auto_modes = resolved_modes
+        if self._checkpoint():
+            raise FittingCancelled()
+        self.auto_modes_resolved.emit(resolved_modes)
+        if self._checkpoint():
+            raise FittingCancelled()
+        initial_curves = _curves_from_evaluations(
+            request,
+            starting_evaluations,
+            effective_local,
+        )
+        if self._checkpoint():
+            raise FittingCancelled()
+        self.curves_updated.emit(
+            initial_curves
+        )
+        if self._checkpoint():
+            raise FittingCancelled()
+        self._last_curve_emit = time.monotonic()
+        run_identity = FitRunIdentity.build(
+            {
+                "kind": "global_fit_run",
+                "schema_version": 1,
+                "origin_tab_id": request.origin.tab_id,
+                "origin_capture_id": request.origin.capture_id,
+                "mechanism_text": request.mechanism_source.full_dsl,
+                "local_observables": [
+                    {
+                        "name": item.name,
+                        "expression": item.expression,
+                        "scalars": [
+                            {
+                                "name": scalar.name,
+                                "value": float(scalar.value),
+                                "minimum": _stamp_bound(scalar.minimum),
+                                "maximum": _stamp_bound(scalar.maximum),
+                                "scope": scalar.scope,
+                            }
+                            for scalar in item.scalar_parameters
+                        ],
+                    }
+                    for item in request.local_observables
+                ],
+                "datasets": [
+                    {
+                        "dataset_id": item.dataset_id,
+                        "set_id": mapped_by_id[item.dataset_id].set_id,
+                        "observations": {
+                            name: {
+                                "raw_observation_id": (
+                                    series.raw_observation_id
+                                ),
+                                "t": [
+                                    float(value)
+                                    for value in np.asarray(
+                                        series.t,
+                                        dtype=float,
+                                    ).reshape(-1)
+                                ],
+                                "y": [
+                                    float(value)
+                                    for value in np.asarray(
+                                        series.y,
+                                        dtype=float,
+                                    ).reshape(-1)
+                                ],
+                                "source_rows": list(
+                                    series.source_rows
+                                ),
+                                "observed_x": {
+                                    "identity": (
+                                        (
+                                            next(
+                                                observation.raw_observation_id
+                                                for observation in mapped_by_id[
+                                                    item.dataset_id
+                                                ].observations
+                                                if observation.model_species
+                                                == item.x_name
+                                            )
+                                        )
+                                        if item.x_name != "t"
+                                        else series.raw_observation_id
+                                    ),
+                                    "kind": (
+                                        "raw_observation"
+                                        if item.x_name != "t"
+                                        else "observation_time"
+                                    ),
+                                    "name": item.x_name,
+                                    "values": [
+                                        float(value)
+                                        for value in np.asarray(
+                                            (
+                                                item.x_obs_by_species[name]
+                                                if item.x_name != "t"
+                                                else series.t
+                                            ),
+                                            dtype=float,
+                                        ).reshape(-1)
+                                    ],
+                                    "paired_y_raw_observation_id": (
+                                        series.raw_observation_id
+                                    ),
+                                    "paired_source_rows": list(
+                                        series.source_rows
+                                    ),
+                                },
+                            }
+                            for name, series in item.observations.items()
+                        },
+                        "mappings": [
+                            {
+                                "raw_observation_id": raw_id,
+                                "raw_column": raw_column,
+                                "model_target": model_target,
+                            }
+                            for raw_id, raw_column, model_target in next(
+                                local.observation_targets
+                                for local in included
+                                if local.dataset_id == item.dataset_id
+                            )
+                        ],
+                        "targets": item.species_list,
+                        "target_weights": dict(item.target_weights),
+                        "sampling": {
+                            "t_min": float(
+                                effective_local[item.dataset_id].sample_t_min
+                            ),
+                            "t_max": float(
+                                effective_local[item.dataset_id].sample_t_max
+                            ),
+                            "points": (
+                                effective_local[
+                                    item.dataset_id
+                                ].sample_points
+                            ),
+                        },
+                        "dataset_weight": float(
+                            effective_local[item.dataset_id].weight
+                        ),
+                        "execution": {
+                            "solver": effective_local[
+                                item.dataset_id
+                            ].execution.solver,
+                            "t_start": float(
+                                effective_local[
+                                    item.dataset_id
+                                ].execution.t_start
+                            ),
+                            "t_end": float(
+                                effective_local[
+                                    item.dataset_id
+                                ].execution.t_end
+                            ),
+                            "integration_points": int(
+                                effective_local[
+                                    item.dataset_id
+                                ].execution.integration_points
+                            ),
+                        },
+                        "x_name": item.x_name,
+                        "x_mapping_requested": (
+                            effective_local[
+                                item.dataset_id
+                            ].parametric.requested_mode
+                            if effective_local[
+                                item.dataset_id
+                            ].parametric is not None
+                            else "time"
+                        ),
+                        "x_mapping_resolved": (
+                            effective_local[
+                                item.dataset_id
+                            ].parametric.resolved_mode
+                            if effective_local[
+                                item.dataset_id
+                            ].parametric is not None
+                            else "time"
+                        ),
+                    }
+                    for item in datasets
+                ],
+                "parameters": [
+                    {
+                        "name": item.name,
+                        "display_name": item.display_name,
+                        "fit": item.fit,
+                        "initial": item.initial,
+                        "minimum": _stamp_bound(item.minimum),
+                        "maximum": _stamp_bound(item.maximum),
+                        "log10": item.log10,
+                        "scope": item.scope,
+                        "dataset_values": dict(item.dataset_values),
+                        "family": item.family,
+                        "role": item.role,
+                        "unit": item.unit,
+                    }
+                    for item in request.parameters
+                ],
+                "initials": [
+                    {
+                        "set_id": item.set_id,
+                        "species": item.species,
+                        "fit": item.fit,
+                        "initial": item.initial,
+                        "minimum": _stamp_bound(item.minimum),
+                        "maximum": _stamp_bound(item.maximum),
+                        "log10": item.log10,
+                        "scope": item.scope,
+                    }
+                    for item in request.initials
+                ],
+                "settings": {
+                    "method": request.defaults.method,
+                    "max_nfev": request.defaults.max_nfev,
+                    "ftol": request.defaults.ftol,
+                    "xtol": request.defaults.xtol,
+                    "use_seed": request.defaults.use_seed,
+                    "seed": request.defaults.seed if request.defaults.use_seed else None,
+                },
+                "scientific_settings": {
+                    "temperature": float(
+                        request.origin.scientific_settings.temperature
+                    ),
+                    "rtol": float(request.origin.scientific_settings.rtol),
+                    "atol": float(request.origin.scientific_settings.atol),
+                    "sparse_jacobian_policy": bool(
+                        request.origin.scientific_settings.sparse_jacobian_policy
+                    ),
+                    "wegscheider_policy": bool(
+                        request.origin.scientific_settings.wegscheider_policy
+                    ),
+                },
+                "prepared_identities": prepared_ids,
+                "resolved_auto_modes": dict(resolved_modes),
+            }
+        )
+        self._run_identity = run_identity
+        if self._checkpoint():
+            raise FittingCancelled()
+        self.run_identity_ready.emit(run_identity)
+        if self._checkpoint():
+            raise FittingCancelled()
+
+        def live_evaluations(
+            params: Mapping[str, float],
+        ) -> dict[str, object]:
+            evaluations: dict[str, object] = {}
+            for local in included:
+                dataset_id = local.dataset_id
+                values = dict(fixed_by_dataset[dataset_id])
+                for variable in shared_variables:
+                    values[variable.name] = float(
+                        params.get(variable.name, variable.initial)
+                    )
+                for variable in variable_by_dataset[dataset_id]:
+                    key = f"{dataset_id}::{variable.name}"
+                    values[variable.name] = float(
+                        params.get(key, variable.initial)
+                    )
+                for variable in coupled_variables:
+                    if dataset_id not in variable.dataset_ids:
+                        continue
+                    values[variable.parameter_name] = float(
+                        params.get(variable.variable_id, variable.initial)
+                    )
+                evaluations[dataset_id] = evaluators[
+                    dataset_id
+                ].evaluate_series_with_parameter_origins(
+                    values,
+                    {
+                        name: FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
+                        for name in values
+                    },
+                )
+            return evaluations
+
+        def progress(iteration: int, cost: float, params: dict[str, float]) -> None:
+            if self._checkpoint():
+                raise FittingCancelled()
+            self.progress.emit(
+                min(95, max(1, int(100 * iteration / max(1, request.defaults.max_nfev)))),
+                f"Iteration {iteration}: objective SSQ={cost:.4g}",
+            )
+            if self._checkpoint():
+                raise FittingCancelled()
+            if math.isfinite(cost) and cost < self._best_cost:
+                self._best_cost = float(cost)
+                self._best_iteration = int(iteration)
+                self._best_params = dict(params)
+                now = time.monotonic()
+                if now - self._last_best_emit >= _BEST_INTERVAL_SECONDS:
+                    if self._checkpoint():
+                        raise FittingCancelled()
+                    self.best_updated.emit(self._live_update())
+                    if self._checkpoint():
+                        raise FittingCancelled()
+                    self._last_best_emit = now
+                if now - self._last_curve_emit >= _CURVE_INTERVAL_SECONDS:
+                    try:
+                        live_curves = _curves_from_evaluations(
+                            request,
+                            live_evaluations(self._best_params),
+                            effective_local,
+                        )
+                    except (FitSimulationError, KeyError, TypeError, ValueError):
+                        live_curves = ()
+                    if live_curves and not self._cancelled.is_set():
+                        if self._checkpoint():
+                            raise FittingCancelled()
+                        self.curves_updated.emit(live_curves)
+                        if self._checkpoint():
+                            raise FittingCancelled()
+                    self._last_curve_emit = now
+
+        method = str(request.defaults.method).strip().lower()
+        result = fit_global(
+            fit_evaluators=evaluators,
+            datasets=datasets,
+            shared_variables=shared_variables,
+            dataset_overrides=overrides,
+            coupled_variables=coupled_variables,
+            weights={item.dataset_id: item.weight for item in included},
+            method="de" if method == "differential_evolution" else method,
+            max_nfev=int(request.defaults.max_nfev),
+            ftol=float(request.defaults.ftol),
+            xtol=float(request.defaults.xtol),
+            seed=int(request.defaults.seed) if request.defaults.use_seed else None,
+            progress_callback=progress,
+            cancellation_check=self._checkpoint,
+        )
+        if self._checkpoint():
+            raise FittingCancelled()
+        if result.completion.status == "fail":
+            message = result.message or "Fit did not produce a candidate."
+            raise RuntimeError(message)
+
+        scalar_values = tuple(
+            (
+                dataset_id,
+                _finite_items(
+                    {
+                        name: value
+                        for name, value in values.items()
+                        if not name.startswith(INITIAL_PREFIX)
+                    },
+                    field=f"Fit scalar values {dataset_id}",
+                ),
+            )
+            for dataset_id, values in sorted(result.dataset_params.items())
+        )
+        execution_by_set_map: dict[
+            str,
+            SimulationExecutionSettings,
+        ] = {}
+        execution_conflict = False
+        for item in included:
+            set_id = mapped_by_id[item.dataset_id].set_id
+            previous = execution_by_set_map.get(set_id)
+            if previous is not None and previous != item.execution:
+                execution_conflict = True
+            execution_by_set_map[set_id] = item.execution
+        execution_by_set = (
+            ()
+            if execution_conflict
+            else tuple(execution_by_set_map.items())
+        )
+        curves = _curves_from_result(request, result)
+        initial_values_by_set = _initial_values_from_result(
+            request,
+            result,
+        )
+        terminal_snapshot = _terminal_setup_snapshot(
+            self._setup_snapshot,
+            request=request,
+            result=result,
+            effective_datasets=effective_local,
+            initial_values_by_set=initial_values_by_set,
+        )
+        if self._checkpoint():
+            raise FittingCancelled()
+        self.progress.emit(100, f"Fit complete · {run_identity.short_hash}")
+        if self._checkpoint():
+            raise FittingCancelled()
+        return FitCandidate(
+            origin_tab_id=request.origin.tab_id,
+            origin_capture_id=request.origin.capture_id,
+            mechanism_source=request.mechanism_source,
+            prepared_dsl=request.prepared_dsl,
+            parameters=_finite_items(result.shared_params, field="Fit parameters"),
+            scalar_values_by_dataset=scalar_values,
+            initial_values_by_set=initial_values_by_set,
+            execution_by_set=execution_by_set,
+            local_observables=terminal_snapshot.local_observables,
+            result=result,
+            curves=curves,
+            run_identity=run_identity,
+            setup_snapshot=terminal_snapshot,
+            resolved_auto_modes=resolved_modes,
+        )
+
+    def _live_update(self) -> FitLiveUpdate:
+        included_dataset_ids = {
+            item.dataset_id for item in self._request.datasets if item.included
+        }
+        included_set_ids = {
+            mapped.set_id
+            for mapped in self._request.origin.mapped_datasets
+            if mapped.dataset_id in included_dataset_ids
+        }
+        initials_by_set: dict[str, dict[str, float]] = {}
+        for initial in self._request.initials:
+            if not initial.fit or initial.set_id not in included_set_ids:
                 continue
-            dataset_params.setdefault(ds_id, {})
-            dataset_params[ds_id][param_name] = float(value)
-        return dataset_params
+            variable_id = (
+                f"initial:global:{initial.species}"
+                if initial.scope == "global"
+                else f"initial:{initial.set_id}:{initial.species}"
+            )
+            value = self._best_params.get(variable_id)
+            if value is not None and math.isfinite(float(value)):
+                initials_by_set.setdefault(initial.set_id, {})[
+                    initial.species
+                ] = float(value)
+        return FitLiveUpdate(
+            iteration=self._best_iteration,
+            cost=self._best_cost,
+            parameters=_finite_items(
+                {
+                    name: value
+                    for name, value in self._best_params.items()
+                    if "::" not in name and not name.startswith("initial:")
+                },
+                field="live Fit parameters",
+            ),
+            scalar_values_by_dataset=tuple(
+                (
+                    dataset_id,
+                    _finite_items(
+                        {
+                            parameter.name: self._best_params.get(
+                                f"{dataset_id}::{parameter.name}",
+                                dict(parameter.dataset_values)[dataset_id],
+                            )
+                            for parameter in self._request.parameters
+                            if (
+                                parameter.fit
+                                and parameter.scope == "per_dataset"
+                                and dataset_id
+                                in dict(parameter.dataset_values)
+                            )
+                        },
+                        field=f"live Fit scalars {dataset_id}",
+                    ),
+                )
+                for dataset_id in sorted(included_dataset_ids)
+            ),
+            initial_values_by_set=tuple(
+                (
+                    set_id,
+                    tuple(sorted(values.items())),
+                )
+                for set_id, values in sorted(initials_by_set.items())
+            ),
+        )

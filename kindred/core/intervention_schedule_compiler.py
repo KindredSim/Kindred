@@ -1,396 +1,850 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+import math
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from kindred.core.intervention_schedule import (
-    InterventionInstantEvent,
-    InterventionInterval,
+    InterventionFlux,
+    InterventionHold,
+    InterventionJump,
     InterventionProtocol,
     InterventionProtocolOperation,
-    InterventionRepeatedInterval,
     InterventionSchedule,
     InterventionScheduleError,
+    InterventionSet,
+    InterventionTrigger,
+    InterventionTriggerAction,
     coerce_intervention_schedule,
-    _instant_event_is_absolute,
-    _instant_events_conflict,
 )
+
+__all__ = [
+    "ExecutableFlux",
+    "ExecutableHold",
+    "ExecutableInstant",
+    "ExecutableTrigger",
+    "InterventionExecutionContract",
+    "TriggerFiring",
+    "compile_intervention_schedule",
+    "validate_boundary_conflicts",
+]
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+
+def _fingerprint(value: object) -> str:
+    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _finite_derived(value: object, *, context: str) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise InterventionScheduleError(
+            f"{context} must remain finite."
+        ) from exc
+    if not math.isfinite(number):
+        raise InterventionScheduleError(f"{context} must remain finite.")
+    return number
+
+
+def _protocol_boundary(
+    start: float, every: float, index: int, *, duration: float | None = None
+) -> float:
+    try:
+        value = start + every * index
+        if duration is not None:
+            value += duration
+    except (OverflowError, ValueError) as exc:
+        raise InterventionScheduleError(
+            "Protocol boundary arithmetic must remain finite."
+        ) from exc
+    return _finite_derived(value, context="Protocol boundary")
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    frozen = _freeze(value)
+    if not isinstance(frozen, Mapping):
+        raise TypeError("Expected a mapping.")
+    return frozen
 
 
 @dataclass(frozen=True, slots=True)
-class CompiledInterventionSchedule:
-    executable_schedule: InterventionSchedule
-    normalized_declarative_payload: Mapping[str, Any]
+class ExecutableInstant:
+    op: str
+    species: str
+    time: float
+    declaration_ordinal: int
+    value: float | None = None
+    delta: float | None = None
+    phase: str = "ordinary"
+    window_ordinal: int | None = None
+    authored_ordinal: int | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "op": self.op,
+            "species": self.species,
+            "time": self.time,
+            "declaration_ordinal": self.declaration_ordinal,
+            "phase": self.phase,
+        }
+        payload["value" if self.op == "set" else "delta"] = (
+            self.value if self.op == "set" else self.delta
+        )
+        if self.window_ordinal is not None:
+            payload["window_ordinal"] = self.window_ordinal
+        if self.authored_ordinal is not None:
+            payload["authored_ordinal"] = self.authored_ordinal
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutableFlux:
+    species: str
+    start_time: float
+    end_time: float
+    flux_rate: float
+    declaration_ordinal: int
+    phase: str = "ordinary"
+    window_ordinal: int | None = None
+    authored_ordinal: int | None = None
+
+    @property
+    def op(self) -> str:
+        return "flux"
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "op": "flux",
+            "species": self.species,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "flux_rate": self.flux_rate,
+            "declaration_ordinal": self.declaration_ordinal,
+            "phase": self.phase,
+        }
+        if self.window_ordinal is not None:
+            payload["window_ordinal"] = self.window_ordinal
+        if self.authored_ordinal is not None:
+            payload["authored_ordinal"] = self.authored_ordinal
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutableHold:
+    species: str
+    start_time: float
+    end_time: float
+    value: float
+    declaration_ordinal: int
+    phase: str = "ordinary"
+    window_ordinal: int | None = None
+    authored_ordinal: int | None = None
+
+    @property
+    def op(self) -> str:
+        return "hold"
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "op": "hold",
+            "species": self.species,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "value": self.value,
+            "declaration_ordinal": self.declaration_ordinal,
+            "phase": self.phase,
+        }
+        if self.window_ordinal is not None:
+            payload["window_ordinal"] = self.window_ordinal
+        if self.authored_ordinal is not None:
+            payload["authored_ordinal"] = self.authored_ordinal
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutableTrigger:
+    declaration_ordinal: int
+    watch_species: str
+    threshold: float
+    direction: str
+    max_count: int
+    min_interval: float
+    then: InterventionTriggerAction
+
+    @property
+    def op(self) -> str:
+        return "trigger"
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "op": "trigger",
+            "declaration_ordinal": self.declaration_ordinal,
+            "watch_species": self.watch_species,
+            "threshold": self.threshold,
+            "direction": self.direction,
+            "max_count": self.max_count,
+            "min_interval": self.min_interval,
+            "then": self.then.to_payload(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerFiring:
+    declaration_ordinal: int
+    watch_species: str
+    threshold: float
+    direction: str
+    root_time: float
+    event_state: Mapping[str, float]
+    firing_ordinal: int
+    nested_action_payload: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(float(self.root_time)):
+            raise InterventionScheduleError("Trigger root time must be finite.")
+        if any(
+            not math.isfinite(float(value)) for value in self.event_state.values()
+        ):
+            raise InterventionScheduleError(
+                "Trigger event-time state must be finite."
+            )
+        object.__setattr__(
+            self,
+            "event_state",
+            MappingProxyType(
+                {
+                    str(name): float(value)
+                    for name, value in self.event_state.items()
+                }
+            ),
+        )
+        object.__setattr__(
+            self,
+            "nested_action_payload",
+            _frozen_mapping(self.nested_action_payload),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "declaration_ordinal": self.declaration_ordinal,
+            "watch_species": self.watch_species,
+            "threshold": self.threshold,
+            "direction": self.direction,
+            "root_time": self.root_time,
+            "event_state": dict(self.event_state),
+            "firing_ordinal": self.firing_ordinal,
+            "nested_action_payload": dict(self.nested_action_payload),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class InterventionExecutionContract:
+    declarative_payload: Mapping[str, Any]
     executable_payload: Mapping[str, Any]
     declarative_fingerprint: str
     executable_fingerprint: str
-    lineage: tuple[Mapping[str, Any], ...] = ()
-    provenance: Mapping[str, Any] | None = None
+    instants: tuple[ExecutableInstant, ...] = ()
+    fluxes: tuple[ExecutableFlux, ...] = ()
+    holds: tuple[ExecutableHold, ...] = ()
+    triggers: tuple[ExecutableTrigger, ...] = ()
+    discontinuities: tuple[float, ...] = ()
+    segment_identity: tuple[tuple[float, float], ...] = ()
+    protocol_lineage: tuple[Mapping[str, Any], ...] = ()
+    trigger_firings: tuple[TriggerFiring, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "normalized_declarative_payload", _copy_mapping(self.normalized_declarative_payload))
-        object.__setattr__(self, "executable_payload", _copy_mapping(self.executable_payload))
-        object.__setattr__(self, "lineage", tuple(_copy_mapping(item) for item in self.lineage))
-        provenance = self.provenance
-        if provenance is None:
-            provenance = {}
-        object.__setattr__(self, "provenance", _copy_mapping(provenance))
+        object.__setattr__(
+            self, "declarative_payload", _frozen_mapping(self.declarative_payload)
+        )
+        object.__setattr__(
+            self, "executable_payload", _frozen_mapping(self.executable_payload)
+        )
+        object.__setattr__(
+            self,
+            "protocol_lineage",
+            tuple(_frozen_mapping(item) for item in self.protocol_lineage),
+        )
+        object.__setattr__(
+            self,
+            "discontinuities",
+            tuple(float(value) for value in self.discontinuities),
+        )
+        object.__setattr__(
+            self,
+            "segment_identity",
+            tuple((float(start), float(end)) for start, end in self.segment_identity),
+        )
+
+    @property
+    def is_empty(self) -> bool:
+        return not (
+            self.instants or self.fluxes or self.holds or self.triggers
+        )
+
+    def with_trigger_firings(
+        self, firings: Sequence[TriggerFiring]
+    ) -> "InterventionExecutionContract":
+        return replace(self, trigger_firings=tuple(firings))
+
+    def discontinuities_for_span(
+        self, start_time: float, end_time: float
+    ) -> tuple[float, ...]:
+        start = _finite_derived(start_time, context="Segment start")
+        end = _finite_derived(end_time, context="Segment end")
+        if end <= start:
+            raise InterventionScheduleError(
+                "Segment end must be greater than segment start."
+            )
+        return tuple(
+            value for value in self.discontinuities if start < value < end
+        )
+
+    def segments_for_span(
+        self, start_time: float, end_time: float
+    ) -> tuple[tuple[float, float], ...]:
+        start = _finite_derived(start_time, context="Segment start")
+        end = _finite_derived(end_time, context="Segment end")
+        boundaries = (
+            start,
+            *self.discontinuities_for_span(start, end),
+            end,
+        )
+        return tuple(zip(boundaries, boundaries[1:]))
+
+    def runtime_discontinuities_for_span(
+        self, start_time: float, end_time: float
+    ) -> tuple[float, ...]:
+        start = _finite_derived(start_time, context="Segment start")
+        end = _finite_derived(end_time, context="Segment end")
+        static = self.discontinuities_for_span(start, end)
+        firing_times = tuple(
+            firing.root_time
+            for firing in self.trigger_firings
+            if start < firing.root_time < end
+        )
+        return tuple(sorted(set(static + firing_times)))
+
+    def runtime_segments_for_span(
+        self, start_time: float, end_time: float
+    ) -> tuple[tuple[float, float], ...]:
+        start = _finite_derived(start_time, context="Segment start")
+        end = _finite_derived(end_time, context="Segment end")
+        boundaries = (
+            start,
+            *self.runtime_discontinuities_for_span(start, end),
+            end,
+        )
+        return tuple(zip(boundaries, boundaries[1:]))
+
+    def provenance_projection(self) -> dict[str, Any]:
+        return {
+            "declarative_fingerprint": self.declarative_fingerprint,
+            "executable_fingerprint": self.executable_fingerprint,
+            "declarative": _plain(self.declarative_payload),
+            "executable": _plain(self.executable_payload),
+            "discontinuities": list(self.discontinuities),
+            "segment_identity": [
+                {"start_time": start, "end_time": end}
+                for start, end in self.segment_identity
+            ],
+            "protocol_lineage": [
+                _plain(item) for item in self.protocol_lineage
+            ],
+            "trigger_firings": [
+                firing.to_payload() for firing in self.trigger_firings
+            ],
+        }
+
+    def annotation_projection(
+        self,
+        *,
+        execution_start: float | None = None,
+        execution_end: float | None = None,
+    ) -> tuple[Mapping[str, object], ...]:
+        if (execution_start is None) != (execution_end is None):
+            raise InterventionScheduleError(
+                "Annotation execution span requires both start and end."
+            )
+        span: tuple[float, float] | None = None
+        if execution_start is not None and execution_end is not None:
+            start = _finite_derived(
+                execution_start,
+                context="Annotation execution start",
+            )
+            end = _finite_derived(
+                execution_end,
+                context="Annotation execution end",
+            )
+            if end < start:
+                raise InterventionScheduleError(
+                    "Annotation execution end must not precede its start."
+                )
+            span = (start, end)
+        annotations: list[Mapping[str, object]] = []
+        for instant in self.instants:
+            if span is not None and not (
+                span[0] <= instant.time <= span[1]
+            ):
+                continue
+            annotations.append(
+                MappingProxyType(
+                    {
+                        "time": instant.time,
+                        "kind": (
+                            "protocol-" + instant.phase
+                            if instant.phase != "ordinary"
+                            else "instant"
+                        ),
+                        "label": f"{instant.op} {instant.species}",
+                        "declaration_ordinal": instant.declaration_ordinal,
+                        "window_ordinal": instant.window_ordinal,
+                        "authored_ordinal": instant.authored_ordinal,
+                    }
+                )
+            )
+        for interval in self.fluxes + self.holds:
+            visible_start = interval.start_time
+            visible_end = interval.end_time
+            if span is not None:
+                visible_start = max(visible_start, span[0])
+                visible_end = min(visible_end, span[1])
+                if visible_end <= visible_start:
+                    continue
+            annotations.append(
+                MappingProxyType(
+                    {
+                        "start": visible_start,
+                        "end": visible_end,
+                        "declared_start": interval.start_time,
+                        "declared_end": interval.end_time,
+                        "kind": interval.op,
+                        "label": f"{interval.op} {interval.species}",
+                        "declaration_ordinal": interval.declaration_ordinal,
+                        "window_ordinal": interval.window_ordinal,
+                        "authored_ordinal": interval.authored_ordinal,
+                    }
+                )
+            )
+        for firing in self.trigger_firings:
+            if span is not None and not (
+                span[0] <= firing.root_time <= span[1]
+            ):
+                continue
+            nested_action_payload = firing.nested_action_payload
+            annotations.append(
+                MappingProxyType(
+                    {
+                        "time": firing.root_time,
+                        "kind": "trigger",
+                        "label": (
+                            f"trigger {firing.watch_species}: "
+                            f"{nested_action_payload.get('op', '')} "
+                            f"{nested_action_payload.get('species', '')}"
+                        ).strip(),
+                        "declaration_ordinal": firing.declaration_ordinal,
+                        "firing_ordinal": firing.firing_ordinal,
+                        "threshold": firing.threshold,
+                        "direction": firing.direction,
+                        "event_state": dict(firing.event_state),
+                        "nested_action_payload": dict(
+                            firing.nested_action_payload
+                        ),
+                    }
+                )
+            )
+        return tuple(annotations)
+
+
+def _instant_from_direct(
+    operation: InterventionSet | InterventionJump,
+) -> ExecutableInstant:
+    if isinstance(operation, InterventionSet):
+        return ExecutableInstant(
+            op="set",
+            species=operation.species,
+            time=float(operation.time),
+            value=float(operation.value),
+            declaration_ordinal=operation.declaration_ordinal,
+        )
+    return ExecutableInstant(
+        op="jump",
+        species=operation.species,
+        time=float(operation.time),
+        delta=float(operation.delta),
+        declaration_ordinal=operation.declaration_ordinal,
+    )
+
+
+def _protocol_instant(
+    protocol: InterventionProtocol,
+    operation: InterventionProtocolOperation,
+    *,
+    window_ordinal: int,
+    time: float,
+) -> ExecutableInstant:
+    return ExecutableInstant(
+        op=operation.op,
+        species=operation.species,
+        time=time,
+        value=operation.value,
+        delta=operation.delta,
+        declaration_ordinal=protocol.declaration_ordinal,
+        phase=operation.phase,
+        window_ordinal=window_ordinal,
+        authored_ordinal=operation.authored_ordinal,
+    )
+
+
+def _protocol_interval(
+    protocol: InterventionProtocol,
+    operation: InterventionProtocolOperation,
+    *,
+    window_ordinal: int,
+    start_time: float,
+    end_time: float,
+) -> ExecutableFlux | ExecutableHold:
+    common = {
+        "species": operation.species,
+        "start_time": start_time,
+        "end_time": end_time,
+        "declaration_ordinal": protocol.declaration_ordinal,
+        "phase": operation.phase,
+        "window_ordinal": window_ordinal,
+        "authored_ordinal": operation.authored_ordinal,
+    }
+    if operation.op == "flux":
+        return ExecutableFlux(flux_rate=float(operation.flux_rate), **common)
+    return ExecutableHold(value=float(operation.value), **common)
+
+
+def _lineage(
+    protocol: InterventionProtocol,
+    operation: InterventionProtocolOperation,
+    *,
+    window_ordinal: int,
+    primitive: ExecutableInstant | ExecutableFlux | ExecutableHold,
+) -> dict[str, Any]:
+    return {
+        "declaration_ordinal": protocol.declaration_ordinal,
+        "window_ordinal": window_ordinal,
+        "phase": operation.phase,
+        "authored_ordinal": operation.authored_ordinal,
+        "nested_payload": operation.to_payload(),
+        "lowered_primitive": primitive.to_payload(),
+        "actual_time_or_window": (
+            {"time": primitive.time}
+            if isinstance(primitive, ExecutableInstant)
+            else {
+                "start_time": primitive.start_time,
+                "end_time": primitive.end_time,
+            }
+        ),
+    }
+
+
+def _execution_order(item: ExecutableInstant) -> tuple[float, int, int, int, int]:
+    phase_order = {"ordinary": 0, "before": 1, "after": 2}
+    return (
+        item.time,
+        item.declaration_ordinal,
+        phase_order[item.phase],
+        -1 if item.window_ordinal is None else item.window_ordinal,
+        -1 if item.authored_ordinal is None else item.authored_ordinal,
+    )
 
 
 def compile_intervention_schedule(
     schedule: InterventionSchedule | Mapping[str, Any] | None,
-) -> CompiledInterventionSchedule:
+) -> InterventionExecutionContract:
     schedule_obj = coerce_intervention_schedule(schedule) or InterventionSchedule()
     if schedule_obj.is_parameterized:
-        raise InterventionScheduleError("Parameterized intervention schedule must be resolved before compilation.")
-    if not schedule_obj.repeated_intervals and not schedule_obj.protocols and not _schedule_has_metadata(schedule_obj):
-        payload = schedule_obj.to_payload()
-        return CompiledInterventionSchedule(
-            executable_schedule=schedule_obj,
-            normalized_declarative_payload=payload,
-            executable_payload=payload,
-            declarative_fingerprint=schedule_obj.fingerprint,
-            executable_fingerprint=schedule_obj.fingerprint,
+        raise InterventionScheduleError(
+            "Parameterized intervention schedule must be resolved before compilation."
         )
-
-    instant_payloads = [_strip_metadata(event.to_payload()) for event in schedule_obj.instant_events]
-    repeated_payloads = [_strip_metadata(event.to_payload()) for event in schedule_obj.repeated_events]
-    trigger_payloads = [_strip_metadata(event.to_payload()) for event in schedule_obj.trigger_events]
-    interval_payloads = [_strip_metadata(interval.to_payload()) for interval in schedule_obj.intervals]
-    instant_sources: list[tuple[InterventionInstantEvent, str]] = [
-        (event, "primitive instant event") for event in schedule_obj.instant_events
-    ]
-    for repeated_index, repeated_event in enumerate(schedule_obj.repeated_events):
-        for window_index, event in enumerate(repeated_event.expand()):
-            instant_sources.append((event, f"primitive repeated event {repeated_index} window {window_index}"))
+    instants: list[ExecutableInstant] = []
+    fluxes: list[ExecutableFlux] = []
+    holds: list[ExecutableHold] = []
+    triggers: list[ExecutableTrigger] = []
     lineage: list[dict[str, Any]] = []
-
-    for declaration_index, repeated_interval in enumerate(schedule_obj.repeated_intervals):
-        for window_index, interval in enumerate(repeated_interval.expand()):
-            interval_payloads.append(_strip_metadata(interval.to_payload()))
-            lineage.append(
-                _lineage_entry_for_repeated_interval(
-                    repeated_interval,
-                    declaration_index=declaration_index,
-                    window_index=window_index,
-                    interval=interval,
+    for operation in schedule_obj.operations:
+        if isinstance(operation, (InterventionSet, InterventionJump)):
+            instants.append(_instant_from_direct(operation))
+        elif isinstance(operation, InterventionFlux):
+            fluxes.append(
+                ExecutableFlux(
+                    species=operation.species,
+                    start_time=float(operation.start_time),
+                    end_time=float(operation.end_time),
+                    flux_rate=float(operation.flux_rate),
+                    declaration_ordinal=operation.declaration_ordinal,
                 )
             )
-
-    for protocol in schedule_obj.protocols:
-        _extend_protocol_payloads(
-            protocol,
-            instant_payloads=instant_payloads,
-            instant_sources=instant_sources,
-            interval_payloads=interval_payloads,
-            lineage=lineage,
-        )
-    _validate_compiled_instant_conflicts(instant_sources)
-
-    executable_schedule = InterventionSchedule.from_payload(
-        {
-            "instant_events": instant_payloads,
-            "repeated_events": repeated_payloads,
-            "trigger_events": trigger_payloads,
-            "intervals": interval_payloads,
-        }
-    )
-    declarative_payload = schedule_obj.to_payload()
-    executable_payload = executable_schedule.to_payload()
-    provenance: dict[str, Any] = {
-        "declarative_payload": declarative_payload,
-        "executable_payload": executable_payload,
-        "declarative_fingerprint": schedule_obj.fingerprint,
-        "executable_fingerprint": executable_schedule.fingerprint,
-    }
-    if schedule_obj.metadata:
-        provenance["metadata"] = _metadata_dict(schedule_obj.metadata)
-    primitive_metadata = _primitive_metadata_entries(schedule_obj)
-    if primitive_metadata:
-        provenance["primitive_metadata"] = primitive_metadata
-    if lineage:
-        provenance["lineage"] = [_copy_mapping(item) for item in lineage]
-    if _metadata_mentions_display_unit(schedule_obj.metadata) or _lineage_mentions_display_unit(lineage) or any(
-        _metadata_mentions_display_unit(entry["metadata"]) for entry in primitive_metadata
-    ):
-        provenance["metadata_uses_internal_numeric_values"] = True
-
-    return CompiledInterventionSchedule(
-        executable_schedule=executable_schedule,
-        normalized_declarative_payload=declarative_payload,
-        executable_payload=executable_payload,
-        declarative_fingerprint=schedule_obj.fingerprint,
-        executable_fingerprint=executable_schedule.fingerprint,
-        lineage=tuple(lineage),
-        provenance=provenance,
-    )
-
-
-def _extend_protocol_payloads(
-    protocol: InterventionProtocol,
-    *,
-    instant_payloads: list[dict[str, Any]],
-    instant_sources: list[tuple[InterventionInstantEvent, str]],
-    interval_payloads: list[dict[str, Any]],
-    lineage: list[dict[str, Any]],
-) -> None:
-    start = float(protocol.start if protocol.start is not None else 0.0)
-    every = float(protocol.every if protocol.every is not None else 0.0)
-    duration = float(protocol.duration if protocol.duration is not None else 0.0)
-    if every <= 0.0:
-        raise InterventionScheduleError("every must be greater than zero.")
-    if duration <= 0.0:
-        raise InterventionScheduleError("duration must be greater than zero.")
-
-    windows = tuple(
-        (
-            window_index,
-            start + every * float(window_index),
-            start + every * float(window_index) + duration,
-        )
-        for window_index in range(int(protocol.count))
-    )
-    _validate_protocol_instant_operations(protocol, windows)
-
-    for window_index, window_start, window_end in windows:
-        for operation in protocol.before:
-            event = operation.to_instant_event(time=window_start)
-            instant_payloads.append(_strip_metadata(event.to_payload()))
-            instant_sources.append((event, _protocol_instant_source(protocol, window_index, operation)))
-            lineage.append(_lineage_entry_for_protocol(protocol, window_index, operation, primitive=event))
-        for operation in protocol.during:
-            interval = operation.to_interval(start=window_start, end=window_end)
-            interval_payloads.append(_strip_metadata(interval.to_payload()))
-            lineage.append(_lineage_entry_for_protocol(protocol, window_index, operation, primitive=interval))
-        for operation in protocol.after:
-            event = operation.to_instant_event(time=window_end)
-            instant_payloads.append(_strip_metadata(event.to_payload()))
-            instant_sources.append((event, _protocol_instant_source(protocol, window_index, operation)))
-            lineage.append(_lineage_entry_for_protocol(protocol, window_index, operation, primitive=event))
-
-
-def _validate_protocol_instant_operations(
-    protocol: InterventionProtocol,
-    windows: Sequence[tuple[int, float, float]],
-) -> None:
-    by_time_species: dict[tuple[float, str], tuple[int, str, InterventionProtocolOperation]] = {}
-    for window_index, window_start, window_end in windows:
-        for phase, time, operations in (
-            ("before", window_start, protocol.before),
-            ("after", window_end, protocol.after),
-        ):
-            for operation in operations:
-                key = (float(time), str(operation.species))
-                existing = by_time_species.get(key)
-                if existing is None:
-                    by_time_species[key] = (window_index, phase, operation)
-                    continue
-                existing_window_index, existing_phase, existing_operation = existing
-                if _instant_events_conflict(
-                    existing_operation.to_instant_event(time=float(time)),
-                    operation.to_instant_event(time=float(time)),
+        elif isinstance(operation, InterventionHold):
+            holds.append(
+                ExecutableHold(
+                    species=operation.species,
+                    start_time=float(operation.start_time),
+                    end_time=float(operation.end_time),
+                    value=float(operation.value),
+                    declaration_ordinal=operation.declaration_ordinal,
+                )
+            )
+        elif isinstance(operation, InterventionTrigger):
+            triggers.append(
+                ExecutableTrigger(
+                    declaration_ordinal=operation.declaration_ordinal,
+                    watch_species=operation.watch_species,
+                    threshold=float(operation.threshold),
+                    direction=operation.direction,
+                    max_count=operation.max_count,
+                    min_interval=operation.min_interval,
+                    then=operation.then,
+                )
+            )
+        elif isinstance(operation, InterventionProtocol):
+            start = float(operation.start_time)
+            duration = operation.duration
+            _protocol_boundary(
+                start,
+                operation.every,
+                operation.count - 1,
+                duration=duration,
+            )
+            previous_window_start: float | None = None
+            for window_ordinal in range(operation.count):
+                window_start = _protocol_boundary(
+                    start, operation.every, window_ordinal
+                )
+                if (
+                    previous_window_start is not None
+                    and window_start <= previous_window_start
                 ):
                     raise InterventionScheduleError(
-                        f"Protocol {protocol.name!r} window {existing_window_index} phase {existing_phase!r} "
-                        f"conflicts with window {window_index} phase {phase!r} for species {operation.species} "
-                        f"at t={time:g}."
+                        "Protocol windows must advance exactly in binary64."
                     )
+                previous_window_start = window_start
+                window_end: float | None = None
+                if duration is not None:
+                    window_end = _protocol_boundary(
+                        start,
+                        operation.every,
+                        window_ordinal,
+                        duration=duration,
+                    )
+                    if window_end <= window_start:
+                        raise InterventionScheduleError(
+                            "Protocol window duration must remain positive "
+                            "after binary64 expansion."
+                        )
+                for nested in operation.before:
+                    primitive = _protocol_instant(
+                        operation,
+                        nested,
+                        window_ordinal=window_ordinal,
+                        time=window_start,
+                    )
+                    instants.append(primitive)
+                    lineage.append(
+                        _lineage(
+                            operation,
+                            nested,
+                            window_ordinal=window_ordinal,
+                            primitive=primitive,
+                        )
+                    )
+                for nested in operation.during:
+                    if window_end is None:
+                        raise InterventionScheduleError(
+                            "Protocol during requires a finite duration."
+                        )
+                    primitive = _protocol_interval(
+                        operation,
+                        nested,
+                        window_ordinal=window_ordinal,
+                        start_time=window_start,
+                        end_time=window_end,
+                    )
+                    if isinstance(primitive, ExecutableFlux):
+                        fluxes.append(primitive)
+                    else:
+                        holds.append(primitive)
+                    lineage.append(
+                        _lineage(
+                            operation,
+                            nested,
+                            window_ordinal=window_ordinal,
+                            primitive=primitive,
+                        )
+                    )
+                for nested in operation.after:
+                    if window_end is None:
+                        raise InterventionScheduleError(
+                            "Protocol after requires a finite duration."
+                        )
+                    primitive = _protocol_instant(
+                        operation,
+                        nested,
+                        window_ordinal=window_ordinal,
+                        time=window_end,
+                    )
+                    instants.append(primitive)
+                    lineage.append(
+                        _lineage(
+                            operation,
+                            nested,
+                            window_ordinal=window_ordinal,
+                            primitive=primitive,
+                        )
+                    )
+    instants.sort(key=_execution_order)
+    fluxes.sort(
+        key=lambda item: (
+            item.start_time,
+            item.declaration_ordinal,
+            -1 if item.window_ordinal is None else item.window_ordinal,
+            -1 if item.authored_ordinal is None else item.authored_ordinal,
+        )
+    )
+    holds.sort(
+        key=lambda item: (
+            item.start_time,
+            item.declaration_ordinal,
+            -1 if item.window_ordinal is None else item.window_ordinal,
+            -1 if item.authored_ordinal is None else item.authored_ordinal,
+        )
+    )
+    triggers.sort(key=lambda item: item.declaration_ordinal)
+    validate_boundary_conflicts(instants=instants, entering_holds=holds)
+    _validate_hold_overlaps(holds)
+    executable_operations = [
+        *(item.to_payload() for item in instants),
+        *(item.to_payload() for item in fluxes),
+        *(item.to_payload() for item in holds),
+        *(item.to_payload() for item in triggers),
+    ]
+    executable_operations.sort(
+        key=lambda item: (
+            int(item["declaration_ordinal"]),
+            int(item.get("window_ordinal", -1)),
+            {"ordinary": 0, "before": 1, "during": 2, "after": 3}.get(
+                str(item.get("phase", "ordinary")), 4
+            ),
+            int(item.get("authored_ordinal", -1)),
+        )
+    )
+    executable_payload = {"operations": executable_operations}
+    discontinuities = sorted(
+        {
+            *(item.time for item in instants),
+            *(item.start_time for item in fluxes),
+            *(item.end_time for item in fluxes),
+            *(item.start_time for item in holds),
+            *(item.end_time for item in holds),
+        }
+    )
+    if any(not math.isfinite(value) for value in discontinuities):
+        raise InterventionScheduleError(
+            "Executable discontinuities must remain finite."
+        )
+    segments = tuple(zip(discontinuities, discontinuities[1:]))
+    declarative_payload = schedule_obj.to_payload()
+    return InterventionExecutionContract(
+        declarative_payload=declarative_payload,
+        executable_payload=executable_payload,
+        declarative_fingerprint=schedule_obj.fingerprint,
+        executable_fingerprint=(
+            "" if not executable_operations else _fingerprint(executable_payload)
+        ),
+        instants=tuple(instants),
+        fluxes=tuple(fluxes),
+        holds=tuple(holds),
+        triggers=tuple(triggers),
+        discontinuities=tuple(discontinuities),
+        segment_identity=segments,
+        protocol_lineage=tuple(lineage),
+    )
 
-def _validate_compiled_instant_conflicts(instants: Sequence[tuple[InterventionInstantEvent, str]]) -> None:
-    absolute_by_key: dict[tuple[float, str], tuple[InterventionInstantEvent, str]] = {}
-    delta_by_key: dict[tuple[float, str], tuple[InterventionInstantEvent, str]] = {}
-    for event, source in instants:
-        key = (float(event.time if event.time is not None else 0.0), str(event.species))
-        if not _instant_event_is_absolute(event):
-            existing = absolute_by_key.get(key)
-            if existing is not None:
-                _raise_instant_conflict(existing, (event, source), species=event.species, time=key[0])
-            delta_by_key.setdefault(key, (event, source))
-            continue
-        existing_delta = delta_by_key.get(key)
-        if existing_delta is not None:
-            _raise_instant_conflict(existing_delta, (event, source), species=event.species, time=key[0])
-        existing_absolute = absolute_by_key.get(key)
-        if existing_absolute is not None and _instant_events_conflict(existing_absolute[0], event):
-            _raise_instant_conflict(existing_absolute, (event, source), species=event.species, time=key[0])
-        absolute_by_key[key] = (event, source)
 
-
-def _raise_instant_conflict(
-    left: tuple[InterventionInstantEvent, str],
-    right: tuple[InterventionInstantEvent, str],
+def validate_boundary_conflicts(
     *,
-    species: str,
-    time: float,
+    instants: Sequence[ExecutableInstant],
+    entering_holds: Sequence[ExecutableHold],
 ) -> None:
-    left_source = left[1]
-    right_source = right[1]
-    if right_source.startswith("protocol ") and not left_source.startswith("protocol "):
-        left_source, right_source = right_source, left_source
-    raise InterventionScheduleError(
-        f"{left_source} conflicts with {right_source} for species {species} at t={time:g}."
-    )
-
-
-def _operation_execution_payload(operation: InterventionProtocolOperation) -> dict[str, Any]:
-    payload = operation.to_payload()
-    payload.pop("metadata", None)
-    return payload
-
-
-def _protocol_instant_source(
-    protocol: InterventionProtocol,
-    window_index: int,
-    operation: InterventionProtocolOperation,
-) -> str:
-    return f"protocol {protocol.name!r} window {int(window_index)} phase {operation.phase!r}"
-
-
-def _schedule_has_metadata(schedule: InterventionSchedule) -> bool:
-    return bool(
-        schedule.metadata
-        or any(event.metadata for event in schedule.instant_events)
-        or any(event.metadata for event in schedule.repeated_events)
-        or any(event.metadata for event in schedule.trigger_events)
-        or any(interval.metadata for interval in schedule.intervals)
-    )
-
-
-def _lineage_entry_for_repeated_interval(
-    repeated_interval: InterventionRepeatedInterval,
-    *,
-    declaration_index: int,
-    window_index: int,
-    interval: InterventionInterval,
-) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "declaration": "repeated_interval",
-        "declaration_index": int(declaration_index),
-        "window_index": int(window_index),
-        "phase": "during",
-        "species": str(repeated_interval.species),
-        "primitive_kind": str(interval.kind),
-        "start": float(interval.start if interval.start is not None else 0.0),
-        "end": float(interval.end if interval.end is not None else 0.0),
-    }
-    if repeated_interval.metadata:
-        entry["metadata"] = _metadata_dict(repeated_interval.metadata)
-    return entry
-
-
-def _lineage_entry_for_protocol(
-    protocol: InterventionProtocol,
-    window_index: int,
-    operation: InterventionProtocolOperation,
-    *,
-    primitive: InterventionInstantEvent | InterventionInterval,
-) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "protocol": str(protocol.name),
-        "window_index": int(window_index),
-        "phase": str(operation.phase),
-        "species": str(operation.species),
-        "primitive_kind": str(operation.op),
-    }
-    if isinstance(primitive, InterventionInterval):
-        entry["start"] = float(primitive.start if primitive.start is not None else 0.0)
-        entry["end"] = float(primitive.end if primitive.end is not None else 0.0)
-    else:
-        entry["time"] = float(primitive.time if primitive.time is not None else 0.0)
-    if protocol.metadata:
-        entry["protocol_metadata"] = _metadata_dict(protocol.metadata)
-    if operation.metadata:
-        entry["metadata"] = _metadata_dict(operation.metadata)
-    return entry
-
-
-def _primitive_metadata_entries(schedule: InterventionSchedule) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    for index, event in enumerate(schedule.instant_events):
-        if event.metadata:
-            entries.append(
-                {
-                    "kind": "instant_event",
-                    "index": int(index),
-                    "species": str(event.species),
-                    "metadata": _metadata_dict(event.metadata),
-                }
+    by_key: dict[tuple[float, str], list[ExecutableInstant | ExecutableHold]] = {}
+    for instant in instants:
+        by_key.setdefault((instant.time, instant.species), []).append(instant)
+    for hold in entering_holds:
+        by_key.setdefault((hold.start_time, hold.species), []).append(hold)
+    for (time, species), candidates in by_key.items():
+        sets = [
+            item
+            for item in candidates
+            if isinstance(item, ExecutableInstant) and item.op == "set"
+        ]
+        jumps = [
+            item
+            for item in candidates
+            if isinstance(item, ExecutableInstant) and item.op == "jump"
+        ]
+        holds = [item for item in candidates if isinstance(item, ExecutableHold)]
+        if sets and jumps:
+            raise InterventionScheduleError(
+                f"set and jump conflict for {species} at t={time:g}."
             )
-    for index, event in enumerate(schedule.repeated_events):
-        if event.metadata:
-            entries.append(
-                {
-                    "kind": "repeated_event",
-                    "index": int(index),
-                    "species": str(event.species),
-                    "metadata": _metadata_dict(event.metadata),
-                }
+        absolute_values = [
+            *(float(item.value) for item in sets),
+            *(float(item.value) for item in holds),
+        ]
+        if absolute_values and any(
+            value != absolute_values[0] for value in absolute_values[1:]
+        ):
+            raise InterventionScheduleError(
+                f"Incompatible absolute/hold conflict for {species} at t={time:g}."
             )
-    for index, event in enumerate(schedule.trigger_events):
-        if event.metadata:
-            entries.append(
-                {
-                    "kind": "trigger_event",
-                    "index": int(index),
-                    "species": str(event.species),
-                    "metadata": _metadata_dict(event.metadata),
-                }
+        if holds and jumps:
+            raise InterventionScheduleError(
+                f"hold start and jump conflict for {species} at t={time:g}."
             )
-    for index, interval in enumerate(schedule.intervals):
-        if interval.metadata:
-            entries.append(
-                {
-                    "kind": "interval",
-                    "index": int(index),
-                    "species": str(interval.species),
-                    "metadata": _metadata_dict(interval.metadata),
-                }
-            )
-    return entries
 
 
-def _metadata_mentions_display_unit(metadata: Mapping[str, Any] | Sequence[tuple[str, str]]) -> bool:
-    if isinstance(metadata, Mapping):
-        return "display_unit" in metadata
-    return any(str(key) == "display_unit" for key, _value in metadata)
-
-
-def _lineage_mentions_display_unit(lineage: Sequence[Mapping[str, Any]]) -> bool:
-    for entry in lineage:
-        for key in ("metadata", "protocol_metadata"):
-            metadata = entry.get(key)
-            if isinstance(metadata, Mapping) and _metadata_mentions_display_unit(metadata):
-                return True
-    return False
-
-
-def _strip_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
-    out = {}
-    for key, value in payload.items():
-        if str(key) == "metadata":
-            continue
-        if isinstance(value, Mapping):
-            out[str(key)] = _strip_metadata(value)
-        elif isinstance(value, list):
-            out[str(key)] = [_strip_metadata(item) if isinstance(item, Mapping) else item for item in value]
-        else:
-            out[str(key)] = value
-    return out
-
-
-def _copy_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, item in value.items():
-        if isinstance(item, Mapping):
-            out[str(key)] = _copy_mapping(item)
-        elif isinstance(item, list):
-            out[str(key)] = [_copy_mapping(entry) if isinstance(entry, Mapping) else entry for entry in item]
-        elif isinstance(item, tuple):
-            out[str(key)] = tuple(_copy_mapping(entry) if isinstance(entry, Mapping) else entry for entry in item)
-        else:
-            out[str(key)] = item
-    return out
-
-
-def _metadata_dict(metadata: Sequence[tuple[str, str]]) -> dict[str, str]:
-    return {str(key): str(value) for key, value in metadata}
+def _validate_hold_overlaps(holds: Sequence[ExecutableHold]) -> None:
+    for index, left in enumerate(holds):
+        for right in holds[index + 1 :]:
+            if left.species != right.species:
+                continue
+            if left.start_time < right.end_time and right.start_time < left.end_time:
+                if left.value != right.value:
+                    raise InterventionScheduleError(
+                        "Overlapping holds for "
+                        f"{left.species} must have equal resolved values."
+                    )

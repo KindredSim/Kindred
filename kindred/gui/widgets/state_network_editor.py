@@ -14,6 +14,7 @@ Emits stateNetworkChanged signal when modified.
 from __future__ import annotations
 
 from contextlib import suppress
+from collections.abc import Mapping
 import os
 import logging
 from typing import List, Dict, Tuple, Optional
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QSplitter, QGroupBox
 )
 
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.gui.diagnostics import linux_rss_kb, safe_len_find_children
 
 logger = logging.getLogger(__name__)
@@ -37,7 +39,9 @@ __all__ = ["StateNetworkEditor"]
 
 _STATE_KIND_OPTIONS = ("GS", "TS")
 _ENERGY_UNIT_OPTIONS = ("kJ/mol", "kcal/mol", "J/mol")
-_PRESERVED_STATE_FIELD_KEYS = ("members", "std", "standard_state")
+_VISIBLE_STATE_FIELD_KEYS = frozenset(
+    {"kind", "energy", "energy_unit", "degeneracy"}
+)
 
 
 class _ComboBoxItemDelegate(QStyledItemDelegate):
@@ -110,7 +114,6 @@ class StateNetworkEditor(QWidget):
         self._states_table.cellChanged.connect(self._on_states_changed)
         self._states_table.setItemDelegateForColumn(1, _ComboBoxItemDelegate(_STATE_KIND_OPTIONS, self._states_table))
         self._states_table.setItemDelegateForColumn(3, _ComboBoxItemDelegate(_ENERGY_UNIT_OPTIONS, self._states_table))
-        self._states_default_edit_triggers = self._states_table.editTriggers()
 
         # States buttons
         states_btn_layout = QHBoxLayout()
@@ -136,7 +139,6 @@ class StateNetworkEditor(QWidget):
         self._edges_table.horizontalHeader().setStretchLastSection(True)
         self._edges_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._edges_table.cellChanged.connect(self._on_edges_changed)
-        self._edges_default_edit_triggers = self._edges_table.editTriggers()
 
         # Edges buttons
         edges_btn_layout = QHBoxLayout()
@@ -165,7 +167,6 @@ class StateNetworkEditor(QWidget):
         layout.addWidget(self._status_label)
 
         # Track if we're programmatically updating (to prevent signal loops)
-        self._read_only = False
         self._updating = False
         self._has_validation_errors = False
         self._logged_first_change = False
@@ -189,16 +190,14 @@ class StateNetworkEditor(QWidget):
             self._states_table.itemSelectionChanged.connect(self._debug_on_states_selection_changed)
 
     @staticmethod
-    def _preserved_state_fields_from_kv(kv: Dict[str, str]) -> Dict[str, str]:
-        preserved: Dict[str, str] = {}
-        for key in _PRESERVED_STATE_FIELD_KEYS:
-            value = kv.get(key)
-            if value is None:
-                continue
-            text = str(value).strip()
-            if text:
-                preserved[key] = text
-        return preserved
+    def _preserved_state_fields_from_authored(
+        authored_fields: Mapping[str, object],
+    ) -> Dict[str, str]:
+        return {
+            str(key): str(value)
+            for key, value in authored_fields.items()
+            if str(key) not in _VISIBLE_STATE_FIELD_KEYS
+        }
 
     @staticmethod
     def _preserved_state_fields_from_item(item: QTableWidgetItem | None) -> Dict[str, str]:
@@ -208,29 +207,12 @@ class StateNetworkEditor(QWidget):
         if not isinstance(data, dict):
             return {}
         preserved: Dict[str, str] = {}
-        for key in _PRESERVED_STATE_FIELD_KEYS:
-            value = data.get(key)
-            if value is None:
+        for key, value in data.items():
+            name = str(key)
+            if name in _VISIBLE_STATE_FIELD_KEYS:
                 continue
-            text = str(value).strip()
-            if text:
-                preserved[key] = text
+            preserved[name] = str(value)
         return preserved
-
-    def _clear_preserved_state_fields_for_row(self, row: int | None) -> None:
-        if row is None:
-            return
-        try:
-            row_i = int(row)
-        except (TypeError, ValueError):
-            return
-        if row_i < 0 or row_i >= self._states_table.rowCount():
-            return
-        item = self._states_table.item(row_i, 0)
-        if item is None or not self._preserved_state_fields_from_item(item):
-            return
-        with QtCore.QSignalBlocker(self._states_table):
-            item.setData(Qt.ItemDataRole.UserRole, {})
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -381,23 +363,6 @@ class StateNetworkEditor(QWidget):
 
     # -------------------- Public API --------------------
 
-    def validate_state_network_dsl_loadable(self, dsl_text: str) -> None:
-        unsupported_lines = []
-        for line_no, raw_line in enumerate(str(dsl_text or "").splitlines(), start=1):
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            lower = line.lower()
-            if lower.startswith("energy=") or lower.startswith("state:") or lower.startswith("edge:"):
-                continue
-            unsupported_lines.append((line_no, line))
-        if unsupported_lines:
-            first_line_no, first_line = unsupported_lines[0]
-            raise ValueError(
-                "State Network DSL contains unsupported line "
-                f"{first_line_no}: {first_line!r}."
-            )
-
     def get_state_network_dsl(self) -> str:
         """
         Export state network as DSL text.
@@ -447,45 +412,35 @@ class StateNetworkEditor(QWidget):
 
         return "\n".join(lines)
 
-    def set_state_network_dsl(self, dsl_text: str):
-        """
-        Load state network from DSL text.
+    def set_state_network_analysis(
+        self,
+        prepared_dsl: PreparedDslRequestSet,
+    ) -> None:
+        """Load the editor from immutable public State Network facts."""
 
-        Parameters
-        ----------
-        dsl_text : str
-            DSL text with state: and edge: lines
-        """
-        self.validate_state_network_dsl_loadable(dsl_text)
+        if not isinstance(prepared_dsl, PreparedDslRequestSet):
+            raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+        facts = prepared_dsl.analysis.structure["state_network"]
+        if not isinstance(facts, Mapping):
+            raise TypeError("DSL state_network analysis must be a mapping.")
+        if facts.get("analysis_identity") != prepared_dsl.analysis.identity:
+            raise ValueError(
+                "State Network facts do not belong to the prepared analysis."
+            )
+        states = tuple(facts.get("states", ()))
+        edges = tuple(facts.get("edges", ()))
+        if any(not isinstance(item, Mapping) for item in (*states, *edges)):
+            raise TypeError("State Network states and edges must be mappings.")
+
         self._change_flush_timer.stop()
         self._updating = True
         try:
-            # Clear existing data (must also dispose of cell widgets to avoid leaks)
             self._reset_tables()
-
-            energy_unit = "kJ/mol"
-            for line in dsl_text.strip().split('\n'):
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-
-                lower = line.lower()
-                if lower.startswith("energy="):
-                    try:
-                        from kindred.core.simulator.dsl_parse import _parse_energy_unit_directive
-
-                        energy_unit = _parse_energy_unit_directive(line)
-                    except Exception:
-                        logger.debug("StateNetworkEditor: ignored invalid energy directive %r", line, exc_info=True)
-                    continue
-
-                if lower.startswith('state:'):
-                    self._parse_state_line(line, energy_unit=energy_unit)
-                elif lower.startswith('edge:'):
-                    self._parse_edge_line(line)
-
+            for state in states:
+                self._append_state_fact(state)
+            for edge in edges:
+                self._append_edge_fact(edge)
             self._validate()
-
         finally:
             self._updating = False
 
@@ -507,9 +462,6 @@ class StateNetworkEditor(QWidget):
             self._updating = False
 
         self.stateNetworkChanged.emit()
-
-    def is_read_only(self) -> bool:
-        return bool(getattr(self, "_read_only", False))
 
     def is_valid(self) -> bool:
         self._change_flush_timer.stop()
@@ -545,51 +497,6 @@ class StateNetworkEditor(QWidget):
                     editor,
                     QAbstractItemDelegate.EndEditHint.SubmitModelCache,
                 )
-
-    def _close_active_table_editor(self, table: QTableWidget) -> None:
-        open_editors = self._open_table_editors(table)
-        if not open_editors:
-            return
-        for editor in open_editors:
-            with suppress(RuntimeError, TypeError):
-                delegate = table.itemDelegate()
-                if delegate is not None:
-                    delegate.closeEditor.emit(
-                        editor,
-                        QAbstractItemDelegate.EndEditHint.RevertModelCache,
-                    )
-            with suppress(RuntimeError, TypeError):
-                table.closeEditor(
-                    editor,
-                    QAbstractItemDelegate.EndEditHint.RevertModelCache,
-                )
-            with suppress(RuntimeError, TypeError):
-                editor.blockSignals(True)
-                editor.clearFocus()
-                editor.hide()
-                editor.close()
-                editor.setParent(None)
-                editor.deleteLater()
-
-    def set_read_only(self, read_only: bool) -> None:
-        read_only = bool(read_only)
-        self._read_only = read_only
-
-        self._add_state_btn.setEnabled(not read_only)
-        self._remove_state_btn.setEnabled(not read_only)
-        self._add_edge_btn.setEnabled(not read_only)
-        self._remove_edge_btn.setEnabled(not read_only)
-
-        if read_only:
-            self._close_active_table_editor(self._states_table)
-            self._close_active_table_editor(self._edges_table)
-            no_edit = QAbstractItemView.EditTrigger.NoEditTriggers
-            self._states_table.setEditTriggers(no_edit)
-            self._edges_table.setEditTriggers(no_edit)
-            return
-
-        self._states_table.setEditTriggers(self._states_default_edit_triggers)
-        self._edges_table.setEditTriggers(self._edges_default_edit_triggers)
 
     def get_states(self) -> List[Dict]:
         """
@@ -645,8 +552,6 @@ class StateNetworkEditor(QWidget):
 
     def _add_state_row(self):
         """Add a new state row."""
-        if self.is_read_only():
-            return
         row = self._states_table.rowCount()
         self._states_table.insertRow(row)
 
@@ -673,8 +578,6 @@ class StateNetworkEditor(QWidget):
 
     def _remove_selected_states(self):
         """Remove selected state rows."""
-        if self.is_read_only():
-            return
         selected_rows = sorted(set(index.row() for index in self._states_table.selectedIndexes()), reverse=True)
         with QtCore.QSignalBlocker(self._states_table):
             for row in selected_rows:
@@ -685,8 +588,6 @@ class StateNetworkEditor(QWidget):
 
     def _add_edge_row(self):
         """Add a new edge row."""
-        if self.is_read_only():
-            return
         row = self._edges_table.rowCount()
         self._edges_table.insertRow(row)
 
@@ -701,8 +602,6 @@ class StateNetworkEditor(QWidget):
 
     def _remove_selected_edges(self):
         """Remove selected edge rows."""
-        if self.is_read_only():
-            return
         selected_rows = sorted(set(index.row() for index in self._edges_table.selectedIndexes()), reverse=True)
         for row in selected_rows:
             self._edges_table.removeRow(row)
@@ -735,7 +634,6 @@ class StateNetworkEditor(QWidget):
                     self._debug_reentrancy_exit("states_changed")
                     return
             try:
-                self._clear_preserved_state_fields_for_row(row)
                 self._schedule_user_change()
             finally:
                 if debug_entered:
@@ -850,72 +748,43 @@ class StateNetworkEditor(QWidget):
             if debug_entered:
                 self._debug_reentrancy_exit("validate")
 
-    @staticmethod
-    def _editor_energy_from_state_kv(kv: Dict[str, str], default_unit: str) -> Tuple[str, str]:
-        energy_text = str(kv.get("energy") or "0").strip()
-        unit = str(kv.get("energy_unit") or default_unit or "kJ/mol").strip()
-        if energy_text:
-            parts = energy_text.split()
-            if len(parts) == 2 and parts[1] in _ENERGY_UNIT_OPTIONS:
-                energy_text = parts[0]
-                unit = parts[1]
+    def _append_state_fact(self, fact: Mapping[str, object]) -> None:
+        name = str(fact["name"])
+        kind = str(fact["kind"])
+        energy = float(fact["source_energy_value"])
+        unit = str(fact["source_energy_unit"])
+        degeneracy = float(fact["degeneracy"])
+        authored = fact.get("authored_fields", {})
+        if not isinstance(authored, Mapping):
+            raise TypeError("State authored_fields must be a mapping.")
+        if not name or kind not in _STATE_KIND_OPTIONS:
+            raise ValueError("State facts contain an invalid name or kind.")
         if unit not in _ENERGY_UNIT_OPTIONS:
-            unit = "kJ/mol"
-        return energy_text or "0", unit
+            raise ValueError("State facts contain an unsupported energy unit.")
 
-    def _parse_state_line(self, line: str, *, energy_unit: str = "kJ/mol"):
-        """Load a parser-valid `state:` line into the editor tables."""
-        _, rest = line.split(':', 1)
-        try:
-            from kindred.core.simulator.dsl_parse import _parse_state_rest
-
-            name, kv = _parse_state_rest(rest)
-        except Exception:
-            logger.debug("StateNetworkEditor: ignored invalid state line %r", line, exc_info=True)
-            return
-
-        if not name:
-            return
-
-        energy_text, unit = self._editor_energy_from_state_kv(kv, energy_unit)
-        state_data = {
-            "name": str(name),
-            "kind": str(kv.get("kind") or "GS").strip().upper(),
-            "energy": energy_text,
-            "unit": unit,
-            "degeneracy": str(kv.get("degeneracy") or "1").strip() or "1",
-        }
-
-        # Add row
         row = self._states_table.rowCount()
         self._states_table.insertRow(row)
-
-        name_item = QTableWidgetItem(state_data["name"])
-        name_item.setData(Qt.ItemDataRole.UserRole, self._preserved_state_fields_from_kv(kv))
+        name_item = QTableWidgetItem(name)
+        name_item.setData(
+            Qt.ItemDataRole.UserRole,
+            self._preserved_state_fields_from_authored(authored),
+        )
         self._states_table.setItem(row, 0, name_item)
+        self._states_table.setItem(row, 1, QTableWidgetItem(kind))
+        self._states_table.setItem(row, 2, QTableWidgetItem(f"{energy:.17g}"))
+        self._states_table.setItem(row, 3, QTableWidgetItem(unit))
+        self._states_table.setItem(
+            row,
+            4,
+            QTableWidgetItem(f"{degeneracy:.17g}"),
+        )
 
-        self._states_table.setItem(row, 1, QTableWidgetItem(state_data["kind"]))
-
-        self._states_table.setItem(row, 2, QTableWidgetItem(state_data["energy"]))
-
-        self._states_table.setItem(row, 3, QTableWidgetItem(state_data["unit"]))
-
-        self._states_table.setItem(row, 4, QTableWidgetItem(state_data["degeneracy"]))
-
-    def _parse_edge_line(self, line: str):
-        """Parse 'edge: A,B' or 'edge: A-B' line."""
-        _, rest = line.split(':', 1)
-        try:
-            from kindred.core.simulator.dsl_parse import _parse_edge_step
-
-            state_a, state_b = _parse_edge_step(rest)
-        except Exception:
-            logger.debug("StateNetworkEditor: ignored invalid edge line %r", line, exc_info=True)
-            return
-
-        # Add row
+    def _append_edge_fact(self, fact: Mapping[str, object]) -> None:
+        state_a = str(fact["state_a"])
+        state_b = str(fact["state_b"])
+        if not state_a or not state_b:
+            raise ValueError("State Network edge facts must be nonblank.")
         row = self._edges_table.rowCount()
         self._edges_table.insertRow(row)
-
         self._edges_table.setItem(row, 0, QTableWidgetItem(state_a))
         self._edges_table.setItem(row, 1, QTableWidgetItem(state_b))

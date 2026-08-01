@@ -12,9 +12,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
-import pickle
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -25,8 +24,10 @@ from kindred.core.runtime_defaults import (
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 )
 from kindred.core.intervention_schedule import (
-    coerce_intervention_schedule,
     normalized_intervention_schedule_identity_fingerprints,
+)
+from kindred.core.intervention_schedule_compiler import (
+    InterventionExecutionContract,
 )
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
@@ -43,34 +44,32 @@ from kindred.core.simulation_preparation import (
     _scalar_parameter_is_derived,
     _solve_request,
     _symbolic_jacobian_for_bind_failure,
-    assert_simulation_execution_request_schedule_identity,
     build_simulation_request_from_prepared_run,
     canonicalize_request_parameter_names,
-    coerce_prepared_simulation_metadata,
     metadata_view_for_mechanism,
     partition_simulation_parameter_values,
     prepare_bound_mechanism,
     prepare_simulation_worker_run,
-    resolve_prepared_run_intervention_schedule,
+    resolve_prepared_run_intervention_execution,
     SimulationPreparationError,
 )
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
-from kindred.core.simulation_series_payload import SimulationSeriesPayload, coerce_simulation_series_payload
+from kindred.core.simulation_series_payload import SimulationSeriesPayload
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "CallableFittingEvaluator",
     "FITTING_PARAM_ORIGIN_CONFIGURED_DATASET",
     "FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR",
     "FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET",
     "FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED",
+    "FittingSeriesEvaluation",
     "PreparedFittingExecutionContext",
     "SerialFittingEvaluator",
-    "coerce_fitting_series_evaluator",
     "evaluate_fitting_series",
     "prepare_fitting_execution_context",
 ]
@@ -86,16 +85,6 @@ _OPTIMIZER_PARAMETER_ORIGINS = frozenset(
         FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     }
 )
-
-
-def _prepared_metadata_from_evaluator(value) -> Optional[PreparedSimulationMetadata]:
-    try:
-        return coerce_prepared_simulation_metadata(
-            getattr(value, "prepared_metadata", None)
-            or getattr(value, "_kindred_prepared_simulation_meta", None)
-        )
-    except Exception:
-        return None
 
 
 def _parameter_origin_for(name: str, origins: Optional[Mapping[str, str]]) -> str:
@@ -134,24 +123,6 @@ def _coerce_consumed_parameter_value(
     )
 
 
-def _raise_for_forwarded_parameter_values(
-    params: Mapping[str, float],
-    *,
-    origins: Optional[Mapping[str, str]],
-    failed_params: Optional[Dict[str, float]],
-) -> None:
-    for raw_name, raw_value in dict(params or {}).items():
-        name = str(raw_name)
-        if not name.strip():
-            continue
-        _coerce_consumed_parameter_value(
-            name=name,
-            raw_value=raw_value,
-            origins=origins,
-            failed_params=failed_params,
-        )
-
-
 def _reject_requested_derived_scalars_for_fitting(mechanism: object, names: object) -> None:
     for raw_name in names or ():
         name = str(raw_name or "").strip()
@@ -186,23 +157,8 @@ def _fitting_cancel_requested(cancellation_check) -> bool:
     return bool(cancel_requested())
 
 
-class CallableFittingEvaluator:
-    """Adapter that lifts a callable simulation boundary into the evaluator contract."""
-
-    def __init__(self, simulation_func) -> None:
-        if not callable(simulation_func):
-            raise TypeError("simulation_func must be callable.")
-        self._simulation_func = simulation_func
-
-    @property
-    def prepared_metadata(self) -> Optional[PreparedSimulationMetadata]:
-        return _prepared_metadata_from_evaluator(self._simulation_func)
-
-    def __call__(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
-        return self.evaluate_series(params)
-
-    def evaluate_series(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
-        return coerce_simulation_series_payload(self._simulation_func(dict(params or {})))
+class FittingSeriesEvaluator(Protocol):
+    """Exact evaluator contract consumed by the Fit optimizer."""
 
     def evaluate_series_with_parameter_origins(
         self,
@@ -210,181 +166,274 @@ class CallableFittingEvaluator:
         origins: Optional[Mapping[str, str]] = None,
         *,
         failed_params: Optional[Dict[str, float]] = None,
-    ) -> SimulationSeriesPayload:
-        forwarded = dict(params or {})
-        _raise_for_forwarded_parameter_values(
-            forwarded,
-            origins=origins,
-            failed_params=failed_params,
-        )
-        return self.evaluate_series(forwarded)
+    ) -> "FittingSeriesEvaluation": ...
 
 
-class _EvaluateSeriesMethodAdapter:
-    """Adapter that makes evaluate_series-only evaluators callable."""
+@dataclass(frozen=True, slots=True)
+class FittingSeriesEvaluation:
+    """Simulation series plus the exact Run-owned intervention execution."""
 
-    def __init__(self, evaluator) -> None:
-        self._evaluator = evaluator
+    series: SimulationSeriesPayload
+    segment_ids: np.ndarray
+    segment_keys: tuple[str, ...]
+    pre_boundary_sample_mask: np.ndarray
+    intervention_execution: InterventionExecutionContract
 
-    @property
-    def prepared_metadata(self) -> Optional[PreparedSimulationMetadata]:
-        return _prepared_metadata_from_evaluator(self._evaluator)
-
-    def __call__(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
-        return self.evaluate_series(params)
-
-    def evaluate_series(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
-        return coerce_simulation_series_payload(self._evaluator.evaluate_series(dict(params or {})))
-
-    def evaluate_series_with_parameter_origins(
-        self,
-        params: Mapping[str, float],
-        origins: Optional[Mapping[str, str]] = None,
-        *,
-        failed_params: Optional[Dict[str, float]] = None,
-    ) -> SimulationSeriesPayload:
-        origin_aware_evaluate_series = getattr(
-            self._evaluator,
-            "evaluate_series_with_parameter_origins",
-            None,
-        )
-        if callable(origin_aware_evaluate_series):
-            return coerce_simulation_series_payload(
-                origin_aware_evaluate_series(
-                    dict(params or {}),
-                    dict(origins or {}),
-                    failed_params=failed_params,
+    def __post_init__(self) -> None:
+        if not isinstance(self.series, SimulationSeriesPayload):
+            raise TypeError(
+                "Fit series must be the final SimulationSeriesPayload type."
+            )
+        if not isinstance(
+            self.intervention_execution, InterventionExecutionContract
+        ):
+            raise TypeError(
+                "Fit intervention execution must be an "
+                "InterventionExecutionContract."
+            )
+        segment_ids = np.asarray(self.segment_ids, dtype=np.int64).reshape(-1).copy()
+        times = np.asarray(self.series.t, dtype=float).reshape(-1)
+        if segment_ids.size != times.size:
+            raise ValueError("Fit segment identity must align with simulation time.")
+        if (
+            np.any(segment_ids < 0)
+            or np.any(np.diff(segment_ids) < 0)
+        ):
+            raise ValueError(
+                "Fit segment identity must be ordered and nonnegative."
+            )
+        if np.any(np.diff(times) < 0.0):
+            raise ValueError("Fit simulation time must be ordered.")
+        segment_keys = tuple(str(value or "").strip() for value in self.segment_keys)
+        if (
+            len(segment_keys) != times.size
+            or any(not value for value in segment_keys)
+        ):
+            raise ValueError(
+                "Fit segment keys must align with simulation time and be nonblank."
+            )
+        pre_boundary_sample_mask = np.asarray(
+            self.pre_boundary_sample_mask,
+            dtype=bool,
+        ).reshape(-1).copy()
+        if pre_boundary_sample_mask.size != times.size:
+            raise ValueError(
+                "Fit pre-boundary identity must align with simulation time."
+            )
+        if times.size > 1:
+            discontinuities = (
+                self.intervention_execution.runtime_discontinuities_for_span(
+                    float(times[0]),
+                    float(times[-1]),
                 )
             )
-        forwarded = dict(params or {})
-        _raise_for_forwarded_parameter_values(
-            forwarded,
-            origins=origins,
-            failed_params=failed_params,
+            discontinuity_times = np.asarray(discontinuities, dtype=float)
+            expected_post = np.searchsorted(
+                discontinuity_times,
+                times,
+                side="right",
+            )
+            expected_pre = np.searchsorted(
+                discontinuity_times,
+                times,
+                side="left",
+            )
+            expected = np.where(
+                pre_boundary_sample_mask,
+                expected_pre,
+                expected_post,
+            )
+            if not np.array_equal(segment_ids, expected):
+                raise ValueError(
+                    "Fit segment identity conflicts with the intervention "
+                    "execution contract."
+                )
+        segment_ids.setflags(write=False)
+        pre_boundary_sample_mask.setflags(write=False)
+        object.__setattr__(self, "segment_ids", segment_ids)
+        object.__setattr__(self, "segment_keys", segment_keys)
+        object.__setattr__(
+            self,
+            "pre_boundary_sample_mask",
+            pre_boundary_sample_mask,
         )
-        return self.evaluate_series(forwarded)
-
-
-def coerce_fitting_series_evaluator(value):
-    if hasattr(value, "evaluate_series") and callable(getattr(value, "evaluate_series")):
-        if callable(value):
-            return value
-        return _EvaluateSeriesMethodAdapter(value)
-    if callable(value):
-        return CallableFittingEvaluator(value)
-    raise TypeError("Fitting evaluator must expose evaluate_series(params) or be callable.")
-
-
-def _fitting_series_evaluator_lane_clone_method(value):
-    normalized = coerce_fitting_series_evaluator(value)
-    if isinstance(normalized, _EvaluateSeriesMethodAdapter):
-        clone_lane = getattr(normalized._evaluator, "_kindred_clone_fitting_evaluator_lane", None)
-    else:
-        clone_lane = getattr(normalized, "_kindred_clone_fitting_evaluator_lane", None)
-    return clone_lane if callable(clone_lane) else None
-
-
-def _clone_fitting_series_evaluator_lane(value):
-    normalized = coerce_fitting_series_evaluator(value)
-    source = normalized._evaluator if isinstance(normalized, _EvaluateSeriesMethodAdapter) else normalized
-    clone_lane = _fitting_series_evaluator_lane_clone_method(value)
-    if clone_lane is None:
-        return None
-    try:
-        clone = clone_lane()
-    except Exception:
-        return None
-    if clone is source or clone is normalized:
-        return None
-    try:
-        return coerce_fitting_series_evaluator(clone)
-    except Exception:
-        return None
-
-
-def _with_fitting_evaluator_cancellation_check(value, cancellation_check):
-    normalized = coerce_fitting_series_evaluator(value)
-    target = normalized._evaluator if isinstance(normalized, _EvaluateSeriesMethodAdapter) else normalized
-    attach = getattr(target, "_kindred_set_fitting_cancellation_check", None)
-    if callable(attach):
-        attach(cancellation_check)
-    return normalized
-
-
-def _supports_fitting_evaluator_cancellation_check(value) -> bool:
-    try:
-        normalized = coerce_fitting_series_evaluator(value)
-    except Exception:
-        return False
-    target = normalized._evaluator if isinstance(normalized, _EvaluateSeriesMethodAdapter) else normalized
-    return callable(getattr(target, "_kindred_set_fitting_cancellation_check", None))
-
-
-def _supports_isolated_fitting_evaluator_lanes(value) -> bool:
-    try:
-        clone_lane = _fitting_series_evaluator_lane_clone_method(value)
-    except Exception:
-        return False
-    return clone_lane is not None
 
 
 def evaluate_fitting_series(
-    evaluator,
+    evaluator: FittingSeriesEvaluator,
     params: Mapping[str, float],
     *,
     origins: Optional[Mapping[str, str]] = None,
     failed_params: Optional[Dict[str, float]] = None,
-) -> SimulationSeriesPayload:
-    normalized = coerce_fitting_series_evaluator(evaluator)
-    origin_method = getattr(normalized, "evaluate_series_with_parameter_origins", None)
-    if callable(origin_method):
-        return coerce_simulation_series_payload(
-            origin_method(
-                dict(params or {}),
-                dict(origins or {}),
-                failed_params=failed_params,
-            )
+) -> FittingSeriesEvaluation:
+    if not callable(
+        getattr(evaluator, "evaluate_series_with_parameter_origins", None)
+    ):
+        raise TypeError(
+            "Fit evaluator must implement "
+            "evaluate_series_with_parameter_origins(...)."
         )
-    forwarded = dict(params or {})
-    _raise_for_forwarded_parameter_values(
-        forwarded,
-        origins=origins,
+    value = evaluator.evaluate_series_with_parameter_origins(
+        dict(params or {}),
+        dict(origins or {}),
         failed_params=failed_params,
     )
-    return coerce_simulation_series_payload(normalized.evaluate_series(forwarded))
-
-
-def _payload_value_for_comparison(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return np.asarray(value).tolist()
-    to_dict = getattr(value, "to_dict", None)
-    if callable(to_dict):
-        return _payload_value_for_comparison(to_dict())
-    fingerprint = getattr(value, "fingerprint", None)
-    if callable(fingerprint):
-        return str(fingerprint())
-    if isinstance(value, Mapping):
-        return {str(key): _payload_value_for_comparison(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_payload_value_for_comparison(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_payload_value_for_comparison(item) for item in value)
+    if (
+        not isinstance(value, FittingSeriesEvaluation)
+        or not isinstance(value.series, SimulationSeriesPayload)
+    ):
+        raise TypeError(
+            "Fit evaluator must return FittingSeriesEvaluation with a "
+            "SimulationSeriesPayload and segment identity."
+        )
     return value
 
 
-def _execution_request_payload_for_comparison(value: SimulationExecutionRequest) -> Dict[str, Any]:
-    payload = _payload_value_for_comparison(value.to_payload())
-    prepared_payload = payload.get("prepared_payload")
-    if isinstance(prepared_payload, dict):
-        prepared_payload = dict(prepared_payload)
-        prepared_payload.pop("mechanism", None)
-        prepared_payload.pop("bindings", None)
-        payload["prepared_payload"] = prepared_payload
-    return payload
+def _fitting_result_series(
+    result: object,
+    *,
+    species_names: Tuple[str, ...],
+) -> tuple[
+    np.ndarray,
+    Dict[str, np.ndarray],
+    np.ndarray,
+    tuple[str, ...],
+    np.ndarray,
+    np.ndarray,
+]:
+    result_times = np.asarray(getattr(result, "t"), dtype=float).reshape(-1)
+    result_values = np.asarray(getattr(result, "Y"), dtype=float)
+    if (
+        result_values.ndim != 2
+        or result_values.shape != (len(species_names), result_times.size)
+    ):
+        raise FitSimulationError(
+            "Fitting result species values are misaligned.",
+            details={"fatal": True, "stage": "intervention_execution"},
+        )
+    provenance = dict(getattr(result, "provenance", {}) or {})
+    discontinuity_ids = np.asarray(
+        provenance.get("result_discontinuity_ids"),
+        dtype=np.int64,
+    ).reshape(-1)
+    segment_keys = tuple(
+        str(value or "").strip()
+        for value in provenance.get("result_segment_keys", ())
+    )
+    integration_segment_ids = np.asarray(
+        provenance.get("result_segment_ids"),
+        dtype=np.int64,
+    ).reshape(-1)
+    if not (
+        discontinuity_ids.size
+        == len(segment_keys)
+        == integration_segment_ids.size
+        == result_times.size
+    ):
+        raise FitSimulationError(
+            "Fitting result lost aligned segment/discontinuity identity.",
+            details={"fatal": True, "stage": "intervention_execution"},
+        )
+
+    rows: list[
+        tuple[float, int, int, str, int, np.ndarray, bool]
+    ] = [
+        (
+            float(time),
+            1,
+            int(discontinuity_id),
+            segment_key,
+            int(integration_segment_id),
+            np.asarray(result_values[:, index], dtype=float).reshape(-1),
+            False,
+        )
+        for index, (
+            time,
+            discontinuity_id,
+            segment_key,
+            integration_segment_id,
+        ) in enumerate(
+            zip(
+                result_times,
+                discontinuity_ids,
+                segment_keys,
+                integration_segment_ids,
+                strict=True,
+            )
+        )
+    ]
+    pre_identities: set[tuple[float, str]] = set()
+    for raw_sample in provenance.get("pre_boundary_samples", ()):
+        if not isinstance(raw_sample, Mapping):
+            raise FitSimulationError(
+                "Fitting result contains an invalid pre-boundary sample.",
+                details={"fatal": True, "stage": "intervention_execution"},
+            )
+        try:
+            time = float(raw_sample["time"])
+            segment_key = str(raw_sample["segment_key"] or "").strip()
+            integration_segment_id = int(raw_sample["segment_id"])
+            discontinuity_id = int(raw_sample["discontinuity_id"])
+            state = np.asarray(
+                raw_sample["state"],
+                dtype=float,
+            ).reshape(-1)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise FitSimulationError(
+                "Fitting result contains an invalid pre-boundary sample.",
+                details={"fatal": True, "stage": "intervention_execution"},
+            ) from exc
+        identity = (time, segment_key)
+        if (
+            not np.isfinite(time)
+            or not segment_key
+            or integration_segment_id < 0
+            or discontinuity_id < 0
+            or state.size != len(species_names)
+            or not np.all(np.isfinite(state))
+            or identity in pre_identities
+            or (
+                result_times.size
+                and (
+                    time < float(result_times[0])
+                    or time > float(result_times[-1])
+                )
+            )
+        ):
+            raise FitSimulationError(
+                "Fitting result contains an invalid pre-boundary sample.",
+                details={"fatal": True, "stage": "intervention_execution"},
+            )
+        pre_identities.add(identity)
+        rows.append(
+            (
+                time,
+                0,
+                discontinuity_id,
+                segment_key,
+                integration_segment_id,
+                state.copy(),
+                True,
+            )
+        )
+    rows.sort(key=lambda row: (row[0], row[1], row[4]))
+    times = np.asarray([row[0] for row in rows], dtype=float)
+    values = np.column_stack([row[5] for row in rows])
+    return (
+        times,
+        {
+            name: np.asarray(values[index, :], dtype=float).reshape(-1).copy()
+            for index, name in enumerate(species_names)
+        },
+        np.asarray([row[2] for row in rows], dtype=np.int64),
+        tuple(row[3] for row in rows),
+        np.asarray([row[4] for row in rows], dtype=np.int64),
+        np.asarray([row[6] for row in rows], dtype=bool),
+    )
 
 
 def _fitting_plan_from_execution_request(
-    execution_request: SimulationExecutionRequest | Mapping[str, Any],
+    execution_request: SimulationExecutionRequest,
 ) -> SimulationPlan:
     return SimulationPlan.from_execution_request(
         execution_request,
@@ -394,90 +443,63 @@ def _fitting_plan_from_execution_request(
 
 
 def _coerce_fitting_simulation_plan(
-    value: SimulationPlan | Mapping[str, Any],
+    value: SimulationPlan,
 ) -> SimulationPlan:
     from kindred.core.simulation_algebra_policy import ensure_fitting_strict_algebra_policy
 
-    plan = value if isinstance(value, SimulationPlan) else SimulationPlan.from_payload(value)
+    if not isinstance(value, SimulationPlan):
+        raise TypeError("simulation_plan must be SimulationPlan.")
+    plan = value
     if plan.execution_mode != "fitting":
         raise ValueError("Fitting execution context requires a fitting simulation plan.")
     ensure_fitting_strict_algebra_policy(plan.algebra_policy)
     return SimulationPlan.from_payload(plan.to_payload())
 
 
-def _assert_matching_fitting_execution_request(
-    *,
-    simulation_plan: SimulationPlan,
-    execution_request: SimulationExecutionRequest | Mapping[str, Any],
-) -> None:
-    request = (
-        execution_request
-        if isinstance(execution_request, SimulationExecutionRequest)
-        else SimulationExecutionRequest.from_mapping(dict(execution_request))
-    )
-    if _execution_request_payload_for_comparison(request) != _execution_request_payload_for_comparison(
-        simulation_plan.execution_request
-    ):
-        raise ValueError("Fitting simulation_plan execution_request does not match execution_request.")
-
-
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class PreparedFittingExecutionContext:
-    """Structured execution data for the shared fitting evaluation seam."""
+    """Required final fitting plan and its typed preparation metadata."""
 
     simulation_plan: SimulationPlan
-    requested_param_names: List[str]
+    requested_param_names: tuple[str, ...]
     prepared_metadata: PreparedSimulationMetadata
     temperature_K: float
     initial_prefix: str
 
-    def __init__(
-        self,
-        *,
-        requested_param_names: List[str],
-        prepared_metadata: PreparedSimulationMetadata | Mapping[str, Any],
-        temperature_K: float,
-        initial_prefix: str,
-        simulation_plan: SimulationPlan | Mapping[str, Any] | None = None,
-        execution_request: SimulationExecutionRequest | Mapping[str, Any] | None = None,
-    ) -> None:
-        plan_value = simulation_plan
-        if plan_value is None:
-            if execution_request is None:
-                raise TypeError("simulation_plan or execution_request is required.")
-            plan = _fitting_plan_from_execution_request(execution_request)
-        else:
-            plan = _coerce_fitting_simulation_plan(plan_value)
-            if execution_request is not None:
-                _assert_matching_fitting_execution_request(
-                    simulation_plan=plan,
-                    execution_request=execution_request,
-                )
-        metadata_copy = coerce_prepared_simulation_metadata(prepared_metadata)
-        if metadata_copy is None:
-            raise TypeError("prepared_metadata must be a PreparedSimulationMetadata or compatible mapping.")
+    def __post_init__(self) -> None:
+        plan = _coerce_fitting_simulation_plan(self.simulation_plan)
+        if not isinstance(self.prepared_metadata, PreparedSimulationMetadata):
+            raise TypeError(
+                "prepared_metadata must be PreparedSimulationMetadata."
+            )
+        names = tuple(
+            dict.fromkeys(
+                str(name)
+                for name in self.requested_param_names
+                if str(name).strip()
+            )
+        )
         object.__setattr__(self, "simulation_plan", plan)
         object.__setattr__(
             self,
             "requested_param_names",
-            [str(name) for name in list(requested_param_names or []) if str(name).strip()],
+            names,
         )
-        object.__setattr__(self, "prepared_metadata", metadata_copy)
-        object.__setattr__(self, "temperature_K", float(temperature_K))
-        object.__setattr__(self, "initial_prefix", str(initial_prefix or "init:"))
-
-    @property
-    def execution_request(self) -> SimulationExecutionRequest:
-        return self.simulation_plan.execution_request
+        object.__setattr__(self, "temperature_K", float(self.temperature_K))
+        object.__setattr__(
+            self,
+            "initial_prefix",
+            str(self.initial_prefix or "init:"),
+        )
 
     def clone(
         self,
         *,
-        prepared_metadata: PreparedSimulationMetadata | Mapping[str, Any] | None = None,
+        prepared_metadata: PreparedSimulationMetadata | None = None,
     ) -> "PreparedFittingExecutionContext":
         return type(self)(
             simulation_plan=SimulationPlan.from_payload(copy.deepcopy(self.simulation_plan.to_payload())),
-            requested_param_names=list(self.requested_param_names),
+            requested_param_names=self.requested_param_names,
             prepared_metadata=self.prepared_metadata if prepared_metadata is None else prepared_metadata,
             temperature_K=float(self.temperature_K),
             initial_prefix=str(self.initial_prefix),
@@ -486,11 +508,11 @@ class PreparedFittingExecutionContext:
 
 def prepare_fitting_execution_context(
     *,
-    mechanism_text: str,
+    prepared_dsl: PreparedDslRequestSet,
     param_names: List[str],
+    t_start: float = 0.0,
     t_end: float,
     num_points: int,
-    temperature_K: float = 298.15,
     solver: str = DEFAULT_SOLVER_NAME,
     rtol: float = 1e-6,
     atol: float = 1e-12,
@@ -500,9 +522,21 @@ def prepare_fitting_execution_context(
 ) -> PreparedFittingExecutionContext:
     """Prepare structured execution data for serial fitting evaluation."""
 
+    if not isinstance(prepared_dsl, PreparedDslRequestSet):
+        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+    t_start = float(t_start)
     t_end = float(t_end)
+    if not np.isfinite(t_start) or not np.isfinite(t_end) or t_end <= t_start:
+        raise ValueError("Fitting execution requires finite t_end > t_start.")
     grid_n = max(2, int(num_points))
     initial_prefix = str(initial_prefix or "init:")
+    mechanism_param_names = [
+        str(name)
+        for name in (param_names or ())
+        if str(name).strip()
+        and not str(name).startswith(initial_prefix)
+    ]
+    temperature_K = float(prepared_dsl.analysis.structure["temperature_K"])
 
     prepared_solver_config = _build_solver_config(
         solver_input=str(solver or DEFAULT_SOLVER_NAME),
@@ -513,25 +547,26 @@ def prepare_fitting_execution_context(
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
     bound = prepare_bound_mechanism(
-        mechanism_text=mechanism_text,
-        param_names=list(param_names or []),
-        temperature_K=float(temperature_K),
-        initials={},
+        prepared_dsl,
+        mechanism_param_names,
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
     try:
-        _reject_requested_derived_scalars_for_fitting(bound.mechanism, param_names or [])
+        _reject_requested_derived_scalars_for_fitting(
+            bound.mechanism,
+            mechanism_param_names,
+        )
         requested_partition = partition_simulation_parameter_values(
             mechanism=bound.mechanism,
             parameter_overrides=None,
             unresolved_intervention_schedule=bound.unresolved_intervention_schedule,
-            requested_parameter_names=param_names or [],
+            requested_parameter_names=mechanism_param_names,
             runtime_parameter_names=_available_energy_binding_names(bound.mechanism),
         )
         _raise_unowned_request_parameter_values(requested_partition)
         canonical_requested_param_names = canonicalize_request_parameter_names(
             requested_partition,
-            param_names or [],
+            mechanism_param_names,
         )
         _reject_requested_algebra_owned_mechanism_parameters_for_fitting(
             bound.mechanism,
@@ -545,7 +580,7 @@ def prepare_fitting_execution_context(
         ) from exc
     prepared_payload = dict(bound.as_serializable_execution_payload())
     prepared_payload["requested_parameter_names"] = list(canonical_requested_param_names)
-    intervention_schedule = coerce_intervention_schedule(prepared_payload.get("intervention_schedule"))
+    intervention_schedule = bound.unresolved_intervention_schedule
     from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
     (
@@ -558,8 +593,10 @@ def prepare_fitting_execution_context(
 
     prepared_meta = PreparedSimulationMetadata(
         version=1,
-        mechanism_text_sha256=hashlib.sha256((mechanism_text or "").encode("utf-8")).hexdigest(),
-        mechanism_text_len=len(mechanism_text or ""),
+        mechanism_text_sha256=hashlib.sha256(
+            prepared_dsl.analysis.normalized_text.encode("utf-8")
+        ).hexdigest(),
+        mechanism_text_len=len(prepared_dsl.analysis.normalized_text),
         param_names=sorted({str(x) for x in canonical_requested_param_names if str(x).strip()}),
         t_end=float(t_end),
         num_points=int(grid_n),
@@ -578,7 +615,7 @@ def prepare_fitting_execution_context(
     execution_request = SimulationExecutionRequest(
         prepared_payload=prepared_payload,
         initials={},
-        t_span=(0.0, float(t_end)),
+        t_span=(float(t_start), float(t_end)),
         solver_config={
             "solver": str(prepared_solver_config.solver),
             "rtol": float(prepared_solver_config.rtol),
@@ -590,12 +627,21 @@ def prepare_fitting_execution_context(
             ),
             MechanismMetadataKeys.TEMPERATURE_K: float(temperature_K),
         },
-        mechanism_text=str(mechanism_text or ""),
         intervention_schedule=intervention_schedule,
     )
     return PreparedFittingExecutionContext(
-        execution_request=execution_request,
-        requested_param_names=sorted({str(x) for x in canonical_requested_param_names if str(x).strip()}),
+        simulation_plan=_fitting_plan_from_execution_request(
+            execution_request
+        ),
+        requested_param_names=tuple(
+            sorted(
+                {
+                    str(x)
+                    for x in canonical_requested_param_names
+                    if str(x).strip()
+                }
+            )
+        ),
         prepared_metadata=prepared_meta,
         temperature_K=float(temperature_K),
         initial_prefix=str(initial_prefix),
@@ -628,124 +674,16 @@ class SerialFittingEvaluator:
         self._prepared_solver_config = None
         self._parameter_algebra_spec = None
         self._compiled_algebra = None
-        self._kindred_fitting_execution_context = self._context
         self._cancellation_check = None
 
     @property
     def prepared_metadata(self) -> PreparedSimulationMetadata:
         return self._context.prepared_metadata
 
-    @property
-    def context(self) -> PreparedFittingExecutionContext:
-        return self._context
-
-    def with_fixed_params(self, fixed_params: Mapping[str, float]) -> "SerialFittingEvaluator":
-        merged = dict(self._fixed_params)
-        merged_origins = dict(self._fixed_param_origins)
-        for name, value in dict(fixed_params or {}).items():
-            if str(name).strip():
-                param_name = str(name)
-                merged[param_name] = float(value)
-                merged_origins[param_name] = FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
-        return type(self)(self._context, fixed_params=merged, fixed_param_origins=merged_origins)
-
-    def _kindred_clone_fitting_evaluator_lane(self) -> "SerialFittingEvaluator":
-        return type(self)(
-            self._context,
-            fixed_params=dict(self._fixed_params),
-            fixed_param_origins=dict(self._fixed_param_origins),
-        )
-
-    def to_process_payload(self) -> Dict[str, Any]:
-        self._ensure_prepared()
-        payload = {
-            "simulation_plan": self._context.simulation_plan.to_payload(),
-            "requested_param_names": list(self._context.requested_param_names),
-            "prepared_metadata": self._context.prepared_metadata.to_serializable_dict(),
-            "temperature_K": float(self._context.temperature_K),
-            "initial_prefix": str(self._context.initial_prefix),
-            "fixed_params": dict(self._fixed_params),
-            "fixed_param_origins": dict(self._fixed_param_origins),
-        }
-        payload_copy = copy.deepcopy(payload)
-        pickle.dumps(payload_copy)
-        return payload_copy
-
-    @classmethod
-    def from_process_payload(cls, payload: Mapping[str, Any]) -> "SerialFittingEvaluator":
-        required_keys = (
-            "simulation_plan",
-            "requested_param_names",
-            "prepared_metadata",
-            "temperature_K",
-            "initial_prefix",
-            "fixed_params",
-            "fixed_param_origins",
-        )
-        if not isinstance(payload, Mapping):
-            raise TypeError("Process payload must be a mapping.")
-        if "execution_request" in payload:
-            raise KeyError("Process payload contains legacy execution_request key.")
-        missing = [name for name in required_keys if name not in payload]
-        if missing:
-            raise KeyError(f"Process payload is missing required keys: {', '.join(missing)}")
-        simulation_plan = payload["simulation_plan"]
-        if not isinstance(simulation_plan, Mapping):
-            raise TypeError("Process payload simulation_plan must be a mapping.")
-        plan = SimulationPlan.from_payload(simulation_plan)
-        plan_payload = plan.to_payload()
-        prepared_metadata_payload = payload["prepared_metadata"]
-        if not isinstance(prepared_metadata_payload, Mapping):
-            raise TypeError("Process payload prepared_metadata must be a mapping.")
-        prepared_metadata = PreparedSimulationMetadata.from_mapping(dict(prepared_metadata_payload))
-        requested_param_names = sorted(
-            {str(name) for name in list(payload["requested_param_names"] or []) if str(name).strip()}
-        )
-        metadata_param_names = sorted(str(name) for name in list(prepared_metadata.param_names or []))
-        if requested_param_names != metadata_param_names:
-            raise ValueError("Process payload requested_param_names conflict with simulation_plan metadata.")
-        request = plan.to_execution_request()
-        solver_config = dict(request.solver_config or {})
-        plan_temperature = float(
-            solver_config.get(
-                MechanismMetadataKeys.TEMPERATURE_K,
-                prepared_metadata.temperature_K,
-            )
-        )
-        if abs(float(payload["temperature_K"]) - plan_temperature) > 1e-12:
-            raise ValueError("Process payload temperature_K conflicts with simulation_plan.")
-        if abs(float(prepared_metadata.temperature_K) - plan_temperature) > 1e-12:
-            raise ValueError("Process payload prepared_metadata.temperature_K conflicts with simulation_plan.")
-        if str(payload["initial_prefix"] or "init:") != str(prepared_metadata.initial_prefix or "init:"):
-            raise ValueError("Process payload initial_prefix conflicts with prepared_metadata.")
-        try:
-            assert_simulation_execution_request_schedule_identity(
-                request,
-                expected_declarative_fingerprint=str(
-                    prepared_metadata.intervention_schedule_declarative_fingerprint or ""
-                ),
-                expected_executable_fingerprint=str(
-                    prepared_metadata.intervention_schedule_executable_fingerprint or ""
-                ),
-            )
-        except SimulationPreparationError as exc:
-            raise ValueError(
-                f"Process payload intervention_schedule conflicts with simulation_plan: {exc}"
-            ) from exc
-        return cls(
-            PreparedFittingExecutionContext(
-                simulation_plan=plan_payload,
-                execution_request=None,
-                requested_param_names=list(metadata_param_names),
-                prepared_metadata=prepared_metadata,
-                temperature_K=float(plan_temperature),
-                initial_prefix=str(prepared_metadata.initial_prefix),
-            ),
-            fixed_params=dict(payload["fixed_params"]),
-            fixed_param_origins=dict(payload["fixed_param_origins"]),
-        )
-
-    def _kindred_set_fitting_cancellation_check(self, cancellation_check) -> "SerialFittingEvaluator":
+    def set_cancellation_check(
+        self,
+        cancellation_check,
+    ) -> "SerialFittingEvaluator":
         self._cancellation_check = cancellation_check
         return self
 
@@ -804,10 +742,10 @@ class SerialFittingEvaluator:
                     details={"fatal": True, "stage": "parameter_binding"},
                 )
 
-    def __call__(self, params: Dict[str, float]) -> SimulationSeriesPayload:
+    def __call__(self, params: Dict[str, float]) -> FittingSeriesEvaluation:
         return self.evaluate_series(params)
 
-    def evaluate_series(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
+    def evaluate_series(self, params: Mapping[str, float]) -> FittingSeriesEvaluation:
         configured_origins = {
             str(name): FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
             for name in dict(params or {})
@@ -825,7 +763,7 @@ class SerialFittingEvaluator:
         origins: Optional[Mapping[str, str]] = None,
         *,
         failed_params: Optional[Dict[str, float]] = None,
-    ) -> SimulationSeriesPayload:
+    ) -> FittingSeriesEvaluation:
         self._raise_if_cancel_requested()
         self._ensure_prepared()
         prepared_run = self._prepared_run
@@ -951,14 +889,14 @@ class SerialFittingEvaluator:
             events.append(cancellation_event)
 
         try:
-            intervention_schedule = resolve_prepared_run_intervention_schedule(
+            intervention_execution = resolve_prepared_run_intervention_execution(
                 prepared_run,
                 parameter_partition,
             )
         except SimulationPreparationError as exc:
             raise FitSimulationError(
-                f"Fitting intervention schedule failed: {exc}",
-                details={"fatal": False, "stage": "intervention_schedule"},
+                f"Fitting intervention execution failed: {exc}",
+                details={"fatal": False, "stage": "intervention_execution"},
             ) from exc
 
         symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
@@ -971,13 +909,14 @@ class SerialFittingEvaluator:
             prepared_solver_config is not None
             and bool(getattr(prepared_solver_config, "use_sparse_jacobian", False))
             and str(getattr(prepared_solver_config, "solver", prepared_run.request.solver)).upper() in {"BDF", "RADAU"}
-            and prepared_run.request.temperature_schedule is None
         ):
             try:
                 jacobian_func, symbolic_identity = _bind_symbolic_jacobian_for_current_mechanism(
                     mechanism=prepared_run.mechanism,
                     prepared_solver_config=prepared_solver_config,
-                    temperature_K=float(self._context.temperature_K),
+                    temperature_schedule=(
+                        prepared_run.request.temperature_schedule
+                    ),
                 )
                 symbolic_jacobian = SymbolicJacobianExecution.supported(
                     jacobian_func=jacobian_func,
@@ -989,7 +928,6 @@ class SerialFittingEvaluator:
                         symbolic_jacobian,
                     )
                 )
-                self._kindred_fitting_execution_context = self._context
             except UnsupportedSymbolicExpressionError as exc:
                 symbolic_jacobian = _symbolic_jacobian_for_bind_failure(prepared_run.mechanism, exc)
                 self._context = self._context.clone(
@@ -998,12 +936,11 @@ class SerialFittingEvaluator:
                         symbolic_jacobian,
                     )
                 )
-                self._kindred_fitting_execution_context = self._context
 
         request = build_simulation_request_from_prepared_run(
             prepared_run,
             y0=y0,
-            intervention_schedule=intervention_schedule,
+            intervention_execution=intervention_execution,
             symbolic_jacobian=symbolic_jacobian,
             events=events,
         )
@@ -1016,11 +953,19 @@ class SerialFittingEvaluator:
                 f"Fitting simulation failed: {exc}",
                 details={"fatal": False},
             ) from exc
+        self._raise_if_cancel_requested()
 
-        species_payload = {
-            name: np.asarray(result.Y[idx, :], dtype=float).reshape(-1).copy()
-            for idx, name in enumerate(prepared_run.species_names)
-        }
+        (
+            times,
+            species_payload,
+            segment_ids,
+            segment_keys,
+            result_segment_ids,
+            pre_boundary_sample_mask,
+        ) = _fitting_result_series(
+            result,
+            species_names=tuple(prepared_run.species_names),
+        )
 
         algebra_scalars: Dict[str, float] = {}
         if self._compiled_algebra is not None:
@@ -1038,13 +983,16 @@ class SerialFittingEvaluator:
                     name: float(y0[idx]) for idx, name in enumerate(prepared_run.species_names)
                 }
                 species_series = {
-                    name: np.asarray(result.Y[idx, :], dtype=float).reshape(-1)
-                    for idx, name in enumerate(prepared_run.species_names)
+                    name: np.asarray(
+                        species_payload[name],
+                        dtype=float,
+                    ).reshape(-1)
+                    for name in prepared_run.species_names
                 }
                 algebra_series, algebra_scalars = evaluate_compiled_algebra_series_for_simulation(
                     prepared_run.mechanism,
                     self._compiled_algebra,
-                    t=np.asarray(result.t, dtype=float).reshape(-1),
+                    t=times,
                     species_series=species_series,
                     initials=initials_map,
                     temperature_K=float(self._context.temperature_K),
@@ -1061,12 +1009,68 @@ class SerialFittingEvaluator:
                     message_prefix="Algebra evaluation failed during fitting simulation",
                 ) from exc
 
-        return coerce_simulation_series_payload(
-            SimulationSeriesPayload(
-                t=np.asarray(result.t, dtype=float).reshape(-1).copy(),
-                species=species_payload,
-                algebra_scalars=dict(algebra_scalars),
+        series = SimulationSeriesPayload(
+            t=times.copy(),
+            species=species_payload,
+            algebra_scalars=dict(algebra_scalars),
+        )
+        result_execution = result.intervention_execution
+        if not isinstance(result_execution, InterventionExecutionContract):
+            raise FitSimulationError(
+                "Fitting result is missing its intervention execution contract.",
+                details={"fatal": True, "stage": "intervention_execution"},
             )
+        if (
+            result_execution.with_trigger_firings(())
+            != intervention_execution.with_trigger_firings(())
+        ):
+            raise FitSimulationError(
+                "Fitting result intervention execution conflicts with the "
+                "resolved request contract.",
+                details={"fatal": True, "stage": "intervention_execution"},
+            )
+        if not (
+            segment_ids.size
+            == len(segment_keys)
+            == result_segment_ids.size
+            == times.size
+        ):
+            raise FitSimulationError(
+                "Fitting result lost aligned segment/discontinuity identity.",
+                details={"fatal": True, "stage": "intervention_execution"},
+            )
+        if np.any(np.diff(result_segment_ids) < 0):
+            raise FitSimulationError(
+                "Fitting result segment identity is not ordered.",
+                details={"fatal": True, "stage": "intervention_execution"},
+            )
+        key_by_segment_id: dict[int, str] = {}
+        for segment_id, segment_key in zip(
+            result_segment_ids,
+            segment_keys,
+            strict=True,
+        ):
+            normalized_key = str(segment_key or "").strip()
+            existing = key_by_segment_id.setdefault(
+                int(segment_id),
+                normalized_key,
+            )
+            if not normalized_key or existing != normalized_key:
+                raise FitSimulationError(
+                    "Fitting result segment identity is internally "
+                    "inconsistent.",
+                    details={
+                        "fatal": True,
+                        "stage": "intervention_execution",
+                    },
+                )
+        self._raise_if_cancel_requested()
+        return FittingSeriesEvaluation(
+            series=series,
+            segment_ids=segment_ids,
+            segment_keys=segment_keys,
+            pre_boundary_sample_mask=pre_boundary_sample_mask,
+            intervention_execution=result_execution,
         )
 
     def _ensure_prepared(self) -> None:
@@ -1089,7 +1093,11 @@ class SerialFittingEvaluator:
         if self._prepared_run is not None:
             return
         self._raise_if_cancel_requested()
-        prepared_run = prepare_simulation_worker_run(execution_request=self._context.execution_request)
+        prepared_run = prepare_simulation_worker_run(
+            execution_request=(
+                self._context.simulation_plan.execution_request
+            )
+        )
         self._raise_if_cancel_requested()
         self._prepared_solver_config = _build_solver_config(
             solver_input=str(prepared_run.request.solver),
@@ -1138,7 +1146,6 @@ class SerialFittingEvaluator:
                     symbolic_jacobian,
                 )
             )
-            self._kindred_fitting_execution_context = self._context
         if isinstance(symbolic_wegscheider_identity, Mapping) and symbolic_wegscheider_identity:
             self._context = self._context.clone(
                 prepared_metadata=replace(
@@ -1146,7 +1153,6 @@ class SerialFittingEvaluator:
                     symbolic_wegscheider_identity=dict(symbolic_wegscheider_identity),
                 )
             )
-            self._kindred_fitting_execution_context = self._context
         self._bindings = dict(bindings)
         self._species_index = {name: idx for idx, name in enumerate(prepared_run.species_names)}
         self._raise_if_cancel_requested()
@@ -1229,3 +1235,4 @@ class SerialFittingEvaluator:
                 rhs=rhs,
                 request=replace(prepared_run.request, rhs=rhs),
             )
+    "FittingSeriesEvaluation",

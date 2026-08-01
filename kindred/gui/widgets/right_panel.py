@@ -3,31 +3,29 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from PySide6 import QtWidgets
 
-# Direct imports required to avoid circular dependency with widgets/__init__.py
 from kindred.gui.widgets.data_manager import DataManagerPanel
+from kindred.gui.widgets.dataset_overlay_panel import DatasetOverlayPanel
+
 __all__ = ["RightPanelTabbed"]
 
 
 class RightPanelTabbed(QtWidgets.QWidget):
     """
-    Right panel with the Data tab.
+    Right panel with the fixed Data and Overlays tabs.
 
-    Contains one tab:
+    Contains exactly two tabs:
     - Data: DataManagerPanel for loading CSV files
-
-    This is a simple container widget that provides access to the
-    data manager.
+    - Overlays: DatasetOverlayPanel for experimental plot membership
     """
 
     def __init__(
         self,
-        parent: Optional[QtWidgets.QWidget] = None,
+        parent: QtWidgets.QWidget | None = None,
         *,
-        data_panel: Optional[DataManagerPanel] = None,
+        data_panel: DataManagerPanel,
+        overlay_panel: DatasetOverlayPanel,
     ):
         """
         Initialize right panel with tabs.
@@ -45,11 +43,15 @@ class RightPanelTabbed(QtWidgets.QWidget):
         self._tabs = QtWidgets.QTabWidget()
         layout.addWidget(self._tabs)
 
-        # Data tab
-        self._data_manager = data_panel if data_panel is not None else DataManagerPanel()
+        if not isinstance(data_panel, DataManagerPanel):
+            raise TypeError("RightPanelTabbed requires the retained DataManagerPanel.")
+        if not isinstance(overlay_panel, DatasetOverlayPanel):
+            raise TypeError(
+                "RightPanelTabbed requires the retained DatasetOverlayPanel."
+            )
+        self._data_manager = data_panel
         self._data_manager.setObjectName("dataPanel")
         self._tabs.addTab(self._data_manager, "Data")
-
-    def add_tab(self, widget: QtWidgets.QWidget, label: str) -> int:
-        """Add an external widget as a new tab. Returns the tab index."""
-        return self._tabs.addTab(widget, label)
+        self._overlay_panel = overlay_panel
+        self._overlay_panel.setObjectName("datasetOverlayPanel")
+        self._tabs.addTab(self._overlay_panel, "Overlays")

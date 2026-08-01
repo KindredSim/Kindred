@@ -84,48 +84,6 @@ def _coerce_fit_diagnostic_remediation(
     return cast(FitDiagnosticRemediation, remediation)
 
 
-def _coerce_fit_diagnostic(
-    value: object,
-    *,
-    default_phase: FitDiagnosticPhase,
-    default_dataset_id: Optional[str] = None,
-) -> FitDiagnostic:
-    if isinstance(value, FitDiagnostic):
-        return value
-    if isinstance(value, Mapping) and (
-        "failure" in value or "phase" in value or "dataset_id" in value or "remediation" in value
-    ):
-        failure = coerce_simulation_failure(value.get("failure"))
-        return FitDiagnostic(
-            phase=_coerce_fit_diagnostic_phase(value.get("phase"), default_phase=default_phase),
-            dataset_id=value.get("dataset_id", default_dataset_id),
-            failure=failure,
-            remediation=_coerce_fit_diagnostic_remediation(value.get("remediation"), failure=failure),
-            parameter_snapshot=value.get("parameter_snapshot"),  # type: ignore[arg-type]
-        )
-    failure = coerce_simulation_failure(value)
-    return FitDiagnostic(
-        phase=default_phase,
-        dataset_id=default_dataset_id,
-        failure=failure,
-        remediation=_coerce_fit_diagnostic_remediation(None, failure=failure),
-    )
-
-
-def _coerce_fit_detail_section(value: object) -> FitDetailSection:
-    if isinstance(value, FitDetailSection):
-        return value
-    if isinstance(value, Mapping) and ("failure" in value or "dataset_id" in value):
-        return FitDetailSection(
-            dataset_id=value.get("dataset_id"),
-            failure=value.get("failure"),
-        )
-    return FitDetailSection(
-        dataset_id=getattr(value, "dataset_id", None),
-        failure=getattr(value, "failure", value),
-    )
-
-
 @dataclass
 class FitDiagnostic:
     phase: FitDiagnosticPhase
@@ -169,24 +127,41 @@ class GlobalFitCompletion:
         self.status = cast(FitCompletionStatus, status)
         self.optimizer_converged = bool(self.optimizer_converged)
         self.nonfinite_metrics = bool(self.nonfinite_metrics)
-        if self.optimizer_diagnostic is not None:
-            self.optimizer_diagnostic = _coerce_fit_diagnostic(
-                self.optimizer_diagnostic,
-                default_phase="optimizer",
+        if (
+            self.optimizer_diagnostic is not None
+            and not isinstance(self.optimizer_diagnostic, FitDiagnostic)
+        ):
+            raise TypeError(
+                "optimizer_diagnostic must be FitDiagnostic or None."
             )
-        self.dataset_failures = {
-            str(ds_id): _coerce_fit_diagnostic(
-                diagnostic,
-                default_phase="final_replay",
-                default_dataset_id=str(ds_id),
-            )
-            for ds_id, diagnostic in dict(self.dataset_failures).items()
-        }
+        typed_failures: Dict[str, FitDiagnostic] = {}
+        for ds_id, diagnostic in dict(self.dataset_failures).items():
+            if not isinstance(diagnostic, FitDiagnostic):
+                raise TypeError(
+                    "dataset_failures must contain FitDiagnostic values."
+                )
+            dataset_id = str(ds_id)
+            if (
+                diagnostic.dataset_id is not None
+                and diagnostic.dataset_id != dataset_id
+            ):
+                raise ValueError(
+                    "Dataset failure key conflicts with diagnostic identity."
+                )
+            typed_failures[dataset_id] = diagnostic
+        self.dataset_failures = typed_failures
         self.dataset_warnings = {
             str(ds_id): str(message)
             for ds_id, message in dict(self.dataset_warnings).items()
         }
-        self.detail_sections = [_coerce_fit_detail_section(section) for section in list(self.detail_sections)]
+        if any(
+            not isinstance(section, FitDetailSection)
+            for section in self.detail_sections
+        ):
+            raise TypeError(
+                "detail_sections must contain FitDetailSection values."
+            )
+        self.detail_sections = list(self.detail_sections)
         if self.nonfinite_metrics and self.status != "fail":
             raise ValueError("GlobalFitCompletion.nonfinite_metrics=True requires status='fail'.")
         if self.status == "ok":

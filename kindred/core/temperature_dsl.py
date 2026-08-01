@@ -2,16 +2,12 @@
 Temperature schedule DSL parsing for Kindred.
 
 Supports parsing temperature schedule definitions from DSL text:
-- temp_const: T = 298.15 K  (constant temperature)
 - temp_step: t=[0,50,100], T=[298,320,310]  (piecewise steps)
 - temp_response: t=[0,50,100], T=[298,320], tau=10  (first-order response)
 
 Integrates with TemperatureSchedule class from kindred.core.temperature.
 
 Example DSL:
-    # Constant temperature (default)
-    temp_const: T=298.15
-
     # Piecewise temperature schedule
     temp_step: t=[0,50,100,150], T=[298,320,320,310]
     # Creates intervals: [0,50)→298K, [50,100)→320K, [100,150]→310K
@@ -84,12 +80,15 @@ def _parse_number_list(text: str) -> List[float]:
         raise TemperatureDSLError(f"Failed to parse number list '{text}': {e}")
 
 
-def parse_temperature_schedule(dsl_text: str) -> Optional[TemperatureSchedule]:
+def parse_temperature_schedule(
+    dsl_text: str,
+    *,
+    nominal_temperature: float = 298.15,
+) -> Optional[TemperatureSchedule]:
     """
     Parse temperature schedule from DSL text.
 
     Recognizes:
-    - temp_const: T=298.15  (constant temperature)
     - temp_step: t=[0,50,100], T=[298,320,310]  (piecewise)
     - temp_response: t=[0,50,100], T=[298,320], tau=10
 
@@ -110,11 +109,6 @@ def parse_temperature_schedule(dsl_text: str) -> Optional[TemperatureSchedule]:
 
     Examples
     --------
-    >>> dsl = "temp_const: T=310.15"
-    >>> schedule = parse_temperature_schedule(dsl)
-    >>> schedule(0.0)
-    310.15
-
     >>> dsl = "temp_step: t=[0,50,100], T=[298,320,310]"
     >>> schedule = parse_temperature_schedule(dsl)
     >>> schedule(25.0)
@@ -128,74 +122,27 @@ def parse_temperature_schedule(dsl_text: str) -> Optional[TemperatureSchedule]:
         if not line or line.startswith('#'):
             continue
 
-        # Constant temperature: temp_const: T=298.15
-        if line.lower().startswith('temp_const:'):
-            return _parse_const_temperature(line)
-
         # Piecewise temperature: temp_step: t=[...], T=[...]
         if line.lower().startswith('temp_step:'):
-            return _parse_piecewise_temperature(line)
+            return _parse_piecewise_temperature(
+                line,
+                nominal_temperature=nominal_temperature,
+            )
 
         if line.lower().startswith('temp_response:'):
-            return _parse_response_temperature(line)
+            return _parse_response_temperature(
+                line,
+                nominal_temperature=nominal_temperature,
+            )
 
     # No temperature schedule found
     return None
 
-
-def _parse_const_temperature(line: str) -> TemperatureSchedule:
-    """
-    Parse constant temperature line.
-
-    Format: temp_const: T=298.15
-
-    Parameters
-    ----------
-    line : str
-        DSL line
-
-    Returns
-    -------
-    TemperatureSchedule
-        Constant temperature schedule
-    """
-    # Extract T=<value>
-    match = re.search(r'T\s*=\s*([0-9.eE+-]+)', line, re.IGNORECASE)
-    if not match:
-        raise TemperatureDSLError(
-            "Invalid temp_const syntax",
-            suggestion="Use format: temp_const: T=<value>",
-            examples=[
-                "temp_const: T=298.15",
-                "temp_const: T=310.0"
-            ]
-        )
-
-    try:
-        temperature = float(match.group(1))
-    except ValueError:
-        raise TemperatureDSLError(
-            f"Invalid temperature value: {match.group(1)}",
-            suggestion="Temperature must be a valid number",
-            examples=["T=298.15", "T=3.1015e+02"]
-        )
-
-    if temperature <= 0:
-        raise TemperatureDSLError(
-            f"Temperature must be positive, got {temperature} K",
-            suggestion="Temperature must be in Kelvin (absolute temperature)",
-            examples=[
-                "T=298.15  (room temperature)",
-                "T=273.15  (ice point)",
-                "T=373.15  (boiling point of water)"
-            ]
-        )
-
-    logger.info(f"Parsed constant temperature: T = {temperature} K")
-    return TemperatureSchedule.constant(temperature)
-
-
-def _parse_piecewise_temperature(line: str) -> TemperatureSchedule:
+def _parse_piecewise_temperature(
+    line: str,
+    *,
+    nominal_temperature: float,
+) -> TemperatureSchedule:
     """
     Parse piecewise temperature line.
 
@@ -259,7 +206,10 @@ def _parse_piecewise_temperature(line: str) -> TemperatureSchedule:
         logger.debug(f"  t ∈ [{t_start}, {t_end}): T = {temp} K")
 
     try:
-        return TemperatureSchedule.piecewise(intervals)
+        return TemperatureSchedule.piecewise(
+            intervals,
+            baseline_temperature=nominal_temperature,
+        )
     except TemperatureScheduleError as e:
         raise TemperatureDSLError(f"Invalid piecewise schedule: {e}")
 
@@ -285,7 +235,11 @@ def _parse_time_temperature_lists(
     return times, temperatures
 
 
-def _parse_response_temperature(line: str) -> TemperatureSchedule:
+def _parse_response_temperature(
+    line: str,
+    *,
+    nominal_temperature: float,
+) -> TemperatureSchedule:
     """
     Parse first-order response temperature line.
 
@@ -334,6 +288,11 @@ def _parse_response_temperature(line: str) -> TemperatureSchedule:
         )
 
     try:
-        return TemperatureSchedule.response(times, temperatures, tau=tau)
+        return TemperatureSchedule.response(
+            times,
+            temperatures,
+            tau=tau,
+            baseline_temperature=nominal_temperature,
+        )
     except TemperatureScheduleError as e:
         raise TemperatureDSLError(f"Invalid response schedule: {e}")

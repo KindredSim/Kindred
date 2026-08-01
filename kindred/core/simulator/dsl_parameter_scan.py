@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from kindred.core.algebra.simulation_series import compile_algebra_observables
 from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
@@ -19,17 +18,11 @@ from kindred.core.equilibrium_rate_authority import (
     normalize_existing_equilibrium_rate_authority,
     step_entry_authored_role_is_editable,
 )
-from . import parameter_algebra
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
 from kindred.core.units import UnitsModel
 from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
 
-from .dsl import _parse_dsl_ir
-from .dsl_build import build_mechanism_from_ir
-from .errors import DSLError
-from .parameter_algebra_spec import collect_algebra_section_lines
 from .parameter_namespace import (
-    build_namespace_from_ir_steps,
     build_namespace_from_mechanism,
 )
 from .step_indexing import get_step_index_map
@@ -88,16 +81,11 @@ def _mechanism_temperature(mechanism: object) -> float:
     return 298.15
 
 
-def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
-    """
-    Extract explicit reaction parameters from DSL content.
+def extract_parameters_from_mechanism(
+    mechanism: object,
+) -> list[ParameterDefinition]:
+    """Project parameters from one already admitted mechanism."""
 
-    Supports both modern and shorthand reaction syntax:
-    - Modern: reaction: A -> B; k=1.0
-    - Shorthand: A -> B ; k=1.0 (used in preset files like M1)
-    """
-    ir = _parse_dsl_ir(text)
-    mechanism = build_mechanism_from_ir(ir, initials={})
     namespace = build_namespace_from_mechanism(mechanism)
     parameters: list[ParameterDefinition] = []
     rxns = list(getattr(mechanism, "reactions", []) or [])
@@ -213,45 +201,4 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
     return parameters
 
 
-def _scan_mechanism_param_names(ir) -> set[str]:
-    return build_namespace_from_ir_steps(ir.steps).flat_names()
-
-
-def extract_parameter_names_from_dsl(text: str) -> set[str]:
-    """
-    Extract all parameter names from DSL content.
-
-    This function extracts parameter names from:
-    1. Reaction parameter definitions (k, kf, kr, A, Ea, dG_act, etc.)
-    2. Algebra declaration lines in the mechanism DSL:
-       - `param name = ...` (solver/parameter-algebra)
-       - `let name = ...` (observables)
-    """
-    param_names: set[str] = set()
-
-    ir = _parse_dsl_ir(text)
-    mechanism = build_mechanism_from_ir(ir, initials={})
-    mechanism_namespace = build_namespace_from_ir_steps(ir.steps)
-    param_names.update(mechanism_namespace.flat_names())
-    for eq in getattr(mechanism, "equilibria", []) or []:
-        name = generated_fast_equilibrium_runtime_parameter_name(eq)
-        if name is not None:
-            param_names.add(name)
-
-    spec = parameter_algebra.parse_parameter_algebra_spec_from_dsl_text(
-        text,
-        mechanism_namespace=mechanism_namespace,
-    )
-    algebra_lines = collect_algebra_section_lines(text)
-    if algebra_lines:
-        try:
-            compile_algebra_observables(
-                "\n".join(str(raw) for _line_no, raw in algebra_lines),
-                mechanism_namespace=mechanism_namespace,
-            )
-        except ValueError as exc:
-            raise DSLError(str(exc)) from exc
-    param_names.update(spec.observable_names)
-    param_names.update({assignment.name for assignment in spec.param_statements})
-
-    return param_names
+__all__ = ["ParameterDefinition", "extract_parameters_from_mechanism"]

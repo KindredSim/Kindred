@@ -1,10 +1,17 @@
 # title: Isotope entrainment chase
 # Adds an unlabeled substrate chase after a labeled catalyst-bound adduct has accumulated.
+intervention_set1 = {
+  [LabeledSubstrate] = 1.0
+  [UnlabeledSubstrate] = 0.0
+  [Catalyst] = 0.2
+  [LabeledAdduct] = 0.0
+  [UnlabeledAdduct] = 0.0
+  [LabeledProduct] = 0.0
+  [UnlabeledProduct] = 0.0
+}
+
 reaction: LabeledSubstrate + Catalyst -> LabeledAdduct; k=1.0
 reaction: LabeledAdduct -> LabeledProduct + Catalyst; k=0.35
 reaction: UnlabeledSubstrate + Catalyst -> UnlabeledAdduct; k=1.0
 reaction: UnlabeledAdduct -> UnlabeledProduct + Catalyst; k=0.35
-intervention_set1 = {
-  initial: LabeledSubstrate=1.0, UnlabeledSubstrate=0.0, Catalyst=0.2, LabeledAdduct=0.0, UnlabeledAdduct=0.0, LabeledProduct=0.0, UnlabeledProduct=0.0
-}
-intervention: op=trigger; trigger_species=LabeledAdduct; threshold=0.05; direction=rising; action=add; species=UnlabeledSubstrate; amount=1.0; max_count=1; min_interval=0.0
+intervention: op=trigger; watch_species=LabeledAdduct; threshold=0.05; direction=rising; max_count=1; min_interval=0.0; then={op=jump,species=UnlabeledSubstrate,delta=1.0}

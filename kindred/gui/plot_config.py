@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -16,9 +17,30 @@ __all__ = [
     "is_pyqtgraph_available",
     "require_pyqtgraph",
     "pyqtgraph_import_error",
+    "PlotPresentationIntent",
 ]
 
 _PYQTGRAPH_IMPORT_CACHE: Optional[Tuple[bool, Any, Optional[BaseException]]] = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlotPresentationIntent:
+    option: str
+    enabled: bool
+
+    def __post_init__(self) -> None:
+        normalized = str(self.option or "").strip().lower()
+        if normalized not in {
+            "log_x",
+            "log_y",
+            "legend_visible",
+            "x_inverted",
+            "y_inverted",
+        }:
+            raise ValueError(f"Unknown persisted Plot option {self.option!r}.")
+        if type(self.enabled) is not bool:
+            raise TypeError("Plot presentation intent enabled must be a bool.")
+        object.__setattr__(self, "option", normalized)
 
 
 def try_import_pyqtgraph() -> Tuple[bool, Any, Optional[BaseException]]:
@@ -85,13 +107,7 @@ class PlotBackend:
         Current backend: always 'pyqtgraph'
     """
 
-    _instance = None
     _backend = "pyqtgraph"
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
 
     @classmethod
     def set_backend(cls, backend: str) -> None:
@@ -215,73 +231,6 @@ def fix_pyqtgraph_stylehints_warning():
     except (ImportError, AttributeError) as e:
         # Qt 6.5+ feature, gracefully ignore if not available
         logger.debug(f"Could not fix PyQtGraph colorScheme connection: {e}")
-
-
-def fix_pyqtgraph_csv_exporter_encoding():
-    """
-    Patch PyQtGraph's CSVExporter to write files as UTF-8 with BOM.
-
-    PyQtGraph 0.13.7 opens CSV files with ``open(path, 'w', newline='')``,
-    which uses the platform default encoding.  On Windows this is typically
-    cp1252, causing ``UnicodeEncodeError`` when plot curve names contain
-    non-ASCII characters (e.g. Greek letters in species names).
-
-    The patch replaces the ``export`` method so that the file is opened with
-    ``encoding='utf-8-sig'`` (UTF-8 with BOM, recognised by Excel on Windows).
-    """
-    ok, _pg, _exc = try_import_pyqtgraph()
-    if not ok:
-        return
-
-    try:
-        import csv
-        import itertools
-
-        import numpy as np
-        from pyqtgraph.exporters.CSVExporter import CSVExporter  # type: ignore[import-not-found]
-
-        if getattr(CSVExporter, "_kindred_encoding_patched", False):
-            return
-
-        _original_export = CSVExporter.export
-
-        def _export_utf8(self, fileName=None):
-            from pyqtgraph import PlotItem  # type: ignore[import-not-found]
-
-            if not isinstance(self.item, PlotItem):
-                raise TypeError("Must have a PlotItem selected for CSV export.")
-            if fileName is None:
-                self.fileSaveDialog(filter=["*.csv", "*.tsv"])
-                return
-
-            from pyqtgraph import ErrorBarItem  # type: ignore[import-not-found]
-
-            for item in self.item.items:
-                if isinstance(item, ErrorBarItem):
-                    self._exportErrorBarItem(item)
-                elif hasattr(item, "implements") and item.implements("plotData"):
-                    self._exportPlotDataItem(item)
-
-            sep = "," if self.params["separator"] == "comma" else "\t"
-            columns = [col for dataset in self.data for col in dataset]
-            with open(fileName, "w", encoding="utf-8-sig", newline="") as csvfile:
-                writer = csv.writer(csvfile, delimiter=sep, quoting=csv.QUOTE_MINIMAL)
-                writer.writerow(self.header)
-                for row in itertools.zip_longest(*columns, fillvalue=""):
-                    writer.writerow([
-                        item if isinstance(item, str)
-                        else np.format_float_positional(item, precision=self.params["precision"])
-                        for item in row
-                    ])
-            self.header.clear()
-            self.data.clear()
-
-        CSVExporter.export = _export_utf8
-        CSVExporter._kindred_encoding_patched = True
-        logger.debug("Patched PyQtGraph CSVExporter for UTF-8 encoding")
-
-    except Exception as exc:
-        logger.debug("Could not patch PyQtGraph CSVExporter: %s", exc)
 
 
 def log_backend_info():

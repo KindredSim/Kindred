@@ -1,795 +1,1306 @@
+"""Active-tab parameter/species Slider drafts and exact Preview intent."""
+
 from __future__ import annotations
 
-from collections import OrderedDict
-from collections.abc import Mapping as MappingABC
-import logging
+from dataclasses import dataclass, replace
+import hashlib
 import math
-import re
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import Callable
 
-from kindred.core.equilibrium_rate_authority import (
-    effective_equilibrium_forward_rate,
-    effective_equilibrium_keq,
-    effective_equilibrium_reverse_rate,
-    generated_fast_equilibrium_runtime_parameter_name,
+from PySide6 import QtCore
+
+from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.project_document import MechanismTabDocument
+from kindred.core.result_repository import (
+    ExplicitResultKey,
+    PreviewResultIdentity,
+    PreviewResultKey,
 )
+from kindred.core.simulator.dsl_parse import (
+    DslParameterCoordinateUpdate,
+    PreparedDslRequestSet,
+    derive_prepared_dsl_with_parameter_updates,
+    prepare_dsl_request_set,
+)
+from kindred.core.simulator.errors import DSLError
+from kindred.core.units import UnitsModel
+from kindred.core.simulator.wegscheider_symbolic import (
+    UnresolvedWegscheiderCyclicityError,
+)
+from kindred.gui.parameter_enumeration import (
+    GuiParameterCoordinate,
+    enumerate_parameter_coordinates,
+)
+from kindred.gui.widgets.batch_initial_conditions_table import (
+    BatchInitialConditionsTableModel,
+    BatchInitialConditionsTableView,
+    projected_analysis_identity,
+    projected_initial_values,
+    projected_species_names,
+    resolve_live_slider_target_set_ids,
+)
+from kindred.gui.widgets.mechanism_editor import (
+    DetailedBalanceCorrectionOutcome,
+    DetailedBalanceCorrectionRequest,
+    MechanismEditorTabbed,
+)
+from kindred.gui.workspace_tab_registry import ScientificDocumentDelta
 
-if TYPE_CHECKING:
-    from kindred.gui.main_window import MainWindow
+__all__ = [
+    "ActiveTabSliderBinding",
+    "ParameterSliderProjection",
+    "build_parameter_slider_projection",
+]
 
-logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True, slots=True)
+class ParameterSliderProjection:
+    values: tuple[tuple[str, float], ...]
+    metadata: tuple[tuple[str, tuple[tuple[str, object], ...]], ...]
+    coordinates: tuple[GuiParameterCoordinate, ...] = ()
+
+    def values_dict(self) -> dict[str, float]:
+        return dict(self.values)
+
+    def metadata_dict(self) -> dict[str, dict[str, object]]:
+        return {name: dict(items) for name, items in self.metadata}
+
+    def coordinate_dict(self) -> dict[str, GuiParameterCoordinate]:
+        return {coordinate.name: coordinate for coordinate in self.coordinates}
 
 
-class MainWindowVariableRuntime:
-    """Owns MainWindow's slider-variable metadata and energy-mode UI pipeline."""
+@dataclass(frozen=True, slots=True)
+class _ActiveSliderRenderProjection:
+    tab: MechanismTabDocument
+    projection: ParameterSliderProjection
+    parameter_values: tuple[tuple[str, float], ...]
+    targets: tuple[str, ...]
+    target_display_names: tuple[str, ...]
+    species_values: tuple[tuple[str, float], ...]
+    mixed_species: frozenset[str]
+    preserve_visibility: bool
 
-    def __init__(self, main_window: "MainWindow") -> None:
-        self._mw = main_window
-        self._variable_metadata: Dict[str, Dict[str, object]] = {}
 
-    def variable_metadata(self) -> Dict[str, Dict[str, object]]:
-        return {str(name): dict(meta or {}) for name, meta in self._variable_metadata.items()}
+@dataclass(frozen=True, slots=True)
+class _PreviewCapture:
+    tab_id: str
+    prepared_dsl: PreparedDslRequestSet
+    projection: ParameterSliderProjection
+    targets: tuple[tuple[PreviewResultKey, str], ...]
+    debounce_kind: str
 
-    def set_variable_metadata(self, metadata: Dict[str, Dict[str, object]] | None) -> None:
-        normalized: Dict[str, Dict[str, object]] = {}
-        for name, meta in dict(metadata or {}).items():
-            normalized[str(name)] = dict(meta or {}) if isinstance(meta, dict) else {}
-        self._variable_metadata = normalized
 
-    def clear_variable_metadata(self) -> None:
-        self._variable_metadata = {}
+@dataclass(frozen=True, slots=True)
+class _SuspendedPreviewDisposition:
+    capture: _PreviewCapture | None
 
-    def update_variable_metadata_entry(
-        self,
-        name: str,
-        updates: MappingABC[str, object],
-    ) -> Dict[str, object]:
-        name_s = str(name)
-        meta = dict(self._variable_metadata.get(name_s) or {})
-        for key, value in dict(updates or {}).items():
-            meta[str(key)] = value
-        self._variable_metadata[name_s] = meta
-        return dict(meta)
 
-    def _normalize_visibility_scope_value(self, value: object) -> object:
-        if value is None or isinstance(value, (bool, int, str)):
-            return value
-        if isinstance(value, float):
-            if not math.isfinite(value):
-                return str(value)
-            return float(value)
-        if isinstance(value, (list, tuple)):
-            return tuple(self._normalize_visibility_scope_value(item) for item in value)
-        if isinstance(value, dict):
-            return tuple(
-                (str(key), self._normalize_visibility_scope_value(item))
-                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            )
-        return str(value)
+def build_parameter_slider_projection(
+    prepared_dsl: PreparedDslRequestSet,
+    *,
+    wegscheider_cyclicity_enabled: bool,
+) -> ParameterSliderProjection:
+    """Project one accepted typed DSL authority into stable Slider values."""
 
-    def _slider_visibility_scope_signature(
-        self,
-        variables: Dict[str, float],
-        metadata: Dict[str, Dict[str, object]],
-    ) -> tuple[tuple[str, tuple[tuple[str, object], ...]], ...]:
-        # Visibility scope tracks the semantic slider universe, not raw DSL text or values.
-        meta_keys = (
-            "type",
-            "index",
-            "role",
-            "label",
-            "editable",
-            "derived",
-            "expr",
-            "unit",
-            "scale",
-            "ts",
-            "reactant",
-            "product",
-            "cm_id",
-            "kind",
+    if not isinstance(prepared_dsl, PreparedDslRequestSet):
+        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+    coordinates = tuple(
+        coordinate
+        for coordinate in enumerate_parameter_coordinates(
+            prepared_dsl,
+            wegscheider_cyclicity_enabled=bool(
+                wegscheider_cyclicity_enabled
+            ),
         )
-        signature: list[tuple[str, tuple[tuple[str, object], ...]]] = []
-        for name in sorted((str(name) for name in variables.keys()), key=str):
-            meta = dict(metadata.get(str(name)) or {})
-            scope_meta = tuple(
-                (key, self._normalize_visibility_scope_value(meta[key]))
-                for key in meta_keys
-                if key in meta
-            )
-            signature.append((str(name), scope_meta))
-        return tuple(signature)
+        if coordinate.writable and not coordinate.derived
+    )
+    normalized_values = tuple(
+        (coordinate.name, float(coordinate.value))
+        for coordinate in coordinates
+    )
+    normalized_metadata = tuple(
+        (
+            coordinate.name,
+            tuple({
+                "type": coordinate.family,
+                "family": coordinate.family,
+                "role": coordinate.role,
+                "label": coordinate.display_name,
+                "unit": coordinate.unit,
+                "editable": coordinate.writable,
+                "derived": coordinate.derived,
+                "min": coordinate.minimum,
+                "max": coordinate.maximum,
+                "scale": (
+                    "log" if coordinate.log10_allowed else "linear"
+                ),
+            }.items()),
+        )
+        for coordinate in coordinates
+    )
+    return ParameterSliderProjection(
+        normalized_values,
+        normalized_metadata,
+        coordinates,
+    )
 
-    def extract_and_populate_variables(
+
+class ActiveTabSliderBinding(QtCore.QObject):
+    """Own transient Slider drafts; SimulationJobOwner owns Preview execution."""
+
+    draftStateChanged = QtCore.Signal(str, bool)
+    sliderDraftStateChanged = QtCore.Signal(str, bool)
+    targetSetIdsChanged = QtCore.Signal(object)
+    previewDetailedBalanceCorrectionRequired = QtCore.Signal(object)
+    previewDetailedBalanceCommitRequested = QtCore.Signal(object)
+    previewDetailedBalanceBlockCleared = QtCore.Signal(str)
+    errorRaised = QtCore.Signal(str)
+
+    def __init__(
         self,
         *,
-        preserve_visibility: bool = False,
+        registry,
+        table: BatchInitialConditionsTableView,
+        variable_sliders,
+        species_sliders,
+        simulation_jobs,
+        preview_preflight: Callable[[tuple[str, ...]], bool] | None = None,
+        parameter_preview_debounce_ms: int = 80,
+        equilibrium_preview_debounce_ms: int = 150,
+        parent: QtCore.QObject | None = None,
     ) -> None:
-        mw = self._mw
+        super().__init__(parent)
+        self._registry = registry
+        self._table = table
+        self._variable_sliders = variable_sliders
+        self._species_sliders = species_sliders
+        slider_workspace_owner = variable_sliders.parentWidget()
+        while (
+            slider_workspace_owner is not None
+            and not isinstance(slider_workspace_owner, MechanismEditorTabbed)
+        ):
+            slider_workspace_owner = slider_workspace_owner.parentWidget()
+        if not isinstance(slider_workspace_owner, MechanismEditorTabbed):
+            raise TypeError("Slider widgets must belong to MechanismEditorTabbed.")
+        species_owner = species_sliders.parentWidget()
+        while (
+            species_owner is not None
+            and not isinstance(species_owner, MechanismEditorTabbed)
+        ):
+            species_owner = species_owner.parentWidget()
+        if species_owner is not slider_workspace_owner:
+            raise TypeError("Slider widgets must share one MechanismEditorTabbed.")
+        self._slider_workspace_owner = slider_workspace_owner
+        self._simulation_jobs = simulation_jobs
+        self._preview_preflight = preview_preflight
+        self._projection_by_tab: dict[str, ParameterSliderProjection] = {}
+        self._tab_snapshot_by_id: dict[str, MechanismTabDocument] = {}
+        self._last_targets_by_tab: dict[str, tuple[str, ...]] = {}
+        self._preview_capture: _PreviewCapture | None = None
+        self._suspended_preview_disposition: (
+            _SuspendedPreviewDisposition | None
+        ) = None
+        self._pending_detailed_balance_request: (
+            DetailedBalanceCorrectionRequest | None
+        ) = None
+        self._rendering = False
+        self._parameter_timer = self._make_preview_timer(
+            parameter_preview_debounce_ms
+        )
+        self._equilibrium_timer = self._make_preview_timer(
+            equilibrium_preview_debounce_ms
+        )
+        # Species Preview timing is fixed and has no Config preference.
+        self._species_timer = self._make_preview_timer(80)
+        variable_sliders.variableChanged.connect(self.stage_parameter)
+        species_sliders.speciesEdited.connect(self.stage_species)
+        model = table.model()
+        if not isinstance(model, BatchInitialConditionsTableModel):
+            raise TypeError("table must use BatchInitialConditionsTableModel.")
+        table.selectionModel().currentChanged.connect(self._on_live_current_changed)
+        model.snapshotRendered.connect(self._on_table_snapshot_rendered)
+
+    def _make_preview_timer(self, interval_ms: int) -> QtCore.QTimer:
+        interval = int(interval_ms)
+        if not 0 <= interval <= 1000:
+            raise ValueError("Slider debounce must be between 0 and 1000 ms.")
+        timer = QtCore.QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(interval)
+        timer.timeout.connect(self._submit_preview)
+        return timer
+
+    def set_preview_debounce_intervals(
+        self,
+        *,
+        parameter_ms: int,
+        equilibrium_K_ms: int,
+    ) -> None:
+        """Apply Config-owned values without creating a species preference."""
+
+        parameter = int(parameter_ms)
+        equilibrium = int(equilibrium_K_ms)
+        if not 0 <= parameter <= 1000 or not 0 <= equilibrium <= 1000:
+            raise ValueError("Slider debounce must be between 0 and 1000 ms.")
+        self._parameter_timer.setInterval(parameter)
+        self._equilibrium_timer.setInterval(equilibrium)
+
+    def _stop_preview_timers(self) -> None:
+        self._parameter_timer.stop()
+        self._equilibrium_timer.stop()
+        self._species_timer.stop()
+
+    def resolve_target_set_ids(self) -> tuple[str, ...]:
+        tab = self._registry.active_tab
+        return resolve_live_slider_target_set_ids(
+            table=self._table,
+            pinned_set_ids=self._registry.active_presentation.pinned_slider_set_ids,
+            existing_set_ids=(item.set_id for item in tab.initial_condition_sets),
+        )
+
+    def prepare_active_render(
+        self,
+        *,
+        preserve_visibility: bool = True,
+    ) -> _ActiveSliderRenderProjection:
+        """Prepare one complete parameter/species view without widget mutation."""
+
+        tab = self._registry.active_tab
+        runtime = self._registry.active_runtime
+        projection = (
+            ParameterSliderProjection((), ())
+            if tab.prepared_dsl is None
+            else build_parameter_slider_projection(
+                tab.prepared_dsl,
+                wegscheider_cyclicity_enabled=(
+                    tab.scientific_settings.wegscheider_policy
+                ),
+            )
+        )
+        parameter_values = projection.values_dict()
+        parameter_values.update(runtime.slider_parameter_draft)
+        targets = self.resolve_target_set_ids()
+        species_values, mixed_species = self._project_species_targets(
+            tab,
+            targets,
+        )
+        return _ActiveSliderRenderProjection(
+            tab=tab,
+            projection=projection,
+            parameter_values=tuple(parameter_values.items()),
+            targets=targets,
+            target_display_names=tuple(
+                tab.initial_condition_set(set_id).name
+                for set_id in targets
+            ),
+            species_values=tuple(species_values.items()),
+            mixed_species=mixed_species,
+            preserve_visibility=bool(preserve_visibility),
+        )
+
+    def apply_render_projection(
+        self,
+        prepared: _ActiveSliderRenderProjection,
+    ) -> None:
+        """Apply one fully prepared coherent parameter/species projection."""
+
+        if not isinstance(prepared, _ActiveSliderRenderProjection):
+            raise TypeError(
+                "prepared must be _ActiveSliderRenderProjection."
+            )
+        self._rendering = True
+        variable_blocker = QtCore.QSignalBlocker(self._variable_sliders)
+        species_blocker = QtCore.QSignalBlocker(self._species_sliders)
         try:
-            from kindred.core.batch_initial_conditions import (
-                strip_named_reaction_dsl_initial_concentration_sets,
+            self._variable_sliders.render_values(
+                dict(prepared.parameter_values),
+                metadata=prepared.projection.metadata_dict(),
+                preserve_visibility=prepared.preserve_visibility,
+                visibility_scope_signature=tuple(
+                    prepared.projection.metadata
+                ),
             )
-            from kindred.gui.parameter_enumeration import enumerate_step_parameters_for_gui
-            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-            from kindred.core.simulator.parameter_algebra import (
-                apply_parameter_algebra_to_mechanism,
-                solver_parameter_units_from_mechanism,
+            self._species_sliders.render_values(
+                dict(prepared.species_values),
+                target_set_ids=prepared.targets,
+                target_display_names=prepared.target_display_names,
+                mixed_species=prepared.mixed_species,
+                preserve_visibility=prepared.preserve_visibility,
+                visibility_scope_signature=prepared.species_values,
             )
-            from kindred.core.units import UnitsModel
+        finally:
+            del species_blocker
+            del variable_blocker
+            self._rendering = False
+        self._projection_by_tab[prepared.tab.tab_id] = prepared.projection
+        self._tab_snapshot_by_id[prepared.tab.tab_id] = prepared.tab
+        self._slider_workspace_owner.render_slider_workspace_presentation()
 
-            source = mw.canonical_mechanism_source()
-            if not source.full_dsl.strip():
-                mw.clear_variable_sliders()
-                self.clear_variable_metadata()
-                mw._energy_mode_channels = []
-                mw._preview_session.sync_committed_slider_values(
-                    {},
-                    schema_text=source.without_reaction_initial_concentrations().full_dsl,
-                )
-                self.update_parameter_table_from_sliders()
-                return
+    def settle_render_projection(
+        self,
+        prepared: _ActiveSliderRenderProjection,
+    ) -> None:
+        """Publish target/Preview effects after the whole workspace applies."""
 
-            temperature_k = mw.temperature_spinbox_value()
-            units = UnitsModel(temperature_K=temperature_k)
-
-            parse_source = source.with_reactions_text(
-                strip_named_reaction_dsl_initial_concentration_sets(str(source.reactions_text))
+        if not isinstance(prepared, _ActiveSliderRenderProjection):
+            raise TypeError(
+                "prepared must be _ActiveSliderRenderProjection."
             )
-            committed_schema_text = parse_source.full_dsl
-            try:
-                solver_owner = getattr(mw, "_simulation_runtime_settings_owner", None)
-                if solver_owner is None or not callable(
-                    getattr(solver_owner, "wegscheider_cyclicity_enabled", None)
-                ):
-                    raise RuntimeError("Variable runtime requires simulation runtime settings owner.")
-                wegscheider_enabled = bool(solver_owner.wegscheider_cyclicity_enabled())
-
-                def _build_structure_snapshot(full_dsl: str) -> object:
-                    mechanism_obj = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
-                    if isinstance(getattr(mechanism_obj, "metadata", None), dict):
-                        mechanism_obj.metadata["wegscheider_cyclicity_enabled"] = wegscheider_enabled
-                    _ = apply_parameter_algebra_to_mechanism(
-                        full_dsl,
-                        mechanism=mechanism_obj,
-                        require_mutable=False,
-                    )
-                    return mechanism_obj
-
-                mechanism_helpers = getattr(mw, "_mechanism_helpers", None)
-                authoritative_structure_snapshot = getattr(
-                    mechanism_helpers,
-                    "authoritative_structure_snapshot",
-                    None,
-                )
-                if callable(authoritative_structure_snapshot):
-                    structure_snapshot = authoritative_structure_snapshot(
-                        source=parse_source,
-                        units_identity=(
-                            "temperature_K",
-                            f"{float(temperature_k):.17g}",
-                            "wegscheider",
-                            str(wegscheider_enabled),
+        if self._suspended_preview_disposition is not None:
+            return
+        tab = prepared.tab
+        runtime = self._registry.tab_runtime(tab.tab_id)
+        targets = prepared.targets
+        targets_changed = self._reconcile_target_change(tab, targets)
+        if targets_changed and any(
+            runtime.slider_parameter_draft
+            or runtime.slider_species_drafts_by_set_id.get(set_id)
+            for set_id in targets
+        ):
+            prepared = self._preflight_preview_action(targets)
+            if prepared is not None:
+                current_tab, _current_projection = prepared
+                if current_tab.tab_id == tab.tab_id:
+                    self._begin_preview_cycle(
+                        prepared,
+                        targets,
+                        debounce_kind=(
+                            "parameter"
+                            if runtime.slider_parameter_draft
+                            else "species"
                         ),
-                        builder=_build_structure_snapshot,
                     )
-                    mechanism = structure_snapshot.mechanism
-                else:
-                    mechanism = _build_structure_snapshot(parse_source.full_dsl)
-            except Exception as exc:
-                logger.warning("Could not parse mechanism for variable extraction: %s", exc)
-                return
 
-            variables, metadata = enumerate_step_parameters_for_gui(mechanism)
-            unit_map = solver_parameter_units_from_mechanism(mechanism)
-
-            for name, meta in list(metadata.items()):
-                if isinstance(meta, dict) and meta.get("value_valid") is False:
-                    mw._record_best_effort_failure(
-                        "main_window.enumerate_step_parameters_for_gui.value_invalid",
-                        message=(
-                            f"Slider parameter {name!r} had a non-numeric/non-finite value; "
-                            "using 0.0 and marking value_valid=False"
-                        ),
-                        max_logs=5,
-                    )
-            mw._step_index_map = (getattr(mechanism, "metadata", {}) or {}).get("step_index_map") or []
-            for name in list(variables.keys()):
-                meta = dict(metadata.get(name) or {})
-                meta["unit"] = unit_map.get(name, "1")
-                metadata[name] = meta
-
-            scalar_params = (getattr(mechanism, "metadata", {}) or {}).get("scalar_params") or {}
-            scalar_info = (getattr(mechanism, "metadata", {}) or {}).get("scalar_param_info") or {}
-            if isinstance(scalar_params, dict):
-                for name, value in scalar_params.items():
-                    try:
-                        nm = str(name)
-                        variables[nm] = float(value)
-                        info = scalar_info.get(nm) if isinstance(scalar_info, dict) else None
-                        meta = {
-                            "type": "scalar",
-                            "index": 0,
-                            "label": "Scalar parameter",
-                            "line": (info.get("line") if isinstance(info, dict) else 0),
-                            "role": "scalar",
-                        }
-                        meta["unit"] = unit_map.get(nm, "1")
-                        if isinstance(info, dict):
-                            if "expr" in info:
-                                meta["expr"] = info["expr"]
-                            if info.get("derived") is True:
-                                meta["editable"] = False
-                                meta["derived"] = True
-                        metadata[nm] = meta
-                    except Exception as exc:
-                        mw._record_best_effort_failure(
-                            "main_window.scalar_params.import",
-                            message="Failed to import scalar solver parameter into slider variables",
-                            exc=exc,
-                        )
-                        continue
-
-            constrained = (getattr(mechanism, "metadata", {}) or {}).get("constrained_params") or {}
-            if isinstance(constrained, dict):
-                for name, info in constrained.items():
-                    nm = str(name)
-                    if nm not in variables:
-                        continue
-                    meta = dict(metadata.get(nm) or {})
-                    meta["editable"] = False
-                    meta["derived"] = True
-                    if isinstance(info, dict):
-                        if "expr" in info:
-                            meta["expr"] = info["expr"]
-                        if "line" in info:
-                            meta["line"] = info["line"]
-                        if "constraint_reason" in info:
-                            meta["constraint_reason"] = info["constraint_reason"]
-                    metadata[nm] = meta
-
-            current_metadata = self.variable_metadata()
-            has_current_energy_sliders = any(
-                isinstance(meta, dict) and meta.get("type") == "energy"
-                for meta in dict(current_metadata or {}).values()
+    def render_active(self, *, preserve_visibility: bool = True) -> bool:
+        try:
+            prepared = self.prepare_active_render(
+                preserve_visibility=preserve_visibility
             )
-            has_generated_fast_equilibrium = self.has_generated_computational_fast_equilibrium(
-                mechanism
+        except (TypeError, ValueError) as exc:
+            self.errorRaised.emit(
+                "Slider projection failed; the previous coherent Slider "
+                f"view was kept: {exc}"
             )
-            if (
-                has_generated_fast_equilibrium
-                or self.is_energy_mode_mechanism(mechanism)
-            ) and (
-                has_generated_fast_equilibrium
-                or not variables
-                or has_current_energy_sliders
+            return False
+        self.apply_render_projection(prepared)
+        self.settle_render_projection(prepared)
+        return True
+
+    def _reconcile_target_change(
+        self,
+        tab: MechanismTabDocument,
+        targets: tuple[str, ...],
+    ) -> bool:
+        existing = {item.set_id for item in tab.initial_condition_sets}
+        previous = self._last_targets_by_tab.get(tab.tab_id, ())
+        current = tuple(targets)
+        self._last_targets_by_tab[tab.tab_id] = current
+        if current != previous:
+            self.targetSetIdsChanged.emit(current)
+        removed = tuple(
+            set_id
+            for set_id in previous
+            if set_id not in current and set_id in existing
+        )
+        added = tuple(set_id for set_id in current if set_id not in previous)
+        runtime = self._registry.tab_runtime(tab.tab_id)
+        dirty_removed = tuple(
+            set_id
+            for set_id in removed
+            if runtime.slider_parameter_draft
+            or runtime.slider_species_drafts_by_set_id.get(set_id)
+        )
+        clean_removed = tuple(
+            set_id for set_id in removed if set_id not in dirty_removed
+        )
+        dirty_added = tuple(
+            set_id
+            for set_id in added
+            if runtime.slider_parameter_draft
+            or runtime.slider_species_drafts_by_set_id.get(set_id)
+        )
+        dirty_transition = tuple(dict.fromkeys((*dirty_removed, *dirty_added)))
+        if dirty_transition:
+            self._simulation_jobs.deauthorize_targets(
+                tab.tab_id,
+                dirty_transition,
+            )
+        if clean_removed:
+            self._simulation_jobs.reconcile_canonical_targets(
+                self._explicit_key(tab, set_id) for set_id in clean_removed
+            )
+        return current != previous
+
+    def drop_tab_runtime(self, tab_id: str) -> None:
+        """Forget Slider-owned captures after the Run owner purges a tab."""
+
+        target = str(tab_id)
+        self.cancel_pending_preview_intent(target)
+        self._projection_by_tab.pop(target, None)
+        self._tab_snapshot_by_id.pop(target, None)
+        previous = self._last_targets_by_tab.pop(target, ())
+        self.clear_preview_detailed_balance_block(target)
+        if previous and target == self._registry.active_tab_id:
+            self.targetSetIdsChanged.emit(())
+
+    def reset_project_session_state(self) -> None:
+        """Reset only transient Slider/Preview state after project replacement."""
+
+        self._stop_preview_timers()
+        self._preview_capture = None
+        self._suspended_preview_disposition = None
+        self._simulation_jobs.drop_pending_preview()
+        for tab_id, _presentation in self._registry.presentation_items():
+            runtime = self._registry.tab_runtime(tab_id)
+            runtime.slider_parameter_draft.clear()
+            runtime.slider_species_drafts_by_set_id.clear()
+        self._projection_by_tab.clear()
+        self._tab_snapshot_by_id.clear()
+        self._last_targets_by_tab.clear()
+        self._pending_detailed_balance_request = None
+        self._rendering = False
+
+        self._slider_workspace_owner.reset_slider_session_presentation()
+
+    def _project_species_targets(
+        self,
+        tab: MechanismTabDocument,
+        targets: tuple[str, ...],
+    ) -> tuple[dict[str, float], frozenset[str]]:
+        species_names = tuple(projected_species_names(tab))
+        if not targets:
+            return ({name: 0.0 for name in species_names}, frozenset())
+        runtime = self._registry.tab_runtime(tab.tab_id)
+        target_values: list[dict[str, float]] = []
+        for set_id in targets:
+            values = dict(projected_initial_values(tab, set_id))
+            values.update(
+                runtime.slider_species_drafts_by_set_id.get(set_id, {})
+            )
+            target_values.append(values)
+        projected: dict[str, float] = {}
+        mixed: set[str] = set()
+        for species in species_names:
+            first = float(target_values[0].get(species, 0.0))
+            if not math.isfinite(first) or first < 0.0:
+                raise ValueError(
+                    f"Initial concentration for {species!r} must be finite "
+                    "and nonnegative."
+                )
+            projected[species] = first
+            if any(
+                not math.isclose(
+                    float(values.get(species, 0.0)),
+                    first,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+                for values in target_values[1:]
             ):
-                projection_base_variables = variables if has_generated_fast_equilibrium else None
-                projection_base_metadata = metadata if has_generated_fast_equilibrium else None
-                self.populate_energy_mode_variables_from_mechanism(
-                    mechanism,
-                    refresh_sliders=True,
-                    preserve_visibility=bool(preserve_visibility),
-                    base_variables=projection_base_variables,
-                    base_metadata=projection_base_metadata,
-                )
-                return
+                mixed.add(species)
+        return projected, frozenset(mixed)
 
-            visibility_scope_signature = self._slider_visibility_scope_signature(variables, metadata)
-            self.set_variable_metadata(metadata)
+    @QtCore.Slot(QtCore.QModelIndex, QtCore.QModelIndex)
+    def _on_live_current_changed(
+        self,
+        _current: QtCore.QModelIndex,
+        _previous: QtCore.QModelIndex,
+    ) -> None:
+        if not self._rendering:
+            self.render_active(preserve_visibility=True)
 
-            if variables:
-                mw.set_variable_sliders(
-                    variables,
-                    metadata=metadata,
-                    preserve_visibility=bool(preserve_visibility),
-                    visibility_scope_signature=visibility_scope_signature,
+    @QtCore.Slot()
+    def _on_table_snapshot_rendered(self) -> None:
+        if not self._rendering:
+            self.render_active(preserve_visibility=True)
+
+    @QtCore.Slot(str, float)
+    def stage_parameter(self, name: str, value: float) -> bool:
+        if (
+            self._rendering
+            or self._suspended_preview_disposition is not None
+        ):
+            return False
+        value_f = float(value)
+        if not math.isfinite(value_f):
+            return self._reject_slider_action(
+                f"Parameter {name!r} must be finite."
+            )
+        targets = self.resolve_target_set_ids()
+        prepared = self._preflight_preview_action(targets)
+        if prepared is None:
+            return self._restore_rejected_slider_action()
+        tab, projection = prepared
+        metadata = projection.metadata_dict()
+        coordinate_metadata = metadata.get(str(name))
+        if coordinate_metadata is None:
+            return self._reject_slider_action(
+                f"Parameter {name!r} is absent."
+            )
+        if coordinate_metadata.get("editable") is False:
+            return self._reject_slider_action(
+                f"Parameter {name!r} is derived and cannot be edited."
+            )
+        runtime = self._registry.tab_runtime(tab.tab_id)
+        canonical = projection.values_dict()
+        previous = dict(runtime.slider_parameter_draft)
+        was_parameter_dirty = bool(previous)
+        if str(name) in canonical and value_f == canonical[str(name)]:
+            runtime.slider_parameter_draft.pop(str(name), None)
+        else:
+            runtime.slider_parameter_draft[str(name)] = value_f
+        if runtime.slider_parameter_draft == previous:
+            return True
+        target_ids = set(targets)
+        unselected = tuple(
+            item.set_id
+            for item in tab.initial_condition_sets
+            if item.set_id not in target_ids
+        )
+        if (
+            runtime.slider_parameter_draft
+            and not was_parameter_dirty
+            and unselected
+        ):
+            # A global parameter edit is scientific for every set, even when
+            # Preview itself is scoped to exact Slider targets.
+            self._simulation_jobs.deauthorize_targets(tab.tab_id, unselected)
+        elif (
+            not runtime.slider_parameter_draft
+            and was_parameter_dirty
+            and unselected
+        ):
+            clean_unselected = tuple(
+                set_id
+                for set_id in unselected
+                if not runtime.slider_species_drafts_by_set_id.get(set_id)
+            )
+            dirty_unselected = tuple(
+                set_id
+                for set_id in unselected
+                if runtime.slider_species_drafts_by_set_id.get(set_id)
+            )
+            if clean_unselected:
+                self._reconcile_canonical_set_ids(tab, clean_unselected)
+            if dirty_unselected:
+                self._simulation_jobs.deauthorize_targets(
+                    tab.tab_id,
+                    dirty_unselected,
                 )
-                logger.info("Populated %s variable sliders", len(variables))
-                mw._preview_session.sync_committed_slider_values(
-                    self._committable_slider_values(variables, metadata),
-                    schema_text=committed_schema_text,
-                )
-                self.update_parameter_table_from_sliders()
+        if not targets:
+            self.cancel_pending_preview_intent(tab.tab_id)
+        else:
+            role = str(coordinate_metadata.get("role") or "")
+            self._begin_preview_cycle(
+                prepared,
+                targets,
+                debounce_kind=(
+                    "equilibrium" if role == "Keq" else "parameter"
+                ),
+            )
+        self._emit_draft_state(tab.tab_id)
+        return True
+
+    def _reconcile_canonical_set_ids(
+        self,
+        tab: MechanismTabDocument,
+        set_ids: tuple[str, ...],
+    ) -> None:
+        self._simulation_jobs.reconcile_canonical_targets(
+            self._explicit_key(tab, set_id)
+            for set_id in tuple(dict.fromkeys(set_ids))
+        )
+
+    @QtCore.Slot(str, float)
+    def stage_species(self, species: str, value: float) -> bool:
+        if (
+            self._rendering
+            or self._suspended_preview_disposition is not None
+        ):
+            return False
+        value_f = float(value)
+        if not math.isfinite(value_f) or value_f < 0.0:
+            return self._reject_slider_action(
+                f"Initial value for {species!r} must be finite and nonnegative."
+            )
+        targets = self.resolve_target_set_ids()
+        if not targets:
+            return self._restore_rejected_slider_action()
+        prepared = self._preflight_preview_action(targets)
+        if prepared is None:
+            return self._restore_rejected_slider_action()
+        tab, projection = prepared
+        species_name = str(species)
+        if species_name not in projected_species_names(tab):
+            return self._reject_slider_action(
+                f"Species {species_name!r} is absent."
+            )
+        drafts = self._registry.tab_runtime(
+            tab.tab_id
+        ).slider_species_drafts_by_set_id
+        before = {
+            set_id: dict(drafts.get(set_id, {}))
+            for set_id in targets
+        }
+        for set_id in targets:
+            initial_set = tab.initial_condition_set(set_id)
+            canonical = initial_set.values_dict().get(species_name, 0.0)
+            if math.isclose(
+                value_f,
+                canonical,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                set_drafts = drafts.get(set_id)
+                if set_drafts is not None:
+                    set_drafts.pop(species_name, None)
+                    if not set_drafts:
+                        drafts.pop(set_id, None)
             else:
-                logger.info("No variables found to populate sliders")
-                mw.clear_variable_sliders()
-                mw._preview_session.sync_committed_slider_values(
-                    {},
-                    schema_text=committed_schema_text,
-                )
-                self.clear_variable_metadata()
-                self.update_parameter_table_from_sliders()
-            self.set_variable_metadata(metadata)
-        except Exception as exc:
-            logger.error("Error extracting variables: %s", exc, exc_info=True)
-            try:
-                mw.clear_variable_sliders()
-            except RuntimeError as clear_exc:
-                logger.debug("Failed to clear sliders after extraction failure: %s", clear_exc, exc_info=True)
-            mw._preview_session.sync_committed_slider_values({})
-            self.clear_variable_metadata()
-
-    @staticmethod
-    def _committable_slider_values(
-        values: MappingABC[str, float],
-        metadata: MappingABC[str, MappingABC[str, object]],
-    ) -> Dict[str, float]:
-        out: Dict[str, float] = {}
-        for raw_name, raw_value in dict(values or {}).items():
-            name = str(raw_name)
-            meta = metadata.get(name) if isinstance(metadata, MappingABC) else None
-            if isinstance(meta, MappingABC) and meta.get("editable") is False:
-                continue
-            try:
-                out[name] = float(raw_value)
-            except Exception:
-                continue
-        return out
-
-    def update_parameter_table_from_sliders(self) -> None:
-        mw = self._mw
-        values = mw.variable_slider_values() or {}
-        meta = self._variable_metadata or {}
-        params: Dict[str, Tuple[float, str]] = {}
-        for name, val in values.items():
-            m = meta.get(name)
-            unit = "1"
-            if isinstance(m, dict) and m.get("unit"):
-                unit = str(m.get("unit"))
-            try:
-                params[str(name)] = (float(val), unit)
-            except Exception as exc:
-                mw._record_best_effort_failure(
-                    "main_window.param_table.float_value",
-                    message=f"Failed to parse slider value for parameter table ({name})",
-                    exc=exc,
-                )
-                continue
-        try:
-            plot = mw.main_plot()
-            updater = getattr(plot, "update_parameters", None)
-            if callable(updater):
-                updater(dict(params))
-        except Exception:
-            return
-
-    def is_energy_mode_mechanism(self, mechanism: object) -> bool:
-        return bool(self.has_generated_computational_fast_equilibrium(mechanism))
-
-    def has_generated_computational_fast_equilibrium(self, mechanism: object) -> bool:
-        for eq in list(getattr(mechanism, "equilibria", []) or []):
-            if generated_fast_equilibrium_runtime_parameter_name(eq) is not None:
-                return True
-        return False
-
-    def dsl_global_temperature_k(self, dsl_text: str) -> float | None:
-        if not dsl_text:
-            return None
-        for raw in str(dsl_text).splitlines():
-            before_comment, _, _comment = raw.partition("#")
-            stripped = before_comment.strip()
-            if not stripped:
-                continue
-            if not stripped.lower().startswith("t="):
-                continue
-            _key, _eq, rest = stripped.partition("=")
-            try:
-                val = float(rest.strip().split()[0])
-            except Exception:
-                return None
-            if math.isfinite(val) and val > 0:
-                return float(val)
-            return None
-        return None
-
-    def sync_energy_mode_temperature_from_mechanism(self, mechanism: object) -> None:
-        mw = self._mw
-        meta = getattr(mechanism, "metadata", {}) or {}
-        if not isinstance(meta, MappingABC):
-            return
-        try:
-            temperature_k = float(meta.get("temperature_K"))
-        except Exception:
-            return
-        if not math.isfinite(temperature_k) or temperature_k <= 0:
-            return
-        mw.set_temperature_mode_indicator_text(f"Temperature: {temperature_k:.2f} K (from DSL)")
-        mw.set_temperature_override_state(
-            enabled=False,
-            tooltip="Overridden by energy-mode DSL (T=...).",
+                drafts.setdefault(set_id, {})[species_name] = value_f
+        after = {
+            set_id: dict(drafts.get(set_id, {}))
+            for set_id in targets
+        }
+        if after == before:
+            return True
+        self._begin_preview_cycle(
+            prepared,
+            targets,
+            debounce_kind="species",
         )
+        self._emit_draft_state(tab.tab_id)
+        return True
 
-    def populate_energy_mode_variables_from_mechanism(
+    def _preflight_preview_action(
         self,
-        mechanism: object,
-        *,
-        refresh_sliders: bool,
-        preserve_visibility: bool = False,
-        base_variables: MappingABC[str, object] | None = None,
-        base_metadata: MappingABC[str, MappingABC[str, object]] | None = None,
-    ) -> None:
-        mw = self._mw
+        targets: tuple[str, ...],
+    ) -> tuple[MechanismTabDocument, ParameterSliderProjection] | None:
+        """Settle visible science before any Slider draft/currentness mutation."""
 
-        def _equilibrium_value(eq_obj: object, role: str) -> float:
-            effective_temperature = float(temperature_k) if temperature_k is not None else 298.15
-            if role == "Keq":
-                value = effective_equilibrium_keq(eq_obj, temperature_K=effective_temperature)
-                return float(value) if value is not None else float("nan")
-            if role == "kr":
-                value = effective_equilibrium_reverse_rate(eq_obj, temperature_K=effective_temperature)
-                return float(value) if value is not None else float("nan")
-            if role == "kf":
-                value = effective_equilibrium_forward_rate(eq_obj, temperature_K=effective_temperature)
-                return float(value) if value is not None else float("nan")
-            raw_value = getattr(eq_obj, role, None)
-            try:
-                return float(raw_value() if callable(raw_value) else raw_value)
-            except Exception:
-                return float("nan")
-
-        meta = getattr(mechanism, "metadata", {}) or {}
-        energy_unit = "kJ/mol"
-        if isinstance(meta, MappingABC) and meta.get("energy_unit"):
-            energy_unit = str(meta.get("energy_unit"))
-
-        from kindred.core.constants import R as r_j_per_mol_k
-
+        tab = self._registry.active_tab
+        runtime = self._registry.active_runtime
+        visible_source = runtime.reactions_draft or tab.mechanism_source
+        visible_projection: ParameterSliderProjection | None = None
+        visible_prepared: PreparedDslRequestSet | None = None
         try:
-            from kindred.core.simulator.kinetics import rate_units
-            from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
-            from kindred.core.units import UnitsModel
-        except Exception:
-            EquilibriumMetadataKeys = None  # type: ignore[assignment]
-            UnitsModel = None  # type: ignore[assignment]
-            rate_units = None  # type: ignore[assignment]
-
-        temperature_k: float | None = None
-        if isinstance(meta, MappingABC) and meta.get("temperature_K") is not None:
-            try:
-                temperature_k = float(meta.get("temperature_K"))
-            except Exception:
-                temperature_k = None
-        if temperature_k is None or (not math.isfinite(float(temperature_k))) or float(temperature_k) <= 0.0:
-            try:
-                temperature_k = float(mw.temperature_spinbox_value())
-            except Exception:
-                temperature_k = None
-
-        step_context_by_equilibrium_index: dict[int, str] = {}
-        if isinstance(meta, MappingABC):
-            for entry in list(meta.get("step_index_map") or []):
-                if not isinstance(entry, MappingABC):
-                    continue
-                if str(entry.get("kind") or "") != "equilibrium":
-                    continue
-                try:
-                    eq_index = int(entry.get("equilibrium_index"))
-                except Exception:
-                    continue
-                context = str(entry.get("context") or "").strip()
-                if context:
-                    step_context_by_equilibrium_index[eq_index] = context
-
-        def _context_molecularity(context: str) -> tuple[int, int]:
-            text = str(context or "")
-            arrow = "<=>" if "<=>" in text else "<->" if "<->" in text else ""
-            if not arrow:
-                return 1, 1
-
-            def _side_count(side: str) -> int:
-                total = 0
-                for raw in [part.strip() for part in str(side or "").split("+") if part.strip()]:
-                    term = raw.replace(" ", "")
-                    match = re.match(r"^(\d+)?[A-Za-z_][A-Za-z0-9_]*$", term)
-                    if match is None:
-                        return 1
-                    total += int(match.group(1) or "1")
-                return max(1, int(total or 1))
-
-            lhs, rhs = [part.strip() for part in text.split(arrow, 1)]
-            return _side_count(lhs), _side_count(rhs)
-
-        def _format_stoich_side(side: object) -> str:
-            if not isinstance(side, MappingABC):
-                return ""
-            pieces: list[str] = []
-            for raw_name, raw_coeff in sorted(side.items(), key=lambda item: str(item[0])):
-                name = str(raw_name or "").strip()
-                if not name:
-                    return ""
-                try:
-                    coeff = float(raw_coeff)
-                except Exception:
-                    return ""
-                if not math.isfinite(coeff) or coeff <= 0.0:
-                    return ""
-                if abs(coeff - 1.0) < 1e-12:
-                    pieces.append(name)
-                elif abs(coeff - round(coeff)) < 1e-12:
-                    pieces.append(f"{int(round(coeff))}{name}")
-                else:
-                    pieces.append(f"{coeff:g}{name}")
-            return " + ".join(pieces)
-
-        def _equilibrium_context_from_stoich(eq_obj: object) -> str:
-            lhs = _format_stoich_side(getattr(eq_obj, "stoich_forward", {}) or {})
-            rhs = _format_stoich_side(getattr(eq_obj, "stoich_back", {}) or {})
-            if lhs and rhs:
-                return f"{lhs} <-> {rhs}"
-            return ""
-
-        def _stoich_molecularity(side: object) -> int | None:
-            if not isinstance(side, MappingABC):
-                return None
-            try:
-                total = float(sum(float(value) for value in side.values()))
-            except Exception:
-                return None
-            rounded = int(round(total))
-            if rounded >= 1 and abs(total - float(rounded)) <= 1e-9:
-                return int(rounded)
-            return None
-
-        def _equilibrium_molecularity(eq_obj: object) -> tuple[int, int] | None:
-            fwd = _stoich_molecularity(getattr(eq_obj, "stoich_forward", {}) or {})
-            rev = _stoich_molecularity(getattr(eq_obj, "stoich_back", {}) or {})
-            if fwd is None or rev is None:
-                return None
-            return fwd, rev
-
-        fast_eq_channels: list[dict[str, object]] = []
-        for eq_index, eq in enumerate(list(getattr(mechanism, "equilibria", []) or [])):
-            eq_meta = getattr(eq, "metadata", {}) or {}
-            if not isinstance(eq_meta, MappingABC):
-                continue
-            var_eq = generated_fast_equilibrium_runtime_parameter_name(eq)
-            if var_eq is None:
-                continue
-            cm_id = str(eq_meta.get("cm_id") or "").strip()
-            if not cm_id:
-                mw._record_best_effort_failure(
-                    "main_window.energy_channels.fast_eq.cm_id",
-                    message="Skipping generated fast-equilibrium channel without cm_id metadata",
-                    exc=None,
-                )
-                continue
-            stoich_context = _equilibrium_context_from_stoich(eq)
-            label = str(
-                step_context_by_equilibrium_index.get(int(eq_index))
-                or stoich_context
-                or cm_id
-                or "fast equilibrium"
-            )
-            try:
-                dg_eq_j = float(eq_meta.get("dG_eq_J_per_mol"))
-            except Exception as exc:
-                mw._record_best_effort_failure(
-                    "main_window.energy_channels.fast_eq.read_dG",
-                    message=f"Skipping parsed fast-equilibrium channel with invalid dG metadata ({label})",
-                    exc=exc,
-                )
-                continue
-            source_energy_unit = str(
-                eq_meta.get(EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT)  # type: ignore[union-attr]
-                if EquilibriumMetadataKeys is not None
-                else ""
-            ) or energy_unit
-            source_unit_conv = UnitsModel(energy_unit=source_energy_unit) if UnitsModel is not None else None  # type: ignore[call-arg]
-            dg_eq_val = (
-                float(source_unit_conv.from_jmol(float(dg_eq_j)))
-                if source_unit_conv is not None
-                else float(dg_eq_j) / 1000.0
-            )
-            kf = _equilibrium_value(eq, "kf")
-            kr = _equilibrium_value(eq, "kr")
-            k_thermo = _equilibrium_value(eq, "Keq")
-            if (
-                (not math.isfinite(float(k_thermo)) or float(k_thermo) <= 0.0)
-                and temperature_k is not None
-                and math.isfinite(float(temperature_k))
-                and float(temperature_k) > 0.0
-            ):
-                try:
-                    k_thermo = float(math.exp(-float(dg_eq_j) / (float(r_j_per_mol_k) * float(temperature_k))))
-                except Exception:
-                    k_thermo = float("nan")
-            if not (
-                math.isfinite(float(kf))
-                and float(kf) > 0.0
-                and math.isfinite(float(kr))
-                and float(kr) > 0.0
-                and math.isfinite(float(k_thermo))
-                and float(k_thermo) > 0.0
-            ):
-                continue
-            try:
-                std_ratio = float(eq_meta.get("std_ratio"))
-            except Exception as exc:
-                mw._record_best_effort_failure(
-                    "main_window.energy_channels.fast_eq.std_ratio",
-                    message=f"Skipping generated fast-equilibrium channel with invalid std_ratio metadata ({label})",
-                    exc=exc,
-                )
-                continue
-            if not (math.isfinite(float(std_ratio)) and float(std_ratio) > 0.0):
-                mw._record_best_effort_failure(
-                    "main_window.energy_channels.fast_eq.std_ratio",
-                    message=f"Skipping generated fast-equilibrium channel with non-positive std_ratio metadata ({label})",
-                    exc=None,
-                )
-                continue
-            molecularity_fwd, molecularity_rev = _context_molecularity(label)
-            stoich_molecularity = _equilibrium_molecularity(eq)
-            if stoich_molecularity is not None:
-                molecularity_fwd, molecularity_rev = stoich_molecularity
-            try:
-                molecularity_fwd = int(eq_meta.get("molecularity_fwd") or molecularity_fwd)
-            except Exception:
-                molecularity_fwd = int(molecularity_fwd)
-            try:
-                molecularity_rev = int(eq_meta.get("molecularity_rev") or molecularity_rev)
-            except Exception:
-                molecularity_rev = int(molecularity_rev)
-            unit_kf = "1/s"
-            unit_kr = "1/s"
-            try:
-                if rate_units is not None:
-                    unit_kf = str(rate_units(int(molecularity_fwd)))
-                    unit_kr = str(rate_units(int(molecularity_rev)))
-            except Exception:
-                unit_kf = "1/s"
-                unit_kr = "1/s"
-
-            fast_eq_channels.append(
-                {
-                    "kind": "fast_equilibrium",
-                    "cm_id": cm_id,
-                    "var_eq": var_eq,
-                    "label": label,
-                    "dG_eq": float(dg_eq_val),
-                    "kf_fixed": float(kf),
-                    "kr": float(kr),
-                    "K_thermo": float(k_thermo),
-                    "std_ratio": float(std_ratio),
-                    "source_unit": source_energy_unit,
-                    "molecularity_fwd": int(max(1, int(molecularity_fwd))),
-                    "molecularity_rev": int(max(1, int(molecularity_rev))),
-                    "unit_kf": unit_kf,
-                    "unit_kr": unit_kr,
-                }
-            )
-
-        fast_eq_channels.sort(key=lambda c: (str(c.get("cm_id")), str(c.get("label"))))
-        all_channels = list(fast_eq_channels)
-        mw._energy_mode_channels = list(all_channels)
-
-        variables: OrderedDict[str, float] = OrderedDict()
-        vmeta: OrderedDict[str, Dict[str, object]] = OrderedDict()
-        params: Dict[str, Tuple[float, str]] = {}
-        base_meta_map = dict(base_metadata or {})
-        for raw_name, raw_value in dict(base_variables or {}).items():
-            name = str(raw_name)
-            try:
-                value = float(raw_value)
-            except Exception:
-                continue
-            meta_entry = dict(base_meta_map.get(name) or {})
-            variables[name] = value
-            vmeta[name] = meta_entry
-            params[name] = (value, str(meta_entry.get("unit") or "1"))
-
-        if not all_channels:
-            self.set_variable_metadata(dict(vmeta))
-            if refresh_sliders and variables:
-                mw.set_variable_sliders(
-                    dict(variables),
-                    metadata=dict(vmeta),
-                    preserve_visibility=bool(preserve_visibility),
-                    visibility_scope_signature=self._slider_visibility_scope_signature(
-                        dict(variables),
-                        dict(vmeta),
+            visible_prepared = (
+                tab.prepared_dsl
+                if runtime.reactions_draft is None
+                else prepare_dsl_request_set(
+                    visible_source.full_dsl,
+                    initials={},
+                    units=UnitsModel(
+                        temperature_K=tab.scientific_settings.temperature
                     ),
                 )
-                mw._preview_session.sync_committed_slider_values(
-                    self._committable_slider_values(variables, vmeta),
-                    schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
+            )
+            if visible_prepared is None:
+                raise ValueError("Preview requires nonempty Reactions.")
+            visible_projection = build_parameter_slider_projection(
+                visible_prepared,
+                wegscheider_cyclicity_enabled=(
+                    tab.scientific_settings.wegscheider_policy
+                ),
+            )
+        except UnresolvedWegscheiderCyclicityError as exc:
+            request = self._preview_detailed_balance_request(
+                tab,
+                exc,
+                reactions_text=visible_source.reactions_text,
+            )
+            self._pending_detailed_balance_request = request
+            self.previewDetailedBalanceCorrectionRequired.emit(request)
+            return None
+        except (DSLError, TypeError, ValueError):
+            # The application settlement callback presents source diagnostics.
+            visible_projection = None
+
+        callback = self._preview_preflight
+        if callback is None:
+            if runtime.reactions_draft is not None:
+                self.errorRaised.emit(
+                    "Preview requires visible Reactions to be accepted first."
                 )
-            else:
-                mw.clear_variable_sliders()
-                mw._preview_session.sync_committed_slider_values(
-                    {},
-                    schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
+                return None
+            if not self._preview_inputs_valid(targets):
+                return None
+        elif not bool(callback(targets)):
+            return None
+
+        tab = self._registry.active_tab
+        runtime = self._registry.active_runtime
+        try:
+            if tab.prepared_dsl is None:
+                raise ValueError(
+                    "Preview requires accepted Reactions with retained DSL analysis."
                 )
-                self.clear_variable_metadata()
-            mw._energy_mode_channels = []
-            try:
-                plot = mw.main_plot()
-                updater = getattr(plot, "update_parameters", None)
-                if callable(updater):
-                    updater(dict(params))
-            except Exception as exc:
-                logger.debug("Failed to clear plot parameter summary: %s", exc, exc_info=True)
-                mw._plot_parameter_summary_stale = True
+            projection = (
+                visible_projection
+                if visible_prepared is tab.prepared_dsl
+                and visible_projection is not None
+                else build_parameter_slider_projection(
+                    tab.prepared_dsl,
+                    wegscheider_cyclicity_enabled=(
+                        tab.scientific_settings.wegscheider_policy
+                    ),
+                )
+            )
+        except UnresolvedWegscheiderCyclicityError as exc:
+            request = self._preview_detailed_balance_request(
+                tab,
+                exc,
+                reactions_text=tab.mechanism_source.reactions_text,
+            )
+            self._pending_detailed_balance_request = request
+            self.previewDetailedBalanceCorrectionRequired.emit(request)
+            return None
+        except (TypeError, ValueError) as exc:
+            self.errorRaised.emit(f"Preview parameter projection failed: {exc}")
+            return None
+        missing = set(runtime.slider_parameter_draft).difference(
+            projection.values_dict()
+        )
+        if missing:
+            self.errorRaised.emit(
+                "Preview draft parameter(s) are absent from accepted "
+                "Reactions: " + ", ".join(sorted(missing))
+            )
+            return None
+        self._projection_by_tab[tab.tab_id] = projection
+        self._tab_snapshot_by_id[tab.tab_id] = tab
+        self.clear_preview_detailed_balance_block(tab.tab_id)
+        return tab, projection
+
+    def _begin_preview_cycle(
+        self,
+        transaction: tuple[
+            MechanismTabDocument,
+            ParameterSliderProjection,
+        ],
+        targets: tuple[str, ...],
+        *,
+        debounce_kind: str,
+    ) -> None:
+        if self._suspended_preview_disposition is not None:
+            return
+        tab, projection = transaction
+        runtime = self._registry.tab_runtime(tab.tab_id)
+        dirty_targets = tuple(
+            set_id
+            for set_id in targets
+            if runtime.slider_parameter_draft
+            or runtime.slider_species_drafts_by_set_id.get(set_id)
+        )
+        canonical_targets = tuple(
+            set_id for set_id in targets if set_id not in dirty_targets
+        )
+        if canonical_targets:
+            self._reconcile_canonical_set_ids(tab, canonical_targets)
+        if not dirty_targets:
+            self.cancel_pending_preview_intent(tab.tab_id)
+            return
+        prepared_dsl = tab.prepared_dsl
+        if not isinstance(prepared_dsl, PreparedDslRequestSet):
+            self._reject(
+                "Preview requires accepted Reactions with retained DSL analysis."
+            )
             return
 
-        def _range(center: float, *, nonnegative: bool) -> tuple[float, float]:
-            span = max(10.0, abs(center) * 0.5)
-            lo = center - span
-            hi = center + span
-            if nonnegative:
-                lo = max(0.0, lo)
-            if hi <= lo:
-                hi = lo + max(1.0, span)
-            return float(lo), float(hi)
+        captured: list[tuple[PreviewResultKey, str]] = []
+        self._stop_preview_timers()
+        self._preview_capture = None
+        for set_id in dirty_targets:
+            key = self._simulation_jobs.begin_preview_edit(
+                self._preview_identity(tab, projection, set_id)
+            )
+            if key is not None:
+                captured.append((key, tab.initial_condition_set(set_id).name))
+        if not captured:
+            self.cancel_pending_preview_intent(tab.tab_id)
+            return
+        self._preview_capture = _PreviewCapture(
+            tab_id=tab.tab_id,
+            prepared_dsl=prepared_dsl,
+            projection=projection,
+            targets=tuple(captured),
+            debounce_kind=str(debounce_kind),
+        )
+        self._preview_timer(debounce_kind).start()
 
-        for ch in fast_eq_channels:
-            cm_id = str(ch.get("cm_id") or "")
-            label = str(ch.get("label") or cm_id or "fast equilibrium")
-            dg_eq = float(ch.get("dG_eq") or 0.0)
-            kf_fixed = float(ch.get("kf_fixed") or float("nan"))
-            std_ratio = float(ch.get("std_ratio") or 1.0)
+    def _preview_timer(self, debounce_kind: str) -> QtCore.QTimer:
+        timers = {
+            "parameter": self._parameter_timer,
+            "equilibrium": self._equilibrium_timer,
+            "species": self._species_timer,
+        }
+        timer = timers.get(str(debounce_kind))
+        if timer is None:
+            raise ValueError(
+                f"Unknown Preview debounce kind {debounce_kind!r}."
+            )
+        return timer
 
-            var_eq = str(ch.get("var_eq") or "")
-            if not var_eq:
-                continue
+    @staticmethod
+    def _preview_detailed_balance_request(
+        tab: MechanismTabDocument,
+        error: UnresolvedWegscheiderCyclicityError,
+        *,
+        reactions_text: str,
+    ) -> DetailedBalanceCorrectionRequest:
+        source = str(reactions_text)
+        identity = hashlib.sha256(
+            (
+                f"Preview\0{tab.tab_id}\0"
+                f"{tab.scientific_settings.temperature:.17g}\0{source}"
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return DetailedBalanceCorrectionRequest(
+            request_id=identity,
+            origin="Preview",
+            tab_id=tab.tab_id,
+            source=source,
+            issue=str(error),
+            temperature_K=float(tab.scientific_settings.temperature),
+        )
 
-            variables[var_eq] = dg_eq
-            eq_lo, eq_hi = _range(dg_eq, nonnegative=False)
-            vmeta[var_eq] = {
-                "type": "energy",
-                "role": "dG_eq_fast",
-                "cm_id": cm_id,
-                "label": f"{label} (ΔG° fast)",
-                "unit": str(ch.get("source_unit") or energy_unit),
-                "source_unit": str(ch.get("source_unit") or energy_unit),
-                "scale": "linear",
-                "min": eq_lo,
-                "max": eq_hi,
-                "kf_fixed": float(kf_fixed),
-                "std_ratio": float(std_ratio),
-            }
+    def complete_preview_detailed_balance_correction(
+        self,
+        outcome: DetailedBalanceCorrectionOutcome,
+    ) -> bool:
+        """Accept one typed modal outcome without resubmitting Preview."""
 
-            k_thermo = float("nan")
-            kr_val = float(ch.get("kr") or float("nan"))
+        if not isinstance(outcome, DetailedBalanceCorrectionOutcome):
+            raise TypeError("outcome must be DetailedBalanceCorrectionOutcome.")
+        pending = self._pending_detailed_balance_request
+        if pending is None:
+            return False
+        if (
+            (
+                outcome.request_id,
+                outcome.origin,
+                outcome.tab_id,
+                outcome.source,
+                outcome.issue,
+            )
+            != (
+                pending.request_id,
+                pending.origin,
+                pending.tab_id,
+                pending.source,
+                pending.issue,
+            )
+        ):
+            self.errorRaised.emit(
+                "Preview detailed-balance outcome is no longer current."
+            )
+            return False
+        if outcome.cancelled:
+            # Cancellation aborts this correction attempt but deliberately
+            # retains the blocked request so Fix can be invoked again.
+            return True
+        corrected = outcome.corrected_source
+        if corrected is None:
+            raise ValueError("Accepted correction has no corrected source.")
+        current_visible_source = (
+            self._registry.active_runtime.reactions_draft
+            or self._registry.active_tab.mechanism_source
+        )
+        if (
+            self._registry.active_tab_id != pending.tab_id
+            or current_visible_source.reactions_text
+            not in {pending.source, corrected}
+        ):
+            self.errorRaised.emit(
+                "Preview detailed-balance source is no longer current."
+            )
+            return False
+        self._verify_preview_detailed_balance_source(
+            corrected,
+            temperature_K=pending.temperature_K,
+        )
+        self._pending_detailed_balance_request = None
+        # Integration commits this exact typed outcome. No Preview request is
+        # scheduled here or by the editor modal.
+        self.previewDetailedBalanceCommitRequested.emit(outcome)
+        return True
+
+    def clear_preview_detailed_balance_block(
+        self,
+        tab_id: str | None = None,
+    ) -> bool:
+        pending = self._pending_detailed_balance_request
+        if pending is None:
+            return False
+        target = None if tab_id is None else str(tab_id)
+        if target is not None and pending.tab_id != target:
+            return False
+        self._pending_detailed_balance_request = None
+        self.previewDetailedBalanceBlockCleared.emit(pending.tab_id)
+        return True
+
+    @staticmethod
+    def _verify_preview_detailed_balance_source(
+        reactions_text: str,
+        *,
+        temperature_K: float,
+    ) -> None:
+        from kindred.core.simulator.parameter_algebra import (
+            apply_parameter_algebra_spec_to_mechanism,
+        )
+        from kindred.core.simulator.wegscheider_symbolic import (
+            validate_wegscheider_cyclicity_resolved,
+        )
+        from kindred.core.units import UnitsModel
+
+        source = str(reactions_text or "")
+        prepared_dsl = prepare_dsl_request_set(
+            source,
+            initials={},
+            units=UnitsModel(temperature_K=float(temperature_K)),
+        )
+        mechanism = prepared_dsl.mechanism_for_execution()
+        apply_parameter_algebra_spec_to_mechanism(
+            prepared_dsl.parameter_algebra_spec_for_execution(),
+            mechanism=mechanism,
+            require_mutable=False,
+        )
+        validate_wegscheider_cyclicity_resolved(mechanism)
+
+    def _preview_inputs_valid(self, targets: tuple[str, ...]) -> bool:
+        runtime = self._registry.active_runtime
+        invalid_targets = tuple(
+            set_id
+            for set_id in targets
+            if runtime.invalid_initial_text_by_set_id.get(set_id)
+        )
+        if invalid_targets:
+            self.errorRaised.emit(
+                "Preview blocked by invalid visible Initial Conditions in: "
+                + ", ".join(invalid_targets)
+            )
+            return False
+        return True
+
+    @QtCore.Slot()
+    def _submit_preview(self) -> None:
+        from kindred.gui.controllers.simulation_job_owner import (
+            PreviewIntent,
+            build_preview_target,
+        )
+
+        if self._suspended_preview_disposition is not None:
+            return
+        capture = self._preview_capture
+        self._preview_capture = None
+        if capture is None:
+            return
+        targets = tuple(
+            build_preview_target(
+                prepared_dsl=capture.prepared_dsl,
+                key=key,
+                set_name=set_name,
+            )
+            for key, set_name in capture.targets
+            if self._simulation_jobs.preview_key_is_current(key)
+        )
+        if targets:
+            self._simulation_jobs.request_preview(
+                PreviewIntent(tab_id=capture.tab_id, targets=targets)
+            )
+
+    def has_slider_draft(self, tab_id: str | None = None) -> bool:
+        runtime = (
+            self._registry.active_runtime
+            if tab_id is None
+            else self._registry.tab_runtime(tab_id)
+        )
+        return bool(
+            runtime.slider_parameter_draft
+            or runtime.slider_species_drafts_by_set_id
+        )
+
+    def suspend_preview_disposition(self) -> _SuspendedPreviewDisposition:
+        """Fence one nested Run/Fit disposition without changing its draft."""
+
+        if self._suspended_preview_disposition is not None:
+            raise RuntimeError("A Slider Preview disposition is already active.")
+        self._stop_preview_timers()
+        transaction = _SuspendedPreviewDisposition(
+            capture=self._preview_capture,
+        )
+        self._preview_capture = None
+        self._suspended_preview_disposition = transaction
+        self._simulation_jobs.drop_pending_preview()
+        return transaction
+
+    def resume_preview_disposition(
+        self,
+        transaction: _SuspendedPreviewDisposition,
+    ) -> None:
+        """Resume the unchanged exact capture only after a modal cancellation."""
+
+        if transaction is not self._suspended_preview_disposition:
+            raise ValueError("Slider Preview disposition is not current.")
+        self._suspended_preview_disposition = None
+        self._preview_capture = transaction.capture
+        if transaction.capture is not None:
+            self._preview_timer(
+                transaction.capture.debounce_kind
+            ).start()
+
+    def discard_preview_disposition(
+        self,
+        transaction: _SuspendedPreviewDisposition,
+    ) -> None:
+        """End one disposition fence without restoring its Preview capture."""
+
+        if transaction is not self._suspended_preview_disposition:
+            raise ValueError("Slider Preview disposition is not current.")
+        self._suspended_preview_disposition = None
+        self._preview_capture = None
+        self._simulation_jobs.drop_pending_preview()
+
+    def discard_slider_draft(self, tab_id: str | None = None) -> bool:
+        if self._suspended_preview_disposition is not None:
+            return False
+        target_tab_id = (
+            self._registry.active_tab_id if tab_id is None else str(tab_id)
+        )
+        runtime = self._registry.tab_runtime(target_tab_id)
+        parameter_dirty = bool(runtime.slider_parameter_draft)
+        changed = bool(
+            runtime.slider_parameter_draft
+            or runtime.slider_species_drafts_by_set_id
+        )
+        if not changed:
+            return False
+        tab = (
+            self._registry.active_tab
+            if target_tab_id == self._registry.active_tab_id
+            else self._tab_snapshot_by_id.get(target_tab_id)
+        )
+        if tab is None:
+            return self._reject(
+                f"Cannot discard Slider draft for unavailable tab {target_tab_id!r}."
+            )
+        affected = (
+            tuple(item.set_id for item in tab.initial_condition_sets)
+            if parameter_dirty
+            else tuple(runtime.slider_species_drafts_by_set_id)
+        )
+        runtime.slider_parameter_draft.clear()
+        runtime.slider_species_drafts_by_set_id.clear()
+        self.cancel_pending_preview_intent(target_tab_id)
+        self.clear_preview_detailed_balance_block(target_tab_id)
+        self._reconcile_canonical_set_ids(tab, affected)
+        if target_tab_id == self._registry.active_tab_id:
+            self.render_active()
+        self._emit_draft_state(target_tab_id)
+        return changed
+
+    def cancel_pending_preview_intent(self, tab_id: str | None = None) -> None:
+        target = None if tab_id is None else str(tab_id)
+        capture = self._preview_capture
+        if capture is not None and (target is None or capture.tab_id == target):
+            self._stop_preview_timers()
+            self._preview_capture = None
+        self._simulation_jobs.drop_pending_preview(target)
+
+    def apply(self) -> bool:
+        if self._suspended_preview_disposition is not None:
+            return False
+        runtime = self._registry.active_runtime
+        parameter_updates = dict(runtime.slider_parameter_draft)
+        species_updates = {
+            set_id: dict(values)
+            for set_id, values in runtime.slider_species_drafts_by_set_id.items()
+            if values
+        }
+        if not parameter_updates and not species_updates:
+            return False
+        preflight_targets = tuple(
+            dict.fromkeys(
+                (*self.resolve_target_set_ids(), *species_updates)
+            )
+        )
+        prepared = self._preflight_preview_action(preflight_targets)
+        if prepared is None:
+            return False
+        tab, _projection = prepared
+        runtime = self._registry.active_runtime
+        parameter_updates = dict(runtime.slider_parameter_draft)
+        species_updates = {
+            set_id: dict(values)
+            for set_id, values in runtime.slider_species_drafts_by_set_id.items()
+            if values
+        }
+
+        source = tab.mechanism_source
+        candidate_prepared_dsl = tab.prepared_dsl
+        if parameter_updates:
             try:
-                if temperature_k is not None and math.isfinite(float(temperature_k)) and float(temperature_k) > 0.0:
-                    source_unit = str(ch.get("source_unit") or energy_unit)
-                    source_conv = UnitsModel(energy_unit=source_unit) if UnitsModel is not None else None  # type: ignore[call-arg]
-                    dg_eq_j = float(source_conv.to_jmol(dg_eq)) if source_conv is not None else float(dg_eq) * 1000.0
-                    k_thermo = float(math.exp(-float(dg_eq_j) / (float(r_j_per_mol_k) * float(temperature_k))))
-                    if math.isfinite(k_thermo) and k_thermo > 0.0 and math.isfinite(kf_fixed) and kf_fixed > 0.0:
-                        kr_val = float(kf_fixed / (k_thermo * max(1e-300, float(std_ratio))))
-            except Exception as exc:
-                logger.debug("Failed to compute derived fast-equilibrium parameters: %s", exc, exc_info=True)
-                k_thermo = float("nan")
-                kr_val = float(ch.get("kr") or float("nan"))
-
-            params[f"ΔG° ({label})"] = (dg_eq, str(ch.get("source_unit") or energy_unit))
-            params[f"k_f ({label})"] = (kf_fixed, str(ch.get("unit_kf") or "1/s"))
-            params[f"k_r ({label})"] = (kr_val, str(ch.get("unit_kr") or "1/s"))
-            params[f"Keq ({label})"] = (k_thermo, "1")
-
-        self.set_variable_metadata(dict(vmeta))
-        visibility_scope_signature = self._slider_visibility_scope_signature(dict(variables), dict(vmeta))
-
-        if refresh_sliders:
-            mw.set_variable_sliders(
-                dict(variables),
-                metadata=dict(vmeta),
-                preserve_visibility=bool(preserve_visibility),
-                visibility_scope_signature=visibility_scope_signature,
-            )
-            mw._preview_session.sync_committed_slider_values(
-                self._committable_slider_values(variables, vmeta),
-                schema_text=mw.canonical_mechanism_source().without_reaction_initial_concentrations().full_dsl,
+                prepared_dsl = tab.prepared_dsl
+                if not isinstance(prepared_dsl, PreparedDslRequestSet):
+                    raise TypeError(
+                        "Slider Apply requires retained DSL analysis."
+                    )
+                candidate_prepared_dsl = (
+                    derive_prepared_dsl_with_parameter_updates(
+                        prepared_dsl,
+                        tuple(
+                            DslParameterCoordinateUpdate(
+                                name=str(name),
+                                value=float(value),
+                            )
+                            for name, value in parameter_updates.items()
+                        ),
+                        wegscheider_cyclicity_enabled=bool(
+                            tab.scientific_settings.wegscheider_policy
+                        ),
+                    )
+                )
+            except (LookupError, TypeError, ValueError) as exc:
+                return self._reject(f"Slider Apply failed ({exc}).")
+            source = MechanismAuthoringSource.from_full_dsl_text(
+                candidate_prepared_dsl.analysis.normalized_text
             )
 
-        try:
-            plot = mw.main_plot()
-            updater = getattr(plot, "update_parameters", None)
-            if callable(updater):
-                updater(dict(params))
-        except Exception as exc:
-            logger.debug("Failed to update plot parameter summary: %s", exc, exc_info=True)
-            mw._plot_parameter_summary_stale = True
+        candidate_sets = []
+        for initial_set in tab.initial_condition_sets:
+            updates = species_updates.get(initial_set.set_id)
+            if not updates:
+                candidate_sets.append(initial_set)
+                continue
+            values = initial_set.values_dict()
+            values.update(updates)
+            candidate_sets.append(initial_set.with_values(values))
+        candidate = replace(
+            tab,
+            mechanism_source=source,
+            prepared_dsl=candidate_prepared_dsl,
+        ).with_initial_condition_sets(tuple(candidate_sets))
+        delta = self._registry.replace_active_tab(candidate)
+        if delta is None:
+            return False
+        self.cancel_pending_preview_intent(tab.tab_id)
+        self._consume_document_delta(delta)
+        self.clear_preview_detailed_balance_block(tab.tab_id)
+        runtime.slider_parameter_draft.clear()
+        runtime.slider_species_drafts_by_set_id.clear()
+        self.render_active()
+        self._emit_draft_state(tab.tab_id)
+        return True
+
+    def reset(self) -> bool:
+        if self._suspended_preview_disposition is not None:
+            return False
+        tab = self._registry.active_tab
+        runtime = self._registry.active_runtime
+        targets = self.resolve_target_set_ids()
+        parameter_dirty = bool(runtime.slider_parameter_draft)
+        if not parameter_dirty and not any(
+            runtime.slider_species_drafts_by_set_id.get(set_id)
+            for set_id in targets
+        ):
+            return False
+        changed = parameter_dirty
+        runtime.slider_parameter_draft.clear()
+        for set_id in targets:
+            changed = bool(
+                runtime.slider_species_drafts_by_set_id.pop(set_id, None)
+            ) or changed
+        self.cancel_pending_preview_intent(tab.tab_id)
+        self.clear_preview_detailed_balance_block(tab.tab_id)
+        reconciled_targets = (
+            tuple(item.set_id for item in tab.initial_condition_sets)
+            if parameter_dirty
+            else targets
+        )
+        remaining_dirty = set(runtime.slider_species_drafts_by_set_id)
+        canonical_targets = tuple(
+            set_id
+            for set_id in reconciled_targets
+            if set_id not in remaining_dirty
+        )
+        still_dirty_targets = tuple(
+            set_id
+            for set_id in reconciled_targets
+            if set_id in remaining_dirty
+        )
+        if canonical_targets:
+            self._reconcile_canonical_set_ids(tab, canonical_targets)
+        if still_dirty_targets:
+            self._simulation_jobs.deauthorize_targets(
+                tab.tab_id,
+                still_dirty_targets,
+            )
+        self.render_active()
+        self._emit_draft_state(tab.tab_id)
+        return changed
+
+    def _preview_identity(
+        self,
+        tab: MechanismTabDocument,
+        projection: ParameterSliderProjection,
+        set_id: str,
+    ) -> PreviewResultIdentity:
+        runtime = self._registry.tab_runtime(tab.tab_id)
+        parameter_values = projection.values_dict()
+        parameter_values.update(runtime.slider_parameter_draft)
+        initial_values = dict(projected_initial_values(tab, set_id))
+        initial_values.update(
+            runtime.slider_species_drafts_by_set_id.get(set_id, {})
+        )
+        return PreviewResultIdentity(
+            tab_id=tab.tab_id,
+            set_id=set_id,
+            mechanism_source=tab.mechanism_source,
+            analysis_identity=projected_analysis_identity(tab),
+            parameter_values=tuple(parameter_values.items()),
+            initial_values=tuple(initial_values.items()),
+            execution_settings=tab.resolved_execution_settings(set_id),
+            scientific_settings=tab.scientific_settings,
+        )
+
+    def _consume_document_delta(self, delta: ScientificDocumentDelta) -> None:
+        if not isinstance(delta, ScientificDocumentDelta):
+            raise TypeError("delta must be ScientificDocumentDelta.")
+        for tab_id, set_ids in delta.affected_targets_by_tab:
+            if set_ids:
+                self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
+
+    @staticmethod
+    def _explicit_key(
+        tab: MechanismTabDocument,
+        set_id: str,
+    ) -> ExplicitResultKey:
+        return ExplicitResultKey(
+            tab_id=tab.tab_id,
+            set_id=set_id,
+            mechanism_source=tab.mechanism_source,
+            analysis_identity=projected_analysis_identity(tab),
+            initial_values=projected_initial_values(tab, set_id),
+            execution_settings=tab.resolved_execution_settings(set_id),
+            scientific_settings=tab.scientific_settings,
+        )
+
+    def _emit_draft_state(self, tab_id: str) -> None:
+        slider_dirty = self.has_slider_draft(tab_id)
+        self.draftStateChanged.emit(
+            str(tab_id),
+            self._registry.tab_runtime(tab_id).has_dirty_drafts,
+        )
+        self.sliderDraftStateChanged.emit(str(tab_id), slider_dirty)
+
+    def _reject(self, message: str) -> bool:
+        self.errorRaised.emit(str(message))
+        return False
+
+    def _restore_rejected_slider_action(self) -> bool:
+        self.render_active(preserve_visibility=True)
+        return False
+
+    def _reject_slider_action(self, message: str) -> bool:
+        self.errorRaised.emit(str(message))
+        return self._restore_rejected_slider_action()

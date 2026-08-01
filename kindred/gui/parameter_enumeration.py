@@ -1,136 +1,260 @@
-"""
-GUI-facing enumeration of canonical solver parameters.
+"""Typed GUI coordinates for mechanism parameters.
 
-This is intentionally Qt-free so it can be unit-tested without launching a GUI.
+The GUI never scans DSL text to invent parameter ownership.  This module
+parses the accepted source once, projects the core's typed rate families, and
+returns the one coordinate representation consumed by Slider and Fit.
 """
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from typing import Dict, Mapping, Tuple
+from dataclasses import dataclass
+import math
+from typing import Mapping
 
 from kindred.core.equilibrium_rate_authority import (
-    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
     step_entry_authored_role_is_derived,
     step_entry_authored_role_is_editable,
 )
-from kindred.core.mechanism_metadata import MechanismMetadataKeys
+from kindred.core.kinetics import (
+    ForwardRateModel,
+    forward_rate_at_temperature,
+    forward_rate_family,
+    forward_rate_model_for_equilibrium,
+    forward_rate_model_for_reaction,
+)
+from kindred.core.mechanism_metadata import (
+    MechanismMetadataKeys,
+    MechanismMetadataView,
+)
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulator.parameter_algebra import (
+    apply_parameter_algebra_spec_to_mechanism,
+    solver_parameter_units_from_mechanism,
+)
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.step_indexing import get_step_index_map
-from kindred.core.validation import try_parse_finite_float, try_parse_int
+from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
 
-__all__ = ["enumerate_step_parameters_for_gui"]
-
-
-def _try_finite_float(x: object) -> tuple[float, bool]:
-    try:
-        raw = x() if callable(x) else x
-    except Exception:
-        return 0.0, False
-    return try_parse_finite_float(raw)
+__all__ = [
+    "GuiParameterCoordinate",
+    "enumerate_parameter_coordinates",
+]
 
 
-def _mechanism_temperature(mechanism: object) -> float:
-    meta = getattr(mechanism, "metadata", {}) or {}
-    if isinstance(meta, Mapping):
-        value, ok = _try_finite_float(meta.get(MechanismMetadataKeys.TEMPERATURE_K))
-        if ok:
-            return float(value)
-    return 298.15
+def _finite(value: object) -> float | None:
+    parsed, ok = try_parse_callable_finite_float(value)
+    return float(parsed) if ok else None
 
 
-def _equilibrium_keq_value(eq: object, *, temperature_K: float) -> tuple[float, bool]:
-    value = effective_equilibrium_keq(eq, temperature_K=float(temperature_K))
-    if value is not None:
-        return float(value), True
-    return 0.0, False
+def _positive_bounds(value: float) -> tuple[float, float]:
+    if value > 0.0:
+        low = max(value * 0.01, 1e-12)
+        high = min(value * 100.0, 1e300)
+        if high > low:
+            return float(low), float(high)
+    return 0.0, max(1.0, abs(value) * 10.0)
 
 
-def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[str, float]", Dict[str, Dict[str, object]]]:
-    """
-    Return (variables, metadata) for canonical step-index parameters only.
+def _signed_bounds(value: float) -> tuple[float, float]:
+    span = max(1.0, abs(value) * 10.0)
+    return float(value - span), float(value + span)
 
-    - variables maps canonical parameter name -> current numeric value
-    - metadata includes:
-        type: 'reaction' or 'equilibrium'
-        index: canonical step index (1-based)
-        role: 'k'/'kf'/'kr'/'Keq'
-        label: 'Step N: <context>'
-        editable/derived for Keq-implied constraints (kr or kf derived when Keq is explicit)
-    """
-    variables: "OrderedDict[str, float]" = OrderedDict()
-    metadata: Dict[str, Dict[str, object]] = {}
 
-    step_map = get_step_index_map(mechanism)
+@dataclass(frozen=True, slots=True)
+class GuiParameterCoordinate:
+    """One stable GUI/Fit coordinate backed by a typed scientific owner."""
+
+    name: str
+    display_name: str
+    value: float
+    minimum: float
+    maximum: float
+    log10_allowed: bool
+    family: str
+    role: str
+    writable: bool
+    derived: bool
+    unit: str = "1"
+
+
+def enumerate_parameter_coordinates(
+    prepared_dsl: PreparedDslRequestSet,
+    *,
+    wegscheider_cyclicity_enabled: bool,
+) -> tuple[GuiParameterCoordinate, ...]:
+    """Enumerate writable coordinates from one accepted typed DSL authority."""
+
+    if not isinstance(prepared_dsl, PreparedDslRequestSet):
+        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+    temperature = float(prepared_dsl.analysis.structure["temperature_K"])
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(
+            "Prepared DSL nominal temperature must be positive and finite."
+        )
+    if type(wegscheider_cyclicity_enabled) is not bool:
+        raise TypeError("wegscheider_cyclicity_enabled must be a bool.")
+    mechanism = prepared_dsl.mechanism_for_execution()
+    metadata = getattr(mechanism, "metadata", {}) or {}
+    if isinstance(metadata, dict):
+        metadata[MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED] = bool(
+            wegscheider_cyclicity_enabled
+        )
+    metadata_view = MechanismMetadataView.from_metadata(metadata)
+    apply_parameter_algebra_spec_to_mechanism(
+        prepared_dsl.parameter_algebra_spec_for_execution(),
+        mechanism=mechanism,
+        require_mutable=False,
+    )
     namespace = build_namespace_from_mechanism(mechanism)
-    step_entry_by_index = {}
-    for entry in step_map:
-        n, ok = try_parse_int(entry.get("step_index"))
+    step_by_index: dict[int, Mapping[str, object]] = {}
+    for entry in get_step_index_map(mechanism):
+        parsed, ok = try_parse_int(entry.get("step_index"))
         if ok:
-            step_entry_by_index[int(n)] = entry
-    rxns = list(getattr(mechanism, "reactions", []) or [])
-    eqs = list(getattr(mechanism, "equilibria", []) or [])
-    temperature_K = _mechanism_temperature(mechanism)
+            step_by_index[int(parsed)] = entry
+    units = solver_parameter_units_from_mechanism(mechanism)
+    constrained = {
+        str(name)
+        for name in dict(metadata.get("constrained_params") or {})
+    }
+    reactions = tuple(getattr(mechanism, "reactions", ()) or ())
+    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+    coordinates: list[GuiParameterCoordinate] = []
+
     for item in namespace.ordered_items:
         info = item.info
-        n = info.step_index
-        if n is None:
+        if info.step_index is None:
             continue
-        entry = step_entry_by_index.get(int(n), {})
+        step_index = int(info.step_index)
+        entry = step_by_index.get(step_index, {})
         kind = str(info.step_kind or "")
         role = str(info.role or "")
-        context = str(entry.get("context") or "")
-        label = f"Step {n}: {context}".strip()
-        if kind == "reaction":
-            idx, ok = try_parse_int(entry.get("reaction_index", -1))
-            if not ok:
-                continue
-            if not (0 <= idx < len(rxns)):
-                continue
-            name = item.canonical_name
-            value, ok = _try_finite_float(getattr(rxns[idx], "rate", None))
-            variables[name] = float(value)
-            metadata[name] = {"type": "reaction", "index": n, "role": "k", "label": label, "value_valid": bool(ok)}
-        elif kind == "equilibrium":
-            idx, ok = try_parse_int(entry.get("equilibrium_index", -1))
-            if not ok:
-                continue
-            if not (0 <= idx < len(eqs)):
-                continue
-            eq = eqs[idx]
-            authority = normalize_existing_equilibrium_rate_authority(eq)
+        name = str(item.canonical_name)
+        if name in constrained:
+            continue
+        context = str(entry.get("context") or "").strip()
+        family = "Constant"
+        derived = False
+        writable = True
+        model: ForwardRateModel | None = None
+        value: float | None = None
 
-            name = item.canonical_name
+        if kind == "reaction":
+            raw_index, ok = try_parse_int(entry.get("reaction_index", -1))
+            if not ok or not (0 <= raw_index < len(reactions)):
+                continue
+            model = forward_rate_model_for_reaction(
+                reactions[int(raw_index)],
+                default_kappa=metadata_view.kappa_global,
+                default_standard_conc_M=metadata_view.standard_conc_M,
+            )
+            family = forward_rate_family(model)
+            value = forward_rate_at_temperature(model, temperature)
+        elif kind == "equilibrium":
+            raw_index, ok = try_parse_int(entry.get("equilibrium_index", -1))
+            if not ok or not (0 <= raw_index < len(equilibria)):
+                continue
+            equilibrium = equilibria[int(raw_index)]
+            authority = normalize_existing_equilibrium_rate_authority(equilibrium)
+            editable = step_entry_authored_role_is_editable(entry, role)
+            derived_truth = step_entry_authored_role_is_derived(entry, role)
+            writable = bool(
+                authority.authored_role_is_editable(role)
+                if editable is None
+                else editable
+            )
+            derived = bool(
+                authority.authored_role_is_derived(role)
+                if derived_truth is None
+                else derived_truth
+            )
             if role == "kf":
-                effective_kf = effective_equilibrium_forward_rate(eq, temperature_K=temperature_K)
-                value, ok = (float(effective_kf), True) if effective_kf is not None else (0.0, False)
+                model = forward_rate_model_for_equilibrium(
+                    equilibrium,
+                    temperature_K=temperature,
+                    default_kappa=metadata_view.kappa_global,
+                    default_standard_conc_M=metadata_view.standard_conc_M,
+                )
+                family = forward_rate_family(model)
+                value = forward_rate_at_temperature(model, temperature)
             elif role == "kr":
-                effective_kr = effective_equilibrium_reverse_rate(eq, temperature_K=temperature_K)
-                value, ok = (float(effective_kr), True) if effective_kr is not None else (0.0, False)
+                family = "reverse"
+                value = effective_equilibrium_reverse_rate(
+                    equilibrium,
+                    temperature_K=temperature,
+                )
             elif role == "Keq":
-                value, ok = _equilibrium_keq_value(eq, temperature_K=temperature_K)
+                family = "reverse"
+                value = effective_equilibrium_keq(
+                    equilibrium,
+                    temperature_K=temperature,
+                )
             else:
                 continue
-            variables[name] = float(value)
-            metadata[name] = {
-                "type": "equilibrium",
-                "index": n,
-                "role": role,
-                "label": label,
-                "value_valid": bool(ok),
-            }
-            editable = step_entry_authored_role_is_editable(entry, role)
-            derived = step_entry_authored_role_is_derived(entry, role)
-            if editable is None:
-                editable = authority.authored_role_is_editable(role)
-            if derived is None:
-                derived = authority.authored_role_is_derived(role)
-            if not editable:
-                metadata[name]["editable"] = False
-            if derived:
-                metadata[name]["derived"] = True
+        if value is None or not math.isfinite(float(value)):
+            continue
+        # Fit and Preview consume this API directly: derived readouts never
+        # enter their request parameter maps.
+        if not writable or derived:
+            continue
+        low, high = (
+            _positive_bounds(float(value))
+            if float(value) >= 0.0
+            else _signed_bounds(float(value))
+        )
+        display_name = name
+        if model is not None:
+            if family in {"Arrhenius", "Eyring"}:
+                display_name = f"{name} (k@{temperature:g} K)"
+        if context:
+            display_name = f"{display_name} — {context}"
+        coordinates.append(
+            GuiParameterCoordinate(
+                name=name,
+                display_name=display_name,
+                value=float(value),
+                minimum=low,
+                maximum=high,
+                log10_allowed=bool(float(value) > 0.0 and low > 0.0),
+                family=family,
+                role=role,
+                writable=True,
+                derived=False,
+                unit=str(units.get(name, "1")),
+            )
+        )
 
-    return variables, metadata
+    scalar_params = dict(metadata.get("scalar_params") or {})
+    scalar_info = dict(metadata.get("scalar_param_info") or {})
+    for raw_name, raw_value in scalar_params.items():
+        name = str(raw_name)
+        value = _finite(raw_value)
+        info = dict(scalar_info.get(name) or {})
+        if (
+            value is None
+            or name in constrained
+            or info.get("derived") is True
+            or info.get("editable") is False
+        ):
+            continue
+        low, high = (
+            _positive_bounds(value) if value > 0.0 else _signed_bounds(value)
+        )
+        coordinates.append(
+            GuiParameterCoordinate(
+                name=name,
+                display_name=name,
+                value=value,
+                minimum=low,
+                maximum=high,
+                log10_allowed=bool(value > 0.0 and low > 0.0),
+                family="scalar",
+                role="scalar",
+                writable=True,
+                derived=False,
+                unit=str(units.get(name, "1")),
+            )
+        )
+    return tuple(coordinates)

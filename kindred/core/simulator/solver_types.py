@@ -6,7 +6,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 import numpy as np
 
-from kindred.core.intervention_schedule import InterventionSchedule
+from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
 from kindred.core.temperature import TemperatureScheduleProtocol
 
 from .jacobian import JacobianConfig
@@ -32,6 +32,7 @@ class SimulationRequest:
     rhs: ODERhs
     t_span: Tuple[float, float]
     y0: np.ndarray
+    intervention_execution: InterventionExecutionContract
     solver: str = DEFAULT_SOLVER_NAME
     rtol: float = 1e-6
     atol: float = 1e-12
@@ -47,10 +48,17 @@ class SimulationRequest:
 
     progress_callback: Optional[Callable[[float, float, float], None]] = None
     temperature_schedule: TemperatureScheduleProtocol | None = None
-    intervention_schedule: InterventionSchedule | Mapping[str, Any] | None = None
     species_names: Optional[Tuple[str, ...]] = None
     symbolic_wegscheider_identity: Optional[Mapping[str, Any]] = None
     symbolic_jacobian_status: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.intervention_execution, InterventionExecutionContract
+        ):
+            raise TypeError(
+                "intervention_execution must be an InterventionExecutionContract."
+            )
 
 
 @dataclass(frozen=True)
@@ -58,3 +66,4 @@ class SimulationOutput:
     t: np.ndarray
     Y: np.ndarray
     provenance: dict[str, object]
+    intervention_execution: InterventionExecutionContract

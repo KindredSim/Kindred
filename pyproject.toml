@@ -46,8 +46,8 @@ test = [
 ]
 
 [project.gui-scripts]
-kindred = "kindred.gui_entrypoint:main"
-kindred-gui = "kindred.gui_entrypoint:main"
+kindred = "kindred.__main__:main"
+kindred-gui = "kindred.__main__:main"
 
 [tool.setuptools]
 packages = { find = {} }

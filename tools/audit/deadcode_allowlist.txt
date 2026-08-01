@@ -13,20 +13,3 @@
 #   support surfaces only.
 # - Do not allowlist `kindred/**` production modules here.
 # - Do not allowlist `tools/audit/**`; fix or justify those separately.
-
-# Environment compatibility shim (auto-imported by Python when present on sys.path).
-sitecustomize.py
-
-# GUI-path compatibility shims retained after moving headless batch models into
-# kindred.core. In-repo consumers now import the core homes directly, so these
-# modules intentionally have little/no production evidence while preserving old
-# import paths.
-kindred/gui/batch_initial_conditions.py
-kindred/gui/controllers/batch_simulation_cache.py
-
-# Retained general-purpose widget with dedicated tests (test_collapsible_section.py).
-# No current production import after removing the redundant mechanism dock wrapper.
-kindred/gui/widgets/collapsible_section.py
-
-# Intentional standalone diagnostics harness for manual fitting process-pool checks.
-tools/diagnostics/fitting_pool_leak_probe.py

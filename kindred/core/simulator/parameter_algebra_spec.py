@@ -30,7 +30,6 @@ _NON_ALGEBRA_ASSIGNMENT_PREFIXES = {
     "reaction",
     "state",
     "t",
-    "temp_const",
     "temp_response",
     "temp_step",
     "time",

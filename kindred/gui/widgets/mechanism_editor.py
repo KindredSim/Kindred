@@ -3,14 +3,21 @@
 
 from __future__ import annotations
 
-import contextlib
-from typing import Callable, Optional
+from dataclasses import dataclass
+import math
+from typing import TYPE_CHECKING, Callable, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
 
-from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
-from kindred.gui.ui_helpers import make_bounded_label, make_scroll_area, set_bounded_label_text
+if TYPE_CHECKING:
+    from kindred.core.mechanism_source import MechanismAuthoringSource
+
+from kindred.gui.ui_helpers import (
+    make_bounded_label,
+    make_scroll_area,
+    set_bounded_label_text,
+)
 
 # Direct imports required to avoid circular dependency with widgets/__init__.py
 from kindred.gui.widgets.state_network_editor import StateNetworkEditor
@@ -18,7 +25,215 @@ from kindred.gui.widgets.mechanism_highlighter import MechanismHighlighter
 from kindred.gui.widgets.variable_sliders import VariableSliders
 from kindred.gui.widgets.species_sliders import BatchSpeciesSliders
 
-__all__ = ["MechanismEditorTabbed"]
+__all__ = [
+    "DetailedBalanceCorrectionOutcome",
+    "DetailedBalanceCorrectionRequest",
+    "MechanismEditorBinding",
+    "MechanismEditorTabbed",
+    "open_detailed_balance_correction_modal",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _MechanismEditorRenderProjection:
+    source: object
+    state_network_prepared_dsl: object
+    notes: str
+    slider_dirty: bool
+    document_identity: tuple[int, str]
+
+
+@dataclass(frozen=True, slots=True)
+class DetailedBalanceCorrectionRequest:
+    request_id: str
+    origin: str
+    tab_id: str
+    source: str
+    issue: str
+    temperature_K: float = 298.15
+
+    def __post_init__(self) -> None:
+        for field_name in ("request_id", "origin", "tab_id", "issue"):
+            if not str(getattr(self, field_name) or "").strip():
+                raise ValueError(f"{field_name} must be nonblank.")
+        if str(self.origin).strip().casefold() not in {"run", "fit", "preview"}:
+            raise ValueError("origin must be Run, Fit, or Preview.")
+        if not str(self.source or "").strip():
+            raise ValueError("source must be nonblank.")
+        temperature = float(self.temperature_K)
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("temperature_K must be positive and finite.")
+        object.__setattr__(self, "temperature_K", temperature)
+
+
+@dataclass(frozen=True, slots=True)
+class DetailedBalanceCorrectionOutcome:
+    request_id: str
+    origin: str
+    tab_id: str
+    source: str
+    issue: str
+    corrected_source: str | None
+    cancelled: bool
+
+    def __post_init__(self) -> None:
+        for field_name in ("request_id", "origin", "tab_id", "source", "issue"):
+            if not str(getattr(self, field_name) or "").strip():
+                raise ValueError(f"{field_name} must be nonblank.")
+        if str(self.origin).strip().casefold() not in {"run", "fit", "preview"}:
+            raise ValueError("origin must be Run, Fit, or Preview.")
+        if type(self.cancelled) is not bool:
+            raise TypeError("cancelled must be a bool.")
+        corrected = self.corrected_source
+        if corrected is not None and not str(corrected).strip():
+            raise ValueError("corrected_source must be nonblank when provided.")
+        if self.cancelled == (corrected is not None):
+            raise ValueError(
+                "Detailed-balance outcome must be either cancelled or corrected."
+            )
+
+
+class _DetailedBalanceCorrectionDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        request: DetailedBalanceCorrectionRequest,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._request = request
+        self._corrected_source: str | None = None
+        self.setWindowTitle("Fix Detailed Balance")
+        self.setModal(True)
+        from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
+        from kindred.core.simulator.parameter_algebra import (
+            apply_parameter_algebra_spec_to_mechanism,
+        )
+        from kindred.core.simulator.wegscheider_symbolic import (
+            analyze_wegscheider_cyclicity,
+        )
+        from kindred.core.units import UnitsModel
+
+        prepared_dsl = prepare_dsl_request_set(
+            request.source,
+            initials={},
+            units=UnitsModel(temperature_K=request.temperature_K),
+        )
+        mechanism = prepared_dsl.mechanism_for_execution()
+        apply_parameter_algebra_spec_to_mechanism(
+            prepared_dsl.parameter_algebra_spec_for_execution(),
+            mechanism=mechanism,
+            require_mutable=False,
+        )
+        self._report = analyze_wegscheider_cyclicity(mechanism)
+        if not self._report.unresolved_cycles:
+            raise ValueError("The accepted source has no unresolved detailed-balance cycle.")
+
+        layout = QtWidgets.QVBoxLayout(self)
+        issue = QtWidgets.QLabel(request.issue, self)
+        issue.setWordWrap(True)
+        layout.addWidget(issue)
+        form = QtWidgets.QFormLayout()
+        self._selectors: dict[str, QtWidgets.QComboBox] = {}
+        for cycle in self._report.unresolved_cycles:
+            selector = QtWidgets.QComboBox(self)
+            selector.addItems(list(cycle.parameter_names))
+            self._selectors[cycle.cycle_id] = selector
+            form.addRow(
+                f"{cycle.cycle_id} dependent parameter",
+                selector,
+            )
+        layout.addLayout(form)
+        explanation = QtWidgets.QLabel(
+            "Kindred will add one symbolic dependency for each cycle, then "
+            "parse and reverify the corrected source before it can be used.",
+            self,
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self._accept_correction)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @property
+    def corrected_source(self) -> str | None:
+        return self._corrected_source
+
+    @QtCore.Slot()
+    def _accept_correction(self) -> None:
+        from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
+        from kindred.core.simulator.parameter_algebra import (
+            apply_parameter_algebra_spec_to_mechanism,
+        )
+        from kindred.core.simulator.wegscheider_symbolic import (
+            apply_wegscheider_resolution_to_reactions_text,
+            build_wegscheider_resolution_updates,
+            validate_wegscheider_cyclicity_resolved,
+        )
+        from kindred.core.units import UnitsModel
+
+        selected = {
+            cycle_id: selector.currentText()
+            for cycle_id, selector in self._selectors.items()
+        }
+        try:
+            updates = build_wegscheider_resolution_updates(
+                self._report,
+                selected,
+            )
+            corrected = apply_wegscheider_resolution_to_reactions_text(
+                self._request.source,
+                updates,
+            )
+            prepared_dsl = prepare_dsl_request_set(
+                corrected,
+                initials={},
+                units=UnitsModel(
+                    temperature_K=self._request.temperature_K
+                ),
+            )
+            mechanism = prepared_dsl.mechanism_for_execution()
+            apply_parameter_algebra_spec_to_mechanism(
+                prepared_dsl.parameter_algebra_spec_for_execution(),
+                mechanism=mechanism,
+                require_mutable=False,
+            )
+            validate_wegscheider_cyclicity_resolved(mechanism)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Detailed Balance Not Corrected",
+                str(exc),
+            )
+            return
+        self._corrected_source = corrected
+        self.accept()
+
+
+def open_detailed_balance_correction_modal(
+    parent: QtWidgets.QWidget | None,
+    request: DetailedBalanceCorrectionRequest,
+) -> DetailedBalanceCorrectionOutcome:
+    """Run the sole detailed-balance modal and return typed truth."""
+
+    if not isinstance(request, DetailedBalanceCorrectionRequest):
+        raise TypeError("request must be DetailedBalanceCorrectionRequest.")
+    dialog = _DetailedBalanceCorrectionDialog(request, parent)
+    accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
+    corrected = dialog.corrected_source if accepted else None
+    return DetailedBalanceCorrectionOutcome(
+        request_id=request.request_id,
+        origin=request.origin,
+        tab_id=request.tab_id,
+        source=request.source,
+        issue=request.issue,
+        corrected_source=corrected,
+        cancelled=not accepted,
+    )
 
 
 class _PersistentToggleMenu(QtWidgets.QMenu):
@@ -59,140 +274,17 @@ class _PersistentToggleMenu(QtWidgets.QMenu):
         super().mouseReleaseEvent(event)
 
 
-class _DraftAwarePlainTextEdit(QtWidgets.QPlainTextEdit):
-    """QPlainTextEdit that asks before user-originated mutations."""
-
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
-        super().__init__(parent)
-        self._mutation_intent_callback: Optional[Callable[[], bool]] = None
-
-    def set_mutation_intent_callback(self, callback: Optional[Callable[[], bool]]) -> None:
-        self._mutation_intent_callback = callback if callable(callback) else None
-
-    def _mutation_allowed(self) -> bool:
-        callback = self._mutation_intent_callback
-        if callback is None:
-            return True
-        return bool(callback())
-
-    def _document_undo_available(self) -> bool:
-        with contextlib.suppress(AttributeError, RuntimeError):
-            return bool(self.document().isUndoAvailable())
-        return False
-
-    def _document_redo_available(self) -> bool:
-        with contextlib.suppress(AttributeError, RuntimeError):
-            return bool(self.document().isRedoAvailable())
-        return False
-
-    def _key_event_may_edit(self, event: QtGui.QKeyEvent) -> bool:
-        if event.matches(QtGui.QKeySequence.StandardKey.Paste):
-            return bool(self.canPaste())
-        if event.matches(QtGui.QKeySequence.StandardKey.Cut):
-            return bool(self.textCursor().hasSelection())
-        with contextlib.suppress(AttributeError):
-            if event.matches(QtGui.QKeySequence.StandardKey.Delete):
-                return self._delete_key_can_mutate()
-        key = int(event.key())
-        if key == int(QtCore.Qt.Key.Key_Backspace):
-            return self._backspace_key_can_mutate()
-        if key == int(QtCore.Qt.Key.Key_Delete):
-            return self._delete_key_can_mutate()
-        if key in (
-            int(QtCore.Qt.Key.Key_Return),
-            int(QtCore.Qt.Key.Key_Enter),
-            int(QtCore.Qt.Key.Key_Tab),
-        ):
-            return True
-        modifiers = event.modifiers()
-        if modifiers & (
-            QtCore.Qt.KeyboardModifier.ControlModifier
-            | QtCore.Qt.KeyboardModifier.AltModifier
-        ):
-            return False
-        return bool(str(event.text() or ""))
-
-    def _backspace_key_can_mutate(self) -> bool:
-        cursor = self.textCursor()
-        if cursor.hasSelection():
-            return True
-        return int(cursor.position()) > 0
-
-    def _delete_key_can_mutate(self) -> bool:
-        cursor = self.textCursor()
-        if cursor.hasSelection():
-            return True
-        return int(cursor.position()) < len(str(self.toPlainText()))
-
-    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        if event.matches(QtGui.QKeySequence.StandardKey.Undo):
-            if self._document_undo_available() and not self._mutation_allowed():
-                event.accept()
-                return
-            super().keyPressEvent(event)
-            return
-        if event.matches(QtGui.QKeySequence.StandardKey.Redo):
-            if self._document_redo_available() and not self._mutation_allowed():
-                event.accept()
-                return
-            super().keyPressEvent(event)
-            return
-        if self._key_event_may_edit(event) and not self._mutation_allowed():
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-    def undo(self) -> None:
-        if self._document_undo_available() and not self._mutation_allowed():
-            return
-        super().undo()
-
-    def redo(self) -> None:
-        if self._document_redo_available() and not self._mutation_allowed():
-            return
-        super().redo()
-
-    def inputMethodEvent(self, event: QtGui.QInputMethodEvent) -> None:
-        replacement_length = int(event.replacementLength())
-        mutates = (
-            bool(str(event.commitString() or ""))
-            or replacement_length > 0
-            or bool(self.textCursor().hasSelection())
-        )
-        if mutates and not self._mutation_allowed():
-            event.accept()
-            return
-        super().inputMethodEvent(event)
-
-    def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        if event.mimeData() is not None and event.mimeData().hasText() and not self._mutation_allowed():
-            event.ignore()
-            return
-        super().dropEvent(event)
-
-    def insertFromMimeData(self, source: QtCore.QMimeData) -> None:
-        if source is not None and source.hasText() and not self._mutation_allowed():
-            return
-        super().insertFromMimeData(source)
-
-    def cut(self) -> None:
-        if self.textCursor().hasSelection() and not self._mutation_allowed():
-            return
-        super().cut()
-
-    def paste(self) -> None:
-        if self.canPaste() and not self._mutation_allowed():
-            return
-        super().paste()
-
-
 class MechanismEditorTabbed(QtWidgets.QWidget):
     speciesModeChanged = Signal(bool)
     speciesResetRequested = Signal()
     mechanismInspectRequested = Signal()
-    reactionsApplyRequested = Signal()
-    reactionsDiscardRequested = Signal()
+    sourceDraftEdited = Signal(object)
+    notesEdited = Signal(str)
+    sliderApplyRequested = Signal()
+    sliderResetRequested = Signal()
     validationStateChanged = Signal(str)
+    nativeHistoryAvailabilityChanged = Signal(bool, bool)
+    detailedBalanceCorrectionCompleted = Signal(object)
 
     """
     Mechanism editor with Reactions and Notes tabs.
@@ -203,8 +295,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     The State Network editor is accessible via the Edit menu.
 
-    The reaction text editor is directly editable. MainWindow owns the
-    draft/apply/discard flow and validates only when changes are applied.
+    The reaction text editor is directly editable. It emits visible authoring
+    and validation intent; scientific action boundaries own reconciliation.
     """
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
@@ -219,6 +311,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         super().__init__(parent)
 
         self._current_validation_state = "idle"
+        self._validation_temperature_provider: Callable[[], float] = (
+            lambda: 298.15
+        )
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -233,20 +328,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         # Text editor for DSL
         reactions_header_row = QtWidgets.QHBoxLayout()
-        self._apply_reactions_btn = QtWidgets.QPushButton("Apply Changes", self)
-        self._apply_reactions_btn.setObjectName("reactionsApplyChangesButton")
-        self._apply_reactions_btn.setToolTip("Apply the Reactions draft to the authoritative mechanism")
-        self._apply_reactions_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
-        self._apply_reactions_btn.setEnabled(False)
-        self._apply_reactions_btn.clicked.connect(lambda _checked=False: self.reactionsApplyRequested.emit())
-        reactions_header_row.addWidget(self._apply_reactions_btn)
-        self._discard_reactions_btn = QtWidgets.QPushButton("Discard Changes", self)
-        self._discard_reactions_btn.setObjectName("reactionsDiscardChangesButton")
-        self._discard_reactions_btn.setToolTip("Restore Reactions text from the last applied mechanism")
-        self._discard_reactions_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
-        self._discard_reactions_btn.setEnabled(False)
-        self._discard_reactions_btn.clicked.connect(lambda _checked=False: self.reactionsDiscardRequested.emit())
-        reactions_header_row.addWidget(self._discard_reactions_btn)
         reactions_header_row.addStretch()
         self.symbolic_calculator_btn = QtWidgets.QPushButton("Σ", self)
         self.symbolic_calculator_btn.setObjectName("symbolicCalculatorOpenButton")
@@ -258,7 +339,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self.inspect_mechanism_btn.setObjectName("mechanismInspectorOpenButton")
         self.inspect_mechanism_btn.setToolTip("Open a read-only Mechanism Inspector")
         self.inspect_mechanism_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
-        self.inspect_mechanism_btn.clicked.connect(lambda _checked=False: self.mechanismInspectRequested.emit())
+        self.inspect_mechanism_btn.clicked.connect(
+            lambda _checked=False: self.mechanismInspectRequested.emit()
+        )
         reactions_header_row.addWidget(self.inspect_mechanism_btn)
         self._run_btn = QtWidgets.QPushButton("Run")
         run_font = self._run_btn.font()
@@ -269,7 +352,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         reactions_header_row.addWidget(self._run_btn)
         reactions_layout.addLayout(reactions_header_row)
 
-        self._reactions_text = _DraftAwarePlainTextEdit()
+        self._reactions_text = QtWidgets.QPlainTextEdit()
         self._reactions_text.setPlaceholderText(
             "Example:\n"
             "reaction: 2A + B => C ; kf=1e5\n"
@@ -288,9 +371,17 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         )
         self._reactions_text.setFont(QtGui.QFont("Courier New", 10))
         self._reactions_text.setUndoRedoEnabled(True)  # Enable undo/redo
+        self._reactions_text.undoAvailable.connect(
+            self._emit_native_history_availability
+        )
+        self._reactions_text.redoAvailable.connect(
+            self._emit_native_history_availability
+        )
 
         # Apply syntax highlighting
-        self._reactions_highlighter = MechanismHighlighter(self._reactions_text.document())
+        self._reactions_highlighter = MechanismHighlighter(
+            self._reactions_text.document()
+        )
 
         # Validation indicator (shows DSL parsing status)
         self._validation_label = QtWidgets.QLabel()
@@ -299,16 +390,34 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Preferred,
         )
-        self._validation_label.setStyleSheet("QLabel { padding: 4px; border-radius: 3px; }")
+        self._validation_label.setStyleSheet(
+            "QLabel { padding: 4px; border-radius: 3px; }"
+        )
         self._validation_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self._set_validation_state("idle")
         reactions_layout.addWidget(self._validation_label)
+        self._detailed_balance_fix_button = QtWidgets.QPushButton(
+            "Fix Detailed Balance…",
+            self,
+        )
+        self._detailed_balance_fix_button.setObjectName(
+            "detailedBalanceFixButton"
+        )
+        self._detailed_balance_fix_button.hide()
+        self._pending_detailed_balance_request: (
+            DetailedBalanceCorrectionRequest | None
+        ) = None
+        self._detailed_balance_context_provider: (
+            Callable[[], tuple[str, str]] | None
+        ) = None
+        self._detailed_balance_fix_button.clicked.connect(
+            self._run_pending_detailed_balance_fix
+        )
+        reactions_layout.addWidget(self._detailed_balance_fix_button)
 
         # Unified slider surface for interactive parameter adjustment
         self._variable_sliders = VariableSliders(embedded=True)
         self._species_sliders = BatchSpeciesSliders(embedded=True)
-        self._variable_sliders.contentStateChanged.connect(self._sync_slider_workspace_state)
-        self._species_sliders.contentStateChanged.connect(self._sync_slider_workspace_state)
         self._slider_surface = make_scroll_area(self)
         self._slider_surface.setObjectName("unifiedSliderSurface")
         self._slider_surface_content = QtWidgets.QWidget(self._slider_surface)
@@ -327,63 +436,61 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         # Fine mode toggle
         self._fine_btn = QtWidgets.QPushButton("Fine")
         self._fine_btn.setCheckable(True)
-        self._fine_btn.setToolTip("Toggle fine adjustment mode for more precise slider control")
-        self._fine_btn.toggled.connect(lambda v: self._variable_sliders.set_fine_mode(v))
+        self._fine_btn.setToolTip(
+            "Toggle fine adjustment mode for more precise slider control"
+        )
+        self._fine_btn.toggled.connect(
+            lambda v: self._variable_sliders.set_fine_mode(v)
+        )
         slider_actions_layout.addWidget(self._fine_btn)
 
         # Override mode controls (Commit/Reset)
         self._commit_runtime_parameters_btn = QtWidgets.QPushButton("Apply")
-        self._commit_runtime_parameters_btn.setObjectName("commitRuntimeParametersButton")
-        self._commit_runtime_parameters_btn.setToolTip("Apply current slider values to the canonical mechanism")
+        self._commit_runtime_parameters_btn.setObjectName(
+            "commitRuntimeParametersButton"
+        )
+        self._commit_runtime_parameters_btn.setToolTip(
+            "Apply current slider values to the canonical mechanism"
+        )
+        self._commit_runtime_parameters_btn.clicked.connect(self.sliderApplyRequested)
         slider_actions_layout.addWidget(self._commit_runtime_parameters_btn)
 
         self._reset_runtime_parameters_btn = QtWidgets.QPushButton("Reset")
         self._reset_runtime_parameters_btn.setObjectName("resetRuntimeParametersButton")
-        self._reset_runtime_parameters_btn.setToolTip("Revert sliders to canonical mechanism values")
+        self._reset_runtime_parameters_btn.setToolTip(
+            "Revert sliders to canonical mechanism values"
+        )
+        self._reset_runtime_parameters_btn.clicked.connect(self.sliderResetRequested)
         slider_actions_layout.addWidget(self._reset_runtime_parameters_btn)
 
         # Visibility picker for the unified slider surface.
         self._slider_visibility_picker_btn = QtWidgets.QToolButton()
         self._slider_visibility_picker_btn.setText("Visible sliders")
         self._slider_visibility_picker_btn.setObjectName("sliderVisibilityPickerButton")
-        self._slider_visibility_picker_btn.setToolTip("Choose which mechanism parameters to show as interactive sliders")
-        self._slider_visibility_picker_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._slider_visibility_picker_btn.setToolTip(
+            "Choose which mechanism parameters to show as interactive sliders"
+        )
+        self._slider_visibility_picker_btn.setPopupMode(
+            QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup
+        )
         self._slider_visibility_menu = _PersistentToggleMenu(self)
-        self._slider_visibility_menu.aboutToShow.connect(self._rebuild_slider_visibility_menu)
+        self._slider_visibility_menu.aboutToShow.connect(
+            self._rebuild_slider_visibility_menu
+        )
         self._slider_visibility_picker_btn.setMenu(self._slider_visibility_menu)
         slider_actions_layout.addWidget(self._slider_visibility_picker_btn)
         self._slider_edit_targets_label = make_bounded_label(
             "Slider edit targets: none",
             max_width=240,
         )
-        self._slider_edit_targets_label.setToolTip("The set whose initial conditions are controlled by concentration sliders")
+        self._slider_edit_targets_label.setToolTip(
+            "The set whose initial conditions are controlled by concentration sliders"
+        )
         target_font = self._slider_edit_targets_label.font()
         target_font.setPointSize(max(1, target_font.pointSize() - 1))
         self._slider_edit_targets_label.setFont(target_font)
         slider_actions_layout.addWidget(self._slider_edit_targets_label)
         slider_actions_layout.addStretch()
-
-        slider_runtime_layout = QtWidgets.QHBoxLayout()
-        slider_runtime_layout.setSpacing(8)
-
-        # Slider simulation points
-        slider_runtime_layout.addWidget(QtWidgets.QLabel("Points:"))
-        self._slider_points_spin = QtWidgets.QSpinBox()
-        self._slider_points_spin.setRange(50, 20000)
-        self._slider_points_spin.setSingleStep(50)
-        self._slider_points_spin.setValue(100)
-        self._slider_points_spin.setMinimumWidth(100)
-        self._slider_points_spin.setToolTip("Number of time points for slider preview simulations")
-        slider_runtime_layout.addWidget(self._slider_points_spin)
-
-        # Slider solver
-        slider_runtime_layout.addWidget(QtWidgets.QLabel("Solver:"))
-        self._slider_solver_combo = QtWidgets.QComboBox()
-        self._slider_solver_combo.addItems(["Radau", "BDF"])
-        self._slider_solver_combo.setCurrentText("BDF")
-        self._slider_solver_combo.setToolTip("ODE solver used for slider preview simulations")
-        slider_runtime_layout.addWidget(self._slider_solver_combo)
-        slider_runtime_layout.addStretch()
 
         # Bottom pane: slider header + controls + slider surface
         self._slider_pane_container = QtWidgets.QWidget()
@@ -392,10 +499,13 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_pane_layout.setContentsMargins(0, 0, 0, 0)
         slider_pane_layout.setSpacing(6)
         slider_pane_layout.addLayout(slider_actions_layout)
-        slider_pane_layout.addLayout(slider_runtime_layout)
-        self._slider_empty_state_label = QtWidgets.QLabel("Choose sliders from Visible sliders.")
+        self._slider_empty_state_label = QtWidgets.QLabel(
+            "Choose sliders from Visible sliders."
+        )
         self._slider_empty_state_label.setWordWrap(True)
-        self._slider_empty_state_label.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self._slider_empty_state_label.setAlignment(
+            QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft
+        )
         empty_state_font = self._slider_empty_state_label.font()
         empty_state_font.setPointSize(max(1, empty_state_font.pointSize() - 1))
         self._slider_empty_state_label.setFont(empty_state_font)
@@ -416,7 +526,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         reactions_layout.addWidget(self._reactions_splitter, stretch=1)
 
         # Reserved for explicit validation requests; text edits do not parse drafts.
-        self._validation_timer = QtCore.QTimer()
+        self._validation_timer = QtCore.QTimer(self)
         self._validation_timer.setSingleShot(True)
         self._validation_timer.setInterval(100)
         self._validation_timer.timeout.connect(self._validate_dsl)
@@ -434,13 +544,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         help_label = QtWidgets.QLabel(
             '<pre style="white-space: pre-wrap;"><b>Global Directives</b>\n'
             "energy=kJ/mol       (Supported: kJ/mol, kcal/mol, J/mol)\n"
-            "T=300               (Isothermal temperature in K)\n"
+            "Nominal temperature is owned by the mechanism tab; a source-level T= directive is rejected.\n"
             "C0=1.0              (Standard concentration in M)\n"
             "kappa=1.0           (Transmission coefficient; also κ=)\n"
             "\n"
             "<b>Initial Conditions</b>\n"
-            "[A]=1.0, [B]=0.2    (Bracket syntax)\n"
-            "init: A=1.0, B=0.2  (Keyword syntax; also initial:)\n"
+            "Ordinary source, presets, and intervention examples use the same typed [A]=, init:, initial:, and named-block admission. Acceptance materializes canonical sets and leaves deterministic commented provenance in Reactions.\n"
             "\n"
             "<b>Arrows</b>\n"
             "Irreversible: -&gt; or =&gt;    Reversible: &lt;-&gt; or &lt;=&gt;\n"
@@ -464,28 +573,51 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "edge: GS1,TS1   (or edge: GS1-TS1)\n"
             "\n"
             "<b>Temperature Schedules</b>\n"
-            "temp_const: T=350\n"
             "temp_step: t=[0,50,100], T=[298,320]\n"
             "temp_response: t=[0,50,100], T=[298,320], tau=10\n"
             "\n"
             "<b>Species Intervention Schedules</b>\n"
+            "The public operations are set, jump, flux, hold, protocol, and trigger. Top-level fields are separated by semicolons.\n"
             "intervention: op=set; species=A; time=1.0; value=2.0\n"
-            "intervention: op=add; species=A; time=2.0; amount=0.5\n"
-            "intervention: op=remove; species=A; time=3.0; amount=0.25\n"
-            "intervention: op=clear; species=A; time=4.0\n"
-            "intervention: op=pulse; species=A; start=1.0; every=0.5; count=4; amount=0.2\n"
-            "intervention: op=source; species=B; start=0.0; end=5.0; rate=0.1\n"
-            "intervention: op=sink; species=B; start=0.0; end=5.0; rate=0.1\n"
-            "intervention: op=reservoir; species=O2; start=0.0; end=10.0; value=1.0\n"
-            "intervention: op=clamp; species=light; start=0.0; end=10.0; value=1.0\n"
-            "intervention: op=repeated_interval; kind=source; species=A; start=0.0; every=2.0; duration=0.5; count=3; rate=0.25\n"
-            "intervention: op=protocol; kind=repeat; name=light_cycle; start=0.0; every=2.0; duration=1.0; count=3; during=reservoir:light:value=1.0; after=clear:light\n"
-            "intervention: op=trigger; trigger_species=A; threshold=0.8; direction=falling; action=add; species=B; amount=0.1; max_count=1; min_interval=0.0\n"
-            "Fittable fields: instant time_param/value_param/amount_param; pulse start_param/every_param/amount_param; interval start_param/end_param/value_param/rate_param; repeated interval start_param/every_param/duration_param/value_param/rate_param; protocol start_param/every_param/duration_param and phase value_param/rate_param/amount_param; trigger threshold_param/value_param/amount_param.\n"
+            "intervention: op=jump; species=A; time=2.0; delta=-0.25\n"
+            "intervention: op=flux; species=B; start_time=0.0; end_time=5.0; flux_rate=-0.1\n"
+            "intervention: op=hold; species=O2; start_time=0.0; end_time=10.0; value=1.0\n"
+            "set requires species, exactly one time/time_param, and exactly one value/value_param. jump replaces the last pair with exactly one delta/delta_param.\n"
+            "flux requires species and exactly one each of start_time/start_time_param, end_time/end_time_param, and flux_rate/flux_rate_param. hold uses the same timing fields and exactly one value/value_param.\n"
+            "Each ordinary numeric field above is replaced, not supplemented, by its matching parameter field when parameterized.\n"
+            "The exhaustive parameter fields are time_param, start_time_param, end_time_param, value_param, delta_param, flux_rate_param, and threshold_param.\n"
+            "\n"
+            "<b>Repeat Protocols</b>\n"
+            "intervention: op=protocol; kind=repeat; start_time=0.5; every=1.25; count=4; before={op=jump,species=Oxidant,delta=0.2}\n"
+            "intervention: op=protocol; kind=repeat; start_time=0.0; every=2.0; count=3; duration=1.0; during={op=hold,species=Light,value=1.0}; after={op=set,species=Light,value=0.0}\n"
+            "before={op=set,species=A,value=1|op=jump,species=B,delta=0.2}\n"
+            "during={op=flux,species=C,flux_rate=-0.1|op=hold,species=D,value=4}\n"
+            "before, during, and after each contain one braced envelope. A pipe separates ordered operation records; a comma separates fields.\n"
+            "before and after allow set or jump. during allows flux or hold. Nested operations declare op and species exactly once and have implicit protocol timing; nested timing, protocol, and trigger operations are forbidden.\n"
+            "Nested set/hold use exactly one value/value_param, jump uses exactly one delta/delta_param, and flux uses exactly one flux_rate/flux_rate_param.\n"
+            "Protocol requires kind=repeat, exactly one start_time/start_time_param, a positive finite literal every, a positive integer literal count, and at least one nonempty phase.\n"
+            "A positive finite literal duration is required exactly when during or after is present. Braces do not nest; semicolons are forbidden inside an envelope; brace, pipe, and comma are forbidden in values.\n"
+            "Empty records or fields and unmatched braces reject.\n"
+            "\n"
+            "<b>State Triggers</b>\n"
+            "intervention: op=trigger; watch_species=A; threshold=0.8; direction=falling; max_count=1; min_interval=0.0; then={op=jump,species=B,delta=0.1}\n"
+            "Trigger requires watch_species, exactly one threshold/threshold_param, direction, a positive integer literal max_count, a finite nonnegative literal min_interval, and one braced then action.\n"
+            "The required direction field is rising, falling, or either. then allows exactly one set or jump with implicit trigger time, so time/time_param is not used inside then.\n"
+            "Only an exact terminal solver root can fire a trigger. After firing at T, it rearms no earlier than max(T + min_interval, nextafter(T, +infinity)); a firing cannot recursively trigger another firing at the same boundary.\n"
+            "Initial equality fires only when ordinary solver event handling reports a root at integration start. Count and firing provenance advance atomically only after the action succeeds.\n"
+            "\n"
+            "<b>Intervention Domains and Ordering</b>\n"
+            "Literal and resolved time, start_time, end_time, threshold, and min_interval are finite and nonnegative; resolved end_time is greater than start_time.\n"
+            "Set/hold value is finite and nonnegative. Jump delta and flux flux_rate are finite signed values, including zero. Negative jumps saturate at zero; negative flux never creates negative state.\n"
+            "every and required duration are finite and strictly positive. count and max_count are positive non-boolean integers. Resolved parameters and derived times are validated under the same domains and must remain finite.\n"
+            "Unknown, duplicate, missing, or empty fields reject at top level and inside protocol/trigger records.\n"
+            "Declaration order and nested authored-operation order are semantic. At one boundary, all static and exact-root trigger candidates are validated before mutation; ending intervals end; ordinary and protocol-before operations run in authored order; entering holds are established; trigger actions run in declaration order; then protocol-after operations run in authored order.\n"
+            "That one conflict check covers static/static, trigger/trigger, and trigger/static candidates. It rejects unequal absolute sets, set plus jump, unequal overlapping holds for one species, and a hold-start instant other than an equal set. Equal overlapping holds are compatible and keep complete lineage.\n"
+            "Scheduled changes, holds, trigger actions, sampled output, and manual sign checks do not create trigger roots.\n"
             "Protected indexed names such as K1, k1, kf1, kr1, and Keq1 resolve through the mechanism parameter namespace; use a longer ordinary name such as K1_test for an independent schedule parameter.\n"
-            "Use Examples &gt; Intervention Examples for runnable current examples, including repeated intervals and repeat protocol cycles built from primitive operations.\n"
-            "Use Inspect... to open the Mechanism Inspector for read-only step numbers, symbolic RHS equations, and compiled intervention schedule payloads from core authorities.\n"
-            "Solved schedule events and intervals can be shown as optional main-plot annotations from solver provenance; they are off by default and controlled from the plot context menu.\n"
+            "Use Examples &gt; Intervention Examples for runnable final-schema examples.\n"
+            "Use Inspect... to open the Mechanism Inspector for read-only step numbers, symbolic RHS equations, declarative payload, typed executable operations, discontinuities, and protocol lineage from core authorities.\n"
+            "Executed schedule operations and exact-root trigger firings appear as main-plot annotations from solver provenance by default and can be toggled from the plot context menu.\n"
             "\n"
             "<b>Algebra Declarations and Observables</b>\n"
             "Write algebra declarations directly in the Reactions text. They may appear before, after, or between reaction lines.\n"
@@ -507,7 +639,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "N_A   Avogadro constant (read-only)\n"
             "R     Gas constant in J/mol/K (read-only)\n"
             "Rkcal Gas constant in kcal/mol/K (read-only)\n"
-            "T     Current temperature in K from the mechanism T directive (read-only)\n"
+            "T     Current nominal temperature in K from the mechanism tab (read-only)\n"
             "\n"
             "<b>Computational Mode (# === Computational Mode ===)</b>\n"
             "Define advanced species thermodynamics (e.g., comp: species A G=-100).\n"
@@ -543,7 +675,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         )
         help_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         help_label.setWordWrap(True)
-        help_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
+        help_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft
+        )
         help_label.setStyleSheet("padding: 8px;")
         help_scroll.setWidget(help_label)
         help_scroll.setWidgetResizable(True)
@@ -565,6 +699,20 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         )
         self._notes_text.setFont(QtGui.QFont("Courier New", 10))
         self._notes_text.setUndoRedoEnabled(True)
+        self._notes_text.undoAvailable.connect(
+            self._emit_native_history_availability
+        )
+        self._notes_text.redoAvailable.connect(
+            self._emit_native_history_availability
+        )
+        self._notes_text.textChanged.connect(
+            lambda: self.notesEdited.emit(str(self._notes_text.toPlainText()))
+        )
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.focusChanged.connect(
+                self._emit_native_history_availability
+            )
         notes_layout.addWidget(self._notes_text)
         self._tabs.addTab(self._notes_tab, "Notes")
 
@@ -573,16 +721,73 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         # a visible, non-laid-out child widget will sit at (0, 0) and can intercept
         # clicks on the QTabBar (making it impossible to switch back to "Reactions").
         self._state_network_editor = StateNetworkEditor(parent=self)
+        self._state_network_editor.stateNetworkChanged.connect(
+            self._on_source_draft_edited
+        )
         self._state_network_editor.hide()
-        QtCore.QTimer.singleShot(0, self._sync_slider_workspace_state)
+        self._state_network_dialog: QtWidgets.QDialog | None = None
+        self._initial_slider_sync_timer = QtCore.QTimer(self)
+        self._initial_slider_sync_timer.setSingleShot(True)
+        self._initial_slider_sync_timer.timeout.connect(
+            self._sync_slider_workspace_state
+        )
+        self._initial_slider_sync_timer.start(0)
 
     def species_sliders_widget(self) -> BatchSpeciesSliders:
         return self._species_sliders
 
+    @QtCore.Slot()
+    def open_state_network_editor(self) -> None:
+        """Open the owned editor; accepted changes remain ordinary source drafts."""
+
+        existing = self._state_network_dialog
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        dialog = QtWidgets.QDialog(self.window())
+        self._state_network_dialog = dialog
+        dialog.setWindowTitle("State Network Editor")
+        dialog.setMinimumSize(700, 550)
+        dialog.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        editor = self._state_network_editor
+        previous_parent = editor.parentWidget()
+        previous_visible = editor.isVisible()
+        editor.setParent(dialog)
+        layout.addWidget(editor, 1)
+        editor.show()
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Close,
+            parent=dialog,
+        )
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def restore_editor(_result: int) -> None:
+            layout.removeWidget(editor)
+            editor.setParent(previous_parent)
+            editor.setVisible(previous_visible)
+            if self._state_network_dialog is dialog:
+                self._state_network_dialog = None
+            dialog.deleteLater()
+
+        dialog.finished.connect(restore_editor)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def set_slider_edit_targets_summary(self, text: str) -> None:
         summary = str(text or "Slider edit targets: none")
-        base_tooltip = "The set whose initial conditions are controlled by concentration sliders"
-        tooltip = base_tooltip if summary == "Slider edit targets: none" else f"{base_tooltip}\n\n{summary}"
+        base_tooltip = (
+            "The set whose initial conditions are controlled by concentration sliders"
+        )
+        tooltip = (
+            base_tooltip
+            if summary == "Slider edit targets: none"
+            else f"{base_tooltip}\n\n{summary}"
+        )
         set_bounded_label_text(
             self._slider_edit_targets_label,
             summary,
@@ -615,14 +820,18 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._variable_sliders.setVisible(visible_variable_entries > 0)
         self._species_sliders.setVisible(visible_species_entries > 0)
         self._slider_surface.setVisible(has_visible_entries)
-        self._slider_empty_state_label.setVisible(has_available_entries and not has_visible_entries)
+        self._slider_empty_state_label.setVisible(
+            has_available_entries and not has_visible_entries
+        )
         self._slider_visibility_picker_btn.setEnabled(has_available_entries)
         self._fine_btn.setVisible(has_variable_entries)
         self._slider_pane_container.setVisible(has_available_entries)
 
         if has_available_entries and not has_visible_entries:
             if has_variable_entries and has_species_entries:
-                helper = "Choose mechanism or concentration sliders from Visible sliders."
+                helper = (
+                    "Choose mechanism or concentration sliders from Visible sliders."
+                )
             elif has_variable_entries:
                 helper = "Choose mechanism sliders from Visible sliders."
             else:
@@ -643,6 +852,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         else:
             self._reactions_splitter.setSizes([1, 0])
 
+    def render_slider_workspace_presentation(self) -> None:
+        """Project Slider child content without publishing user intent."""
+        self._sync_slider_workspace_state()
+
     def _rebuild_slider_visibility_menu(self) -> None:
         menu = self._slider_visibility_menu
         menu.clear()
@@ -655,11 +868,21 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             return
 
         if mechanism_entries:
-            self._add_slider_visibility_entries(menu, title="Mechanism", entry_kind="mechanism", entries=mechanism_entries)
+            self._add_slider_visibility_entries(
+                menu,
+                title="Mechanism",
+                entry_kind="mechanism",
+                entries=mechanism_entries,
+            )
         if mechanism_entries and species_entries:
             menu.addSeparator()
         if species_entries:
-            self._add_slider_visibility_entries(menu, title="Initial concentrations", entry_kind="species", entries=species_entries)
+            self._add_slider_visibility_entries(
+                menu,
+                title="Initial concentrations",
+                entry_kind="species",
+                entries=species_entries,
+            )
 
     def _add_slider_visibility_entries(
         self,
@@ -677,20 +900,45 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             action.setChecked(bool(visible))
             action.setData((str(entry_kind), str(key)))
             action.toggled.connect(
-                lambda checked, kind=str(entry_kind), item=str(key): self._set_slider_entry_visible(kind, item, checked)
+                lambda checked,
+                kind=str(entry_kind),
+                item=str(key): self._set_slider_entry_visible(kind, item, checked)
             )
 
-    def _set_slider_entry_visible(self, entry_kind: str, item_name: str, visible: bool) -> None:
+    def _set_slider_entry_visible(
+        self, entry_kind: str, item_name: str, visible: bool
+    ) -> None:
         if str(entry_kind) == "mechanism":
             self._variable_sliders.set_variable_visible(str(item_name), bool(visible))
-            return
-        if str(entry_kind) == "species":
+        elif str(entry_kind) == "species":
             self._species_sliders.set_species_visible(str(item_name), bool(visible))
+        self._sync_slider_workspace_state()
 
     def _on_text_changed(self):
         """Handle text change event."""
         self._validation_timer.stop()
-        self._set_validation_state("draft")
+        self._set_validation_state(
+            "draft",
+            "Visible Reactions have changed; scientific actions will validate them.",
+        )
+        self._on_source_draft_edited()
+        self._validation_timer.start()
+
+    def _on_source_draft_edited(self) -> None:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        if self._current_validation_state != "draft":
+            self._set_validation_state(
+                "draft",
+                "Visible mechanism source has changed; scientific actions will validate it.",
+            )
+            self._validation_timer.start()
+        self.sourceDraftEdited.emit(
+            MechanismAuthoringSource.from_parts(
+                reactions_text=self.reactions_text(),
+                state_network_dsl=self.state_network_dsl_raw(),
+            )
+        )
 
     def _validate_dsl(self):
         """Validate DSL text and update validation indicator."""
@@ -704,28 +952,35 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         # Try to parse DSL
         try:
-            from kindred.core.batch_initial_conditions import (
-                strip_named_reaction_dsl_initial_concentration_sets,
-            )
-            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+            from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
             from kindred.core.simulator.parameter_algebra import (
-                apply_parameter_algebra_to_mechanism,
-                parameter_algebra_spec_from_mechanism,
+                apply_parameter_algebra_spec_to_mechanism,
             )
             from kindred.core.mechanism_source import MechanismAuthoringSource
+            from kindred.core.units import UnitsModel
 
-            parse_text = strip_named_reaction_dsl_initial_concentration_sets(text)
-            if str(state_network_dsl or "").strip() and not self._state_network_editor.is_valid():
+            if (
+                str(state_network_dsl or "").strip()
+                and not self._state_network_editor.is_valid()
+            ):
                 raise ValueError("Invalid State Network")
             validation_text = MechanismAuthoringSource.from_parts(
-                reactions_text=parse_text,
+                reactions_text=text,
                 state_network_dsl=state_network_dsl,
             ).full_dsl
 
-            # Parse with empty initials (will be populated from DSL)
-            mechanism = parse_dsl_to_mechanism(validation_text, initials={})
-            _ = apply_parameter_algebra_to_mechanism(
+            prepared_dsl = prepare_dsl_request_set(
                 validation_text,
+                initials={},
+                units=UnitsModel(
+                    temperature_K=float(
+                        self._validation_temperature_provider()
+                    )
+                ),
+            )
+            mechanism = prepared_dsl.mechanism_for_execution()
+            apply_parameter_algebra_spec_to_mechanism(
+                prepared_dsl.parameter_algebra_spec_for_execution(),
                 mechanism=mechanism,
                 require_mutable=False,
             )
@@ -736,7 +991,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             n_species = len(mechanism.species)
 
             msg = f"✓ Valid: {n_species} species, {n_reactions} reactions, {n_equilibria} equilibria"
-            spec = parameter_algebra_spec_from_mechanism(mechanism)
+            spec = prepared_dsl.parameter_algebra_spec_for_execution()
             for warning in getattr(spec, "override_warnings", ()) or ():
                 msg += f"\nWarning: {warning.message}"
             self._set_validation_state("valid", msg)
@@ -764,13 +1019,17 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._current_validation_state = state
         self.validationStateChanged.emit(str(state))
         if state == "valid":
-            run_tooltip = "Run simulation for the current run target from Initial Conditions"
+            run_tooltip = (
+                "Run simulation for the current run target from Initial Conditions"
+            )
         elif state == "draft":
-            run_tooltip = "Run may apply a valid Reactions draft before launch."
+            run_tooltip = "Visible Reactions will be validated before Run."
         elif state == "validating":
             run_tooltip = "Mechanism validation is still running."
         else:
-            run_tooltip = "No valid mechanism — enter a valid reaction mechanism to enable"
+            run_tooltip = (
+                "No valid mechanism — enter a valid reaction mechanism to enable"
+            )
         self._run_btn.setToolTip(run_tooltip)
 
         if state == "idle":
@@ -785,7 +1044,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         elif state == "draft":
             self._set_validation_label_text(
-                message or "• Draft changes not applied\nAnalysis uses the applied mechanism; Run may apply a valid draft first."
+                message
+                or "Visible Reactions have changed; scientific actions will validate them."
             )
             self._validation_label.setStyleSheet(
                 "QLabel { padding: 4px; border-radius: 3px; }"
@@ -815,45 +1075,163 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._validation_label.setText(full_text)
         self._validation_label.setToolTip(full_text if full_text else "")
 
-    def slider_points_value(self) -> int:
-        """Get the current slider simulation points setting."""
-        return self._slider_points_spin.value()
-
-    def slider_solver_value(self) -> str:
-        """Get the current slider solver setting."""
-        return self._slider_solver_combo.currentText()
-
-    def set_slider_points_value(self, n: int) -> None:
-        """Set the slider simulation points value."""
-        self._slider_points_spin.setValue(n)
-
-    def set_slider_solver_value(self, s: str) -> None:
-        """Set the slider solver value."""
-        solver_name = normalize_solver_name(s)
-        idx = self._slider_solver_combo.findText(solver_name)
-        if idx < 0:
-            idx = self._slider_solver_combo.findText(DEFAULT_SOLVER_NAME)
-        self._slider_solver_combo.setCurrentIndex(idx if idx >= 0 else 0)
-
     @property
     def run_btn(self) -> QtWidgets.QPushButton:
         return self._run_btn
 
+    def set_run_enabled(self, enabled: bool) -> None:
+        self._run_btn.setEnabled(bool(enabled))
+
+    def set_slider_draft_actions_enabled(
+        self,
+        dirty: bool,
+    ) -> None:
+        enabled = bool(dirty)
+        self._commit_runtime_parameters_btn.setEnabled(enabled)
+        self._reset_runtime_parameters_btn.setEnabled(enabled)
+        self._commit_runtime_parameters_btn.setText(
+            "Apply \N{BULLET}" if dirty else "Apply"
+        )
+
+    def reset_slider_session_presentation(self) -> None:
+        """Restore the owned Slider widgets to a neutral project session."""
+
+        variable_blocker = QtCore.QSignalBlocker(self._variable_sliders)
+        species_blocker = QtCore.QSignalBlocker(self._species_sliders)
+        try:
+            self._variable_sliders.clear()
+            self._species_sliders.clear()
+            self._fine_btn.setChecked(False)
+        finally:
+            del species_blocker
+            del variable_blocker
+        self.clear_preview_detailed_balance_block()
+        self.set_slider_draft_actions_enabled(False)
+        self.set_slider_edit_targets_summary("Slider edit targets: none")
+        self.render_slider_workspace_presentation()
+
     def is_mechanism_valid(self) -> bool:
         return self._current_validation_state == "valid"
-
-    def set_reactions_draft_actions_enabled(self, enabled: bool) -> None:
-        enabled_b = bool(enabled)
-        self._apply_reactions_btn.setEnabled(enabled_b)
-        self._discard_reactions_btn.setEnabled(enabled_b)
 
     def set_reactions_status_text(self, text: str, *, state: str) -> None:
         self._set_validation_state(str(state or "idle"), str(text or ""))
 
-    def set_reactions_user_mutation_guard(self, guard: Optional[Callable[[], bool]]) -> None:
-        set_guard = getattr(self._reactions_text, "set_mutation_intent_callback", None)
-        if callable(set_guard):
-            set_guard(guard)
+    def present_detailed_balance_correction(
+        self,
+        request: DetailedBalanceCorrectionRequest,
+    ) -> DetailedBalanceCorrectionOutcome:
+        """Present the one modal used by Run/Fit correction continuation."""
+
+        if not isinstance(request, DetailedBalanceCorrectionRequest):
+            raise TypeError("request must be DetailedBalanceCorrectionRequest.")
+        if request.origin.strip().casefold() not in {"run", "fit"}:
+            raise ValueError(
+                "Immediate detailed-balance correction requires Run or Fit origin."
+            )
+        if not self._detailed_balance_request_is_current(request):
+            outcome = self._cancelled_detailed_balance_outcome(request)
+            self.detailedBalanceCorrectionCompleted.emit(outcome)
+            return outcome
+        outcome = open_detailed_balance_correction_modal(self, request)
+        if (
+            outcome.corrected_source is not None
+            and not self._detailed_balance_request_is_current(request)
+        ):
+            outcome = self._cancelled_detailed_balance_outcome(request)
+        if outcome.corrected_source is not None:
+            self.apply_detailed_balance_rewrite(outcome.corrected_source)
+        self.detailedBalanceCorrectionCompleted.emit(outcome)
+        return outcome
+
+    def show_preview_detailed_balance_block(
+        self,
+        request: DetailedBalanceCorrectionRequest,
+    ) -> None:
+        """Show Preview's clear blocked message and explicit Fix action."""
+
+        if not isinstance(request, DetailedBalanceCorrectionRequest):
+            raise TypeError("request must be DetailedBalanceCorrectionRequest.")
+        if request.origin.strip().casefold() != "preview":
+            raise ValueError("Preview Fix requires a Preview-origin request.")
+        self._pending_detailed_balance_request = request
+        self.set_reactions_status_text(
+            f"Preview blocked: {request.issue}",
+            state="invalid",
+        )
+        self._detailed_balance_fix_button.show()
+
+    def clear_preview_detailed_balance_block(self) -> None:
+        self._pending_detailed_balance_request = None
+        self._detailed_balance_fix_button.hide()
+
+    @QtCore.Slot()
+    def _run_pending_detailed_balance_fix(self) -> None:
+        request = self._pending_detailed_balance_request
+        if request is None:
+            return
+        if not self._detailed_balance_request_is_current(request):
+            self.detailedBalanceCorrectionCompleted.emit(
+                self._cancelled_detailed_balance_outcome(request)
+            )
+            return
+        outcome = open_detailed_balance_correction_modal(self, request)
+        if (
+            outcome.corrected_source is not None
+            and not self._detailed_balance_request_is_current(request)
+        ):
+            outcome = self._cancelled_detailed_balance_outcome(request)
+        if outcome.corrected_source is not None:
+            self.apply_detailed_balance_rewrite(outcome.corrected_source)
+            self.clear_preview_detailed_balance_block()
+            self.set_reactions_status_text(
+                "Detailed-balance correction applied. Preview was not "
+                "retried; adjust a Slider to request a new Preview.",
+                state="draft",
+            )
+        self.detailedBalanceCorrectionCompleted.emit(outcome)
+
+    def set_detailed_balance_context_provider(
+        self,
+        provider: Callable[[], tuple[str, str]],
+    ) -> None:
+        if not callable(provider):
+            raise TypeError("provider must be callable.")
+        self._detailed_balance_context_provider = provider
+
+    def set_validation_temperature_provider(
+        self,
+        provider: Callable[[], float],
+    ) -> None:
+        if not callable(provider):
+            raise TypeError("provider must be callable.")
+        self._validation_temperature_provider = provider
+
+    def _detailed_balance_request_is_current(
+        self,
+        request: DetailedBalanceCorrectionRequest,
+    ) -> bool:
+        provider = self._detailed_balance_context_provider
+        if provider is None:
+            return False
+        try:
+            tab_id, source = provider()
+        except (KeyError, RuntimeError, ValueError):
+            return False
+        return str(tab_id) == request.tab_id and str(source) == request.source
+
+    @staticmethod
+    def _cancelled_detailed_balance_outcome(
+        request: DetailedBalanceCorrectionRequest,
+    ) -> DetailedBalanceCorrectionOutcome:
+        return DetailedBalanceCorrectionOutcome(
+            request_id=request.request_id,
+            origin=request.origin,
+            tab_id=request.tab_id,
+            source=request.source,
+            issue=request.issue,
+            corrected_source=None,
+            cancelled=True,
+        )
 
     def reactions_text(self) -> str:
         """Return the current Reaction DSL text."""
@@ -861,15 +1239,356 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def set_reactions_text(self, text: str, *, block_signals: bool = False) -> None:
         """Replace the Reaction DSL text."""
-        if not bool(block_signals):
-            self._reactions_text.setPlainText(str(text))
+        replacement = str(text)
+        if self._reactions_text.toPlainText() == replacement:
             return
-        self._reactions_text.blockSignals(True)
+        if not bool(block_signals):
+            self._reactions_text.setPlainText(replacement)
+            return
+        blocker = QtCore.QSignalBlocker(self._reactions_text)
         try:
-            self._reactions_text.setPlainText(str(text))
+            self._reactions_text.setPlainText(replacement)
         finally:
-            self._reactions_text.blockSignals(False)
+            del blocker
+
+    def apply_detailed_balance_rewrite(self, corrected_text: str) -> bool:
+        """Install a correction as exactly one native Reactions edit."""
+
+        replacement = str(corrected_text)
+        if replacement == self.reactions_text():
+            return False
+        cursor = self._reactions_text.textCursor()
+        cursor.beginEditBlock()
+        try:
+            cursor.select(QtGui.QTextCursor.SelectionType.Document)
+            cursor.insertText(replacement)
+        finally:
+            cursor.endEditBlock()
+        return True
+
+    def apply_accepted_reactions_rewrite(
+        self,
+        *,
+        expected_visible_text: str,
+        accepted_text: str,
+    ) -> bool:
+        """Install parser-authored provenance as one undoable native edit."""
+
+        if self.reactions_text() != str(expected_visible_text):
+            return False
+        replacement = str(accepted_text)
+        if replacement == self.reactions_text():
+            return False
+        cursor = self._reactions_text.textCursor()
+        cursor.beginEditBlock()
+        try:
+            cursor.select(QtGui.QTextCursor.SelectionType.Document)
+            cursor.insertText(replacement)
+        finally:
+            cursor.endEditBlock()
+        return True
+
+    def render_authoring_snapshot(
+        self,
+        *,
+        source,
+        state_network_prepared_dsl,
+        notes: str,
+        slider_dirty: bool,
+    ) -> None:
+        """Render one tab snapshot without retaining canonical state."""
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+        from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be MechanismAuthoringSource.")
+        state_text = str(source.state_network_dsl)
+        if state_network_prepared_dsl is None:
+            if state_text.strip():
+                raise TypeError(
+                    "Nonempty State Network source requires "
+                    "PreparedDslRequestSet authority."
+                )
+        elif not isinstance(state_network_prepared_dsl, PreparedDslRequestSet):
+            raise TypeError(
+                "state_network_prepared_dsl must be "
+                "PreparedDslRequestSet or None for blank source."
+            )
+        editor_blocker = QtCore.QSignalBlocker(self)
+        reactions_blocker = QtCore.QSignalBlocker(self._reactions_text)
+        state_blocker = QtCore.QSignalBlocker(self._state_network_editor)
+        notes_blocker = QtCore.QSignalBlocker(self._notes_text)
+        try:
+            self.set_reactions_text(source.reactions_text)
+            if self.state_network_dsl_raw() != state_text:
+                if state_network_prepared_dsl is None:
+                    self._state_network_editor.clear()
+                else:
+                    self._state_network_editor.set_state_network_analysis(
+                        state_network_prepared_dsl
+                    )
+            notes_text = str(notes)
+            if self._notes_text.toPlainText() != notes_text:
+                self._notes_text.setPlainText(notes_text)
+            self.set_slider_draft_actions_enabled(
+                bool(slider_dirty),
+            )
+            self.refresh_validation_indicator()
+        finally:
+            del notes_blocker
+            del state_blocker
+            del reactions_blocker
+            del editor_blocker
+
+    def refresh_validation_indicator(self) -> None:
+        """Refresh validation from the literal visible authoring snapshot."""
+        self._validation_timer.stop()
+        self._validate_dsl()
+
+    def variable_sliders_widget(self) -> VariableSliders:
+        return self._variable_sliders
+
+    def notes_text(self) -> str:
+        return str(self._notes_text.toPlainText())
+
+    def focused_native_editor(self) -> str | None:
+        focused = QtWidgets.QApplication.focusWidget()
+        if focused is self._reactions_text:
+            return "reactions"
+        if focused is self._notes_text:
+            return "notes"
+        return None
+
+    def native_undo_available(self) -> bool:
+        editor = self._focused_text_editor()
+        return bool(editor is not None and editor.document().isUndoAvailable())
+
+    def native_redo_available(self) -> bool:
+        editor = self._focused_text_editor()
+        return bool(editor is not None and editor.document().isRedoAvailable())
+
+    def clear_native_text_history(self) -> None:
+        """Clear only Reactions/Notes native history on document replacement."""
+
+        self._reactions_text.document().clearUndoRedoStacks()
+        self._notes_text.document().clearUndoRedoStacks()
+        self._emit_native_history_availability()
+
+    def undo_focused_text(self) -> bool:
+        editor = self._focused_text_editor()
+        if editor is None or not editor.document().isUndoAvailable():
+            return False
+        editor.undo()
+        return True
+
+    def redo_focused_text(self) -> bool:
+        editor = self._focused_text_editor()
+        if editor is None or not editor.document().isRedoAvailable():
+            return False
+        editor.redo()
+        return True
+
+    def _focused_text_editor(self) -> QtWidgets.QPlainTextEdit | None:
+        return {
+            "reactions": self._reactions_text,
+            "notes": self._notes_text,
+        }.get(self.focused_native_editor())
+
+    @QtCore.Slot()
+    def _emit_native_history_availability(self, *_args) -> None:
+        self.nativeHistoryAvailabilityChanged.emit(
+            self.native_undo_available(),
+            self.native_redo_available(),
+        )
+
+    def focusInEvent(self, event: QtGui.QFocusEvent) -> None:
+        super().focusInEvent(event)
+        self._emit_native_history_availability()
 
     def state_network_dsl_raw(self) -> str:
         """Return the current raw state-network DSL (may be empty)."""
         return str(self._state_network_editor.get_state_network_dsl() or "")
+
+
+class MechanismEditorBinding(QtCore.QObject):
+    """Binds the shared editor to the active tab's retained draft."""
+
+    draftStateChanged = QtCore.Signal(str, bool)
+    errorRaised = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        *,
+        editor: MechanismEditorTabbed,
+        registry,
+        simulation_jobs,
+        parent: QtCore.QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._editor = editor
+        self._registry = registry
+        self._simulation_jobs = simulation_jobs
+        self._rendering = False
+        self._rendered_document_identity: tuple[int, str] | None = None
+        editor.set_detailed_balance_context_provider(
+            self._active_detailed_balance_context
+        )
+        editor.set_validation_temperature_provider(
+            lambda: self._registry.active_tab.scientific_settings.temperature
+        )
+        editor.sourceDraftEdited.connect(self._on_source_draft)
+        editor.notesEdited.connect(self._on_notes_edited)
+
+    def _active_detailed_balance_context(self) -> tuple[str, str]:
+        tab = self._registry.active_tab
+        runtime = self._registry.active_runtime
+        source = runtime.reactions_draft or tab.mechanism_source
+        return tab.tab_id, source.reactions_text
+
+    def prepare_active_render(self) -> _MechanismEditorRenderProjection:
+        """Prepare every fallible authoring projection before widget mutation."""
+
+        from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
+        from kindred.core.units import UnitsModel
+
+        tab = self._registry.active_tab
+        runtime = self._registry.active_runtime
+        source = runtime.reactions_draft or tab.mechanism_source
+        state_network_text = str(source.state_network_dsl)
+        if not state_network_text.strip():
+            state_network_prepared_dsl = None
+        elif (
+            tab.prepared_dsl is not None
+            and state_network_text
+            == tab.mechanism_source.state_network_dsl
+        ):
+            state_network_prepared_dsl = tab.prepared_dsl
+        else:
+            state_network_prepared_dsl = prepare_dsl_request_set(
+                state_network_text,
+                initials={},
+                units=UnitsModel(
+                    temperature_K=tab.scientific_settings.temperature
+                ),
+            )
+        document_identity = self._registry.active_document_identity
+        if (
+            type(document_identity) is not tuple
+            or len(document_identity) != 2
+        ):
+            raise TypeError(
+                "active_document_identity must be (generation, tab_id)."
+            )
+        return _MechanismEditorRenderProjection(
+            source=source,
+            state_network_prepared_dsl=state_network_prepared_dsl,
+            notes=(
+                tab.notes
+                if runtime.notes_draft is None
+                else runtime.notes_draft
+            ),
+            slider_dirty=bool(
+                runtime.slider_parameter_draft
+                or runtime.slider_species_drafts_by_set_id
+            ),
+            document_identity=document_identity,
+        )
+
+    def apply_render_projection(
+        self,
+        projection: _MechanismEditorRenderProjection,
+    ) -> None:
+        """Apply one fully prepared authoring projection."""
+
+        if not isinstance(projection, _MechanismEditorRenderProjection):
+            raise TypeError(
+                "projection must be _MechanismEditorRenderProjection."
+            )
+        identity_changed = (
+            projection.document_identity != self._rendered_document_identity
+        )
+        self._rendering = True
+        try:
+            self._editor.render_authoring_snapshot(
+                source=projection.source,
+                state_network_prepared_dsl=(
+                    projection.state_network_prepared_dsl
+                ),
+                notes=projection.notes,
+                slider_dirty=projection.slider_dirty,
+            )
+            if identity_changed:
+                self._editor.clear_native_text_history()
+            self._rendered_document_identity = projection.document_identity
+        finally:
+            self._rendering = False
+
+    def render_active(self) -> None:
+        self.apply_render_projection(self.prepare_active_render())
+
+    @QtCore.Slot(object)
+    def _on_source_draft(self, source: object) -> None:
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        if self._rendering or not isinstance(source, MechanismAuthoringSource):
+            return
+        tab = self._registry.active_tab
+        runtime = self._registry.active_runtime
+        was_canonical = runtime.reactions_draft is None
+        runtime.reactions_draft = None if source == tab.mechanism_source else source
+        if was_canonical and runtime.reactions_draft is not None:
+            self._simulation_jobs.deauthorize_targets(
+                tab.tab_id,
+                (item.set_id for item in tab.initial_condition_sets),
+            )
+        self.draftStateChanged.emit(tab.tab_id, runtime.has_dirty_drafts)
+
+    @QtCore.Slot(str)
+    def _on_notes_edited(self, notes: str) -> None:
+        if self._rendering:
+            return
+        tab = self._registry.active_tab
+        runtime = self._registry.active_runtime
+        visible_notes = str(notes)
+        runtime.notes_draft = (
+            None if visible_notes == tab.notes else visible_notes
+        )
+        self.draftStateChanged.emit(tab.tab_id, runtime.has_dirty_drafts)
+
+    def has_reactions_draft(self, tab_id: str | None = None) -> bool:
+        runtime = (
+            self._registry.active_runtime
+            if tab_id is None
+            else self._registry.tab_runtime(tab_id)
+        )
+        return runtime.reactions_draft is not None
+
+    def apply_accepted_source_rewrite(
+        self,
+        visible: MechanismAuthoringSource,
+        accepted: MechanismAuthoringSource,
+    ) -> bool:
+        """Keep deterministic parser rewrites inside native Reactions history."""
+
+        from kindred.core.mechanism_source import MechanismAuthoringSource
+
+        if not isinstance(visible, MechanismAuthoringSource):
+            raise TypeError("visible must be MechanismAuthoringSource.")
+        if not isinstance(accepted, MechanismAuthoringSource):
+            raise TypeError("accepted must be MechanismAuthoringSource.")
+        return self._editor.apply_accepted_reactions_rewrite(
+            expected_visible_text=visible.reactions_text,
+            accepted_text=accepted.reactions_text,
+        )
+
+    def discard_reactions_draft(self, tab_id: str | None = None) -> bool:
+        runtime = (
+            self._registry.active_runtime
+            if tab_id is None
+            else self._registry.tab_runtime(tab_id)
+        )
+        changed = runtime.reactions_draft is not None
+        runtime.reactions_draft = None
+        if tab_id is None or str(tab_id) == self._registry.active_tab_id:
+            self.render_active()
+        return changed

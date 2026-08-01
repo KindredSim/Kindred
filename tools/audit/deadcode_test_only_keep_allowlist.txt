@@ -15,5 +15,3 @@
 # - Record why test-only or compatibility-only reachability is intentional.
 # - Reconfirm that production reachability remains intentionally absent.
 # - Update the KEEP rationale when the module's ownership or wiring changes.
-
-kindred/core/simulator/fast_eq.py  # KEEP: compatibility re-export for fast-equilibrium policy; used by tools/tests, not wired in production

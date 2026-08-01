@@ -46,6 +46,9 @@ def _build_simulation_success_payload_base(
         "solver_config": dict(solver_config or {}),
         "provenance": provenance_payload,
     }
+    payload["intervention_execution"] = (
+        result.intervention_execution.provenance_projection()
+    )
     if base_species_count is not None:
         payload["base_species_count"] = max(0, int(base_species_count))
     if extra_fields:

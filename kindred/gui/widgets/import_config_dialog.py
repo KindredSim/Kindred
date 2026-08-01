@@ -16,6 +16,10 @@ from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.core.datasets.csv_import import (
+    PhysicalColumn,
+    identify_physical_columns,
+)
 from kindred.core.datasets.excel_import import list_sheets, read_excel_sheet_rows
 from kindred.core.datasets.units import (
     CONCENTRATION_UNIT_DISPLAY,
@@ -27,7 +31,8 @@ from kindred.gui.widgets.import_config import (
     SheetImportIntent,
     UnitDetection,
     UserImportIntent,
-    detect_units_from_row_mapping,
+    classify_import_source,
+    detect_units_from_physical_row,
     resolve_import_plans,
 )
 
@@ -56,19 +61,19 @@ class ImportConfigDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self._filepath = filepath
         self._remaining_count = remaining_count
-        lower_path = filepath.lower()
-        if lower_path.endswith(".xls") and not lower_path.endswith(".xlsx"):
-            raise ValueError("Legacy .xls format is not supported. Please save as .xlsx.")
-        self._file_type = "excel" if lower_path.endswith(".xlsx") else "csv"
+        self._file_type = classify_import_source(filepath)
         self._result: Optional[ImportDialogResult] = None
 
         # State populated during preview reading
-        self._columns: List[str] = []
+        self._columns: List[PhysicalColumn] = []
         self._preview_rows: List[List[str]] = []
         self._unit_row_detected: bool = False
         self._detected_time_unit: Optional[str] = None
-        self._detected_conc_unit_by_column: Dict[str, Optional[str]] = {}
+        self._detected_conc_unit_by_column: Dict[
+            PhysicalColumn, Optional[str]
+        ] = {}
         self._species_checkboxes: List[QtWidgets.QCheckBox] = []
+        self._species_checked_draft: Dict[PhysicalColumn, bool] = {}
         self._sheet_states: Dict[Optional[str], dict] = {}
 
         # Excel-specific
@@ -277,7 +282,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     self._preview_rows = []
                     self._detect_and_populate()
                     return
-                self._columns = [h.strip() for h in header]
+                self._columns = list(identify_physical_columns(header))
                 rows: List[List[str]] = []
                 for _, row in zip(range(_MAX_PREVIEW_ROWS), reader):
                     rows.append([c.strip() if c else "" for c in row])
@@ -305,9 +310,12 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._sheet_list.setCurrentRow(0)
             self._load_excel_sheet_preview(self._sheet_names[0])
 
-    def _read_excel_sheet_preview(self, sheet_name: str) -> tuple[list[str], list[list[str]]]:
-        rows_raw: List[Dict[str, str]] = []
-        columns: List[str] = []
+    def _read_excel_sheet_preview(
+        self,
+        sheet_name: str,
+    ) -> tuple[list[PhysicalColumn], list[list[str]]]:
+        rows_raw: List[Dict[PhysicalColumn, str]] = []
+        columns: List[PhysicalColumn] = []
         with closing(read_excel_sheet_rows(self._filepath, sheet_name)) as row_iter:
             for i, row_dict in enumerate(row_iter):
                 if i == 0:
@@ -316,24 +324,33 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     break
                 rows_raw.append(row_dict)
         preview_rows = [
-            [str(row_dict.get(c, "")) for c in columns] for row_dict in rows_raw
+            [str(row_dict.get(column, "")) for column in columns]
+            for row_dict in rows_raw
         ]
         return columns, preview_rows
 
     def _build_default_sheet_state(
         self,
-        columns: list[str],
+        columns: list[PhysicalColumn],
         preview_rows: list[list[str]],
     ) -> dict:
         if preview_rows:
             row_mapping = dict(zip(columns, preview_rows[0]))
-            det = detect_units_from_row_mapping(row_mapping)
+            det = detect_units_from_physical_row(row_mapping)
         else:
             det = UnitDetection.empty()
-        time_column = ""
+        time_column: PhysicalColumn | None = None
         for candidate in _TIME_CANDIDATES:
-            if candidate in columns:
-                time_column = candidate
+            matched = next(
+                (
+                    column
+                    for column in columns
+                    if column.assigned_name == candidate
+                ),
+                None,
+            )
+            if matched is not None:
+                time_column = matched
                 break
         species_checked = {
             column_name: column_name != time_column
@@ -375,7 +392,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     def _clone_sheet_state(self, state: dict) -> dict:
         return {
-            "time_column": str(state.get("time_column", "")),
+            "time_column": state.get("time_column"),
             "species_checked": dict(state.get("species_checked", {})),
             "time_unit": str(state.get("time_unit", "s")),
             "concentration_units": dict(state.get("concentration_units", {})),
@@ -385,26 +402,27 @@ class ImportConfigDialog(QtWidgets.QDialog):
             "unit_row_detected": bool(state.get("unit_row_detected", False)),
             "detected_time_unit": state.get("detected_time_unit"),
             "detected_conc_unit_by_column": dict(state.get("detected_conc_unit_by_column", {})),
-            "columns": [str(column) for column in state.get("columns", [])],
+            "columns": list(state.get("columns", [])),
             "preview_rows": [list(row) for row in state.get("preview_rows", [])],
         }
 
     def _current_state_from_widgets(self) -> dict:
+        self._capture_species_checkbox_draft()
         combo_unit = self._conc_unit_combo.currentText()
         # Build per-column concentration_units from detection + combo default
-        conc_units: Dict[str, str] = {}
+        conc_units: Dict[PhysicalColumn, str] = {}
         for cb in self._species_checkboxes:
-            col = str(cb.property("column_name"))
+            col = cb._physical_column
             detected = self._detected_conc_unit_by_column.get(col)
             if self._unit_row_detected and not self._no_unit_row_cb.isChecked() and detected:
                 conc_units[col] = detected
             else:
                 conc_units[col] = combo_unit
         return {
-            "time_column": self._time_combo.currentText(),
+            "time_column": self._selected_time_column(),
             "species_checked": {
-                str(cb.property("column_name")): cb.isChecked()
-                for cb in self._species_checkboxes
+                column: self._species_checked_draft.get(column, True)
+                for column in self._columns
             },
             "time_unit": self._time_unit_combo.currentText(),
             "concentration_units": conc_units,
@@ -488,7 +506,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         if not self._preview_rows:
             return
         row_mapping = dict(zip(self._columns, self._preview_rows[0]))
-        det = detect_units_from_row_mapping(row_mapping)
+        det = detect_units_from_physical_row(row_mapping)
         self._unit_row_detected = det.has_unit_row
         self._detected_time_unit = det.detected_time_unit
         self._detected_conc_unit_by_column = {
@@ -499,19 +517,25 @@ class ImportConfigDialog(QtWidgets.QDialog):
     def _detect_units_for_sheet(
         self,
         sheet_name: str,
-        relevant_columns: list[str],
-    ) -> tuple[UnitDetection, list[str]]:
+        relevant_columns: list[PhysicalColumn],
+    ) -> tuple[UnitDetection, list[PhysicalColumn]]:
         """Return (UnitDetection, column_names) for a specific sheet."""
         if sheet_name == self._previewed_sheet_name:
             row_mapping = dict(zip(self._columns, self._preview_rows[0])) if self._preview_rows else {}
-            det = detect_units_from_row_mapping(row_mapping, relevant_columns)
+            det = detect_units_from_physical_row(
+                row_mapping,
+                relevant_columns,
+            )
             return det, list(self._columns)
         with closing(read_excel_sheet_rows(self._filepath, sheet_name)) as rows:
             first_row = next(iter(rows), None)
         if first_row is None:
             return UnitDetection.empty(), []
         columns = list(first_row.keys())
-        det = detect_units_from_row_mapping(dict(first_row), relevant_columns)
+        det = detect_units_from_physical_row(
+            dict(first_row),
+            relevant_columns,
+        )
         return det, columns
 
     def _restore_sheet_state(self, sheet_name: Optional[str], state: dict) -> None:
@@ -519,13 +543,13 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._time_combo.blockSignals(True)
         self._no_unit_row_cb.blockSignals(True)
         self._conc_unit_combo.blockSignals(True)
-        self._columns = [str(column) for column in state.get("columns", [])]
+        self._columns = list(state.get("columns", []))
         self._preview_rows = [list(row) for row in state.get("preview_rows", [])]
         self._unit_row_detected = bool(state.get("unit_row_detected", False))
         self._detected_time_unit = state.get("detected_time_unit")
         self._detected_conc_unit_by_column = dict(state.get("detected_conc_unit_by_column", {}))
         self._populate_preview_table()
-        self._populate_time_combo(selected_time=str(state.get("time_column", "")))
+        self._populate_time_combo(selected_time=state.get("time_column"))
         self._time_unit_combo.setCurrentText(str(state.get("time_unit", "s")))
         self._conc_unit_combo.setCurrentText(str(state.get("combo_conc_unit", "M")))
         no_unit_row_enabled = bool(state.get("no_unit_row_cb_enabled", False))
@@ -534,12 +558,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
             bool(state.get("override_no_unit_row", False)) and no_unit_row_enabled
         )
         self._refresh_unit_controls()
-        self._populate_species_checkboxes()
         species_checked = dict(state.get("species_checked", {}))
-        for cb in self._species_checkboxes:
-            column_name = str(cb.property("column_name"))
-            if column_name in species_checked:
-                cb.setChecked(bool(species_checked[column_name]))
+        self._populate_species_checkboxes(
+            checked_by_column=species_checked,
+        )
         self._time_combo.blockSignals(False)
         self._no_unit_row_cb.blockSignals(False)
         self._conc_unit_combo.blockSignals(False)
@@ -552,7 +574,9 @@ class ImportConfigDialog(QtWidgets.QDialog):
             return
         display_rows = self._preview_rows
         self._preview_table.setColumnCount(len(self._columns))
-        self._preview_table.setHorizontalHeaderLabels(self._columns)
+        self._preview_table.setHorizontalHeaderLabels(
+            [column.assigned_name for column in self._columns]
+        )
         self._preview_table.setRowCount(len(display_rows))
         for r, row in enumerate(display_rows):
             for c, val in enumerate(row):
@@ -562,22 +586,35 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 self._preview_table.setItem(r, c, item)
         self._preview_table.resizeColumnsToContents()
 
-    def _populate_time_combo(self, selected_time: Optional[str] = None) -> None:
+    def _populate_time_combo(
+        self,
+        selected_time: PhysicalColumn | None = None,
+    ) -> None:
         self._time_combo.blockSignals(True)
         self._time_combo.clear()
-        self._time_combo.addItem("")  # empty sentinel for "not selected"
+        self._time_combo.addItem("", None)
         for col in self._columns:
-            self._time_combo.addItem(col)
+            self._time_combo.addItem(col.assigned_name, col)
         if selected_time is not None:
-            self._time_combo.setCurrentText(selected_time)
+            selected_index = self._time_combo.findData(selected_time)
+            self._time_combo.setCurrentIndex(selected_index)
         else:
-            detected = None
+            detected: PhysicalColumn | None = None
             for candidate in _TIME_CANDIDATES:
-                if candidate in self._columns:
-                    detected = candidate
+                detected = next(
+                    (
+                        column
+                        for column in self._columns
+                        if column.assigned_name == candidate
+                    ),
+                    None,
+                )
+                if detected is not None:
                     break
             if detected:
-                self._time_combo.setCurrentText(detected)
+                self._time_combo.setCurrentIndex(
+                    self._time_combo.findData(detected)
+                )
             else:
                 self._time_combo.setCurrentIndex(0)  # empty
         self._time_combo.blockSignals(False)
@@ -630,9 +667,9 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._no_unit_row_cb.setEnabled(False)
         self._refresh_unit_controls()
 
-    def _label_for_species_column(self, col: str) -> str:
+    def _label_for_species_column(self, col: PhysicalColumn) -> str:
         """Return the display label for a species column checkbox."""
-        label = col
+        label = col.assigned_name
         if self._unit_row_detected and not self._no_unit_row_cb.isChecked():
             combo_unit = self._conc_unit_combo.currentText()
             detected = self._detected_conc_unit_by_column.get(col)
@@ -644,38 +681,75 @@ class ImportConfigDialog(QtWidgets.QDialog):
                         display_unit = "\u00b5" + unit_str[1:]
                     else:
                         display_unit = unit_str
-                    label = f"{col} ({display_unit} \u2192 M)"
+                    label = (
+                        f"{col.assigned_name} ({display_unit} \u2192 M)"
+                    )
             except ValueError:
                 pass
         return label
 
-    def _populate_species_checkboxes(self) -> None:
+    def _capture_species_checkbox_draft(self) -> None:
+        for checkbox in self._species_checkboxes:
+            self._species_checked_draft[checkbox._physical_column] = (
+                checkbox.isChecked()
+            )
+
+    def _populate_species_checkboxes(
+        self,
+        *,
+        checked_by_column: Dict[PhysicalColumn, bool] | None = None,
+    ) -> None:
+        if checked_by_column is None:
+            self._capture_species_checkbox_draft()
+        else:
+            self._species_checked_draft = {
+                column: bool(checked)
+                for column, checked in checked_by_column.items()
+            }
         # Clear existing
         for cb in self._species_checkboxes:
             self._species_layout.removeWidget(cb)
             cb.deleteLater()
         self._species_checkboxes.clear()
 
-        time_col = self._time_combo.currentText()
+        time_col = self._selected_time_column()
         for col in self._columns:
             if col == time_col:
                 continue
             cb = QtWidgets.QCheckBox(self._label_for_species_column(col), self._species_container)
-            cb.setChecked(True)
-            cb.setProperty("column_name", col)
-            cb.toggled.connect(lambda _: self._update_import_enabled())
+            cb._physical_column = col
+            blocker = QtCore.QSignalBlocker(cb)
+            try:
+                cb.setChecked(self._species_checked_draft.get(col, True))
+            finally:
+                del blocker
+            self._species_checked_draft.setdefault(col, cb.isChecked())
+            cb.toggled.connect(
+                lambda checked, column=col: self._on_species_checkbox_toggled(
+                    column,
+                    checked,
+                )
+            )
             self._species_checkboxes.append(cb)
             self._species_layout.addWidget(cb)
 
     def _refresh_species_labels(self) -> None:
         """Update checkbox labels in place without destroying/recreating them."""
         for cb in self._species_checkboxes:
-            col = str(cb.property("column_name"))
+            col = cb._physical_column
             cb.setText(self._label_for_species_column(col))
 
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
+
+    def _on_species_checkbox_toggled(
+        self,
+        column: PhysicalColumn,
+        checked: bool,
+    ) -> None:
+        self._species_checked_draft[column] = bool(checked)
+        self._update_import_enabled()
 
     def _on_time_column_changed(self, _text: str) -> None:
         self._populate_species_checkboxes()
@@ -696,7 +770,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 self._conc_unit_combo.setCurrentText(self._most_common_unit(detected_units))
                 self._conc_unit_combo.blockSignals(False)
         self._refresh_unit_controls()
-        self._populate_species_checkboxes()
+        self._refresh_species_labels()
         self._update_import_enabled()
 
     def _on_sheet_clicked(self, item: QtWidgets.QListWidgetItem) -> None:
@@ -757,9 +831,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
     def _update_import_enabled(self) -> None:
         self._save_current_sheet_state()
         current_state = self._current_state_from_widgets()
-        time_ok = bool(current_state["time_column"]) and str(current_state["time_column"]) in {
-            str(column) for column in current_state.get("columns", [])
-        }
+        time_ok = current_state["time_column"] in current_state.get(
+            "columns",
+            [],
+        )
         species_ok = self._state_has_valid_species_selection(current_state)
         sheets_ok = True
         all_sheet_configs_ok = time_ok and species_ok
@@ -783,16 +858,17 @@ class ImportConfigDialog(QtWidgets.QDialog):
                             all_sheet_configs_ok = False
                             incompatible_hint = (
                                 f"{sheet_name} is missing columns: "
-                                f"{', '.join(sorted(missing))}"
+                                f"{', '.join(sorted(column.assigned_name for column in missing))}"
                             )
                             break
             else:
                 all_sheet_configs_ok = sheets_ok
                 for sheet_name in checked_sheet_names:
                     state = current_state if sheet_name == self._previewed_sheet_name else self._ensure_sheet_state(sheet_name)
-                    sheet_time_ok = bool(state["time_column"]) and str(state["time_column"]) in {
-                        str(column) for column in state.get("columns", [])
-                    }
+                    sheet_time_ok = state["time_column"] in state.get(
+                        "columns",
+                        [],
+                    )
                     sheet_species_ok = self._state_has_valid_species_selection(state)
                     if not (sheet_time_ok and sheet_species_ok):
                         all_sheet_configs_ok = False
@@ -853,16 +929,22 @@ class ImportConfigDialog(QtWidgets.QDialog):
     @staticmethod
     def _build_intent_from_state(
         state: dict, sheet_key: Optional[str],
-    ) -> tuple[SheetImportIntent, UnitDetection, list[str]]:
+    ) -> tuple[
+        SheetImportIntent,
+        UnitDetection,
+        list[PhysicalColumn],
+    ]:
         """Pure transformation: state dict → (intent, detection, columns).
 
         No side effects, no widget reads, no I/O.
         """
-        time_col = str(state.get("time_column", ""))
+        time_col = state.get("time_column")
+        if not isinstance(time_col, PhysicalColumn):
+            raise ValueError("Select one physical time column.")
         species = tuple(
             column_name
             for column_name, checked in dict(state.get("species_checked", {})).items()
-            if checked
+            if checked and column_name != time_col
         )
         override_no_units = bool(
             state.get("override_no_unit_row", False)
@@ -892,12 +974,15 @@ class ImportConfigDialog(QtWidgets.QDialog):
             override_no_unit_row=override_no_units,
         )
 
-        columns = [str(column) for column in state.get("columns", [])]
+        columns = list(state.get("columns", []))
         preview_rows = [list(row) for row in state.get("preview_rows", [])]
         if preview_rows:
             row_mapping = dict(zip(columns, preview_rows[0]))
             relevant_cols = [time_col, *species]
-            detection = detect_units_from_row_mapping(row_mapping, relevant_cols)
+            detection = detect_units_from_physical_row(
+                row_mapping,
+                relevant_cols,
+            )
         else:
             detection = UnitDetection.empty()
 
@@ -938,7 +1023,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
         per_sheet_intents: dict[Optional[str], SheetImportIntent] = {}
         per_sheet_detections: dict[Optional[str], UnitDetection] = {}
-        per_sheet_columns: dict[Optional[str], list[str]] = {}
+        per_sheet_columns: dict[
+            Optional[str],
+            list[PhysicalColumn],
+        ] = {}
 
         for key in checked_keys:
             intent, detection, columns = self._build_intent_from_state(
@@ -1001,24 +1089,33 @@ class ImportConfigDialog(QtWidgets.QDialog):
             del blocker
         self._update_import_enabled()
 
-    def _required_columns_for_current_state(self, state: dict) -> set[str]:
-        time_column = str(state.get("time_column", ""))
-        if not time_column:
+    def _required_columns_for_current_state(
+        self,
+        state: dict,
+    ) -> set[PhysicalColumn]:
+        time_column = state.get("time_column")
+        if not isinstance(time_column, PhysicalColumn):
             return set()
         selected_species = {
-            str(column_name)
-            for column_name, checked in dict(state.get("species_checked", {})).items()
-            if checked
+            column
+            for column, checked in dict(
+                state.get("species_checked", {})
+            ).items()
+            if checked and column != time_column
         }
         if not selected_species:
             return set()
         return {time_column, *selected_species}
 
-    def _sheet_columns(self, sheet_name: str) -> set[str]:
+    def _sheet_columns(self, sheet_name: str) -> set[PhysicalColumn]:
         state = self._ensure_sheet_state(sheet_name)
-        return {str(column) for column in state.get("columns", [])}
+        return set(state.get("columns", []))
 
-    def _sheet_has_required_columns(self, sheet_name: str, required_columns: set[str]) -> bool:
+    def _sheet_has_required_columns(
+        self,
+        sheet_name: str,
+        required_columns: set[PhysicalColumn],
+    ) -> bool:
         return required_columns <= self._sheet_columns(sheet_name)
 
     def _update_bulk_sheet_buttons(self, *, time_ok: bool, species_ok: bool) -> None:
@@ -1043,6 +1140,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._sheet_section.setMinimumHeight(110 if self._file_type == "excel" else 0)
         self._preview_section.setMinimumHeight(160)
 
+    def _selected_time_column(self) -> PhysicalColumn | None:
+        selected = self._time_combo.currentData()
+        return selected if isinstance(selected, PhysicalColumn) else None
+
     @staticmethod
     def _normalize_unit_for_combo(unit: Optional[str]) -> str:
         return str(unit or "").strip().replace("µ", "u").replace("μ", "u")
@@ -1057,17 +1158,19 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     @staticmethod
     def _state_has_valid_species_selection(state: dict) -> bool:
-        columns = {str(column) for column in state.get("columns", [])}
-        time_column = str(state.get("time_column", ""))
+        columns = set(state.get("columns", []))
+        time_column = state.get("time_column")
         selected_species = [
-            str(column_name)
-            for column_name, checked in dict(state.get("species_checked", {})).items()
-            if checked
+            column
+            for column, checked in dict(
+                state.get("species_checked", {})
+            ).items()
+            if checked and column != time_column
         ]
         if not selected_species:
             return False
         return all(
-            column_name in columns and column_name != time_column
+            column_name in columns
             for column_name in selected_species
         )
 

@@ -22,6 +22,7 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
+    effective_reverse_rate_from_keq,
     generated_equilibrium_authority_kind,
     normalize_existing_equilibrium_rate_authority,
     require_step_entry_authored_role_is_editable,
@@ -316,7 +317,12 @@ def _apply_equilibrium_Keq_constraints_to_values(
                 raise ValueError(f"Active equilibrium constraint {keq_key!r} cannot derive missing {kf_key!r}.")
         else:
             if kf_key in base_values:
-                base_values[kr_key] = float(base_values[kf_key]) / keq
+                base_values[kr_key] = float(
+                    effective_reverse_rate_from_keq(
+                        base_values[kf_key],
+                        keq,
+                    )
+                )
             else:
                 raise ValueError(f"Active equilibrium constraint {keq_key!r} cannot derive missing {kr_key!r}.")
 

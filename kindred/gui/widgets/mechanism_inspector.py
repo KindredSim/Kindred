@@ -12,12 +12,16 @@ from kindred.core.equilibrium_rate_authority import (
     generated_fast_equilibrium_runtime_parameter_name,
     generated_equilibrium_authority_kind,
 )
-from kindred.core.batch_initial_conditions import strip_named_reaction_dsl_initial_concentration_sets
-from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
+from kindred.core.intervention_schedule_compiler import (
+    InterventionExecutionContract,
+    compile_intervention_schedule,
+)
 from kindred.core.intervention_schedule import InterventionScheduleError, intervention_schedule_parameter_names
 from kindred.core.mechanism_metadata import MechanismMetadataKeys
-from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulator.parameter_algebra import (
+    apply_parameter_algebra_spec_to_mechanism,
+)
 from kindred.core.simulator.step_indexing import get_step_index_map, iter_canonical_parameters
 from kindred.core.symbolic.jacobian import build_symbolic_jacobian_structure
 
@@ -31,11 +35,18 @@ class MechanismInspectorSections:
     interventions_text: str
 
 
-def build_mechanism_inspector_sections(dsl_text: str) -> MechanismInspectorSections:
+def build_mechanism_inspector_sections(
+    prepared_dsl: PreparedDslRequestSet,
+) -> MechanismInspectorSections:
     """Build read-only inspector sections from the same core authorities used at runtime."""
-    parse_text = strip_named_reaction_dsl_initial_concentration_sets(str(dsl_text or ""))
-    mechanism = parse_dsl_to_mechanism(parse_text, initials={})
-    apply_parameter_algebra_to_mechanism(parse_text, mechanism=mechanism, require_mutable=False)
+    if not isinstance(prepared_dsl, PreparedDslRequestSet):
+        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+    mechanism = prepared_dsl.mechanism_for_execution()
+    apply_parameter_algebra_spec_to_mechanism(
+        prepared_dsl.parameter_algebra_spec_for_execution(),
+        mechanism=mechanism,
+        require_mutable=False,
+    )
     return MechanismInspectorSections(
         steps_text=_safe_format_section("steps", lambda: _format_steps(mechanism)),
         equations_text=_safe_format_section("equations", lambda: _format_equations(mechanism)),
@@ -116,20 +127,16 @@ def _format_interventions(mechanism: object) -> str:
     if schedule is None:
         return "No intervention schedule."
 
-    lines = [
-        "Declarative schedule payload:",
-        json.dumps(schedule.to_payload(), indent=2, sort_keys=True),
-        "",
-        f"Declarative schedule fingerprint: {schedule.fingerprint or 'none'}",
-    ]
     if schedule.is_parameterized:
         parameter_names = sorted(intervention_schedule_parameter_names(schedule))
-        lines.extend(
-            [
-                "",
-                "Executable schedule payload is unavailable until schedule parameters are resolved.",
-            ]
-        )
+        lines = [
+            "Declarative schedule payload:",
+            json.dumps(schedule.to_payload(), indent=2, sort_keys=True),
+            "",
+            f"Declarative schedule fingerprint: {schedule.fingerprint or 'none'}",
+            "",
+            "Typed executable schedule is unavailable until schedule parameters are resolved.",
+        ]
         if parameter_names:
             lines.append(f"Schedule parameters: {', '.join(parameter_names)}")
         return "\n".join(lines)
@@ -137,29 +144,82 @@ def _format_interventions(mechanism: object) -> str:
     try:
         compiled = compile_intervention_schedule(schedule)
     except InterventionScheduleError as exc:
-        lines.extend(
+        return "\n".join(
             [
+                "Declarative schedule payload:",
+                json.dumps(schedule.to_payload(), indent=2, sort_keys=True),
                 "",
-                "Executable schedule payload is unavailable:",
+                f"Declarative schedule fingerprint: {schedule.fingerprint or 'none'}",
+                "",
+                "Typed executable schedule is unavailable:",
                 str(exc),
             ]
         )
-        return "\n".join(lines)
 
+    return _format_intervention_execution(compiled)
+
+
+def _format_intervention_execution(
+    contract: InterventionExecutionContract,
+) -> str:
+    """Project the compiler-owned typed contract without reconstructing it."""
+
+    typed_sections = (
+        ("Instants", contract.instants),
+        ("Fluxes", contract.fluxes),
+        ("Holds", contract.holds),
+        ("Triggers", contract.triggers),
+        ("Trigger firings", contract.trigger_firings),
+    )
     lines = [
         "Declarative schedule payload:",
-        json.dumps(compiled.normalized_declarative_payload, indent=2, sort_keys=True),
+        json.dumps(
+            _plain_json_value(contract.declarative_payload),
+            indent=2,
+            sort_keys=True,
+        ),
         "",
-        "Executable schedule payload:",
-        json.dumps(compiled.executable_payload, indent=2, sort_keys=True),
-        "",
-        "executable intervals:",
-        json.dumps(compiled.executable_payload.get("intervals", []), indent=2, sort_keys=True),
-        "",
-        "Lineage:",
-        json.dumps(list(compiled.lineage), indent=2, sort_keys=True),
+        f"Declarative schedule fingerprint: {contract.declarative_fingerprint or 'none'}",
+        f"Executable schedule fingerprint: {contract.executable_fingerprint or 'none'}",
     ]
+    for label, values in typed_sections:
+        lines.extend(
+            [
+                "",
+                f"Typed {label.lower()}:",
+                json.dumps(
+                    [value.to_payload() for value in values],
+                    indent=2,
+                    sort_keys=True,
+                ),
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Discontinuities:",
+            json.dumps(list(contract.discontinuities), indent=2),
+            "",
+            "Protocol lineage:",
+            json.dumps(
+                _plain_json_value(contract.protocol_lineage),
+                indent=2,
+                sort_keys=True,
+            ),
+        ]
+    )
     return "\n".join(lines)
+
+
+def _plain_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_plain_json_value(item) for item in value]
+    return value
 
 
 def _format_generated_mechanism_summary(mechanism: object) -> list[str]:
@@ -203,7 +263,11 @@ def _has_unsupported_generated_equilibrium(mechanism: object) -> bool:
 class MechanismInspectorDialog(QtWidgets.QDialog):
     """Read-only dialog for current mechanism steps, equations, and interventions."""
 
-    def __init__(self, dsl_text: str, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        prepared_dsl: PreparedDslRequestSet,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("mechanismInspectorDialog")
         self.setWindowTitle("Mechanism Inspector")
@@ -215,7 +279,7 @@ class MechanismInspectorDialog(QtWidgets.QDialog):
         layout.addWidget(tabs)
 
         try:
-            sections = build_mechanism_inspector_sections(dsl_text)
+            sections = build_mechanism_inspector_sections(prepared_dsl)
         except Exception as exc:
             sections = MechanismInspectorSections(
                 steps_text=f"Unable to inspect mechanism:\n{exc}",

@@ -85,14 +85,19 @@ class DSLError(ReactionValidationError, ValueError):
 def invalid_temperature_error(value: str) -> DSLError:
     """Error for invalid temperature value."""
     return DSLError(
-        f"Invalid temperature: T={value}",
-        suggestion="Temperature must be positive (in Kelvin)",
+        f"Invalid nominal temperature: {value} K",
+        suggestion=(
+            "Set the nominal temperature in the mechanism tab to a value "
+            "within 0.1–10000 K."
+        ),
         examples=[
-            "T=298.15  (room temperature, 25°C)",
-            "T=310.0   (body temperature, 37°C)",
-            "T=373.15  (boiling point of water)"
-        ]
+            "Mechanism tab nominal temperature: 298.15 K",
+            "Mechanism tab nominal temperature: 310 K",
+            "Mechanism tab nominal temperature: 373.15 K",
+        ],
     )
+
+
 def invalid_number_error(value: str, field: str) -> DSLError:
     """Error for non-numeric value where number expected."""
     return DSLError(
@@ -130,8 +135,7 @@ def missing_rate_parameters_error(reaction_type: str) -> DSLError:
             examples=[
                 "reaction: A -> B; k=1.5",
                 "reaction: A -> B; dG_act=75.5",
-                "reaction: A -> B; dG_act=75.5; T=310.0"
-            ]
+            ],
         )
     elif reaction_type == "Arrhenius":
         return DSLError(
@@ -139,7 +143,7 @@ def missing_rate_parameters_error(reaction_type: str) -> DSLError:
             suggestion="Provide pre-exponential factor and activation energy",
             examples=[
                 "reaction: A -> B; A=1.5e10; Ea=65.0",
-                "reaction: A -> B; A=1e13; Ea=50.0; energy=kJ/mol"
+                "reaction: A -> B; A=1e13; Ea=50.0",
             ]
         )
     else:
@@ -248,7 +252,7 @@ def invalid_keyvalue_pair_error(chunk: str) -> DSLError:
         examples=[
             "k=1.5",
             "dG_act=75.5",
-            "T=310.0",
+            "C0=1.0",
             "energy=kJ/mol"
         ]
     )

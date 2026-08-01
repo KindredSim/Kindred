@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+from kindred.core.kinetics import K_from_deltaG_eq
+from kindred.core.simulator.errors import DSLError
 
 AUTHORITY_ERROR = "equilibrium requires kf and exactly one of kr or Keq/dG_eq"
 GENERATED_RATE_MODEL_ERROR = "generated transition-state equilibrium requires complete generated_rate_model"
@@ -13,6 +15,99 @@ GENERATED_DIRECT_MODEL_ERROR = "generated direct thermodynamic equilibrium requi
 GENERATED_FAST_EQUILIBRIUM_RUNTIME_PARAMETER_PREFIX = "dG_eq_fast__"
 _AUTHORITY_SOURCE_METADATA_KEY = "authority_source"
 _GENERATED_SCALAR_MIRROR_METADATA_KEYS = frozenset({"kf", "kr", "Keq"})
+
+
+def _positive_finite(value: object, *, label: str) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DSLError(f"{label} must be positive and finite") from exc
+    if not number > 0.0 or not math.isfinite(number):
+        raise DSLError(f"{label} must be positive and finite")
+    return number
+
+
+def choose_fast_equilibrium_rate(
+    explicit_rates: Iterable[float] | None = None,
+    *,
+    fallback: float = 1e6,
+    clamp_min: float = 1e3,
+    clamp_max: float = 1e12,
+) -> float:
+    """Return the sole policy-owned generated fast-equilibrium forward rate."""
+
+    lower = _positive_finite(clamp_min, label="clamp_min")
+    upper = _positive_finite(clamp_max, label="clamp_max")
+    if upper < lower:
+        lower, upper = upper, lower
+    clean = [
+        float(rate)
+        for rate in tuple(explicit_rates or ())
+        if isinstance(rate, (int, float))
+        and not isinstance(rate, bool)
+        and math.isfinite(float(rate))
+        and float(rate) > 0.0
+    ]
+    base = (
+        10.0 * max(clean)
+        if clean
+        else _positive_finite(fallback, label="fallback")
+    )
+    return min(upper, max(lower, base))
+
+
+@dataclass(frozen=True, slots=True)
+class FastEquilibriumRates:
+    kf: float
+    kr: float
+    Keq: float
+    k_fast: float
+    source: str
+
+
+def derive_fast_equilibrium_rates(
+    *,
+    Keq: float | None = None,
+    dG_eq_J_per_mol: float | None = None,
+    temperature_K: float = 298.15,
+    explicit_rates: Iterable[float] | None = None,
+) -> FastEquilibriumRates:
+    """Derive one generated fast-equilibrium rate pair."""
+
+    if Keq is None and dG_eq_J_per_mol is None:
+        raise DSLError(
+            "derive_fast_equilibrium_rates requires Keq or "
+            "dG_eq_J_per_mol"
+        )
+    if Keq is None:
+        try:
+            delta_g = float(dG_eq_J_per_mol)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise DSLError("dG_eq_J_per_mol must be finite") from exc
+        if not math.isfinite(delta_g):
+            raise DSLError("dG_eq_J_per_mol must be finite")
+        equilibrium_constant = K_from_deltaG_eq(
+            delta_g,
+            _positive_finite(temperature_K, label="temperature_K"),
+        )
+        source = "derived(ΔG°)"
+    else:
+        equilibrium_constant = _positive_finite(Keq, label="Keq")
+        source = "derived(Keq)"
+    forward = choose_fast_equilibrium_rate(explicit_rates)
+    reverse = float(
+        effective_reverse_rate_from_keq(
+            forward,
+            equilibrium_constant,
+        )
+    )
+    return FastEquilibriumRates(
+        kf=forward,
+        kr=reverse,
+        Keq=equilibrium_constant,
+        k_fast=forward,
+        source=source,
+    )
 
 
 class EquilibriumRateAuthorityKind:

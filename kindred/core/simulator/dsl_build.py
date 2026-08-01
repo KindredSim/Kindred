@@ -7,6 +7,7 @@ utilities does not eagerly import Mechanism/kinetics/state-network construction 
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import numbers
@@ -14,14 +15,17 @@ from typing import Dict, List, Optional
 
 from ..equilibrium_rate_authority import (
     EquilibriumRateInputContext,
+    effective_reverse_rate_from_keq,
     normalize_equilibrium_rate_authority,
 )
 from ..mechanism import Mechanism
 from ..mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
 from ..kinetics import K_from_deltaG_eq
 from .dsl_format import format_stoichiometry_side as _fmt_side
+from .dsl_build_input import DslMechanismBuildInput
 from .errors import DSLError
 from .parameter_namespace import _namespace_policy_from_step
+from .state_model import StateNetwork
 
 logger = logging.getLogger(__name__)
 
@@ -29,37 +33,46 @@ __all__ = ["build_mechanism_from_ir"]
 
 
 def build_mechanism_from_ir(
-    ir: object,
-    *,
-    initials: Optional[Dict[str, float]] = None,
+    build_input: DslMechanismBuildInput,
 ) -> Mechanism:
-    """
-    Build a `Mechanism` from a parsed DSL IR.
+    """Build a mechanism from the sole exact immutable builder input."""
 
-    Parameters
-    ----------
-    ir
-        DSLIR-like object produced by `kindred.core.simulator.dsl._parse_dsl_ir`.
-    initials
-        Optional initial concentrations mapping. Treated as input-only.
+    if type(build_input) is not DslMechanismBuildInput:
+        raise TypeError(
+            "build_mechanism_from_ir requires exact DslMechanismBuildInput."
+        )
 
-    Returns
-    -------
-    Mechanism
-    """
-    initials_in = dict(initials or {})
-    initials_merged = dict(initials_in)
-    initials_merged.update(dict(getattr(ir, "initials_from_dsl", {}) or {}))
+    initials_merged = dict(build_input.initials)
+    energy_unit = build_input.energy_unit
+    T = build_input.temperature_K
+    C0 = build_input.standard_conc_M
+    kappa_global = build_input.kappa_global
+    steps = build_input.steps
+    algebra_lines = build_input.algebra_lines
+    intervention_schedule = build_input.intervention_schedule
+    temperature_schedule = None
+    if build_input.temperature_schedule_json is not None:
+        from kindred.core.temperature import TemperatureSchedule
 
-    energy_unit = str(getattr(ir, "energy_unit"))
-    T = float(getattr(ir, "temperature_K"))
-    C0 = float(getattr(ir, "standard_conc_M"))
-    kappa_global = float(getattr(ir, "kappa_global"))
-    net = getattr(ir, "state_network")
-    steps = list(getattr(ir, "steps", []) or [])
-    algebra_lines = list(getattr(ir, "algebra_lines", []) or [])
-    temperature_schedule = getattr(ir, "temperature_schedule", None)
-    intervention_schedule = getattr(ir, "intervention_schedule", None)
+        temperature_schedule = TemperatureSchedule.from_dict(
+            json.loads(build_input.temperature_schedule_json)
+        )
+
+    net = StateNetwork()
+    for state in build_input.states:
+        net.add_state(
+            state.name,
+            kind=state.kind,
+            energy=(state.energy_jmol, "J/mol"),
+            degeneracy=state.degeneracy,
+            standard_state=state.standard_state,
+            members=state.members,
+            std_conc_product_M=state.std_conc_product_M,
+        )
+    for edge in build_input.edges:
+        net.add_edge(edge.state_a, edge.state_b)
+    if build_input.states or build_input.edges:
+        net.validate()
 
     mechanism = Mechanism()
     MechanismMetadataView(
@@ -70,7 +83,7 @@ def build_mechanism_from_ir(
         step_index_policy="dsl_only",
     ).apply_to_metadata(mechanism.metadata)
 
-    if getattr(net, "states")() or getattr(net, "edges")():
+    if net.states() or net.edges():
         mechanism.metadata["state_network"] = net.to_serializable()
 
     # Canonical step-index mapping (global DSL step order).
@@ -81,8 +94,8 @@ def build_mechanism_from_ir(
     # Collect all species
     all_species = set()
     for step in steps:
-        all_species.update(dict(getattr(step, "reactants", {}) or {}).keys())
-        all_species.update(dict(getattr(step, "products", {}) or {}).keys())
+        all_species.update(dict(step.reactants).keys())
+        all_species.update(dict(step.products).keys())
 
     # Add species to mechanism
     for sp_name in sorted(all_species):
@@ -93,99 +106,128 @@ def build_mechanism_from_ir(
     # build mechanism objects but do not consume authored public step indices.
     authored_step_no = 0
     for _source_step_no, step in enumerate(steps, start=1):
-        reactants = dict(getattr(step, "reactants", {}) or {})
-        products = dict(getattr(step, "products", {}) or {})
-        generated_computational_mode = bool(getattr(step, "generated_computational_mode", False))
+        reactants = dict(step.reactants)
+        products = dict(step.products)
+        generated_computational_mode = step.generated_computational_mode
 
-        model = str(getattr(step, "model", "Eyring") or "Eyring")
+        model = step.model
 
         rxn_overrides: Dict[str, object] = {}
-        if model == "Arrhenius":
+        if model == "Constant":
+            rxn_overrides["model"] = "Constant"
+        elif model == "Arrhenius":
             rxn_overrides["model"] = "Arrhenius"
-            A = getattr(step, "arrhenius_A", None)
-            EaJ = getattr(step, "arrhenius_Ea_J_per_mol", None)
+            A = step.arrhenius_A
+            EaJ = step.arrhenius_Ea_J_per_mol
             if A is not None:
                 rxn_overrides["A"] = float(A)
             if EaJ is not None:
                 rxn_overrides["Ea_J_per_mol"] = float(EaJ)
         elif model == "Eyring":
             rxn_overrides["model"] = "Eyring"
-            dGJ = getattr(step, "eyring_dG_act_J_per_mol", None)
+            dGJ = step.eyring_dG_act_J_per_mol
             if dGJ is not None:
                 rxn_overrides["dG_act_J_per_mol"] = float(dGJ)
-            kappa = getattr(step, "kappa", None)
+            kappa = step.kappa
             if kappa is not None:
                 rxn_overrides["kappa"] = float(kappa)
-            sc = getattr(step, "standard_conc_M", None)
+            sc = step.standard_conc_M
             if sc is not None:
                 rxn_overrides["standard_conc_M"] = float(sc)
 
-        is_equilibrium = bool(getattr(step, "is_equilibrium", False))
+        is_equilibrium = step.is_equilibrium
         namespace_policy = _namespace_policy_from_step(step)
-        kr_attr = getattr(step, "kr", None)
+        kr_attr = step.kr
         is_equilibrium_step = namespace_policy.step_kind == "equilibrium"
 
         if is_equilibrium_step:
-            kf_val = float(getattr(step, "kf"))
+            kf_val = step.kf
             kr_val = float(kr_attr) if kr_attr is not None else None
-            Keq_input = getattr(step, "Keq_input", None)
-            user_kf_explicit = bool(getattr(step, "user_kf_explicit", False))
-            user_kr_explicit = bool(getattr(step, "user_kr_explicit", False))
+            Keq_input = step.Keq_input
+            user_kf_explicit = step.user_kf_explicit
+            user_kr_explicit = step.user_kr_explicit
 
             if Keq_input is not None and kr_val is not None and user_kf_explicit and not user_kr_explicit:
                 try:
                     Keq_in = float(Keq_input)
-                except Exception:
-                    Keq_in = float("nan")
-                if math.isfinite(Keq_in) and abs(Keq_in) > 1e-30:
-                    kr_val = kf_val / Keq_in
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise DSLError(
+                        "Equilibrium Keq must be a finite positive number."
+                    ) from exc
+                if not math.isfinite(Keq_in) or Keq_in <= 1e-30:
+                    raise DSLError(
+                        "Equilibrium Keq must be a finite positive number."
+                    )
+                kr_val = float(
+                    effective_reverse_rate_from_keq(kf_val, Keq_in)
+                )
 
-            dG_eq_J = getattr(step, "dG_eq_J_per_mol", None)
+            dG_eq_J = step.dG_eq_J_per_mol
             if Keq_input is not None:
                 Keq_model_value = Keq_input
             elif dG_eq_J is not None:
-                Keq_model_value = float(K_from_deltaG_eq(float(dG_eq_J), float(getattr(ir, "temperature_K"))))
+                Keq_model_value = float(
+                    K_from_deltaG_eq(float(dG_eq_J), T)
+                )
             else:
                 Keq_model_value = None
 
             forward_model: Optional[Dict[str, object]] = None
-            if model == "Arrhenius" and getattr(step, "arrhenius_A", None) is not None and getattr(
-                step, "arrhenius_Ea_J_per_mol", None
-            ) is not None:
+            if (
+                model == "Arrhenius"
+                and step.arrhenius_A is not None
+                and step.arrhenius_Ea_J_per_mol is not None
+            ):
                 forward_model = {
                     "type": "Arrhenius",
-                    "A": float(getattr(step, "arrhenius_A")),
-                    "Ea_J_per_mol": float(getattr(step, "arrhenius_Ea_J_per_mol")),
+                    "A": step.arrhenius_A,
+                    "Ea_J_per_mol": step.arrhenius_Ea_J_per_mol,
                 }
-            elif model == "Eyring" and getattr(step, "eyring_dG_act_J_per_mol", None) is not None:
+            elif (
+                model == "Eyring"
+                and step.eyring_dG_act_J_per_mol is not None
+            ):
                 forward_model = {
                     "type": "Eyring",
-                    "dG_act_J_per_mol": float(getattr(step, "eyring_dG_act_J_per_mol")),
-                    "kappa": float(getattr(step, "kappa", kappa_global)),
-                    "standard_conc_M": float(getattr(step, "standard_conc_M", C0) or C0),
+                    "dG_act_J_per_mol": step.eyring_dG_act_J_per_mol,
+                    "kappa": (
+                        step.kappa
+                        if step.kappa is not None
+                        else kappa_global
+                    ),
+                    "standard_conc_M": (
+                        step.standard_conc_M
+                        if step.standard_conc_M is not None
+                        else C0
+                    ),
+                }
+            elif model == "Constant":
+                forward_model = {
+                    "type": "Constant",
+                    "k": float(kf_val),
                 }
 
             eq_metadata = EquilibriumMetadataView(
                 fast_equilibrium=bool(is_equilibrium),
                 user_provided_kf=bool(user_kf_explicit),
                 user_provided_kr=bool(user_kr_explicit),
-                dG_eq_J_per_mol=float(getattr(step, "dG_eq_J_per_mol"))
-                if getattr(step, "dG_eq_J_per_mol", None) is not None
+                dG_eq_J_per_mol=step.dG_eq_J_per_mol
+                if step.dG_eq_J_per_mol is not None
                 else None,
                 Keq_input=Keq_input,
-                explicit_rates=tuple(float(x) for x in (getattr(step, "explicit_rates", []) or [])),
+                explicit_rates=step.explicit_rates,
                 forward_model=forward_model,
-                standard_conc_M=float(getattr(step, "standard_conc_M"))
-                if getattr(step, "standard_conc_M", None) is not None
+                standard_conc_M=step.standard_conc_M
+                if step.standard_conc_M is not None
                 else None,
             ).to_metadata()
-            if getattr(step, "cm_id", None) is not None:
-                eq_metadata["cm_id"] = str(getattr(step, "cm_id"))
+            if step.cm_id is not None:
+                eq_metadata["cm_id"] = step.cm_id
                 if generated_computational_mode:
                     eq_metadata["authority_source"] = EquilibriumRateInputContext.GENERATED_COMPUTATIONAL_MODE.value
-            if getattr(step, "cm_std_ratio", None) is not None:
-                eq_metadata["std_ratio"] = float(getattr(step, "cm_std_ratio"))
-            source_energy_unit = str(getattr(step, "source_energy_unit", "") or "").strip()
+            if step.cm_std_ratio is not None:
+                eq_metadata["std_ratio"] = step.cm_std_ratio
+            source_energy_unit = str(step.source_energy_unit or "").strip()
             if source_energy_unit:
                 eq_metadata[EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT] = source_energy_unit
             authority_context = (
@@ -217,7 +259,7 @@ def build_mechanism_from_ir(
             mechanism.add_reaction(
                 reactants=reactants,
                 products=products,
-                rate=float(getattr(step, "kf")),
+                rate=step.kf,
                 overrides=rxn_overrides or None,
             )
 
@@ -236,8 +278,8 @@ def build_mechanism_from_ir(
         if is_equilibrium_step:
             entry["equilibrium_index"] = int(eq_index)
             entry.update(authority.step_map_fields())
-            entry["user_provided_kf"] = bool(getattr(step, "user_kf_explicit", False))
-            entry["user_provided_kr"] = bool(getattr(step, "user_kr_explicit", False))
+            entry["user_provided_kf"] = step.user_kf_explicit
+            entry["user_provided_kr"] = step.user_kr_explicit
             if str(eq_metadata.get("cm_id") or ""):
                 entry["cm_id"] = str(eq_metadata["cm_id"])
         else:
@@ -254,7 +296,7 @@ def build_mechanism_from_ir(
     )
 
     # Convert state network to additional reactions if present
-    if getattr(net, "states")() or getattr(net, "edges")():
+    if net.states() or net.edges():
         logger.debug("Converting state network to reactions...")
         from .state_network_converter import convert_state_network_to_mechanism
 
@@ -320,7 +362,7 @@ def build_mechanism_from_ir(
             try:
                 if not math.isfinite(float(val)):
                     _fail(f"{where} introduced a non-finite numeric value ({val!r}).")
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 _fail(f"{where} introduced a non-numeric parameter value ({type(val).__name__}).")
 
         for i, rxn in enumerate((getattr(mechanism, "reactions", []) or [])[rxn_start:], start=rxn_start + 1):

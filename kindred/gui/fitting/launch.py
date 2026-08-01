@@ -1,684 +1,1306 @@
-"""Launch-time orchestration for fitting sessions."""
+"""Immutable Fit capture plus strict Fit-local request construction."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
-import logging
 import math
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Iterable
 
 import numpy as np
-from PySide6 import QtWidgets
 
-from kindred.core.analysis.fit_dataset_payload import (
-    FitDatasetPayloadResult,
-    read_fit_dataset_payload,
+from kindred.core.algebra.observable_introspection import (
+    FitLocalObservable,
+    fit_observable_names,
 )
-from kindred.core.datasets.observation_payload import (
-    copy_observations_map,
-    dense_view_from_observations,
-    observations_from_payload,
+from kindred.core.analysis.dataset_sampling import compute_sampled_indices
+from kindred.core.dataset_mapping import (
+    validate_fit_inclusion,
+    validate_raw_dataset_record,
 )
-from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-from kindred.gui.controllers.dataset_errors import DatasetOwnerError
-from kindred.gui.fitting.batch_mapping import (
-    T0_SEED_TOL_S,
-    apply_batch_mapping_to_settings,
-    create_and_seed_batch_set,
-    default_batch_set_name_for_dataset,
-    pick_existing_batch_set,
-    prompt_dataset_batch_mapping_choice,
-    resolve_saved_batch_mapping,
-    select_batch_set,
-    unique_batch_set_name,
+from kindred.core.intervention_schedule import coerce_intervention_schedule
+from kindred.core.intervention_schedule_compiler import (
+    compile_intervention_schedule,
 )
-from kindred.gui.ports import AuthoritativeRewriteOutcome
-from kindred.gui.fitting.runtime_inputs import FittingEvaluatorRuntimeSettings, FittingRuntimeInputs
-from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity
-
-if TYPE_CHECKING:
-    from kindred.gui.controllers.dataset_fit_settings_store import DatasetFitSettings
-
-
-logger = logging.getLogger(__name__)
+from kindred.core.mechanism_metadata import MechanismMetadataView
+from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.project_document import (
+    FitDefaults,
+    MechanismTabDocument,
+    ProjectDocument,
+    SimulationExecutionSettings,
+    TabScientificSettings,
+    default_project_document,
+    validate_simulation_execution_settings,
+)
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.temperature import declared_temperature_step_boundaries
+from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
+from kindred.gui.fitting.contracts import FitParametricSettings, FitRunIdentity
+from kindred.gui.widgets.batch_initial_conditions_table import (
+    projected_initial_values,
+    projected_species_names,
+)
 
 __all__ = [
-    "FittingLaunchDatasetSelection",
-    "FittingLaunchPurpose",
-    "FittingLaunchRejection",
-    "FittingLaunchResult",
-    "FittingLaunchSnapshot",
-    "GlobalFitLaunchSettings",
-    "GlobalFitLaunchContext",
-    "launch_global_fit_session",
-    "validate_de_bounds",
+    "FitDatasetLocalSettings",
+    "FitExecutionRequest",
+    "FitInitialVariable",
+    "FitMappedDatasetSnapshot",
+    "FitObservationSnapshot",
+    "FitOriginSnapshot",
+    "FitParameterVariable",
+    "FitSelectedObservation",
+    "FitSetupSnapshot",
+    "build_fit_execution_request",
+    "capture_fit_origin",
+    "pre_boundary_fit_row_candidates",
+    "revalidate_fit_request_inclusions",
+    "resolve_pre_boundary_fit_rows",
+    "selected_observations",
 ]
 
 
-def validate_de_bounds(
-    config: Dict[str, Any],
-    *,
-    dataset_variable_params: Optional[Mapping[str, Mapping[str, Mapping[str, Any]]]] = None,
-) -> Tuple[bool, List[str]]:
-    errors = []
+def _required(value: object, field: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise ValueError(f"{field} must be nonblank.")
+    return normalized
 
-    method = str(config.get("method", "")).lower()
-    parameters = config.get("parameters", {})
-    bounds = config.get("bounds", {})
 
-    if method == "lm":
-        bounded_params: List[str] = []
-        for param_name in parameters.keys():
-            bound_tuple = bounds.get(param_name)
-            if not isinstance(bound_tuple, tuple) or len(bound_tuple) != 2:
-                continue
-            try:
-                min_val = float(bound_tuple[0])
-                max_val = float(bound_tuple[1])
-            except (TypeError, ValueError):
-                continue
-            if np.isfinite(min_val) or np.isfinite(max_val):
-                bounded_params.append(str(param_name))
-        for dataset_id, spec_map in (dataset_variable_params or {}).items():
-            if not isinstance(spec_map, Mapping):
-                continue
-            for param_name, spec in spec_map.items():
-                if not isinstance(spec, Mapping):
-                    continue
-                try:
-                    min_val = float(spec.get("min"))
-                    max_val = float(spec.get("max"))
-                except (TypeError, ValueError):
-                    continue
-                if np.isfinite(min_val) or np.isfinite(max_val):
-                    bounded_params.append(f"{dataset_id}::{param_name}")
-        if bounded_params:
-            return False, [
-                "Levenberg-Marquardt fitting does not support finite bounds. "
-                "Use trf or dogbox, or remove bounds for: "
-                + ", ".join(sorted(set(bounded_params)))
-            ]
+def _finite(value: object, field: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field} must be finite.")
+    return parsed
 
-    if method not in {"differential_evolution", "de"}:
-        return True, []
 
-    for param_name in parameters.keys():
-        if param_name not in bounds:
-            errors.append(f"Parameter '{param_name}' has no bounds defined")
-            continue
+@dataclass(frozen=True, slots=True)
+class FitObservationSnapshot:
+    raw_observation_id: str
+    raw_column: str
+    model_species: str
+    t: tuple[float, ...]
+    y: tuple[float, ...]
+    source_rows: tuple[int, ...]
 
-        bound_tuple = bounds[param_name]
-        if not isinstance(bound_tuple, tuple) or len(bound_tuple) != 2:
-            errors.append(f"Parameter '{param_name}' has invalid bound format")
-            continue
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "raw_observation_id",
+            _required(self.raw_observation_id, "raw observation ID"),
+        )
+        object.__setattr__(self, "raw_column", _required(self.raw_column, "raw column"))
+        object.__setattr__(
+            self,
+            "model_species",
+            _required(self.model_species, "mapped model series"),
+        )
+        times = tuple(_finite(value, "observation time") for value in self.t)
+        values = tuple(_finite(value, "observation value") for value in self.y)
+        if len(times) != len(values) or not times:
+            raise ValueError("Fit observation requires equal nonempty t/y values.")
+        rows = tuple(int(value) for value in self.source_rows)
+        if (
+            len(rows) != len(times)
+            or any(row <= 0 for row in rows)
+            or len(set(rows)) != len(rows)
+        ):
+            raise ValueError(
+                "Fit observations require complete unique positive physical "
+                "source-row identity."
+            )
+        object.__setattr__(self, "t", times)
+        object.__setattr__(self, "y", values)
+        object.__setattr__(self, "source_rows", rows)
 
-        min_val, max_val = bound_tuple
 
-        if not np.isfinite(min_val):
-            errors.append(f"Parameter '{param_name}' has non-finite minimum bound: {min_val}")
+@dataclass(frozen=True, slots=True)
+class FitMappedDatasetSnapshot:
+    dataset_id: str
+    display_name: str
+    set_id: str
+    set_name: str
+    initial_values: tuple[tuple[str, float], ...]
+    observations: tuple[FitObservationSnapshot, ...]
+    included_at_launch: bool
+    execution: SimulationExecutionSettings
 
-        if not np.isfinite(max_val):
-            errors.append(f"Parameter '{param_name}' has non-finite maximum bound: {max_val}")
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "dataset_id", _required(self.dataset_id, "dataset ID"))
+        object.__setattr__(self, "display_name", _required(self.display_name, "dataset name"))
+        object.__setattr__(self, "set_id", _required(self.set_id, "set ID"))
+        object.__setattr__(self, "set_name", _required(self.set_name, "set name"))
+        names: set[str] = set()
+        values: list[tuple[str, float]] = []
+        for raw_name, raw_value in self.initial_values:
+            name = _required(raw_name, "initial species")
+            if name in names:
+                raise ValueError(f"Duplicate initial species {name!r}.")
+            names.add(name)
+            value = _finite(raw_value, f"initial value {name}")
+            if value < 0.0:
+                raise ValueError(
+                    f"Initial value {name!r} must be nonnegative."
+                )
+            values.append((name, value))
+        object.__setattr__(self, "initial_values", tuple(values))
+        observations = tuple(self.observations)
+        if any(
+            not isinstance(item, FitObservationSnapshot)
+            for item in observations
+        ):
+            raise TypeError(
+                "Mapped Fit observations must be FitObservationSnapshot values."
+            )
+        raw_columns = [item.raw_column for item in observations]
+        raw_ids = [item.raw_observation_id for item in observations]
+        if (
+            len(raw_columns) != len(set(raw_columns))
+            or len(raw_ids) != len(set(raw_ids))
+        ):
+            raise ValueError(
+                "Mapped Fit observation columns and dataset-local raw "
+                "observation IDs must be unique."
+            )
+        object.__setattr__(self, "observations", observations)
+        validate_simulation_execution_settings(self.execution)
 
-        if np.isfinite(min_val) and np.isfinite(max_val) and min_val >= max_val:
-            errors.append(
-                f"Parameter '{param_name}' has invalid bounds: "
-                f"min ({min_val:.6g}) >= max ({max_val:.6g})"
+
+@dataclass(frozen=True, slots=True)
+class FitParameterVariable:
+    name: str
+    display_name: str
+    initial: float
+    minimum: float
+    maximum: float
+    fit: bool = True
+    log10: bool = False
+    scope: str = "shared"
+    dataset_values: tuple[tuple[str, float], ...] = ()
+    family: str = ""
+    role: str = ""
+    unit: str = "1"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", _required(self.name, "parameter name"))
+        object.__setattr__(
+            self,
+            "display_name",
+            _required(self.display_name, "parameter display name"),
+        )
+        initial = _finite(self.initial, f"{self.name} initial")
+        minimum = float(self.minimum)
+        maximum = float(self.maximum)
+        if math.isnan(minimum) or math.isnan(maximum):
+            raise ValueError(f"{self.name} bounds cannot be NaN.")
+        if minimum >= maximum or not minimum <= initial <= maximum:
+            raise ValueError(f"{self.name} requires minimum <= initial <= maximum.")
+        if self.log10 and (minimum <= 0.0 or initial <= 0.0):
+            raise ValueError(f"{self.name} log10 fitting requires positive values.")
+        object.__setattr__(self, "initial", initial)
+        object.__setattr__(self, "minimum", minimum)
+        object.__setattr__(self, "maximum", maximum)
+        scope = str(self.scope or "").strip().lower()
+        if scope not in {"shared", "per_dataset"}:
+            raise ValueError("Scalar Fit scope must be Shared or Per-dataset.")
+        dataset_values = tuple(
+            (_required(dataset_id, "dataset ID"), _finite(value, self.name))
+            for dataset_id, value in self.dataset_values
+        )
+        if len(dataset_values) != len({item[0] for item in dataset_values}):
+            raise ValueError(f"{self.name} repeats a dataset-local value.")
+        if any(
+            not minimum <= value <= maximum
+            or (self.log10 and value <= 0.0)
+            for _dataset_id, value in dataset_values
+        ):
+            raise ValueError(
+                f"{self.name} dataset values must satisfy its bounds and "
+                "Log10 domain."
+            )
+        object.__setattr__(self, "scope", scope)
+        object.__setattr__(self, "dataset_values", dataset_values)
+        object.__setattr__(self, "family", str(self.family or "").strip())
+        object.__setattr__(self, "role", str(self.role or "").strip())
+        object.__setattr__(self, "unit", str(self.unit or "1").strip() or "1")
+
+
+@dataclass(frozen=True, slots=True)
+class FitInitialVariable:
+    set_id: str
+    species: str
+    initial: float
+    minimum: float
+    maximum: float
+    fit: bool = False
+    log10: bool = False
+    scope: str = "global"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "set_id", _required(self.set_id, "set ID"))
+        object.__setattr__(self, "species", _required(self.species, "species"))
+        initial = _finite(self.initial, f"{self.species} initial")
+        minimum = _finite(self.minimum, f"{self.species} minimum")
+        maximum = _finite(self.maximum, f"{self.species} maximum")
+        if minimum >= maximum or not minimum <= initial <= maximum:
+            raise ValueError(f"{self.species} requires minimum <= initial <= maximum.")
+        if self.log10 and (minimum <= 0.0 or initial <= 0.0):
+            raise ValueError(f"{self.species} log10 fitting requires positive values.")
+        object.__setattr__(self, "initial", initial)
+        object.__setattr__(self, "minimum", minimum)
+        object.__setattr__(self, "maximum", maximum)
+        scope = str(self.scope or "").strip().lower()
+        if scope not in {"global", "local"}:
+            raise ValueError("Initial Fit scope must be Global or Local.")
+        if minimum < 0.0:
+            raise ValueError("Initial concentration minimum must be nonnegative.")
+        object.__setattr__(self, "scope", scope)
+
+
+@dataclass(frozen=True, slots=True)
+class FitDatasetLocalSettings:
+    dataset_id: str
+    included: bool
+    sample_t_min: float
+    sample_t_max: float
+    sample_points: int | None
+    execution: SimulationExecutionSettings
+    weight: float = 1.0
+    target_species: tuple[str, ...] = ()
+    target_weights: tuple[tuple[str, float], ...] = ()
+    observation_targets: tuple[tuple[str, str, str], ...] = ()
+    pre_boundary_segment_keys: tuple[
+        tuple[str, int, str],
+        ...,
+    ] = ()
+    parametric: FitParametricSettings | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "dataset_id", _required(self.dataset_id, "dataset ID"))
+        low = _finite(self.sample_t_min, "sampling t min")
+        high = _finite(self.sample_t_max, "sampling t max")
+        if high < low:
+            raise ValueError("Sampling t max must be >= t min.")
+        points = None if self.sample_points in (None, 0) else int(self.sample_points)
+        if points is not None and points < 2:
+            raise ValueError("Sampling Points must be All or at least 2.")
+        weight = _finite(self.weight, "dataset weight")
+        if weight <= 0.0:
+            raise ValueError("Dataset weight must be positive.")
+        validate_simulation_execution_settings(self.execution)
+        targets = tuple(_required(item, "target series") for item in self.target_species)
+        if len(targets) != len(set(targets)):
+            raise ValueError("Fit target series must be unique.")
+        target_weights = tuple(
+            (_required(name, "target series"), _finite(value, "target weight"))
+            for name, value in self.target_weights
+        )
+        weight_names = [name for name, _value in target_weights]
+        if (
+            len(weight_names) != len(set(weight_names))
+            or set(weight_names) != set(targets)
+        ):
+            raise ValueError(
+                "Fit target weights must exactly match selected targets."
+            )
+        if any(value <= 0.0 for _name, value in target_weights):
+            raise ValueError("Target weights must be positive.")
+        mapping = tuple(
+            (
+                _required(raw_id, "raw observation ID"),
+                _required(raw, "raw observation"),
+                _required(model, "model target"),
+            )
+            for raw_id, raw, model in self.observation_targets
+        )
+        if (
+            len({raw_id for raw_id, _raw, _model in mapping}) != len(mapping)
+            or len({raw for _raw_id, raw, _model in mapping}) != len(mapping)
+        ):
+            raise ValueError(
+                "Observation target overrides must have unique dataset-local "
+                "raw IDs and raw columns."
+            )
+        mapped_targets = [model for _raw_id, _raw, model in mapping]
+        if (
+            len(mapped_targets) != len(set(mapped_targets))
+            or set(mapped_targets) != set(targets)
+        ):
+            raise ValueError(
+                "Observation target overrides must exactly match selected "
+                "Fit targets."
+            )
+        object.__setattr__(self, "sample_t_min", low)
+        object.__setattr__(self, "sample_t_max", high)
+        object.__setattr__(self, "sample_points", points)
+        object.__setattr__(self, "weight", weight)
+        object.__setattr__(self, "target_species", targets)
+        object.__setattr__(self, "target_weights", target_weights)
+        object.__setattr__(self, "observation_targets", mapping)
+        pre_boundary_keys = tuple(
+            (
+                _required(raw_id, "raw observation ID"),
+                int(source_row),
+                _required(segment_key, "pre-boundary segment key"),
+            )
+            for raw_id, source_row, segment_key
+            in self.pre_boundary_segment_keys
+        )
+        identities = [
+            (raw_id, source_row)
+            for raw_id, source_row, _segment_key in pre_boundary_keys
+        ]
+        target_raw_ids = {
+            raw_id for raw_id, _raw, _model in mapping
+        }
+        if (
+            len(identities) != len(set(identities))
+            or any(source_row <= 0 for _raw_id, source_row in identities)
+            or any(raw_id not in target_raw_ids for raw_id, _row in identities)
+        ):
+            raise ValueError(
+                "Pre-boundary Fit identities must uniquely target positive "
+                "source rows of selected raw observations."
+            )
+        object.__setattr__(
+            self,
+            "pre_boundary_segment_keys",
+            pre_boundary_keys,
+        )
+        if self.parametric is not None and self.parametric.dataset_id != self.dataset_id:
+            raise ValueError("Parametric settings changed stable dataset identity.")
+        if self.parametric is not None and pre_boundary_keys:
+            raise ValueError(
+                "Pre-boundary Fit rows are supported only for time-X "
+                "observations."
+            )
+        if self.parametric is not None and self.parametric.x_name in targets:
+            raise ValueError(
+                "The selected parametric X series cannot also be a Y target."
             )
 
-    for dataset_id, spec_map in (dataset_variable_params or {}).items():
-        if not isinstance(spec_map, Mapping):
+
+@dataclass(frozen=True, slots=True)
+class FitOriginSnapshot:
+    tab_id: str
+    tab_name: str
+    mechanism_source: MechanismAuthoringSource
+    prepared_dsl: PreparedDslRequestSet
+    scientific_settings: TabScientificSettings
+    fit_defaults: FitDefaults
+    mapped_datasets: tuple[FitMappedDatasetSnapshot, ...]
+    parameter_defaults: tuple[FitParameterVariable, ...]
+    capture_id: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tab_id", _required(self.tab_id, "tab ID"))
+        object.__setattr__(self, "tab_name", _required(self.tab_name, "tab name"))
+        if not isinstance(self.mechanism_source, MechanismAuthoringSource):
+            raise TypeError("mechanism_source must be MechanismAuthoringSource.")
+        if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
+            raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+        if (
+            self.prepared_dsl.analysis.normalized_text
+            != self.mechanism_source.full_dsl.strip()
+        ):
+            raise ValueError(
+                "Fit origin prepared DSL must be the retained analysis for "
+                "the captured source."
+            )
+        if not isinstance(self.scientific_settings, TabScientificSettings):
+            raise TypeError("scientific_settings must be TabScientificSettings.")
+        if not isinstance(self.fit_defaults, FitDefaults):
+            raise TypeError("fit_defaults must be FitDefaults.")
+        mapped_datasets = tuple(self.mapped_datasets)
+        parameter_defaults = tuple(self.parameter_defaults)
+        if any(
+            not isinstance(item, FitMappedDatasetSnapshot)
+            for item in mapped_datasets
+        ):
+            raise TypeError(
+                "Fit origin datasets must be FitMappedDatasetSnapshot values."
+            )
+        if any(
+            not isinstance(item, FitParameterVariable)
+            for item in parameter_defaults
+        ):
+            raise TypeError(
+                "Fit origin parameters must be FitParameterVariable values."
+            )
+        dataset_ids = [item.dataset_id for item in mapped_datasets]
+        parameter_names = [item.name for item in parameter_defaults]
+        if len(dataset_ids) != len(set(dataset_ids)):
+            raise ValueError("Fit origin dataset IDs must be unique.")
+        if len(parameter_names) != len(set(parameter_names)):
+            raise ValueError("Fit origin parameter names must be unique.")
+        object.__setattr__(self, "mapped_datasets", mapped_datasets)
+        object.__setattr__(self, "parameter_defaults", parameter_defaults)
+        capture_id = str(self.capture_id or "").strip()
+        if not capture_id:
+            payload = {
+                "tab_id": self.tab_id,
+                "mechanism_text": self.mechanism_source.full_dsl,
+                "prepared_analysis_identity": self.prepared_dsl.analysis.identity,
+                "scientific_settings": {
+                    "temperature": self.scientific_settings.temperature,
+                    "rtol": self.scientific_settings.rtol,
+                    "atol": self.scientific_settings.atol,
+                    "sparse_jacobian_policy": (
+                        self.scientific_settings.sparse_jacobian_policy
+                    ),
+                    "wegscheider_policy": (
+                        self.scientific_settings.wegscheider_policy
+                    ),
+                },
+                "fit_defaults": {
+                    "method": self.fit_defaults.method,
+                    "max_nfev": self.fit_defaults.max_nfev,
+                    "ftol": self.fit_defaults.ftol,
+                    "xtol": self.fit_defaults.xtol,
+                    "use_seed": self.fit_defaults.use_seed,
+                    "seed": self.fit_defaults.seed,
+                },
+                "datasets": [
+                    {
+                        "dataset_id": item.dataset_id,
+                        "set_id": item.set_id,
+                        "initial_values": dict(item.initial_values),
+                        "included_at_launch": item.included_at_launch,
+                        "execution": {
+                            "solver": item.execution.solver,
+                            "t_start": item.execution.t_start,
+                            "t_end": item.execution.t_end,
+                            "integration_points": (
+                                item.execution.integration_points
+                            ),
+                        },
+                        "observations": [
+                            {
+                                "raw_observation_id": obs.raw_observation_id,
+                                "raw_column": obs.raw_column,
+                                "model_species": obs.model_species,
+                                "t": obs.t,
+                                "y": obs.y,
+                                "source_rows": obs.source_rows,
+                            }
+                            for obs in item.observations
+                        ],
+                    }
+                    for item in self.mapped_datasets
+                ],
+                "parameters": [
+                    {
+                        "name": item.name,
+                        "display_name": item.display_name,
+                        "initial": item.initial,
+                        "family": item.family,
+                        "role": item.role,
+                        "unit": item.unit,
+                    }
+                    for item in self.parameter_defaults
+                ],
+            }
+            capture_id = FitRunIdentity.build(payload).short_hash
+        object.__setattr__(self, "capture_id", capture_id)
+
+
+@dataclass(frozen=True, slots=True)
+class FitExecutionRequest:
+    origin: FitOriginSnapshot
+    mechanism_source: MechanismAuthoringSource
+    prepared_dsl: PreparedDslRequestSet
+    local_observables: tuple[FitLocalObservable, ...]
+    datasets: tuple[FitDatasetLocalSettings, ...]
+    parameters: tuple[FitParameterVariable, ...]
+    initials: tuple[FitInitialVariable, ...]
+    defaults: FitDefaults
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, FitOriginSnapshot):
+            raise TypeError("origin must be FitOriginSnapshot.")
+        if not isinstance(self.mechanism_source, MechanismAuthoringSource):
+            raise TypeError("mechanism_source must be MechanismAuthoringSource.")
+        if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
+            raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+        if (
+            self.prepared_dsl.analysis.normalized_text
+            != self.mechanism_source.full_dsl.strip()
+        ):
+            raise ValueError(
+                "Fit request prepared DSL must exactly match its effective source."
+            )
+        if not isinstance(self.defaults, FitDefaults):
+            raise TypeError("defaults must be FitDefaults.")
+        default_project_document(fit_defaults=self.defaults)
+        local_observables = tuple(self.local_observables)
+        datasets = tuple(self.datasets)
+        parameters = tuple(self.parameters)
+        initials = tuple(self.initials)
+        if any(
+            not isinstance(item, FitLocalObservable)
+            for item in local_observables
+        ):
+            raise TypeError(
+                "Fit request observables must be FitLocalObservable values."
+            )
+        if any(
+            not isinstance(item, FitDatasetLocalSettings)
+            for item in datasets
+        ):
+            raise TypeError(
+                "Fit request datasets must be FitDatasetLocalSettings values."
+            )
+        if any(
+            not isinstance(item, FitParameterVariable)
+            for item in parameters
+        ):
+            raise TypeError(
+                "Fit request parameters must be FitParameterVariable values."
+            )
+        if any(
+            not isinstance(item, FitInitialVariable)
+            for item in initials
+        ):
+            raise TypeError(
+                "Fit request initials must be FitInitialVariable values."
+            )
+        object.__setattr__(self, "local_observables", local_observables)
+        object.__setattr__(self, "datasets", datasets)
+        object.__setattr__(self, "parameters", parameters)
+        object.__setattr__(self, "initials", initials)
+
+
+@dataclass(frozen=True, slots=True)
+class FitSetupSnapshot:
+    """One complete typed Fit setup at launch or terminal completion."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    mechanism_source: MechanismAuthoringSource
+    prepared_dsl: PreparedDslRequestSet
+    datasets: tuple[FitDatasetLocalSettings, ...]
+    parameters: tuple[FitParameterVariable, ...]
+    initials: tuple[FitInitialVariable, ...]
+    defaults: FitDefaults
+    local_observables: tuple[FitLocalObservable, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "origin_tab_id",
+            _required(self.origin_tab_id, "snapshot tab ID"),
+        )
+        object.__setattr__(
+            self,
+            "origin_capture_id",
+            _required(self.origin_capture_id, "snapshot capture ID"),
+        )
+        if not isinstance(self.mechanism_source, MechanismAuthoringSource):
+            raise TypeError(
+                "snapshot mechanism_source must be MechanismAuthoringSource."
+            )
+        if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
+            raise TypeError(
+                "snapshot prepared_dsl must be a PreparedDslRequestSet."
+            )
+        if (
+            self.prepared_dsl.analysis.normalized_text
+            != self.mechanism_source.full_dsl.strip()
+        ):
+            raise ValueError(
+                "Fit snapshot prepared DSL must exactly match its source."
+            )
+        if not isinstance(self.defaults, FitDefaults):
+            raise TypeError("snapshot defaults must be FitDefaults.")
+        datasets = tuple(self.datasets)
+        parameters = tuple(self.parameters)
+        initials = tuple(self.initials)
+        local_observables = tuple(self.local_observables)
+        if any(
+            not isinstance(item, FitDatasetLocalSettings)
+            for item in datasets
+        ):
+            raise TypeError(
+                "Fit snapshot datasets must be FitDatasetLocalSettings values."
+            )
+        if any(
+            not isinstance(item, FitParameterVariable)
+            for item in parameters
+        ):
+            raise TypeError(
+                "Fit snapshot parameters must be FitParameterVariable values."
+            )
+        if any(
+            not isinstance(item, FitInitialVariable)
+            for item in initials
+        ):
+            raise TypeError(
+                "Fit snapshot initials must be FitInitialVariable values."
+            )
+        if any(
+            not isinstance(item, FitLocalObservable)
+            for item in local_observables
+        ):
+            raise TypeError(
+                "Fit snapshot observables must be FitLocalObservable values."
+            )
+        object.__setattr__(self, "datasets", datasets)
+        object.__setattr__(self, "parameters", parameters)
+        object.__setattr__(self, "initials", initials)
+        object.__setattr__(self, "local_observables", local_observables)
+
+    @classmethod
+    def from_request(
+        cls,
+        request: FitExecutionRequest,
+    ) -> "FitSetupSnapshot":
+        if not isinstance(request, FitExecutionRequest):
+            raise TypeError("request must be FitExecutionRequest.")
+        return cls(
+            origin_tab_id=request.origin.tab_id,
+            origin_capture_id=request.origin.capture_id,
+            mechanism_source=request.mechanism_source,
+            prepared_dsl=request.prepared_dsl,
+            datasets=request.datasets,
+            parameters=request.parameters,
+            initials=request.initials,
+            defaults=request.defaults,
+            local_observables=request.local_observables,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FitSelectedObservation:
+    raw_observation_id: str
+    raw_column: str
+    model_species: str
+    t: tuple[float, ...]
+    y: tuple[float, ...]
+    source_rows: tuple[int, ...]
+    pre_boundary_segment_keys_by_source_row: tuple[
+        tuple[int, str],
+        ...,
+    ] = ()
+
+
+def _parameter_bounds(value: float) -> tuple[float, float]:
+    if value > 0.0:
+        low = max(value * 0.01, 1e-12)
+        high = min(value * 100.0, 1e300)
+        if high > low:
+            return low, high
+    span = max(1.0, abs(value) * 10.0)
+    return value - span, value + span
+
+
+def _initial_bounds(value: float) -> tuple[float, float]:
+    if value > 0.0:
+        return 0.0, max(value * 10.0, value + 1.0)
+    return 0.0, 1.0
+
+
+def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, ...]:
+    if not tab.mechanism_source.full_dsl.strip():
+        return ()
+    variables: list[FitParameterVariable] = []
+    if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
+        raise ValueError("Fit requires an accepted prepared mechanism.")
+    coordinates = enumerate_parameter_coordinates(
+        tab.prepared_dsl,
+        wegscheider_cyclicity_enabled=bool(
+            tab.scientific_settings.wegscheider_policy
+        ),
+    )
+    for coordinate in coordinates:
+        name = _required(coordinate.name, "parameter name")
+        value = _finite(coordinate.value, f"parameter {name}")
+        low = float(coordinate.minimum)
+        high = float(coordinate.maximum)
+        if math.isnan(low) or math.isnan(high) or low >= high:
+            low, high = _parameter_bounds(value)
+        variables.append(
+            FitParameterVariable(
+                name=name,
+                display_name=str(coordinate.display_name or name),
+                initial=value,
+                minimum=low,
+                maximum=high,
+                fit=True,
+                log10=bool(coordinate.log10_allowed and value > 0.0 and low > 0.0),
+                family=str(coordinate.family),
+                role=str(coordinate.role),
+                unit=str(coordinate.unit),
+            )
+        )
+    return tuple(variables)
+
+
+def capture_fit_origin(document: ProjectDocument, tab_id: str) -> FitOriginSnapshot:
+    """Copy mapped dataset science from one exact tab."""
+    if not isinstance(document, ProjectDocument):
+        raise TypeError("document must be ProjectDocument.")
+    tab = document.tab(tab_id)
+    if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
+        raise ValueError("Fit requires an accepted visible mechanism.")
+    mechanism_species = projected_species_names(tab)
+    mapped: list[FitMappedDatasetSnapshot] = []
+    for dataset_id, link in tab.dataset_links:
+        if link.set_id is None:
             continue
-        for param_name, spec in spec_map.items():
-            if not isinstance(spec, Mapping):
-                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has invalid bound format")
-                continue
-            try:
-                min_val = float(spec.get("min"))
-                max_val = float(spec.get("max"))
-            except (TypeError, ValueError):
-                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has non-numeric bounds")
-                continue
-            if not np.isfinite(min_val):
-                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has non-finite minimum bound: {min_val}")
-            if not np.isfinite(max_val):
-                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has non-finite maximum bound: {max_val}")
-            if np.isfinite(min_val) and np.isfinite(max_val) and min_val >= max_val:
-                errors.append(
-                    f"Dataset '{dataset_id}' parameter '{param_name}' has invalid bounds: "
-                    f"min ({min_val:.6g}) >= max ({max_val:.6g})"
-                )
-
-    is_valid = len(errors) == 0
-    return is_valid, errors
-
-
-class FittingLaunchPurpose(Enum):
-    PASSIVE_READINESS = "passive_readiness"
-    EXPLICIT_RUN = "explicit_run"
-
-
-@dataclass(frozen=True)
-class FittingLaunchRejection:
-    title: str
-    message: str
-    passive_status: str = "Fitting runtime not ready"
-    detailed_message: str = ""
-
-
-@dataclass(frozen=True)
-class FittingLaunchResult:
-    identity: Optional[FittingRuntimeIdentity]
-    rejection: Optional[FittingLaunchRejection] = None
-
-
-@dataclass(frozen=True)
-class FittingLaunchDatasetSelection:
-    rows: tuple[dict[str, Any], ...]
-    ids: tuple[str, ...]
-
-    def as_mapping(self) -> dict[str, Any]:
-        return {
-            "rows": [dict(row) for row in self.rows],
-            "ids": list(self.ids),
+        dataset = validate_raw_dataset_record(document.dataset(dataset_id))
+        initial_set = tab.initial_condition_set(link.set_id)
+        validated = (
+            validate_fit_inclusion(
+                document=document,
+                tab=tab,
+                dataset_id=dataset_id,
+                mechanism_species=mechanism_species,
+            )
+            if link.include_in_fit
+            else None
+        )
+        by_column = {
+            observation.column_name: observation
+            for observation in dataset.observations
         }
-
-
-@dataclass(frozen=True)
-class FittingLaunchSnapshot:
-    config: dict[str, Any]
-    global_dataset_params: dict[str, Any]
-    global_dataset_variable_params: dict[str, Any]
-    dataset_selection: FittingLaunchDatasetSelection
-    integration: tuple[str, float, float]
-
-
-@dataclass(frozen=True)
-class GlobalFitLaunchSettings:
-    runtime_inputs: FittingRuntimeInputs
-
-
-@dataclass(frozen=True)
-class GlobalFitLaunchContext:
-    parent: QtWidgets.QWidget
-    dataset_registry: Any
-    dataset_fit_settings_store: Any
-    dataset_view_publisher: Any
-    mechanism_parameter_scan_owner: Any
-    mechanism_text_getter: Callable[[], str]
-    reactions_text_getter: Callable[[], str]
-    reactions_text_rewriter: Callable[..., AuthoritativeRewriteOutcome]
-    extract_mechanism_initials: Callable[[str], Dict[str, float]]
-    record_best_effort_failure: Callable[..., None]
-    set_status: Callable[[str], None]
-    sync_batch_species_columns: Callable[[List[str]], None]
-    batch_initials_for_row: Callable[[int], Dict[str, float]]
-    fitting_settings_getter: Callable[[], GlobalFitLaunchSettings]
-    num_points_getter: Callable[[], int]
-    register_fit_window: Callable[..., object]
-    apply_fit_results_to_project: Callable[[str, Dict[str, float], Dict[str, Dict[str, float]]], None]
-    load_fitting_defaults: Callable[[], Dict[str, object]]
-    batch_store: Any = None
-    batch_model: Any = None
-    batch_table: Any = None
-    window_factory: Optional[Callable[..., QtWidgets.QWidget]] = None
-
-
-def _coerce_global_fit_launch_settings(raw_settings: object) -> GlobalFitLaunchSettings:
-    if not isinstance(raw_settings, GlobalFitLaunchSettings):
-        raise RuntimeError("Global Fit launch settings provider must return GlobalFitLaunchSettings.")
-    return GlobalFitLaunchSettings(
-        runtime_inputs=_require_global_fit_runtime_inputs(raw_settings.runtime_inputs),
+        observations: list[FitObservationSnapshot] = []
+        mapping = (
+            tuple(
+                (target.raw_column, target.model_target)
+                for target in validated.targets
+            )
+            if validated is not None
+            else link.observation_mapping
+        )
+        for raw_column, model_species in mapping:
+            observation = by_column.get(raw_column)
+            if observation is None:
+                raise ValueError(
+                    f"Dataset {dataset.display_name!r} mapping references "
+                    f"missing column {raw_column!r}."
+                )
+            observations.append(
+                FitObservationSnapshot(
+                    raw_observation_id=observation.raw_observation_id,
+                    raw_column=raw_column,
+                    model_species=model_species,
+                    t=observation.t,
+                    y=observation.y,
+                    source_rows=observation.source_rows,
+                )
+            )
+        mapped.append(
+            FitMappedDatasetSnapshot(
+                dataset_id=dataset.dataset_id,
+                display_name=dataset.display_name,
+                set_id=initial_set.set_id,
+                set_name=initial_set.name,
+                initial_values=projected_initial_values(tab, initial_set.set_id),
+                observations=tuple(observations),
+                included_at_launch=bool(link.include_in_fit),
+                execution=(
+                    validated.execution
+                    if validated is not None
+                    else tab.resolved_execution_settings(initial_set.set_id)
+                ),
+            )
+        )
+    return FitOriginSnapshot(
+        tab_id=tab.tab_id,
+        tab_name=tab.name,
+        mechanism_source=tab.mechanism_source,
+        prepared_dsl=tab.prepared_dsl,
+        scientific_settings=tab.scientific_settings,
+        fit_defaults=document.fit_defaults,
+        mapped_datasets=tuple(mapped),
+        parameter_defaults=_scan_parameters(tab),
     )
 
 
-def _require_global_fit_runtime_inputs(value: object) -> FittingRuntimeInputs:
-    if not isinstance(value, FittingRuntimeInputs):
-        raise RuntimeError("Global Fit launch settings require typed runtime inputs.")
-    return value
-
-
-def _require_global_fit_launch_solver(value: object) -> str:
-    if not isinstance(value, str):
-        raise RuntimeError("Global Fit launch settings require explicit solver.")
-    solver_label = value.strip()
-    if not solver_label:
-        raise RuntimeError("Global Fit launch settings require explicit solver.")
-    return solver_label
-
-
-def _require_global_fit_positive_finite_float(value: object, label: str) -> float:
-    if isinstance(value, bool):
-        raise RuntimeError(f"Global Fit launch settings require numeric {label}.")
-    try:
-        numeric = float(value)
-    except Exception as exc:
-        raise RuntimeError(f"Global Fit launch settings require numeric {label}.") from exc
-    if not math.isfinite(numeric) or numeric <= 0.0:
-        raise RuntimeError(f"Global Fit launch settings require positive finite {label}.")
-    return numeric
-
-
-def _read_global_fit_launch_settings(context: GlobalFitLaunchContext) -> GlobalFitLaunchSettings:
-    getter = context.fitting_settings_getter
-    try:
-        raw_settings = getter()
-    except Exception as exc:
-        raise RuntimeError("Failed to read Global Fit launch settings.") from exc
-    return _coerce_global_fit_launch_settings(raw_settings)
-
-
-def _record_failure(
-    context: GlobalFitLaunchContext,
-    key: str,
-    *,
-    message: str,
-    exc: Optional[Exception] = None,
-) -> None:
-    try:
-        context.record_best_effort_failure(
-            key,
-            message=message,
-            exc=exc,
-        )
-    except Exception:
-        logger.debug("Failed to record fitting launch failure %s", key, exc_info=True)
-
-
-def _coerce_dataset_payload(
+def _captured_fit_observation(
+    origin: FitOriginSnapshot,
     *,
     dataset_id: str,
-    observations: Mapping[str, Mapping[str, object]],
-) -> FitDatasetPayloadResult:
-    observations_map = copy_observations_map(observations)
-    if not observations_map:
-        return FitDatasetPayloadResult.absent()
-    return read_fit_dataset_payload(
-        dataset_id=str(dataset_id),
-        observations=observations_map,
-        selected_species=list(observations_map.keys()),
+    raw_observation_id: str,
+) -> tuple[FitMappedDatasetSnapshot, FitObservationSnapshot]:
+    if not isinstance(origin, FitOriginSnapshot):
+        raise TypeError("origin must be a FitOriginSnapshot.")
+    dataset = next(
+        (
+            item
+            for item in origin.mapped_datasets
+            if item.dataset_id == str(dataset_id)
+        ),
+        None,
+    )
+    observation = (
+        None
+        if dataset is None
+        else next(
+            (
+                item
+                for item in dataset.observations
+                if item.raw_observation_id == str(raw_observation_id)
+            ),
+            None,
+        )
+    )
+    if dataset is None or observation is None:
+        raise ValueError(
+            "Pre-boundary Fit identity must name one exact captured "
+            "observation."
+        )
+    return dataset, observation
+
+
+def _pre_boundary_candidates_for_observation(
+    origin: FitOriginSnapshot,
+    dataset: FitMappedDatasetSnapshot,
+    observation: FitObservationSnapshot,
+    *,
+    execution: SimulationExecutionSettings | None,
+) -> tuple[tuple[int, str], ...]:
+    captured_execution = dataset.execution if execution is None else execution
+    if not isinstance(captured_execution, SimulationExecutionSettings):
+        raise TypeError("execution must be SimulationExecutionSettings.")
+    validate_simulation_execution_settings(captured_execution)
+    schedule = coerce_intervention_schedule(
+        origin.prepared_dsl.intervention_schedule_for_execution()
+    )
+    if schedule is not None and schedule.is_parameterized:
+        raise ValueError(
+            "Pre-boundary Fit identity is ambiguous for a parameterized "
+            "intervention schedule."
+        )
+    contract = compile_intervention_schedule(schedule)
+    if contract.triggers:
+        raise ValueError(
+            "Pre-boundary Fit identity is ambiguous when runtime triggers "
+            "can create earlier integration segments."
+        )
+    mechanism = origin.prepared_dsl.mechanism_for_execution()
+    metadata = MechanismMetadataView.from_metadata(
+        getattr(mechanism, "metadata", None)
+    )
+    boundaries = tuple(
+        sorted(
+            set(
+                contract.discontinuities_for_span(
+                    captured_execution.t_start,
+                    captured_execution.t_end,
+                )
+                + declared_temperature_step_boundaries(
+                    metadata.temperature_schedule,
+                    t_start=captured_execution.t_start,
+                    t_end=captured_execution.t_end,
+                )
+            )
+        )
+    )
+    segment_key_by_time = {
+        boundary: f"integration:{index}"
+        for index, boundary in enumerate(boundaries)
+    }
+    return tuple(
+        (int(row), segment_key_by_time[float(time)])
+        for row, time in zip(
+            observation.source_rows,
+            observation.t,
+            strict=True,
+        )
+        if float(time) in segment_key_by_time
     )
 
 
-def _resolve_window_factory(context: GlobalFitLaunchContext) -> Callable[..., QtWidgets.QWidget]:
-    if callable(context.window_factory):
-        return context.window_factory
-    from .window import FittingWindow
+def pre_boundary_fit_row_candidates(
+    origin: FitOriginSnapshot,
+    *,
+    dataset_id: str,
+    raw_observation_id: str,
+    execution: SimulationExecutionSettings | None = None,
+) -> tuple[tuple[int, str], ...]:
+    """Discover exact static pre-boundary rows with one boundary build."""
 
-    return FittingWindow
+    dataset, observation = _captured_fit_observation(
+        origin,
+        dataset_id=dataset_id,
+        raw_observation_id=raw_observation_id,
+    )
+    return _pre_boundary_candidates_for_observation(
+        origin,
+        dataset,
+        observation,
+        execution=execution,
+    )
 
 
-def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWidgets.QWidget]:
-    """Launch the global-fit window using the fitting package as the owner."""
-    if context.dataset_registry is None:
-        QtWidgets.QMessageBox.warning(context.parent, "Global Fit", "Dataset source unavailable in the current layout.")
-        return None
+def resolve_pre_boundary_fit_rows(
+    origin: FitOriginSnapshot,
+    *,
+    dataset_id: str,
+    raw_observation_id: str,
+    source_rows: Iterable[int],
+    execution: SimulationExecutionSettings | None = None,
+) -> tuple[tuple[int, str], ...]:
+    """Resolve authored time-X rows against canonical exact candidates."""
 
-    records = tuple(context.dataset_registry.records())
-    if not records:
-        QtWidgets.QMessageBox.warning(context.parent, "Global Fit", "Load at least one dataset first.")
-        return None
-    selected_records = tuple(sorted(records, key=lambda record: str(record.display_name)))
-    datasets_map = {
-        str(record.dataset_id): dict(record.payload or {})
-        for record in selected_records
-    }
-    display_name_by_id = {
-        str(record.dataset_id): str(record.display_name)
-        for record in selected_records
-    }
-
-    has_any_species = False
-    for payload in (datasets_map or {}).values():
-        if observations_from_payload(payload):
-            has_any_species = True
-            break
-    if not has_any_species:
-        QtWidgets.QMessageBox.warning(context.parent, "Global Fit", "No species available for loaded datasets.")
-        return None
-
-    mechanism_text = str(context.mechanism_text_getter() or "")
-    try:
-        mechanism_initials = context.extract_mechanism_initials(mechanism_text)
-    except Exception as exc:
-        _record_failure(
-            context,
-            "global_fit.extract_mechanism_initials",
-            message="Failed to extract mechanism initials while launching global fit; continuing with empty initials",
-            exc=exc,
-        )
-        mechanism_initials = {}
-    mechanism_species = list((mechanism_initials or {}).keys())
-    selected_dataset_ids = [str(record.dataset_id) for record in selected_records]
-    dataset_count = len(selected_dataset_ids)
-    dataset_label = f"{dataset_count} dataset{'s' if dataset_count != 1 else ''}"
-
-    try:
-        parameter_defs = context.mechanism_parameter_scan_owner.scan_mechanism_parameters(mechanism_text)
-    except DatasetOwnerError as exc:
-        QtWidgets.QMessageBox.warning(context.parent, "Global Fit", str(exc))
-        return None
-
-    try:
-        context.sync_batch_species_columns(mechanism_species)
-    except Exception as exc:
-        _record_failure(
-            context,
-            "global_fit.sync_batch_species_columns",
-            message="Failed to sync batch species columns while launching global fit; continuing without mapping refresh",
-            exc=exc,
-        )
-
-    batch_store = context.batch_store
-    batch_model = context.batch_model
-    batch_table = context.batch_table
-
-    def _defaults_for_batch_set(set_name: str) -> Optional[Dict[str, float]]:
-        if batch_store is None:
-            return None
-        row = batch_store.row_for_set(set_name)
-        if row is None:
-            return None
-        try:
-            return context.batch_initials_for_row(int(row))
-        except Exception as exc:
-            try:
-                if batch_model is not None:
-                    batch_model.validate_rows([int(row)])
-            except Exception as inner_exc:
-                _record_failure(
-                    context,
-                    "global_fit.batch_model.validate_rows",
-                    message="Failed to revalidate batch rows after invalid initial conditions during global fit prep",
-                    exc=inner_exc,
-                )
-            QtWidgets.QMessageBox.warning(
-                context.parent,
-                "Global Fit",
-                f"Set '{set_name}' has invalid initial conditions:\n\n{exc}\n\n"
-                "Fix the Initial Conditions table and retry Global Fit.",
-            )
-            return None
-
-    defaults_by_dataset: Dict[str, Dict[str, float]] = {}
-    batch_set_names = list(batch_store.set_names()) if batch_store is not None else []
-
-    for dataset_id in selected_dataset_ids:
-        display_name = display_name_by_id.get(str(dataset_id), str(dataset_id))
-        settings = context.dataset_fit_settings_store.get_fit_settings(dataset_id)
-        base = default_batch_set_name_for_dataset(display_name) or str(display_name)
-
-        resolved_mapping = resolve_saved_batch_mapping(settings, batch_store)
-        target_set: Optional[str] = resolved_mapping.batch_set if resolved_mapping.status == "mapped" else None
-        if target_set is None:
-            create_set_name = unique_batch_set_name(batch_set_names, base)
-            action = prompt_dataset_batch_mapping_choice(
-                context.parent,
-                display_name,
-                create_set_name,
-                title="Global Fit – Set Mapping",
-                skip_label="Cancel",
-                skip_description="Cancel global fit",
-            )
-            if action == "skip":
-                context.set_status("Global fit cancelled")
-                return None
-            if action == "map":
-                target_set = pick_existing_batch_set(
-                    context.parent,
-                    display_name,
-                    batch_set_names,
-                    title="Map Dataset to Set",
-                    empty_message_title="Global Fit",
-                    empty_message_text="No sets exist to map to. Create a set first.",
-                )
-                if not target_set:
-                    context.set_status("Global fit cancelled")
-                    return None
-                apply_batch_mapping_to_settings(settings, batch_store, target_set)
-            else:
-                dataset_payload = datasets_map.get(dataset_id) or {}
-                row_idx, created, seeded = create_and_seed_batch_set(
-                    dataset_name=display_name,
-                    dataset_payload=dataset_payload,
-                    mechanism_species=mechanism_species,
-                    batch_store=batch_store,
-                    batch_model=batch_model,
-                    set_name=create_set_name,
-                    record_failure=lambda key, **kwargs: _record_failure(context, key, **kwargs),
-                    failure_key_prefix="global_fit",
-                    tol=T0_SEED_TOL_S,
-                )
-                target_set = create_set_name
-                if created and not seeded and not mechanism_species:
-                    context.set_status("Global fit cancelled")
-                    return None
-                apply_batch_mapping_to_settings(settings, batch_store, target_set)
-                if created and batch_store is not None and not seeded:
-                    try:
-                        all_times = []
-                        for spec in observations_from_payload(dataset_payload).values():
-                            t_arr = np.asarray(spec.get("t", []), dtype=float).reshape(-1)
-                            finite_times = t_arr[np.isfinite(t_arr)]
-                            if finite_times.size:
-                                all_times.extend(float(value) for value in finite_times)
-                        t0 = float(min(all_times)) if all_times else float("nan")
-                    except Exception:
-                        t0 = float("nan")
-                    if not (abs(t0) <= T0_SEED_TOL_S):
-                        resp2 = QtWidgets.QMessageBox.warning(
-                            context.parent,
-                            "Global Fit – Initial Conditions",
-                            (
-                                f"Dataset '{display_name}' does not start at t\u22480 "
-                                f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
-                                "OK: Create set with zeros and continue\n"
-                                "Cancel: Create set and edit manually (then restart Global Fit)"
-                            ),
-                            QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
-                            QtWidgets.QMessageBox.StandardButton.Ok,
-                        )
-                        if resp2 == QtWidgets.QMessageBox.StandardButton.Cancel:
-                            select_batch_set(
-                                batch_store,
-                                batch_model,
-                                batch_table,
-                                target_set,
-                                record_failure=lambda key, **kwargs: _record_failure(context, key, **kwargs),
-                                failure_key_prefix="global_fit",
-                            )
-                            QtWidgets.QMessageBox.information(
-                                context.parent,
-                                "Global Fit",
-                                (
-                                    f"Set '{target_set}' was created.\n\n"
-                                    "Edit its initial concentrations in the Initial Conditions table, "
-                                    "then start Global Fit again."
-                                ),
-                            )
-                            context.set_status("Global fit cancelled")
-                            return None
-
-        defaults = _defaults_for_batch_set(target_set)
-        if defaults is None:
-            context.set_status("Global fit cancelled")
-            return None
-        defaults_by_dataset[dataset_id] = defaults
-        batch_set_names = list(batch_store.set_names()) if batch_store is not None else batch_set_names
-
-    settings_map: Dict[str, "DatasetFitSettings"] = {}
-    for dataset_id in selected_dataset_ids:
-        display_name = display_name_by_id.get(str(dataset_id), str(dataset_id))
-        settings = context.dataset_fit_settings_store.get_fit_settings(dataset_id)
-        settings.ensure_species(mechanism_species, defaults_by_dataset.get(dataset_id, mechanism_initials))
-        missing_initials = [
-            species_name for species_name in (mechanism_species or [])
-            if species_name not in (settings.initial_conditions or {})
-        ]
-        if missing_initials:
-            QtWidgets.QMessageBox.warning(
-                context.parent,
-                "Global Fit",
-                f"Dataset '{display_name}' requires initial concentrations for: {', '.join(missing_initials)}.",
-            )
-            context.set_status("Global fit cancelled")
-            return None
-        context.dataset_fit_settings_store.update_fit_settings(dataset_id, settings)
-        settings_map[dataset_id] = settings
-
-    dataset_params: Dict[str, Dict[str, float]] = {}
-    dataset_variable_params: Dict[str, Dict[str, Dict[str, float]]] = {}
-    weights: Dict[str, float] = {}
-    initial_prefix = "init:"
-    for dataset_id in selected_dataset_ids:
-        settings = settings_map[dataset_id]
-        weights[dataset_id] = settings.weight
-        dataset_params[dataset_id] = {}
-        var_specs: Dict[str, Dict[str, float]] = {}
-        for species, init_value in settings.initial_conditions.items():
-            key = f"{initial_prefix}{species}"
-            if settings.fit_flags.get(species):
-                bound_pair = settings.bounds.get(species, (0.0, max(10.0, init_value * 10 or 10.0)))
-                var_specs[key] = {
-                    "initial": init_value,
-                    "min": bound_pair[0],
-                    "max": bound_pair[1],
-                    "log10": bool(settings.log10_flags.get(species, False)),
-                }
-            else:
-                dataset_params[dataset_id][key] = init_value
-        if var_specs:
-            dataset_variable_params[dataset_id] = var_specs
-
-    t_axes: List[np.ndarray] = []
-    dataset_entries: List[Dict[str, object]] = []
-    dataset_payloads: List[Dict[str, object]] = []
-    dataset_payload_results: Dict[str, object] = {}
-    for dataset_id, payload in datasets_map.items():
-        observations = observations_from_payload(payload)
-        t_values, species_map = dense_view_from_observations(observations)
-        series_map: Dict[str, np.ndarray] = {}
-        if isinstance(species_map, dict):
-            for name, values in species_map.items():
-                try:
-                    arr = np.asarray(values, dtype=float).reshape(-1)
-                except Exception as exc:
-                    _record_failure(
-                        context,
-                        "global_fit.dataset_entries.series",
-                        message=f"Skipping invalid dataset series '{name}' while preparing global fit",
-                        exc=exc,
-                    )
-                    continue
-                if t_values.size and arr.size == t_values.size:
-                    series_map[str(name)] = arr.copy()
-        if t_values.size:
-            t_axes.append(t_values)
-        dataset_entries.append(
-            {
-                "id": str(dataset_id),
-                "label": display_name_by_id.get(str(dataset_id), str(dataset_id)),
-                "observations": copy_observations_map(observations),
-                "t": t_values,
-                "species_data": series_map,
-                "selected_species": [],
-                "weight": weights.get(str(dataset_id), 1.0),
-                "include": True,
-            }
-        )
-        fit_payload = _coerce_dataset_payload(
-            dataset_id=str(dataset_id),
-            observations=observations,
-        )
-        dataset_payload_results[str(dataset_id)] = fit_payload
-        payload_dict = getattr(fit_payload, "payload", None)
-        if isinstance(payload_dict, dict):
-            dataset_payloads.append(dict(payload_dict))
-
-    if t_axes:
-        max_time = max(float(np.max(t_values)) for t_values in t_axes if t_values.size)
-        if not np.isfinite(max_time):
-            max_time = 1.0
-        max_len = max(int(t_values.size) for t_values in t_axes if t_values.size)
-    else:
-        max_time = 1.0
-        max_len = 2
-
-    grid_points = max(2, int(context.num_points_getter()), int(max_len))
-    launch_settings = _read_global_fit_launch_settings(context)
-
-    def _build_simulation(
-        mechanism_text_for_run: str,
-        param_names_for_run: List[str],
-        *,
-        solver: str,
-        rtol: float,
-        atol: float,
-        temperature_K: Optional[float] = None,
-        use_sparse_jacobian: Optional[bool] = None,
-        wegscheider_cyclicity_enabled: Optional[bool] = None,
+    dataset, observation = _captured_fit_observation(
+        origin,
+        dataset_id=dataset_id,
+        raw_observation_id=raw_observation_id,
+    )
+    requested_rows = tuple(int(value) for value in source_rows)
+    if (
+        len(requested_rows) != len(set(requested_rows))
+        or any(value <= 0 for value in requested_rows)
     ):
-        from kindred.core.simulator.solvers import normalize_solver_name
-
-        solver_label = _require_global_fit_launch_solver(solver)
-        solver_value = normalize_solver_name(solver_label)
-        rtol_value = _require_global_fit_positive_finite_float(rtol, "rtol")
-        atol_value = _require_global_fit_positive_finite_float(atol, "atol")
-        evaluator_inputs = launch_settings.runtime_inputs.evaluator
-        runtime_settings = FittingEvaluatorRuntimeSettings(
-            temperature_K=(
-                temperature_K if temperature_K is not None else evaluator_inputs.temperature_K
-            ),
-            use_sparse_jacobian=(
-                use_sparse_jacobian
-                if use_sparse_jacobian is not None
-                else evaluator_inputs.use_sparse_jacobian
-            ),
-            wegscheider_cyclicity_enabled=(
-                wegscheider_cyclicity_enabled
-                if wegscheider_cyclicity_enabled is not None
-                else evaluator_inputs.wegscheider_cyclicity_enabled
-            ),
+        raise ValueError(
+            "Pre-boundary Fit rows must uniquely name captured positive "
+            "physical source rows."
         )
-        fit_context = prepare_fitting_execution_context(
-            mechanism_text=str(mechanism_text_for_run or ""),
-            param_names=[str(x) for x in (param_names_for_run or []) if str(x)],
-            t_end=max_time,
-            num_points=grid_points,
-            solver=solver_value,
-            rtol=rtol_value,
-            atol=atol_value,
-            **runtime_settings.builder_kwargs(),
-            initial_prefix=initial_prefix,
+    captured_rows = set(observation.source_rows)
+    if any(row not in captured_rows for row in requested_rows):
+        raise ValueError(
+            "Pre-boundary Fit rows must belong to the exact captured "
+            "observation."
         )
-        return SerialFittingEvaluator(fit_context)
-
-    window_factory = _resolve_window_factory(context)
-    window = window_factory(
-        mode="global",
-        parameter_defs=parameter_defs,
-        dataset_entries=dataset_entries,
-        dataset_fit_settings_store=context.dataset_fit_settings_store,
-        dataset_view_publisher=context.dataset_view_publisher,
-        mechanism_parameter_scan_owner=context.mechanism_parameter_scan_owner,
-        simulation_func=None,
-        mechanism_species=mechanism_species,
-        mechanism_text_getter=context.mechanism_text_getter,
-        reactions_text_getter=context.reactions_text_getter,
-        reactions_text_rewriter=context.reactions_text_rewriter,
-        simulation_builder=_build_simulation,
-        runtime_inputs=launch_settings.runtime_inputs,
-        dataset_params=dataset_params,
-        dataset_variable_params=dataset_variable_params,
-        dataset_payloads=dataset_payloads,
-        dataset_payload_results=dataset_payload_results,
-        dataset_weights=weights,
-        project_apply_callback=context.apply_fit_results_to_project,
-        config_defaults=context.load_fitting_defaults(),
-        parent=context.parent,
+    if not requested_rows:
+        return ()
+    candidate_by_row = dict(
+        _pre_boundary_candidates_for_observation(
+            origin,
+            dataset,
+            observation,
+            execution=execution,
+        )
     )
-    window.setWindowTitle(f"Global Fit – {dataset_label}")
-    context.set_status(f"Global fitting window open ({dataset_label})")
-    context.register_fit_window(window, runtime_inputs=launch_settings.runtime_inputs)
-    return window
+    missing = tuple(
+        row for row in requested_rows if row not in candidate_by_row
+    )
+    if missing:
+        raise ValueError(
+            "Source row(s) "
+            + ", ".join(str(row) for row in missing)
+            + " are not exact, unambiguous pre-boundary times in the "
+            "captured execution."
+        )
+    return tuple((row, candidate_by_row[row]) for row in requested_rows)
+
+
+def selected_observations(
+    mapped: FitMappedDatasetSnapshot,
+    local: FitDatasetLocalSettings,
+) -> tuple[FitSelectedObservation, ...]:
+    """Materialize only selected existing rows for one dataset."""
+    target_by_raw_id = {
+        raw_id: (raw_column, model_target)
+        for raw_id, raw_column, model_target in local.observation_targets
+    }
+    wanted = set(local.target_species)
+    selected: list[FitSelectedObservation] = []
+    pre_boundary_by_raw_id: dict[str, dict[int, str]] = {}
+    for raw_id, source_row, segment_key in local.pre_boundary_segment_keys:
+        pre_boundary_by_raw_id.setdefault(raw_id, {})[
+            int(source_row)
+        ] = segment_key
+    seen_targets: set[str] = set()
+    consumed_pre_boundary_identities: set[tuple[str, int]] = set()
+    for observation in mapped.observations:
+        captured_raw, target = target_by_raw_id.get(
+            observation.raw_observation_id,
+            (observation.raw_column, observation.model_species),
+        )
+        if captured_raw != observation.raw_column:
+            raise ValueError(
+                f"Dataset {mapped.display_name!r} raw observation identity "
+                "changed columns inside the Fit capture."
+            )
+        if target not in wanted:
+            continue
+        if target in seen_targets:
+            raise ValueError(
+                f"Dataset {mapped.display_name!r} maps multiple selected columns "
+                f"to target {target!r}."
+            )
+        indices = compute_sampled_indices(
+            t=np.asarray(observation.t, dtype=float),
+            t_min=local.sample_t_min,
+            t_max=local.sample_t_max,
+            n_points=local.sample_points,
+        )
+        times = tuple(float(observation.t[index]) for index in indices)
+        values = tuple(float(observation.y[index]) for index in indices)
+        if any(
+            time < local.execution.t_start or time > local.execution.t_end
+            for time in times
+        ):
+            raise ValueError(
+                f"Dataset {mapped.display_name!r} has selected observation times "
+                f"outside [{local.execution.t_start:g}, {local.execution.t_end:g}]."
+            )
+        selected.append(
+            FitSelectedObservation(
+                raw_observation_id=observation.raw_observation_id,
+                raw_column=observation.raw_column,
+                model_species=target,
+                t=times,
+                y=values,
+                source_rows=tuple(
+                    int(observation.source_rows[index])
+                    for index in indices
+                ),
+                pre_boundary_segment_keys_by_source_row=tuple(
+                    (
+                        int(observation.source_rows[index]),
+                        pre_boundary_by_raw_id[
+                            observation.raw_observation_id
+                        ][int(observation.source_rows[index])],
+                    )
+                    for index in indices
+                    if int(observation.source_rows[index])
+                    in pre_boundary_by_raw_id.get(
+                        observation.raw_observation_id,
+                        {},
+                    )
+                ),
+            )
+        )
+        consumed_pre_boundary_identities.update(
+            (
+                observation.raw_observation_id,
+                int(observation.source_rows[index]),
+            )
+            for index in indices
+            if int(observation.source_rows[index])
+            in pre_boundary_by_raw_id.get(
+                observation.raw_observation_id,
+                {},
+            )
+        )
+        seen_targets.add(target)
+    missing = wanted - seen_targets
+    if missing:
+        raise ValueError(
+            f"Dataset {mapped.display_name!r} has no selected observation rows "
+            f"for: {', '.join(sorted(missing))}."
+        )
+    requested_pre_boundary_identities = {
+        (raw_id, int(source_row))
+        for raw_id, source_row, _segment_key
+        in local.pre_boundary_segment_keys
+    }
+    if (
+        consumed_pre_boundary_identities
+        != requested_pre_boundary_identities
+    ):
+        raise ValueError(
+            "Explicit pre-boundary Fit identity references a source row "
+            "outside the selected immutable observation capture."
+        )
+    return tuple(selected)
+
+
+def revalidate_fit_request_inclusions(
+    *,
+    document: ProjectDocument,
+    request: FitExecutionRequest,
+) -> None:
+    """Revalidate every currently included dataset through Dataset authority."""
+
+    if not isinstance(document, ProjectDocument):
+        raise TypeError("document must be ProjectDocument.")
+    if not isinstance(request, FitExecutionRequest):
+        raise TypeError("request must be FitExecutionRequest.")
+    tab = document.tab(request.origin.tab_id)
+    species = projected_species_names(tab)
+    mapped_by_id = {
+        item.dataset_id: item for item in request.origin.mapped_datasets
+    }
+    allowed_observable_names = {
+        item.name for item in request.local_observables
+    } | set(fit_observable_names(request.prepared_dsl))
+    for local in request.datasets:
+        if not local.included:
+            continue
+        validated = validate_fit_inclusion(
+            document=document,
+            tab=tab,
+            dataset_id=local.dataset_id,
+            mechanism_species=species,
+        )
+        captured = mapped_by_id[local.dataset_id]
+        if validated.set_id != captured.set_id:
+            raise ValueError(
+                f"Dataset {captured.display_name!r} changed mapped set."
+            )
+        validated_by_raw = {
+            item.raw_observation_id: item for item in validated.targets
+        }
+        captured_by_raw = {
+            item.raw_observation_id: item for item in captured.observations
+        }
+        for raw_id, raw_column, model_target in local.observation_targets:
+            authoritative = validated_by_raw.get(raw_id)
+            snapshot = captured_by_raw.get(raw_id)
+            if authoritative is None or snapshot is None:
+                raise ValueError(
+                    f"Dataset {captured.display_name!r} target "
+                    f"{raw_column!r} is no longer eligible."
+                )
+            if (
+                authoritative.raw_column != raw_column
+                or snapshot.raw_column != raw_column
+                or authoritative.raw_observation_id != raw_id
+                or snapshot.raw_observation_id != raw_id
+                or tuple(authoritative.t) != snapshot.t
+                or tuple(authoritative.y) != snapshot.y
+                or tuple(authoritative.source_rows) != snapshot.source_rows
+            ):
+                raise ValueError(
+                    f"Dataset {captured.display_name!r} observation "
+                    f"{raw_column!r} changed after Fit capture."
+                )
+            if (
+                model_target != authoritative.model_target
+                and model_target not in allowed_observable_names
+            ):
+                raise ValueError(
+                    f"Dataset {captured.display_name!r} mapped target "
+                    f"{model_target!r} is no longer valid."
+                )
+
+
+def build_fit_execution_request(
+    *,
+    origin: FitOriginSnapshot,
+    mechanism_source: MechanismAuthoringSource,
+    prepared_dsl: PreparedDslRequestSet,
+    local_observables: Iterable[FitLocalObservable],
+    datasets: Iterable[FitDatasetLocalSettings],
+    parameters: Iterable[FitParameterVariable],
+    initials: Iterable[FitInitialVariable],
+    defaults: FitDefaults | None = None,
+) -> FitExecutionRequest:
+    """Validate a complete owner-built Fit request at the execution boundary."""
+    request = FitExecutionRequest(
+        origin=origin,
+        mechanism_source=mechanism_source,
+        prepared_dsl=prepared_dsl,
+        local_observables=tuple(local_observables),
+        datasets=tuple(datasets),
+        parameters=tuple(parameters),
+        initials=tuple(initials),
+        defaults=defaults or origin.fit_defaults,
+    )
+    mapped_by_id = {item.dataset_id: item for item in origin.mapped_datasets}
+    requested_ids = [item.dataset_id for item in request.datasets]
+    if (
+        len(requested_ids) != len(set(requested_ids))
+        or set(requested_ids) != set(mapped_by_id)
+    ):
+        raise ValueError("Fit request must contain each mapped dataset exactly once.")
+    included = {
+        item.dataset_id
+        for item in request.datasets
+        if item.included
+    }
+    if not included:
+        raise ValueError("Select at least one mapped dataset for fitting.")
+    retained_dataset_ids = set(mapped_by_id)
+    parameter_names = [item.name for item in request.parameters]
+    expected_names = [item.name for item in origin.parameter_defaults]
+    local_scalar_names = {
+        scalar.name
+        for observable in request.local_observables
+        for scalar in observable.scalar_parameters
+    }
+    if (
+        len(parameter_names) != len(set(parameter_names))
+        or set(parameter_names) != set(expected_names) | local_scalar_names
+    ):
+        raise ValueError(
+            "Fit request must contain each captured and Fit-local scalar exactly once."
+        )
+    for parameter in request.parameters:
+        local_ids = {
+            dataset_id for dataset_id, _value in parameter.dataset_values
+        }
+        if not local_ids.issubset(retained_dataset_ids):
+            raise ValueError(
+                f"Parameter {parameter.name!r} has values outside the "
+                "retained mapped datasets."
+            )
+        if (
+            parameter.scope == "per_dataset"
+            and not included.issubset(local_ids)
+        ):
+            raise ValueError(
+                f"Per-dataset parameter {parameter.name!r} requires one "
+                "value for every currently included dataset."
+            )
+    initial_keys = [(item.set_id, item.species) for item in request.initials]
+    expected_initial_keys = {
+        (mapped.set_id, species)
+        for mapped in origin.mapped_datasets
+        for species, _value in mapped.initial_values
+    }
+    if len(initial_keys) != len(set(initial_keys)) or set(initial_keys) != expected_initial_keys:
+        raise ValueError(
+            "Fit request must contain each mapped initial concentration exactly once."
+        )
+    initial_rows_by_species: dict[str, list[FitInitialVariable]] = {}
+    for initial in request.initials:
+        initial_rows_by_species.setdefault(initial.species, []).append(initial)
+    included_set_ids = {
+        mapped.set_id
+        for mapped in origin.mapped_datasets
+        if mapped.dataset_id in included
+    }
+    for species, rows in initial_rows_by_species.items():
+        active_rows = [
+            item for item in rows if item.set_id in included_set_ids
+        ]
+        scopes = {item.scope for item in active_rows}
+        if len(scopes) != 1:
+            raise ValueError(
+                f"Included initial {species!r} cannot mix Global and Local scope."
+            )
+        if scopes == {"global"}:
+            signatures = {
+                (
+                    item.initial,
+                    item.minimum,
+                    item.maximum,
+                    item.fit,
+                    item.log10,
+                )
+                for item in active_rows
+            }
+            if len(signatures) != 1:
+                raise ValueError(
+                    f"Global initial {species!r} requires one explicit "
+                    "value, bounds, Fit selection, and Log10 selection."
+                )
+    for local in request.datasets:
+        if local.included:
+            observations = selected_observations(
+                mapped_by_id[local.dataset_id],
+                local,
+            )
+            if not observations:
+                raise ValueError(
+                    f"Dataset {mapped_by_id[local.dataset_id].display_name!r} "
+                    "has no selected observations."
+                )
+    if not any(item.fit for item in request.parameters) and not any(
+        item.fit
+        and any(
+            mapped.set_id == item.set_id and mapped.dataset_id in included
+            for mapped in origin.mapped_datasets
+        )
+        for item in request.initials
+    ):
+        raise ValueError(
+            "Select at least one parameter or initial concentration to fit."
+        )
+    return request

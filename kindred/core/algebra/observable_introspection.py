@@ -1,8 +1,14 @@
+"""Bounded validation for observables defined inside an open Fit session."""
+
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
-from typing import Iterable, Set
 
+from kindred.core.algebra.identifier_canonicalization import (
+    canonicalize_observable_rhs_source,
+)
 from kindred.core.algebra.parser import (
     BinaryNode,
     CallNode,
@@ -12,245 +18,233 @@ from kindred.core.algebra.parser import (
     UnaryNode,
     parse_algebra,
 )
-from kindred.core.algebra.identifier_canonicalization import canonicalize_observable_rhs_source
 from kindred.core.algebra.symbols import SymbolTable
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra_spec import (
-    classify_parameter_algebra_declaration,
-    invalid_parameter_algebra_identifier_reference_message,
     is_protected_indexed_parameter_identifier,
     is_protected_step_key_identifier,
 )
-from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
+from kindred.core.simulator.parameter_namespace import (
+    build_namespace_from_mechanism,
+)
 
 __all__ = [
-    "ObservableExpressionAnalysis",
-    "analyze_observable_expression",
-    "extract_observables_from_algebra_text",
-    "detect_unknown_scalar_identifiers",
+    "FitLocalObservable",
+    "FitLocalScalar",
+    "fit_observable_names",
+    "validate_fit_local_observable",
 ]
 
-
-@dataclass(frozen=True)
-class ObservableExpressionAnalysis:
-    identifiers: Set[str]
-    species_refs: Set[str]
-    has_time_ref: bool
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _iter_identifiers(expr: ExprNode) -> Iterable[str]:
+@dataclass(frozen=True, slots=True)
+class FitLocalScalar:
+    name: str
+    value: float = 1.0
+    minimum: float = float("-inf")
+    maximum: float = float("inf")
+    scope: str = "shared"
+
+    def __post_init__(self) -> None:
+        name = str(self.name or "").strip()
+        value = float(self.value)
+        minimum = float(self.minimum)
+        maximum = float(self.maximum)
+        scope = str(self.scope or "").strip().lower()
+        if not _IDENTIFIER.fullmatch(name):
+            raise ValueError("Fit-local scalar name is not a valid identifier.")
+        if (
+            not math.isfinite(value)
+            or math.isnan(minimum)
+            or math.isnan(maximum)
+            or minimum >= maximum
+            or not minimum <= value <= maximum
+        ):
+            raise ValueError(
+                f"Fit-local scalar {name!r} requires finite value within "
+                "ordered non-NaN bounds."
+            )
+        if scope not in {"shared", "per_dataset"}:
+            raise ValueError(
+                "Fit-local scalar scope must be Shared or Per-dataset."
+            )
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "minimum", minimum)
+        object.__setattr__(self, "maximum", maximum)
+        object.__setattr__(self, "scope", scope)
+
+
+@dataclass(frozen=True, slots=True)
+class FitLocalObservable:
+    name: str
+    expression: str
+    scalar_parameters: tuple[FitLocalScalar, ...] = ()
+
+    def __post_init__(self) -> None:
+        name = str(self.name or "").strip()
+        expression = str(self.expression or "").strip()
+        scalars = tuple(self.scalar_parameters)
+        if not _IDENTIFIER.fullmatch(name):
+            raise ValueError("Fit-local observable name is not a valid identifier.")
+        if not expression:
+            raise ValueError("Fit-local observable expression must be nonblank.")
+        if any(not isinstance(item, FitLocalScalar) for item in scalars):
+            raise TypeError(
+                "Fit-local observable scalars must be FitLocalScalar values."
+            )
+        scalar_names = [item.name for item in scalars]
+        if len(scalar_names) != len(set(scalar_names)):
+            raise ValueError("Fit-local observable scalar names must be unique.")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "expression", expression)
+        object.__setattr__(self, "scalar_parameters", scalars)
+
+
+def _identifiers(expr: ExprNode) -> set[str]:
     if isinstance(expr, IdentNode):
-        yield str(expr.name)
-        return
+        return {str(expr.name)}
     if isinstance(expr, SpeciesRefNode):
-        return
+        return set()
     if isinstance(expr, UnaryNode):
-        yield from _iter_identifiers(expr.rhs)
-        return
+        return _identifiers(expr.rhs)
     if isinstance(expr, BinaryNode):
-        yield from _iter_identifiers(expr.lhs)
-        yield from _iter_identifiers(expr.rhs)
-        return
+        return _identifiers(expr.lhs) | _identifiers(expr.rhs)
     if isinstance(expr, CallNode):
-        for arg in expr.args:
-            yield from _iter_identifiers(arg)
-        return
+        found: set[str] = set()
+        for argument in expr.args:
+            found |= _identifiers(argument)
+        return found
+    return set()
 
 
-def _iter_species_refs(expr: ExprNode) -> Iterable[str]:
+def _species_refs(expr: ExprNode) -> set[str]:
     if isinstance(expr, SpeciesRefNode):
-        yield str(expr.name)
-        return
+        return {str(expr.name)}
     if isinstance(expr, IdentNode):
-        return
+        return set()
     if isinstance(expr, UnaryNode):
-        yield from _iter_species_refs(expr.rhs)
-        return
+        return _species_refs(expr.rhs)
     if isinstance(expr, BinaryNode):
-        yield from _iter_species_refs(expr.lhs)
-        yield from _iter_species_refs(expr.rhs)
-        return
+        return _species_refs(expr.lhs) | _species_refs(expr.rhs)
     if isinstance(expr, CallNode):
-        for arg in expr.args:
-            yield from _iter_species_refs(arg)
-        return
+        found: set[str] = set()
+        for argument in expr.args:
+            found |= _species_refs(argument)
+        return found
+    return set()
 
 
-def analyze_observable_expression(expr_src: str) -> ObservableExpressionAnalysis:
-    """
-    Parse an Algebra expression using the project Algebra parser and return structural info.
+def fit_observable_names(
+    prepared_dsl: PreparedDslRequestSet,
+) -> tuple[str, ...]:
+    """Return named algebra series available to the Fit evaluator."""
 
-    Notes
-    -----
-    - This uses a synthetic `# Algebra` block so the same grammar/compiler is exercised
-      as in mechanism compilation.
-    - Identifiers are *bare* IDENT tokens (not bracket species refs).
-    """
-    src = f"# Algebra\nlet __expr__ = {str(expr_src).strip()}\n"
-    block = parse_algebra(src)
+    if not isinstance(prepared_dsl, PreparedDslRequestSet):
+        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+    return tuple(sorted(str(name) for name in prepared_dsl.analysis.observable_names))
+
+
+def validate_fit_local_observable(
+    *,
+    name: str,
+    expression: str,
+    prepared_dsl: PreparedDslRequestSet,
+    additional_known_observables: tuple[str, ...] = (),
+    unknown_scalar_scope: str = "shared",
+) -> FitLocalObservable:
+    """Validate one local definition without mutating canonical project text."""
+    observable_name = str(name or "").strip()
+    expression_source = str(expression or "").strip()
+    if not _IDENTIFIER.fullmatch(observable_name):
+        raise ValueError(
+            "Observable name must match [A-Za-z_][A-Za-z0-9_]*."
+        )
+    if not expression_source:
+        raise ValueError("Observable expression must be nonblank.")
+
+    if not isinstance(prepared_dsl, PreparedDslRequestSet):
+        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+    mechanism = prepared_dsl.mechanism_for_execution()
+    namespace = build_namespace_from_mechanism(mechanism)
+    species = set(prepared_dsl.analysis.species_names)
+    existing = set(prepared_dsl.analysis.observable_names) | {
+        str(item) for item in additional_known_observables
+    }
+    symbols = SymbolTable()
+    occupied_casefold = {
+        item.casefold()
+        for item in (
+            species
+            | existing
+            | namespace.flat_names()
+            | set(symbols.protected_names())
+            | set(symbols.functions())
+        )
+    }
+    if (
+        observable_name.casefold() in occupied_casefold
+        or is_protected_indexed_parameter_identifier(observable_name)
+        or is_protected_step_key_identifier(observable_name)
+    ):
+        raise ValueError(
+            f"Observable name {observable_name!r} conflicts with existing model science."
+        )
+
+    block = parse_algebra(
+        f"# Algebra\nlet __kindred_fit_observable__ = {expression_source}\n"
+    )
     if not block.lines:
-        return ObservableExpressionAnalysis(identifiers=set(), species_refs=set(), has_time_ref=False)
+        raise ValueError("Observable expression did not produce an Algebra value.")
     expr = block.lines[0].expr
-    return ObservableExpressionAnalysis(
-        identifiers=set(_iter_identifiers(expr)),
-        species_refs=set(_iter_species_refs(expr)),
-        has_time_ref=bool(expr.has_time_ref()),
+    if expr.has_time_ref():
+        raise ValueError(
+            "Fit-local observables cannot use baseline/time-reference expressions."
+        )
+    unknown_species = _species_refs(expr) - species
+    if unknown_species:
+        raise ValueError(
+            "Observable references unknown species: "
+            + ", ".join(sorted(unknown_species))
+        )
+    bare_species = _identifiers(expr) & species
+    if bare_species:
+        raise ValueError(
+            "Species must use bracket notation: "
+            + ", ".join(sorted(bare_species))
+        )
+    if observable_name in _identifiers(expr):
+        raise ValueError(
+            f"Observable {observable_name!r} cannot reference itself."
+        )
+    allowed = (
+        namespace.flat_names()
+        | existing
+        | set(symbols.protected_names())
+        | set(symbols.functions())
     )
-
-
-def _reject_invalid_identifier_references(
-    identifiers: Set[str],
-    *,
-    mechanism_namespace: MechanismParameterNamespace | None = None,
-    reject_unresolved_protected_indexed: bool = False,
-) -> None:
-    for name in sorted(str(identifier) for identifier in (identifiers or set()) if str(identifier).strip()):
-        message = invalid_parameter_algebra_identifier_reference_message(
-            name,
-            mechanism_namespace=mechanism_namespace,
-            reject_unresolved_protected_indexed=bool(reject_unresolved_protected_indexed),
-        )
-        if message is not None:
-            raise ValueError(message)
-
-
-def extract_observables_from_algebra_text(
-    algebra_text: str,
-    *,
-    mechanism_namespace: MechanismParameterNamespace | None = None,
-) -> dict[str, str]:
-    """
-    Extract observable definitions from the persisted Algebra editor text.
-
-    Supports:
-      - `let name = expr`
-
-    Excludes:
-      - `param name = expr` (scalar params / parameter algebra)
-      - comments and blank lines
-
-    Returns
-    -------
-    dict
-        Mapping of observable_name -> expression_source (RHS text).
-    """
-    out: dict[str, str] = {}
-
-    for raw in str(algebra_text or "").splitlines():
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        # Strip inline comments (ignore '#' inside bracket refs like [A]_0).
-        code = stripped
-        if "#" in stripped:
-            bracket_depth = 0
-            for i, ch in enumerate(stripped):
-                if ch == "[":
-                    bracket_depth += 1
-                elif ch == "]":
-                    bracket_depth = max(0, bracket_depth - 1)
-                elif ch == "#" and bracket_depth == 0:
-                    code = stripped[:i].rstrip()
-                    break
-        code = code.strip()
-        if not code or code.startswith("#"):
-            continue
-        classification = classify_parameter_algebra_declaration(
-            code,
-            mechanism_namespace=mechanism_namespace,
-            allow_non_algebra_bare_assignment=False,
-        )
-        if classification.kind == "param":
-            continue
-
-        if classification.kind == "let":
-            if is_protected_indexed_parameter_identifier(classification.raw_name):
-                raise ValueError(
-                    f"{classification.raw_name!r} is a protected indexed parameter identifier "
-                    "and cannot be declared as an observable."
-                )
-            if is_protected_step_key_identifier(classification.raw_name):
-                raise ValueError(
-                    f"{classification.raw_name!r} is a step-local DSL key "
-                    "and cannot be declared as an observable."
-                )
-            rest = code[4:].strip()
-        elif classification.kind == "invalid_step_key_identifier":
+    unknown_identifiers = _identifiers(expr) - allowed
+    for unknown in unknown_identifiers:
+        if (
+            is_protected_indexed_parameter_identifier(unknown)
+            or is_protected_step_key_identifier(unknown)
+        ):
             raise ValueError(
-                f"{classification.raw_name!r} is a step-local DSL key "
-                "and cannot be declared as an observable."
+                f"Observable references protected identifier {unknown!r}."
             )
-        elif classification.kind == "unsupported_bare_assignment":
-            raise ValueError(
-                f"Bare algebra assignment {classification.raw_name!r} is not supported. "
-                "Use 'let name = expr' or 'param name = expr'."
-            )
-        else:
-            continue
-
-        if "=" not in rest:
-            continue
-        lhs, rhs = rest.split("=", 1)
-        name = lhs.strip()
-        expr = rhs.strip()
-        if not name or not expr:
-            continue
-        analysis = analyze_observable_expression(expr)
-        _reject_invalid_identifier_references(
-            analysis.identifiers,
-            mechanism_namespace=mechanism_namespace,
-            reject_unresolved_protected_indexed=mechanism_namespace is None,
-        )
-        if mechanism_namespace is not None:
-            expr = canonicalize_observable_rhs_source(expr, mechanism_namespace=mechanism_namespace)
-        out[str(name)] = str(expr)
-    return out
-
-
-def detect_unknown_scalar_identifiers(
-    expr_src: str,
-    *,
-    observable_name: str,
-    known_identifiers: Set[str],
-    mechanism_species: Set[str],
-    mechanism_namespace: MechanismParameterNamespace | None = None,
-) -> Set[str]:
-    """
-    Return bare identifier names that likely represent missing scalar parameters.
-
-    Excludes:
-    - Bracket species refs (they are not identifiers here)
-    - Protected constants and builtin function names (SymbolTable)
-    - The observable's own name
-    - Any names already known to the caller (fit parameters, existing observables, etc.)
-    - Mechanism species names (species must be bracketed in observables)
-    """
-    analysis = analyze_observable_expression(expr_src)
-    symtab = SymbolTable()
-    blocked = set(known_identifiers or set())
-    blocked |= set(mechanism_species or set())
-    blocked.add(str(observable_name))
-    blocked |= set(symtab.protected_names())
-    blocked |= set(symtab.functions().keys())
-    _reject_invalid_identifier_references(
-        analysis.identifiers,
-        mechanism_namespace=mechanism_namespace,
+    scope = str(unknown_scalar_scope or "").strip().lower()
+    if scope not in {"shared", "per_dataset"}:
+        raise ValueError("Unknown scalar scope must be Shared or Per-dataset.")
+    canonical = canonicalize_observable_rhs_source(
+        expression_source,
+        mechanism_namespace=namespace,
     )
-    identifier_names: set[str] = set()
-    for raw_name in analysis.identifiers or set():
-        name = str(raw_name or "").strip()
-        if not name:
-            continue
-        if mechanism_namespace is not None:
-            resolution = mechanism_namespace.resolve(name)
-            if resolution.canonical_name is not None:
-                identifier_names.add(str(resolution.canonical_name))
-                continue
-        identifier_names.add(name)
-    candidates = {nm for nm in identifier_names if nm and nm not in blocked}
-    _reject_invalid_identifier_references(
-        candidates,
-        mechanism_namespace=mechanism_namespace,
-        reject_unresolved_protected_indexed=mechanism_namespace is None,
+    return FitLocalObservable(
+        observable_name,
+        canonical,
+        tuple(
+            FitLocalScalar(name=item, scope=scope)
+            for item in sorted(unknown_identifiers)
+        ),
     )
-    return candidates

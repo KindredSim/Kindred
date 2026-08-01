@@ -127,7 +127,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         keywords = [
             'reaction', 'equilibrium',
             'init', 'initial', 'time',
-            'temp_const', 'temp_step', 'temp_response', 'state', 'edge', 'intervention',
+            'temp_step', 'temp_response', 'state', 'edge', 'intervention',
         ]
         keyword_pattern = r'\b(' + '|'.join(keywords) + r')\b'
         self.rules.append((re.compile(keyword_pattern, re.IGNORECASE), 'keyword', False))

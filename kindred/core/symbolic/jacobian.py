@@ -6,8 +6,20 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from kindred.core.mechanism import Equilibrium, Mechanism, Reaction
-from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+from kindred.core.mechanism import Equilibrium, FrozenDict, Mechanism
+from kindred.core.ode_builder import (
+    EffectiveRateCoefficientEvaluator,
+    build_effective_rate_coefficient_evaluator,
+)
+from kindred.core.temperature import TemperatureScheduleProtocol
+from kindred.core.kinetics import (
+    forward_rate_family,
+    forward_rate_model_for_equilibrium,
+)
+from kindred.core.mechanism_metadata import (
+    EquilibriumMetadataKeys,
+    MechanismMetadataView,
+)
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
     effective_reverse_rate_from_keq,
@@ -24,7 +36,7 @@ from .artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR, SymbolicArtifactIdentity
 from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
 from .identity import symbolic_fingerprint
-from .namespaces import make_evaluation_snapshot_context, make_state_symbol_context, symbolic_status_payload
+from .namespaces import make_state_symbol_context, symbolic_status_payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,13 +63,61 @@ class SymbolicJacobianStructure:
     _compiled: Callable[..., Any]
     state_symbol_context: Mapping[str, Any]
 
-    def bind(self, parameter_values: Mapping[str, object] | None = None) -> SymbolicJacobianArtifact:
-        snapshot = _coerce_snapshot_values(
-            self.parameter_symbols,
-            parameter_values,
+    def bind(
+        self,
+        coefficient_evaluator: EffectiveRateCoefficientEvaluator,
+        *,
+        temperature_schedule: TemperatureScheduleProtocol | None = None,
+        schedule_identity: Mapping[str, object] | None = None,
+    ) -> SymbolicJacobianArtifact:
+        if not isinstance(
+            coefficient_evaluator,
+            EffectiveRateCoefficientEvaluator,
+        ):
+            raise TypeError(
+                "coefficient_evaluator must be "
+                "EffectiveRateCoefficientEvaluator."
+            )
+        if temperature_schedule is not None and not callable(
+            temperature_schedule
+        ):
+            raise TypeError("temperature_schedule must be callable.")
+        nominal_temperature = float(
+            coefficient_evaluator.nominal_temperature_K
         )
-        snapshot_context = make_evaluation_snapshot_context(snapshot).to_payload()
-        snapshot_fingerprint = str(snapshot_context["fingerprint"])
+        nominal_coefficients = coefficient_evaluator(
+            nominal_temperature
+        )
+        nominal_by_name = _coefficient_values_by_parameter_name(
+            coefficient_evaluator,
+            nominal_coefficients.forward,
+            nominal_coefficients.reverse,
+        )
+        snapshot = tuple(
+            (name, float(nominal_by_name[name]))
+            for name in self.parameter_symbols
+        )
+        execution_payload = FrozenDict(
+            {
+                "kind": "runtime-effective-rate-evaluation",
+                "evaluation_mode": (
+                    "per-call-typed-schedule"
+                    if temperature_schedule is not None
+                    else "nominal-temperature-fallback"
+                ),
+                "nominal_temperature_K": nominal_temperature,
+                "typed_schedule": (
+                    FrozenDict(schedule_identity)
+                    if schedule_identity is not None
+                    else None
+                ),
+                "rate_authority_snapshot": (
+                    coefficient_evaluator.authority_snapshot
+                ),
+                "parameter_symbols": self.parameter_symbols,
+            }
+        )
+        snapshot_fingerprint = symbolic_fingerprint(execution_payload)
         metadata = get_symbolic_backend_metadata()
         identity = SymbolicArtifactIdentity.jacobian(
             metadata,
@@ -67,13 +127,30 @@ class SymbolicJacobianStructure:
             evaluation_snapshot_fingerprint=snapshot_fingerprint,
             parameter_symbols=self.parameter_symbols,
         )
-        parameter_tuple = tuple(value for _name, value in snapshot)
 
-        def jacobian_func(_t: float, y: np.ndarray) -> np.ndarray:
+        def jacobian_func(t: float, y: np.ndarray) -> np.ndarray:
             values = np.asarray(y, dtype=float).reshape(-1)
             if values.size != len(self.species_names):
                 raise ValueError(f"symbolic jacobian expected {len(self.species_names)} state values, got {values.size}")
-            return np.asarray(self._compiled(*values, *parameter_tuple), dtype=float)
+            temperature = (
+                nominal_temperature
+                if temperature_schedule is None
+                else float(temperature_schedule(float(t)))
+            )
+            coefficients = coefficient_evaluator(temperature)
+            coefficient_values = _coefficient_values_by_parameter_name(
+                coefficient_evaluator,
+                coefficients.forward,
+                coefficients.reverse,
+            )
+            parameter_tuple = tuple(
+                coefficient_values[name]
+                for name in self.parameter_symbols
+            )
+            return np.asarray(
+                self._compiled(*values, *parameter_tuple),
+                dtype=float,
+            )
 
         setattr(jacobian_func, SYMBOLIC_JACOBIAN_IDENTITY_ATTR, identity.to_payload())
         return SymbolicJacobianArtifact(
@@ -85,7 +162,7 @@ class SymbolicJacobianStructure:
             parameter_symbols=self.parameter_symbols,
             evaluation_snapshot=snapshot,
             state_symbol_context=dict(self.state_symbol_context),
-            evaluation_snapshot_context=snapshot_context,
+            evaluation_snapshot_context=execution_payload,
         )
 
 
@@ -117,6 +194,60 @@ class SymbolicJacobianSupport:
         return symbolic_status_payload(kind="jacobian", state=state, code=self.code, reason=reason)
 
 
+def _coefficient_parameter_name(
+    step_index: int,
+    direction: str,
+) -> str:
+    role = "kf" if direction == "forward" else "kr"
+    return f"__kindred_effective_{role}_{int(step_index) + 1}"
+
+
+def _symbolic_coefficient_parameter_symbols(
+    mechanism: Mechanism,
+) -> tuple[str, ...]:
+    names: list[str] = []
+    step_index = 0
+    for _reaction in getattr(mechanism, "reactions", ()) or ():
+        names.append(
+            _coefficient_parameter_name(step_index, "forward")
+        )
+        step_index += 1
+    for _equilibrium in getattr(mechanism, "equilibria", ()) or ():
+        names.extend(
+            (
+                _coefficient_parameter_name(step_index, "forward"),
+                _coefficient_parameter_name(step_index, "reverse"),
+            )
+        )
+        step_index += 1
+    return tuple(sorted(names))
+
+
+def _coefficient_values_by_parameter_name(
+    evaluator: EffectiveRateCoefficientEvaluator,
+    forward: tuple[float, ...],
+    reverse: tuple[float, ...],
+) -> dict[str, float]:
+    if not (
+        len(evaluator.step_kinds)
+        == len(forward)
+        == len(reverse)
+    ):
+        raise UnsupportedSymbolicExpressionError(
+            "Effective rate coefficient shape conflicts with symbolic topology."
+        )
+    values: dict[str, float] = {}
+    for step_index, kind in enumerate(evaluator.step_kinds):
+        values[
+            _coefficient_parameter_name(step_index, "forward")
+        ] = float(forward[step_index])
+        if kind == "equilibrium":
+            values[
+                _coefficient_parameter_name(step_index, "reverse")
+            ] = float(reverse[step_index])
+    return values
+
+
 @dataclass(frozen=True, slots=True)
 class _EquilibriumRateSource:
     kf: object | None
@@ -126,42 +257,6 @@ class _EquilibriumRateSource:
     kr_name: str | None
     keq_name: str | None
     reverse_std_ratio: float = 1.0
-    reverse_authority: str = "keq"
-    symbolic_parameterized: bool = True
-    generated_parameter_name: str | None = None
-    authored_symbolic_roles: tuple[str, ...] = ()
-
-
-class _ParameterRegistry:
-    def __init__(self, sympy: Any) -> None:
-        self._sympy = sympy
-        self._symbols: dict[str, Any] = {}
-        self._values: dict[str, float] = {}
-
-    def parameter(self, value: object, *, label: str, default_name: str) -> Any:
-        name = str(default_name or getattr(value, "name", None) or label).strip()
-        if not name:
-            name = str(default_name or label)
-        scalar = _finite_scalar(value, label=label)
-        existing = self._values.get(name)
-        if existing is not None and not math.isclose(existing, scalar, rel_tol=0.0, abs_tol=0.0):
-            raise UnsupportedSymbolicExpressionError(
-                f"Conflicting values for symbolic parameter {name!r}."
-            )
-        self._values[name] = scalar
-        symbol = self._symbols.get(name)
-        if symbol is None:
-            symbol = self._sympy.Symbol(name)
-            self._symbols[name] = symbol
-        return symbol
-
-    @property
-    def parameter_names(self) -> tuple[str, ...]:
-        return tuple(sorted(self._symbols.keys()))
-
-    @property
-    def parameter_values(self) -> tuple[tuple[str, float], ...]:
-        return tuple((name, float(self._values[name])) for name in self.parameter_names)
 
 
 def _canonical_step_parameter_name(
@@ -226,20 +321,6 @@ def _finite_scalar(value: object, *, label: str) -> float:
     return out
 
 
-def _coerce_snapshot_values(
-    parameter_symbols: tuple[str, ...],
-    parameter_values: Mapping[str, object] | None,
-) -> tuple[tuple[str, float], ...]:
-    supplied = dict(parameter_values or {})
-    out: list[tuple[str, float]] = []
-    for name in parameter_symbols:
-        raw = supplied.get(name)
-        if raw is None:
-            raise UnsupportedSymbolicExpressionError(f"Missing symbolic parameter value for {name!r}.")
-        out.append((name, _finite_scalar(raw, label=f"symbolic parameter {name}")))
-    return tuple(out)
-
-
 def _stoichiometric_coefficient_expr(sympy: Any, coeff: float, *, exact: bool) -> Any:
     if bool(exact):
         return sympy.Rational(str(float(coeff)))
@@ -254,31 +335,6 @@ def _power_product(sympy: Any, symbols: Mapping[str, Any], powers: Mapping[str, 
             raise UnsupportedSymbolicExpressionError(f"Unknown species {species_name!r} in symbolic Jacobian.")
         expr *= symbols[str(species_name)] ** sympy.Rational(str(power))
     return expr
-
-
-def _reaction_rate_expr(
-    sympy: Any,
-    mechanism: Mechanism,
-    rxn: Reaction,
-    symbols: Mapping[str, Any],
-    registry: _ParameterRegistry,
-    *,
-    reaction_index: int,
-) -> Any:
-    rate_value = getattr(rxn, "rate", None)
-    rate = registry.parameter(
-        rate_value,
-        label="reaction rate",
-        default_name=_canonical_step_parameter_name(
-            mechanism,
-            kind="reaction",
-            item_index=int(reaction_index),
-            role="k",
-            expected_name=f"k{int(reaction_index) + 1}",
-            value=rate_value,
-        ),
-    )
-    return rate * _power_product(sympy, symbols, getattr(rxn, "rate_orders", {}) or {})
 
 
 def _explicit_keq_source(eq: Equilibrium) -> object | None:
@@ -307,37 +363,6 @@ def _equilibrium_rate_source(
     kr = getattr(eq, "kr", None)
     keq = _explicit_keq_source(eq)
     meta = getattr(eq, "metadata", {}) or {}
-    generated_name = generated_fast_equilibrium_runtime_parameter_name(eq)
-    if generated_name is not None:
-        reverse_authority = "keq" if keq is not None else "kr"
-        try:
-            authority = normalize_existing_equilibrium_rate_authority(eq)
-        except ValueError:
-            authority = None
-        if authority is not None and authority.kind == EquilibriumRateAuthorityKind.KR:
-            keq = None
-            reverse_authority = "kr"
-        elif authority is not None and authority.kind == EquilibriumRateAuthorityKind.KEQ:
-            keq = authority.Keq
-            reverse_authority = "keq"
-        try:
-            reverse_std_ratio = float(authority.reverse_std_ratio) if authority is not None else 1.0
-        except Exception:
-            reverse_std_ratio = 1.0
-        if not math.isfinite(reverse_std_ratio) or reverse_std_ratio <= 0.0:
-            reverse_std_ratio = 1.0
-        return _EquilibriumRateSource(
-            kf=kf,
-            kr=kr,
-            keq=keq,
-            kf_name=None,
-            kr_name=None,
-            keq_name=None,
-            reverse_std_ratio=reverse_std_ratio,
-            reverse_authority=reverse_authority,
-            symbolic_parameterized=False,
-            generated_parameter_name=generated_name,
-        )
     if isinstance(meta, Mapping) and generated_equilibrium_authority_kind(meta):
         raise UnsupportedSymbolicExpressionError(
             "Generated equilibrium owner models are outside symbolic Jacobian support."
@@ -367,22 +392,14 @@ def _equilibrium_rate_source(
         value=keq,
     )
 
-    reverse_authority = "keq" if keq is not None else "kr"
     try:
         authority = normalize_existing_equilibrium_rate_authority(eq)
     except ValueError:
         authority = None
     if authority is not None and authority.kind == EquilibriumRateAuthorityKind.KR:
         keq = None
-        reverse_authority = "kr"
     elif authority is not None and authority.kind == EquilibriumRateAuthorityKind.KEQ:
         keq = authority.Keq
-        reverse_authority = "keq"
-    authored_symbolic_roles = (
-        authority.authored_symbolic_roles()
-        if authority is not None
-        else (("kf", "kr") if reverse_authority == "kr" else ("kf", "Keq"))
-    )
     try:
         reverse_std_ratio = float(authority.reverse_std_ratio) if authority is not None else 1.0
     except Exception:
@@ -397,50 +414,7 @@ def _equilibrium_rate_source(
         kr_name=kr_name,
         keq_name=keq_name,
         reverse_std_ratio=reverse_std_ratio,
-        reverse_authority=reverse_authority,
-        authored_symbolic_roles=authored_symbolic_roles,
     )
-
-
-def _equilibrium_rates(
-    mechanism: Mechanism,
-    eq: Equilibrium,
-    registry: _ParameterRegistry,
-    *,
-    equilibrium_index: int,
-) -> tuple[Any, Any]:
-    source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
-    kf_value, kr_value, keq_value = _equilibrium_parameter_value_triad(source)
-    if not source.symbolic_parameterized:
-        return float(kf_value), float(kr_value)
-    kf_symbol = registry.parameter(kf_value, label="equilibrium kf", default_name=str(source.kf_name or ""))
-    if source.reverse_authority == "kr":
-        kr_symbol = registry.parameter(kr_value, label="equilibrium kr", default_name=str(source.kr_name or ""))
-        return kf_symbol, kr_symbol
-    if "Keq" in source.authored_symbolic_roles:
-        keq_source = registry.parameter(keq_value, label="equilibrium Keq", default_name=str(source.keq_name or ""))
-    else:
-        keq_source = keq_value
-    return kf_symbol, effective_reverse_rate_from_keq(
-        kf_symbol,
-        keq_source,
-        _positive_reverse_std_ratio(source.reverse_std_ratio),
-    )
-
-
-def _equilibrium_rate_expr(
-    sympy: Any,
-    mechanism: Mechanism,
-    eq: Equilibrium,
-    symbols: Mapping[str, Any],
-    registry: _ParameterRegistry,
-    *,
-    equilibrium_index: int,
-) -> Any:
-    kf, kr = _equilibrium_rates(mechanism, eq, registry, equilibrium_index=equilibrium_index)
-    forward = kf * _power_product(sympy, symbols, getattr(eq, "stoich_forward", {}) or {})
-    reverse = kr * _power_product(sympy, symbols, getattr(eq, "stoich_back", {}) or {})
-    return forward - reverse
 
 
 def _unsupported_support(code: str, reason: str, payload: Mapping[str, Any]) -> SymbolicJacobianSupport:
@@ -485,9 +459,9 @@ def _positive_reverse_std_ratio(value: object) -> float:
 
 
 def _equilibrium_parameter_value_triad(source: _EquilibriumRateSource) -> tuple[float, float, float]:
-    kf_label = source.kf_name or source.generated_parameter_name or "generated computational-mode equilibrium kf"
-    kr_label = source.kr_name or source.generated_parameter_name or "generated computational-mode equilibrium kr"
-    keq_label = source.keq_name or source.generated_parameter_name or "generated computational-mode equilibrium Keq"
+    kf_label = source.kf_name or "equilibrium kf"
+    kr_label = source.kr_name or "equilibrium kr"
+    keq_label = source.keq_name or "equilibrium Keq"
     kf_value = _finite_scalar(source.kf, label=f"symbolic parameter {kf_label}")
     reverse_std_ratio = _positive_reverse_std_ratio(source.reverse_std_ratio)
     kr_value = _symbolic_snapshot_scalar_value(source.kr) if source.kr is not None else None
@@ -517,6 +491,32 @@ def _equilibrium_parameter_value_triad(source: _EquilibriumRateSource) -> tuple[
     if keq_value <= 0.0 or not math.isfinite(keq_value):
         raise UnsupportedSymbolicExpressionError("equilibrium Keq derived from kf/kr must be positive and finite.")
     return float(kf_value), float(kr_value), float(keq_value)
+
+
+def _authored_equilibrium_forward_rate_family(
+    mechanism: Mechanism,
+    eq: Equilibrium,
+) -> str:
+    """Validate and return one authored typed forward-rate family."""
+
+    mechanism_metadata = MechanismMetadataView.from_metadata(
+        getattr(mechanism, "metadata", {}) or {}
+    )
+    try:
+        model = forward_rate_model_for_equilibrium(
+            eq,
+            temperature_K=float(mechanism_metadata.temperature_K),
+            default_kappa=float(mechanism_metadata.kappa_global),
+            default_standard_conc_M=float(
+                mechanism_metadata.standard_conc_M
+            ),
+        )
+        family = forward_rate_family(model)
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedSymbolicExpressionError(
+            f"Unsupported authored equilibrium forward-rate model: {exc}"
+        ) from exc
+    return family
 
 
 def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobianSupport:
@@ -553,13 +553,15 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
     for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
         meta = dict(getattr(eq, "metadata", {}) or {})
         generated_kind = generated_equilibrium_authority_kind(meta)
-        if generated_kind:
+        generated_parameter = (
+            generated_fast_equilibrium_runtime_parameter_name(eq)
+        )
+        if generated_kind or generated_parameter is not None:
             kf = getattr(eq, "kf", None)
             kr = getattr(eq, "kr", None)
             keq = _explicit_keq_source(eq)
             keq_input = _metadata_keq_input(eq)
             has_forward_model = bool(meta.get(EquilibriumMetadataKeys.FORWARD_MODEL))
-            has_reverse_model = bool(meta.get("reverse_model"))
             has_dg_eq = bool(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None)
             equilibria_payload.append(
                 {
@@ -571,9 +573,9 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
                         _symbolic_snapshot_value_kind(keq_input) if keq_input is not None else "missing"
                     ),
                     "has_forward_model": has_forward_model,
-                    "has_reverse_model": has_reverse_model,
                     "has_dG_eq_J_per_mol": has_dg_eq,
                     "generated_authority_kind": generated_kind,
+                    "generated_parameter": generated_parameter,
                 }
             )
             if not unsupported_code:
@@ -590,8 +592,16 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
         keq_kind = _symbolic_snapshot_value_kind(keq) if keq is not None else "missing"
         keq_input_kind = _symbolic_snapshot_value_kind(keq_input) if keq_input is not None else "missing"
         has_forward_model = bool(meta.get(EquilibriumMetadataKeys.FORWARD_MODEL))
-        has_reverse_model = bool(meta.get("reverse_model"))
         has_dg_eq = bool(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None)
+        try:
+            forward_rate_family_name = (
+                _authored_equilibrium_forward_rate_family(mechanism, eq)
+            )
+        except UnsupportedSymbolicExpressionError as exc:
+            forward_rate_family_name = "unsupported"
+            if not unsupported_code:
+                unsupported_code = "unsupported-equilibrium-rate-model"
+                unsupported_reason = str(exc)
         equilibria_payload.append(
             {
                 "index": idx,
@@ -600,15 +610,11 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
                 "Keq_value_kind": keq_kind,
                 "Keq_input_value_kind": keq_input_kind,
                 "has_forward_model": has_forward_model,
-                "has_reverse_model": has_reverse_model,
                 "has_dG_eq_J_per_mol": has_dg_eq,
+                "forward_rate_family": forward_rate_family_name,
             }
         )
         if unsupported_code:
-            continue
-        if has_forward_model or has_reverse_model or has_dg_eq:
-            unsupported_code = "temperature-dependent-equilibrium"
-            unsupported_reason = "Temperature-dependent equilibrium models are outside symbolic Jacobian support."
             continue
         try:
             _equilibrium_parameter_value_triad(source)
@@ -626,6 +632,15 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
     }
     if unsupported_code:
         return _unsupported_support(unsupported_code, unsupported_reason, payload)
+    try:
+        evaluator = build_effective_rate_coefficient_evaluator(mechanism)
+        evaluator(evaluator.nominal_temperature_K)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return _unsupported_support(
+            "unsupported-effective-rate-authority",
+            f"Symbolic Jacobian effective-rate authority is unsupported: {exc}",
+            payload,
+        )
     return SymbolicJacobianSupport(
         supported=True,
         code="supported",
@@ -643,7 +658,6 @@ def _structure_identity_payload(
     _ = support_payload
     reactions_payload = []
     for idx, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):
-        rate = getattr(rxn, "rate", None)
         reactions_payload.append(
             {
                 "index": idx,
@@ -651,30 +665,29 @@ def _structure_identity_payload(
                 "products": dict(getattr(rxn, "products", {}) or {}),
                 "rate_orders": dict(getattr(rxn, "rate_orders", {}) or {}),
                 "net_stoich": dict(getattr(rxn, "net_stoich", {}) or {}),
-                "rate_parameter": _canonical_step_parameter_name(
-                    mechanism,
-                    kind="reaction",
-                    item_index=idx - 1,
-                    role="k",
-                    expected_name=f"k{idx}",
-                    value=rate,
+                "forward_coefficient": _coefficient_parameter_name(
+                    idx - 1,
+                    "forward",
                 ),
             }
         )
     equilibria_payload = []
+    reaction_count = len(reactions_payload)
     for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
-        source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=idx - 1)
+        step_index = reaction_count + idx - 1
         equilibria_payload.append(
             {
                 "index": idx,
                 "stoich_forward": dict(getattr(eq, "stoich_forward", {}) or {}),
                 "stoich_back": dict(getattr(eq, "stoich_back", {}) or {}),
-                "kf_parameter": source.kf_name,
-                "kr_parameter": source.kr_name,
-                "keq_parameter": source.keq_name,
-                "generated_parameter": source.generated_parameter_name,
-                "reverse_authority": source.reverse_authority,
-                "reverse_std_ratio": source.reverse_std_ratio,
+                "forward_coefficient": _coefficient_parameter_name(
+                    step_index,
+                    "forward",
+                ),
+                "reverse_coefficient": _coefficient_parameter_name(
+                    step_index,
+                    "reverse",
+                ),
             }
         )
     return {
@@ -685,84 +698,8 @@ def _structure_identity_payload(
     }
 
 
-def _symbolic_names_for_equilibrium_source(source: _EquilibriumRateSource) -> tuple[str, ...]:
-    role_to_name = {
-        "kf": source.kf_name,
-        "kr": source.kr_name,
-        "Keq": source.keq_name,
-    }
-    return tuple(
-        str(role_to_name[role])
-        for role in source.authored_symbolic_roles
-        if role in role_to_name and role_to_name[role] is not None
-    )
-
-
 def _symbolic_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
-    parameter_names: set[str] = set()
-    for reaction_index, rxn in enumerate(getattr(mechanism, "reactions", []) or []):
-        rate = getattr(rxn, "rate", None)
-        parameter_names.add(
-            _canonical_step_parameter_name(
-                mechanism,
-                kind="reaction",
-                item_index=int(reaction_index),
-                role="k",
-                expected_name=f"k{int(reaction_index) + 1}",
-                value=rate,
-            )
-        )
-    for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
-        source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
-        _equilibrium_parameter_value_triad(source)
-        if not source.symbolic_parameterized:
-            continue
-        parameter_names.update(_symbolic_names_for_equilibrium_source(source))
-    return tuple(sorted(parameter_names))
-
-
-def _parameter_values_for_mechanism(
-    mechanism: Mechanism,
-    parameter_symbols: tuple[str, ...],
-) -> dict[str, float]:
-    values: dict[str, float] = {}
-    for reaction_index, rxn in enumerate(getattr(mechanism, "reactions", []) or []):
-        rate = getattr(rxn, "rate", None)
-        name = _canonical_step_parameter_name(
-            mechanism,
-            kind="reaction",
-            item_index=int(reaction_index),
-            role="k",
-            expected_name=f"k{int(reaction_index) + 1}",
-            value=rate,
-        )
-        values[name] = _finite_scalar(rate, label=f"symbolic parameter {name}")
-    for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
-        source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
-        kf_value, kr_value, keq_value = _equilibrium_parameter_value_triad(source)
-        if not source.symbolic_parameterized:
-            continue
-        role_to_name = {
-            "kf": source.kf_name,
-            "kr": source.kr_name,
-            "Keq": source.keq_name,
-        }
-        role_to_value = {
-            "kf": kf_value,
-            "kr": kr_value,
-            "Keq": keq_value,
-        }
-        for role in source.authored_symbolic_roles:
-            name = role_to_name.get(role)
-            if name is not None:
-                values[str(name)] = float(role_to_value[role])
-
-    out: dict[str, float] = {}
-    for name in parameter_symbols:
-        if name not in values:
-            raise UnsupportedSymbolicExpressionError(f"Missing symbolic parameter value for {name!r}.")
-        out[str(name)] = float(values[name])
-    return out
+    return _symbolic_coefficient_parameter_symbols(mechanism)
 
 
 def symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism: Mechanism) -> str:
@@ -799,18 +736,20 @@ def _build_symbolic_mechanism_expression_model(
     state_context = make_state_symbol_context(species_names)
     state_symbols = tuple(sympy.Dummy(name) for name in state_context.symbol_names)
     symbol_by_species = dict(zip(species_names, state_symbols))
-    registry = _ParameterRegistry(sympy)
     rhs = [sympy.Integer(0) for _name in species_names]
     species_index = {name: idx for idx, name in enumerate(species_names)}
 
     for reaction_index, rxn in enumerate(getattr(mechanism, "reactions", []) or []):
-        rate_expr = _reaction_rate_expr(
+        coefficient = sympy.Symbol(
+            _coefficient_parameter_name(
+                reaction_index,
+                "forward",
+            )
+        )
+        rate_expr = coefficient * _power_product(
             sympy,
-            mechanism,
-            rxn,
             symbol_by_species,
-            registry,
-            reaction_index=reaction_index,
+            getattr(rxn, "rate_orders", {}) or {},
         )
         for species_name, coeff in getattr(rxn, "net_stoich", {}).items():
             rhs[species_index[str(species_name)]] += _stoichiometric_coefficient_expr(
@@ -819,15 +758,26 @@ def _build_symbolic_mechanism_expression_model(
                 exact=bool(exact_stoichiometric_coefficients),
             ) * rate_expr
 
+    reaction_count = len(tuple(getattr(mechanism, "reactions", []) or ()))
     for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
-        rate_expr = _equilibrium_rate_expr(
-            sympy,
-            mechanism,
-            eq,
-            symbol_by_species,
-            registry,
-            equilibrium_index=equilibrium_index,
+        step_index = reaction_count + equilibrium_index
+        forward_coefficient = sympy.Symbol(
+            _coefficient_parameter_name(step_index, "forward")
         )
+        reverse_coefficient = sympy.Symbol(
+            _coefficient_parameter_name(step_index, "reverse")
+        )
+        forward_expr = forward_coefficient * _power_product(
+            sympy,
+            symbol_by_species,
+            getattr(eq, "stoich_forward", {}) or {},
+        )
+        reverse_expr = reverse_coefficient * _power_product(
+            sympy,
+            symbol_by_species,
+            getattr(eq, "stoich_back", {}) or {},
+        )
+        rate_expr = forward_expr - reverse_expr
         for species_name in species_names:
             coeff = float(getattr(eq, "stoich_back", {}).get(species_name, 0.0)) - float(
                 getattr(eq, "stoich_forward", {}).get(species_name, 0.0)
@@ -841,7 +791,7 @@ def _build_symbolic_mechanism_expression_model(
 
     rhs_matrix = sympy.Matrix(rhs)
     jacobian_matrix = rhs_matrix.jacobian(sympy.Matrix(state_symbols))
-    parameter_symbols = registry.parameter_names
+    parameter_symbols = _symbolic_coefficient_parameter_symbols(mechanism)
     return _SymbolicMechanismExpressionModel(
         species_names=species_names,
         parameter_symbols=parameter_symbols,
@@ -904,8 +854,3 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
         _compiled=compiled,
         state_symbol_context=model.state_symbol_context,
     )
-
-
-def build_symbolic_jacobian_artifact(mechanism: Mechanism) -> SymbolicJacobianArtifact:
-    structure = build_symbolic_jacobian_structure(mechanism)
-    return structure.bind(_parameter_values_for_mechanism(mechanism, structure.parameter_symbols))

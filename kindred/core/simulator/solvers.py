@@ -34,8 +34,6 @@ from kindred.core.temperature import (
     TemperatureScheduleProtocol,
     coerce_temperature_schedule,
 )
-from kindred.core.intervention_schedule import coerce_intervention_schedule
-from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 from kindred.core.exceptions import (
     InitialConditionError,
     SimulationCancelled,
@@ -44,12 +42,16 @@ from kindred.core.exceptions import (
     create_solver_error,
 )
 from kindred.core.time_grid import build_time_grid
-from .nonnegative_invariant import project_nonnegative_trajectory
+from .nonnegative_invariant import (
+    NonnegativeProjection,
+    project_nonnegative_trajectory,
+)
 from .solver_output import solver_trajectory_array
 from .intervention_schedule_execution import (
     InterventionScheduleExecutionOwner,
     ScheduleExecutionRequest,
     SegmentExecutionRequest,
+    SegmentIdentity,
     SegmentRunResult,
 )
 from .solver_types import (
@@ -83,14 +85,32 @@ def _normal_event_states_with_projection(
     *,
     count: int,
     species_count: int,
-) -> tuple[list[list[np.ndarray]], dict[str, object]]:
-    states: list[list[np.ndarray]] = [[] for _ in range(max(0, int(count)))]
-    projection_count = 0
-    max_negative_magnitude = 0.0
-    if raw_states is None or count <= 0:
-        return states, {"projected": False, "count": 0, "max_negative_magnitude": 0.0}
-    if not isinstance(raw_states, Sequence):
-        return states, {"projected": False, "count": 0, "max_negative_magnitude": 0.0}
+) -> tuple[
+    list[list[np.ndarray]],
+    NonnegativeProjection,
+]:
+    raw_output = _normal_event_states(
+        raw_states,
+        count=count,
+        species_count=species_count,
+    )
+    projections: list[NonnegativeProjection] = []
+    for exact_rows in raw_output:
+        for exact in exact_rows:
+            _projected, projection = project_nonnegative_trajectory(
+                np.asarray(exact, dtype=float).reshape(-1, 1).copy(),
+                context="Simulation event state",
+            )
+            projections.append(projection)
+    return raw_output, NonnegativeProjection.aggregate(projections)
+
+
+def _normal_event_states(raw_states: object, *, count: int, species_count: int) -> list[list[np.ndarray]]:
+    output: list[list[np.ndarray]] = [
+        [] for _ in range(max(0, int(count)))
+    ]
+    if raw_states is None or count <= 0 or not isinstance(raw_states, Sequence):
+        return output
     for idx in range(min(int(count), len(raw_states))):
         raw = raw_states[idx]
         arr = np.asarray(raw, dtype=float)
@@ -106,62 +126,12 @@ def _normal_event_states_with_projection(
         elif arr.ndim != 2:
             try:
                 arr = arr.reshape(-1, int(species_count))
-            except Exception:
+            except ValueError:
                 continue
-        projected_rows: list[np.ndarray] = []
-        for row in arr:
-            projected, provenance = project_nonnegative_trajectory(
-                np.asarray(row, dtype=float).reshape(-1, 1),
-                context="Simulation event state",
-            )
-            projected_rows.append(projected.reshape(-1))
-            projection_count += int(provenance.get("count", 0) or 0)
-            max_negative_magnitude = max(
-                max_negative_magnitude,
-                float(provenance.get("max_negative_magnitude", 0.0) or 0.0),
-            )
-        states[idx] = projected_rows
-    return states, {
-        "projected": bool(projection_count),
-        "count": int(projection_count),
-        "max_negative_magnitude": float(max_negative_magnitude),
-    }
-
-
-def _normal_event_states(raw_states: object, *, count: int, species_count: int) -> list[list[np.ndarray]]:
-    states, _provenance = _normal_event_states_with_projection(
-        raw_states,
-        count=count,
-        species_count=species_count,
-    )
-    return states
-
-
-def _attach_event_states(
-    output: SimulationOutput,
-    *,
-    raw_states: object,
-    count: int,
-    species_count: int,
-) -> SimulationOutput:
-    event_states, event_projection = _normal_event_states_with_projection(
-        raw_states,
-        count=count,
-        species_count=species_count,
-    )
-    if bool(event_projection.get("projected")):
-        provenance = dict(output.provenance)
-        provenance["event_state_nonnegative_projection"] = event_projection
-        output = SimulationOutput(
-            t=output.t,
-            Y=output.Y,
-            provenance=provenance,
-        )
-    object.__setattr__(
-        output,
-        "_kindred_event_states",
-        event_states,
-    )
+        output[idx] = [
+            np.asarray(row, dtype=float).reshape(-1).copy()
+            for row in arr
+        ]
     return output
 
 
@@ -190,7 +160,11 @@ def normalize_solver_name(name: object) -> str:
 class _TemperatureInjectedRhs:
     def __init__(self, rhs: ODERhsWithTemp, schedule: TemperatureScheduleProtocol) -> None:
         self._rhs = rhs
-        schedule_obj = coerce_temperature_schedule(schedule)
+        schedule_obj = (
+            schedule
+            if isinstance(schedule, TemperatureScheduleDictProtocol)
+            else coerce_temperature_schedule(schedule)
+        )
         if schedule_obj is None:
             raise TypeError("temperature_schedule must not be None when injecting temperature.")
         self._schedule = schedule_obj
@@ -292,26 +266,11 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
     prov["jacobian_sparsity_hint"] = req.jac_sparsity is not None
     if isinstance(req.symbolic_wegscheider_identity, Mapping) and req.symbolic_wegscheider_identity:
         prov["symbolic_wegscheider_identity"] = dict(req.symbolic_wegscheider_identity)
-    schedule = coerce_intervention_schedule(req.intervention_schedule)
-    prov["has_intervention_schedule"] = schedule is not None
-    if schedule is not None:
-        compiled_schedule = compile_intervention_schedule(schedule)
-        prov["intervention_schedule_declarative"] = compiled_schedule.normalized_declarative_payload
-        prov["intervention_schedule_declarative_fingerprint"] = compiled_schedule.declarative_fingerprint
-        prov["intervention_schedule_executable"] = compiled_schedule.executable_payload
-        prov["intervention_schedule_executable_fingerprint"] = compiled_schedule.executable_fingerprint
-        if compiled_schedule.lineage:
-            prov["intervention_schedule_lineage"] = [dict(item) for item in compiled_schedule.lineage]
-        metadata = compiled_schedule.provenance.get("metadata")
-        if isinstance(metadata, Mapping):
-            prov["intervention_schedule_metadata"] = dict(metadata)
-        primitive_metadata = compiled_schedule.provenance.get("primitive_metadata")
-        if isinstance(primitive_metadata, Sequence) and not isinstance(primitive_metadata, (str, bytes)):
-            entries = [dict(item) for item in primitive_metadata if isinstance(item, Mapping)]
-            if entries:
-                prov["intervention_schedule_primitive_metadata"] = entries
-        prov["intervention_schedule_metadata_uses_internal_numeric_values"] = bool(
-            compiled_schedule.provenance.get("metadata_uses_internal_numeric_values")
+    intervention_execution = req.intervention_execution
+    prov["has_intervention_schedule"] = not intervention_execution.is_empty
+    if not intervention_execution.is_empty:
+        prov["intervention_execution"] = (
+            intervention_execution.provenance_projection()
         )
 
     if req.temperature_schedule is not None:
@@ -348,6 +307,7 @@ def _scrub_unused_jacobian_provenance(
 def _execute_scipy(
     req: SimulationRequest,
     *,
+    segment_identity: SegmentIdentity,
     rhs: Rhs2,
     rhs_for_jac: Rhs2,
     t0: float,
@@ -356,7 +316,7 @@ def _execute_scipy(
     t_eval: np.ndarray,
     prov: Dict[str, object],
     method: str,
-) -> SimulationOutput:
+) -> SegmentRunResult:
     base_kwargs: Dict[str, Any] = dict(t_eval=t_eval, rtol=float(req.rtol), atol=float(req.atol))
     if req.max_step is not None:
         base_kwargs["max_step"] = float(req.max_step)
@@ -368,6 +328,15 @@ def _execute_scipy(
 
     jac_callable = req.jacobian_func
     jac_sparsity = req.jac_sparsity
+    implicit_method = str(method) in {"Radau", "BDF"}
+    prov["symbolic_jacobian"] = bool(
+        implicit_method and jac_callable is not None
+    )
+    prov["jacobian_sparsity_hint"] = bool(
+        implicit_method
+        and jac_callable is None
+        and jac_sparsity is not None
+    )
     banded_jacobian_active = (
         jac_callable is not None
         and
@@ -405,8 +374,15 @@ def _execute_scipy(
         return False
 
     def _solve_or_cancelled(method_name: str):
+        if _cancel_requested_via_event():
+            raise SimulationCancelled()
         try:
-            return _solve_ivp(fun=rhs, t_span=(t0, t1), y0=y0, **_kwargs_for_method(method_name))  # type: ignore[misc]
+            solved = _solve_ivp(
+                fun=rhs,
+                t_span=(t0, t1),
+                y0=y0,
+                **_kwargs_for_method(method_name),
+            )  # type: ignore[misc]
         except ValueError as exc:
             # SciPy event root-finder can raise on cancellation races (brentq sign error).
             # If we have an explicit cancellation event and it reports cancellation requested,
@@ -414,6 +390,9 @@ def _execute_scipy(
             if events_list and _looks_like_brentq_sign_error(exc) and _cancel_requested_via_event():
                 raise SimulationCancelled() from exc
             raise
+        if _cancel_requested_via_event():
+            raise SimulationCancelled()
+        return solved
 
     sol = _solve_or_cancelled(method)
 
@@ -432,30 +411,83 @@ def _execute_scipy(
 
     prov["solver_used"] = method
     t_out = np.asarray(sol.t, float)
+    raw_trajectory = solver_trajectory_array(
+        sol.y,
+        y0=y0,
+        t_out=t_out,
+    )
+    raw_terminal_state = None
+    if (
+        t_out.size
+        and float(t_out[-1]) == float(t1)
+        and raw_trajectory.ndim == 2
+        and raw_trajectory.shape[1]
+    ):
+        raw_terminal_state = np.asarray(
+            raw_trajectory[:, -1],
+            dtype=float,
+        ).reshape(-1).copy()
     Y_out, nonnegative_projection = project_nonnegative_trajectory(
-        solver_trajectory_array(sol.y, y0=y0, t_out=t_out),
+        raw_trajectory,
         context="Simulation",
     )
-    if bool(nonnegative_projection.get("projected")):
-        prov["nonnegative_projection"] = nonnegative_projection
+    if nonnegative_projection.projected:
+        prov["nonnegative_projection"] = nonnegative_projection.to_payload()
     if hasattr(sol, "t_events") and sol.t_events:
         prov["events"] = [list(te) for te in sol.t_events]
+    event_count = len(events_list or ())
+    raw_event_states, event_state_projection = (
+        _normal_event_states_with_projection(
+            getattr(sol, "y_events", None),
+            count=event_count,
+            species_count=int(np.asarray(y0, dtype=float).reshape(-1).size),
+        )
+    )
+    if event_state_projection.projected:
+        prov["event_state_nonnegative_projection"] = (
+            event_state_projection.to_payload()
+        )
+    prov["result_segment_ids"] = tuple(
+        int(segment_identity.ordinal) for _ in t_out
+    )
+    prov["result_segment_keys"] = tuple(
+        segment_identity.key for _ in t_out
+    )
+    prov["result_discontinuity_ids"] = tuple(0 for _ in t_out)
+    prov["state_at_boundary"] = "post-stage-7"
+    if _cancel_requested_via_event():
+        raise SimulationCancelled()
     output = SimulationOutput(
         t=t_out,
         Y=Y_out,
         provenance=prov,
+        intervention_execution=req.intervention_execution,
     )
-    return _attach_event_states(
-        output,
-        raw_states=getattr(sol, "y_events", None),
-        count=len(events_list or ()),
-        species_count=int(np.asarray(y0, dtype=float).reshape(-1).size),
+    return SegmentRunResult(
+        identity=segment_identity,
+        output=output,
+        event_times=_normal_event_provenance(
+            output.provenance.get("events"),
+            count=event_count,
+        ),
+        raw_event_states=raw_event_states,
+        raw_terminal_state=raw_terminal_state,
+        trajectory_projection=nonnegative_projection,
+        event_state_projection=event_state_projection,
+        solver_used=str(output.provenance.get("solver_used") or method),
+        symbolic_jacobian_used=bool(
+            output.provenance.get("symbolic_jacobian")
+        ),
+        jacobian_sparsity_hint=bool(
+            output.provenance.get("jacobian_sparsity_hint")
+        ),
     )
 
 
 def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
-    output = _execute_scipy(
+    return _execute_scipy(
         request.request,
+        segment_identity=request.identity,
         rhs=request.rhs,
         rhs_for_jac=request.rhs_for_jac,
         t0=request.t0,
@@ -464,19 +496,6 @@ def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
         t_eval=request.t_eval,
         prov=request.provenance,
         method=request.method,
-    )
-    events = output.provenance.get("events")
-    return SegmentRunResult(
-        output=output,
-        event_times=_normal_event_provenance(events, count=len(_event_callables_for_request(request.request) or ())),
-        event_states=_normal_event_states(
-            getattr(output, "_kindred_event_states", None),
-            count=len(_event_callables_for_request(request.request) or ()),
-            species_count=int(np.asarray(request.y0, dtype=float).reshape(-1).size),
-        ),
-        solver_used=str(output.provenance.get("solver_used") or request.method),
-        symbolic_jacobian_used=bool(output.provenance.get("symbolic_jacobian")),
-        jacobian_sparsity_hint=bool(output.provenance.get("jacobian_sparsity_hint")),
     )
 
 
@@ -539,7 +558,15 @@ def solve_ode(req: SimulationRequest) -> SimulationOutput:
     if not isinstance(req, SimulationRequest):
         raise TypeError(f"solve_ode expects SimulationRequest, got {type(req)!r}")
     if req.temperature_schedule is not None:
-        req = replace(req, temperature_schedule=coerce_temperature_schedule(req.temperature_schedule))
+        schedule = (
+            req.temperature_schedule
+            if isinstance(
+                req.temperature_schedule,
+                TemperatureScheduleDictProtocol,
+            )
+            else coerce_temperature_schedule(req.temperature_schedule)
+        )
+        req = replace(req, temperature_schedule=schedule)
     y0 = np.asarray(req.y0, float)
     if y0.ndim != 1 or not np.all(np.isfinite(y0)):
         raise InitialConditionError("y0 must be a 1D finite array")
@@ -552,26 +579,30 @@ def solve_ode(req: SimulationRequest) -> SimulationOutput:
 
     method = _scipy_method_for(req.solver)
     _scrub_unused_jacobian_provenance(prov, method=method, req=req)
-    schedule = coerce_intervention_schedule(req.intervention_schedule)
-    if schedule is not None:
-        compiled_schedule = compile_intervention_schedule(schedule)
-        if not compiled_schedule.executable_schedule.is_empty():
-            return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
-                ScheduleExecutionRequest(
-                    request=req,
-                    rhs=rhs,
-                    rhs_for_jac=rhs_for_jac,
-                    t0=t0,
-                    t1=t1,
-                    y0=y0,
-                    t_eval=t_eval,
-                    provenance=prov,
-                    method=method,
-                    schedule=compiled_schedule.executable_schedule,
-                )
+    intervention_execution = req.intervention_execution
+    if not intervention_execution.is_empty or req.temperature_schedule is not None:
+        return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
+            ScheduleExecutionRequest(
+                request=req,
+                rhs=rhs,
+                rhs_for_jac=rhs_for_jac,
+                t0=t0,
+                t1=t1,
+                y0=y0,
+                t_eval=t_eval,
+                provenance=prov,
+                method=method,
+                schedule=intervention_execution,
             )
+        )
     return _execute_scipy(
         req,
+        segment_identity=SegmentIdentity(
+            kind="unsegmented",
+            ordinal=0,
+            t_start=t0,
+            t_end=t1,
+        ),
         rhs=rhs,
         rhs_for_jac=rhs_for_jac,
         t0=t0,
@@ -580,4 +611,4 @@ def solve_ode(req: SimulationRequest) -> SimulationOutput:
         t_eval=t_eval,
         prov=prov,
         method=method,
-    )
+    ).output

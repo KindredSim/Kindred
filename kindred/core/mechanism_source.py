@@ -32,6 +32,12 @@ class MechanismAuthoringSource:
     reactions_text: str = ""
     state_network_dsl: str = ""
 
+    def __post_init__(self) -> None:
+        if type(self.reactions_text) is not str:
+            raise TypeError("reactions_text must be an exact str.")
+        if type(self.state_network_dsl) is not str:
+            raise TypeError("state_network_dsl must be an exact str.")
+
     @classmethod
     def from_parts(cls, *, reactions_text: str = "", state_network_dsl: str = "") -> "MechanismAuthoringSource":
         return cls(
@@ -99,11 +105,6 @@ class MechanismAuthoringSource:
             reactions_text=self.reactions_text,
             state_network_dsl=str(state_network_dsl or ""),
         )
-
-    def without_reaction_initial_concentrations(self) -> "MechanismAuthoringSource":
-        from kindred.core.batch_initial_conditions import strip_reaction_dsl_initial_concentrations
-
-        return self.with_reactions_text(strip_reaction_dsl_initial_concentrations(self.reactions_text))
 
     @property
     def full_dsl(self) -> str:

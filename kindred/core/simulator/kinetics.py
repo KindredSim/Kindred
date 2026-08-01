@@ -125,7 +125,7 @@ def preview_line(
     reversible: bool,
     kf: float,
     kr: float | None = None,
-    model: str = "Eyring",               # "Eyring" | "Arrhenius"
+    model: str = "Constant",             # "Constant" | "Arrhenius" | "Eyring"
     unit: str = "1/s",
     kappa: float = 1.0,
     T: float = 298.15,
@@ -146,6 +146,9 @@ def preview_line(
         if kr is None:
             raise ValueError("kr must be provided for reversible preview")
         head += f" ; kr={format_sci_half_up(kr, sig_figs)}"
-    # Keep κ visible even for Arrhenius previews so the output format stays consistent.
-    trailer = f"# model={model}; unit={unit}; κ={float(kappa):.1f}; T={float(T):.2f} K; source={source}"
+    family_detail = f"; κ={float(kappa):.1f}" if model == "Eyring" else ""
+    trailer = (
+        f"# model={model}; unit={unit}{family_detail}; "
+        f"T={float(T):.2f} K; source={source}"
+    )
     return f"{head}  {trailer}"

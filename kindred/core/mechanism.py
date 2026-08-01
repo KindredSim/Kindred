@@ -18,8 +18,8 @@ Current contract
   - net_stoich: immutable Mapping[str, float] products - reactants, zeros omitted
   - order: int  derived molecularity from rate_orders
   - rate: StructuredRate | Callable    (opaque holder here; evaluated upstream)
-  - overrides: {"model": "Eyring" | "Arrhenius" | None,
-                "kappa": float | None, "A": float | None, "Ea": float | None,
+  - overrides: {"model": "Constant" | "Eyring" | "Arrhenius" | None,
+                "kappa": float | None, "A": float | None,
                 "Ea_J_per_mol": float | None, "dG_act_J_per_mol": float | None,
                 "standard_conc_M": float | None}
 - Equilibrium:
@@ -214,14 +214,12 @@ def _derive_net_stoich(reactants: Mapping[str, float], products: Mapping[str, fl
 
 def _normalize_overrides(overrides: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """
-    Keep only allowed override keys and normalize types conservatively.
-    Unknown keys are dropped deterministically.
+    Validate final structured rate-override keys and normalize numeric values.
     """
     allowed = {
         "model",
         "kappa",
         "A",
-        "Ea",
         "Ea_J_per_mol",
         "dG_act_J_per_mol",
         "standard_conc_M",
@@ -229,16 +227,31 @@ def _normalize_overrides(overrides: Optional[Mapping[str, Any]]) -> Dict[str, An
     out: Dict[str, Any] = {}
     if not overrides:
         return out
+    unknown = sorted(str(key) for key in overrides if key not in allowed)
+    if unknown:
+        raise ValueError(
+            "Unsupported reaction rate override field(s): "
+            + ", ".join(unknown)
+        )
     for k in allowed:
         if k in overrides:
             out[k] = overrides[k]
     # normalize model
     model = out.get("model", None)
     if model is not None:
-        if model not in ("Eyring", "Arrhenius"):
-            raise ValueError("overrides.model must be 'Eyring', 'Arrhenius', or None")
+        if model not in ("Constant", "Eyring", "Arrhenius"):
+            raise ValueError(
+                "overrides.model must be 'Constant', 'Eyring', "
+                "'Arrhenius', or None"
+            )
     # numeric sanity where applicable
-    for num_key in ("kappa", "A", "Ea", "Ea_J_per_mol", "dG_act_J_per_mol", "standard_conc_M"):
+    for num_key in (
+        "kappa",
+        "A",
+        "Ea_J_per_mol",
+        "dG_act_J_per_mol",
+        "standard_conc_M",
+    ):
         if num_key in out and out[num_key] is not None:
             try:
                 out[num_key] = float(out[num_key])  # Ea and A accept float; kappa likewise

@@ -21,9 +21,9 @@ import logging
 import os
 import re
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
-from kindred.core.batch_initial_conditions import reaction_dsl_with_parseable_initial_concentrations
 from kindred.core.mechanism_source import MechanismAuthoringSource
 
 logger = logging.getLogger(__name__)
@@ -33,12 +33,31 @@ __all__ = [
     "get_resource_path",
     "list_resources",
     "get_preset_mechanism_source",
-    "get_parseable_preset_mechanism_source",
     "get_intervention_example_source",
-    "get_parseable_intervention_example_source",
-    "get_all_example_specs",
     "get_all_intervention_example_specs",
+    "InterventionExampleCatalogError",
+    "InterventionExampleSpec",
 ]
+
+
+class InterventionExampleCatalogError(RuntimeError):
+    """The packaged intervention-example catalog is missing or unreadable."""
+
+
+@dataclass(frozen=True, slots=True)
+class InterventionExampleSpec:
+    """One dynamically discovered packaged intervention example."""
+
+    id: str
+    title: str
+    path: str
+    type: str = "intervention"
+
+
+_MANDATORY_INTERVENTION_EXAMPLE_IDS = frozenset(
+    {"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8"}
+)
+_FIXED_PRESET_IDS = frozenset(f"M{index}" for index in range(1, 10))
 
 
 def get_resource_text(relative_path: str, encoding: str = "utf-8") -> str:
@@ -244,20 +263,6 @@ def _natural_key(name: str) -> list[object]:
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
 
 
-def _list_text_resource_files(subdir: str) -> list[str]:
-    names: list[str] = []
-    from importlib.resources import files
-
-    try:
-        base = files("kindred").joinpath("data", subdir)
-        for item in base.iterdir():
-            if item.is_file() and item.suffix == ".txt":
-                names.append(item.name)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Could not list resources in %s: %s", subdir, exc)
-    return sorted(names, key=_natural_key)
-
-
 def _title_from_resource_text(text: str, *, fallback: str) -> str:
     for line in str(text or "").splitlines():
         stripped = line.strip()
@@ -285,20 +290,11 @@ def get_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
     MechanismAuthoringSource
         Complete mechanism source.
     """
-    return MechanismAuthoringSource.from_full_dsl_text(get_resource_text(f"presets/{preset_id}.txt"))
-
-
-def get_parseable_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
-    """
-    Load a bundled preset mechanism as parser/solver-safe simulation DSL.
-
-    Raw bundled presets may include GUI-import authoring Initial Conditions
-    blocks. This API converts them to ordinary `initial:` DSL so direct parser
-    and solver consumers receive initial values in parser-safe text.
-    """
-    source = get_preset_mechanism_source(preset_id)
-    return source.with_reactions_text(
-        reaction_dsl_with_parseable_initial_concentrations(source.reactions_text)
+    normalized = str(preset_id).strip()
+    if normalized not in _FIXED_PRESET_IDS:
+        raise ValueError("Preset mechanism must be one of M1 through M9.")
+    return MechanismAuthoringSource.from_full_dsl_text(
+        get_resource_text(f"presets/{normalized}.txt")
     )
 
 
@@ -316,83 +312,83 @@ def get_intervention_example_source(example_id: str) -> MechanismAuthoringSource
     MechanismAuthoringSource
         Complete mechanism source.
     """
-    return MechanismAuthoringSource.from_full_dsl_text(get_resource_text(f"interventions/{example_id}.txt"))
-
-
-def get_parseable_intervention_example_source(example_id: str) -> MechanismAuthoringSource:
-    """
-    Load a bundled intervention example as parser/solver-safe simulation DSL.
-
-    Raw bundled interventions may include GUI-import authoring Initial
-    Conditions blocks. This API converts them to ordinary `initial:` DSL for
-    direct core parser and solver consumers.
-    """
-    source = get_intervention_example_source(example_id)
-    return source.with_reactions_text(
-        reaction_dsl_with_parseable_initial_concentrations(source.reactions_text)
+    normalized = str(example_id).strip()
+    available = {spec.id for spec in get_all_intervention_example_specs()}
+    if normalized not in available:
+        raise ValueError(
+            f"Unknown packaged intervention example {normalized!r}."
+        )
+    return MechanismAuthoringSource.from_full_dsl_text(
+        get_resource_text(f"interventions/{normalized}.txt")
     )
 
 
-def get_all_example_specs() -> list[dict]:
+def get_all_intervention_example_specs() -> tuple[InterventionExampleSpec, ...]:
     """
-    Get metadata for all bundled preset examples.
+    Discover and validate all bundled intervention examples.
 
-    Returns a list of example specifications discovered from the packaged
-    presets directory rather than a hardcoded set, keeping GUI menus in sync
-    with the shipped files.
+    Discovery is dynamic and naturally ordered, so later non-contiguous IDs
+    are included. The mandatory I1-I8 package contract fails closed when a
+    required file is absent or any discovered resource cannot be read.
 
     Returns
     -------
-    list of dict
-        Each dict contains:
-        - id: str - Example identifier (e.g., "M1")
-        - type: str - "preset"
-        - path: str - Resource path relative to kindred/data
+    tuple of InterventionExampleSpec
+        Typed metadata for every discovered intervention resource.
 
-    Examples
-    --------
-    >>> specs = get_all_example_specs()
-    >>> len(specs)  # Should be 9 (M1-M9)
-    9
-    >>> specs[0]
-    {'id': 'M1', 'type': 'preset', 'path': 'presets/M1.txt'}
+    Raises
+    ------
+    InterventionExampleCatalogError
+        If discovery fails, I1-I8 are incomplete, or a discovered resource is
+        unreadable.
     """
-    examples: list[dict] = []
+    from importlib.resources import files
 
-    for name in _list_text_resource_files("presets"):
-        base = name[:-4] if name.endswith(".txt") else name
-        examples.append({
-            "id": base,
-            "type": "preset",
-            "path": f"presets/{name}",
-        })
+    try:
+        base = files("kindred").joinpath("data", "interventions")
+        names = sorted(
+            (
+                item.name
+                for item in base.iterdir()
+                if item.is_file() and item.suffix == ".txt"
+            ),
+            key=_natural_key,
+        )
+    except Exception as exc:
+        raise InterventionExampleCatalogError(
+            "Unable to discover packaged intervention examples."
+        ) from exc
 
-    return examples
+    discovered_ids = {
+        name[:-4] if name.endswith(".txt") else name
+        for name in names
+    }
+    missing = sorted(
+        _MANDATORY_INTERVENTION_EXAMPLE_IDS - discovered_ids,
+        key=_natural_key,
+    )
+    if missing:
+        raise InterventionExampleCatalogError(
+            "Mandatory packaged intervention examples are missing: "
+            + ", ".join(missing)
+        )
 
-
-def get_all_intervention_example_specs() -> list[dict]:
-    """
-    Get metadata for all bundled intervention examples.
-
-    Returns
-    -------
-    list of dict
-        Each dict contains:
-        - id: str - Example identifier (e.g., "I1")
-        - type: str - "intervention"
-        - path: str - Resource path relative to kindred/data
-    """
-    examples: list[dict] = []
-
-    for name in _list_text_resource_files("interventions"):
+    examples: list[InterventionExampleSpec] = []
+    for name in names:
         base = name[:-4] if name.endswith(".txt") else name
         path = f"interventions/{name}"
-        title = _title_from_resource_text(get_resource_text(path), fallback=base)
-        examples.append({
-            "id": base,
-            "type": "intervention",
-            "path": path,
-            "title": title,
-        })
+        try:
+            text = get_resource_text(path)
+        except Exception as exc:
+            raise InterventionExampleCatalogError(
+                f"Packaged intervention example {base!r} is unreadable."
+            ) from exc
+        examples.append(
+            InterventionExampleSpec(
+                id=base,
+                path=path,
+                title=_title_from_resource_text(text, fallback=base),
+            )
+        )
 
-    return examples
+    return tuple(examples)
