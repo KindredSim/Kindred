@@ -32,16 +32,14 @@ class FitObservationSeries:
     """One visible Y series with its physical source-row identity."""
 
     raw_observation_id: str
+    raw_column: str
     t: np.ndarray
     y: np.ndarray
     source_rows: tuple[int, ...]
-    pre_boundary_segment_keys_by_source_row: tuple[
-        tuple[int, str],
-        ...,
-    ] = ()
 
     def __post_init__(self) -> None:
         raw_observation_id = str(self.raw_observation_id)
+        raw_column = str(self.raw_column)
         if (
             not raw_observation_id
             or raw_observation_id != raw_observation_id.strip()
@@ -50,6 +48,8 @@ class FitObservationSeries:
                 "Fit observation raw identity must be a nonblank "
                 "dataset-local opaque string."
             )
+        if not raw_column or raw_column != raw_column.strip():
+            raise ValueError("Fit observation raw column must be nonblank.")
         t = _readonly_float_vector(self.t, "observation time")
         y = _readonly_float_vector(self.y, "observation value")
         rows = tuple(int(value) for value in self.source_rows)
@@ -62,29 +62,11 @@ class FitObservationSeries:
             raise ValueError(
                 "Fit observation source rows must be unique and positive."
             )
-        pre_boundary_keys = tuple(
-            (int(row), str(key or "").strip())
-            for row, key in self.pre_boundary_segment_keys_by_source_row
-        )
-        keyed_rows = [row for row, _key in pre_boundary_keys]
-        if (
-            len(keyed_rows) != len(set(keyed_rows))
-            or any(row not in rows for row in keyed_rows)
-            or any(not key for _row, key in pre_boundary_keys)
-        ):
-            raise ValueError(
-                "Explicit pre-boundary Fit identity must contain unique "
-                "captured source rows and nonblank exact segment keys."
-            )
         object.__setattr__(self, "t", t)
         object.__setattr__(self, "y", y)
         object.__setattr__(self, "raw_observation_id", raw_observation_id)
+        object.__setattr__(self, "raw_column", raw_column)
         object.__setattr__(self, "source_rows", rows)
-        object.__setattr__(
-            self,
-            "pre_boundary_segment_keys_by_source_row",
-            pre_boundary_keys,
-        )
 
 
 def normalize_dataset_target_weights(

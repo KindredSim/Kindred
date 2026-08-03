@@ -14,12 +14,10 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
-    generated_fast_equilibrium_runtime_parameter_name,
     normalize_existing_equilibrium_rate_authority,
     step_entry_authored_role_is_editable,
 )
-from kindred.core.mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
-from kindred.core.units import UnitsModel
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
 
 from .parameter_namespace import (
@@ -50,7 +48,7 @@ class ParameterDefinition:
     unit : str | None
         Unit owned by the source endpoint, when the value is unitful.
     role : str | None
-        Source role for structured endpoints such as generated fast equilibria.
+        Source role for a structured parameter endpoint.
     min/max : float | None
         Optional source-owned default scan range.
     """
@@ -151,50 +149,6 @@ def extract_parameters_from_mechanism(
                     if step_entry_authored_role_is_editable(entry, role) is not None
                     else authority.authored_role_is_editable(role)
                 ),
-            )
-        )
-
-    step_entry_by_equilibrium_index: dict[int, dict] = {}
-    for entry in step_entry_by_index.values():
-        if not isinstance(entry, dict) or str(entry.get("kind") or "") != "equilibrium":
-            continue
-        equilibrium_index, ok = try_parse_int(entry.get("equilibrium_index", -1))
-        if ok:
-            step_entry_by_equilibrium_index[int(equilibrium_index)] = entry
-    for equilibrium_index, eq in enumerate(eqs):
-        metadata = dict(getattr(eq, "metadata", {}) or {})
-        name = generated_fast_equilibrium_runtime_parameter_name(eq)
-        if name is None:
-            continue
-        dG_eq_j = _finite_value(metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
-        if dG_eq_j is None:
-            continue
-        source_energy_unit = str(
-            metadata.get(EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT)
-            or (getattr(mechanism, "metadata", {}) or {}).get(MechanismMetadataKeys.ENERGY_UNIT)
-            or "kJ/mol"
-        )
-        unit_conv = UnitsModel(energy_unit=source_energy_unit)
-        source_value = float(unit_conv.from_jmol(float(dG_eq_j)))
-        span = max(10.0, abs(source_value) * 0.5)
-        entry = step_entry_by_equilibrium_index.get(int(equilibrium_index), {})
-        step_index = None
-        parsed_step_index, step_ok = try_parse_int(entry.get("step_index")) if entry else (None, False)
-        if step_ok:
-            step_index = int(parsed_step_index)
-        context = str(entry.get("context") or metadata.get("cm_id") or name)
-        parameters.append(
-            ParameterDefinition(
-                name=name,
-                value=source_value,
-                context=context,
-                source="Generated fast dG_eq",
-                step_index=step_index,
-                editable=True,
-                unit=source_energy_unit,
-                role="dG_eq_fast",
-                min=float(source_value - span),
-                max=float(source_value + span),
             )
         )
 

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from kindred.core.intervention_schedule import InterventionSchedule
 
 __all__ = [
-    "DslBuildEdge",
-    "DslBuildState",
     "DslBuildStep",
     "DslMechanismBuildInput",
 ]
@@ -18,39 +17,6 @@ def _require_exact_tuple(value: object, field: str) -> tuple[object, ...]:
     if type(value) is not tuple:
         raise TypeError(f"{field} must be an exact tuple.")
     return value
-
-
-@dataclass(frozen=True, slots=True)
-class DslBuildState:
-    name: str
-    kind: str
-    energy_jmol: float
-    degeneracy: float
-    standard_state: str
-    members: tuple[str, ...] | None
-    std_conc_product_M: float | None
-
-    def __post_init__(self) -> None:
-        if type(self.name) is not str or not self.name:
-            raise TypeError("DSL build state name must be a nonempty exact str.")
-        if type(self.kind) is not str:
-            raise TypeError("DSL build state kind must be an exact str.")
-        if self.members is not None:
-            members = _require_exact_tuple(self.members, "DSL build state members")
-            if any(type(member) is not str for member in members):
-                raise TypeError(
-                    "DSL build state members must contain exact strings."
-                )
-
-
-@dataclass(frozen=True, slots=True)
-class DslBuildEdge:
-    state_a: str
-    state_b: str
-
-    def __post_init__(self) -> None:
-        if type(self.state_a) is not str or type(self.state_b) is not str:
-            raise TypeError("DSL build edge endpoints must be exact strings.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,9 +38,6 @@ class DslBuildStep:
     explicit_rates: tuple[float, ...]
     user_kf_explicit: bool
     user_kr_explicit: bool
-    cm_id: str | None
-    cm_std_ratio: float | None
-    generated_computational_mode: bool
     source_energy_unit: str | None
 
     def __post_init__(self) -> None:
@@ -98,7 +61,6 @@ class DslBuildStep:
             "is_equilibrium",
             "user_kf_explicit",
             "user_kr_explicit",
-            "generated_computational_mode",
         ):
             if type(getattr(self, field)) is not bool:
                 raise TypeError(f"{field} must be an exact bool.")
@@ -115,8 +77,6 @@ class DslMechanismBuildInput:
     kappa_global: float
     temperature_schedule_json: str | None
     intervention_schedule: InterventionSchedule | None
-    states: tuple[DslBuildState, ...]
-    edges: tuple[DslBuildEdge, ...]
     steps: tuple[DslBuildStep, ...]
     algebra_lines: tuple[str, ...]
     initials: tuple[tuple[str, float], ...]
@@ -126,6 +86,25 @@ class DslMechanismBuildInput:
             raise TypeError("DSL mechanism build input version must be exact int 1.")
         if type(self.energy_unit) is not str:
             raise TypeError("DSL mechanism build energy_unit must be an exact str.")
+        if any(
+            type(value) is not float
+            for value in (
+                self.temperature_K,
+                self.standard_conc_M,
+                self.kappa_global,
+            )
+        ) or (
+            not math.isfinite(self.temperature_K)
+            or self.temperature_K <= 0.0
+            or not math.isfinite(self.standard_conc_M)
+            or self.standard_conc_M <= 0.0
+            or not math.isfinite(self.kappa_global)
+            or self.kappa_global <= 0.0
+        ):
+            raise ValueError(
+                "DSL mechanism build temperature, standard concentration, and "
+                "kappa must be positive and finite."
+            )
         if (
             self.temperature_schedule_json is not None
             and type(self.temperature_schedule_json) is not str
@@ -141,16 +120,9 @@ class DslMechanismBuildInput:
                 "DSL mechanism build intervention schedule must be exact "
                 "InterventionSchedule."
             )
-        for field, item_type in (
-            ("states", DslBuildState),
-            ("edges", DslBuildEdge),
-            ("steps", DslBuildStep),
-        ):
-            entries = _require_exact_tuple(getattr(self, field), field)
-            if any(type(entry) is not item_type for entry in entries):
-                raise TypeError(
-                    f"{field} must contain exact {item_type.__name__} values."
-                )
+        steps = _require_exact_tuple(self.steps, "steps")
+        if any(type(entry) is not DslBuildStep for entry in steps):
+            raise TypeError("steps must contain exact DslBuildStep values.")
         algebra_lines = _require_exact_tuple(
             self.algebra_lines,
             "algebra_lines",

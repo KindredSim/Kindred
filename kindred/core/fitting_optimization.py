@@ -28,10 +28,20 @@ __all__ = [
 
 
 def _is_cancelled_error(exc: BaseException) -> bool:
-    if isinstance(exc, (KeyboardInterrupt, FittingCancelled, SimulationCancelled)):
-        return True
-    message = str(exc).lower()
-    return "cancelled" in message or "canceled" in message or "cancel" in message
+    # Cancellation is an explicit typed outcome. Never infer it from an
+    # arbitrary exception message, which could hide a real solver/programming
+    # failure containing the word "cancel".
+    return isinstance(exc, (KeyboardInterrupt, FittingCancelled, SimulationCancelled))
+
+
+def _is_expected_candidate_domain_error(exc: BaseException) -> bool:
+    """Return true only for an evaluator's explicit candidate-domain outcome."""
+
+    return bool(
+        isinstance(exc, FitSimulationError)
+        and isinstance(exc.details, dict)
+        and exc.details.get("candidate_domain") is True
+    )
 
 
 @dataclass
@@ -166,19 +176,14 @@ def fit_parameters(
                     residuals = np.asarray(wrapped_objective(params), dtype=float).reshape(-1)
                 except FittingCancelled:
                     raise
-                except FitSimulationError:
+                except FitSimulationError as exc:
+                    if not _is_expected_candidate_domain_error(exc):
+                        raise
                     return float(effective_penalty)
-                except RuntimeError as exc:
-                    if _is_cancelled_error(exc):
-                        raise FittingCancelled() from exc
-                    return float(effective_penalty)
-                except Exception as exc:
-                    if _is_cancelled_error(exc):
-                        raise FittingCancelled() from exc
-                    return float(effective_penalty)
-
                 if residuals.size == 0 or not np.all(np.isfinite(residuals)):
-                    return float(effective_penalty)
+                    raise OptimizationError(
+                        "Fit objective returned empty or non-finite residuals."
+                    )
                 return float(np.sum(residuals**2))
 
             dim = max(1, len(x0))
@@ -253,12 +258,9 @@ def fit_parameters(
                 _eps = np.minimum(1e-12, (_ub - _lb) / 3.0)
                 x0 = np.clip(x0, _lb + _eps, _ub - _eps)
 
-            if scipy_method == "lm":
-                diff_step = float(np.nanmedian(np.maximum(np.abs(x0) * 1e-4, 1e-6)))
-                if not np.isfinite(diff_step) or diff_step <= 0.0:
-                    diff_step = 1e-6
-            else:
-                diff_step = np.maximum(np.abs(x0) * 1e-4, 1e-6)
+            # scipy interprets diff_step as relative to each coordinate.  Passing
+            # an already scaled absolute step applies that scaling a second time.
+            diff_step = 1e-4
             lsq_kwargs = build_least_squares_kwargs(
                 ftol=ftol,
                 xtol=xtol,
@@ -291,8 +293,6 @@ def fit_parameters(
                     failed_params=_vector_to_param_dict(x_opt),
                     parameter_space="optimizer",
                 )
-            except Exception:
-                residuals = result.fun
 
             try:
                 J = result.jac
@@ -327,11 +327,6 @@ def fit_parameters(
                 parameter_space="physical",
             )
         return _build_failed_result(str(exc), parameter_space="optimizer")
-    except RuntimeError as exc:
-        if _is_cancelled_error(exc):
-            raise FittingCancelled() from exc
-        logger.error("Fitting failed: %s", exc, exc_info=True)
-        raise OptimizationError(f"Fitting failed: {exc}") from exc
     except Exception as exc:
         if _is_cancelled_error(exc):
             raise FittingCancelled() from exc

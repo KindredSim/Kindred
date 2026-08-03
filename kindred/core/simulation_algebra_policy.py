@@ -225,18 +225,6 @@ def fitting_strict_parse_error(exc: BaseException, *, message_prefix: str) -> Fi
     )
 
 
-def fitting_strict_time_ref_error(stmt: object) -> FitSimulationError:
-    return FitSimulationError(
-        "Algebra baseline references like [A](T0) are not supported for fitting (v1).",
-        details={"fatal": True},
-        context=ErrorContext(
-            line=getattr(stmt, "line", None),
-            col=getattr(stmt, "col", None),
-            line_text=getattr(stmt, "line_text", None),
-        ),
-    )
-
-
 def fitting_strict_evaluation_error(
     exc: BaseException,
     *,

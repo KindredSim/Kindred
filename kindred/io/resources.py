@@ -293,8 +293,8 @@ def get_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
     normalized = str(preset_id).strip()
     if normalized not in _FIXED_PRESET_IDS:
         raise ValueError("Preset mechanism must be one of M1 through M9.")
-    return MechanismAuthoringSource.from_full_dsl_text(
-        get_resource_text(f"presets/{normalized}.txt")
+    return MechanismAuthoringSource.from_parts(
+        reactions_text=get_resource_text(f"presets/{normalized}.txt")
     )
 
 
@@ -318,8 +318,8 @@ def get_intervention_example_source(example_id: str) -> MechanismAuthoringSource
         raise ValueError(
             f"Unknown packaged intervention example {normalized!r}."
         )
-    return MechanismAuthoringSource.from_full_dsl_text(
-        get_resource_text(f"interventions/{normalized}.txt")
+    return MechanismAuthoringSource.from_parts(
+        reactions_text=get_resource_text(f"interventions/{normalized}.txt")
     )
 
 

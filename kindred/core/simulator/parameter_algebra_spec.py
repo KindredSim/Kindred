@@ -1,14 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import re
-from typing import List, Sequence, Set, Tuple
+from types import MappingProxyType
+from typing import List, Mapping, Sequence, Set, Tuple
 
+from kindred.core.algebra.parser import (
+    AlgebraBlock,
+    BinaryNode,
+    CallNode,
+    ExprNode,
+    IdentNode,
+    LetStatement,
+    NumberNode,
+    SpeciesRefNode,
+    UnaryNode,
+    parse_algebra,
+)
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import (
     MechanismParameterNamespace,
-    is_reserved_generated_fast_equilibrium_runtime_name,
     is_protected_indexed_identifier,
 )
 
@@ -20,15 +32,12 @@ _MECH_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
 _MECH_PARAM_CI_RE = re.compile(r"^(?:k|kf|kr|keq)(\d+)$", re.IGNORECASE)
 _PROTECTED_STEP_KEY_IDENTIFIERS = frozenset({"k", "kf", "kr", "keq"})
 _NON_ALGEBRA_ASSIGNMENT_PREFIXES = {
-    "comp",
-    "edge",
     "energy",
     "equilibrium",
     "init",
     "initial",
     "kappa",
     "reaction",
-    "state",
     "t",
     "temp_response",
     "temp_step",
@@ -136,23 +145,6 @@ def _raise_protected_step_key_identifier_error(
     )
 
 
-def _raise_reserved_generated_fast_identifier_error(
-    raw_name: str,
-    *,
-    line_number: int,
-    line_content: str,
-) -> None:
-    raise DSLError(
-        f"{raw_name!r} is a reserved generated fast-equilibrium parameter name.",
-        suggestion=(
-            "Generated fast-equilibrium dG parameters are owned by Computational Mode metadata. "
-            "Choose a scalar/observable name outside the 'dG_eq_fast__' namespace."
-        ),
-        line_number=line_number,
-        line_content=line_content,
-    )
-
-
 def _raise_unsupported_bare_assignment_error(
     raw_name: str,
     *,
@@ -173,6 +165,9 @@ class ParameterAssignment:
     expr_src: str
     line_number: int
     line_content: str
+    # Retained canonical AST.  ``expr_src`` remains source provenance only;
+    # execution must consume this object rather than reconstructing text.
+    expr_ast: ExprNode | None = None
 
 
 @dataclass(frozen=True)
@@ -289,6 +284,17 @@ class ParameterAlgebraNamespace:
     builtin_function_names: Set[str]
     protected_symbol_names: Set[str]
 
+    def __post_init__(self) -> None:
+        for field_name in (
+            "mechanism_param_names",
+            "param_assignment_names",
+            "scalar_input_names",
+            "observable_names",
+            "builtin_function_names",
+            "protected_symbol_names",
+        ):
+            object.__setattr__(self, field_name, frozenset(getattr(self, field_name)))
+
     def solver_param_names(self) -> Set[str]:
         return set(self.mechanism_param_names) | set(self.param_assignment_names)
 
@@ -318,11 +324,75 @@ class ParameterAlgebraSpec:
       Derived parameters are re-evaluated whenever solver parameters change.
     """
 
-    param_statements: List[ParameterAssignment]
+    param_statements: Tuple[ParameterAssignment, ...]
     observable_names: Set[str]
     mechanism_namespace: MechanismParameterNamespace
     scalar_input_names: Set[str] = field(default_factory=set)
     override_warnings: Tuple[ParameterOverrideWarning, ...] = field(default_factory=tuple)
+    parameter_block: AlgebraBlock | None = None
+    observable_block: AlgebraBlock | None = None
+    raw_to_canonical_identifiers_by_assignment: Mapping[str, Mapping[str, str]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "param_statements", tuple(self.param_statements))
+        object.__setattr__(self, "observable_names", frozenset(self.observable_names))
+        object.__setattr__(self, "scalar_input_names", frozenset(self.scalar_input_names))
+        object.__setattr__(self, "override_warnings", tuple(self.override_warnings))
+        aliases = {
+            str(name): MappingProxyType(
+                {
+                    str(raw_name): str(canonical_name)
+                    for raw_name, canonical_name in dict(mapping).items()
+                }
+            )
+            for name, mapping in dict(
+                self.raw_to_canonical_identifiers_by_assignment
+            ).items()
+        }
+        object.__setattr__(
+            self,
+            "raw_to_canonical_identifiers_by_assignment",
+            MappingProxyType(aliases),
+        )
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "ParameterAlgebraSpec":
+        import copy
+
+        clone = type(self)(
+            self.param_statements,
+            self.observable_names,
+            copy.deepcopy(self.mechanism_namespace, memo),
+            self.scalar_input_names,
+            self.override_warnings,
+            copy.deepcopy(self.parameter_block, memo),
+            copy.deepcopy(self.observable_block, memo),
+            {
+                name: dict(mapping)
+                for name, mapping in self.raw_to_canonical_identifiers_by_assignment.items()
+            },
+        )
+        memo[id(self)] = clone
+        return clone
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (
+            type(self),
+            (
+                self.param_statements,
+                self.observable_names,
+                self.mechanism_namespace,
+                self.scalar_input_names,
+                self.override_warnings,
+                self.parameter_block,
+                self.observable_block,
+                {
+                    name: dict(mapping)
+                    for name, mapping in self.raw_to_canonical_identifiers_by_assignment.items()
+                },
+            ),
+        )
 
     @property
     def mechanism_param_names(self) -> Set[str]:
@@ -344,6 +414,599 @@ class ParameterAlgebraSpec:
             builtin_function_names=set(symtab.functions().keys()),
             protected_symbol_names=set(symtab.protected_names()),
         )
+
+
+def _iter_expr_identifiers(expr: ExprNode):
+    if isinstance(expr, IdentNode):
+        yield str(expr.name)
+    elif isinstance(expr, (NumberNode, SpeciesRefNode)):
+        return
+    elif isinstance(expr, UnaryNode):
+        yield from _iter_expr_identifiers(expr.rhs)
+    elif isinstance(expr, BinaryNode):
+        yield from _iter_expr_identifiers(expr.lhs)
+        yield from _iter_expr_identifiers(expr.rhs)
+    elif isinstance(expr, CallNode):
+        for arg in expr.args:
+            yield from _iter_expr_identifiers(arg)
+
+
+def _iter_call_names(expr: ExprNode):
+    if isinstance(expr, CallNode):
+        yield str(expr.name)
+        for arg in expr.args:
+            yield from _iter_call_names(arg)
+    elif isinstance(expr, UnaryNode):
+        yield from _iter_call_names(expr.rhs)
+    elif isinstance(expr, BinaryNode):
+        yield from _iter_call_names(expr.lhs)
+        yield from _iter_call_names(expr.rhs)
+
+
+def _canonicalize_parameter_expr(
+    expr: ExprNode,
+    *,
+    mechanism_namespace: MechanismParameterNamespace,
+    scalar_input_names: Set[str],
+    assignment: ParameterAssignment,
+) -> tuple[ExprNode, Mapping[str, str]]:
+    """Canonicalize mechanism identifiers while retaining the parsed AST."""
+    if isinstance(expr, (NumberNode, SpeciesRefNode)):
+        return expr, {}
+    if isinstance(expr, IdentNode):
+        raw_name = str(expr.name)
+        resolution = mechanism_namespace.resolve(raw_name)
+        invalid = (
+            mechanism_namespace.invalid_protected_indexed_identifier(raw_name)
+            if resolution.canonical_name is None
+            else None
+        )
+        if invalid is not None:
+            _raise_invalid_protected_indexed_identifier_error(
+                raw_name,
+                suggested_names=invalid.suggested_names,
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        if resolution.canonical_name is None and is_protected_indexed_parameter_identifier(raw_name):
+            _raise_invalid_protected_indexed_identifier_error(
+                raw_name,
+                suggested_names=(),
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        if resolution.canonical_name is None or raw_name in scalar_input_names:
+            return expr, {}
+        return IdentNode(resolution.canonical_name), {raw_name: resolution.canonical_name}
+    if isinstance(expr, UnaryNode):
+        rhs, aliases = _canonicalize_parameter_expr(
+            expr.rhs,
+            mechanism_namespace=mechanism_namespace,
+            scalar_input_names=scalar_input_names,
+            assignment=assignment,
+        )
+        return UnaryNode(expr.op, rhs), aliases
+    if isinstance(expr, BinaryNode):
+        lhs, lhs_aliases = _canonicalize_parameter_expr(
+            expr.lhs,
+            mechanism_namespace=mechanism_namespace,
+            scalar_input_names=scalar_input_names,
+            assignment=assignment,
+        )
+        rhs, rhs_aliases = _canonicalize_parameter_expr(
+            expr.rhs,
+            mechanism_namespace=mechanism_namespace,
+            scalar_input_names=scalar_input_names,
+            assignment=assignment,
+        )
+        aliases = dict(lhs_aliases)
+        for raw_name, canonical_name in rhs_aliases.items():
+            old = aliases.get(raw_name)
+            if old is not None and old != canonical_name:
+                raise ValueError(
+                    f"Conflicting mechanism identifier mapping for {raw_name!r}."
+                )
+            aliases[raw_name] = canonical_name
+        return BinaryNode(expr.op, lhs, rhs), aliases
+    if isinstance(expr, CallNode):
+        args: list[ExprNode] = []
+        aliases: dict[str, str] = {}
+        for arg in expr.args:
+            canonical_arg, arg_aliases = _canonicalize_parameter_expr(
+                arg,
+                mechanism_namespace=mechanism_namespace,
+                scalar_input_names=scalar_input_names,
+                assignment=assignment,
+            )
+            args.append(canonical_arg)
+            for raw_name, canonical_name in arg_aliases.items():
+                old = aliases.get(raw_name)
+                if old is not None and old != canonical_name:
+                    raise ValueError(
+                        f"Conflicting mechanism identifier mapping for {raw_name!r}."
+                    )
+                aliases[raw_name] = canonical_name
+        return CallNode(expr.name, tuple(args)), aliases
+    return expr, {}
+
+
+def _compile_retained_parameter_block(
+    assignments: Sequence[ParameterAssignment],
+    *,
+    mechanism_namespace: MechanismParameterNamespace,
+    scalar_input_names: Set[str],
+    parsed: AlgebraBlock,
+) -> tuple[AlgebraBlock, Mapping[str, Mapping[str, str]]]:
+    """Canonicalize the parameter slice of the retained admission AST."""
+    canonical_lines: list[LetStatement] = []
+    alias_map: dict[str, Mapping[str, str]] = {}
+    for assignment, statement in zip(assignments, parsed.lines):
+        expr, aliases = _canonicalize_parameter_expr(
+            statement.expr,
+            mechanism_namespace=mechanism_namespace,
+            scalar_input_names=set(scalar_input_names),
+            assignment=assignment,
+        )
+        canonical_lines.append(
+            LetStatement(
+                name=assignment.name,
+                expr=expr,
+                line=int(assignment.line_number or statement.line),
+                col=int(statement.col),
+                line_text=assignment.line_content,
+            )
+        )
+        alias_map[assignment.name] = dict(aliases)
+    block = AlgebraBlock(
+        lines=tuple(canonical_lines),
+        ast=tuple(stmt.expr for stmt in canonical_lines),
+        static_values=parsed.static_values,
+    )
+    return block, alias_map
+
+
+def _validate_retained_parameter_program(
+    spec: ParameterAlgebraSpec,
+    *,
+    assignments: Sequence[ParameterAssignment],
+    block: AlgebraBlock,
+) -> None:
+    """Validate names, roles, and dependency cycles before acceptance."""
+    namespace = spec.namespace_model()
+    defined = {str(assignment.name) for assignment in assignments}
+    # Parameter algebra is static solver-parameter algebra. Runtime state,
+    # row-local time, and temperature belong to dynamic ``let`` observables and
+    # are rejected here before any source or mechanism mutation.
+    allowed_constants = set(namespace.protected_symbol_names) - {"T"}
+    dependencies: dict[str, set[str]] = {}
+    for assignment, statement in zip(assignments, block.lines):
+        idents = set(_iter_expr_identifiers(statement.expr))
+        if statement.expr.has_species_ref() or "T" in idents or "t" in idents:
+            raise DSLError(
+                f"Parameter expression for {assignment.name!r} must be static.",
+                suggestion="Use numeric literals, other static parameters, and supported constants; put dynamic state expressions in a 'let'.",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        dynamic_scalars = sorted(idents & set(namespace.scalar_input_names))
+        if dynamic_scalars:
+            raise DSLError(
+                "Parameter expression cannot reference dynamic scalar input(s): "
+                + ", ".join(repr(name) for name in dynamic_scalars),
+                suggestion="Use admitted solver parameters in 'param' expressions and consume dynamic scalars from a 'let'.",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        if not (idents - allowed_constants):
+            # Literal/constant-only parameter expressions are statically
+            # admitted; reject domain/division failures before mutation.
+            try:
+                import numpy as np
+
+                from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
+
+                evaluate_block(
+                    AlgebraBlock(
+                        lines=(statement,),
+                        ast=(statement.expr,),
+                        static_values={},
+                    ),
+                    EvaluationContext(
+                        t=np.array([0.0]),
+                        species_series={},
+                        initials={},
+                        species_names=set(),
+                        symtab=SymbolTable(),
+                    ),
+                )
+            except Exception as exc:
+                raise DSLError(
+                    f"Static parameter expression for {assignment.name!r} is invalid: {exc}",
+                    line_number=assignment.line_number,
+                    line_content=assignment.line_content,
+                ) from exc
+        unknown_functions = {
+            name
+            for name in _iter_call_names(statement.expr)
+            if name not in namespace.builtin_function_names
+        }
+        if unknown_functions:
+            raise DSLError(
+                "Unknown function(s) in parameter expression: "
+                + ", ".join(repr(name) for name in sorted(unknown_functions)),
+                suggestion="Use a supported Algebra math function.",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        unknown = {
+            name
+            for name in idents
+            if name not in defined
+            and name not in namespace.solver_param_names()
+            and name not in allowed_constants
+        }
+        if unknown:
+            raise DSLError(
+                "Unknown name(s) in parameter expression: "
+                + ", ".join(repr(name) for name in sorted(unknown)),
+                suggestion="Parameter expressions may only reference other parameters and supported constants.",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        dependencies[assignment.name] = {
+            name for name in idents if name in defined
+        }
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str, stack: list[str]) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            cycle = stack[stack.index(name):] + [name]
+            raise DSLError(
+                "Parameter algebra has a dependency cycle: " + " -> ".join(cycle),
+                suggestion="Rewrite the param definitions so they form an acyclic dependency graph.",
+            )
+        visiting.add(name)
+        for dependency in sorted(dependencies.get(name, ())):
+            visit(dependency, stack + [name])
+        visiting.remove(name)
+        visited.add(name)
+
+    for name in sorted(defined):
+        visit(name, [])
+
+    # Catch domains that become statically decidable through a chain of
+    # literal/constant assignments (for example ``param a = 0`` followed by
+    # ``param b = 1 / a``), across the static dependency chain.
+    static_names: set[str] = set()
+    pending = list(assignments)
+    changed = True
+    statement_by_name = {
+        str(assignment.name): statement
+        for assignment, statement in zip(assignments, block.lines)
+    }
+    while changed:
+        changed = False
+        for assignment in pending:
+            name = str(assignment.name)
+            if name in static_names:
+                continue
+            statement = statement_by_name[name]
+            idents = set(_iter_expr_identifiers(statement.expr))
+            if statement.expr.has_species_ref() or (idents & {"T", "t"}):
+                continue
+            external = idents - defined - allowed_constants
+            if external:
+                continue
+            if all(dependency in static_names for dependency in dependencies.get(name, ())):
+                static_names.add(name)
+                changed = True
+    if static_names:
+        ordered_static_names: list[str] = []
+        ordered_seen: set[str] = set()
+
+        def append_static(name: str) -> None:
+            if name in ordered_seen:
+                return
+            for dependency in sorted(dependencies.get(name, ())):
+                if dependency in static_names:
+                    append_static(dependency)
+            ordered_seen.add(name)
+            ordered_static_names.append(name)
+
+        for assignment in assignments:
+            if str(assignment.name) in static_names:
+                append_static(str(assignment.name))
+        static_statements = tuple(
+            statement_by_name[name]
+            for name in ordered_static_names
+        )
+        try:
+            import numpy as np
+
+            from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
+
+            static_series, static_scalars = evaluate_block(
+                AlgebraBlock(
+                    lines=static_statements,
+                    ast=tuple(statement.expr for statement in static_statements),
+                    static_values={},
+                ),
+                EvaluationContext(
+                    t=np.array([0.0]),
+                    species_series={},
+                    initials={},
+                    species_names=set(),
+                    symtab=SymbolTable(),
+                ),
+            )
+            for name in ordered_static_names:
+                if name not in namespace.mechanism_param_names:
+                    continue
+                if name in static_scalars:
+                    value = float(static_scalars[name])
+                else:
+                    values = static_series.get(name)
+                    if values is None or values.size != 1:
+                        raise ValueError(
+                            f"Static mechanism parameter {name!r} has no scalar value."
+                        )
+                    value = float(values[0])
+                if not np.isfinite(value) or value <= 0.0:
+                    raise ValueError(
+                        f"Mechanism parameter {name!r} must be a positive finite real."
+                    )
+        except Exception as exc:
+            name = next(
+                (
+                    str(statement.name)
+                    for statement in static_statements
+                    if int(getattr(exc, "line", 0) or 0) == int(statement.line)
+                ),
+                str(static_statements[0].name),
+            )
+            assignment = next(item for item in assignments if item.name == name)
+            raise DSLError(
+                f"Static parameter expression for {name!r} is invalid: {exc}",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            ) from exc
+
+
+def _validate_retained_observable_program(
+    spec: ParameterAlgebraSpec,
+    *,
+    block: AlgebraBlock,
+) -> None:
+    """Validate retained ``let`` names, domains, and dependency cycles.
+
+    This is admission-only validation.  Dynamic concentration, ``t``/``T``,
+    coefficient, and scalar references are intentionally left for the live
+    execution context rather than evaluated against a nominal value.
+    """
+    namespace = spec.namespace_model()
+    defined_params = set(namespace.param_assignment_names)
+    defined_lets = {str(statement.name) for statement in block.lines}
+    allowed_constants = set(namespace.protected_symbol_names)
+    dynamic_identifiers = {"t", "T"}
+    dependencies: dict[str, set[str]] = {}
+
+    for statement in block.lines:
+        name = str(statement.name)
+        idents = set(_iter_expr_identifiers(statement.expr))
+        dynamic = bool(
+            statement.expr.has_species_ref()
+            or (idents & dynamic_identifiers)
+        )
+        if not dynamic and not (idents - allowed_constants):
+            try:
+                import numpy as np
+
+                from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
+
+                evaluate_block(
+                    AlgebraBlock(
+                        lines=(statement,),
+                        ast=(statement.expr,),
+                        static_values={},
+                    ),
+                    EvaluationContext(
+                        t=np.array([0.0]),
+                        species_series={},
+                        initials={},
+                        species_names=set(),
+                        symtab=SymbolTable(),
+                    ),
+                )
+            except Exception as exc:
+                raise DSLError(
+                    f"Static observable expression for {name!r} is invalid: {exc}",
+                    line_number=statement.line,
+                    line_content=statement.line_text,
+                ) from exc
+
+        unknown_functions = {
+            function_name
+            for function_name in _iter_call_names(statement.expr)
+            if function_name not in namespace.builtin_function_names
+        }
+        if unknown_functions:
+            raise DSLError(
+                "Unknown function(s) in observable expression: "
+                + ", ".join(repr(function_name) for function_name in sorted(unknown_functions)),
+                suggestion="Use a supported Algebra math function.",
+                line_number=statement.line,
+                line_content=statement.line_text,
+            )
+
+        unknown = {
+            identifier
+            for identifier in idents
+            if identifier not in defined_params
+            and identifier not in defined_lets
+            and identifier not in namespace.mechanism_param_names
+            and spec.mechanism_namespace.resolve(identifier).canonical_name is None
+            and identifier not in namespace.scalar_input_names
+            and identifier not in allowed_constants
+            and identifier not in dynamic_identifiers
+        }
+        if unknown:
+            raise DSLError(
+                "Unknown name(s) in observable expression: "
+                + ", ".join(repr(identifier) for identifier in sorted(unknown)),
+                suggestion="Observable expressions may reference retained parameters, mechanism coefficients, scalars, and supported constants.",
+                line_number=statement.line,
+                line_content=statement.line_text,
+            )
+        dependencies[name] = {
+            identifier
+            for identifier in idents
+            if identifier in defined_lets
+        }
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str, stack: list[str]) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            cycle = stack[stack.index(name):] + [name]
+            raise DSLError(
+                "Observable algebra has a dependency cycle: " + " -> ".join(cycle),
+                suggestion="Rewrite the let definitions so they form an acyclic dependency graph.",
+            )
+        visiting.add(name)
+        for dependency in sorted(dependencies.get(name, ())):
+            visit(dependency, stack + [name])
+        visiting.remove(name)
+        visited.add(name)
+
+    for name in sorted(defined_lets):
+        visit(name, [])
+
+    static_names: set[str] = set()
+    statement_by_name = {str(statement.name): statement for statement in block.lines}
+    changed = True
+    while changed:
+        changed = False
+        for name, statement in statement_by_name.items():
+            if name in static_names:
+                continue
+            idents = set(_iter_expr_identifiers(statement.expr))
+            if statement.expr.has_species_ref() or (idents & dynamic_identifiers):
+                continue
+            # A let that depends on a retained static parameter is valid, but
+            # its domain is decided only after the prepared scalar snapshot is
+            # available. Do not attempt nominal admission-time evaluation.
+            external = idents - defined_lets - allowed_constants
+            if external:
+                continue
+            if all(dependency in static_names for dependency in dependencies.get(name, ())):
+                static_names.add(name)
+                changed = True
+    if static_names:
+        ordered_static_names: list[str] = []
+        ordered_seen: set[str] = set()
+
+        def append_static(name: str) -> None:
+            if name in ordered_seen:
+                return
+            for dependency in sorted(dependencies.get(name, ())):
+                if dependency in static_names:
+                    append_static(dependency)
+            ordered_seen.add(name)
+            ordered_static_names.append(name)
+
+        for name in statement_by_name:
+            if name in static_names:
+                append_static(name)
+        static_statements = tuple(
+            statement_by_name[name]
+            for name in ordered_static_names
+        )
+        try:
+            import numpy as np
+
+            from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
+
+            evaluate_block(
+                AlgebraBlock(
+                    lines=static_statements,
+                    ast=tuple(statement.expr for statement in static_statements),
+                    static_values={},
+                ),
+                EvaluationContext(
+                    t=np.array([0.0]),
+                    species_series={},
+                    initials={},
+                    species_names=set(),
+                    symtab=SymbolTable(),
+                ),
+            )
+        except Exception as exc:
+            name = next(
+                (
+                    str(statement.name)
+                    for statement in static_statements
+                    if int(getattr(exc, "line", 0) or 0) == int(statement.line)
+                ),
+                str(static_statements[0].name),
+            )
+            raise DSLError(
+                f"Static observable expression for {name!r} is invalid: {exc}",
+                line_number=statement_by_name[name].line,
+                line_content=statement_by_name[name].line_text,
+            ) from exc
+
+
+def _compile_retained_algebra_program(
+    algebra_lines: Sequence[Tuple[int, str]],
+) -> tuple[AlgebraBlock, tuple[tuple[str, int, str], ...]]:
+    """Parse all accepted Algebra declarations in one admission pass.
+
+    The returned declaration descriptors are ``(kind, source_line, source)``
+    and align one-for-one with the parsed block statements.  Parameter and
+    observable views are partitioned from this retained block; no later layer
+    needs to rebuild source text.
+    """
+    source_lines = ["# Algebra"]
+    descriptors: list[tuple[str, int, str]] = []
+    for line_number, raw in algebra_lines:
+        classification = classify_parameter_algebra_declaration(
+            raw,
+            line_number=line_number,
+            allow_non_algebra_bare_assignment=False,
+        )
+        if classification.kind not in {"param", "let"}:
+            continue
+        match = _PARAM_STMT_RE.match(classification.code) if classification.kind == "param" else _LET_STMT_RE.match(classification.code)
+        if match is None:
+            raise DSLError(
+                f"Malformed {classification.kind} declaration.",
+                line_number=line_number,
+                line_content=raw,
+            )
+        name = str(match.group(1))
+        expr_src = str(match.group(2) or "").strip()
+        source_lines.append(f"let {name} = {expr_src}")
+        descriptors.append((classification.kind, int(line_number), str(raw)))
+    try:
+        block = parse_algebra("\n".join(source_lines) + "\n")
+    except Exception as exc:
+        statement_index = int(getattr(exc, "line", 0) or 0) - 2
+        if 0 <= statement_index < len(descriptors):
+            _kind, line_number, line_content = descriptors[statement_index]
+            raise DSLError(
+                str(exc),
+                line_number=line_number,
+                line_content=line_content,
+            ) from exc
+        raise DSLError(str(exc)) from exc
+    return block, tuple(descriptors)
 
 
 def mechanism_parameter_name_pattern() -> re.Pattern[str]:
@@ -414,12 +1077,6 @@ def extract_parameter_assignments_from_algebra_lines(
 
         if classification.kind == "param":
             raw_name = classification.raw_name
-            if is_reserved_generated_fast_equilibrium_runtime_name(raw_name):
-                _raise_reserved_generated_fast_identifier_error(
-                    raw_name,
-                    line_number=line_no,
-                    line_content=original,
-                )
             resolution = mechanism_namespace.resolve(raw_name)
             if classification.invalid_protected_indexed_identifier:
                 _raise_invalid_protected_indexed_identifier_error(
@@ -473,12 +1130,6 @@ def extract_parameter_assignments_from_algebra_lines(
 
         if classification.kind == "let":
             target_raw = classification.raw_name
-            if is_reserved_generated_fast_equilibrium_runtime_name(target_raw):
-                _raise_reserved_generated_fast_identifier_error(
-                    target_raw,
-                    line_number=line_no,
-                    line_content=original,
-                )
             resolution = mechanism_namespace.resolve(target_raw)
             target = resolution.canonical_name or target_raw
             if resolution.canonical_name is not None and target in mechanism_param_names:
@@ -531,12 +1182,6 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
         if classification.kind == "param":
             continue
         if classification.kind == "let":
-            if is_reserved_generated_fast_equilibrium_runtime_name(classification.raw_name):
-                _raise_reserved_generated_fast_identifier_error(
-                    classification.raw_name,
-                    line_number=_line_no,
-                    line_content=raw.rstrip("\n"),
-                )
             if is_protected_indexed_parameter_identifier(classification.raw_name):
                 _raise_protected_observable_identifier_error(
                     classification.raw_name,
@@ -586,9 +1231,70 @@ def parse_parameter_algebra_spec_from_dsl_text(
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
-    return ParameterAlgebraSpec(
+    initial_spec = ParameterAlgebraSpec(
         param_statements=list(assignments),
         observable_names=set(observables),
         mechanism_namespace=mechanism_namespace,
         scalar_input_names=set(scalar_input_names or ()),
+    )
+    full_block, descriptors = _compile_retained_algebra_program(lines)
+    parameter_indices = [
+        index for index, (kind, _line_number, _line_content) in enumerate(descriptors)
+        if kind == "param"
+    ]
+    observable_indices = [
+        index for index, (kind, _line_number, _line_content) in enumerate(descriptors)
+        if kind == "let"
+    ]
+    parameter_raw_block = AlgebraBlock(
+        lines=tuple(full_block.lines[index] for index in parameter_indices),
+        ast=tuple(full_block.ast[index] for index in parameter_indices),
+        static_values={
+            name: value
+            for name, value in full_block.static_value_map().items()
+            if name in {assignments[i].name for i in range(len(assignments))}
+        },
+    )
+    if assignments:
+        block, alias_map = _compile_retained_parameter_block(
+            assignments,
+            mechanism_namespace=mechanism_namespace,
+            scalar_input_names=set(scalar_input_names or ()),
+            parsed=parameter_raw_block,
+        )
+        _validate_retained_parameter_program(
+            initial_spec,
+            assignments=assignments,
+            block=block,
+        )
+        retained_assignments = [
+            replace(
+                assignment,
+                expr_ast=statement.expr,
+            )
+            for assignment, statement in zip(assignments, block.lines)
+        ]
+    else:
+        # Keep an explicit empty parameter block so let-only Algebra still
+        # carries one accepted, partitioned program through the pipeline.
+        block = parameter_raw_block
+        alias_map = {}
+        retained_assignments = []
+
+    observable_block = AlgebraBlock(
+        lines=tuple(full_block.lines[index] for index in observable_indices),
+        ast=tuple(full_block.ast[index] for index in observable_indices),
+        static_values={
+            name: value
+            for name, value in full_block.static_value_map().items()
+            if name in {observables_name for observables_name in observables}
+        },
+    )
+    _validate_retained_observable_program(initial_spec, block=observable_block)
+    return replace(
+        initial_spec,
+        param_statements=retained_assignments,
+        parameter_block=block,
+        observable_block=observable_block,
+        raw_to_canonical_identifiers_by_assignment=alias_map,
     )

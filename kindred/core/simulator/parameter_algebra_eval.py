@@ -18,7 +18,6 @@ from kindred.core.algebra.parser import (
     NumberNode,
     SpeciesRefNode,
     UnaryNode,
-    parse_algebra,
 )
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
@@ -83,14 +82,6 @@ def _toposort(names: Sequence[str], deps: Dict[str, Set[str]]) -> List[str]:
     for name in names:
         visit(name)
     return order
-
-
-def _parse_param_block(assignments: Sequence[ParameterAssignment]) -> AlgebraBlock:
-    lines = ["# Algebra"]
-    for assignment in assignments:
-        lines.append(f"let {assignment.name} = {assignment.expr_src}")
-    block_src = "\n".join(lines) + "\n"
-    return parse_algebra(block_src)
 
 
 def _map_algebra_error_to_assignment(
@@ -229,38 +220,48 @@ def _parse_canonicalized_param_block(
     spec: ParameterAlgebraSpec,
     assignments: Sequence[ParameterAssignment],
 ) -> _CanonicalizedParameterBlock:
-    parsed_block = _parse_param_block(assignments)
-    scalar_input_names = set(spec.scalar_input_names)
-    lines: List[LetStatement] = []
-    raw_to_canonical_identifiers_by_assignment: Dict[str, Mapping[str, str]] = {}
-
-    for assignment, stmt in zip(assignments, parsed_block.lines):
-        canonicalized_expr = _canonicalize_mechanism_param_identifiers(
-            stmt.expr,
-            mechanism_namespace=spec.mechanism_namespace,
-            scalar_input_names=scalar_input_names,
-            assignment=assignment,
+    retained = spec.parameter_block
+    if retained is None:
+        raise DSLError(
+            "Parameter algebra has no retained admitted AST.",
+            suggestion="Re-admit the mechanism source before evaluating parameter algebra.",
         )
+    retained_by_name = {str(statement.name): statement for statement in retained.lines}
+    lines: List[LetStatement] = []
+    static_values = retained.static_value_map()
+    aliases = dict(spec.raw_to_canonical_identifiers_by_assignment)
+    for assignment in assignments:
+        statement = retained_by_name.get(str(assignment.name))
+        expr = assignment.expr_ast
+        if statement is not None:
+            expr = statement.expr
+        if expr is None:
+            raise DSLError(
+                f"Parameter algebra assignment {assignment.name!r} has no retained AST.",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
         lines.append(
             LetStatement(
-                name=stmt.name,
-                expr=canonicalized_expr.expr,
-                line=stmt.line,
-                col=stmt.col,
-                line_text=stmt.line_text,
+                name=str(assignment.name),
+                expr=expr,
+                line=int(assignment.line_number or (statement.line if statement else 0)),
+                col=int(statement.col if statement is not None else 1),
+                line_text=str(assignment.line_content),
             )
         )
-        raw_to_canonical_identifiers_by_assignment[assignment.name] = dict(
-            canonicalized_expr.raw_to_canonical_identifiers
-        )
-
+    selected_names = {str(assignment.name) for assignment in assignments}
     return _CanonicalizedParameterBlock(
         block=AlgebraBlock(
-            lines=lines,
-            ast=[line.expr for line in lines],
-            static_values=dict(parsed_block.static_values),
+            lines=tuple(lines),
+            ast=tuple(line.expr for line in lines),
+            static_values={name: value for name, value in static_values.items() if name in selected_names},
         ),
-        raw_to_canonical_identifiers_by_assignment=dict(raw_to_canonical_identifiers_by_assignment),
+        raw_to_canonical_identifiers_by_assignment={
+            str(name): dict(mapping)
+            for name, mapping in aliases.items()
+            if str(name) in selected_names
+        },
     )
 
 
@@ -332,17 +333,8 @@ def _build_assignment_analysis(
     if expr.has_species_ref():
         return _analysis(
             DSLError(
-                "Parameter expressions cannot reference concentrations like [A], [A]_0, or [A](T0)",
+                "Parameter expressions cannot reference concentrations like [A] or [A]_0",
                 suggestion="Use only numeric literals, math functions, and other parameters (k1, k2, ...).",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        )
-    if expr.has_time_ref():
-        return _analysis(
-            DSLError(
-                "Parameter expressions cannot reference baseline/time-dependent terms (T0)",
-                suggestion="Use only time-independent expressions for parameter algebra.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
@@ -352,6 +344,31 @@ def _build_assignment_analysis(
             DSLError(
                 "Parameter expressions cannot reference temperature 'T' (keep parameter algebra static)",
                 suggestion="If you need temperature-dependent rates, use Arrhenius/Eyring reaction models instead.",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        )
+    if "t" in idents:
+        return _analysis(
+            DSLError(
+                "Parameter expressions cannot reference row-local time 't'",
+                suggestion="Use time only in dynamic 'let' observables.",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        )
+
+    dynamic_scalar_inputs = sorted(idents & set(namespace.scalar_input_names))
+    if dynamic_scalar_inputs:
+        display_names = _display_identifier_names(
+            dynamic_scalar_inputs,
+            raw_to_canonical_identifiers=raw_to_canonical_identifiers,
+        )
+        return _analysis(
+            DSLError(
+                "Parameter expressions cannot reference dynamic scalar input(s): "
+                + ", ".join(repr(name) for name in display_names),
+                suggestion="Use admitted solver parameters in 'param' expressions and consume dynamic scalars from a 'let'.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
@@ -399,8 +416,6 @@ def _build_assignment_analysis(
             continue
         if name in solver_params:
             continue
-        if name in namespace.scalar_input_names:
-            continue
         if name in allowed_constants:
             continue
         unknown.add(name)
@@ -422,7 +437,7 @@ def _build_assignment_analysis(
     referenced_input_names = sorted(
         name
         for name in idents
-        if (name in solver_params or name in namespace.scalar_input_names) and name not in defined_names
+        if name in solver_params and name not in defined_names
     )
     missing = [name for name in referenced_input_names if name not in base_values]
     if missing:
@@ -616,6 +631,11 @@ def evaluate_parameter_algebra(
                     observable_names=set(spec.observable_names),
                     mechanism_namespace=spec.mechanism_namespace,
                     scalar_input_names=set(spec.scalar_input_names),
+                    parameter_block=spec.parameter_block,
+                    observable_block=spec.observable_block,
+                    raw_to_canonical_identifiers_by_assignment=(
+                        dict(spec.raw_to_canonical_identifiers_by_assignment)
+                    ),
                 )
                 val_map = evaluate_parameter_algebra_in_context(
                     tmp_spec,
@@ -664,7 +684,6 @@ def evaluate_parameter_algebra(
         initials={},
         species_names=set(),
         symtab=symtab,
-        baseline=None,
     )
 
     try:
@@ -731,7 +750,6 @@ def evaluate_parameter_algebra_in_context(
         initials={},
         species_names=set(),
         symtab=symtab,
-        baseline=None,
     )
     try:
         series, scalars = evaluate_block(block, ctx)

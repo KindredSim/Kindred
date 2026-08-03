@@ -13,7 +13,7 @@ import copy
 import hashlib
 import logging
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 
@@ -33,6 +33,7 @@ from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     SimulationExecutionRequest,
     _available_energy_binding_names,
+    _apply_execution_parameter_algebra_and_cyclicity,
     _bind_requested_parameters_to_prepared_mechanism,
     _bind_symbolic_jacobian_for_current_mechanism,
     _build_solver_config,
@@ -46,7 +47,6 @@ from kindred.core.simulation_preparation import (
     _symbolic_jacobian_for_bind_failure,
     build_simulation_request_from_prepared_run,
     canonicalize_request_parameter_names,
-    metadata_view_for_mechanism,
     partition_simulation_parameter_values,
     prepare_bound_mechanism,
     prepare_simulation_worker_run,
@@ -54,6 +54,7 @@ from kindred.core.simulation_preparation import (
     SimulationPreparationError,
 )
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+from kindred.core.simulation_result_finalization import finalize_simulation_result
 from kindred.core.simulation_series_payload import SimulationSeriesPayload
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
@@ -118,6 +119,7 @@ def _coerce_consumed_parameter_value(
         failed_params=dict(failed_params or {}) or None,
         details={
             "fatal": origin not in _OPTIMIZER_PARAMETER_ORIGINS,
+            "candidate_domain": origin in _OPTIMIZER_PARAMETER_ORIGINS,
             "parameter_origin": origin,
         },
     )
@@ -176,7 +178,7 @@ class FittingSeriesEvaluation:
     series: SimulationSeriesPayload
     segment_ids: np.ndarray
     segment_keys: tuple[str, ...]
-    pre_boundary_sample_mask: np.ndarray
+    discontinuity_ids: np.ndarray
     intervention_execution: InterventionExecutionContract
 
     def __post_init__(self) -> None:
@@ -202,8 +204,8 @@ class FittingSeriesEvaluation:
             raise ValueError(
                 "Fit segment identity must be ordered and nonnegative."
             )
-        if np.any(np.diff(times) < 0.0):
-            raise ValueError("Fit simulation time must be ordered.")
+        if np.any(np.diff(times) <= 0.0):
+            raise ValueError("Fit simulation time must be strictly increasing.")
         segment_keys = tuple(str(value or "").strip() for value in self.segment_keys)
         if (
             len(segment_keys) != times.size
@@ -212,51 +214,21 @@ class FittingSeriesEvaluation:
             raise ValueError(
                 "Fit segment keys must align with simulation time and be nonblank."
             )
-        pre_boundary_sample_mask = np.asarray(
-            self.pre_boundary_sample_mask,
-            dtype=bool,
+        discontinuity_ids = np.asarray(
+            self.discontinuity_ids,
+            dtype=np.int64,
         ).reshape(-1).copy()
-        if pre_boundary_sample_mask.size != times.size:
-            raise ValueError(
-                "Fit pre-boundary identity must align with simulation time."
-            )
-        if times.size > 1:
-            discontinuities = (
-                self.intervention_execution.runtime_discontinuities_for_span(
-                    float(times[0]),
-                    float(times[-1]),
-                )
-            )
-            discontinuity_times = np.asarray(discontinuities, dtype=float)
-            expected_post = np.searchsorted(
-                discontinuity_times,
-                times,
-                side="right",
-            )
-            expected_pre = np.searchsorted(
-                discontinuity_times,
-                times,
-                side="left",
-            )
-            expected = np.where(
-                pre_boundary_sample_mask,
-                expected_pre,
-                expected_post,
-            )
-            if not np.array_equal(segment_ids, expected):
-                raise ValueError(
-                    "Fit segment identity conflicts with the intervention "
-                    "execution contract."
-                )
+        if (
+            discontinuity_ids.size != times.size
+            or np.any(discontinuity_ids < 0)
+            or np.any(np.diff(discontinuity_ids) < 0)
+        ):
+            raise ValueError("Fit discontinuity identity must align with simulation time.")
         segment_ids.setflags(write=False)
-        pre_boundary_sample_mask.setflags(write=False)
+        discontinuity_ids.setflags(write=False)
         object.__setattr__(self, "segment_ids", segment_ids)
         object.__setattr__(self, "segment_keys", segment_keys)
-        object.__setattr__(
-            self,
-            "pre_boundary_sample_mask",
-            pre_boundary_sample_mask,
-        )
+        object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
 
 
 def evaluate_fitting_series(
@@ -287,149 +259,6 @@ def evaluate_fitting_series(
             "SimulationSeriesPayload and segment identity."
         )
     return value
-
-
-def _fitting_result_series(
-    result: object,
-    *,
-    species_names: Tuple[str, ...],
-) -> tuple[
-    np.ndarray,
-    Dict[str, np.ndarray],
-    np.ndarray,
-    tuple[str, ...],
-    np.ndarray,
-    np.ndarray,
-]:
-    result_times = np.asarray(getattr(result, "t"), dtype=float).reshape(-1)
-    result_values = np.asarray(getattr(result, "Y"), dtype=float)
-    if (
-        result_values.ndim != 2
-        or result_values.shape != (len(species_names), result_times.size)
-    ):
-        raise FitSimulationError(
-            "Fitting result species values are misaligned.",
-            details={"fatal": True, "stage": "intervention_execution"},
-        )
-    provenance = dict(getattr(result, "provenance", {}) or {})
-    discontinuity_ids = np.asarray(
-        provenance.get("result_discontinuity_ids"),
-        dtype=np.int64,
-    ).reshape(-1)
-    segment_keys = tuple(
-        str(value or "").strip()
-        for value in provenance.get("result_segment_keys", ())
-    )
-    integration_segment_ids = np.asarray(
-        provenance.get("result_segment_ids"),
-        dtype=np.int64,
-    ).reshape(-1)
-    if not (
-        discontinuity_ids.size
-        == len(segment_keys)
-        == integration_segment_ids.size
-        == result_times.size
-    ):
-        raise FitSimulationError(
-            "Fitting result lost aligned segment/discontinuity identity.",
-            details={"fatal": True, "stage": "intervention_execution"},
-        )
-
-    rows: list[
-        tuple[float, int, int, str, int, np.ndarray, bool]
-    ] = [
-        (
-            float(time),
-            1,
-            int(discontinuity_id),
-            segment_key,
-            int(integration_segment_id),
-            np.asarray(result_values[:, index], dtype=float).reshape(-1),
-            False,
-        )
-        for index, (
-            time,
-            discontinuity_id,
-            segment_key,
-            integration_segment_id,
-        ) in enumerate(
-            zip(
-                result_times,
-                discontinuity_ids,
-                segment_keys,
-                integration_segment_ids,
-                strict=True,
-            )
-        )
-    ]
-    pre_identities: set[tuple[float, str]] = set()
-    for raw_sample in provenance.get("pre_boundary_samples", ()):
-        if not isinstance(raw_sample, Mapping):
-            raise FitSimulationError(
-                "Fitting result contains an invalid pre-boundary sample.",
-                details={"fatal": True, "stage": "intervention_execution"},
-            )
-        try:
-            time = float(raw_sample["time"])
-            segment_key = str(raw_sample["segment_key"] or "").strip()
-            integration_segment_id = int(raw_sample["segment_id"])
-            discontinuity_id = int(raw_sample["discontinuity_id"])
-            state = np.asarray(
-                raw_sample["state"],
-                dtype=float,
-            ).reshape(-1)
-        except (KeyError, TypeError, ValueError, OverflowError) as exc:
-            raise FitSimulationError(
-                "Fitting result contains an invalid pre-boundary sample.",
-                details={"fatal": True, "stage": "intervention_execution"},
-            ) from exc
-        identity = (time, segment_key)
-        if (
-            not np.isfinite(time)
-            or not segment_key
-            or integration_segment_id < 0
-            or discontinuity_id < 0
-            or state.size != len(species_names)
-            or not np.all(np.isfinite(state))
-            or identity in pre_identities
-            or (
-                result_times.size
-                and (
-                    time < float(result_times[0])
-                    or time > float(result_times[-1])
-                )
-            )
-        ):
-            raise FitSimulationError(
-                "Fitting result contains an invalid pre-boundary sample.",
-                details={"fatal": True, "stage": "intervention_execution"},
-            )
-        pre_identities.add(identity)
-        rows.append(
-            (
-                time,
-                0,
-                discontinuity_id,
-                segment_key,
-                integration_segment_id,
-                state.copy(),
-                True,
-            )
-        )
-    rows.sort(key=lambda row: (row[0], row[1], row[4]))
-    times = np.asarray([row[0] for row in rows], dtype=float)
-    values = np.column_stack([row[5] for row in rows])
-    return (
-        times,
-        {
-            name: np.asarray(values[index, :], dtype=float).reshape(-1).copy()
-            for index, name in enumerate(species_names)
-        },
-        np.asarray([row[2] for row in rows], dtype=np.int64),
-        tuple(row[3] for row in rows),
-        np.asarray([row[4] for row in rows], dtype=np.int64),
-        np.asarray([row[6] for row in rows], dtype=bool),
-    )
 
 
 def _fitting_plan_from_execution_request(
@@ -465,6 +294,7 @@ class PreparedFittingExecutionContext:
     prepared_metadata: PreparedSimulationMetadata
     temperature_K: float
     initial_prefix: str
+    requested_sample_times: tuple[float, ...]
 
     def __post_init__(self) -> None:
         plan = _coerce_fitting_simulation_plan(self.simulation_plan)
@@ -491,6 +321,20 @@ class PreparedFittingExecutionContext:
             "initial_prefix",
             str(self.initial_prefix or "init:"),
         )
+        sample_times = tuple(float(value) for value in self.requested_sample_times)
+        t_start, t_end = plan.execution_request.t_span
+        if (
+            not sample_times
+            or any(not np.isfinite(value) for value in sample_times)
+            or any(right <= left for left, right in zip(sample_times, sample_times[1:]))
+            or sample_times[0] < float(t_start)
+            or sample_times[-1] > float(t_end)
+        ):
+            raise ValueError(
+                "Fitting requested sample times must be finite, strictly "
+                "increasing, and inside the execution span."
+            )
+        object.__setattr__(self, "requested_sample_times", sample_times)
 
     def clone(
         self,
@@ -503,6 +347,7 @@ class PreparedFittingExecutionContext:
             prepared_metadata=self.prepared_metadata if prepared_metadata is None else prepared_metadata,
             temperature_K=float(self.temperature_K),
             initial_prefix=str(self.initial_prefix),
+            requested_sample_times=self.requested_sample_times,
         )
 
 
@@ -513,6 +358,7 @@ def prepare_fitting_execution_context(
     t_start: float = 0.0,
     t_end: float,
     num_points: int,
+    objective_sample_times: Sequence[float],
     solver: str = DEFAULT_SOLVER_NAME,
     rtol: float = 1e-6,
     atol: float = 1e-12,
@@ -537,6 +383,26 @@ def prepare_fitting_execution_context(
         and not str(name).startswith(initial_prefix)
     ]
     temperature_K = float(prepared_dsl.analysis.structure["temperature_K"])
+    objective_times = np.asarray(tuple(objective_sample_times), dtype=float).reshape(-1)
+    if (
+        np.any(~np.isfinite(objective_times))
+        or np.any(objective_times < t_start)
+        or np.any(objective_times > t_end)
+    ):
+        raise ValueError(
+            "Objective observation times must be finite and inside the Fit span."
+        )
+    requested_sample_times = tuple(
+        float(value)
+        for value in np.unique(
+            np.concatenate(
+                (
+                    np.linspace(t_start, t_end, grid_n, dtype=float),
+                    objective_times,
+                )
+            )
+        )
+    )
 
     prepared_solver_config = _build_solver_config(
         solver_input=str(solver or DEFAULT_SOLVER_NAME),
@@ -645,6 +511,7 @@ def prepare_fitting_execution_context(
         prepared_metadata=prepared_meta,
         temperature_K=float(temperature_K),
         initial_prefix=str(initial_prefix),
+        requested_sample_times=requested_sample_times,
     )
 
 
@@ -668,9 +535,7 @@ class SerialFittingEvaluator:
             for name in self._fixed_params
         }
         self._prepared_run = None
-        self._bindings: Dict[str, Any] = {}
         self._species_index: Dict[str, int] = {}
-        self._last_shared_fp: Optional[Tuple[Tuple[str, float], ...]] = None
         self._prepared_solver_config = None
         self._parameter_algebra_spec = None
         self._compiled_algebra = None
@@ -766,9 +631,26 @@ class SerialFittingEvaluator:
     ) -> FittingSeriesEvaluation:
         self._raise_if_cancel_requested()
         self._ensure_prepared()
-        prepared_run = self._prepared_run
-        if prepared_run is None:
-            raise RuntimeError("Prepared fitting lane unavailable.")
+        # Every candidate starts from the retained immutable execution request.
+        # A rejected candidate can therefore never contaminate the next one.
+        prepared_run = prepare_simulation_worker_run(
+            execution_request=self._context.simulation_plan.execution_request
+        )
+        try:
+            candidate_bindings = _bind_requested_parameters_to_prepared_mechanism(
+                prepared_run.mechanism,
+                self._context.requested_param_names,
+                unresolved_intervention_schedule=(
+                    prepared_run.unresolved_intervention_schedule
+                ),
+            )
+        except SimulationPreparationError as exc:
+            raise _fit_simulation_error_from_preparation_error(exc) from exc
+        except Exception as exc:
+            raise FitSimulationError(
+                f"Structured fitting candidate preparation failed: {exc}",
+                details={"fatal": True, "stage": "parameter_binding"},
+            ) from exc
 
         param_map = {str(name): float(value) for name, value in self._fixed_params.items()}
         origin_map = dict(self._fixed_param_origins)
@@ -830,7 +712,7 @@ class SerialFittingEvaluator:
                 )
             else:
                 binding_name = parameter_partition.mechanism_parameter_name_by_raw.get(name, name)
-                if binding_name not in self._bindings:
+                if binding_name not in candidate_bindings:
                     if name in parameter_partition.schedule_only_parameter_names:
                         if name not in requested_parameter_names:
                             raise FitSimulationError(
@@ -868,13 +750,12 @@ class SerialFittingEvaluator:
                     failed_params=failed_params,
                 )
 
-        shared_fp = tuple(sorted((name, float(val)) for name, val in shared_values.items()))
-        if shared_fp != self._last_shared_fp:
-            self._apply_shared_values(shared_values)
-            self._last_shared_fp = shared_fp
-            prepared_run = self._prepared_run
-            if prepared_run is None:
-                raise RuntimeError("Prepared fitting lane unavailable.")
+        prepared_run = self._apply_shared_values(
+            prepared_run,
+            candidate_bindings,
+            shared_values,
+            origins=origin_map,
+        )
 
         y0 = np.asarray(prepared_run.y0, dtype=float).copy()
         for species_name, value in initial_overrides.items():
@@ -894,9 +775,23 @@ class SerialFittingEvaluator:
                 parameter_partition,
             )
         except SimulationPreparationError as exc:
+            schedule_names = {
+                str(name)
+                for name in getattr(parameter_partition, "schedule_parameter_names", ())
+                if str(name).strip()
+            }
+            candidate_schedule = any(
+                _parameter_origin_for(name, origin_map)
+                in _OPTIMIZER_PARAMETER_ORIGINS
+                for name in schedule_names
+            )
             raise FitSimulationError(
                 f"Fitting intervention execution failed: {exc}",
-                details={"fatal": False, "stage": "intervention_execution"},
+                details={
+                    "fatal": not candidate_schedule,
+                    "candidate_domain": candidate_schedule,
+                    "stage": "intervention_execution",
+                },
             ) from exc
 
         symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
@@ -944,6 +839,13 @@ class SerialFittingEvaluator:
             symbolic_jacobian=symbolic_jacobian,
             events=events,
         )
+        request = replace(
+            request,
+            t_eval=np.asarray(
+                self._context.requested_sample_times,
+                dtype=float,
+            ),
+        )
         try:
             result = _solve_request(request)
         except (FitSimulationError, SimulationCancelled):
@@ -951,70 +853,43 @@ class SerialFittingEvaluator:
         except Exception as exc:
             raise FitSimulationError(
                 f"Fitting simulation failed: {exc}",
-                details={"fatal": False},
+                details={"fatal": True, "stage": "solver"},
             ) from exc
         self._raise_if_cancel_requested()
 
-        (
-            times,
-            species_payload,
-            segment_ids,
-            segment_keys,
-            result_segment_ids,
-            pre_boundary_sample_mask,
-        ) = _fitting_result_series(
-            result,
-            species_names=tuple(prepared_run.species_names),
-        )
-
-        algebra_scalars: Dict[str, float] = {}
-        if self._compiled_algebra is not None:
-            from kindred.core.algebra.simulation_series import (
-                evaluate_compiled_algebra_series_for_simulation,
+        initials_map = {
+            name: float(y0[index])
+            for index, name in enumerate(prepared_run.species_names)
+        }
+        try:
+            admitted = finalize_simulation_result(
+                mechanism=prepared_run.mechanism,
+                result=result,
+                species_names=list(prepared_run.species_names),
+                initials_for_algebra=initials_map,
+                temperature_schedule=prepared_run.request.temperature_schedule,
+                simulation_plan=self._context.simulation_plan,
             )
-            from kindred.core.simulation_algebra_policy import (
-                ensure_fitting_strict_algebra_policy,
-                fitting_strict_evaluation_error,
-            )
-
-            ensure_fitting_strict_algebra_policy(self._context.simulation_plan.algebra_policy)
-            try:
-                initials_map = {
-                    name: float(y0[idx]) for idx, name in enumerate(prepared_run.species_names)
-                }
-                species_series = {
-                    name: np.asarray(
-                        species_payload[name],
-                        dtype=float,
-                    ).reshape(-1)
-                    for name in prepared_run.species_names
-                }
-                algebra_series, algebra_scalars = evaluate_compiled_algebra_series_for_simulation(
-                    prepared_run.mechanism,
-                    self._compiled_algebra,
-                    t=times,
-                    species_series=species_series,
-                    initials=initials_map,
-                    temperature_K=float(self._context.temperature_K),
-                )
-                for name, values in (algebra_series or {}).items():
-                    if name in species_payload:
-                        continue
-                    species_payload[str(name)] = np.asarray(values, dtype=float).reshape(-1).copy()
-            except FitSimulationError:
-                raise
-            except Exception as exc:
-                raise fitting_strict_evaluation_error(
-                    exc,
-                    message_prefix="Algebra evaluation failed during fitting simulation",
-                ) from exc
-
+        except Exception as exc:
+            if isinstance(exc, (FittingCancelled, SimulationCancelled)):
+                raise FittingCancelled() from exc
+            raise FitSimulationError(
+                f"Fitting result finalization failed: {exc}",
+                details={"fatal": True, "stage": "result_finalization"},
+            ) from exc
         series = SimulationSeriesPayload(
-            t=times.copy(),
-            species=species_payload,
-            algebra_scalars=dict(algebra_scalars),
+            t=admitted.t,
+            species=dict(admitted.series),
+            algebra_scalars=dict(admitted.scalars),
         )
-        result_execution = result.intervention_execution
+        segment_ids = np.asarray(admitted.segment_ids, dtype=np.int64)
+        segment_keys = tuple(admitted.segment_keys)
+        discontinuity_ids = np.asarray(
+            admitted.discontinuity_ids,
+            dtype=np.int64,
+        )
+        times = np.asarray(admitted.t, dtype=float)
+        result_execution = admitted.intervention_execution
         if not isinstance(result_execution, InterventionExecutionContract):
             raise FitSimulationError(
                 "Fitting result is missing its intervention execution contract.",
@@ -1030,23 +905,23 @@ class SerialFittingEvaluator:
                 details={"fatal": True, "stage": "intervention_execution"},
             )
         if not (
-            segment_ids.size
+            discontinuity_ids.size
             == len(segment_keys)
-            == result_segment_ids.size
+            == segment_ids.size
             == times.size
         ):
             raise FitSimulationError(
                 "Fitting result lost aligned segment/discontinuity identity.",
                 details={"fatal": True, "stage": "intervention_execution"},
             )
-        if np.any(np.diff(result_segment_ids) < 0):
+        if np.any(np.diff(segment_ids) < 0) or np.any(np.diff(discontinuity_ids) < 0):
             raise FitSimulationError(
                 "Fitting result segment identity is not ordered.",
                 details={"fatal": True, "stage": "intervention_execution"},
             )
         key_by_segment_id: dict[int, str] = {}
         for segment_id, segment_key in zip(
-            result_segment_ids,
+            segment_ids,
             segment_keys,
             strict=True,
         ):
@@ -1069,7 +944,7 @@ class SerialFittingEvaluator:
             series=series,
             segment_ids=segment_ids,
             segment_keys=segment_keys,
-            pre_boundary_sample_mask=pre_boundary_sample_mask,
+            discontinuity_ids=discontinuity_ids,
             intervention_execution=result_execution,
         )
 
@@ -1108,7 +983,7 @@ class SerialFittingEvaluator:
             wegscheider_cyclicity_enabled=bool(self._context.prepared_metadata.wegscheider_cyclicity_enabled),
         )
         try:
-            bindings = _bind_requested_parameters_to_prepared_mechanism(
+            _bind_requested_parameters_to_prepared_mechanism(
                 prepared_run.mechanism,
                 self._context.requested_param_names,
                 unresolved_intervention_schedule=prepared_run.unresolved_intervention_schedule,
@@ -1153,86 +1028,98 @@ class SerialFittingEvaluator:
                     symbolic_wegscheider_identity=dict(symbolic_wegscheider_identity),
                 )
             )
-        self._bindings = dict(bindings)
         self._species_index = {name: idx for idx, name in enumerate(prepared_run.species_names)}
         self._raise_if_cancel_requested()
 
         from kindred.core.algebra.simulation_series import (
             CompiledAlgebraSeries,
-            compile_algebra_observables,
+            compiled_algebra_for_mechanism,
         )
         from kindred.core.simulation_algebra_policy import (
             ensure_fitting_strict_algebra_policy,
-            fitting_strict_parse_error,
-            fitting_strict_time_ref_error,
         )
         from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
-        from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
         ensure_fitting_strict_algebra_policy(self._context.simulation_plan.algebra_policy)
         self._parameter_algebra_spec = parameter_algebra_spec_from_mechanism(prepared_run.mechanism)
         self._raise_if_cancel_requested()
 
         compiled_algebra: Optional[CompiledAlgebraSeries] = None
-        algebra_text = metadata_view_for_mechanism(prepared_run.mechanism).algebra_text
-        if algebra_text:
-            try:
-                compiled_algebra = compile_algebra_observables(
-                    str(algebra_text),
-                    mechanism_namespace=build_namespace_from_mechanism(prepared_run.mechanism),
-                )
-            except Exception as exc:
-                raise fitting_strict_parse_error(
-                    exc,
-                    message_prefix="Failed to parse Algebra observables for fitting",
-                ) from exc
-            if compiled_algebra.time_ref_statements:
-                stmt = compiled_algebra.time_ref_statements[0]
-                raise fitting_strict_time_ref_error(stmt)
+        compiled_algebra = compiled_algebra_for_mechanism(prepared_run.mechanism)
         self._compiled_algebra = compiled_algebra
         self._raise_if_cancel_requested()
 
-    def _apply_shared_values(self, shared_values: Mapping[str, float]) -> None:
-        prepared_run = self._prepared_run
-        if prepared_run is None:
-            raise RuntimeError("Prepared fitting lane unavailable.")
+    def _apply_shared_values(
+        self,
+        prepared_run: object,
+        bindings: Mapping[str, Any],
+        shared_values: Mapping[str, float],
+        *,
+        origins: Optional[Mapping[str, str]] = None,
+    ) -> object:
         for name, value in shared_values.items():
-            binding = self._bindings.get(name)
+            binding = bindings.get(name)
             if binding is None:
                 continue
             try:
                 binding.set(float(value))
-            except Exception as exc:
+            except (ValueError, OverflowError, FloatingPointError) as exc:
+                origin = _parameter_origin_for(name, origins)
                 raise FitSimulationError(
                     f"Failed to update parameter binding {name!r}: {exc}",
-                    details={"fatal": True},
+                    details={
+                        "fatal": origin not in _OPTIMIZER_PARAMETER_ORIGINS,
+                        "candidate_domain": origin in _OPTIMIZER_PARAMETER_ORIGINS,
+                        "stage": "parameter_binding",
+                    },
                 ) from exc
-
-        from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_spec_to_mechanism
-
-        try:
-            if self._parameter_algebra_spec is not None:
-                _ = apply_parameter_algebra_spec_to_mechanism(
-                    self._parameter_algebra_spec,
-                    mechanism=prepared_run.mechanism,
-                    require_mutable=True,
-                )
-        except Exception as exc:
-            raise FitSimulationError(f"Parameter algebra failed during fitting simulation: {exc}") from exc
-
-        if shared_values:
-            try:
-                from kindred.core.ode_builder import build_ode_rhs_from_mechanism
-
-                rhs = build_ode_rhs_from_mechanism(prepared_run.mechanism)
             except Exception as exc:
                 raise FitSimulationError(
-                    f"Failed to rebuild RHS after parameter binding updates: {exc}",
-                    details={"fatal": True, "stage": "ode_build"},
+                    f"Unexpected parameter binding failure for {name!r}: {exc}",
+                    details={"fatal": True, "stage": "parameter_binding"},
                 ) from exc
-            self._prepared_run = replace(
-                prepared_run,
-                rhs=rhs,
-                request=replace(prepared_run.request, rhs=rhs),
+
+        if self._prepared_solver_config is None:
+            raise FitSimulationError(
+                "Fit candidate preparation is missing its solver config.",
+                details={"fatal": True, "stage": "candidate_preparation"},
             )
-    "FittingSeriesEvaluation",
+        try:
+            _apply_execution_parameter_algebra_and_cyclicity(
+                mechanism=prepared_run.mechanism,
+                prepared_solver_config=self._prepared_solver_config,
+                require_mutable=True,
+            )
+        except SimulationPreparationError as exc:
+            candidate_domain = any(
+                _parameter_origin_for(name, origins)
+                in _OPTIMIZER_PARAMETER_ORIGINS
+                for name in shared_values
+            )
+            raise FitSimulationError(
+                f"Failed to prepare complete fitting candidate: {exc}",
+                details={
+                    "fatal": not candidate_domain,
+                    "candidate_domain": candidate_domain,
+                    "stage": "candidate_preparation",
+                },
+            ) from exc
+        except Exception as exc:
+            raise FitSimulationError(
+                f"Unexpected fitting candidate preparation failure: {exc}",
+                details={"fatal": True, "stage": "candidate_preparation"},
+            ) from exc
+        try:
+            from kindred.core.ode_builder import build_ode_rhs_from_mechanism
+
+            rhs = build_ode_rhs_from_mechanism(prepared_run.mechanism)
+        except Exception as exc:
+            raise FitSimulationError(
+                f"Fitting candidate ODE binding failed: {exc}",
+                details={"fatal": True, "stage": "ode_build"},
+            ) from exc
+        return replace(
+            prepared_run,
+            rhs=rhs,
+            request=replace(prepared_run.request, rhs=rhs),
+        )

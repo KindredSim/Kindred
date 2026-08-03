@@ -15,6 +15,7 @@ from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTa
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.workspace_result_presenter import (
     ResultDataBlock,
+    ResultLayerKind,
     WorkspacePlotLayer,
     WorkspaceResultPresenter,
     WorkspaceResultProjection,
@@ -99,6 +100,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         self._applied_projection: WorkspaceResultProjection | None = None
         self._rendered_blocks: tuple[ResultDataBlock, ...] = ()
+        self._copy_all_enabled = False
         self._sampling_limit_by_tab: dict[str, int | None] = {}
         self._curve_items: list[object] = []
         self._annotation_items: list[object] = []
@@ -185,7 +187,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> QtWidgets.QTabWidget:
         """Return the exact analysis surface in its requested composition."""
 
-        if bool(detached):
+        if bool(detached) and self._details_tabs.parentWidget() is self._main_splitter:
             self._details_tabs.setParent(None)
             self._details_tabs.show()
         return self._details_tabs
@@ -198,36 +200,31 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self,
         projection: WorkspaceResultProjection,
     ) -> None:
-        """Apply atomically enough to keep the prior plot/Copy truth on failure."""
+        """Apply one projection; failure invalidates this panel's projection."""
 
         if not isinstance(projection, WorkspaceResultProjection):
             raise TypeError(
                 "apply_workspace_result_projection requires "
                 "WorkspaceResultProjection."
             )
-        previous = self._applied_projection
-        previous_rendered = self._rendered_blocks
-        previous_interaction_modes = dict(self._interaction_mode_by_tab)
-        previous_presentations = dict(self._presentation_by_tab)
-        previous_axis_ranges = dict(self._axis_range_by_tab)
         try:
             rendered = self._render_projection(projection)
         except Exception as exc:
             logger.exception("Workspace projection render failed")
-            self._interaction_mode_by_tab = previous_interaction_modes
-            self._presentation_by_tab = previous_presentations
-            self._axis_range_by_tab = previous_axis_ranges
-            if previous is not None:
-                try:
-                    self._render_projection(previous)
-                except Exception:
-                    logger.exception("Failed to restore previous plot projection")
-            self._applied_projection = previous
-            self._rendered_blocks = previous_rendered
+            # A failed projection is ordinary unavailability for this panel:
+            # never retain a stale scene or export authority.
+            try:
+                self._clear_plot_items()
+            except Exception:
+                logger.exception("Failed to clear rejected plot projection")
+            self._applied_projection = None
+            self._rendered_blocks = ()
+            self._copy_all_enabled = False
             self.renderFailed.emit(str(exc))
             raise
         self._applied_projection = projection
         self._rendered_blocks = rendered
+        self._copy_all_enabled = bool(projection.copy_all_blocks)
 
     def set_persisted_plot_state(
         self,
@@ -284,6 +281,23 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def rendered_point_blocks(self) -> tuple[ResultDataBlock, ...]:
         return self._rendered_blocks
+
+    def clear_workspace_result_projection(self) -> None:
+        """Clear rejected public truth without affecting other tab-local state."""
+
+        try:
+            self._clear_plot_items()
+            self._parameter_table.setRowCount(0)
+            self._species_table.setRowCount(0)
+        finally:
+            self._applied_projection = None
+            self._rendered_blocks = ()
+            self._copy_all_enabled = False
+
+    def set_copy_all_enabled(self, enabled: bool) -> None:
+        """Receive the active workspace's physical Copy capability."""
+
+        self._copy_all_enabled = bool(enabled)
 
     def _render_projection(
         self,
@@ -370,39 +384,45 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         sampling_limit: int | None,
     ) -> ResultDataBlock | None:
         sample = self._sample_indices(block.t.size, sampling_limit)
-        identity_boundaries = (
-            np.flatnonzero(
-                np.diff(block.discontinuity_ids) != 0
-            )
-            + 1
-        )
-        if identity_boundaries.size:
+        if layer.kind is not block.kind:
+            raise ValueError("plot layer and data block kinds must match.")
+        if block.kind is not ResultLayerKind.EXPERIMENTAL:
+            region_endpoints = self._execution_region_endpoints(block)
             sample = np.unique(
                 np.concatenate(
                     (
                         sample,
-                        identity_boundaries,
-                        identity_boundaries - 1,
+                        region_endpoints,
                     )
                 )
             )
         x = block.t[sample]
-        segment_ids = block.segment_ids[sample]
-        segment_keys = tuple(block.segment_keys[int(index)] for index in sample)
-        discontinuity_ids = block.discontinuity_ids[sample]
-        split_points = tuple(
-            int(index)
-            for index in (
-                np.flatnonzero(np.diff(discontinuity_ids) != 0) + 1
+        if block.kind is ResultLayerKind.EXPERIMENTAL:
+            if block.source_row is None:
+                raise ValueError("experimental plot block lacks source_row.")
+            segment_ids = None
+            segment_keys = None
+            discontinuity_ids = None
+            source_row = block.source_row[sample]
+            chunks = ((0, x.size),)
+        else:
+            if (
+                block.segment_ids is None
+                or block.segment_keys is None
+                or block.discontinuity_ids is None
+            ):
+                raise ValueError("simulation plot block lacks executor identity.")
+            segment_ids = block.segment_ids[sample]
+            segment_keys = tuple(
+                block.segment_keys[int(index)] for index in sample
             )
-        )
-        chunks = tuple(
-            zip(
-                (0, *split_points),
-                (*split_points, x.size),
-                strict=True,
+            discontinuity_ids = block.discontinuity_ids[sample]
+            source_row = None
+            chunks = self._execution_region_chunks(
+                segment_ids,
+                segment_keys,
+                discontinuity_ids,
             )
-        )
         colors = dict(layer.color_by_series)
         rendered_series: list[tuple[str, np.ndarray]] = []
         for series_name, values in block.series:
@@ -410,13 +430,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             color = colors.get(series_name, _fallback_color(series_name))
             name = f"{layer.label}: {series_name}"
             for chunk_index, (start, end) in enumerate(chunks):
-                if layer.markers:
+                singleton = end - start == 1
+                if layer.markers or singleton:
                     item = self._plot_widget.plot(
                         x[start:end],
                         y[start:end],
                         pen=None,
                         symbol="o",
-                        symbolSize=layer.point_size,
+                        symbolSize=(
+                            layer.point_size if layer.markers else 5.0
+                        ),
                         symbolBrush=pg.mkBrush(color),
                         symbolPen=pg.mkPen(color),
                         name=name if chunk_index == 0 else None,
@@ -445,11 +468,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         return ResultDataBlock(
             block_id=block.block_id,
             label=block.label,
+            kind=block.kind,
             t=x,
             series=tuple(rendered_series),
             segment_ids=segment_ids,
             segment_keys=segment_keys,
             discontinuity_ids=discontinuity_ids,
+            source_row=source_row,
             x_name=block.x_name,
             series_provenance=block.series_provenance,
             x_provenance=block.x_provenance,
@@ -555,6 +580,61 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return np.arange(count, dtype=int)
         return np.linspace(0, count - 1, sampling_limit, dtype=int)
 
+    @staticmethod
+    def _execution_region_endpoints(block: ResultDataBlock) -> np.ndarray:
+        if (
+            block.segment_ids is None
+            or block.segment_keys is None
+            or block.discontinuity_ids is None
+        ):
+            raise ValueError("simulation plot block lacks executor identity.")
+        count = int(block.t.size)
+        if count == 1:
+            return np.asarray((0,), dtype=int)
+        changes = np.fromiter(
+            (
+                index
+                for index in range(1, count)
+                if (
+                    int(block.segment_ids[index])
+                    != int(block.segment_ids[index - 1])
+                    or block.segment_keys[index]
+                    != block.segment_keys[index - 1]
+                    or int(block.discontinuity_ids[index])
+                    != int(block.discontinuity_ids[index - 1])
+                )
+            ),
+            dtype=int,
+        )
+        starts = np.concatenate((np.asarray((0,), dtype=int), changes))
+        ends = np.concatenate((changes - 1, np.asarray((count - 1,), dtype=int)))
+        return np.unique(np.concatenate((starts, ends)))
+
+    @staticmethod
+    def _execution_region_chunks(
+        segment_ids: np.ndarray,
+        segment_keys: tuple[str, ...],
+        discontinuity_ids: np.ndarray,
+    ) -> tuple[tuple[int, int], ...]:
+        count = int(segment_ids.size)
+        if count == 0:
+            return ()
+        starts = [0]
+        starts.extend(
+            index
+            for index in range(1, count)
+            if (
+                int(segment_ids[index]) != int(segment_ids[index - 1])
+                or segment_keys[index] != segment_keys[index - 1]
+                or int(discontinuity_ids[index])
+                != int(discontinuity_ids[index - 1])
+            )
+        )
+        return tuple(
+            (start, starts[index + 1] if index + 1 < len(starts) else count)
+            for index, start in enumerate(starts)
+        )
+
     @QtCore.Slot(object)
     def _add_scalar_guide(self, requested_name: object) -> None:
         projection = self._applied_projection
@@ -611,12 +691,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self.apply_workspace_result_projection(projection)
         except Exception:
             self._sampling_limit_by_tab[tab_id] = previous_limit
-            try:
-                self.apply_workspace_result_projection(projection)
-            except Exception:
-                logger.exception(
-                    "Failed to restore plot after sampling render rejection"
-                )
             raise
 
     @QtCore.Slot()
@@ -692,7 +766,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         projection = self._applied_projection
         if self._enable_copy_visible_data_action:
             copy_all = menu.addAction("Copy All")
-            copy_all.setEnabled(projection is not None)
+            copy_all.setEnabled(
+                bool(
+                    self._copy_all_enabled
+                    and projection is not None
+                    and projection.copy_all_blocks
+                )
+            )
             copy_all.triggered.connect(self._copy_all_to_clipboard)
             copy_rendered = menu.addAction("Copy Rendered Points")
             copy_rendered.setEnabled(bool(self._rendered_blocks))
@@ -775,17 +855,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             [],
         )
         annotations.append((annotation_text, x, y))
-        try:
-            self.apply_workspace_result_projection(projection)
-        except Exception:
-            annotations.pop()
-            try:
-                self.apply_workspace_result_projection(projection)
-            except Exception:
-                logger.exception(
-                    "Failed to restore plot after annotation render rejection"
-                )
-            raise
+        self.apply_workspace_result_projection(projection)
 
     @QtCore.Slot()
     def _clear_manual_annotations(self) -> None:
@@ -795,19 +865,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         annotations = self._manual_annotations_by_tab.get(projection.tab_id)
         if not annotations:
             return
-        previous = list(annotations)
         annotations.clear()
-        try:
-            self.apply_workspace_result_projection(projection)
-        except Exception:
-            annotations.extend(previous)
-            try:
-                self.apply_workspace_result_projection(projection)
-            except Exception:
-                logger.exception(
-                    "Failed to restore plot after annotation-clear rejection"
-                )
-            raise
+        self.apply_workspace_result_projection(projection)
 
     @QtCore.Slot(str)
     def _set_interaction_mode(self, mode: str) -> None:
@@ -873,11 +932,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     @QtCore.Slot()
     def _copy_all_to_clipboard(self) -> None:
         projection = self._applied_projection
-        if projection is None:
+        if (
+            not self._copy_all_enabled
+            or projection is None
+            or not projection.copy_all_blocks
+        ):
             QtWidgets.QMessageBox.critical(
                 self,
                 "Copy All",
-                "No applied result projection is available.",
+                "No current result data is available to copy.",
             )
             return
         self._start_responsive_copy(

@@ -1,4 +1,4 @@
-"""Direct application and shared-plot theme ownership."""
+"""Direct application and workspace plot-container theme broadcasting."""
 
 from __future__ import annotations
 

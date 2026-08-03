@@ -29,8 +29,9 @@ from kindred.core.result_repository import (
     PreviewResultIdentity,
     PreviewResultKey,
     ResultRepository,
-    SimulationResultProvenance,
     SimulationResultValue,
+    scientific_identity,
+    standard_concentration_identity,
 )
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulation_preparation import (
@@ -39,7 +40,7 @@ from kindred.core.simulation_preparation import (
     prepare_simulation_worker_run,
 )
 from kindred.core.simulation_result_finalization import (
-    evaluate_simulation_result_algebra,
+    finalize_simulation_result,
 )
 from kindred.core.simulator.solvers import solve_ode
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
@@ -261,7 +262,7 @@ def build_execution_request(
     )
     if (
         prepared_dsl.analysis.normalized_text
-        != mechanism_source.full_dsl.strip()
+        != mechanism_source.reactions_text.strip()
     ):
         raise ValueError(
             "prepared DSL source does not match the captured mechanism source."
@@ -302,7 +303,7 @@ def _validate_request_against_result_key(
     analysis = request.prepared_payload.get("dsl_analysis")
     if (
         getattr(analysis, "normalized_text", None)
-        != key.mechanism_source.full_dsl.strip()
+        != key.mechanism_source.reactions_text.strip()
     ):
         raise ValueError(
             "execution request analysis does not match result source."
@@ -507,6 +508,10 @@ def build_explicit_target(
         set_id=set_id,
         mechanism_source=mechanism_source,
         analysis_identity=prepared_dsl.analysis.identity,
+        standard_concentration_identity=standard_concentration_identity(
+            prepared_dsl
+        ),
+        scientific_identity=scientific_identity(prepared_dsl),
         initial_values=values,
         execution_settings=execution_settings,
         scientific_settings=scientific_settings,
@@ -621,12 +626,26 @@ def _detailed_balance_report(
     """Return typed cyclicity truth from one exact accepted source."""
 
     mechanism = prepared_dsl.mechanism_for_execution()
+    parameter_algebra_spec = prepared_dsl.parameter_algebra_spec_for_execution()
     apply_parameter_algebra_spec_to_mechanism(
-        prepared_dsl.parameter_algebra_spec_for_execution(),
+        parameter_algebra_spec,
         mechanism=mechanism,
         require_mutable=False,
     )
-    return analyze_wegscheider_cyclicity(mechanism)
+    return analyze_wegscheider_cyclicity(
+        mechanism,
+        parameter_algebra_spec=parameter_algebra_spec,
+    )
+
+
+def _source_energy_unit_for_prepared(prepared_dsl: PreparedDslRequestSet) -> str:
+    """Return the accepted source energy unit carried by one DSL analysis."""
+
+    structure = prepared_dsl.analysis.structure
+    if not isinstance(structure, Mapping):
+        return "kJ/mol"
+    value = str(structure.get("energy_unit", "kJ/mol")).strip()
+    return value or "kJ/mol"
 
 
 def _detailed_balance_correction_for_capture(
@@ -637,6 +656,7 @@ def _detailed_balance_correction_for_capture(
             MechanismAuthoringSource,
             float,
             WegscheiderCyclicityReport,
+            str,
         ]
     ] = []
     reports_by_analysis_identity: dict[
@@ -658,13 +678,21 @@ def _detailed_balance_correction_for_capture(
             report = _detailed_balance_report(target.prepared_dsl)
             reports_by_analysis_identity[analysis_identity] = report
         if report.unresolved_cycles:
+            source_energy_unit = str(
+                _source_energy_unit_for_prepared(target.prepared_dsl)
+            )
             unresolved.append(
-                (target.key.mechanism_source, temperature, report)
+                (
+                    target.key.mechanism_source,
+                    temperature,
+                    report,
+                    source_energy_unit,
+                )
             )
     if not unresolved:
         return None
 
-    source, temperature, report = unresolved[0]
+    source, temperature, report, source_energy_unit = unresolved[0]
     cycle_truth = tuple(
         (
             cycle.cycle_id,
@@ -676,6 +704,7 @@ def _detailed_balance_correction_for_capture(
     if any(
         candidate_source != source
         or candidate_temperature != temperature
+        or candidate_source_energy_unit != source_energy_unit
         or tuple(
             (
                 cycle.cycle_id,
@@ -685,7 +714,12 @@ def _detailed_balance_correction_for_capture(
             for cycle in candidate_report.unresolved_cycles
         )
         != cycle_truth
-        for candidate_source, candidate_temperature, candidate_report
+        for (
+            candidate_source,
+            candidate_temperature,
+            candidate_report,
+            candidate_source_energy_unit,
+        )
         in unresolved[1:]
     ):
         raise ValueError(
@@ -705,7 +739,7 @@ def _detailed_balance_correction_for_capture(
     request_id = hashlib.sha256(
         (
             f"Run\0{capture.tab_id}\0{temperature:.17g}\0"
-            f"{source.full_dsl}\0{target_identity}\0"
+            f"{source.reactions_text}\0{target_identity}\0"
             f"{report.symbolic_identity['source_fingerprint']}"
         ).encode("utf-8")
     ).hexdigest()[:16]
@@ -716,6 +750,8 @@ def _detailed_balance_correction_for_capture(
         source=source.reactions_text,
         issue=issue,
         temperature_K=temperature,
+        report=report,
+        source_energy_unit=source_energy_unit,
     )
 
 
@@ -725,12 +761,16 @@ def _verify_detailed_balance_resolved(
     """Prove one accepted typed correction resolves every cycle."""
 
     mechanism = prepared_dsl.mechanism_for_execution()
+    parameter_algebra_spec = prepared_dsl.parameter_algebra_spec_for_execution()
     apply_parameter_algebra_spec_to_mechanism(
-        prepared_dsl.parameter_algebra_spec_for_execution(),
+        parameter_algebra_spec,
         mechanism=mechanism,
         require_mutable=False,
     )
-    validate_wegscheider_cyclicity_resolved(mechanism)
+    validate_wegscheider_cyclicity_resolved(
+        mechanism,
+        parameter_algebra_spec=parameter_algebra_spec,
+    )
 
 
 def _solve_prepared(
@@ -744,60 +784,15 @@ def _solve_prepared(
     solved = solve_ode(prepared.request)
     if cancelled.is_set():
         raise SimulationCancelled()
-    finalized = evaluate_simulation_result_algebra(
+    result = finalize_simulation_result(
         mechanism=prepared.mechanism,
         result=solved,
         species_names=list(prepared.species_names),
         initials_for_algebra=prepared.initials_for_algebra,
+        temperature_schedule=prepared.temperature_schedule,
         simulation_plan=None,
-    )
-    matrix = np.asarray(finalized.y, dtype=float)
-    time = np.asarray(solved.t, dtype=float).reshape(-1)
-    if matrix.ndim != 2 or matrix.shape[0] != len(finalized.species_names):
-        raise ValueError("solver returned an invalid species matrix.")
-    if matrix.shape[1] != time.size:
-        raise ValueError("solver result time and species lengths differ.")
-    if cancelled.is_set():
-        raise SimulationCancelled()
-    solver_provenance = dict(getattr(solved, "provenance", {}) or {})
-    segment_ids = np.asarray(
-        solver_provenance.get("result_segment_ids"),
-        dtype=np.int64,
-    ).reshape(-1)
-    segment_keys = tuple(
-        str(value)
-        for value in solver_provenance.get("result_segment_keys", ())
-    )
-    discontinuity_ids = np.asarray(
-        solver_provenance.get("result_discontinuity_ids"),
-        dtype=np.int64,
-    ).reshape(-1)
-    if not (
-        segment_ids.size
-        == len(segment_keys)
-        == discontinuity_ids.size
-        == time.size
-    ):
-        raise ValueError(
-            "solver result is missing aligned segment/discontinuity identity."
-        )
-    result = SimulationResultValue(
-        t=time,
-        series={
-            str(name): matrix[index, :]
-            for index, name in enumerate(finalized.species_names)
-        },
-        segment_ids=segment_ids,
-        segment_keys=segment_keys,
-        discontinuity_ids=discontinuity_ids,
-        scalars=finalized.algebra_scalars,
         parameters=parameters,
-        provenance=SimulationResultProvenance(
-            solver=solver_provenance,
-            preparation_warnings=tuple(prepared.warnings),
-            algebra_errors=tuple(finalized.algebra_errors),
-        ),
-        intervention_execution=solved.intervention_execution,
+        preparation_warnings=prepared.warnings,
     )
     if cancelled.is_set():
         raise SimulationCancelled()
@@ -956,7 +951,6 @@ class _DirectSimulationWorker(QtCore.QThread):
 
 RepositoryResolver = Callable[[str], ResultRepository | None]
 ExplicitKeyCurrentness = Callable[[ExplicitResultKey], bool]
-RenderResults = Callable[[str], bool]
 RawUserParallelMaximum = Callable[[], object]
 
 
@@ -968,7 +962,6 @@ class SimulationJobOwner(QtCore.QObject):
     status_changed = QtCore.Signal(str)
     results_changed = QtCore.Signal(str)
     terminal = QtCore.Signal(object)
-    render_failed = QtCore.Signal(str, str)
     detailed_balance_correction_requested = QtCore.Signal(object)
 
     def __init__(
@@ -981,7 +974,6 @@ class SimulationJobOwner(QtCore.QObject):
             [str, MechanismAuthoringSource],
             PreparedDslRequestSet | None,
         ],
-        render_results: RenderResults | None = None,
         user_parallel_maximum: RawUserParallelMaximum | None = None,
         cpu_count: Callable[[], object] | None = None,
         parent: QtCore.QObject | None = None,
@@ -999,7 +991,6 @@ class SimulationJobOwner(QtCore.QObject):
         self._repository_for_tab = repository_for_tab
         self._explicit_result_key_is_current = explicit_result_key_is_current
         self._commit_detailed_balance_source = commit_detailed_balance_source
-        self._render_results = render_results
         self._user_parallel_maximum = user_parallel_maximum or (lambda: None)
         self._cpu_count = cpu_count or os.cpu_count
         self._worker: _DirectSimulationWorker | None = None
@@ -1182,10 +1173,7 @@ class SimulationJobOwner(QtCore.QObject):
         self._retire_preview_keys(tid, targets)
         generations = self.advance_explicit_publication_generations(tid, targets)
         repository = self._repository(tid)
-        repository.deauthorize_sets(
-            targets,
-            explicit_key_is_current=self._explicit_completion_is_live_key,
-        )
+        repository.deauthorize_sets(targets)
         self.results_changed.emit(tid)
         return generations
 
@@ -1554,6 +1542,11 @@ class SimulationJobOwner(QtCore.QObject):
                 corrected_key = replace(
                     target.key,
                     mechanism_source=corrected_source,
+                    analysis_identity=corrected_prepared.analysis.identity,
+                    standard_concentration_identity=(
+                        standard_concentration_identity(corrected_prepared)
+                    ),
+                    scientific_identity=scientific_identity(corrected_prepared),
                 )
                 if not self._explicit_completion_is_live_key(corrected_key):
                     raise RuntimeError(
@@ -1768,25 +1761,8 @@ class SimulationJobOwner(QtCore.QObject):
             self.status_changed.emit("Requested result is not cached; display unchanged.")
             return False
         self.results_changed.emit(key.tab_id)
-        self.rerender(key.tab_id)
-        self.status_changed.emit("Cached result shown.")
+        self.status_changed.emit("Cached result loaded for display.")
         return True
-
-    def rerender(self, tab_id: str) -> bool:
-        """One direct Try Again operation without retained recovery state."""
-
-        callback = self._render_results
-        if callback is None:
-            return True
-        tid = _required_id(tab_id, "tab_id")
-        try:
-            rendered = bool(callback(tid))
-        except Exception as exc:
-            self.render_failed.emit(tid, str(exc))
-            return False
-        if not rendered:
-            self.render_failed.emit(tid, "Result surface rejected the projection.")
-        return rendered
 
     def _start_worker(
         self,
@@ -1870,7 +1846,6 @@ class SimulationJobOwner(QtCore.QObject):
                 self._retire_preview_keys(key.tab_id, (key.set_id,))
             self._outcomes[key] = "success"
             self.results_changed.emit(key.tab_id)
-            self._render_after_publication(key.tab_id)
             return
         if isinstance(key, PreviewResultKey) and self._job_kind == "preview":
             target_name = self._target_display_name(key)
@@ -1895,7 +1870,6 @@ class SimulationJobOwner(QtCore.QObject):
             # Semantic publication is complete before any render attempt,
             # including for inactive tabs and non-plotted targets.
             self.results_changed.emit(key.tab_id)
-            self._render_after_publication(key.tab_id)
             return
         self._record_discard(
             key,
@@ -2109,12 +2083,3 @@ class SimulationJobOwner(QtCore.QObject):
         if current_targets == intent.targets:
             return intent
         return PreviewIntent(tab_id=intent.tab_id, targets=current_targets)
-
-    def _render_after_publication(self, tab_id: str) -> None:
-        if not self.rerender(tab_id):
-            detail = (
-                "Result retained, but physical rendering failed; "
-                "use Try Again to rerender."
-            )
-            self._details.append(detail)
-            self.status_changed.emit(detail)

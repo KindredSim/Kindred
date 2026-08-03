@@ -496,8 +496,8 @@ class FitSessionOwner(QtCore.QObject):
                     definitions,
                 )
             )
-            corrected_effective = MechanismAuthoringSource.from_full_dsl_text(
-                corrected_prepared.analysis.normalized_text
+            corrected_effective = MechanismAuthoringSource.from_parts(
+                reactions_text=corrected_prepared.analysis.normalized_text
             )
             self._verify_detailed_balance_resolved(corrected_prepared)
             writable_coordinates = {
@@ -726,8 +726,8 @@ class FitSessionOwner(QtCore.QObject):
                 origin.prepared_dsl,
                 definitions,
             )
-            effective = MechanismAuthoringSource.from_full_dsl_text(
-                effective_prepared.analysis.normalized_text
+            effective = MechanismAuthoringSource.from_parts(
+                reactions_text=effective_prepared.analysis.normalized_text
             )
             window.install_local_observable(
                 dataset_id=mapped.dataset_id,
@@ -798,8 +798,8 @@ class FitSessionOwner(QtCore.QObject):
                     definitions,
                 )
             )
-            effective_source = MechanismAuthoringSource.from_full_dsl_text(
-                effective_prepared.analysis.normalized_text
+            effective_source = MechanismAuthoringSource.from_parts(
+                reactions_text=effective_prepared.analysis.normalized_text
             )
         except (TypeError, ValueError, KeyError) as exc:
             self._set_status(f"Fit setup reset failed: {exc}")
@@ -1511,25 +1511,6 @@ class FitSessionOwner(QtCore.QObject):
                         )
                         for target in targets
                     ),
-                    pre_boundary_segment_keys=tuple(
-                        (
-                            str(
-                                target.get(
-                                    "raw_observation_id"
-                                )
-                                or ""
-                            ),
-                            int(identity.get("source_row")),
-                            str(identity.get("segment_key") or ""),
-                        )
-                        for target in targets
-                        for identity in self._mapping_items(
-                            target.get(
-                                "pre_boundary_segment_keys"
-                            ),
-                            "pre-boundary segment keys",
-                        )
-                    ),
                     parametric=(
                         None
                         if str(item.get("x_name") or "t") == "t"
@@ -1743,8 +1724,8 @@ class FitSessionOwner(QtCore.QObject):
         )
         return FitExecutionRequest(
             origin=origin,
-            mechanism_source=MechanismAuthoringSource.from_full_dsl_text(
-                effective_prepared.analysis.normalized_text
+            mechanism_source=MechanismAuthoringSource.from_parts(
+                reactions_text=effective_prepared.analysis.normalized_text
             ),
             prepared_dsl=effective_prepared,
             local_observables=local_observables,
@@ -2018,8 +1999,8 @@ class FitSessionOwner(QtCore.QObject):
             )
             next_tab = replace(
                 next_tab,
-                mechanism_source=MechanismAuthoringSource.from_full_dsl_text(
-                    prepared.analysis.normalized_text
+                mechanism_source=MechanismAuthoringSource.from_parts(
+                    reactions_text=prepared.analysis.normalized_text
                 ),
                 prepared_dsl=prepared,
             )
@@ -2112,11 +2093,11 @@ class FitSessionOwner(QtCore.QObject):
                         "Typed Fit parameter Apply lost its exact origin or "
                         "derived analysis identity."
                     )
-                derived_source = MechanismAuthoringSource.from_full_dsl_text(
-                    prepared.analysis.normalized_text
+                derived_source = MechanismAuthoringSource.from_parts(
+                    reactions_text=prepared.analysis.normalized_text
                 )
                 if (
-                    derived_source.full_dsl.strip()
+                    derived_source.reactions_text.strip()
                     != prepared.analysis.normalized_text
                 ):
                     raise RuntimeError(

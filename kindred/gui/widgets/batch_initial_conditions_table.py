@@ -17,7 +17,11 @@ from kindred.core.project_document import (
     next_set_name,
 )
 from kindred.core.project_presentation_state import ProjectPresentationState
-from kindred.core.result_repository import ExplicitResultKey
+from kindred.core.result_repository import (
+    ExplicitResultKey,
+    scientific_identity,
+    standard_concentration_identity,
+)
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
 from kindred.gui.workspace_tab_registry import ScientificDocumentDelta
 
@@ -283,7 +287,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             if column == self.slider_column():
                 return "Pin this exact set as a Slider target."
             if column == self.plot_column():
-                return "Show this exact set in the shared plot."
+                return "Show this exact set in the active mechanism plot."
             if column == self.custom_column():
                 return (
                     "Use one complete four-field override for this set"
@@ -1029,6 +1033,10 @@ class InitialConditionsTableActions(QtCore.QObject):
                 set_id=set_id,
                 mechanism_source=tab.mechanism_source,
                 analysis_identity=projected_analysis_identity(tab),
+                standard_concentration_identity=standard_concentration_identity(
+                    tab.prepared_dsl
+                ),
+                scientific_identity=scientific_identity(tab.prepared_dsl),
                 initial_values=projected_initial_values(tab, set_id),
                 execution_settings=tab.resolved_execution_settings(set_id),
                 scientific_settings=tab.scientific_settings,

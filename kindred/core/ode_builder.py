@@ -19,11 +19,7 @@ import numpy as np
 
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
-    GENERATED_RATE_MODEL_ERROR,
-    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
-    effective_equilibrium_reverse_rate,
-    generated_equilibrium_authority_kind,
     json_safe_equilibrium_authority_payload,
     normalize_existing_equilibrium_rate_authority,
 )
@@ -39,6 +35,7 @@ from .kinetics import (
     forward_rate_model_for_equilibrium,
     forward_rate_model_for_reaction,
 )
+from .exceptions import SolverError
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +89,7 @@ def _forward_rate_model_payload(model: ForwardRateModel) -> dict[str, object]:
             "dG_act_J_per_mol": float(model.dG_act_J_per_mol),
             "kappa": float(model.kappa),
             "standard_conc_M": float(model.standard_conc_M),
-            "molecularity": int(model.molecularity),
+            "molecularity": float(model.molecularity),
         }
     else:
         raise TypeError("Unsupported typed forward-rate model.")
@@ -142,17 +139,43 @@ class EffectiveRateCoefficientEvaluator:
         pairs = tuple(evaluator(temperature) for evaluator in self._evaluators)
         forward = tuple(float(pair[0]) for pair in pairs)
         reverse = tuple(float(pair[1]) for pair in pairs)
-        values = (*forward, *reverse)
-        if any(not math.isfinite(value) or value < 0.0 for value in values):
+        if not (
+            len(self.step_kinds)
+            == len(forward)
+            == len(reverse)
+        ):
             raise ValueError(
-                "Effective rate coefficients must be finite and nonnegative."
+                "Effective rate coefficient shape conflicts with mechanism steps."
             )
+        for kind, forward_value, reverse_value in zip(
+            self.step_kinds,
+            forward,
+            reverse,
+            strict=True,
+        ):
+            if not math.isfinite(forward_value) or forward_value <= 0.0:
+                raise ValueError(
+                    "Effective forward rate coefficients must be positive and finite."
+                )
+            if kind == "equilibrium":
+                if not math.isfinite(reverse_value) or reverse_value <= 0.0:
+                    raise ValueError(
+                        "Effective reverse rate coefficients must be positive and finite."
+                    )
+            elif kind == "reaction":
+                if reverse_value != 0.0:
+                    raise ValueError(
+                        "Irreversible reaction coefficient rows cannot carry a reverse rate."
+                    )
+            else:
+                raise ValueError(
+                    f"Unsupported effective-rate step kind {kind!r}."
+                )
         return EffectiveRateCoefficients(
             temperature_K=temperature,
             forward=forward,
             reverse=reverse,
         )
-
 
 def build_effective_rate_coefficient_evaluator(
     mechanism: Mechanism,
@@ -229,117 +252,88 @@ def build_effective_rate_coefficient_evaluator(
         snapshots.append(snapshot)
 
     for equilibrium in mechanism.equilibria:
-        metadata = getattr(equilibrium, "metadata", {}) or {}
-        generated_kind = generated_equilibrium_authority_kind(metadata)
-        if generated_kind:
-            snapshot = {
-                "kind": "equilibrium",
-                "generated_authority": str(generated_kind),
-                "authority": json_safe_equilibrium_authority_payload(
-                    metadata
-                ),
-            }
-
-            def equilibrium_coefficients(
-                temperature_K: float,
-                *,
-                _equilibrium: Equilibrium = equilibrium,
-            ) -> tuple[float, float]:
-                forward = effective_equilibrium_forward_rate(
-                    _equilibrium,
-                    temperature_K=temperature_K,
-                )
-                reverse = effective_equilibrium_reverse_rate(
-                    _equilibrium,
-                    temperature_K=temperature_K,
-                )
-                if forward is None or reverse is None:
-                    raise ValueError(GENERATED_RATE_MODEL_ERROR)
-                return float(forward), float(reverse)
-
+        authority = normalize_existing_equilibrium_rate_authority(
+            equilibrium
+        )
+        forward_binding = (
+            equilibrium.kf
+            if isinstance(equilibrium.kf, RateBinding)
+            else None
+        )
+        if isinstance(forward_binding, ForwardRateBinding):
+            forward_model = forward_binding.model
         else:
-            authority = normalize_existing_equilibrium_rate_authority(
-                equilibrium
+            forward_model = forward_rate_model_for_equilibrium(
+                equilibrium,
+                temperature_K=nominal_temperature,
+                default_kappa=default_kappa,
+                default_standard_conc_M=default_standard_conc,
             )
-            forward_binding = (
-                equilibrium.kf
-                if isinstance(equilibrium.kf, RateBinding)
+        snapshot = {
+            "kind": "equilibrium",
+            "forward_model": _forward_rate_model_payload(forward_model),
+            "forward_binding_name": (
+                str(forward_binding.name)
+                if isinstance(forward_binding, RateBinding)
                 else None
-            )
-            if isinstance(forward_binding, ForwardRateBinding):
-                forward_model = forward_binding.model
-            else:
-                forward_model = forward_rate_model_for_equilibrium(
-                    equilibrium,
-                    temperature_K=nominal_temperature,
-                    default_kappa=default_kappa,
-                    default_standard_conc_M=default_standard_conc,
-                )
-            snapshot = {
-                "kind": "equilibrium",
-                "forward_model": _forward_rate_model_payload(forward_model),
-                "forward_binding_name": (
-                    str(forward_binding.name)
-                    if isinstance(forward_binding, RateBinding)
-                    else None
-                ),
-                "authority": json_safe_equilibrium_authority_payload(
-                    dict(authority.identity_items())
-                ),
-                "reverse_binding_name": (
-                    str(authority.kr.name)
-                    if isinstance(authority.kr, RateBinding)
-                    else None
-                ),
-                "reverse_model": (
-                    _forward_rate_model_payload(authority.kr.model)
-                    if isinstance(authority.kr, ForwardRateBinding)
-                    else None
-                ),
-            }
+            ),
+            "authority": json_safe_equilibrium_authority_payload(
+                dict(authority.identity_items())
+            ),
+            "reverse_binding_name": (
+                str(authority.kr.name)
+                if isinstance(authority.kr, RateBinding)
+                else None
+            ),
+            "reverse_model": (
+                _forward_rate_model_payload(authority.kr.model)
+                if isinstance(authority.kr, ForwardRateBinding)
+                else None
+            ),
+        }
 
-            def equilibrium_coefficients(
-                temperature_K: float,
-                *,
-                _equilibrium: Equilibrium = equilibrium,
-                _authority=authority,
-                _forward_binding: RateBinding | None = forward_binding,
-                _forward_model: ForwardRateModel = forward_model,
-            ) -> tuple[float, float]:
-                forward = (
-                    _evaluate_rate_binding(
-                        _forward_binding,
-                        temperature_K,
-                    )
-                    if _forward_binding is not None
-                    else forward_rate_at_temperature(
-                        _forward_model,
-                        temperature_K,
-                    )
+        def equilibrium_coefficients(
+            temperature_K: float,
+            *,
+            _equilibrium: Equilibrium = equilibrium,
+            _authority=authority,
+            _forward_binding: RateBinding | None = forward_binding,
+            _forward_model: ForwardRateModel = forward_model,
+        ) -> tuple[float, float]:
+            forward = (
+                _evaluate_rate_binding(
+                    _forward_binding,
+                    temperature_K,
                 )
-                if _authority.kind == EquilibriumRateAuthorityKind.KR:
-                    reverse = _authority.effective_reverse_rate()
-                    if isinstance(reverse, RateBinding):
-                        reverse = _evaluate_rate_binding(
-                            reverse,
-                            temperature_K,
-                        )
-                    elif callable(reverse):
-                        reverse = float(reverse())
-                else:
-                    equilibrium_constant = effective_equilibrium_keq(
-                        _equilibrium,
-                        temperature_K=temperature_K,
+                if _forward_binding is not None
+                else forward_rate_at_temperature(
+                    _forward_model,
+                    temperature_K,
+                )
+            )
+            if _authority.kind == EquilibriumRateAuthorityKind.KR:
+                reverse = _authority.effective_reverse_rate()
+                if isinstance(reverse, RateBinding):
+                    reverse = _evaluate_rate_binding(
+                        reverse,
+                        temperature_K,
                     )
-                    if equilibrium_constant is None:
-                        raise ValueError(
-                            "Equilibrium missing usable Keq/dG_eq authority."
-                        )
-                    reverse = _authority.effective_reverse_rate(
-                        Keq=equilibrium_constant,
-                        kf=forward,
+                elif callable(reverse):
+                    reverse = float(reverse())
+            else:
+                equilibrium_constant = effective_equilibrium_keq(
+                    _equilibrium,
+                    temperature_K=temperature_K,
+                )
+                if equilibrium_constant is None:
+                    raise ValueError(
+                        "Equilibrium missing usable Keq/dG_eq authority."
                     )
-                return float(forward), float(reverse)
+                reverse = _authority.effective_reverse_rate(
+                    Keq=equilibrium_constant,
+                    kf=forward,
+                )
+            return float(forward), float(reverse)
 
         evaluators.append(equilibrium_coefficients)
         step_kinds.append("equilibrium")
@@ -397,6 +391,7 @@ def build_ode_rhs_from_mechanism(
         steps.append(("equilibrium", eq))
 
     n_steps = len(steps)
+    n_reactions = len(mechanism.reactions)
     S = np.zeros((n_species, n_steps))
     exp_forward = np.zeros((n_steps, n_species), dtype=float)
     exp_reverse = np.zeros((n_steps, n_species), dtype=float)
@@ -426,7 +421,14 @@ def build_ode_rhs_from_mechanism(
 
     forward_mask = exp_forward != 0.0
     reverse_mask = exp_reverse != 0.0
+    fractional_forward_mask = forward_mask & (
+        exp_forward != np.rint(exp_forward)
+    )
+    fractional_reverse_mask = reverse_mask & (
+        exp_reverse != np.rint(exp_reverse)
+    )
     forward_buffer = np.ones_like(exp_forward)
+    forward_power_bases = np.empty_like(exp_forward)
     reverse_buffer = np.ones_like(exp_reverse)
 
     k_forward_dyn = np.zeros(n_steps, dtype=float)
@@ -454,17 +456,32 @@ def build_ode_rhs_from_mechanism(
         """
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             out.fill(0.0)
+            if np.any(np.isnan(log_f)) or np.any(np.isnan(log_r)):
+                raise SolverError(
+                    "Reversible rate logarithm is non-finite at the solver state."
+                )
             max_lr = np.maximum(log_f, log_r)
             min_lr = np.minimum(log_f, log_r)
-            mask = np.isfinite(max_lr)
-            if not np.any(mask):
+            finite_max = np.isfinite(max_lr)
+            unrepresentable = ~finite_max & (max_lr > 0.0)
+            if np.any(unrepresentable):
+                raise SolverError(
+                    "Reversible rate difference is non-finite at the solver state."
+                )
+            if not np.any(finite_max):
+                # Both rates are exactly zero in log space (-inf - -inf).
                 return
-            d = min_lr[mask] - max_lr[mask]  # <= 0
+            indices = np.flatnonzero(finite_max)
+            d = min_lr[indices] - max_lr[indices]  # <= 0
             small = -np.expm1(d)  # 1 - exp(d), in [0, 1]
-            log_mag = max_lr[mask] + np.log(small)  # log(0) -> -inf => mag 0
+            log_mag = max_lr[indices] + np.log(small)
             mag = np.exp(log_mag)
-            sign = np.where(log_f[mask] >= log_r[mask], 1.0, -1.0)
-            out[mask] = sign * mag
+            if np.any(~np.isfinite(mag)):
+                raise SolverError(
+                    "Reversible rate difference is non-finite at the solver state."
+                )
+            sign = np.where(log_f[indices] >= log_r[indices], 1.0, -1.0)
+            out[indices] = sign * mag
 
     def ode_rhs(t: float, y: np.ndarray, *, T: Optional[float] = None) -> np.ndarray:
         """ODE right-hand side from stoichiometry and reaction rates."""
@@ -476,11 +493,83 @@ def build_ode_rhs_from_mechanism(
 
         if not has_reverse_terms:
             forward_buffer.fill(1.0)
-            np.power(y_arr, exp_forward, out=forward_buffer, where=forward_mask)
+            if np.any(
+                fractional_forward_mask & (y_arr[np.newaxis, :] < 0.0)
+            ):
+                # Implicit solvers may briefly trial a negative internal state.
+                # Restrict only non-integral power evaluation to its physical
+                # domain; this leaves both the solver state and integer powers
+                # unchanged and does not alter published concentration truth.
+                forward_power_bases[:] = y_arr
+                np.maximum(
+                    forward_power_bases,
+                    0.0,
+                    out=forward_power_bases,
+                    where=fractional_forward_mask,
+                )
+                np.power(
+                    forward_power_bases,
+                    exp_forward,
+                    out=forward_buffer,
+                    where=forward_mask,
+                )
+            else:
+                np.power(
+                    y_arr,
+                    exp_forward,
+                    out=forward_buffer,
+                    where=forward_mask,
+                )
             rates_forward = k_forward_dyn * forward_buffer.prod(axis=1)
             return _stoichiometric_flux_product(
                 S,
                 rates_forward,
+                workspace=stoich_rate_buffer,
+                out=stoich_flux,
+            )
+
+        if np.any(y_arr < 0.0):
+            # The log-domain path below cannot retain the sign of integer
+            # powers at a solver's negative trial state.  Evaluate those
+            # powers directly while limiting only non-integral powers to a
+            # scratch physical-domain base; leave y_arr itself untouched.
+            forward_buffer.fill(1.0)
+            forward_power_bases[:] = y_arr
+            np.maximum(
+                forward_power_bases,
+                0.0,
+                out=forward_power_bases,
+                where=fractional_forward_mask,
+            )
+            np.power(
+                forward_power_bases,
+                exp_forward,
+                out=forward_buffer,
+                where=forward_mask,
+            )
+            np.prod(forward_buffer, axis=1, out=log_prod_forward)
+            np.multiply(k_forward_dyn, log_prod_forward, out=net_rates)
+
+            reverse_buffer.fill(1.0)
+            forward_power_bases[:] = y_arr
+            np.maximum(
+                forward_power_bases,
+                0.0,
+                out=forward_power_bases,
+                where=fractional_reverse_mask,
+            )
+            np.power(
+                forward_power_bases,
+                exp_reverse,
+                out=reverse_buffer,
+                where=reverse_mask,
+            )
+            np.prod(reverse_buffer, axis=1, out=log_prod_reverse)
+            np.multiply(k_reverse_dyn, log_prod_reverse, out=log_rate_reverse)
+            np.subtract(net_rates, log_rate_reverse, out=net_rates)
+            return _stoichiometric_flux_product(
+                S,
+                net_rates,
                 workspace=stoich_rate_buffer,
                 out=stoich_flux,
             )
@@ -507,6 +596,38 @@ def build_ode_rhs_from_mechanism(
             np.add(log_k_reverse_dyn, log_prod_reverse, out=log_rate_reverse)
 
         _stable_diff_exp_logs(log_rate_forward, log_rate_reverse, net_rates)
+        if n_reactions:
+            forward_buffer[:n_reactions].fill(1.0)
+            reaction_fractional_mask = fractional_forward_mask[:n_reactions]
+            if np.any(
+                reaction_fractional_mask & (y_arr[np.newaxis, :] < 0.0)
+            ):
+                # Keep irreversible integer-power trial evaluations signed even
+                # when equilibria require the log-domain calculation below.
+                forward_power_bases[:n_reactions] = y_arr
+                np.maximum(
+                    forward_power_bases[:n_reactions],
+                    0.0,
+                    out=forward_power_bases[:n_reactions],
+                    where=reaction_fractional_mask,
+                )
+                np.power(
+                    forward_power_bases[:n_reactions],
+                    exp_forward[:n_reactions],
+                    out=forward_buffer[:n_reactions],
+                    where=forward_mask[:n_reactions],
+                )
+            else:
+                np.power(
+                    y_arr,
+                    exp_forward[:n_reactions],
+                    out=forward_buffer[:n_reactions],
+                    where=forward_mask[:n_reactions],
+                )
+            net_rates[:n_reactions] = (
+                k_forward_dyn[:n_reactions]
+                * forward_buffer[:n_reactions].prod(axis=1)
+            )
         return _stoichiometric_flux_product(
             S,
             net_rates,

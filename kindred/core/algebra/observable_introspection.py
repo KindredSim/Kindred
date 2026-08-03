@@ -198,10 +198,6 @@ def validate_fit_local_observable(
     if not block.lines:
         raise ValueError("Observable expression did not produce an Algebra value.")
     expr = block.lines[0].expr
-    if expr.has_time_ref():
-        raise ValueError(
-            "Fit-local observables cannot use baseline/time-reference expressions."
-        )
     unknown_species = _species_refs(expr) - species
     if unknown_species:
         raise ValueError(

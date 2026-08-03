@@ -1,5 +1,5 @@
 # kindred/gui/widgets/mechanism_editor.py
-"""Tabbed mechanism editor for reactions, notes, and state networks."""
+"""Tabbed mechanism editor for Reactions and Notes."""
 
 from __future__ import annotations
 
@@ -19,11 +19,10 @@ from kindred.gui.ui_helpers import (
     set_bounded_label_text,
 )
 
-# Direct imports required to avoid circular dependency with widgets/__init__.py
-from kindred.gui.widgets.state_network_editor import StateNetworkEditor
 from kindred.gui.widgets.mechanism_highlighter import MechanismHighlighter
 from kindred.gui.widgets.variable_sliders import VariableSliders
 from kindred.gui.widgets.species_sliders import BatchSpeciesSliders
+from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
 
 __all__ = [
     "DetailedBalanceCorrectionOutcome",
@@ -37,7 +36,6 @@ __all__ = [
 @dataclass(frozen=True, slots=True)
 class _MechanismEditorRenderProjection:
     source: object
-    state_network_prepared_dsl: object
     notes: str
     slider_dirty: bool
     document_identity: tuple[int, str]
@@ -51,6 +49,8 @@ class DetailedBalanceCorrectionRequest:
     source: str
     issue: str
     temperature_K: float = 298.15
+    report: WegscheiderCyclicityReport | None = None
+    source_energy_unit: str = "kJ/mol"
 
     def __post_init__(self) -> None:
         for field_name in ("request_id", "origin", "tab_id", "issue"):
@@ -60,10 +60,20 @@ class DetailedBalanceCorrectionRequest:
             raise ValueError("origin must be Run, Fit, or Preview.")
         if not str(self.source or "").strip():
             raise ValueError("source must be nonblank.")
+        if not isinstance(self.report, WegscheiderCyclicityReport):
+            raise TypeError(
+                "Detailed-balance correction requires the accepted cyclicity report."
+            )
+        if not self.report.unresolved_cycles:
+            raise ValueError("Detailed-balance report has no unresolved cycles.")
         temperature = float(self.temperature_K)
         if not math.isfinite(temperature) or temperature <= 0.0:
             raise ValueError("temperature_K must be positive and finite.")
+        source_energy_unit = str(self.source_energy_unit or "").strip()
+        if not source_energy_unit:
+            raise ValueError("source_energy_unit must be nonblank.")
         object.__setattr__(self, "temperature_K", temperature)
+        object.__setattr__(self, "source_energy_unit", source_energy_unit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,27 +114,9 @@ class _DetailedBalanceCorrectionDialog(QtWidgets.QDialog):
         self._corrected_source: str | None = None
         self.setWindowTitle("Fix Detailed Balance")
         self.setModal(True)
-        from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
-        from kindred.core.simulator.parameter_algebra import (
-            apply_parameter_algebra_spec_to_mechanism,
-        )
-        from kindred.core.simulator.wegscheider_symbolic import (
-            analyze_wegscheider_cyclicity,
-        )
-        from kindred.core.units import UnitsModel
-
-        prepared_dsl = prepare_dsl_request_set(
-            request.source,
-            initials={},
-            units=UnitsModel(temperature_K=request.temperature_K),
-        )
-        mechanism = prepared_dsl.mechanism_for_execution()
-        apply_parameter_algebra_spec_to_mechanism(
-            prepared_dsl.parameter_algebra_spec_for_execution(),
-            mechanism=mechanism,
-            require_mutable=False,
-        )
-        self._report = analyze_wegscheider_cyclicity(mechanism)
+        if not isinstance(request.report, WegscheiderCyclicityReport):
+            raise TypeError("Detailed-balance request has no accepted report.")
+        self._report = request.report
         if not self._report.unresolved_cycles:
             raise ValueError("The accepted source has no unresolved detailed-balance cycle.")
 
@@ -138,14 +130,18 @@ class _DetailedBalanceCorrectionDialog(QtWidgets.QDialog):
             selector = QtWidgets.QComboBox(self)
             selector.addItems(list(cycle.parameter_names))
             self._selectors[cycle.cycle_id] = selector
+            label = f"{cycle.cycle_id} dependent parameter"
+            if any(name.startswith("dG_eq") for name in cycle.parameter_names):
+                label += f" ({request.source_energy_unit})"
             form.addRow(
-                f"{cycle.cycle_id} dependent parameter",
+                label,
                 selector,
             )
         layout.addLayout(form)
         explanation = QtWidgets.QLabel(
-            "Kindred will add one symbolic dependency for each cycle, then "
-            "parse and reverify the corrected source before it can be used.",
+            "Kindred will add one symbolic dependency for each cycle. The "
+            "detached Reactions edit is accepted and reverified by the owning "
+            "Run or Fit workflow before execution continues.",
             self,
         )
         explanation.setWordWrap(True)
@@ -165,16 +161,10 @@ class _DetailedBalanceCorrectionDialog(QtWidgets.QDialog):
 
     @QtCore.Slot()
     def _accept_correction(self) -> None:
-        from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
-        from kindred.core.simulator.parameter_algebra import (
-            apply_parameter_algebra_spec_to_mechanism,
-        )
         from kindred.core.simulator.wegscheider_symbolic import (
             apply_wegscheider_resolution_to_reactions_text,
             build_wegscheider_resolution_updates,
-            validate_wegscheider_cyclicity_resolved,
         )
-        from kindred.core.units import UnitsModel
 
         selected = {
             cycle_id: selector.currentText()
@@ -189,20 +179,6 @@ class _DetailedBalanceCorrectionDialog(QtWidgets.QDialog):
                 self._request.source,
                 updates,
             )
-            prepared_dsl = prepare_dsl_request_set(
-                corrected,
-                initials={},
-                units=UnitsModel(
-                    temperature_K=self._request.temperature_K
-                ),
-            )
-            mechanism = prepared_dsl.mechanism_for_execution()
-            apply_parameter_algebra_spec_to_mechanism(
-                prepared_dsl.parameter_algebra_spec_for_execution(),
-                mechanism=mechanism,
-                require_mutable=False,
-            )
-            validate_wegscheider_cyclicity_resolved(mechanism)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -290,10 +266,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     Mechanism editor with Reactions and Notes tabs.
 
     Features:
-    - Reactions tab: DSL text editor for reactions, algebra declarations, and computational-mode content
+    - Reactions tab: DSL text editor for reactions and algebra declarations
     - Notes tab: persisted free-form text (never parsed or injected)
-
-    The State Network editor is accessible via the Edit menu.
 
     The reaction text editor is directly editable. It emits visible authoring
     and validation intent; scientific action boundaries own reconciliation.
@@ -365,9 +339,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "let conversion = 1.0 - ([A] / max([A]_0, 1e-18))\n"
             "\n"
             "param k_derived = k_base * scale\n"
-            "\n"
-            "# === Computational Mode ===\n"
-            "comp: species C G=-450.12\n"
         )
         self._reactions_text.setFont(QtGui.QFont("Courier New", 10))
         self._reactions_text.setUndoRedoEnabled(True)  # Enable undo/redo
@@ -536,7 +507,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         self._tabs.addTab(self._reactions_tab, "Reactions")
 
-        # Help tab — example + directive/algebra/computational-mode reference
+        # Help tab — current directive and algebra reference
         self._help_tab = QtWidgets.QWidget()
         help_layout = QtWidgets.QVBoxLayout(self._help_tab)
         help_layout.setContentsMargins(0, 0, 0, 0)
@@ -567,11 +538,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "Requires kf= plus exactly one of kr=, Keq=, or dG_eq=.\n"
             "Keq= without kf=, kr= plus Keq=, and all-three rate forms are rejected.\n"
             "\n"
-            "<b>State Network</b>\n"
-            "state: GS1 ; kind=GS ; energy=0.0\n"
-            "state: TS1 ; kind=TS ; energy=85.5 kJ/mol\n"
-            "edge: GS1,TS1   (or edge: GS1-TS1)\n"
-            "\n"
             "<b>Temperature Schedules</b>\n"
             "temp_step: t=[0,50,100], T=[298,320]\n"
             "temp_response: t=[0,50,100], T=[298,320], tau=10\n"
@@ -601,10 +567,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "\n"
             "<b>State Triggers</b>\n"
             "intervention: op=trigger; watch_species=A; threshold=0.8; direction=falling; max_count=1; min_interval=0.0; then={op=jump,species=B,delta=0.1}\n"
-            "Trigger requires watch_species, exactly one threshold/threshold_param, direction, a positive integer literal max_count, a finite nonnegative literal min_interval, and one braced then action.\n"
-            "The required direction field is rising, falling, or either. then allows exactly one set or jump with implicit trigger time, so time/time_param is not used inside then.\n"
+            "Trigger requires watch_species, exactly one threshold/threshold_param, a positive integer literal max_count, a finite nonnegative literal min_interval, and one braced then action.\n"
+            "If supplied, direction is rising, falling, or either; omission defaults to either. then allows exactly one set or jump with implicit trigger time, so time/time_param is not used inside then.\n"
             "Only an exact terminal solver root can fire a trigger. After firing at T, it rearms no earlier than max(T + min_interval, nextafter(T, +infinity)); a firing cannot recursively trigger another firing at the same boundary.\n"
-            "Initial equality fires only when ordinary solver event handling reports a root at integration start. Count and firing provenance advance atomically only after the action succeeds.\n"
+            "Initial equality is neutral. A trigger becomes eligible only after the trajectory occupies a strict side and then makes a genuine direction-compatible crossing. Count and firing provenance advance atomically only after the action succeeds.\n"
             "\n"
             "<b>Intervention Domains and Ordering</b>\n"
             "Literal and resolved time, start_time, end_time, threshold, and min_interval are finite and nonnegative; resolved end_time is greater than start_time.\n"
@@ -639,11 +605,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "N_A   Avogadro constant (read-only)\n"
             "R     Gas constant in J/mol/K (read-only)\n"
             "Rkcal Gas constant in kcal/mol/K (read-only)\n"
-            "T     Current nominal temperature in K from the mechanism tab (read-only)\n"
-            "\n"
-            "<b>Computational Mode (# === Computational Mode ===)</b>\n"
-            "Define advanced species thermodynamics (e.g., comp: species A G=-100).\n"
-            "Note: The 'hartree' energy unit is only supported within Computational Mode blocks.\n"
+            "T     Actual row-local external temperature T(t) in K for let observables (read-only; not allowed in param)\n"
             "\n"
             "Note: Kindred normalizes all energies internally to J/mol.\n"
             "\n"
@@ -668,10 +630,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "equilibrium: C &lt;=&gt; D ; Keq=2.5 ; kf=10.0\n"
             "let total_CD = [C] + [D]\n"
             "\n"
-            "Reaction arrows: -&gt; for irreversible, &lt;-&gt; or &lt;=&gt; for reversible. &lt;- is not accepted.\n"
-            "\n"
-            "# === Computational Mode ===\n"
-            "comp: species C G=-450.12</pre>"
+            "Reaction arrows: -&gt; for irreversible, &lt;-&gt; or &lt;=&gt; for reversible. &lt;- is not accepted.</pre>"
         )
         help_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         help_label.setWordWrap(True)
@@ -716,16 +675,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         notes_layout.addWidget(self._notes_text)
         self._tabs.addTab(self._notes_tab, "Notes")
 
-        # Keep the State Network editor available through the Edit menu without
-        # adding it to the tabbed editor:
-        # a visible, non-laid-out child widget will sit at (0, 0) and can intercept
-        # clicks on the QTabBar (making it impossible to switch back to "Reactions").
-        self._state_network_editor = StateNetworkEditor(parent=self)
-        self._state_network_editor.stateNetworkChanged.connect(
-            self._on_source_draft_edited
-        )
-        self._state_network_editor.hide()
-        self._state_network_dialog: QtWidgets.QDialog | None = None
         self._initial_slider_sync_timer = QtCore.QTimer(self)
         self._initial_slider_sync_timer.setSingleShot(True)
         self._initial_slider_sync_timer.timeout.connect(
@@ -735,48 +684,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def species_sliders_widget(self) -> BatchSpeciesSliders:
         return self._species_sliders
-
-    @QtCore.Slot()
-    def open_state_network_editor(self) -> None:
-        """Open the owned editor; accepted changes remain ordinary source drafts."""
-
-        existing = self._state_network_dialog
-        if existing is not None and existing.isVisible():
-            existing.raise_()
-            existing.activateWindow()
-            return
-
-        dialog = QtWidgets.QDialog(self.window())
-        self._state_network_dialog = dialog
-        dialog.setWindowTitle("State Network Editor")
-        dialog.setMinimumSize(700, 550)
-        dialog.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
-        layout = QtWidgets.QVBoxLayout(dialog)
-        editor = self._state_network_editor
-        previous_parent = editor.parentWidget()
-        previous_visible = editor.isVisible()
-        editor.setParent(dialog)
-        layout.addWidget(editor, 1)
-        editor.show()
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Close,
-            parent=dialog,
-        )
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        def restore_editor(_result: int) -> None:
-            layout.removeWidget(editor)
-            editor.setParent(previous_parent)
-            editor.setVisible(previous_visible)
-            if self._state_network_dialog is dialog:
-                self._state_network_dialog = None
-            dialog.deleteLater()
-
-        dialog.finished.connect(restore_editor)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
 
     def set_slider_edit_targets_summary(self, text: str) -> None:
         summary = str(text or "Slider edit targets: none")
@@ -936,17 +843,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self.sourceDraftEdited.emit(
             MechanismAuthoringSource.from_parts(
                 reactions_text=self.reactions_text(),
-                state_network_dsl=self.state_network_dsl_raw(),
             )
         )
 
     def _validate_dsl(self):
         """Validate DSL text and update validation indicator."""
         text = self._reactions_text.toPlainText()
-        state_network_dsl = self._state_network_editor.get_state_network_dsl()
 
         # Skip validation if text is empty
-        if not text.strip() and not str(state_network_dsl or "").strip():
+        if not text.strip():
             self._set_validation_state("idle")
             return
 
@@ -959,15 +864,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             from kindred.core.mechanism_source import MechanismAuthoringSource
             from kindred.core.units import UnitsModel
 
-            if (
-                str(state_network_dsl or "").strip()
-                and not self._state_network_editor.is_valid()
-            ):
-                raise ValueError("Invalid State Network")
             validation_text = MechanismAuthoringSource.from_parts(
                 reactions_text=text,
-                state_network_dsl=state_network_dsl,
-            ).full_dsl
+            ).reactions_text
 
             prepared_dsl = prepare_dsl_request_set(
                 validation_text,
@@ -1292,51 +1191,30 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self,
         *,
         source,
-        state_network_prepared_dsl,
         notes: str,
         slider_dirty: bool,
+        refresh_validation: bool = True,
     ) -> None:
         """Render one tab snapshot without retaining canonical state."""
         from kindred.core.mechanism_source import MechanismAuthoringSource
-        from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be MechanismAuthoringSource.")
-        state_text = str(source.state_network_dsl)
-        if state_network_prepared_dsl is None:
-            if state_text.strip():
-                raise TypeError(
-                    "Nonempty State Network source requires "
-                    "PreparedDslRequestSet authority."
-                )
-        elif not isinstance(state_network_prepared_dsl, PreparedDslRequestSet):
-            raise TypeError(
-                "state_network_prepared_dsl must be "
-                "PreparedDslRequestSet or None for blank source."
-            )
         editor_blocker = QtCore.QSignalBlocker(self)
         reactions_blocker = QtCore.QSignalBlocker(self._reactions_text)
-        state_blocker = QtCore.QSignalBlocker(self._state_network_editor)
         notes_blocker = QtCore.QSignalBlocker(self._notes_text)
         try:
             self.set_reactions_text(source.reactions_text)
-            if self.state_network_dsl_raw() != state_text:
-                if state_network_prepared_dsl is None:
-                    self._state_network_editor.clear()
-                else:
-                    self._state_network_editor.set_state_network_analysis(
-                        state_network_prepared_dsl
-                    )
             notes_text = str(notes)
             if self._notes_text.toPlainText() != notes_text:
                 self._notes_text.setPlainText(notes_text)
             self.set_slider_draft_actions_enabled(
                 bool(slider_dirty),
             )
-            self.refresh_validation_indicator()
+            if bool(refresh_validation):
+                self.refresh_validation_indicator()
         finally:
             del notes_blocker
-            del state_blocker
             del reactions_blocker
             del editor_blocker
 
@@ -1405,11 +1283,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         super().focusInEvent(event)
         self._emit_native_history_availability()
 
-    def state_network_dsl_raw(self) -> str:
-        """Return the current raw state-network DSL (may be empty)."""
-        return str(self._state_network_editor.get_state_network_dsl() or "")
-
-
 class MechanismEditorBinding(QtCore.QObject):
     """Binds the shared editor to the active tab's retained draft."""
 
@@ -1448,29 +1321,9 @@ class MechanismEditorBinding(QtCore.QObject):
     def prepare_active_render(self) -> _MechanismEditorRenderProjection:
         """Prepare every fallible authoring projection before widget mutation."""
 
-        from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
-        from kindred.core.units import UnitsModel
-
         tab = self._registry.active_tab
         runtime = self._registry.active_runtime
         source = runtime.reactions_draft or tab.mechanism_source
-        state_network_text = str(source.state_network_dsl)
-        if not state_network_text.strip():
-            state_network_prepared_dsl = None
-        elif (
-            tab.prepared_dsl is not None
-            and state_network_text
-            == tab.mechanism_source.state_network_dsl
-        ):
-            state_network_prepared_dsl = tab.prepared_dsl
-        else:
-            state_network_prepared_dsl = prepare_dsl_request_set(
-                state_network_text,
-                initials={},
-                units=UnitsModel(
-                    temperature_K=tab.scientific_settings.temperature
-                ),
-            )
         document_identity = self._registry.active_document_identity
         if (
             type(document_identity) is not tuple
@@ -1481,7 +1334,6 @@ class MechanismEditorBinding(QtCore.QObject):
             )
         return _MechanismEditorRenderProjection(
             source=source,
-            state_network_prepared_dsl=state_network_prepared_dsl,
             notes=(
                 tab.notes
                 if runtime.notes_draft is None
@@ -1497,6 +1349,8 @@ class MechanismEditorBinding(QtCore.QObject):
     def apply_render_projection(
         self,
         projection: _MechanismEditorRenderProjection,
+        *,
+        refresh_validation: bool = True,
     ) -> None:
         """Apply one fully prepared authoring projection."""
 
@@ -1511,11 +1365,9 @@ class MechanismEditorBinding(QtCore.QObject):
         try:
             self._editor.render_authoring_snapshot(
                 source=projection.source,
-                state_network_prepared_dsl=(
-                    projection.state_network_prepared_dsl
-                ),
                 notes=projection.notes,
                 slider_dirty=projection.slider_dirty,
+                refresh_validation=bool(refresh_validation),
             )
             if identity_changed:
                 self._editor.clear_native_text_history()

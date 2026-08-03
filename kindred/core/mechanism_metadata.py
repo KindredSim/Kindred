@@ -30,7 +30,6 @@ class MechanismMetadataKeys:
     TEMPERATURE_SCHEDULE = "temperature_schedule"
     INTERVENTION_SCHEDULE = "intervention_schedule"
     WEGSCHEIDER_CYCLICITY_ENABLED = "wegscheider_cyclicity_enabled"
-    STATE_NETWORK = "state_network"
 
 
 class EquilibriumMetadataKeys:
@@ -43,8 +42,6 @@ class EquilibriumMetadataKeys:
     EXPLICIT_RATES = "explicit_rates"
     FORWARD_MODEL = "forward_model"
     STANDARD_CONC_M = "standard_conc_M"
-    GENERATED_AUTHORITY = "generated_equilibrium_authority"
-    GENERATED_RATE_MODEL = "generated_rate_model"
 
 
 def _as_float(value: object, *, default: float) -> float:
@@ -101,6 +98,21 @@ class MechanismMetadataView:
             "temperature_K",
             coerce_temperature_kelvin(self.temperature_K, field=MechanismMetadataKeys.TEMPERATURE_K),
         )
+        if type(self.standard_conc_M) is bool:
+            raise ValueError(
+                f"{MechanismMetadataKeys.STANDARD_CONC_M} must be positive and finite."
+            )
+        try:
+            standard = float(self.standard_conc_M)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"{MechanismMetadataKeys.STANDARD_CONC_M} must be positive and finite."
+            ) from exc
+        if not math.isfinite(standard) or standard <= 0.0:
+            raise ValueError(
+                f"{MechanismMetadataKeys.STANDARD_CONC_M} must be positive and finite."
+            )
+        object.__setattr__(self, "standard_conc_M", standard)
 
     @classmethod
     def from_metadata(cls, meta: Mapping[str, Any] | None) -> "MechanismMetadataView":
@@ -111,10 +123,7 @@ class MechanismMetadataView:
                 meta.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15),
                 field=MechanismMetadataKeys.TEMPERATURE_K,
             ),
-            standard_conc_M=_as_float(
-                meta.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0),
-                default=1.0,
-            ),
+            standard_conc_M=meta.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0),
             kappa_global=_as_float(
                 meta.get(MechanismMetadataKeys.KAPPA_GLOBAL, 1.0),
                 default=1.0,

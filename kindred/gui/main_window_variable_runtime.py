@@ -15,6 +15,8 @@ from kindred.core.result_repository import (
     ExplicitResultKey,
     PreviewResultIdentity,
     PreviewResultKey,
+    scientific_identity,
+    standard_concentration_identity,
 )
 from kindred.core.simulator.dsl_parse import (
     DslParameterCoordinateUpdate,
@@ -26,6 +28,7 @@ from kindred.core.simulator.errors import DSLError
 from kindred.core.units import UnitsModel
 from kindred.core.simulator.wegscheider_symbolic import (
     UnresolvedWegscheiderCyclicityError,
+    WegscheiderCyclicityReport,
 )
 from kindred.gui.parameter_enumeration import (
     GuiParameterCoordinate,
@@ -688,7 +691,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
                 tab.prepared_dsl
                 if runtime.reactions_draft is None
                 else prepare_dsl_request_set(
-                    visible_source.full_dsl,
+                    visible_source.reactions_text,
                     initials={},
                     units=UnitsModel(
                         temperature_K=tab.scientific_settings.temperature
@@ -708,6 +711,11 @@ class ActiveTabSliderBinding(QtCore.QObject):
                 tab,
                 exc,
                 reactions_text=visible_source.reactions_text,
+                source_energy_unit=(
+                    str(visible_prepared.analysis.structure.get("energy_unit", "kJ/mol"))
+                    if visible_prepared is not None
+                    else "kJ/mol"
+                ),
             )
             self._pending_detailed_balance_request = request
             self.previewDetailedBalanceCorrectionRequired.emit(request)
@@ -751,6 +759,11 @@ class ActiveTabSliderBinding(QtCore.QObject):
                 tab,
                 exc,
                 reactions_text=tab.mechanism_source.reactions_text,
+                source_energy_unit=(
+                    str(tab.prepared_dsl.analysis.structure.get("energy_unit", "kJ/mol"))
+                    if tab.prepared_dsl is not None
+                    else "kJ/mol"
+                ),
             )
             self._pending_detailed_balance_request = request
             self.previewDetailedBalanceCorrectionRequired.emit(request)
@@ -847,6 +860,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
         error: UnresolvedWegscheiderCyclicityError,
         *,
         reactions_text: str,
+        source_energy_unit: str,
     ) -> DetailedBalanceCorrectionRequest:
         source = str(reactions_text)
         identity = hashlib.sha256(
@@ -862,6 +876,8 @@ class ActiveTabSliderBinding(QtCore.QObject):
             source=source,
             issue=str(error),
             temperature_K=float(tab.scientific_settings.temperature),
+            report=WegscheiderCyclicityReport(cycles=tuple(error.cycles)),
+            source_energy_unit=str(source_energy_unit),
         )
 
     def complete_preview_detailed_balance_correction(
@@ -1162,8 +1178,8 @@ class ActiveTabSliderBinding(QtCore.QObject):
                 )
             except (LookupError, TypeError, ValueError) as exc:
                 return self._reject(f"Slider Apply failed ({exc}).")
-            source = MechanismAuthoringSource.from_full_dsl_text(
-                candidate_prepared_dsl.analysis.normalized_text
+            source = MechanismAuthoringSource.from_parts(
+                reactions_text=candidate_prepared_dsl.analysis.normalized_text
             )
 
         candidate_sets = []
@@ -1257,6 +1273,9 @@ class ActiveTabSliderBinding(QtCore.QObject):
             set_id=set_id,
             mechanism_source=tab.mechanism_source,
             analysis_identity=projected_analysis_identity(tab),
+            standard_concentration_identity=standard_concentration_identity(
+                tab.prepared_dsl
+            ),
             parameter_values=tuple(parameter_values.items()),
             initial_values=tuple(initial_values.items()),
             execution_settings=tab.resolved_execution_settings(set_id),
@@ -1280,6 +1299,10 @@ class ActiveTabSliderBinding(QtCore.QObject):
             set_id=set_id,
             mechanism_source=tab.mechanism_source,
             analysis_identity=projected_analysis_identity(tab),
+            standard_concentration_identity=standard_concentration_identity(
+                tab.prepared_dsl
+            ),
+            scientific_identity=scientific_identity(tab.prepared_dsl),
             initial_values=projected_initial_values(tab, set_id),
             execution_settings=tab.resolved_execution_settings(set_id),
             scientific_settings=tab.scientific_settings,

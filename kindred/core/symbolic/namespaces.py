@@ -12,7 +12,7 @@ from .errors import UnsupportedSymbolicExpressionError
 from .identity import symbolic_fingerprint
 
 
-_PROTECTED_RUNTIME_SYMBOLS = {"T", "T0"}
+_PROTECTED_RUNTIME_SYMBOLS = {"T"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +206,7 @@ def reject_unsupported_parameter_symbol_source(source: str) -> None:
         raise UnsupportedSymbolicExpressionError("Empty symbolic expression is not supported.")
     if "[" in source_s or "]" in source_s:
         raise UnsupportedSymbolicExpressionError(
-            "State concentration symbols such as [A], [A]_0, or [A](T0) are not supported in parameter/proof context."
+            "State concentration symbols such as [A] or [A]_0 are not supported in parameter/proof context."
         )
     if re.search(r"\b(if|else|and|or|not)\b", source_s):
         raise UnsupportedSymbolicExpressionError("Dynamic or logical expressions are not supported in symbolic proof.")

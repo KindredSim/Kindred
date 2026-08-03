@@ -912,7 +912,6 @@ def _normalized_mechanism_source(
 ) -> MechanismAuthoringSource:
     return MechanismAuthoringSource.from_parts(
         reactions_text=_normalized_dsl_text(source.reactions_text),
-        state_network_dsl=_normalized_dsl_text(source.state_network_dsl),
     )
 
 
@@ -920,10 +919,10 @@ def _prepare_source_dsl(
     source: MechanismAuthoringSource,
     scientific_settings: TabScientificSettings,
 ) -> PreparedDslRequestSet | None:
-    if not source.full_dsl.strip():
+    if not source.reactions_text.strip():
         return None
     return prepare_dsl_request_set(
-        source.full_dsl,
+        source.reactions_text,
         initials={},
         units=UnitsModel(
             temperature_K=scientific_settings.temperature,
@@ -934,12 +933,12 @@ def _prepare_source_dsl(
 def _prepared_dsl_matches_tab(tab: MechanismTabDocument) -> bool:
     prepared = tab.prepared_dsl
     if prepared is None:
-        return not tab.mechanism_source.full_dsl.strip()
+        return not tab.mechanism_source.reactions_text.strip()
     if type(prepared) is not PreparedDslRequestSet:
         return False
     analysis = prepared.analysis
     if analysis.normalized_text != _normalized_dsl_text(
-        tab.mechanism_source.full_dsl
+        tab.mechanism_source.reactions_text
     ):
         return False
     analysis_temperature = analysis.structure.get("temperature_K")
@@ -975,7 +974,7 @@ def reconcile_tab_mechanism_source(
         )
         admission = (
             DslInitialConditionAdmission(
-                materialized_source=normalized_visible.full_dsl
+                materialized_source=normalized_visible.reactions_text
             )
             if admitted_dsl is None
             else admitted_dsl.analysis.inline_initial_conditions
@@ -1108,7 +1107,7 @@ def reconcile_tab_mechanism_source(
                     raise ValueError(
                         f"Inline initial-condition set {context_name!r} "
                         f"references species {assignment.species!r} absent "
-                        "from the complete Reactions plus State Network model."
+                        "from the complete Reactions model."
                     )
 
         mutable_sets = list(reconciled_sets)
@@ -1191,8 +1190,8 @@ def reconcile_tab_mechanism_source(
             normalized_visible
             if not admission.has_declarations
             else _normalized_mechanism_source(
-                MechanismAuthoringSource.from_full_dsl_text(
-                    admission.materialized_source
+                MechanismAuthoringSource.from_parts(
+                    reactions_text=admission.materialized_source
                 )
             )
         )

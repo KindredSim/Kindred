@@ -5,7 +5,6 @@ Current contract
 ----------------
 - Dynamic evaluation per time t with memoization keyed by (t, symbol).
 - [A] pulls series at time t; [A]_0 pulls initial concentration.
-- [A](T0) linearly interpolates from the baseline grid. Error if baseline absent.
 - Builtins/helpers and protected symbols: see symbols.py and constants.py.
 - No shadowing of species or builtins for user-defined algebra symbols (E120).
 - Error taxonomy uses the algebra error classes and codes defined in errors.py.
@@ -25,7 +24,7 @@ Constraints
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
@@ -37,7 +36,6 @@ from .errors import (
     AlgebraNameError,
     AlgebraShadowError,
     AlgebraTypeError,
-    AlgebraTimeRefError,
     AlgebraZeroDivError,
 )
 from .parser import (
@@ -67,13 +65,6 @@ __all__ = [
 # ----------------------------- context model ---------------------------------
 
 
-@dataclass(frozen=True)
-class Baseline:
-    """Baseline grid and series used for [A](T0) interpolation."""
-    t: np.ndarray                  # strictly increasing
-    series: Mapping[str, np.ndarray]  # name -> values on baseline grid
-
-
 @dataclass
 class EvaluationContext:
     """
@@ -82,7 +73,7 @@ class EvaluationContext:
     Attributes
     ----------
     t : ndarray
-        Native solver grid; strictly increasing; shape (N,).
+        Row-aligned evaluation grid; finite and nondecreasing; shape (N,).
     species_series : mapping
         Species time series on native grid: name -> ndarray (len N).
     initials : mapping
@@ -92,16 +83,24 @@ class EvaluationContext:
     symtab : SymbolTable
         Protected symbols and scalar user symbols. `T` is read-only and may be
         updated by the application, not by user algebra.
-    baseline : Baseline | None
-        Baseline grid/series for [A](T0). If None and such a reference occurs,
-        raise E160.
+    symbol_series : mapping, optional
+        Row-aligned runtime symbols.  These values are resolved before the
+        static symbol table and are intended for step-local ``t``, ``T``,
+        mechanism coefficients, and changing scalar inputs.  A scalar value
+        is broadcast to the supplied grid; an array must have exactly the
+        same length as ``t``.
+    symbol_values : mapping, optional
+        The admitted static scalar snapshot available to observable ``let``
+        expressions. Fit candidates must prepare this complete snapshot before
+        solving; row evaluation never overrides retained ``param`` assignments.
     """
     t: np.ndarray
     species_series: Mapping[str, np.ndarray]
     initials: Mapping[str, float]
     species_names: Set[str]
     symtab: SymbolTable
-    baseline: Optional[Baseline] = None
+    symbol_series: Mapping[str, np.ndarray] = field(default_factory=dict)
+    symbol_values: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -155,36 +154,10 @@ def _as_float(x: Any, *, stmt: LetStatement) -> float:
     return xf
 
 
-def _interp_baseline(b: Baseline, name: str, t_now: float, *, stmt: LetStatement) -> float:
-    """Linear interpolation on baseline grid for [name](T0). Raises E160 if invalid."""
-    if name not in b.series:
-        raise AlgebraTimeRefError(f"baseline missing series {name!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-    t0 = b.t
-    y0 = np.asarray(b.series[name], dtype=float)
-    if t0.ndim != 1 or y0.ndim != 1 or t0.size != y0.size or t0.size < 2:
-        raise AlgebraTimeRefError("baseline grid invalid or ambiguous", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-    if not (np.all(np.isfinite(t0)) and np.all(np.isfinite(y0))):
-        raise AlgebraTimeRefError("baseline contains non-finite values", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-    if np.any(np.diff(t0) <= 0):
-        raise AlgebraTimeRefError("baseline grid must be strictly increasing", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-    # Restrict to interpolation only; be conservative and forbid extrapolation
-    if t_now < t0[0] or t_now > t0[-1]:
-        raise AlgebraTimeRefError("T0 outside baseline range", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-    j = int(np.searchsorted(t0, t_now, side="left"))
-    if j == 0:
-        return float(y0[0])
-    if j == t0.size:
-        return float(y0[-1])
-    t_lo, t_hi = float(t0[j - 1]), float(t0[j])
-    y_lo, y_hi = float(y0[j - 1]), float(y0[j])
-    w = (t_now - t_lo) / (t_hi - t_lo)
-    return float((1.0 - w) + 0.0) * y_lo + float(w) * y_hi
-
-
 def _is_time_varying(expr: ExprNode, sym_timevary: Set[str]) -> bool:
     """Decide if an expression depends on time t."""
     if isinstance(expr, SpeciesRefNode):
-        return expr.kind in ("now", "T0")
+        return expr.kind == "now"
     if isinstance(expr, IdentNode):
         return expr.name in sym_timevary
     if isinstance(expr, (NumberNode,)):
@@ -204,31 +177,45 @@ def _is_time_varying(expr: ExprNode, sym_timevary: Set[str]) -> bool:
 class _Evaluator:
     def __init__(self, block: AlgebraBlock, ctx: EvaluationContext) -> None:
         self.block = block
+        self.static_values = block.static_value_map()
         self.ctx = ctx
         self.N = int(ctx.t.size)
+        self.symbol_series: Dict[str, np.ndarray] = {}
+        for name, values in (ctx.symbol_series or {}).items():
+            arr = np.asarray(values, dtype=float)
+            if arr.ndim == 0:
+                arr = np.full(self.N, float(arr), dtype=float)
+            self.symbol_series[str(name)] = arr.reshape(-1)
+        self.symbol_values: Dict[str, float] = {
+            str(name): float(value)
+            for name, value in (ctx.symbol_values or {}).items()
+        }
         # memo[(i, name)] = float
         self.memo: Dict[Tuple[int, str], float] = {}
         # results
         self.series: Dict[str, np.ndarray] = {}
         self.scalars: Dict[str, float] = {}
         # dependency classification for user-defined symbols
-        self.timevary: Set[str] = set()
+        # Runtime row-aligned symbols are dynamic roots even when their values
+        # happen to be constant over one particular grid.
+        self.timevary: Set[str] = {"t"} | set(self.symbol_series)
 
     # Public entry
     def run(self) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
         # Pre-classify time variance based on AST shape and dependencies
-        for stmt in self.block.lines:
+        for stmt in self.block.statements_in_evaluation_order():
             name = stmt.name
             # shadowing guards
             self._guard_shadow(name, stmt)
-            # dynamic if contains [X] now/T0 or depends on prior dynamic symbols
+            # dynamic if it contains a current-state reference or depends on
+            # prior dynamic symbols
             is_dyn = _is_time_varying(stmt.expr, self.timevary)
             if is_dyn:
                 self.timevary.add(name)
 
-            if not is_dyn and name in self.block.static_values:
+            if not is_dyn and name in self.static_values:
                 # Fully static fold available
-                val = _as_float(self.block.static_values[name], stmt=stmt)
+                val = _as_float(self.static_values[name], stmt=stmt)
                 self.scalars[name] = val
                 self.ctx.symtab.define_user(name, val, species_names=self.ctx.species_names)
             else:
@@ -250,7 +237,7 @@ class _Evaluator:
         """
         errors: List[AlgebraObservableError] = []
 
-        for stmt in self.block.lines:
+        for stmt in self.block.statements_in_evaluation_order():
             name = stmt.name
             try:
                 self._guard_shadow(name, stmt)
@@ -258,8 +245,8 @@ class _Evaluator:
                 if is_dyn:
                     self.timevary.add(name)
 
-                if (not is_dyn) and (name in self.block.static_values):
-                    val = _as_float(self.block.static_values[name], stmt=stmt)
+                if (not is_dyn) and (name in self.static_values):
+                    val = _as_float(self.static_values[name], stmt=stmt)
                     self.scalars[name] = val
                     self.ctx.symtab.define_user(name, val, species_names=self.ctx.species_names)
                     continue
@@ -306,6 +293,15 @@ class _Evaluator:
                 val = float(self.series[name][i])
                 self.memo[key] = val
                 return val
+            if name == "t":
+                return float(self.ctx.t[i])
+            # Accepted runtime context takes precedence over the static table,
+            # allowing T, t, coefficients, and changing scalar inputs to vary
+            # independently at each result row.
+            if name in self.symbol_series:
+                return float(self.symbol_series[name][i])
+            if name in self.symbol_values:
+                return float(self.symbol_values[name])
             # protected or previously defined user scalar in symtab
             if self.ctx.symtab.has(name):
                 return float(self.ctx.symtab.get(name))
@@ -324,12 +320,6 @@ class _Evaluator:
                 if nm not in self.ctx.initials:
                     raise AlgebraNameError(f"unknown species {nm!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
                 return float(self.ctx.initials[nm])
-            if node.kind == "T0":
-                if self.ctx.baseline is None:
-                    raise AlgebraTimeRefError("baseline missing for [A](T0) reference", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-                t_now = float(self.ctx.t[i])
-                return _interp_baseline(self.ctx.baseline, nm, t_now, stmt=stmt)
-
         # Unary
         if isinstance(node, UnaryNode):
             v = self._eval_expr(node.rhs, i, stmt=stmt)
@@ -441,13 +431,40 @@ def evaluate_block(
     """
     # Validate basic shapes once, early
     t = np.asarray(ctx.t, dtype=float)
-    if t.ndim != 1 or t.size == 0 or np.any(~np.isfinite(t)) or np.any(np.diff(t) <= 0):
-        raise AlgebraTypeError("time grid t must be 1D, finite, and strictly increasing", line=1, col=1, line_text="# Algebra")
+    if t.ndim != 1 or t.size == 0 or np.any(~np.isfinite(t)) or np.any(np.diff(t) < 0):
+        raise AlgebraTypeError("time grid t must be 1D, finite, and nondecreasing", line=1, col=1, line_text="# Algebra")
     for nm, arr in ctx.species_series.items():
         a = np.asarray(arr, dtype=float)
         if a.ndim != 1 or a.size != t.size or np.any(~np.isfinite(a)):
             raise AlgebraTypeError(f"series[{nm!r}] must be 1D, finite, length equal to len(t)", line=1, col=1, line_text="# Algebra")
-
+    for nm, raw in (ctx.symbol_series or {}).items():
+        a = np.asarray(raw, dtype=float)
+        if a.ndim == 0:
+            a = np.full(t.size, float(a), dtype=float)
+        if a.ndim != 1 or a.size != t.size or np.any(~np.isfinite(a)):
+            raise AlgebraTypeError(
+                f"symbol_series[{nm!r}] must be scalar or 1D, finite, length equal to len(t)",
+                line=1,
+                col=1,
+                line_text="# Algebra",
+            )
+    for nm, raw in (ctx.symbol_values or {}).items():
+        try:
+            value = float(raw)
+        except Exception as exc:
+            raise AlgebraTypeError(
+                f"symbol_values[{nm!r}] must be numeric",
+                line=1,
+                col=1,
+                line_text="# Algebra",
+            ) from exc
+        if not np.isfinite(value):
+            raise AlgebraTypeError(
+                f"symbol_values[{nm!r}] must be finite",
+                line=1,
+                col=1,
+                line_text="# Algebra",
+            )
     ev = _Evaluator(block, ctx)
     return ev.run()
 
@@ -465,12 +482,39 @@ def evaluate_block_partial(
     """
     # Validate basic shapes once, early (same behavior as strict mode).
     t = np.asarray(ctx.t, dtype=float)
-    if t.ndim != 1 or t.size == 0 or np.any(~np.isfinite(t)) or np.any(np.diff(t) <= 0):
-        raise AlgebraTypeError("time grid t must be 1D, finite, and strictly increasing", line=1, col=1, line_text="# Algebra")
+    if t.ndim != 1 or t.size == 0 or np.any(~np.isfinite(t)) or np.any(np.diff(t) < 0):
+        raise AlgebraTypeError("time grid t must be 1D, finite, and nondecreasing", line=1, col=1, line_text="# Algebra")
     for nm, arr in ctx.species_series.items():
         a = np.asarray(arr, dtype=float)
         if a.ndim != 1 or a.size != t.size or np.any(~np.isfinite(a)):
             raise AlgebraTypeError(f"series[{nm!r}] must be 1D, finite, length equal to len(t)", line=1, col=1, line_text="# Algebra")
-
+    for nm, raw in (ctx.symbol_series or {}).items():
+        a = np.asarray(raw, dtype=float)
+        if a.ndim == 0:
+            a = np.full(t.size, float(a), dtype=float)
+        if a.ndim != 1 or a.size != t.size or np.any(~np.isfinite(a)):
+            raise AlgebraTypeError(
+                f"symbol_series[{nm!r}] must be scalar or 1D, finite, length equal to len(t)",
+                line=1,
+                col=1,
+                line_text="# Algebra",
+            )
+    for nm, raw in (ctx.symbol_values or {}).items():
+        try:
+            value = float(raw)
+        except Exception as exc:
+            raise AlgebraTypeError(
+                f"symbol_values[{nm!r}] must be numeric",
+                line=1,
+                col=1,
+                line_text="# Algebra",
+            ) from exc
+        if not np.isfinite(value):
+            raise AlgebraTypeError(
+                f"symbol_values[{nm!r}] must be finite",
+                line=1,
+                col=1,
+                line_text="# Algebra",
+            )
     ev = _Evaluator(block, ctx)
     return ev.run_partial()

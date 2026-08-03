@@ -80,6 +80,8 @@ def build_algebra_symbol_table(mechanism) -> SymbolTable:
                     raise ValueError(f"unsupported equilibrium role {info.role!r}")
             else:
                 raise ValueError(f"unsupported step kind {info.step_kind!r}")
+            if value_obj is None and info.role == "Keq":
+                continue
             if value_obj is None:
                 raise ValueError("value is missing")
             raw = value_obj() if callable(value_obj) else value_obj

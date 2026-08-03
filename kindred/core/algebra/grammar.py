@@ -13,13 +13,13 @@ EBNF (power is right-associative):
     equality       := comparison { ("==" | "!=") comparison }
     comparison     := term { ("<"|"<="|">"|">=") term }
     term           := factor { ("+"|"-") factor }
-    factor         := power { ("*"|"/") power }
-    power          := unary { ("**"|"^") unary }      # right associative
-    unary          := ("+"|"-"|"!") unary | primary
+    factor         := unary { ("*"|"/") unary }
+    power          := primary [ ("**"|"^") unary ]    # right associative
+    unary          := ("+"|"-"|"!") unary | power
     primary        := NUMBER | IDENT | func_call | species_ref | "(" expr ")"
     func_call      := IDENT "(" [ arg_list ] ")"
     arg_list       := expr { "," expr }
-    species_ref    := "[" IDENT "]" | "[" IDENT "]_0" | "[" IDENT "]" "(" "T0" ")"
+    species_ref    := "[" IDENT "]" | "[" IDENT "]_0"
 
 Built-in functions:
     sqrt, ln, log10, log1p, exp, expm1, sin, cos, tan, abs, min, max, pow, erf
@@ -47,13 +47,13 @@ EBNF: str = (
     "equality       := comparison { (\"==\" | \"!=\") comparison }\n"
     "comparison     := term { (\"<\"|\"<=\"|\">\"|\">=\") term }\n"
     "term           := factor { (\"+\"|\"-\") factor }\n"
-    "factor         := power { (\"*\"|\"/\") power }\n"
-    "power          := unary { (\"**\"|\"^\") unary }  # right associative\n"
-    "unary          := (\"+\"|\"-\"|\"!\") unary | primary\n"
+    "factor         := unary { (\"*\"|\"/\") unary }\n"
+    "power          := primary [ (\"**\"|\"^\") unary ]  # right associative\n"
+    "unary          := (\"+\"|\"-\"|\"!\") unary | power\n"
     "primary        := NUMBER | IDENT | func_call | species_ref | \"(\" expr \")\"\n"
     "func_call      := IDENT \"(\" [ arg_list ] \")\"\n"
     "arg_list       := expr { \",\" expr }\n"
-    "species_ref    := \"[\" IDENT \"]\" | \"[\" IDENT \"]_0\" | \"[\" IDENT \"]\" \"(\" \"T0\" \")\"\n"
+    "species_ref    := \"[\" IDENT \"]\" | \"[\" IDENT \"]_0\"\n"
 )
 
 
@@ -70,7 +70,6 @@ class TokenKind(str, Enum):
 
     # Keywords
     LET = "LET"
-    T0 = "T0"
 
     # Punctuation
     LPAREN = "LPAREN"        # (
@@ -142,7 +141,6 @@ TOKEN_SPEC: List[Tuple[TokenKind, str]] = [
 # Keywords that the lexer should fold to specific TokenKind when IDENT matches.
 KEYWORDS: Dict[str, TokenKind] = {
     "let": TokenKind.LET,
-    "T0": TokenKind.T0,
     # "Algebra" stays IDENT; the header is recognized as "#"+"Algebra" at the parser level.
 }
 
@@ -171,9 +169,9 @@ PRECEDENCE: Dict[str, int] = {
     "-": 5,
     "*": 6,
     "/": 6,
-    "**": 7,   # power
-    "^": 7,    # power alias
-    "unary": 8,  # synthetic precedence for unary +, -, !
+    "unary": 7,  # synthetic precedence for unary +, -, !
+    "**": 8,   # power
+    "^": 8,    # power alias
 }
 
 ASSOCIATIVITY: Dict[str, str] = {

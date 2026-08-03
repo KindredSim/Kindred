@@ -8,10 +8,6 @@ from collections.abc import Callable, Mapping
 
 from PySide6 import QtWidgets
 
-from kindred.core.equilibrium_rate_authority import (
-    generated_fast_equilibrium_runtime_parameter_name,
-    generated_equilibrium_authority_kind,
-)
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
     compile_intervention_schedule,
@@ -83,26 +79,13 @@ def _format_steps(mechanism: object) -> str:
     else:
         lines.append("No indexed DSL reaction or equilibrium steps.")
 
-    generated_summary = _format_generated_mechanism_summary(mechanism)
-    if generated_summary:
-        if lines:
-            lines.append("")
-        lines.extend(generated_summary)
     return "\n".join(lines)
 
 
 def _format_equations(mechanism: object) -> str:
-    if _has_unsupported_generated_equilibrium(mechanism):
-        return "\n".join(
-            [
-                "Symbolic RHS equations are unavailable for mechanisms with generated equilibria.",
-                "Generated equilibria are included in simulation, but they are not represented in indexed symbolic RHS output.",
-            ]
-        )
-
     structure = build_symbolic_jacobian_structure(mechanism)
     schedule = getattr(mechanism, "metadata", {}).get(MechanismMetadataKeys.INTERVENTION_SCHEDULE)
-    lines = ["Base symbolic RHS equations:"]
+    lines = ["Canonical symbolic RHS equations:"]
     if schedule is not None:
         lines.append("Note: intervention schedules are compiled execution inputs; equations here are the base unscheduled mechanism RHS.")
         lines.append("")
@@ -118,7 +101,10 @@ def _format_equations(mechanism: object) -> str:
         lines.append(f"{species_name}: {', '.join(row)}")
     lines.append("")
     lines.append(f"Structure fingerprint: {structure.structure_fingerprint}")
-    lines.append(f"Parameter symbols: {', '.join(structure.parameter_symbols) or 'none'}")
+    lines.append(
+        "Canonical parameter symbols: "
+        + (", ".join(structure.parameter_symbols) or "none")
+    )
     return "\n".join(lines)
 
 
@@ -220,44 +206,6 @@ def _plain_json_value(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return [_plain_json_value(item) for item in value]
     return value
-
-
-def _format_generated_mechanism_summary(mechanism: object) -> list[str]:
-    generated_reaction_count = sum(
-        1
-        for rxn in getattr(mechanism, "reactions", []) or []
-        if _is_generated_mechanism_metadata(getattr(rxn, "metadata", {}) or {})
-    )
-    generated_equilibrium_count = sum(
-        1
-        for eq in getattr(mechanism, "equilibria", []) or []
-        if _is_generated_mechanism_metadata(getattr(eq, "metadata", {}) or {})
-    )
-    if generated_reaction_count == 0 and generated_equilibrium_count == 0:
-        return []
-    return [
-        "Generated mechanism content:",
-        f"  generated reactions={generated_reaction_count}, generated equilibria={generated_equilibrium_count}",
-        "  Generated equilibria are source-owned conversion outputs and do not consume authored DSL step indices.",
-    ]
-
-
-def _is_generated_mechanism_metadata(metadata: object) -> bool:
-    if not isinstance(metadata, Mapping):
-        return False
-    if generated_equilibrium_authority_kind(metadata):
-        return True
-    return generated_fast_equilibrium_runtime_parameter_name(metadata) is not None
-
-
-def _has_unsupported_generated_equilibrium(mechanism: object) -> bool:
-    for eq in list(getattr(mechanism, "equilibria", []) or []):
-        metadata = getattr(eq, "metadata", {}) or {}
-        if not isinstance(metadata, Mapping):
-            continue
-        if _is_generated_mechanism_metadata(metadata):
-            return True
-    return False
 
 
 class MechanismInspectorDialog(QtWidgets.QDialog):

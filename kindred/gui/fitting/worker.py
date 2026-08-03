@@ -23,6 +23,7 @@ from kindred.core.analysis.fit_dataset_payload import (
     FitObservationSeries,
 )
 from kindred.core.analysis.global_fitting import GlobalFitResult, fit_global
+from kindred.core.analysis.global_fit_execution import select_fit_rows
 from kindred.core.analysis.parametric_alignment import (
     DeterministicParametricResolutionError,
     align_y_on_x_obs,
@@ -38,6 +39,7 @@ from kindred.core.project_document import SimulationExecutionSettings
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.wegscheider_symbolic import (
     UnresolvedWegscheiderCyclicityError,
+    WegscheiderCyclicityReport,
 )
 from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.gui.fitting.contracts import (
@@ -146,8 +148,19 @@ class FitCurveDataset:
     observed_y: tuple[tuple[str, tuple[float, ...]], ...]
     model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...]
     model_segment_keys: tuple[tuple[str, tuple[str, ...]], ...]
+    model_discontinuity_ids: tuple[tuple[str, tuple[int, ...]], ...]
     observed_source_rows: tuple[tuple[str, tuple[int, ...]], ...]
     observed_raw_ids: tuple[tuple[str, str], ...]
+    observed_raw_columns: tuple[tuple[str, str], ...]
+    objective_model_x: tuple[tuple[str, tuple[float, ...]], ...]
+    objective_model_y: tuple[tuple[str, tuple[float, ...]], ...]
+    objective_model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...]
+    objective_model_segment_keys: tuple[tuple[str, tuple[str, ...]], ...]
+    objective_model_discontinuity_ids: tuple[tuple[str, tuple[int, ...]], ...]
+    objective_selection_provenance: tuple[tuple[str, tuple[str, ...]], ...]
+    objective_observation_ids: tuple[tuple[str, tuple[str, ...]], ...]
+    objective_raw_columns: tuple[tuple[str, tuple[str, ...]], ...]
+    objective_source_rows: tuple[tuple[str, tuple[int, ...]], ...]
     x_name: str = "t"
 
     def __post_init__(self) -> None:
@@ -179,6 +192,50 @@ class FitCurveDataset:
             (str(name), str(raw_id))
             for name, raw_id in self.observed_raw_ids
         )
+        observed_raw_columns = tuple(
+            (str(name), str(raw_column))
+            for name, raw_column in self.observed_raw_columns
+        )
+        model_discontinuity_ids = tuple(
+            (str(name), tuple(int(value) for value in values))
+            for name, values in self.model_discontinuity_ids
+        )
+        objective_model_x = _curve_items(
+            self.objective_model_x,
+            field="objective model X",
+        )
+        objective_model_y = _curve_items(
+            self.objective_model_y,
+            field="objective model Y",
+        )
+        objective_model_segment_ids = tuple(
+            (str(name), tuple(int(value) for value in values))
+            for name, values in self.objective_model_segment_ids
+        )
+        objective_model_segment_keys = tuple(
+            (str(name), tuple(str(value).strip() for value in values))
+            for name, values in self.objective_model_segment_keys
+        )
+        objective_model_discontinuity_ids = tuple(
+            (str(name), tuple(int(value) for value in values))
+            for name, values in self.objective_model_discontinuity_ids
+        )
+        objective_selection_provenance = tuple(
+            (str(name), tuple(str(value) for value in values))
+            for name, values in self.objective_selection_provenance
+        )
+        objective_observation_ids = tuple(
+            (str(name), tuple(str(value) for value in values))
+            for name, values in self.objective_observation_ids
+        )
+        objective_raw_columns = tuple(
+            (str(name), tuple(str(value) for value in values))
+            for name, values in self.objective_raw_columns
+        )
+        objective_source_rows = tuple(
+            (str(name), tuple(int(value) for value in values))
+            for name, values in self.objective_source_rows
+        )
         names = tuple(name for name, _values in model_y)
         segment_names = tuple(name for name, _values in model_segment_ids)
         segment_key_names = tuple(
@@ -186,6 +243,10 @@ class FitCurveDataset:
         )
         source_row_names = tuple(name for name, _values in observed_source_rows)
         raw_id_names = tuple(name for name, _raw_id in observed_raw_ids)
+        raw_column_names = tuple(
+            name for name, _raw_column in observed_raw_columns
+        )
+        discontinuity_names = tuple(name for name, _values in model_discontinuity_ids)
         if (
             not names
             or set(names) != {name for name, _values in model_x}
@@ -195,15 +256,59 @@ class FitCurveDataset:
             or set(names) != set(segment_key_names)
             or set(names) != set(source_row_names)
             or set(names) != set(raw_id_names)
+            or set(names) != set(raw_column_names)
+            or set(names) != set(discontinuity_names)
             or len(segment_names) != len(set(segment_names))
             or len(segment_key_names) != len(set(segment_key_names))
             or len(source_row_names) != len(set(source_row_names))
             or len(raw_id_names) != len(set(raw_id_names))
+            or len(raw_column_names) != len(set(raw_column_names))
         ):
             raise ValueError(
                 "Fit curves require complete model and observation axes "
                 "for every selected series."
             )
+        objective_maps = (
+            dict(objective_model_x),
+            dict(objective_model_y),
+            dict(objective_model_segment_ids),
+            dict(objective_model_segment_keys),
+            dict(objective_model_discontinuity_ids),
+            dict(objective_selection_provenance),
+            dict(objective_observation_ids),
+            dict(objective_raw_columns),
+            dict(objective_source_rows),
+        )
+        observed_y_by_name = dict(observed_y)
+        rows_by_name = dict(observed_source_rows)
+        raw_ids_by_name = dict(observed_raw_ids)
+        raw_columns_by_name = dict(observed_raw_columns)
+        if any(set(mapping) != set(names) for mapping in objective_maps):
+            raise ValueError("Fit objective rows require complete paired identity.")
+        for name in names:
+            length = len(objective_maps[1][name])
+            if (
+                length == 0
+                or length != len(observed_y_by_name[name])
+                or any(len(mapping[name]) != length for mapping in objective_maps)
+                or any(value < 0 for value in objective_maps[2][name])
+                or any(not value for value in objective_maps[3][name])
+                or any(value < 0 for value in objective_maps[4][name])
+                or any(value not in {"direct", "interpolated"} for value in objective_maps[5][name])
+                or any(not value for value in objective_maps[6][name])
+                or any(not value for value in objective_maps[7][name])
+                or any(value <= 0 for value in objective_maps[8][name])
+                or any(
+                    value != raw_ids_by_name[name]
+                    for value in objective_maps[6][name]
+                )
+                or any(
+                    value != raw_columns_by_name[name]
+                    for value in objective_maps[7][name]
+                )
+                or tuple(objective_maps[8][name]) != rows_by_name[name]
+            ):
+                raise ValueError("Fit objective rows contain incomplete paired identity.")
         for axis, values, field in (
             (dict(model_x), dict(model_y), "model"),
             (dict(observed_x), dict(observed_y), "observed"),
@@ -214,19 +319,20 @@ class FitCurveDataset:
             ):
                 raise ValueError(f"Fit {field} curve X/Y lengths do not align.")
         model_y_by_name = dict(model_y)
-        observed_y_by_name = dict(observed_y)
         segments_by_name = dict(model_segment_ids)
         segment_keys_by_name = dict(model_segment_keys)
-        rows_by_name = dict(observed_source_rows)
-        raw_ids_by_name = dict(observed_raw_ids)
+        discontinuities_by_name = dict(model_discontinuity_ids)
         if any(
             len(segments_by_name[name]) != len(model_y_by_name[name])
             or any(value < 0 for value in segments_by_name[name])
             or len(segment_keys_by_name[name]) != len(model_y_by_name[name])
             or any(not value for value in segment_keys_by_name[name])
+            or len(discontinuities_by_name[name]) != len(model_y_by_name[name])
+            or any(value < 0 for value in discontinuities_by_name[name])
             or len(rows_by_name[name]) != len(observed_y_by_name[name])
             or any(value <= 0 for value in rows_by_name[name])
             or not raw_ids_by_name[name].strip()
+            or not raw_columns_by_name[name].strip()
             for name in names
         ):
             raise ValueError(
@@ -246,12 +352,23 @@ class FitCurveDataset:
             "model_segment_keys",
             model_segment_keys,
         )
+        object.__setattr__(self, "model_discontinuity_ids", model_discontinuity_ids)
+        object.__setattr__(self, "objective_model_x", objective_model_x)
+        object.__setattr__(self, "objective_model_y", objective_model_y)
+        object.__setattr__(self, "objective_model_segment_ids", objective_model_segment_ids)
+        object.__setattr__(self, "objective_model_segment_keys", objective_model_segment_keys)
+        object.__setattr__(self, "objective_model_discontinuity_ids", objective_model_discontinuity_ids)
+        object.__setattr__(self, "objective_selection_provenance", objective_selection_provenance)
+        object.__setattr__(self, "objective_observation_ids", objective_observation_ids)
+        object.__setattr__(self, "objective_raw_columns", objective_raw_columns)
+        object.__setattr__(self, "objective_source_rows", objective_source_rows)
         object.__setattr__(
             self,
             "observed_source_rows",
             observed_source_rows,
         )
         object.__setattr__(self, "observed_raw_ids", observed_raw_ids)
+        object.__setattr__(self, "observed_raw_columns", observed_raw_columns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +412,7 @@ class FitCandidate:
             raise TypeError("Fit candidate prepared_dsl must be retained.")
         if (
             self.prepared_dsl.analysis.normalized_text
-            != self.mechanism_source.full_dsl.strip()
+            != self.mechanism_source.reactions_text.strip()
         ):
             raise ValueError(
                 "Fit candidate prepared DSL must exactly match its source."
@@ -392,23 +509,13 @@ def _dataset_spec(
     local: FitDatasetLocalSettings,
 ) -> FitDatasetSpec:
     selected = selected_observations(mapped, local)
-    if local.parametric is not None and any(
-        item.pre_boundary_segment_keys_by_source_row
-        for item in selected
-    ):
-        raise ValueError(
-            "Explicit pre-boundary segment identity is supported only for "
-            "time-X Fit observations."
-        )
     observation_map = {
         item.model_species: FitObservationSeries(
             raw_observation_id=item.raw_observation_id,
+            raw_column=item.raw_column,
             t=np.asarray(item.t, dtype=float),
             y=np.asarray(item.y, dtype=float),
             source_rows=item.source_rows,
-            pre_boundary_segment_keys_by_source_row=(
-                item.pre_boundary_segment_keys_by_source_row
-            ),
         )
         for item in selected
     }
@@ -765,6 +872,22 @@ def _curves_from_result(
                     for species in model_series
                     if species in axes
                 ),
+                model_discontinuity_ids=tuple(
+                    (
+                        species,
+                        tuple(
+                            int(value)
+                            for value in np.asarray(
+                                result.plot_model_discontinuity_ids[
+                                    dataset_id
+                                ][species],
+                                dtype=np.int64,
+                            )
+                        ),
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
                 observed_source_rows=tuple(
                     (
                         species,
@@ -784,6 +907,72 @@ def _curves_from_result(
                             dataset_id
                         ][species],
                     )
+                    for species in model_series
+                    if species in axes
+                ),
+                observed_raw_columns=tuple(
+                    (item.model_species, item.raw_column)
+                    for item in selected
+                    if item.model_species in model_series
+                    and item.model_species in axes
+                ),
+                objective_model_x=tuple(
+                    (
+                        species,
+                        tuple(
+                            float(value)
+                            for value in result.model_x_by_species[dataset_id][species]
+                        ),
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
+                objective_model_y=tuple(
+                    (
+                        species,
+                        tuple(float(value) for value in result.model_series[dataset_id][species]),
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
+                objective_model_segment_ids=tuple(
+                    (
+                        species,
+                        tuple(int(value) for value in result.model_segment_ids[dataset_id][species]),
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
+                objective_model_segment_keys=tuple(
+                    (species, tuple(result.model_segment_keys[dataset_id][species]))
+                    for species in model_series
+                    if species in axes
+                ),
+                objective_model_discontinuity_ids=tuple(
+                    (
+                        species,
+                        tuple(int(value) for value in result.model_discontinuity_ids[dataset_id][species]),
+                    )
+                    for species in model_series
+                    if species in axes
+                ),
+                objective_selection_provenance=tuple(
+                    (species, tuple(result.model_selection_provenance[dataset_id][species]))
+                    for species in model_series
+                    if species in axes
+                ),
+                objective_observation_ids=tuple(
+                    (species, tuple(result.model_observation_ids[dataset_id][species]))
+                    for species in model_series
+                    if species in axes
+                ),
+                objective_raw_columns=tuple(
+                    (species, tuple(result.model_raw_columns[dataset_id][species]))
+                    for species in model_series
+                    if species in axes
+                ),
+                objective_source_rows=tuple(
+                    (species, tuple(result.model_source_rows[dataset_id][species]))
                     for species in model_series
                     if species in axes
                 ),
@@ -835,6 +1024,13 @@ def _curves_from_evaluations(
             str(value)
             for value in evaluation.segment_keys
         )
+        discontinuity_ids = tuple(
+            int(value)
+            for value in np.asarray(
+                evaluation.discontinuity_ids,
+                dtype=np.int64,
+            ).reshape(-1)
+        )
         x_name = (
             local.parametric.x_name
             if local.parametric is not None
@@ -845,6 +1041,42 @@ def _curves_from_evaluations(
             if x_name == "t"
             else np.asarray(series.species[x_name], dtype=float)
         )
+        objective_rows = {
+            item.model_species: select_fit_rows(
+                model_y=np.asarray(series.species[item.model_species], dtype=float),
+                model_x=(
+                    None
+                    if x_name == "t"
+                    else np.asarray(series.species[x_name], dtype=float)
+                ),
+                x_name=x_name,
+                x_mode=(
+                    local.parametric.resolved_mode
+                    if local.parametric is not None
+                    else "monotone"
+                ),
+                sim_time=np.asarray(series.t, dtype=float),
+                observation_time=np.asarray(item.t, dtype=float),
+                observation_x=np.asarray(
+                    item.t
+                    if x_name == "t"
+                    else observed_axes[item.model_species],
+                    dtype=float,
+                ),
+                observation_id=item.raw_observation_id,
+                raw_column=item.raw_column,
+                source_rows=item.source_rows,
+                segment_ids=np.asarray(evaluation.segment_ids, dtype=np.int64),
+                segment_keys=evaluation.segment_keys,
+                discontinuity_ids=np.asarray(
+                    evaluation.discontinuity_ids,
+                    dtype=np.int64,
+                ),
+                dataset_label=dataset_id,
+                y_name=item.model_species,
+            )
+            for item in selected
+        }
         curves.append(
             FitCurveDataset(
                 dataset_id=dataset_id,
@@ -879,6 +1111,10 @@ def _curves_from_evaluations(
                     (item.model_species, segment_keys)
                     for item in selected
                 ),
+                model_discontinuity_ids=tuple(
+                    (item.model_species, discontinuity_ids)
+                    for item in selected
+                ),
                 observed_source_rows=tuple(
                     (item.model_species, item.source_rows)
                     for item in selected
@@ -888,6 +1124,46 @@ def _curves_from_evaluations(
                         item.model_species,
                         item.raw_observation_id,
                     )
+                    for item in selected
+                ),
+                observed_raw_columns=tuple(
+                    (item.model_species, item.raw_column)
+                    for item in selected
+                ),
+                objective_model_x=tuple(
+                    (item.model_species, tuple(float(value) for value in objective_rows[item.model_species][0]))
+                    for item in selected
+                ),
+                objective_model_y=tuple(
+                    (item.model_species, tuple(float(value) for value in objective_rows[item.model_species][1]))
+                    for item in selected
+                ),
+                objective_model_segment_ids=tuple(
+                    (item.model_species, tuple(int(value) for value in objective_rows[item.model_species][2]))
+                    for item in selected
+                ),
+                objective_model_segment_keys=tuple(
+                    (item.model_species, tuple(objective_rows[item.model_species][3]))
+                    for item in selected
+                ),
+                objective_model_discontinuity_ids=tuple(
+                    (item.model_species, tuple(int(value) for value in objective_rows[item.model_species][4]))
+                    for item in selected
+                ),
+                objective_selection_provenance=tuple(
+                    (item.model_species, tuple(objective_rows[item.model_species][5]))
+                    for item in selected
+                ),
+                objective_observation_ids=tuple(
+                    (item.model_species, tuple(objective_rows[item.model_species][6]))
+                    for item in selected
+                ),
+                objective_raw_columns=tuple(
+                    (item.model_species, tuple(objective_rows[item.model_species][7]))
+                    for item in selected
+                ),
+                objective_source_rows=tuple(
+                    (item.model_species, tuple(objective_rows[item.model_species][8]))
                     for item in selected
                 ),
                 x_name=x_name,
@@ -1245,6 +1521,18 @@ class GlobalFitWorker(QtCore.QThread):
                     t_start=float(execution.t_start),
                     t_end=float(execution.t_end),
                     num_points=int(execution.integration_points),
+                    objective_sample_times=tuple(
+                        sorted(
+                            {
+                                float(time_value)
+                                for observation in selected_observations(
+                                    mapped_by_id[local.dataset_id],
+                                    local,
+                                )
+                                for time_value in observation.t
+                            }
+                        )
+                    ),
                     solver=execution.solver,
                     rtol=float(science.rtol),
                     atol=float(science.atol),
@@ -1287,6 +1575,18 @@ class GlobalFitWorker(QtCore.QThread):
                             ),
                             issue=issue,
                             temperature_K=float(science.temperature),
+                            report=WegscheiderCyclicityReport(tuple(unresolved.cycles)),
+                            source_energy_unit=str(
+                                getattr(request.prepared_dsl.analysis, "structure", {})
+                                .get(
+                                    "source_energy_unit",
+                                    getattr(
+                                        request.prepared_dsl.analysis,
+                                        "structure",
+                                        {},
+                                    ).get("energy_unit", "kJ/mol"),
+                                )
+                            ),
                         )
                     ) from exc
                 raise
@@ -1366,13 +1666,20 @@ class GlobalFitWorker(QtCore.QThread):
                 try:
                     for target_name, observation in provisional.observations.items():
                         align_y_on_x_obs(
-                            t_obs=observation.t,
-                            x_obs=provisional.x_obs_by_species[target_name],
+                            t_obs=np.asarray(
+                                observation.t,
+                                dtype=float,
+                            ),
+                            x_obs=np.asarray(
+                                provisional.x_obs_by_species[target_name],
+                                dtype=float,
+                            ),
                             t_sim=series.t,
                             x_model=series.species[provisional.x_name],
                             y_model=series.species[target_name],
                             segment_ids=evaluation.segment_ids,
                             segment_keys=evaluation.segment_keys,
+                            discontinuity_ids=evaluation.discontinuity_ids,
                             dataset_label=dataset_id,
                             x_name=provisional.x_name,
                             y_name=target_name,
@@ -1428,7 +1735,7 @@ class GlobalFitWorker(QtCore.QThread):
                 "schema_version": 1,
                 "origin_tab_id": request.origin.tab_id,
                 "origin_capture_id": request.origin.capture_id,
-                "mechanism_text": request.mechanism_source.full_dsl,
+                "mechanism_text": request.mechanism_source.reactions_text,
                 "local_observables": [
                     {
                         "name": item.name,

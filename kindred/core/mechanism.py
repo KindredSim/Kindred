@@ -16,7 +16,7 @@ Current contract
   - rate_orders: immutable Mapping[str, float] positive kinetic exponents;
                  None defaults to reactants, {} is explicit zero-order
   - net_stoich: immutable Mapping[str, float] products - reactants, zeros omitted
-  - order: int  derived molecularity from rate_orders
+- order: float  exact finite molecularity from rate_orders
   - rate: StructuredRate | Callable    (opaque holder here; evaluated upstream)
   - overrides: {"model": "Constant" | "Eyring" | "Arrhenius" | None,
                 "kappa": float | None, "A": float | None,
@@ -35,14 +35,15 @@ Design notes
 - This file does not evaluate rates or assemble ODEs; it only holds a validated,
   deterministic description of the mechanism. Solver and simulator layers map
   these structures to kinetics later.
-- Molecularity/order for Reaction is derived from the sum of magnitudes of
-  negative stoichiometric coefficients and rounded to nearest integer with a
-  tight tolerance.
+- Molecularity/order for Reaction is the exact finite floating-point sum of
+  its positive directional rate-order coefficients. Reaction-side
+  coefficients admit every positive finite real value.
 """
 
 from __future__ import annotations
 
 import copy
+import math
 from collections import OrderedDict
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field, replace
@@ -53,20 +54,15 @@ from .validation import validate_name
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
     EquilibriumRateInputContext,
-    GeneratedEquilibriumAuthorityKind,
     effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     effective_reverse_rate_from_keq,
-    equilibrium_is_generated_authority_output,
-    generated_fast_equilibrium_runtime_parameter_name,
-    generated_equilibrium_authority_kind,
     json_safe_equilibrium_metadata_payload,
     json_safe_equilibrium_authority_payload,
     normalize_equilibrium_rate_authority,
     normalize_existing_equilibrium_rate_authority,
     plain_finite_float_or_none,
-    validate_equilibrium_rate_authority_values,
 )
 from .kinetics import K_from_deltaG_eq
 from .mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
@@ -162,24 +158,17 @@ def _ensure_species_exist(stoich: Mapping[str, float], declared: Mapping[str, Sp
             raise KeyError(f"unknown species in stoichiometry: {n!r}")
 
 
-def _close_to_int(x: float, tol: float = 1e-9) -> int:
-    r = round(x)
-    if abs(x - r) <= tol:
-        return int(r)
-    raise ValueError(f"value {x} not within {tol} of an integer")
-
-
-def derive_molecularity(rate_orders: Mapping[str, float]) -> int:
+def derive_molecularity(rate_orders: Mapping[str, float]) -> float:
     """
     Derive reaction molecularity (order) as the sum of kinetic exponents.
 
-    Coefficients like 2A + B -> ... yield order 3.
+    Coefficients like 0.5A + B -> ... yield order 1.5. Rate orders are
+    already validated positive finite real coefficients at this boundary.
     """
-    total = sum(float(v) for v in rate_orders.values())
-    if total < 0:
-        # shouldn't happen, defensive
-        total = 0.0
-    return _close_to_int(total, tol=1e-9)
+    total = math.fsum(float(v) for v in rate_orders.values())
+    if not math.isfinite(total) or total < 0.0:
+        raise ValueError("reaction directional order must be finite and non-negative")
+    return float(total)
 
 
 def _validate_positive_side(side: Mapping[str, float] | None, *, label: str) -> Dict[str, float]:
@@ -191,14 +180,14 @@ def _validate_positive_side(side: Mapping[str, float] | None, *, label: str) -> 
     out: Dict[str, float] = {}
     for k, v in side.items():
         n = validate_name(k)
+        if type(v) is bool:
+            raise TypeError(f"{label} coefficient for {n!r} must be a positive finite real")
         try:
             fv = float(v)
-        except (ValueError, TypeError) as e:
-            raise TypeError(f"{label} coefficient for {n!r} must be numeric, got {v!r}") from e
-        if fv == 0.0:
-            continue
-        if fv < 0.0:
-            raise ValueError(f"{label} coefficient for {n!r} must be positive")
+        except (ValueError, TypeError, OverflowError) as e:
+            raise TypeError(f"{label} coefficient for {n!r} must be a positive finite real, got {v!r}") from e
+        if not math.isfinite(fv) or fv <= 0.0:
+            raise ValueError(f"{label} coefficient for {n!r} must be a positive finite real")
         out[n] = fv
     return out
 
@@ -253,10 +242,23 @@ def _normalize_overrides(overrides: Optional[Mapping[str, Any]]) -> Dict[str, An
         "standard_conc_M",
     ):
         if num_key in out and out[num_key] is not None:
+            if type(out[num_key]) is bool:
+                raise TypeError(
+                    f"overrides.{num_key} must be numeric if provided"
+                )
             try:
-                out[num_key] = float(out[num_key])  # Ea and A accept float; kappa likewise
-            except (ValueError, TypeError) as e:
+                numeric = float(out[num_key])
+            except (ValueError, TypeError, OverflowError) as e:
                 raise TypeError(f"overrides.{num_key} must be numeric if provided") from e
+            if not math.isfinite(numeric):
+                raise ValueError(
+                    f"overrides.{num_key} must be finite if provided"
+                )
+            if num_key in {"kappa", "A", "standard_conc_M"} and numeric <= 0.0:
+                raise ValueError(
+                    f"overrides.{num_key} must be positive and finite"
+                )
+            out[num_key] = numeric
     return out
 
 
@@ -283,8 +285,8 @@ class Reaction:
         Stored opaquely here.
     overrides : Mapping[str, Any]
         Optional per-step overrides for model parameters.
-    order : int
-        Derived molecularity based on rate_orders.
+    order : float
+        Exact finite molecularity: the sum of the directional rate orders.
     """
     reactants: Mapping[str, float]
     products: Mapping[str, float]
@@ -292,7 +294,7 @@ class Reaction:
     rate_orders: Mapping[str, float] | None = None
     overrides: Mapping[str, Any] = field(default_factory=dict)
     net_stoich: Mapping[str, float] = field(init=False)
-    order: int = field(init=False)
+    order: float = field(init=False)
 
     def __post_init__(self) -> None:
         # dataclass with frozen=True; use object.__setattr__
@@ -303,7 +305,10 @@ class Reaction:
         rate_orders = (
             dict(reactants)
             if self.rate_orders is None
-            else _validate_positive_side(self.rate_orders, label="rate_orders")
+            else _validate_positive_side(
+                self.rate_orders,
+                label="rate_orders",
+            )
         )
         net_stoich = _derive_net_stoich(reactants, products)
         if not net_stoich:
@@ -524,7 +529,11 @@ class Mechanism:
         """
         r = _validate_positive_side(reactants, label="reactants")
         p = _validate_positive_side(products, label="products")
-        ro = dict(r) if rate_orders is None else _validate_positive_side(rate_orders, label="rate_orders")
+        ro = (
+            dict(r)
+            if rate_orders is None
+            else _validate_positive_side(rate_orders, label="rate_orders")
+        )
         net = _derive_net_stoich(r, p)
         if not net:
             raise ValueError("reaction net stoichiometry cannot be empty")
@@ -595,15 +604,31 @@ class Mechanism:
         _ensure_species_exist(sb, self.species)
 
         meta = dict(metadata) if metadata else {}
+        standard_conc = meta.get(
+            EquilibriumMetadataKeys.STANDARD_CONC_M,
+            self.metadata.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0),
+        )
+        if type(standard_conc) is bool:
+            raise TypeError(
+                "equilibrium standard concentration must be a positive finite real"
+            )
+        try:
+            standard_conc_value = float(standard_conc)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "equilibrium standard concentration must be a positive finite real"
+            ) from exc
+        if not math.isfinite(standard_conc_value) or standard_conc_value <= 0.0:
+            raise ValueError(
+                "equilibrium standard concentration must be a positive finite real"
+            )
+        # Resolve authored reverse-side authority before deriving any standard-
+        # state factor.  Explicit kf+kr owns both concentration-form rates and
+        # is therefore C0-inert; thermodynamic authority alone consumes the
+        # directional C0 exponent.
+        meta.pop("std_ratio", None)
         meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KF, bool(kf is not None))
         meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KR, bool(kr is not None))
-        validate_equilibrium_rate_authority_values(
-            kf=kf,
-            kr=kr,
-            Keq=Keq,
-            metadata=meta,
-            context=authority_context,
-        )
         authority = normalize_equilibrium_rate_authority(
             kf=kf,
             kr=kr,
@@ -611,11 +636,27 @@ class Mechanism:
             metadata=meta,
             context=authority_context,
         )
-        generated_kind = generated_equilibrium_authority_kind(meta)
-        if (
-            authority.kind == EquilibriumRateAuthorityKind.KEQ
-            and generated_kind != GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM
-        ):
+        if authority.kind == EquilibriumRateAuthorityKind.KEQ:
+            try:
+                directional_delta = math.fsum(sb.values()) - math.fsum(sf.values())
+                standard_ratio = math.pow(standard_conc_value, directional_delta)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "equilibrium directional standard-state ratio must be finite"
+                ) from exc
+            if not math.isfinite(standard_ratio) or standard_ratio <= 0.0:
+                raise ValueError(
+                    "equilibrium directional standard-state ratio must be positive and finite"
+                )
+            meta["std_ratio"] = standard_ratio
+            authority = normalize_equilibrium_rate_authority(
+                kf=kf,
+                kr=kr,
+                Keq=Keq,
+                metadata=meta,
+                context=authority_context,
+            )
+        if authority.kind == EquilibriumRateAuthorityKind.KEQ:
             effective_keq = Keq
             if effective_keq is None and meta.get(EquilibriumMetadataKeys.KEQ_INPUT) is not None:
                 effective_keq = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
@@ -634,7 +675,7 @@ class Mechanism:
                 and scalar_kf is not None
                 and scalar_keq is not None
                 and scalar_std_ratio is not None
-                and abs(float(scalar_keq)) > 1e-30
+                and float(scalar_keq) > 0.0
             ):
                 kr = effective_reverse_rate_from_keq(scalar_kf, scalar_keq, scalar_std_ratio)
 
@@ -716,7 +757,6 @@ class Mechanism:
         equilibria_block = []
         for e in self.equilibria:
             metadata = json_safe_equilibrium_metadata_payload(e)
-            generated_authority_output = equilibrium_is_generated_authority_output(e)
             entry = {
                 "stoich_forward": OrderedDict(sorted(e.stoich_forward.items(), key=lambda kv: order_map[kv[0]])),
                 "stoich_back":   OrderedDict(sorted(e.stoich_back.items(),   key=lambda kv: order_map[kv[0]])),
@@ -726,35 +766,15 @@ class Mechanism:
             effective_kf = effective_equilibrium_forward_rate(e, temperature_K=temperature_K)
             effective_keq = effective_equilibrium_keq(e, temperature_K=temperature_K)
             effective_kr = effective_equilibrium_reverse_rate(e, temperature_K=temperature_K)
-            if generated_authority_output:
-                authority = normalize_existing_equilibrium_rate_authority(e)
-                if effective_kf is None or effective_keq is None or effective_kr is None:
-                    raise ValueError("generated equilibrium requires complete generated owner model for serialization")
-                entry["equilibrium_authority"] = json_safe_equilibrium_authority_payload(
-                    authority.step_map_fields()["equilibrium_authority"]
-                )
-                generated_fast_name = generated_fast_equilibrium_runtime_parameter_name(e)
-                if generated_fast_name is not None:
-                    if authority.dG_eq_J_per_mol is None:
-                        raise ValueError("generated fast equilibrium requires dG owner coordinate for serialization")
-                    entry["kf"] = json_safe_equilibrium_authority_payload(effective_kf)
-                    entry["dG_eq_J_per_mol"] = json_safe_equilibrium_authority_payload(
-                        authority.dG_eq_J_per_mol
-                    )
-                    entry["runtime_parameter"] = {
-                        "name": generated_fast_name,
-                        "role": "dG_eq_fast",
-                    }
-            else:
-                authority = normalize_existing_equilibrium_rate_authority(e)
-                kf_value = effective_kf if effective_kf is not None else e.kf
-                entry["kf"] = json_safe_equilibrium_authority_payload(kf_value)
-                if authority.kind == EquilibriumRateAuthorityKind.KR:
-                    kr_value = effective_kr if effective_kr is not None else authority.kr
-                    entry["kr"] = json_safe_equilibrium_authority_payload(kr_value)
-                elif authority.has_explicit_keq_param:
-                    keq_value = effective_keq if effective_keq is not None else authority.Keq
-                    entry["Keq"] = json_safe_equilibrium_authority_payload(keq_value)
+            authority = normalize_existing_equilibrium_rate_authority(e)
+            kf_value = effective_kf if effective_kf is not None else e.kf
+            entry["kf"] = json_safe_equilibrium_authority_payload(kf_value)
+            if authority.kind == EquilibriumRateAuthorityKind.KR:
+                kr_value = effective_kr if effective_kr is not None else authority.kr
+                entry["kr"] = json_safe_equilibrium_authority_payload(kr_value)
+            elif authority.has_explicit_keq_param:
+                keq_value = effective_keq if effective_keq is not None else authority.Keq
+                entry["Keq"] = json_safe_equilibrium_authority_payload(keq_value)
             equilibria_block.append(entry)
         return {
             "species": species_block,

@@ -7,8 +7,8 @@ Canonical rule:
 - Equilibrium step -> parameters kfN, krN, and KeqN
 
 Policy:
-- State-network and generated Computational Mode steps are excluded from the
-  step-index map to avoid collisions with user-visible authored names.
+- The map covers only canonical authored reaction and equilibrium steps, so
+  each user-visible kinetic parameter has one unambiguous name.
 """
 
 from __future__ import annotations

@@ -99,9 +99,10 @@ def coerce_simulation_failure(value: object) -> SimulationFailure:
         )
     if isinstance(value, BaseException):
         return simulation_failure_from_exception(value)
-    text = str(value or "")
-    legacy_kind = "cancelled" if "cancelled" in text.lower() else "simulation_error"
-    return build_simulation_failure(legacy_kind, text)
+    raise TypeError(
+        "Simulation failure must be a structured mapping or exception; "
+        f"got {type(value).__name__}."
+    )
 
 
 def is_cancelled_failure(value: object) -> bool:

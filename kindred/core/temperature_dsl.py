@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List, Optional
+from typing import List
 
 from .temperature import TemperatureSchedule, TemperatureScheduleError
 
@@ -81,12 +81,12 @@ def _parse_number_list(text: str) -> List[float]:
 
 
 def parse_temperature_schedule(
-    dsl_text: str,
+    directive_line: str,
     *,
     nominal_temperature: float = 298.15,
-) -> Optional[TemperatureSchedule]:
+) -> TemperatureSchedule:
     """
-    Parse temperature schedule from DSL text.
+    Parse one admitted temperature schedule directive.
 
     Recognizes:
     - temp_step: t=[0,50,100], T=[298,320,310]  (piecewise)
@@ -94,13 +94,14 @@ def parse_temperature_schedule(
 
     Parameters
     ----------
-    dsl_text : str
-        DSL text containing temperature schedule definition
+    directive_line : str
+        One top-level temperature schedule directive already admitted by the
+        simulator DSL owner.
 
     Returns
     -------
-    TemperatureSchedule or None
-        Parsed schedule, or None if no temperature schedule found
+    TemperatureSchedule
+        Parsed schedule
 
     Raises
     ------
@@ -116,27 +117,26 @@ def parse_temperature_schedule(
     >>> schedule(75.0)
     320.0
     """
-    lines = [line.strip() for line in dsl_text.splitlines()]
-
-    for line in lines:
-        if not line or line.startswith('#'):
-            continue
-
-        # Piecewise temperature: temp_step: t=[...], T=[...]
-        if line.lower().startswith('temp_step:'):
-            return _parse_piecewise_temperature(
-                line,
-                nominal_temperature=nominal_temperature,
-            )
-
-        if line.lower().startswith('temp_response:'):
-            return _parse_response_temperature(
-                line,
-                nominal_temperature=nominal_temperature,
-            )
-
-    # No temperature schedule found
-    return None
+    lines = directive_line.splitlines()
+    if len(lines) != 1:
+        raise TemperatureDSLError(
+            "Temperature schedule parsing requires exactly one admitted directive."
+        )
+    line = lines[0].strip()
+    lower = line.lower()
+    if lower.startswith('temp_step:'):
+        return _parse_piecewise_temperature(
+            line,
+            nominal_temperature=nominal_temperature,
+        )
+    if lower.startswith('temp_response:'):
+        return _parse_response_temperature(
+            line,
+            nominal_temperature=nominal_temperature,
+        )
+    raise TemperatureDSLError(
+        "Expected one admitted temp_step: or temp_response: directive."
+    )
 
 def _parse_piecewise_temperature(
     line: str,

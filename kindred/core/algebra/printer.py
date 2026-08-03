@@ -62,8 +62,6 @@ def expression_to_source(expr: ExprNode) -> str:
     if isinstance(expr, SpeciesRefNode):
         if expr.kind == "init":
             return f"[{expr.name}]_0"
-        if expr.kind == "T0":
-            return f"[{expr.name}](T0)"
         return f"[{expr.name}]"
     if isinstance(expr, UnaryNode):
         rhs = expression_to_source(expr.rhs)

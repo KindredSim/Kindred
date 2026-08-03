@@ -32,8 +32,6 @@ from kindred.gui.fitting.launch import (
     FitOriginSnapshot,
     FitParameterVariable,
     FitSetupSnapshot,
-    pre_boundary_fit_row_candidates,
-    resolve_pre_boundary_fit_rows,
 )
 from kindred.gui.fitting.worker import (
     FitCandidate,
@@ -239,7 +237,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
         targets_header.addWidget(self._add_observable_button)
         layout.addLayout(targets_header)
-        self._target_table = QtWidgets.QTableWidget(0, 6, self._data_tab)
+        self._target_table = QtWidgets.QTableWidget(0, 5, self._data_tab)
         self._target_table.setHorizontalHeaderLabels(
             (
                 "Use",
@@ -247,7 +245,6 @@ class FittingWindow(QtWidgets.QDialog):
                 "Observed column",
                 "Model target",
                 "Weight",
-                "Pre-boundary source rows",
             )
         )
         self._target_table.itemChanged.connect(
@@ -591,7 +588,7 @@ class FittingWindow(QtWidgets.QDialog):
             raise TypeError("source must be MechanismAuthoringSource.")
         if not isinstance(prepared_dsl, PreparedDslRequestSet):
             raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-        if prepared_dsl.analysis.normalized_text != source.full_dsl.strip():
+        if prepared_dsl.analysis.normalized_text != source.reactions_text.strip():
             raise ValueError(
                 "Fit effective prepared DSL must exactly match its source."
             )
@@ -863,16 +860,6 @@ class FittingWindow(QtWidgets.QDialog):
                                 )[1],
                                 1.0,
                             ),
-                            "pre_boundary_segment_keys": [
-                                {
-                                    "source_row": source_row,
-                                    "segment_key": segment_key,
-                                }
-                                for raw_id, source_row, segment_key
-                                in local.pre_boundary_segment_keys
-                                if raw_id
-                                == observation.raw_observation_id
-                            ],
                         }
                         for observation in mapped.observations
                     ],
@@ -1045,38 +1032,6 @@ class FittingWindow(QtWidgets.QDialog):
                     ),
                 )
                 self._target_table.setItem(target_row, 4, _text_item("1"))
-                boundary_rows = _text_item("")
-                try:
-                    available_rows = tuple(
-                        row
-                        for row, _segment_key
-                        in pre_boundary_fit_row_candidates(
-                            self._origin,
-                            dataset_id=mapped.dataset_id,
-                            raw_observation_id=(
-                                observation.raw_observation_id
-                            ),
-                        )
-                    )
-                except ValueError:
-                    available_rows = ()
-                boundary_rows.setToolTip(
-                    (
-                        "Comma-separated physical source rows. Exact "
-                        "pre-boundary rows available: "
-                        + ", ".join(str(value) for value in available_rows)
-                    )
-                    if available_rows
-                    else (
-                        "No exact statically resolvable pre-boundary rows "
-                        "are available for this captured execution."
-                    )
-                )
-                self._target_table.setItem(
-                    target_row,
-                    5,
-                    boundary_rows,
-                )
                 self._committed_targets[
                     (mapped.dataset_id, observation.raw_observation_id)
                 ] = True
@@ -1734,38 +1689,6 @@ class FittingWindow(QtWidgets.QDialog):
                 )
                 or ""
             )
-            boundary_text = self._target_table.item(row, 5).text().strip()
-            requested_boundary_rows = (
-                ()
-                if not boundary_text
-                else tuple(
-                    int(value.strip())
-                    for value in boundary_text.split(",")
-                    if value.strip()
-                )
-            )
-            raw_execution = execution_by_dataset[dataset_id]
-            captured_execution = SimulationExecutionSettings(
-                solver=str(raw_execution["solver"]),
-                t_start=_read_float(
-                    raw_execution["t_start"],
-                    "simulation t start",
-                ),
-                t_end=_read_float(
-                    raw_execution["t_end"],
-                    "simulation t end",
-                ),
-                integration_points=int(
-                    str(raw_execution["integration_points"])
-                ),
-            )
-            resolved_pre_boundary = resolve_pre_boundary_fit_rows(
-                self._origin,
-                dataset_id=dataset_id,
-                raw_observation_id=raw_observation_id,
-                source_rows=requested_boundary_rows,
-                execution=captured_execution,
-            )
             targets_by_dataset.setdefault(dataset_id, []).append(
                 {
                     "use": use_item.checkState() == QtCore.Qt.CheckState.Checked,
@@ -1773,14 +1696,6 @@ class FittingWindow(QtWidgets.QDialog):
                     "raw_column": self._target_table.item(row, 2).text(),
                     "model_target": self._target_table.item(row, 3).text(),
                     "weight": self._target_table.item(row, 4).text(),
-                    "pre_boundary_segment_keys": [
-                        {
-                            "source_row": source_row,
-                            "segment_key": segment_key,
-                        }
-                        for source_row, segment_key
-                        in resolved_pre_boundary
-                    ],
                 }
             )
         datasets: list[dict[str, object]] = []
@@ -1961,19 +1876,6 @@ class FittingWindow(QtWidgets.QDialog):
             prior = target_lookup.get(key)
             if prior is None:
                 continue
-            identities = list(
-                prior.get("pre_boundary_segment_keys") or ()
-            )
-            if any(not isinstance(identity, Mapping) for identity in identities):
-                raise ValueError(
-                    "Pre-boundary Fit identity must be a mapping."
-                )
-            self._target_table.item(row, 5).setText(
-                ", ".join(
-                    str(int(identity.get("source_row")))
-                    for identity in identities
-                )
-            )
             use.setCheckState(
                 QtCore.Qt.CheckState.Checked
                 if bool(prior.get("use"))
@@ -2812,8 +2714,8 @@ class FittingWindow(QtWidgets.QDialog):
                 (
                     f"Run: {candidate.run_identity.short_hash}",
                     self._display_text(result.message),
-                    f"Global R²: {float(result.global_r_squared):.8g}",
-                    f"Residual MSE: {float(result.global_residual_mse):.8g}",
+                    f"Weighted residual SSE: {float(result.weighted_residual_sse):.8g}",
+                    f"Weighted residual MSE: {float(result.weighted_residual_mse):.8g}",
                     f"Function evaluations: {int(result.nfev)}",
                     f"Pending local observables: {len(candidate.local_observables)}",
                     *((
@@ -2824,11 +2726,20 @@ class FittingWindow(QtWidgets.QDialog):
                     ) if execution_apply_conflict else ()),
                     *(
                         f"{dataset_labels.get(info.dataset_id, 'Dataset')}: "
-                        f"R²={info.r_squared:.8g}, "
-                        f"residual MSE={info.residual_mse:.8g}, "
-                        f"RMSE={info.rmse:.8g}, MAE={info.mae:.8g}, "
+                        f"weighted SSE={info.weighted_residual_sse:.8g}, "
+                        f"weighted MSE={info.weighted_residual_mse:.8g}, "
+                        f"weighted RMSE={info.weighted_rmse:.8g}, "
+                        f"weighted MAE={info.weighted_mae:.8g}, "
                         f"weight={info.weight:.8g}, points={info.n_points}"
                         for info in result.dataset_info
+                    ),
+                    *(
+                        f"{dataset_labels.get(info.dataset_id, 'Dataset')} "
+                        f"{series}: R²={r_squared:.8g}"
+                        for info in result.dataset_info
+                        for series, r_squared in sorted(
+                            info.r_squared_by_series.items()
+                        )
                     ),
                     *(
                         f"shared {parameter_labels.get(name, name)}={value:.12g}"
@@ -2970,6 +2881,11 @@ class FittingWindow(QtWidgets.QDialog):
                     for item in curve.model_segment_keys
                     if item[0] in selected
                 ),
+                model_discontinuity_ids=tuple(
+                    item
+                    for item in curve.model_discontinuity_ids
+                    if item[0] in selected
+                ),
                 observed_source_rows=tuple(
                     item
                     for item in curve.observed_source_rows
@@ -2978,6 +2894,52 @@ class FittingWindow(QtWidgets.QDialog):
                 observed_raw_ids=tuple(
                     item
                     for item in curve.observed_raw_ids
+                    if item[0] in selected
+                ),
+                observed_raw_columns=tuple(
+                    item
+                    for item in curve.observed_raw_columns
+                    if item[0] in selected
+                ),
+                objective_model_x=tuple(
+                    item for item in curve.objective_model_x if item[0] in selected
+                ),
+                objective_model_y=tuple(
+                    item for item in curve.objective_model_y if item[0] in selected
+                ),
+                objective_model_segment_ids=tuple(
+                    item
+                    for item in curve.objective_model_segment_ids
+                    if item[0] in selected
+                ),
+                objective_model_segment_keys=tuple(
+                    item
+                    for item in curve.objective_model_segment_keys
+                    if item[0] in selected
+                ),
+                objective_model_discontinuity_ids=tuple(
+                    item
+                    for item in curve.objective_model_discontinuity_ids
+                    if item[0] in selected
+                ),
+                objective_selection_provenance=tuple(
+                    item
+                    for item in curve.objective_selection_provenance
+                    if item[0] in selected
+                ),
+                objective_observation_ids=tuple(
+                    item
+                    for item in curve.objective_observation_ids
+                    if item[0] in selected
+                ),
+                objective_raw_columns=tuple(
+                    item
+                    for item in curve.objective_raw_columns
+                    if item[0] in selected
+                ),
+                objective_source_rows=tuple(
+                    item
+                    for item in curve.objective_source_rows
                     if item[0] in selected
                 ),
                 x_name=curve.x_name,

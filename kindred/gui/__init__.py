@@ -8,7 +8,7 @@ Contracts
   `kindred.__main__:main` route, which boots QApplication and shows
   `kindred.gui.main_window.MainWindow`.
 - Feature set: simulation + plotting, sliders, statistics/CTC, global fit,
-  solver settings, State Network editing, templates, dataset import,
+  solver settings, templates, dataset import,
   original-data export, and generated XLSX result export.
 - This __init__ does not import PySide6 at module import time to avoid
   side-effects in import-sensitive contexts (for example tests).

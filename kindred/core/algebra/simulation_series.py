@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -21,19 +21,14 @@ from kindred.core.algebra.parser import (
     CallNode,
     ExprNode,
     IdentNode,
-    LetStatement,
     SpeciesRefNode,
     UnaryNode,
-    parse_algebra,
 )
 from kindred.core.algebra.identifier_canonicalization import canonicalize_algebra_block
 from kindred.core.algebra.printer import algebra_block_to_source
 from kindred.core.algebra.symbol_table import build_algebra_symbol_table
 from kindred.core.simulator.parameter_algebra_spec import (
-    classify_parameter_algebra_declaration,
     invalid_parameter_algebra_identifier_reference_message,
-    is_protected_indexed_parameter_identifier,
-    is_protected_step_key_identifier,
 )
 from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
 
@@ -41,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "build_algebra_symbol_table",
+    "compiled_algebra_for_mechanism",
     "compile_algebra_observables",
     "evaluate_algebra_series_for_simulation_with_errors",
     "evaluate_compiled_algebra_series_for_simulation",
@@ -71,9 +67,13 @@ def _reject_invalid_identifier_references(
     block: AlgebraBlock,
     *,
     mechanism_namespace: MechanismParameterNamespace | None = None,
+    allowed_names: set[str] | None = None,
 ) -> None:
+    allowed = set(allowed_names or ())
     for stmt in block.lines:
         for name in sorted(set(_iter_identifiers(stmt.expr))):
+            if name in allowed:
+                continue
             message = invalid_parameter_algebra_identifier_reference_message(
                 name,
                 mechanism_namespace=mechanism_namespace,
@@ -90,95 +90,84 @@ class CompiledAlgebraSeries:
     processed_text: str
     block: AlgebraBlock
     observable_names: Tuple[str, ...]
-    time_ref_statements: Tuple[LetStatement, ...]
 
 
-def _preprocess_algebra_text(
-    algebra_text: str,
-    *,
-    mechanism_namespace: MechanismParameterNamespace | None = None,
-) -> str:
-    algebra_lines_raw = str(algebra_text).strip().split("\n")
-    algebra_lines_processed = ["# Algebra"]
-    for line in algebra_lines_raw:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            code_part = stripped
-            if "#" in stripped:
-                bracket_depth = 0
-                for i, char in enumerate(stripped):
-                    if char == "[":
-                        bracket_depth += 1
-                    elif char == "]":
-                        bracket_depth -= 1
-                    elif char == "#" and bracket_depth == 0:
-                        code_part = stripped[:i].rstrip()
-                        break
-            if not code_part:
-                continue
-            classification = classify_parameter_algebra_declaration(
-                code_part,
-                mechanism_namespace=mechanism_namespace,
-                allow_non_algebra_bare_assignment=False,
-            )
-            if classification.kind == "param":
-                continue
-            if classification.kind == "let":
-                if is_protected_indexed_parameter_identifier(classification.raw_name):
-                    raise ValueError(
-                        f"{classification.raw_name!r} is a protected indexed parameter identifier "
-                        "and cannot be declared as an observable."
-                    )
-                if is_protected_step_key_identifier(classification.raw_name):
-                    raise ValueError(
-                        f"{classification.raw_name!r} is a step-local DSL key "
-                        "and cannot be declared as an observable."
-                    )
-                algebra_lines_processed.append(code_part)
-                continue
-            if classification.kind == "invalid_step_key_identifier":
-                raise ValueError(
-                    f"{classification.raw_name!r} is a step-local DSL key "
-                    "and cannot be declared as an observable."
-                )
-            if classification.kind == "unsupported_bare_assignment":
-                raise ValueError(
-                    f"Bare algebra assignment {classification.raw_name!r} is not supported. "
-                    "Use 'let name = expr' or 'param name = expr'."
-                )
-            algebra_lines_processed.append(code_part)
-        elif stripped:
-            algebra_lines_processed.append(stripped)
-    return "\n".join(algebra_lines_processed) + "\n"
+def compiled_algebra_for_mechanism(
+    mechanism: object,
+) -> CompiledAlgebraSeries | None:
+    """Return the Algebra program retained by the accepted mechanism parse."""
+    compiled = getattr(mechanism, "_compiled_algebra_series", None)
+    if compiled is None:
+        return None
+    if not isinstance(compiled, CompiledAlgebraSeries):
+        raise TypeError("mechanism retained an invalid compiled Algebra program.")
+    return compiled
 
 
 def compile_algebra_observables(
-    algebra_text: str,
     *,
     mechanism_namespace: MechanismParameterNamespace | None = None,
+    retained_spec: object,
 ) -> CompiledAlgebraSeries:
-    """
-    Compile the Algebra observables block once for repeated evaluation.
+    """Compile the retained observable AST for repeated evaluation.
 
-    Notes
-    -----
-    - `param ...` statements are skipped here (they are handled by parameter algebra).
-    - Baseline time references ([A](T0)) are *not* rejected here; fitting callers
-      should enforce any additional constraints.
+    The accepted DSL admission owns parsing and supplies the partitioned block;
+    this boundary has no raw-source parsing route.
     """
-    processed = _preprocess_algebra_text(str(algebra_text), mechanism_namespace=mechanism_namespace)
-    algebra_block = parse_algebra(processed)
+    retained_block = getattr(retained_spec, "observable_block", None)
+    if not isinstance(retained_block, AlgebraBlock):
+        raise TypeError("retained Algebra spec has no observable AST block.")
+    algebra_block = retained_block
+    processed = algebra_block_to_source(algebra_block)
     if mechanism_namespace is not None:
         algebra_block = canonicalize_algebra_block(algebra_block, mechanism_namespace=mechanism_namespace)
         processed = algebra_block_to_source(algebra_block)
-    _reject_invalid_identifier_references(algebra_block, mechanism_namespace=mechanism_namespace)
+    allowed_names = {
+        str(name)
+        for name in getattr(retained_spec, "mechanism_param_names", ()) or ()
+    }
+    allowed_names.update(
+        str(name)
+        for name in getattr(retained_spec, "param_assignment_names", lambda: set())() or ()
+    )
+    _reject_invalid_identifier_references(
+        algebra_block,
+        mechanism_namespace=mechanism_namespace,
+        allowed_names=allowed_names,
+    )
     observable_names = tuple(str(stmt.name) for stmt in (algebra_block.lines or []))
-    time_ref_stmts = tuple(stmt for stmt in (algebra_block.lines or []) if stmt.expr.has_time_ref())
     return CompiledAlgebraSeries(
         processed_text=processed,
         block=algebra_block,
         observable_names=observable_names,
-        time_ref_statements=time_ref_stmts,
+    )
+
+
+def _build_simulation_context(
+    mechanism: object,
+    *,
+    t: np.ndarray,
+    species_series: Dict[str, np.ndarray],
+    initials: Dict[str, float],
+    temperature_K: Optional[float],
+    symbol_series: Mapping[str, np.ndarray | float] | None,
+    symbol_values: Mapping[str, float] | None,
+) -> EvaluationContext:
+    """Build one row-aligned context for the retained Algebra program."""
+    t_arr = np.asarray(t, dtype=float).reshape(-1)
+    runtime_series: Dict[str, np.ndarray | float] = dict(symbol_series or {})
+    runtime_series.setdefault("t", t_arr)
+    if temperature_K is not None and "T" not in runtime_series:
+        runtime_series["T"] = float(temperature_K)
+    symtab = build_algebra_symbol_table(mechanism)
+    return EvaluationContext(
+        t=t_arr,
+        species_series={k: np.asarray(v, dtype=float).reshape(-1) for k, v in species_series.items()},
+        initials={str(k): float(v) for k, v in (initials or {}).items()},
+        species_names=set(species_series.keys()),
+        symtab=symtab,
+        symbol_series=runtime_series,
+        symbol_values={str(name): float(value) for name, value in (symbol_values or {}).items()},
     )
 
 
@@ -190,24 +179,24 @@ def evaluate_compiled_algebra_series_for_simulation(
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
     temperature_K: Optional[float] = None,
+    symbol_series: Mapping[str, np.ndarray | float] | None = None,
+    symbol_values: Mapping[str, float] | None = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
-    """Evaluate compiled algebra declarations against simulation outputs."""
-    species_names = set(species_series.keys())
-    symtab = build_algebra_symbol_table(mechanism)
-    if temperature_K is not None:
-        try:
-            symtab.update_temperature(float(temperature_K))
-        except Exception as exc:
-            logger.debug("Failed to update Algebra temperature: %s", exc, exc_info=True)
-    ctx = EvaluationContext(
-        t=np.asarray(t, dtype=float).reshape(-1),
-        species_series={k: np.asarray(v, dtype=float).reshape(-1) for k, v in species_series.items()},
-        initials={str(k): float(v) for k, v in (initials or {}).items()},
-        species_names=species_names,
-        symtab=symtab,
-        baseline=None,
-    )
+    """Evaluate retained observables against canonical row-local context.
 
+    ``symbol_series`` carries exact per-row temperature, mechanism
+    coefficients, and changing inputs for dynamic ``let`` observables.
+    ``symbol_values`` is the complete prepared static scalar snapshot.
+    """
+    ctx = _build_simulation_context(
+        mechanism,
+        t=t,
+        species_series=species_series,
+        initials=initials,
+        temperature_K=temperature_K,
+        symbol_series=symbol_series,
+        symbol_values=symbol_values,
+    )
     series, scalars = evaluate_block(compiled.block, ctx)
     series_out = {str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in (series or {}).items()}
     scalars_out: Dict[str, float] = {}
@@ -256,24 +245,19 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
     temperature_K: Optional[float] = None,
+    symbol_series: Mapping[str, np.ndarray | float] | None = None,
+    symbol_values: Mapping[str, float] | None = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
     """Best-effort variant of evaluate_compiled_algebra_series_for_simulation()."""
-    species_names = set(species_series.keys())
-    symtab = build_algebra_symbol_table(mechanism)
-    if temperature_K is not None:
-        try:
-            symtab.update_temperature(float(temperature_K))
-        except Exception as exc:
-            logger.debug("Failed to update Algebra temperature: %s", exc, exc_info=True)
-    ctx = EvaluationContext(
-        t=np.asarray(t, dtype=float).reshape(-1),
-        species_series={k: np.asarray(v, dtype=float).reshape(-1) for k, v in species_series.items()},
-        initials={str(k): float(v) for k, v in (initials or {}).items()},
-        species_names=species_names,
-        symtab=symtab,
-        baseline=None,
+    ctx = _build_simulation_context(
+        mechanism,
+        t=t,
+        species_series=species_series,
+        initials=initials,
+        temperature_K=temperature_K,
+        symbol_series=symbol_series,
+        symbol_values=symbol_values,
     )
-
     series, scalars, errors = evaluate_block_partial(compiled.block, ctx)
     series_out = {str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in (series or {}).items()}
     scalars_out: Dict[str, float] = {}
@@ -316,27 +300,22 @@ def evaluate_algebra_series_for_simulation_with_errors(
     t: np.ndarray,
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
+    temperature_K: Optional[float] = None,
+    symbol_series: Mapping[str, np.ndarray | float] | None = None,
+    symbol_values: Mapping[str, float] | None = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
     """
-    Best-effort evaluation of compiled algebra declarations extracted from the
-    mechanism DSL against time series arrays.
+    Best-effort evaluation of the Algebra program retained by accepted
+    mechanism parsing against time series arrays.
 
     Returns (series, scalars, errors). This does not raise for per-observable evaluation errors.
     """
-    meta = getattr(mechanism, "metadata", {}) or {}
-    algebra_text = meta.get("algebra_text")
-    if not algebra_text:
-        return {}, {}, []
-
     try:
-        from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
-
-        compiled = compile_algebra_observables(
-            str(algebra_text),
-            mechanism_namespace=build_namespace_from_mechanism(mechanism),
-        )
+        compiled = compiled_algebra_for_mechanism(mechanism)
     except Exception as exc:
         return {}, {}, [_error_from_exception("__parse__", exc)]
+    if compiled is None:
+        return {}, {}, []
 
     try:
         series, scalars, errors = evaluate_compiled_algebra_series_for_simulation_partial(
@@ -345,7 +324,9 @@ def evaluate_algebra_series_for_simulation_with_errors(
             t=t,
             species_series=species_series,
             initials=initials,
-            temperature_K=None,
+            temperature_K=temperature_K,
+            symbol_series=symbol_series,
+            symbol_values=symbol_values,
         )
     except Exception as exc:
         return {}, {}, [_error_from_exception("__eval__", exc)]
@@ -359,10 +340,13 @@ def evaluate_algebra_series_for_simulation(
     t: np.ndarray,
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
+    temperature_K: Optional[float] = None,
+    symbol_series: Mapping[str, np.ndarray | float] | None = None,
+    symbol_values: Mapping[str, float] | None = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
     """
-    Evaluate compiled algebra declarations extracted from the mechanism DSL
-    against time series arrays.
+    Evaluate the Algebra program retained by accepted mechanism parsing against
+    time series arrays.
 
     Returns
     -------
@@ -375,5 +359,8 @@ def evaluate_algebra_series_for_simulation(
         t=t,
         species_series=species_series,
         initials=initials,
+        temperature_K=temperature_K,
+        symbol_series=symbol_series,
+        symbol_values=symbol_values,
     )
     return series, scalars

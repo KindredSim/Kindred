@@ -35,7 +35,25 @@ __all__ = [
 # ------------------------------ units ----------------------------------------
 
 
-def rate_units(molecularity: int) -> str:
+def _validated_molecularity(molecularity: object) -> float:
+    if type(molecularity) is bool:
+        raise TypeError("molecularity must be numeric")
+    try:
+        value = float(molecularity)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("molecularity must be numeric") from exc
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("molecularity must be a finite non-negative real")
+    return value
+
+
+def _format_exponent(value: float) -> str:
+    if value.is_integer():
+        return str(int(value))
+    return format(value, ".15g")
+
+
+def rate_units(molecularity: float) -> str:
     """
     Return rate constant unit string given step molecularity n.
 
@@ -43,12 +61,14 @@ def rate_units(molecularity: int) -> str:
     n = 2  -> 1/(M*s)
     n >= 3 -> 1/(M^(n-1)*s)
     """
-    n = int(molecularity)
-    if n <= 1:
+    n = _validated_molecularity(molecularity)
+    if n == 0 or n == 1:
         return "1/s"
     if n == 2:
         return "1/(M*s)"
-    return f"1/(M^{n-1}*s)"
+    if n > 1:
+        return f"1/(M^{_format_exponent(n - 1.0)}*s)"
+    return f"M^{_format_exponent(1.0 - n)}/s"
 
 
 # ------------------------------ energy normalization -------------------------

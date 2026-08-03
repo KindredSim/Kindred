@@ -1,22 +1,10 @@
 from __future__ import annotations
 
-import faulthandler
 import logging
 import os
-import signal
 from typing import Callable, Mapping
 
 logger = logging.getLogger(__name__)
-
-
-def _env_truthy(name: str) -> bool:
-    raw = str(os.environ.get(name, "")).strip().lower()
-    return raw not in {"", "0", "false", "no", "off"}
-
-
-def startup_debug_enabled() -> bool:
-    """Return True when verbose startup diagnostics are explicitly enabled."""
-    return _env_truthy("KINDRED_DEBUG_STARTUP")
 
 
 def detect_wsl_environment(
@@ -81,49 +69,8 @@ def apply_qt_startup_workarounds(
     return True
 
 
-def apply_pre_qapplication_startup(*, qt_core: object, startup_debug: bool) -> bool:
-    workaround_applied = apply_qt_startup_workarounds(qt_core=qt_core)
-    if startup_debug:
-        logger.warning("Startup phase: Qt startup workarounds applied=%s", bool(workaround_applied))
-    return workaround_applied
-
-
-def enable_startup_diagnostics(*, enabled: bool) -> Callable[[], None]:
-    """Enable optional faulthandler diagnostics and return their cleanup."""
-    if not enabled:
-        return lambda: None
-
-    logger.warning("KINDRED_DEBUG_STARTUP=1 active: enabling startup diagnostics")
-    faulthandler.enable(all_threads=True)
-    faulthandler.dump_traceback_later(10, repeat=True)
-
-    sigusr2 = getattr(signal, "SIGUSR2", None)
-    if sigusr2 is not None:
-        faulthandler.register(sigusr2, all_threads=True)
-        logger.warning("Startup diagnostics: send SIGUSR2 to dump Python stacks")
-
-    def _cleanup() -> None:
-        faulthandler.cancel_dump_traceback_later()
-        if sigusr2 is not None:
-            faulthandler.unregister(sigusr2)
-
-    return _cleanup
-
-
-def log_plot_backend_startup(*, startup_debug: bool) -> None:
-    from kindred.gui.plot_config import log_backend_info
-
-    log_backend_info()
-    if startup_debug:
-        logger.warning("Startup phase: backend info logged")
-
-
-def apply_post_qapplication_startup(*, startup_debug: bool) -> None:
-    from kindred.gui.plot_config import fix_pyqtgraph_stylehints_warning
-
-    fix_pyqtgraph_stylehints_warning()
-    if startup_debug:
-        logger.warning("Startup phase: style-hints patch applied")
+def apply_pre_qapplication_startup(*, qt_core: object) -> bool:
+    return apply_qt_startup_workarounds(qt_core=qt_core)
 
 
 def load_app_icon(q_icon_type: object):

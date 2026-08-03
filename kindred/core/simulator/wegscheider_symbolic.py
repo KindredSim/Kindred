@@ -10,8 +10,6 @@ from typing import Any, Mapping, Sequence
 from kindred.core.constants import R
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
-    GeneratedEquilibriumAuthorityKind,
-    generated_equilibrium_authority_kind,
     normalize_existing_equilibrium_rate_authority,
 )
 from kindred.core.kinetics import (
@@ -22,7 +20,6 @@ from kindred.core.kinetics import (
     forward_rate_model_for_equilibrium,
 )
 from kindred.core.mechanism_metadata import (
-    EquilibriumMetadataKeys,
     MechanismMetadataView,
 )
 from kindred.core.ode_builder import (
@@ -32,7 +29,6 @@ from kindred.core.ode_builder import (
 from kindred.core.rate_binding import ForwardRateBinding, RateBinding
 from kindred.core.simulator.algebra_section import upsert_lines_into_algebra_section
 from kindred.core.simulator.errors import DSLError
-from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.parameter_algebra_spec import (
     ParameterAlgebraSpec,
     ParameterAssignment,
@@ -63,7 +59,11 @@ class WegscheiderCycle:
     equilibrium_indices: tuple[int, ...]
     coefficients: tuple[int, ...]
     parameter_names: tuple[str, ...]
-    generated_step_flags: tuple[bool, ...] = ()
+    # The cycle coefficients above remain aligned with the selected
+    # equilibrium steps for runtime temperature proofs.  Correction targets
+    # may expose more than one writable coordinate per step (kf+kr), so their
+    # exponents are carried separately and aligned with parameter_names.
+    correction_exponents: tuple[int, ...] = ()
     resolved_by: str | None = None
     resolved_proof_fingerprint: str | None = None
 
@@ -90,9 +90,7 @@ class WegscheiderCyclicityReport:
                 "equilibrium_indices": list(cycle.equilibrium_indices),
                 "coefficients": list(cycle.coefficients),
                 "parameter_names": list(cycle.parameter_names),
-                "generated_step_flags": list(
-                    cycle.generated_step_flags
-                ),
+                "correction_exponents": list(cycle.correction_exponents),
                 "resolved_by": cycle.resolved_by,
                 "proof_fingerprint": cycle.resolved_proof_fingerprint,
             }
@@ -105,9 +103,7 @@ class WegscheiderCyclicityReport:
                 "equilibrium_indices": list(cycle.equilibrium_indices),
                 "coefficients": list(cycle.coefficients),
                 "parameter_names": list(cycle.parameter_names),
-                "generated_step_flags": list(
-                    cycle.generated_step_flags
-                ),
+                "correction_exponents": list(cycle.correction_exponents),
             }
             for cycle in self.cycles
         ]
@@ -143,6 +139,11 @@ class WegscheiderResolutionUpdate:
     cycle_id: str
     parameter_name: str
     expr_src: str
+    # Source-owned dG_eq corrections are materialized by the native Reactions
+    # writer.  Keep the exact linear source-coordinate relation alongside the
+    # display expression so the writer never has to reparse accepted source or
+    # reconstruct the detailed-balance report.
+    source_terms: tuple[tuple[str, Fraction], ...] = ()
 
     @property
     def line(self) -> str:
@@ -173,7 +174,6 @@ class _ReversibleStep:
     equilibrium_index: int
     vector: Mapping[str, Fraction]
     parameter_name: str
-    generated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,13 +201,11 @@ def _as_fraction_stoich_map(values: Mapping[object, object]) -> dict[str, Fracti
 def _reversible_steps(mechanism: object) -> tuple[_ReversibleStep, ...]:
     eqs = list(getattr(mechanism, "equilibria", []) or [])
     authored_by_equilibrium_index: dict[int, int] = {}
-    highest_authored_step = 0
     for entry in get_step_index_map(mechanism):
         try:
             step_index = int(entry.get("step_index"))
         except (TypeError, ValueError):
             continue
-        highest_authored_step = max(highest_authored_step, step_index)
         if str(entry.get("kind") or "") != "equilibrium":
             continue
         try:
@@ -218,20 +216,11 @@ def _reversible_steps(mechanism: object) -> tuple[_ReversibleStep, ...]:
             authored_by_equilibrium_index[equilibrium_index] = step_index
 
     steps: list[_ReversibleStep] = []
-    generated_ordinal = 0
-    for equilibrium_index, eq in enumerate(eqs):
-        authored_step_index = authored_by_equilibrium_index.get(
-            equilibrium_index
-        )
-        if authored_step_index is None:
-            generated_ordinal += 1
-            step_index = highest_authored_step + generated_ordinal
-            parameter_name = (
-                f"generated_effective_Keq_equilibrium_{equilibrium_index + 1}"
-            )
-        else:
-            step_index = authored_step_index
-            parameter_name = f"Keq{step_index}"
+    for equilibrium_index, step_index in sorted(
+        authored_by_equilibrium_index.items(),
+        key=lambda item: item[1],
+    ):
+        parameter_name = f"Keq{step_index}"
         eq = eqs[equilibrium_index]
         forward = _as_fraction_stoich_map(getattr(eq, "stoich_forward", {}) or {})
         back = _as_fraction_stoich_map(getattr(eq, "stoich_back", {}) or {})
@@ -247,10 +236,62 @@ def _reversible_steps(mechanism: object) -> tuple[_ReversibleStep, ...]:
                 equilibrium_index=equilibrium_index,
                 vector=vector,
                 parameter_name=parameter_name,
-                generated=authored_step_index is None,
             )
         )
     return tuple(sorted(steps, key=lambda step: step.step_index))
+
+
+def _correction_coordinates(
+    mechanism: object,
+    selected_steps: Sequence[_ReversibleStep],
+    cycle_coefficients: Sequence[int],
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """Return the writable authority coordinates for one cycle.
+
+    Wegscheider's scientific identity is expressed in equilibrium ratios, but
+    the correction UI must write the accepted authority basis.  Explicit
+    ``kf+kr`` therefore contributes two coordinates (``kfN`` and ``krN``)
+    with opposite exponents.  Thermodynamic ``Keq`` contributes ``KeqN``;
+    a source-owned ``dG_eq`` contributes its indexed source coordinate so the
+    caller cannot accidentally write a derived Keq readout.
+    """
+
+    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+    names: list[str] = []
+    exponents: list[int] = []
+    for step, coefficient in zip(selected_steps, cycle_coefficients, strict=True):
+        if not (0 <= int(step.equilibrium_index) < len(equilibria)):
+            raise ValueError("Wegscheider cycle references an invalid equilibrium index.")
+        equilibrium = equilibria[int(step.equilibrium_index)]
+        authority = normalize_existing_equilibrium_rate_authority(equilibrium)
+        c = int(coefficient)
+        if authority.kind == EquilibriumRateAuthorityKind.KR:
+            names.extend((f"kf{step.step_index}", f"kr{step.step_index}"))
+            exponents.extend((c, -c))
+        elif authority.dG_eq_J_per_mol is not None and not authority.has_explicit_keq_param:
+            names.append(f"dG_eq{step.step_index}")
+            exponents.append(c)
+        else:
+            names.append(f"Keq{step.step_index}")
+            exponents.append(c)
+    return tuple(names), tuple(exponents)
+
+
+def _cycle_correction_terms(
+    cycle: WegscheiderCycle,
+) -> tuple[tuple[str, int], ...]:
+    exponents = cycle.correction_exponents
+    if len(exponents) != len(cycle.parameter_names):
+        exponents = cycle.coefficients
+    if len(exponents) != len(cycle.parameter_names):
+        raise ValueError(
+            f"{cycle.cycle_id} correction-coordinate metadata is not aligned."
+        )
+    return tuple(
+        (str(name), int(exponent))
+        for name, exponent in zip(cycle.parameter_names, exponents, strict=True)
+        if int(exponent) != 0
+    )
 
 
 def _lcm(a: int, b: int) -> int:
@@ -318,20 +359,38 @@ def _nullspace_integer_basis(matrix: Sequence[Sequence[Fraction]]) -> tuple[tupl
 
 
 def _cycle_expression(cycle: WegscheiderCycle, dependent_parameter: str) -> str:
-    if any(cycle.generated_step_flags):
-        raise ValueError(
-            "Wegscheider cycles containing generated steps cannot be "
-            "rewritten through authored parameter algebra."
-        )
-    if dependent_parameter not in cycle.parameter_names:
+    terms = _cycle_correction_terms(cycle)
+    names = tuple(name for name, _coefficient in terms)
+    if dependent_parameter not in names:
         raise ValueError(f"{dependent_parameter!r} is not part of {cycle.cycle_id}.")
-    idx = cycle.parameter_names.index(dependent_parameter)
-    dependent_coeff = int(cycle.coefficients[idx])
+    idx = names.index(dependent_parameter)
+    dependent_coeff = int(terms[idx][1])
     if dependent_coeff == 0:
         raise ValueError(f"{dependent_parameter!r} has zero coefficient in {cycle.cycle_id}.")
+
+    # A detailed-balance cycle may be represented entirely in authored
+    # dG_eq coordinates.  Since log Keq = -dG_eq/(R*T), the dependent energy
+    # is the signed linear combination of the remaining source coordinates.
+    if all(name.startswith("dG_eq") for name, _coefficient in terms):
+        source_terms = _dG_source_terms(terms, dependent_parameter)
+        numerator_terms: list[str] = []
+        for name, factor in source_terms:
+            if factor == 1:
+                numerator_terms.append(name)
+            elif factor == -1:
+                numerator_terms.append(f"-({name})")
+            else:
+                numerator_terms.append(f"({factor}) * {name}")
+        return " + ".join(numerator_terms) if numerator_terms else "0"
+
+    if any(name.startswith("dG_eq") for name, _coefficient in terms):
+        raise ValueError(
+            f"{cycle.cycle_id} mixes dG_eq and dimensionless equilibrium coordinates; "
+            "choose a single source authority basis before correction."
+        )
     numerator_terms: list[str] = []
     denominator_terms: list[str] = []
-    for name, coeff in zip(cycle.parameter_names, cycle.coefficients):
+    for name, coeff in terms:
         if name == dependent_parameter or coeff == 0:
             continue
         exponent = Fraction(-int(coeff), dependent_coeff)
@@ -349,6 +408,29 @@ def _cycle_expression(cycle: WegscheiderCycle, dependent_parameter: str) -> str:
         return numerator
     denominator = " * ".join(denominator_terms)
     return f"{numerator} / ({denominator})"
+
+
+def _dG_source_terms(
+    terms: Sequence[tuple[str, int]],
+    dependent_parameter: str,
+) -> tuple[tuple[str, Fraction], ...]:
+    """Return the source-unit linear relation for a dependent dG_eq."""
+
+    names = tuple(name for name, _coefficient in terms)
+    if dependent_parameter not in names:
+        raise ValueError(f"{dependent_parameter!r} is not part of the cycle.")
+    dependent_coefficient = next(
+        int(coefficient)
+        for name, coefficient in terms
+        if name == dependent_parameter
+    )
+    if dependent_coefficient == 0:
+        raise ValueError(f"{dependent_parameter!r} has zero cycle coefficient.")
+    return tuple(
+        (name, Fraction(-int(coefficient), dependent_coefficient))
+        for name, coefficient in terms
+        if name != dependent_parameter and int(coefficient) != 0
+    )
 
 
 def build_wegscheider_resolution_updates(
@@ -375,6 +457,14 @@ def build_wegscheider_resolution_updates(
                 cycle_id=str(cycle_id),
                 parameter_name=str(parameter_name),
                 expr_src=_cycle_expression(cycle, str(parameter_name)),
+                source_terms=(
+                    _dG_source_terms(
+                        _cycle_correction_terms(cycle),
+                        str(parameter_name),
+                    )
+                    if str(parameter_name).casefold().startswith("dg_eq")
+                    else ()
+                ),
             )
         )
     return tuple(updates)
@@ -389,6 +479,25 @@ def apply_wegscheider_resolution_to_reactions_text(
         return str(dsl_text or "")
 
     lines = str(dsl_text or "").splitlines()
+
+    # dG_eq is a source-owned equilibrium coordinate, not an Algebra
+    # parameter.  Materialize all selected dG corrections in this one
+    # detached Reactions edit, retaining the source's numeric energy unit and
+    # directive context.  The canonical admission/recheck performed by the
+    # owning Run/Fit workflow remains the only source validation authority.
+    dg_updates = {
+        key: update
+        for key, update in pending.items()
+        if re.fullmatch(r"dg_eq\d+", key, flags=re.IGNORECASE)
+    }
+    if dg_updates:
+        _materialize_dG_source_updates(lines, dg_updates)
+        pending = {
+            key: update
+            for key, update in pending.items()
+            if key not in dg_updates
+        }
+
     rewritten: list[str] = []
     replaced: set[str] = set()
     param_re = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
@@ -419,6 +528,95 @@ def apply_wegscheider_resolution_to_reactions_text(
     return upsert_lines_into_algebra_section(rewritten_text, missing)
 
 
+_SOURCE_ARROW_RE = re.compile(r"(?:<=>|<->|->)")
+_SOURCE_DG_RE = re.compile(
+    r"(?P<key>dg_eq)\s*=\s*(?P<value>[^\s;#]+)",
+    re.IGNORECASE,
+)
+
+
+def _source_step_line_indices(lines: Sequence[str]) -> tuple[int, ...]:
+    """Return source line indices for canonical authored reaction steps."""
+
+    indices: list[int] = []
+    for index, raw_line in enumerate(lines):
+        code = strip_inline_comment(str(raw_line)).strip()
+        if not code:
+            continue
+        lower = code.casefold()
+        if (
+            lower.startswith("reaction:")
+            or lower.startswith("equilibrium:")
+            or _SOURCE_ARROW_RE.search(code) is not None
+        ):
+            indices.append(index)
+    return tuple(indices)
+
+
+def _materialize_dG_source_updates(
+    lines: list[str],
+    updates: Mapping[str, WegscheiderResolutionUpdate],
+) -> None:
+    """Rewrite source-owned dG_eq values from retained cycle coordinates."""
+
+    source_steps = _source_step_line_indices(lines)
+    values: dict[str, float] = {}
+    matches: dict[str, tuple[int, re.Match[str]]] = {}
+    for step_number, line_index in enumerate(source_steps, start=1):
+        match = _SOURCE_DG_RE.search(strip_inline_comment(lines[line_index]))
+        if match is None:
+            continue
+        key = f"dg_eq{step_number}"
+        try:
+            value = float(match.group("value"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Source {key} value is not a finite numeric dG_eq coordinate."
+            ) from exc
+        if not isfinite(value):
+            raise ValueError(f"Source {key} value is not finite.")
+        values[key] = float(value)
+        matches[key] = (line_index, match)
+
+    replacements: dict[int, tuple[int, int, str]] = {}
+    for key, update in updates.items():
+        target = str(key).casefold()
+        target_match = re.fullmatch(r"dg_eq(\d+)", target)
+        if target_match is None:
+            raise ValueError(f"Unsupported native detailed-balance target {key!r}.")
+        if target not in matches:
+            raise ValueError(
+                f"Source does not contain authored coordinate {update.parameter_name!r}."
+            )
+        if not update.source_terms:
+            raise ValueError(
+                f"Detailed-balance update {update.parameter_name!r} is missing its "
+                "retained source-coordinate relation."
+            )
+        materialized = 0.0
+        for source_name, factor in update.source_terms:
+            source_key = str(source_name).casefold()
+            if source_key not in values:
+                raise ValueError(
+                    f"Source does not contain authored coordinate {source_name!r}."
+                )
+            materialized += float(factor) * values[source_key]
+        if not isfinite(materialized):
+            raise ValueError(
+                f"Detailed-balance correction for {update.parameter_name!r} is not finite."
+            )
+        line_index, match = matches[target]
+        replacements[line_index] = (
+            match.start("value"),
+            match.end("value"),
+            repr(float(materialized)),
+        )
+
+    for line_index, (start, end, replacement) in replacements.items():
+        raw = lines[line_index]
+        lines[line_index] = raw[:start] + replacement + raw[end:]
+
+
 def _assignment_by_name(spec: ParameterAlgebraSpec | None) -> dict[str, ParameterAssignment]:
     if spec is None:
         return {}
@@ -432,12 +630,17 @@ def _cycle_candidate_proof_fingerprint(
     spec: ParameterAlgebraSpec,
 ) -> str | None:
     candidate = str(assignment.name)
-    if candidate not in cycle.parameter_names:
+    terms = _cycle_correction_terms(cycle)
+    if candidate not in {name for name, _coefficient in terms}:
+        return None
+    if any(name.startswith("dG_eq") for name, _coefficient in terms):
+        # The symbolic product proof works in dimensionless Keq coordinates;
+        # source-owned dG correction is handled by the native source writer.
         return None
     proof = prove_product_identity(
         target_factors={
             str(name): int(coeff)
-            for name, coeff in zip(cycle.parameter_names, cycle.coefficients)
+            for name, coeff in terms
             if int(coeff) != 0
         },
         candidate=assignment,
@@ -452,7 +655,7 @@ def _parameter_algebra_resolution(
     parameter_algebra_spec: ParameterAlgebraSpec | None,
 ) -> tuple[str | None, str | None]:
     assignments = _assignment_by_name(parameter_algebra_spec)
-    for name in cycle.parameter_names:
+    for name, _coefficient in _cycle_correction_terms(cycle):
         assignment = assignments.get(name)
         if assignment is None or parameter_algebra_spec is None:
             continue
@@ -552,139 +755,103 @@ def _step_log_temperature_relation(
 ) -> _LogTemperatureRelation | None:
     equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
     equilibrium = equilibria[step.equilibrium_index]
-    metadata = getattr(equilibrium, "metadata", {}) or {}
-    generated_kind = (
-        generated_equilibrium_authority_kind(metadata)
-        if isinstance(metadata, Mapping)
-        else ""
-    )
     log_temperature_power = 0.0
     inverse_temperature = 0.0
     source = ""
 
-    if generated_kind:
-        model = metadata.get(EquilibriumMetadataKeys.GENERATED_RATE_MODEL)
-        if not isinstance(model, Mapping):
+    authority = normalize_existing_equilibrium_rate_authority(equilibrium)
+    if authority.kind == EquilibriumRateAuthorityKind.KEQ:
+        if (
+            callable(authority.reverse_std_ratio)
+            and bool(
+                getattr(
+                    authority.reverse_std_ratio,
+                    "accepts_runtime_temperature",
+                    False,
+                )
+            )
+        ):
             return None
-        try:
-            if (
-                generated_kind
-                == GeneratedEquilibriumAuthorityKind.TRANSITION_STATE_BARRIER_RATES
-            ):
-                dG_forward = float(model["dG_act_fwd_J_per_mol"])
-                dG_reverse = float(model["dG_act_rev_J_per_mol"])
-                inverse_temperature = -(
-                    dG_forward - dG_reverse
-                ) / float(R)
-                source = "generated-transition-state"
-            elif (
-                generated_kind
-                == GeneratedEquilibriumAuthorityKind.DIRECT_THERMODYNAMIC_EQUILIBRIUM
-            ):
+        if (
+            authority.dG_eq_J_per_mol is not None
+            and not authority.has_explicit_keq_param
+        ):
+            if callable(authority.dG_eq_J_per_mol):
+                return None
+            try:
                 inverse_temperature = -float(
-                    model["dG_eq_J_per_mol"]
+                    authority.dG_eq_J_per_mol
                 ) / float(R)
-                source = "generated-direct-thermodynamic"
-            else:
+            except (TypeError, ValueError, OverflowError):
                 return None
-        except (KeyError, TypeError, ValueError, OverflowError):
-            return None
-    else:
-        authority = normalize_existing_equilibrium_rate_authority(
-            equilibrium
-        )
-        if authority.kind == EquilibriumRateAuthorityKind.KEQ:
-            if (
-                callable(authority.reverse_std_ratio)
-                and bool(
-                    getattr(
-                        authority.reverse_std_ratio,
-                        "accepts_runtime_temperature",
-                        False,
-                    )
-                )
-            ):
-                return None
-            if (
-                authority.dG_eq_J_per_mol is not None
-                and not authority.has_explicit_keq_param
-            ):
-                if callable(authority.dG_eq_J_per_mol):
-                    return None
-                try:
-                    inverse_temperature = -float(
-                        authority.dG_eq_J_per_mol
-                    ) / float(R)
-                except (TypeError, ValueError, OverflowError):
-                    return None
-                source = "authored-delta-g"
-            else:
-                if (
-                    callable(authority.Keq)
-                    and bool(
-                        getattr(
-                            authority.Keq,
-                            "accepts_runtime_temperature",
-                            False,
-                        )
-                    )
-                ):
-                    return None
-                source = "authored-explicit-keq"
-        elif authority.kind == EquilibriumRateAuthorityKind.KR:
-            forward_binding = getattr(equilibrium, "kf", None)
-            if isinstance(forward_binding, ForwardRateBinding):
-                forward_model = forward_binding.model
-                forward_exponents = _forward_model_temperature_exponents(
-                    forward_model
-                )
-            elif isinstance(forward_binding, RateBinding):
-                forward_exponents = (0.0, 0.0)
-            else:
-                try:
-                    forward_model = forward_rate_model_for_equilibrium(
-                        equilibrium,
-                        temperature_K=nominal_temperature_K,
-                        default_kappa=MechanismMetadataView.from_metadata(
-                            getattr(mechanism, "metadata", {}) or {}
-                        ).kappa_global,
-                        default_standard_conc_M=MechanismMetadataView.from_metadata(
-                            getattr(mechanism, "metadata", {}) or {}
-                        ).standard_conc_M,
-                    )
-                except (TypeError, ValueError):
-                    return None
-                forward_exponents = _forward_model_temperature_exponents(
-                    forward_model
-                )
-
-            reverse_binding = authority.kr
-            if isinstance(reverse_binding, ForwardRateBinding):
-                reverse_exponents = _forward_model_temperature_exponents(
-                    reverse_binding.model
-                )
-            elif (
-                callable(reverse_binding)
-                and bool(
-                    getattr(
-                        reverse_binding,
-                        "accepts_runtime_temperature",
-                        False,
-                    )
-                )
-            ):
-                return None
-            else:
-                reverse_exponents = (0.0, 0.0)
-            log_temperature_power = (
-                forward_exponents[0] - reverse_exponents[0]
-            )
-            inverse_temperature = (
-                forward_exponents[1] - reverse_exponents[1]
-            )
-            source = "authored-forward-reverse-rates"
+            source = "authored-delta-g"
         else:
+            if (
+                callable(authority.Keq)
+                and bool(
+                    getattr(
+                        authority.Keq,
+                        "accepts_runtime_temperature",
+                        False,
+                    )
+                )
+            ):
+                return None
+            source = "authored-explicit-keq"
+    elif authority.kind == EquilibriumRateAuthorityKind.KR:
+        forward_binding = getattr(equilibrium, "kf", None)
+        if isinstance(forward_binding, ForwardRateBinding):
+            forward_model = forward_binding.model
+            forward_exponents = _forward_model_temperature_exponents(
+                forward_model
+            )
+        elif isinstance(forward_binding, RateBinding):
+            forward_exponents = (0.0, 0.0)
+        else:
+            try:
+                forward_model = forward_rate_model_for_equilibrium(
+                    equilibrium,
+                    temperature_K=nominal_temperature_K,
+                    default_kappa=MechanismMetadataView.from_metadata(
+                        getattr(mechanism, "metadata", {}) or {}
+                    ).kappa_global,
+                    default_standard_conc_M=MechanismMetadataView.from_metadata(
+                        getattr(mechanism, "metadata", {}) or {}
+                    ).standard_conc_M,
+                )
+            except (TypeError, ValueError):
+                return None
+            forward_exponents = _forward_model_temperature_exponents(
+                forward_model
+            )
+
+        reverse_binding = authority.kr
+        if isinstance(reverse_binding, ForwardRateBinding):
+            reverse_exponents = _forward_model_temperature_exponents(
+                reverse_binding.model
+            )
+        elif (
+            callable(reverse_binding)
+            and bool(
+                getattr(
+                    reverse_binding,
+                    "accepts_runtime_temperature",
+                    False,
+                )
+            )
+        ):
             return None
+        else:
+            reverse_exponents = (0.0, 0.0)
+        log_temperature_power = (
+            forward_exponents[0] - reverse_exponents[0]
+        )
+        inverse_temperature = (
+            forward_exponents[1] - reverse_exponents[1]
+        )
+        source = "authored-forward-reverse-rates"
+    else:
+        return None
 
     if not isfinite(nominal_ratio) or nominal_ratio <= 0.0:
         return None
@@ -897,22 +1064,6 @@ def analyze_wegscheider_cyclicity(
     *,
     parameter_algebra_spec: ParameterAlgebraSpec | None = None,
 ) -> WegscheiderCyclicityReport:
-    if parameter_algebra_spec is None:
-        meta = getattr(mechanism, "metadata", {}) or {}
-        if isinstance(meta, dict):
-            maybe_spec = meta.get("parameter_algebra_spec")
-            if isinstance(maybe_spec, ParameterAlgebraSpec):
-                parameter_algebra_spec = maybe_spec
-            elif str(meta.get("algebra_text") or "").strip():
-                from kindred.core.simulator.parameter_algebra_spec import (
-                    parse_parameter_algebra_spec_from_dsl_text,
-                )
-
-                parameter_algebra_spec = parse_parameter_algebra_spec_from_dsl_text(
-                    str(meta.get("algebra_text") or ""),
-                    mechanism_namespace=build_namespace_from_mechanism(mechanism),
-                )
-
     steps = _reversible_steps(mechanism)
     if len(steps) < 2:
         return WegscheiderCyclicityReport(cycles=())
@@ -965,21 +1116,27 @@ def analyze_wegscheider_cyclicity(
         ]
         if len(selected) < 2:
             continue
+        selected_steps = tuple(step for step, _coefficient in selected)
+        selected_coefficients = tuple(
+            int(coefficient) for _step, coefficient in selected
+        )
+        correction_names, correction_exponents = _correction_coordinates(
+            mechanism,
+            selected_steps,
+            selected_coefficients,
+        )
         cycle = WegscheiderCycle(
             cycle_id=f"cycle_{idx}",
             step_indices=tuple(step.step_index for step, _coeff in selected),
             equilibrium_indices=tuple(step.equilibrium_index for step, _coeff in selected),
-            coefficients=tuple(int(coeff) for _step, coeff in selected),
-            parameter_names=tuple(step.parameter_name for step, _coeff in selected),
-            generated_step_flags=tuple(
-                bool(step.generated)
-                for step, _coeff in selected
-            ),
+            coefficients=selected_coefficients,
+            parameter_names=correction_names,
+            correction_exponents=correction_exponents,
         )
         resolved_by, proof_fingerprint = _runtime_domain_resolution(
             mechanism,
             cycle,
-            tuple(step for step, _coefficient in selected),
+            selected_steps,
             evaluator=evaluator,
             nominal_temperature_K=nominal_temperature_K,
             nominal_ratios=resolved_nominal_ratios,

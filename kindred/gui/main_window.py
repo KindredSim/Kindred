@@ -47,8 +47,14 @@ from kindred.core.project_session import ProjectSession
 from kindred.core.result_repository import (
     ExplicitResultKey,
     ResultRepository,
+    scientific_identity,
+    standard_concentration_identity,
 )
-from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulator.dsl_parse import (
+    PreparedDslRequestSet,
+    prepare_dsl_request_set,
+)
+from kindred.core.units import UnitsModel
 from kindred.gui.app_wiring import (
     build_analysis_dock,
     build_data_dock,
@@ -420,12 +426,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._native_close_authorized = False
         self._rendering_workspace = False
-        self._last_workspace_render_projection: (
-            _WorkspaceRenderProjection | None
-        ) = None
         self._recent_menu: QtWidgets.QMenu | None = None
         self._current_result_projection: WorkspaceResultProjection | None = None
-        self._render_failure_prompt_active = False
         self._dark_mode_action: QtGui.QAction | None = None
         self._run_action: QtGui.QAction | None = None
         self._xlsx_export_action: QtGui.QAction | None = None
@@ -441,14 +443,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._workspace.setObjectName("mechanismWorkspace")
         self.setCentralWidget(self._workspace)
-        self._shared_plot = self._workspace.main_plot()
 
         self._status_label = QtWidgets.QLabel("Ready", self)
         self.statusBar().addWidget(self._status_label, 1)
 
         self._theme_manager = ThemeManager(
             application,
-            self._shared_plot,
+            self._workspace,
             report_failure=self.set_status_text,
         )
         self.config_controller = ConfigController(self._config_port())
@@ -462,7 +463,6 @@ class MainWindow(QtWidgets.QMainWindow):
             repository_for_tab=self._repository_for_tab,
             explicit_result_key_is_current=self._explicit_result_key_is_current,
             commit_detailed_balance_source=self._commit_detailed_balance_source,
-            render_results=self._render_results_for_tab,
             user_parallel_maximum=(
                 self.config_controller.run_user_maximum_preference
             ),
@@ -788,7 +788,10 @@ class MainWindow(QtWidgets.QMainWindow):
             signal.connect(lambda *_args: QtCore.QTimer.singleShot(0, self._render_workspace))
         self._mechanism_editor.notesEdited.connect(self._on_notes_edited)
 
-        self._simulation_jobs.state_changed.connect(self._render_workspace)
+        self._simulation_jobs.state_changed.connect(self._refresh_actions)
+        self._simulation_jobs.results_changed.connect(
+            lambda tab_id: self._render_results_for_tab(str(tab_id))
+        )
         self._simulation_jobs.status_changed.connect(self.set_status_text)
         self._simulation_jobs.detailed_balance_correction_requested.connect(
             self._mechanism_editor.present_detailed_balance_correction
@@ -835,24 +838,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overlay_panel.overlaySelectionRequested.connect(
             self._set_overlay_selection
         )
-        self._overlay_panel.styleChanged.connect(self._render_results)
+        self._overlay_panel.styleChanged.connect(self._render_all_results)
         self.config_controller.applicationPlotPreferencesChanged.connect(
-            self._render_results
+            self._render_all_results
         )
-        self._shared_plot.referenceLayerVisibilityRequested.connect(
-            self._set_reference_lines_visible
-        )
-        self._shared_plot.interventionAnnotationsVisibilityRequested.connect(
-            self._set_intervention_annotations_visible
-        )
-        self._shared_plot.xSeriesRequested.connect(self._set_x_series)
-        self._shared_plot.ySeriesRequested.connect(self._set_y_series)
-        self._shared_plot.parametricModeRequested.connect(
-            self._set_parametric_mode
-        )
-        self._shared_plot.plotPresentationIntentRequested.connect(
-            self._set_plot_presentation
-        )
+        self._workspace.plotCreated.connect(self._connect_workspace_plot)
         self.config_controller.mechanismParameterDebounceChanged.connect(
             lambda _value: self._apply_slider_debounce_settings()
         )
@@ -863,37 +853,153 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Direct render
     # ------------------------------------------------------------------
+    def _render_active_tab_controls_only(self) -> None:
+        """Refresh shared controls after a tab switch without touching results."""
+
+        active_tab = self._workspace_tab_registry.active_tab
+        presentation = self._workspace_tab_registry.active_presentation
+        editor_projection = self._editor_binding.prepare_active_render()
+        initial_projection = self._initial_conditions_actions.prepare_active_render()
+        slider_projection = self._slider_binding.prepare_active_render()
+        data_snapshot = build_data_manager_snapshot(
+            document=self._project_session.document,
+            active_tab=active_tab,
+            presentation=presentation,
+        )
+        species_names = tuple(projected_species_names(active_tab))
+
+        self._editor_binding.apply_render_projection(
+            editor_projection,
+            refresh_validation=False,
+        )
+        if self._workspace_tab_registry.active_runtime.reactions_draft is not None:
+            self._mechanism_editor.set_reactions_status_text(
+                "Visible mechanism source has changed; scientific actions will "
+                "validate it.",
+                state="draft",
+            )
+        elif active_tab.prepared_dsl is not None:
+            self._mechanism_editor.set_reactions_status_text(
+                "Accepted Reactions.",
+                state="valid",
+            )
+        else:
+            self._mechanism_editor.set_reactions_status_text("", state="idle")
+        self._initial_conditions_actions.apply_render_projection(initial_projection)
+        self._simulation_panel.render_run_defaults(
+            active_tab.run_defaults,
+            run_admitted=self._run_admitted(),
+            simulation_job_kind=self._simulation_jobs.current_kind,
+        )
+        self._slider_binding.apply_render_projection(slider_projection)
+        self._dataset_import_panel.render_snapshot(data_snapshot)
+        self._overlay_panel.render_snapshot(
+            records=data_snapshot.datasets,
+            active_links=data_snapshot.active_links,
+            known_species=species_names,
+        )
+        for tab in self._project_session.document.tabs:
+            runtime = self._workspace_tab_registry.tab_runtime(tab.tab_id)
+            self._workspace.set_tab_dirty(tab.tab_id, runtime.has_dirty_drafts)
+            self._workspace.set_tab_close_enabled(
+                tab.tab_id,
+                len(self._project_session.document.tabs) > 1,
+            )
+        targets = tuple(slider_projection.targets)
+        target_names = tuple(
+            active_tab.initial_condition_set(set_id).name
+            for set_id in targets
+        )
+        self._mechanism_editor.set_slider_edit_targets_summary(
+            "Slider edit targets: "
+            + (", ".join(target_names) if target_names else "none")
+        )
+        panel_projection = self._workspace.active_plot().applied_projection
+        self._current_result_projection = (
+            panel_projection
+            if isinstance(panel_projection, WorkspaceResultProjection)
+            and panel_projection.tab_id == active_tab.tab_id
+            else None
+        )
+        self._sync_active_copy_all_capability()
+        self._refresh_symbolic_calculator()
+        self._refresh_title()
+        self._refresh_actions()
+
+    @QtCore.Slot(str, object)
+    def _connect_workspace_plot(self, tab_id: str, plot: object) -> None:
+        """Bind one retained plot only to intents from its owning tab."""
+
+        target = str(tab_id)
+        required_signals = (
+            "referenceLayerVisibilityRequested",
+            "interventionAnnotationsVisibilityRequested",
+            "xSeriesRequested",
+            "ySeriesRequested",
+            "parametricModeRequested",
+            "plotPresentationIntentRequested",
+        )
+        if any(
+            not callable(getattr(getattr(plot, name, None), "connect", None))
+            for name in required_signals
+        ):
+            raise TypeError("Workspace plot must expose the plot intent signals.")
+
+        def active() -> bool:
+            return target == self._workspace_tab_registry.active_tab_id
+
+        plot.referenceLayerVisibilityRequested.connect(
+            lambda visible: (
+                self._set_reference_lines_visible(visible) if active() else None
+            )
+        )
+        plot.interventionAnnotationsVisibilityRequested.connect(
+            lambda visible: (
+                self._set_intervention_annotations_visible(visible)
+                if active()
+                else None
+            )
+        )
+        plot.xSeriesRequested.connect(
+            lambda name: self._set_x_series(name) if active() else None
+        )
+        plot.ySeriesRequested.connect(
+            lambda names: self._set_y_series(names) if active() else None
+        )
+        plot.parametricModeRequested.connect(
+            lambda enabled: self._set_parametric_mode(enabled) if active() else None
+        )
+        plot.plotPresentationIntentRequested.connect(
+            lambda intent: self._set_plot_presentation(intent) if active() else None
+        )
+
     def _render_workspace(self) -> None:
         if self._rendering_workspace:
             return
         self._rendering_workspace = True
         try:
-            projection = self._prepare_workspace_render_projection()
+            try:
+                projection = self._prepare_workspace_render_projection()
+            except Exception as exc:
+                self._invalidate_result_projection(
+                    self._workspace_tab_registry.active_tab_id
+                )
+                self.set_status_text(f"Workspace refresh failed: {exc}")
+                self._refresh_actions()
+                raise
             failures = self._apply_workspace_render_projection(projection)
             if failures:
-                previous = self._last_workspace_render_projection
-                rollback_failures = (
-                    ()
-                    if previous is None
-                    else self._apply_workspace_render_projection(previous)
-                )
-                if previous is not None and not rollback_failures:
-                    self._current_result_projection = (
-                        previous.result_projection
-                    )
+                self._invalidate_result_projection(projection.active_tab_id)
+                self._current_result_projection = None
+                self._workspace.set_active_copy_all_enabled(False)
                 message = "Workspace refresh failed: " + "; ".join(failures)
-                if rollback_failures:
-                    message += (
-                        "; prior-view rollback failed: "
-                        + "; ".join(rollback_failures)
-                    )
                 self.set_status_text(message)
                 raise RuntimeError(message)
             self._slider_binding.settle_render_projection(
                 projection.sliders
             )
             self._current_result_projection = projection.result_projection
-            self._last_workspace_render_projection = projection
+            self._sync_active_copy_all_capability()
             self._refresh_symbolic_calculator()
             self._refresh_title()
             self._refresh_actions()
@@ -949,7 +1055,6 @@ class MainWindow(QtWidgets.QMainWindow):
         prepare("run admission", self._run_admitted)
         if failures:
             message = "Workspace refresh failed: " + "; ".join(failures)
-            self.set_status_text(message)
             raise RuntimeError(message)
 
         slider_projection = prepared["slider projection"]
@@ -990,14 +1095,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         projection: _WorkspaceRenderProjection,
     ) -> tuple[str, ...]:
-        """Apply all consumers, returning typed failures for atomic rollback."""
+        """Apply all consumers, returning typed failures for one report."""
 
         if not isinstance(projection, _WorkspaceRenderProjection):
             raise TypeError(
                 "projection must be _WorkspaceRenderProjection."
             )
         active_tab = projection.document.tab(projection.active_tab_id)
-        presentation = projection.presentation
         data_snapshot = projection.data_snapshot
         failures: list[str] = []
 
@@ -1009,22 +1113,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 failures.append(f"{label}: {exc}")
 
         apply(
-            "plot presentation",
-            lambda: self._shared_plot.set_persisted_plot_state(
-                projection.active_tab_id,
-                log_x=presentation.log_x,
-                log_y=presentation.log_y,
-                legend_visible=presentation.legend_visible,
-                x_inverted=presentation.x_inverted,
-                y_inverted=presentation.y_inverted,
-            ),
-        )
-        apply(
             "tab strip",
             lambda: self._workspace.render(
                 projection.document,
                 active_tab_id=projection.active_tab_id,
             ),
+        )
+        apply(
+            "plot presentation",
+            lambda: self._apply_persisted_plot_states(projection.document),
         )
         apply(
             "mechanism editor",
@@ -1067,7 +1164,7 @@ class MainWindow(QtWidgets.QMainWindow):
         apply(
             "results",
             lambda: self._result_presenter.apply(
-                self._shared_plot,
+                self._workspace.plot_for_tab(projection.active_tab_id),
                 projection.result_projection,
             ),
         )
@@ -1088,6 +1185,20 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
         )
         return tuple(failures)
+
+    def _apply_persisted_plot_states(self, document: ProjectDocument) -> None:
+        """Apply each tab's persisted plot state to its retained panel."""
+
+        for tab in document.tabs:
+            state = self._workspace_tab_registry.presentation(tab.tab_id)
+            self._workspace.plot_for_tab(tab.tab_id).set_persisted_plot_state(
+                tab.tab_id,
+                log_x=state.log_x,
+                log_y=state.log_y,
+                legend_visible=state.legend_visible,
+                x_inverted=state.x_inverted,
+                y_inverted=state.y_inverted,
+            )
 
     def _compose_result_projection(
         self,
@@ -1134,23 +1245,50 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _render_results_for_tab(self, tab_id: str) -> bool:
-        if str(tab_id) != self._workspace_tab_registry.active_tab_id:
-            return True
+        target = str(tab_id)
+        if target != self._workspace_tab_registry.active_tab_id:
+            try:
+                projection = self._compose_result_projection(target)
+                rendered = self._apply_result_projection(projection)
+                self._sync_active_copy_all_capability()
+                if not rendered:
+                    self.set_status_text(
+                        f"Result display failed for mechanism {target!r}; "
+                        "its panel is unavailable until a later publication."
+                    )
+                return rendered
+            except Exception as exc:
+                logger.exception("Result render failed for inactive mechanism")
+                self._invalidate_result_projection(target)
+                self.set_status_text(
+                    f"Result display failed for mechanism {target!r}: {exc}"
+                )
+                return False
         return self._render_results()
 
+    def _render_all_results(self) -> None:
+        """Apply one accepted result projection to every retained tab panel."""
+
+        for tab in tuple(self._project_session.document.tabs):
+            self._render_results_for_tab(tab.tab_id)
+
     def _render_results(self) -> bool:
+        tab_id = self._workspace_tab_registry.active_tab_id
         try:
-            tab_id = self._workspace_tab_registry.active_tab_id
             projection = self._compose_result_projection(tab_id)
             if not self._apply_result_projection(projection):
                 return False
             self._current_result_projection = projection
+            self._sync_active_copy_all_capability()
             return True
         except Exception as exc:
             logger.exception("Result render failed")
+            self._invalidate_result_projection(tab_id)
             self.set_status_text(
-                f"Result display failed; the previous usable plot was kept: {exc}"
+                "Result display failed for the active mechanism; Copy and XLSX "
+                f"are disabled until a current projection renders successfully: {exc}"
             )
+            self._refresh_actions()
             return False
 
     def _apply_result_projection(
@@ -1158,10 +1296,52 @@ class MainWindow(QtWidgets.QMainWindow):
         projection: WorkspaceResultProjection,
     ) -> bool:
         try:
-            self._result_presenter.apply(self._shared_plot, projection)
+            self._result_presenter.apply(
+                self._workspace.plot_for_tab(projection.tab_id),
+                projection,
+            )
         except Exception as exc:
-            return self._on_render_failed(projection.tab_id, str(exc))
+            self._invalidate_after_result_render_failure(
+                projection.tab_id,
+                str(exc),
+            )
+            raise
         return True
+
+    def _invalidate_result_projection(self, tab_id: str) -> None:
+        """Remove a failed tab's physical result surface without touching others."""
+
+        target = str(tab_id)
+        if target == self._workspace_tab_registry.active_tab_id:
+            self._current_result_projection = None
+            self._workspace.set_active_copy_all_enabled(False)
+        try:
+            self._workspace.plot_for_tab(target).clear_workspace_result_projection()
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            logger.exception("Could not clear failed workspace result surface")
+
+    def _active_current_export_projection(
+        self,
+    ) -> WorkspaceResultProjection | None:
+        """Return export truth only when the live active panel applied it."""
+
+        projection = self._current_result_projection
+        if (
+            projection is None
+            or projection.tab_id != self._workspace_tab_registry.active_tab_id
+            or not projection.copy_all_blocks
+        ):
+            return None
+        try:
+            panel = self._workspace.plot_for_tab(projection.tab_id)
+        except (KeyError, RuntimeError):
+            return None
+        return projection if panel.applied_projection is projection else None
+
+    def _sync_active_copy_all_capability(self) -> None:
+        self._workspace.set_active_copy_all_enabled(
+            self._active_current_export_projection() is not None
+        )
 
     def _repository_for_tab(self, tab_id: str) -> ResultRepository:
         repository = self._workspace_tab_registry.tab_runtime(tab_id).result_repository
@@ -1235,13 +1415,20 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     @QtCore.Slot(str)
     def _select_tab(self, tab_id: str) -> None:
-        if tab_id == self._workspace_tab_registry.active_tab_id:
+        target = str(tab_id)
+        previous = self._workspace_tab_registry.active_tab_id
+        if target == previous:
             return
         if not self._settle_execution_candidate():
-            self._render_workspace()
+            self._workspace.select_tab_surface(previous)
             return
-        self._workspace_tab_registry.select_tab(tab_id)
-        self._render_workspace()
+        self._workspace_tab_registry.select_tab(target)
+        self._workspace.select_tab_surface(target)
+        try:
+            self._render_active_tab_controls_only()
+        except Exception as exc:
+            self.set_status_text(f"Could not switch mechanism tab: {exc}")
+            logger.exception("Mechanism tab control refresh failed")
 
     @QtCore.Slot()
     def _create_tab(self) -> None:
@@ -1341,7 +1528,7 @@ class MainWindow(QtWidgets.QMainWindow):
             elif invalid_cells and not invalid_reactions:
                 runtime.invalid_initial_text_by_set_id.clear()
         self._slider_binding.drop_tab_runtime(tab_id)
-        self._shared_plot.drop_tab_session_state(tab_id)
+        self._workspace.drop_tab_session_state(tab_id)
         self._editor_binding.discard_reactions_draft(tab_id)
         runtime.invalid_initial_text_by_set_id.clear()
         self._workspace_tab_registry.close_tab(tab_id)
@@ -1420,6 +1607,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 set_id=set_id,
                 mechanism_source=tab.mechanism_source,
                 analysis_identity=projected_analysis_identity(tab),
+                standard_concentration_identity=standard_concentration_identity(
+                    tab.prepared_dsl
+                ),
+                scientific_identity=scientific_identity(tab.prepared_dsl),
                 initial_values=projected_initial_values(tab, set_id),
                 execution_settings=tab.resolved_execution_settings(set_id),
                 scientific_settings=tab.scientific_settings,
@@ -1450,7 +1641,7 @@ class MainWindow(QtWidgets.QMainWindow):
         source = self._visible_source_for_tab(
             self._workspace_tab_registry.active_tab_id
         )
-        return bool(source.full_dsl.strip())
+        return bool(source.reactions_text.strip())
 
     @QtCore.Slot(bool)
     def _set_shared_run_enabled(self, enabled: bool) -> None:
@@ -1990,18 +2181,42 @@ class MainWindow(QtWidgets.QMainWindow):
             description="Open Template Manager"
         ):
             return
+        source_tab = self._workspace_tab_registry.active_tab
         dialog = TemplateManagerDialog(
             parent=self,
             template_manager=self._template_manager,
-            current_mechanism_source=self._workspace_tab_registry.active_tab.mechanism_source,
+            current_mechanism_source=source_tab.mechanism_source,
+            source_preflight=lambda source: self._preflight_template_source(
+                source_tab.tab_id,
+                source,
+            ),
         )
-        dialog.templateLoadRequested.connect(
+        dialog.templateApplyRequested.connect(
             lambda source: self._accept_external_source(
                 source,
-                description="Load mechanism template",
+                description="Apply mechanism template",
             )
         )
         dialog.exec()
+
+    def _preflight_template_source(
+        self,
+        source_tab_id: str,
+        source: MechanismAuthoringSource,
+    ) -> MechanismAuthoringSource:
+        """Scientifically admit a template candidate in its source tab context."""
+
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("template source must be MechanismAuthoringSource.")
+        source_tab = self._project_session.document.tab(str(source_tab_id))
+        prepare_dsl_request_set(
+            source.reactions_text,
+            initials={},
+            units=UnitsModel(
+                temperature_K=source_tab.scientific_settings.temperature,
+            ),
+        )
+        return source
 
     # ------------------------------------------------------------------
     # Dataset intents
@@ -2671,15 +2886,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtGui.QKeySequence.StandardKey.Redo,
             "redoAction",
         )
-        edit_menu.addSeparator()
-        self._add_action(
-            edit_menu,
-            "State Network Editor...",
-            self._mechanism_editor.open_state_network_editor,
-            None,
-            "stateNetworkAction",
-        )
-
         view_menu = bar.addMenu("&View")
         self._view_menu = view_menu
         panels = view_menu.addMenu("Panels")
@@ -3072,7 +3278,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _export_xlsx(self) -> None:
-        projection = self._current_result_projection
+        projection = self._active_current_export_projection()
         if projection is None:
             self.set_status_text("No result data is available to export.")
             return
@@ -3366,7 +3572,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status_label.setText(str(text))
 
     def _on_document_replaced(self) -> None:
-        self._shared_plot.reset_plot_session_state()
+        self._workspace.reset_plot_session_state()
         self._slider_binding.reset_project_session_state()
         self._symbolic_calculator_owner.reset_project_session_state()
         self._current_result_projection = None
@@ -3406,7 +3612,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._global_fit_action.setEnabled(self._computation_gate.is_idle)
         if self._xlsx_export_action is not None:
             self._xlsx_export_action.setEnabled(
-                self._current_result_projection is not None
+                self._active_current_export_projection() is not None
                 and not self._xlsx_export_owner.is_exporting
             )
 
@@ -3418,38 +3624,14 @@ class MainWindow(QtWidgets.QMainWindow):
             equilibrium_K_ms=self.config_controller.equilibrium_k_debounce_ms(),
         )
 
-    @QtCore.Slot(str, str)
-    def _on_render_failed(self, tab_id: str, message: str) -> bool:
-        if (
-            str(tab_id) != self._workspace_tab_registry.active_tab_id
-            or self._render_failure_prompt_active
-        ):
-            return False
-        self._render_failure_prompt_active = True
-        dialog = QtWidgets.QMessageBox(self)
-        dialog.setWindowTitle("Plot Rendering Failed")
-        dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        dialog.setText(
-            "The scientific result was retained and the prior usable plot "
-            f"was kept.\n\n{message}"
-        )
-        retry = dialog.addButton(
-            "Try Again",
-            QtWidgets.QMessageBox.ButtonRole.AcceptRole,
-        )
-        dialog.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
-        try:
-            dialog.exec()
-            if dialog.clickedButton() is retry:
-                rendered = self._simulation_jobs.rerender(tab_id)
-                if not rendered:
-                    self.set_status_text(
-                        "Plot rerender failed; prior plot and Copy data remain."
-                    )
-                return rendered
-            return False
-        finally:
-            self._render_failure_prompt_active = False
+    def _invalidate_after_result_render_failure(
+        self,
+        tab_id: str,
+        message: str,
+    ) -> None:
+        target = str(tab_id)
+        self._invalidate_result_projection(target)
+        logger.error("Result display failed for %s: %s", target, message)
 
     def authorize_and_schedule_close(self) -> None:
         self._native_close_authorized = True

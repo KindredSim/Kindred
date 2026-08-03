@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
+import hashlib
+import json
+import math
 from numbers import Real
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -29,6 +32,8 @@ __all__ = [
     "ResultRepository",
     "SimulationResultProvenance",
     "SimulationResultValue",
+    "scientific_identity",
+    "standard_concentration_identity",
 ]
 
 
@@ -37,6 +42,238 @@ def _required_id(value: object, field: str) -> str:
     if not normalized:
         raise ValueError(f"{field} must be nonblank.")
     return normalized
+
+
+def standard_concentration_identity(prepared_dsl: object) -> str:
+    """Return the C0 contribution to executable science, not source provenance.
+
+    ``MechanismAuthoringSource`` remains on every result key so an exact source
+    capture is retained for provenance.  C0 is additionally represented by its
+    executable contribution: changing it is scientific only where an Eyring
+    molecularity or an auto-derived equilibrium reverse rate consumes it.
+    """
+
+    mechanism_for_execution = getattr(prepared_dsl, "mechanism_for_execution", None)
+    if not callable(mechanism_for_execution):
+        raise TypeError("prepared_dsl must provide mechanism_for_execution().")
+    mechanism = mechanism_for_execution()
+    metadata = getattr(mechanism, "metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise TypeError("prepared DSL mechanism metadata must be a mapping.")
+
+    from kindred.core.kinetics import (
+        EyringRateModel,
+        forward_rate_model_for_equilibrium,
+        forward_rate_model_for_reaction,
+    )
+    from kindred.core.equilibrium_rate_authority import (
+        EquilibriumRateAuthorityKind,
+        normalize_existing_equilibrium_rate_authority,
+    )
+    from kindred.core.mechanism_metadata import MechanismMetadataView
+
+    view = MechanismMetadataView.from_metadata(metadata)
+    consumes_c0 = False
+    for reaction in tuple(getattr(mechanism, "reactions", ()) or ()):
+        model = forward_rate_model_for_reaction(
+            reaction,
+            default_kappa=view.kappa_global,
+            default_standard_conc_M=view.standard_conc_M,
+        )
+        if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
+            consumes_c0 = True
+            break
+    if not consumes_c0:
+        for equilibrium in tuple(getattr(mechanism, "equilibria", ()) or ()):
+            model = forward_rate_model_for_equilibrium(
+                equilibrium,
+                temperature_K=view.temperature_K,
+                default_kappa=view.kappa_global,
+                default_standard_conc_M=view.standard_conc_M,
+            )
+            if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
+                consumes_c0 = True
+                break
+            authority = normalize_existing_equilibrium_rate_authority(
+                equilibrium
+            )
+            forward_order = math.fsum(
+                float(value)
+                for value in dict(getattr(equilibrium, "stoich_forward", {})).values()
+            )
+            reverse_order = math.fsum(
+                float(value)
+                for value in dict(getattr(equilibrium, "stoich_back", {})).values()
+            )
+            standard_state_exponent = math.fsum((forward_order, -reverse_order))
+            if (
+                authority.kind == EquilibriumRateAuthorityKind.KEQ
+                and standard_state_exponent != 0.0
+            ):
+                consumes_c0 = True
+                break
+    if not consumes_c0:
+        return "C0:inert"
+    return f"C0:consumed:{float(view.standard_conc_M).hex()}"
+
+
+def scientific_identity(prepared_dsl: object) -> str:
+    """Return a deterministic identity for accepted executable science.
+
+    Authoring text and provenance remain on the result key, but comments and
+    formatting never enter this digest.  The payload is assembled from the
+    accepted mechanism, retained ASTs, and executable schedule objects.  An
+    inert standard concentration is removed recursively; a consumed value is
+    retained by :func:`standard_concentration_identity`.
+    """
+
+    mechanism_for_execution = getattr(prepared_dsl, "mechanism_for_execution", None)
+    if not callable(mechanism_for_execution):
+        raise TypeError("prepared_dsl must provide mechanism_for_execution().")
+    mechanism = mechanism_for_execution()
+    c0_identity = standard_concentration_identity(prepared_dsl)
+
+    def canonical(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {
+                str(key): canonical(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+                if str(key) not in {
+                    "dsl_analysis_identity",
+                    "dsl_source_origins",
+                    "algebra_text",
+                    "parameter_algebra_spec",
+                }
+            }
+        if isinstance(value, (tuple, list)):
+            return [canonical(item) for item in value]
+        if isinstance(value, (set, frozenset)):
+            return sorted((canonical(item) for item in value), key=repr)
+        if isinstance(value, np.ndarray):
+            return canonical(value.tolist())
+        if isinstance(value, bool) or value is None or isinstance(value, str):
+            return value
+        if isinstance(value, Real):
+            return {"float_hex": float(value).hex()}
+        if callable(value):
+            model = getattr(value, "model", None)
+            if model is not None:
+                return {"callable": value.__class__.__name__, "model": canonical(model)}
+            return {"callable": value.__class__.__name__}
+        if is_dataclass(value) and not isinstance(value, type):
+            return {
+                "type": value.__class__.__qualname__,
+                "fields": {
+                    item.name: canonical(getattr(value, item.name))
+                    for item in fields(value)
+                },
+            }
+        attrs = getattr(value, "__dict__", None)
+        if isinstance(attrs, Mapping):
+            return {
+                "type": value.__class__.__qualname__,
+                "attrs": canonical(attrs),
+            }
+        raise TypeError(
+            "scientific identity cannot encode executable value "
+            f"{value.__class__.__qualname__}."
+        )
+
+    metadata = getattr(mechanism, "metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise TypeError("prepared DSL mechanism metadata must be a mapping.")
+    from kindred.core.ode_builder import (
+        build_effective_rate_coefficient_evaluator,
+    )
+
+    coefficient_authority = build_effective_rate_coefficient_evaluator(
+        mechanism
+    )
+    reactions = []
+    for reaction in tuple(getattr(mechanism, "reactions", ()) or ()):
+        reactions.append(
+            {
+                "reactants": canonical(getattr(reaction, "reactants", {})),
+                "products": canonical(getattr(reaction, "products", {})),
+                "rate_orders": canonical(getattr(reaction, "rate_orders", {})),
+            }
+        )
+    equilibria = []
+    for equilibrium in tuple(getattr(mechanism, "equilibria", ()) or ()):
+        equilibria.append(
+            {
+                "stoich_forward": canonical(getattr(equilibrium, "stoich_forward", {})),
+                "stoich_back": canonical(getattr(equilibrium, "stoich_back", {})),
+            }
+        )
+    schedule = metadata.get("temperature_schedule")
+    intervention_for_execution = getattr(
+        prepared_dsl,
+        "intervention_schedule_for_execution",
+        None,
+    )
+    if not callable(intervention_for_execution):
+        raise TypeError(
+            "prepared_dsl must provide intervention_schedule_for_execution()."
+        )
+    intervention = intervention_for_execution()
+    payload: dict[str, object] = {
+        "species": tuple(str(name) for name in getattr(mechanism, "species_names", lambda: ())()),
+        "reactions": reactions,
+        "equilibria": equilibria,
+        "coefficient_authority": canonical(
+            coefficient_authority.authority_snapshot
+        ),
+        "temperature_K": canonical(metadata.get("temperature_K", 298.15)),
+        "temperature_schedule": canonical(schedule),
+        "intervention_schedule": canonical(intervention),
+        "c0": c0_identity,
+    }
+    from kindred.core.algebra.simulation_series import algebra_block_to_source
+
+    compiled = getattr(mechanism, "_compiled_algebra_series", None)
+    payload["observable_program"] = (
+        None
+        if compiled is None
+        else algebra_block_to_source(compiled.block)
+    )
+    parameter_spec_for_execution = getattr(
+        prepared_dsl,
+        "parameter_algebra_spec_for_execution",
+        None,
+    )
+    if not callable(parameter_spec_for_execution):
+        raise TypeError(
+            "prepared_dsl must provide parameter_algebra_spec_for_execution()."
+        )
+    spec = parameter_spec_for_execution()
+    block = getattr(spec, "parameter_block", None)
+    payload["parameter_program"] = (
+        None if block is None else algebra_block_to_source(block)
+    )
+    if c0_identity == "C0:inert":
+        def strip_c0(value: object) -> object:
+            if isinstance(value, Mapping):
+                return {
+                    key: strip_c0(item)
+                    for key, item in value.items()
+                    if str(key).lower() not in {"standard_conc_m", "std_ratio", "c0"}
+                }
+            if isinstance(value, list):
+                return [strip_c0(item) for item in value]
+            if isinstance(value, tuple):
+                return [strip_c0(item) for item in value]
+            return value
+
+        payload = strip_c0(payload)  # type: ignore[assignment]
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return f"science:{digest}"
 
 
 def _finite_pairs(
@@ -66,7 +303,9 @@ def _finite_pairs(
 
 
 def _frozen_vector(value: object, *, field: str) -> np.ndarray:
-    candidate = np.asarray(value, dtype=float).reshape(-1)
+    candidate = np.asarray(value, dtype=float)
+    if candidate.ndim != 1:
+        raise ValueError(f"{field} must be one-dimensional.")
     array = (
         value
         if (
@@ -91,7 +330,10 @@ def _frozen_identity_vector(
     field: str,
     size: int,
 ) -> np.ndarray:
-    candidate = np.asarray(value, dtype=np.int64).reshape(-1)
+    raw = np.asarray(value)
+    if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
+        raise ValueError(f"{field} must be a one-dimensional integer array.")
+    candidate = raw.astype(np.int64, copy=False)
     array = (
         value
         if (
@@ -108,6 +350,231 @@ def _frozen_identity_vector(
         raise ValueError(f"{field} must be ordered and nonnegative.")
     array.setflags(write=False)
     return array
+
+
+def _validate_discontinuity_regions(
+    time: np.ndarray,
+    discontinuity_ids: np.ndarray,
+    *,
+    execution: InterventionExecutionContract,
+    execution_start: float,
+    execution_end: float,
+) -> None:
+    """Validate executor region identity against exact executed boundaries."""
+
+    if int(discontinuity_ids[0]) != 0:
+        raise ValueError("result discontinuity identity must start at zero.")
+    expected_advances = {
+        float(value)
+        for value in execution.discontinuities
+        if execution_start < float(value) <= execution_end
+    }
+    expected_advances.update(
+        float(firing.root_time)
+        for firing in execution.trigger_firings
+        if execution_start < float(firing.root_time) <= execution_end
+    )
+    observed_advances: set[float] = set()
+    for index in range(1, int(time.size)):
+        delta = int(discontinuity_ids[index]) - int(
+            discontinuity_ids[index - 1]
+        )
+        if delta not in {0, 1}:
+            raise ValueError(
+                "result discontinuity identity must advance one region at a time."
+            )
+        if delta == 1:
+            observed_advances.add(float(time[index]))
+    if observed_advances != expected_advances:
+        raise ValueError(
+            "result discontinuity regions conflict with executed intervention boundaries."
+        )
+
+
+def _executed_segment_catalog(
+    provenance: SimulationResultProvenance,
+) -> tuple[tuple[int, str, float, float, bool, bool], ...]:
+    raw_catalog = provenance.solver.get("integration_segments")
+    if not isinstance(raw_catalog, (tuple, list)) or not raw_catalog:
+        raise ValueError(
+            "solver provenance must contain the actual executed segment catalog."
+        )
+    catalog: list[tuple[int, str, float, float, bool, bool]] = []
+    seen_ids: set[int] = set()
+    seen_keys: set[str] = set()
+    for position, raw_entry in enumerate(raw_catalog):
+        if not isinstance(raw_entry, Mapping):
+            raise TypeError("executed segment catalog entries must be mappings.")
+        raw_id = raw_entry.get("segment_id")
+        if type(raw_id) is not int or raw_id < 0:
+            raise ValueError(
+                "executed segment catalog IDs must be nonnegative integers."
+            )
+        segment_id = int(raw_id)
+        if segment_id != position or segment_id in seen_ids:
+            raise ValueError(
+                "executed segment catalog IDs must be unique and contiguous."
+            )
+        segment_key = _required_id(
+            raw_entry.get("segment_key"),
+            "executed segment key",
+        )
+        if segment_key in seen_keys:
+            raise ValueError("executed segment catalog keys must be unique.")
+        try:
+            start = float(raw_entry["t_start"])
+            end = float(raw_entry["t_end"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "executed segment catalog spans must be explicit finite values."
+            ) from exc
+        if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+            raise ValueError(
+                "executed segment catalog spans must be finite and increasing."
+            )
+        identity = raw_entry.get("segment_identity")
+        if not isinstance(identity, Mapping):
+            raise TypeError(
+                "executed segment catalog entries require direct segment identity."
+            )
+        if (
+            identity.get("key") != segment_key
+            or identity.get("kind") != "integration"
+            or identity.get("ordinal") != segment_id
+            or identity.get("t_start") != start
+            or identity.get("t_end") != end
+        ):
+            raise ValueError(
+                "executed segment catalog identity conflicts with its direct span."
+            )
+        temperature_boundary = raw_entry.get("temperature_step_boundary")
+        starts_after_discontinuity = raw_entry.get(
+            "starts_after_discontinuity"
+        )
+        if type(temperature_boundary) is not bool or type(
+            starts_after_discontinuity
+        ) is not bool:
+            raise TypeError(
+                "executed segment catalog boundary facts must be explicit booleans."
+            )
+        seen_ids.add(segment_id)
+        seen_keys.add(segment_key)
+        catalog.append(
+            (
+                segment_id,
+                segment_key,
+                start,
+                end,
+                temperature_boundary,
+                starts_after_discontinuity,
+            )
+        )
+    for previous, current in zip(catalog, catalog[1:]):
+        if current[2] != previous[3]:
+            raise ValueError(
+                "executed segment catalog must describe one contiguous execution."
+            )
+    return tuple(catalog)
+
+
+def _validate_rows_against_executed_segments(
+    *,
+    time: np.ndarray,
+    segment_ids: np.ndarray,
+    segment_keys: tuple[str, ...],
+    catalog: tuple[tuple[int, str, float, float, bool, bool], ...],
+) -> None:
+    by_id = {entry[0]: entry for entry in catalog}
+    for row, (raw_id, key) in enumerate(
+        zip(segment_ids, segment_keys, strict=True)
+    ):
+        segment = by_id.get(int(raw_id))
+        if segment is None or key != segment[1]:
+            raise ValueError(
+                "every result row must name one actual executed segment."
+            )
+        row_time = float(time[row])
+        if row_time < segment[2] or row_time > segment[3]:
+            raise ValueError(
+                "result row time lies outside its executed segment span."
+            )
+
+    if (
+        float(time[0]) != catalog[0][2]
+        or int(segment_ids[0]) != catalog[0][0]
+        or segment_keys[0] != catalog[0][1]
+    ):
+        raise ValueError(
+            "the first public result row must identify execution start."
+        )
+    if float(time[-1]) != catalog[-1][3]:
+        raise ValueError(
+            "the final public result row must identify execution end."
+        )
+
+    for (
+        segment_id,
+        segment_key,
+        start,
+        _end,
+        temperature_boundary,
+        starts_after_discontinuity,
+    ) in catalog:
+        if segment_id == 0 or not (
+            temperature_boundary or starts_after_discontinuity
+        ):
+            continue
+        matching_rows = [
+            row
+            for row in range(int(time.size))
+            if int(segment_ids[row]) == segment_id
+            and segment_keys[row] == segment_key
+            and float(time[row]) == start
+        ]
+        if len(matching_rows) != 1:
+            raise ValueError(
+                "every public execution boundary must publish one row in its new segment."
+            )
+
+
+def _validate_direct_solver_row_identity(
+    *,
+    provenance: SimulationResultProvenance,
+    segment_ids: np.ndarray,
+    segment_keys: tuple[str, ...],
+    discontinuity_ids: np.ndarray,
+) -> None:
+    direct = provenance.solver
+    retired = frozenset(
+        {
+            "boundary_sides",
+            "boundary_phases",
+            "result_boundary_sides",
+            "result_boundary_phases",
+        }
+    ).intersection(direct)
+    if retired:
+        raise ValueError(
+            "solver result contains retired boundary identity: "
+            + ", ".join(sorted(retired))
+        )
+    expected = {
+        "result_segment_ids": tuple(int(value) for value in segment_ids),
+        "result_segment_keys": segment_keys,
+        "result_discontinuity_ids": tuple(
+            int(value) for value in discontinuity_ids
+        ),
+    }
+    for field, value in expected.items():
+        raw = direct.get(field)
+        if raw is None or isinstance(raw, (str, bytes)):
+            raise ValueError(
+                f"solver result is missing direct row identity field {field!r}."
+            )
+        if tuple(raw) != value:  # type: ignore[arg-type]
+            raise ValueError(
+                f"explicit result identity conflicts with solver field {field!r}."
+            )
 
 
 def _freeze_provenance_value(value: Any) -> Any:
@@ -151,6 +618,8 @@ class ExplicitResultKey:
     set_id: str
     mechanism_source: MechanismAuthoringSource
     analysis_identity: str
+    standard_concentration_identity: str
+    scientific_identity: str
     initial_values: tuple[tuple[str, float], ...]
     execution_settings: SimulationExecutionSettings
     scientific_settings: TabScientificSettings
@@ -164,6 +633,19 @@ class ExplicitResultKey:
             self,
             "analysis_identity",
             _required_id(self.analysis_identity, "analysis_identity"),
+        )
+        object.__setattr__(
+            self,
+            "standard_concentration_identity",
+            _required_id(
+                self.standard_concentration_identity,
+                "standard_concentration_identity",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "scientific_identity",
+            _required_id(self.scientific_identity, "scientific_identity"),
         )
         object.__setattr__(
             self,
@@ -181,6 +663,19 @@ class ExplicitResultKey:
         validate_simulation_execution_settings(self.execution_settings)
         validate_tab_scientific_settings(self.scientific_settings)
 
+    @property
+    def cache_identity(self) -> tuple[object, ...]:
+        """Exact numerical-cache identity, deliberately excluding provenance."""
+
+        return (
+            self.tab_id,
+            self.set_id,
+            self.scientific_identity,
+            self.initial_values,
+            self.execution_settings,
+            self.scientific_settings,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PreviewResultIdentity:
@@ -190,6 +685,7 @@ class PreviewResultIdentity:
     set_id: str
     mechanism_source: MechanismAuthoringSource
     analysis_identity: str
+    standard_concentration_identity: str
     parameter_values: tuple[tuple[str, float], ...]
     initial_values: tuple[tuple[str, float], ...]
     execution_settings: SimulationExecutionSettings
@@ -204,6 +700,14 @@ class PreviewResultIdentity:
             self,
             "analysis_identity",
             _required_id(self.analysis_identity, "analysis_identity"),
+        )
+        object.__setattr__(
+            self,
+            "standard_concentration_identity",
+            _required_id(
+                self.standard_concentration_identity,
+                "standard_concentration_identity",
+            ),
         )
         object.__setattr__(
             self,
@@ -235,6 +739,7 @@ class PreviewResultKey:
     set_id: str
     mechanism_source: MechanismAuthoringSource
     analysis_identity: str
+    standard_concentration_identity: str
     parameter_values: tuple[tuple[str, float], ...]
     initial_values: tuple[tuple[str, float], ...]
     execution_settings: SimulationExecutionSettings
@@ -248,6 +753,7 @@ class PreviewResultKey:
             set_id=self.set_id,
             mechanism_source=self.mechanism_source,
             analysis_identity=self.analysis_identity,
+            standard_concentration_identity=self.standard_concentration_identity,
             parameter_values=self.parameter_values,
             initial_values=self.initial_values,
             execution_settings=self.execution_settings,
@@ -257,6 +763,11 @@ class PreviewResultKey:
         object.__setattr__(self, "set_id", identity.set_id)
         object.__setattr__(self, "mechanism_source", identity.mechanism_source)
         object.__setattr__(self, "analysis_identity", identity.analysis_identity)
+        object.__setattr__(
+            self,
+            "standard_concentration_identity",
+            identity.standard_concentration_identity,
+        )
         object.__setattr__(self, "parameter_values", identity.parameter_values)
         object.__setattr__(self, "initial_values", identity.initial_values)
         object.__setattr__(
@@ -292,6 +803,7 @@ class PreviewResultKey:
             set_id=identity.set_id,
             mechanism_source=identity.mechanism_source,
             analysis_identity=identity.analysis_identity,
+            standard_concentration_identity=identity.standard_concentration_identity,
             parameter_values=identity.parameter_values,
             initial_values=identity.initial_values,
             execution_settings=identity.execution_settings,
@@ -306,6 +818,7 @@ class PreviewResultKey:
             set_id=self.set_id,
             mechanism_source=self.mechanism_source,
             analysis_identity=self.analysis_identity,
+            standard_concentration_identity=self.standard_concentration_identity,
             parameter_values=self.parameter_values,
             initial_values=self.initial_values,
             execution_settings=self.execution_settings,
@@ -320,6 +833,7 @@ class SimulationResultProvenance:
     solver: Mapping[str, Any]
     preparation_warnings: tuple[str, ...] = ()
     algebra_errors: tuple[Mapping[str, Any], ...] = ()
+    warnings: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.solver, Mapping):
@@ -332,6 +846,11 @@ class SimulationResultProvenance:
                     "algebra_errors must contain only mapping values."
                 )
             errors.append(_frozen_provenance_mapping(value))
+        warnings_payload: list[Mapping[str, Any]] = []
+        for value in self.warnings:
+            if not isinstance(value, Mapping):
+                raise TypeError("warnings must contain only mapping values.")
+            warnings_payload.append(_frozen_provenance_mapping(value))
         object.__setattr__(
             self,
             "solver",
@@ -339,11 +858,12 @@ class SimulationResultProvenance:
         )
         object.__setattr__(self, "preparation_warnings", warnings)
         object.__setattr__(self, "algebra_errors", tuple(errors))
+        object.__setattr__(self, "warnings", tuple(warnings_payload))
 
 
 @dataclass(frozen=True, slots=True, eq=False)
 class SimulationResultValue:
-    """Immutable numerical output, including full-resolution time and provenance."""
+    """Immutable numerical output with executor-issued execution identity."""
 
     t: np.ndarray
     series: Mapping[str, np.ndarray]
@@ -356,6 +876,16 @@ class SimulationResultValue:
     parameters: tuple[tuple[str, float, str], ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.provenance, SimulationResultProvenance):
+            raise TypeError(
+                "provenance must be a SimulationResultProvenance."
+            )
+        if not isinstance(
+            self.intervention_execution, InterventionExecutionContract
+        ):
+            raise TypeError(
+                "intervention_execution must be an InterventionExecutionContract."
+            )
         time = _frozen_vector(self.t, field="result time")
         if time.size > 1 and np.any(np.diff(time) <= 0.0):
             raise ValueError("result time must be strictly increasing.")
@@ -375,17 +905,26 @@ class SimulationResultValue:
         )
         if len(segment_keys) != time.size:
             raise ValueError("result segment keys must align with result time.")
-        key_by_id: dict[int, str] = {}
-        for segment_id, segment_key in zip(
-            segment_ids,
-            segment_keys,
-            strict=True,
-        ):
-            existing = key_by_id.setdefault(int(segment_id), segment_key)
-            if existing != segment_key:
-                raise ValueError(
-                    "one result segment identity cannot name multiple segments."
-                )
+        _validate_direct_solver_row_identity(
+            provenance=self.provenance,
+            segment_ids=segment_ids,
+            segment_keys=segment_keys,
+            discontinuity_ids=discontinuity_ids,
+        )
+        catalog = _executed_segment_catalog(self.provenance)
+        _validate_rows_against_executed_segments(
+            time=time,
+            segment_ids=segment_ids,
+            segment_keys=segment_keys,
+            catalog=catalog,
+        )
+        _validate_discontinuity_regions(
+            time,
+            discontinuity_ids,
+            execution=self.intervention_execution,
+            execution_start=catalog[0][2],
+            execution_end=catalog[-1][3],
+        )
 
         series: dict[str, np.ndarray] = {}
         for raw_name, raw_values in dict(self.series or {}).items():
@@ -427,36 +966,6 @@ class SimulationResultValue:
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
         object.__setattr__(self, "scalars", MappingProxyType(scalars))
         object.__setattr__(self, "parameters", tuple(parameters))
-        if not isinstance(self.provenance, SimulationResultProvenance):
-            raise TypeError(
-                "provenance must be a SimulationResultProvenance."
-            )
-        if not isinstance(
-            self.intervention_execution, InterventionExecutionContract
-        ):
-            raise TypeError(
-                "intervention_execution must be an InterventionExecutionContract."
-            )
-        if time.size > 1:
-            expected_discontinuities = np.searchsorted(
-                np.asarray(
-                    self.intervention_execution.runtime_discontinuities_for_span(
-                        float(time[0]),
-                        float(time[-1]),
-                    ),
-                    dtype=float,
-                ),
-                time,
-                side="right",
-            )
-            if not np.array_equal(discontinuity_ids, expected_discontinuities):
-                raise ValueError(
-                    "result discontinuity identity conflicts with execution truth."
-                )
-        if self.provenance.solver.get("state_at_boundary") != "post-stage-7":
-            raise ValueError(
-                "result provenance must declare post-stage-7 boundary state."
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,7 +1003,7 @@ class ResultRepository:
         ] = {}
         self._reference_by_set_id: dict[str, ExplicitResultEntry] = {}
         self._explicit_cache: OrderedDict[
-            ExplicitResultKey,
+            tuple[object, ...],
             SimulationResultValue,
         ] = OrderedDict()
 
@@ -583,16 +1092,18 @@ class ResultRepository:
         self._preview_by_set_id.pop(key.set_id, None)
         self._preview_display_key_by_set_id.pop(key.set_id, None)
         self._reference_by_set_id.pop(key.set_id, None)
-        self._explicit_cache[key] = result
-        self._explicit_cache.move_to_end(key)
+        cache_identity = key.cache_identity
+        self._explicit_cache[cache_identity] = result
+        self._explicit_cache.move_to_end(cache_identity)
         self._trim_explicit_cache()
         return entry
 
     def cached_result(self, key: ExplicitResultKey) -> SimulationResultValue | None:
         self._require_explicit_key(key)
-        result = self._explicit_cache.get(key)
+        cache_identity = key.cache_identity
+        result = self._explicit_cache.get(cache_identity)
         if result is not None:
-            self._explicit_cache.move_to_end(key)
+            self._explicit_cache.move_to_end(cache_identity)
         return result
 
     def hydrate_cached(self, key: ExplicitResultKey) -> ExplicitResultEntry | None:
@@ -632,27 +1143,14 @@ class ResultRepository:
     def deauthorize_sets(
         self,
         set_ids: Iterable[str],
-        *,
-        explicit_key_is_current: Callable[[ExplicitResultKey], bool],
     ) -> None:
-        """Clear display truth and purge only owner-declared stale cache keys."""
+        """Clear display authorization while retaining exact reusable values."""
 
-        if not callable(explicit_key_is_current):
-            raise TypeError("explicit_key_is_current must be callable.")
         targets = {
             _required_id(set_id, "set_id")
             for set_id in set_ids
         }
         self.clear_semantic_sets(targets)
-        for key in tuple(self._explicit_cache):
-            if key.set_id not in targets:
-                continue
-            try:
-                current = bool(explicit_key_is_current(key))
-            except Exception:
-                current = False
-            if not current:
-                self._explicit_cache.pop(key, None)
 
     def clear_all_semantic_entries(self) -> None:
         self._explicit_by_set_id.clear()
@@ -665,9 +1163,9 @@ class ResultRepository:
 
         sid = _required_id(set_id, "set_id")
         self.clear_semantic_set(sid)
-        for key in tuple(self._explicit_cache):
-            if key.set_id == sid:
-                self._explicit_cache.pop(key, None)
+        for cache_identity in tuple(self._explicit_cache):
+            if cache_identity[1] == sid:
+                self._explicit_cache.pop(cache_identity, None)
 
     def purge_sets(self, set_ids: Iterable[str]) -> None:
         for set_id in tuple(set_ids):

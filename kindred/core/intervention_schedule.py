@@ -1131,10 +1131,6 @@ def _operation_from_fields(
             }
         )
         _reject_keys(data, allowed, context="trigger")
-        if parsed and "direction" not in data:
-            raise InterventionScheduleError(
-                "Trigger direction must be explicit."
-            )
         raw_then = data.get("then")
         if parsed:
             then = _parse_trigger_envelope(str(raw_then or ""))

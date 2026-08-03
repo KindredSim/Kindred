@@ -190,8 +190,8 @@ def fit_global(
                 for item in payloads
             },
             uncertainties=None,
-            global_residual_mse=np.inf,
-            global_r_squared=0.0,
+            weighted_residual_sse=np.inf,
+            weighted_residual_mse=np.inf,
             dataset_info=[],
             nfev=int(getattr(objective, "_iteration", 0)),
             message=str(message),
@@ -349,7 +349,7 @@ def fit_global(
             ),
         )
     except Exception as exc:
-        if isinstance(exc, SimulationCancelled) or "cancelled" in str(exc).lower():
+        if isinstance(exc, (FittingCancelled, SimulationCancelled)):
             raise FittingCancelled() from exc
         if optimizer_completed:
             raise

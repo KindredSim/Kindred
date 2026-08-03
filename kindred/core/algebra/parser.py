@@ -13,19 +13,19 @@ Scope of this module
   { let IDENT = expr NEWLINE }. External mechanism DSL algebra declarations
   are normalized into this format before reaching this parser.
 - Build a typed AST with nodes:
-    Number, Ident, Unary, Binary, Call, SpeciesRef(kind="now"|"init"|"T0")
+    Number, Ident, Unary, Binary, Call, SpeciesRef(kind="now"|"init")
 - Enforce precedence and right-associative power (** and ^).
 - Validate function-argument arity superficially (min 1 for varargs, exact for unary),
   leave deeper numeric/type checks to the evaluator.
 - Conservative static folding:
     * Fold any subtree containing only numeric literals, protected constants,
-      and pure math/helpers, with no SpeciesRef or T0 reference and no user identifiers.
+      and pure math/helpers, with no SpeciesRef and no user identifiers.
     * Record statically-folded results per let binding when entire RHS is static.
 
 Out of scope here
 -----------------
 - Dynamic evaluation (done in evaluator.py).
-- Baseline interpolation or time memoization.
+- Time memoization.
 - Shadowing detection with species names (handled by evaluator with symbol table).
 
 Determinism & constraints
@@ -41,7 +41,8 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from collections.abc import Iterable, Mapping
+from typing import Dict, List, Literal, Optional, Tuple
 
 from .errors import (
     AlgebraSyntaxError,
@@ -126,10 +127,6 @@ class ExprNode:
     def has_species_ref(self) -> bool:
         return False
 
-    def has_time_ref(self) -> bool:
-        return False
-
-
 @dataclass(frozen=True)
 class NumberNode(ExprNode):
     value: float
@@ -157,10 +154,6 @@ class UnaryNode(ExprNode):
     def has_species_ref(self) -> bool:
         return self.rhs.has_species_ref()
 
-    def has_time_ref(self) -> bool:
-        return self.rhs.has_time_ref()
-
-
 @dataclass(frozen=True)
 class BinaryNode(ExprNode):
     op: str
@@ -172,10 +165,6 @@ class BinaryNode(ExprNode):
 
     def has_species_ref(self) -> bool:
         return self.lhs.has_species_ref() or self.rhs.has_species_ref()
-
-    def has_time_ref(self) -> bool:
-        return self.lhs.has_time_ref() or self.rhs.has_time_ref()
-
 
 @dataclass(frozen=True)
 class CallNode(ExprNode):
@@ -191,14 +180,14 @@ class CallNode(ExprNode):
     def has_species_ref(self) -> bool:
         return any(a.has_species_ref() for a in self.args)
 
-    def has_time_ref(self) -> bool:
-        return any(a.has_time_ref() for a in self.args)
-
-
 @dataclass(frozen=True)
 class SpeciesRefNode(ExprNode):
     name: str
-    kind: str  # "now" | "init" | "T0"
+    kind: Literal["now", "init"]
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"now", "init"}:
+            raise ValueError("Species reference kind must be 'now' or 'init'.")
 
     def is_static(self) -> bool:
         # Species refs are time-varying except _0 which is static w.r.t time,
@@ -207,10 +196,6 @@ class SpeciesRefNode(ExprNode):
 
     def has_species_ref(self) -> bool:
         return True
-
-    def has_time_ref(self) -> bool:
-        return self.kind == "T0"
-
 
 @dataclass(frozen=True)
 class LetStatement:
@@ -221,11 +206,127 @@ class LetStatement:
     line_text: str
 
 
+def _iter_identifiers(node: ExprNode):
+    if isinstance(node, IdentNode):
+        yield str(node.name)
+        return
+    if isinstance(node, SpeciesRefNode):
+        return
+    if isinstance(node, UnaryNode):
+        yield from _iter_identifiers(node.rhs)
+        return
+    if isinstance(node, BinaryNode):
+        yield from _iter_identifiers(node.lhs)
+        yield from _iter_identifiers(node.rhs)
+        return
+    if isinstance(node, CallNode):
+        for argument in node.args:
+            yield from _iter_identifiers(argument)
+
+
+def _topological_evaluation_order(
+    statements: Tuple[LetStatement, ...],
+) -> Tuple[str, ...]:
+    """Retain a stable dependency order without changing source order."""
+    names = tuple(str(statement.name) for statement in statements)
+    if len(set(names)) != len(names):
+        duplicate = next(name for name in names if names.count(name) > 1)
+        statement = next(item for item in statements if item.name == duplicate)
+        raise AlgebraSyntaxError(
+            f"duplicate Algebra assignment {duplicate!r}",
+            line=statement.line,
+            col=statement.col,
+            line_text=statement.line_text,
+        )
+    positions = {name: index for index, name in enumerate(names)}
+    dependencies = {
+        str(statement.name): {
+            identifier
+            for identifier in _iter_identifiers(statement.expr)
+            if identifier in positions
+        }
+        for statement in statements
+    }
+    ordered: List[str] = []
+    visiting: List[str] = []
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            start = visiting.index(name)
+            cycle = visiting[start:] + [name]
+            statement = statements[positions[name]]
+            raise AlgebraSyntaxError(
+                "Algebra dependency cycle: " + " -> ".join(cycle),
+                line=statement.line,
+                col=statement.col,
+                line_text=statement.line_text,
+            )
+        visiting.append(name)
+        for dependency in sorted(
+            dependencies.get(name, ()),
+            key=positions.__getitem__,
+        ):
+            visit(dependency)
+        visiting.pop()
+        visited.add(name)
+        ordered.append(name)
+
+    for name in names:
+        visit(name)
+    return tuple(ordered)
+
+
 @dataclass(frozen=True)
 class AlgebraBlock:
-    lines: List[LetStatement]
-    ast: List[ExprNode]
-    static_values: Dict[str, float]
+    """One immutable parsed Algebra program."""
+
+    lines: Tuple[LetStatement, ...]
+    ast: Tuple[ExprNode, ...]
+    static_values: Tuple[Tuple[str, float], ...]
+    evaluation_order: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        lines = tuple(self.lines)
+        ast = tuple(self.ast)
+        raw_static: Mapping[str, float] | Iterable[Tuple[str, float]] = self.static_values
+        static_values = tuple(
+            (str(name), float(value))
+            for name, value in (
+                raw_static.items() if isinstance(raw_static, Mapping) else raw_static
+            )
+        )
+        if len(lines) != len(ast):
+            raise ValueError("AlgebraBlock lines and AST must have identical length.")
+        if tuple(stmt.expr for stmt in lines) != ast:
+            raise ValueError("AlgebraBlock AST must match its retained statements.")
+        if len({name for name, _value in static_values}) != len(static_values):
+            raise ValueError("AlgebraBlock static-value names must be unique.")
+        names = tuple(str(statement.name) for statement in lines)
+        if len(set(names)) != len(names):
+            duplicate = next(name for name in names if names.count(name) > 1)
+            raise ValueError(f"AlgebraBlock assignment names must be unique: {duplicate!r}.")
+        evaluation_order = tuple(str(name) for name in self.evaluation_order)
+        if not evaluation_order and names:
+            evaluation_order = _topological_evaluation_order(lines)
+        if len(evaluation_order) != len(names) or set(evaluation_order) != set(names):
+            raise ValueError(
+                "AlgebraBlock evaluation order must contain every assignment name exactly once."
+            )
+        object.__setattr__(self, "lines", lines)
+        object.__setattr__(self, "ast", ast)
+        object.__setattr__(self, "static_values", static_values)
+        object.__setattr__(self, "evaluation_order", evaluation_order)
+
+    def static_value_map(self) -> Dict[str, float]:
+        return dict(self.static_values)
+
+    def statements_in_evaluation_order(self) -> Tuple[LetStatement, ...]:
+        """Return retained statements in dependency order."""
+        by_name = {str(statement.name): statement for statement in self.lines}
+        return tuple(by_name[name] for name in self.evaluation_order)
 
     # placeholder for symbol table pointer is out-of-scope here; evaluator owns it.
 
@@ -302,7 +403,12 @@ class Parser:
 
             self._consume_newlines()
 
-        return AlgebraBlock(lines=lines, ast=exprs, static_values=static_values)
+        return AlgebraBlock(
+            lines=lines,
+            ast=exprs,
+            static_values=static_values,
+            evaluation_order=_topological_evaluation_order(tuple(lines)),
+        )
 
     def _parse_header(self) -> None:
         # Accept optional leading newlines
@@ -392,24 +498,25 @@ class Parser:
         return node
 
     def _parse_factor(self) -> ExprNode:
-        node = self._parse_power()
+        node = self._parse_unary()
         while True:
             if self._match(TokenKind.STAR):
-                node = BinaryNode("*", node, self._parse_power())
+                node = BinaryNode("*", node, self._parse_unary())
             elif self._match(TokenKind.SLASH):
-                node = BinaryNode("/", node, self._parse_power())
+                node = BinaryNode("/", node, self._parse_unary())
             else:
                 break
         return node
 
     def _parse_power(self) -> ExprNode:
-        # Right-associative: parse a unary, then if ** or ^, recursively parse power on RHS
-        node = self._parse_unary()
+        # Power binds tighter than a prefix unary operator.  Its RHS is a
+        # unary expression so that, for example, 2^-2 means 2^(-2).
+        node = self._parse_primary()
         if self._match(TokenKind.POW2):
-            rhs = self._parse_power()
+            rhs = self._parse_unary()
             return BinaryNode("**", node, rhs)
         if self._match(TokenKind.CARET):
-            rhs = self._parse_power()
+            rhs = self._parse_unary()
             return BinaryNode("^", node, rhs)
         return node
 
@@ -420,7 +527,7 @@ class Parser:
             return UnaryNode("-", self._parse_unary())
         if self._match(TokenKind.BANG):
             return UnaryNode("!", self._parse_unary())
-        return self._parse_primary()
+        return self._parse_power()
 
     def _parse_primary(self) -> ExprNode:
         t = self._cur()
@@ -432,23 +539,26 @@ class Parser:
             except Exception:
                 logger.debug(f"Failed to parse numeric literal: {t.text}", exc_info=True)
                 raise AlgebraSyntaxError("invalid numeric literal", line=t.line, col=t.col, line_text=t.line_text)
+            if not math.isfinite(val):
+                raise AlgebraSyntaxError(
+                    "numeric literal must be finite",
+                    line=t.line,
+                    col=t.col,
+                    line_text=t.line_text,
+                )
             return NumberNode(val)
 
-        # Species refs: "[" IDENT "]" [ "_0" | "(" "T0" ")" ]
+        # Species refs: "[" IDENT "]" [ "_0" ]
         if self._match(TokenKind.LBRACK):
             ident_tok = self._expect(TokenKind.IDENT, "expected species name inside [ ]")
             self._expect(TokenKind.RBRACK, "expected closing ']'")
-            # Either _0 or (T0) or nothing
+            # Either _0 or nothing
             if self._match(TokenKind.IDENT):
                 # Only legal tail is "_0" but tokenized as IDENT; validate text
                 tail = self.toks[self.i - 1]
                 if tail.text != "_0":
                     raise AlgebraSyntaxError("expected '_0' after species reference", line=tail.line, col=tail.col, line_text=tail.line_text)
                 return SpeciesRefNode(ident_tok.text, "init")
-            if self._match(TokenKind.LPAREN):
-                self._expect(TokenKind.T0, "expected T0 after '(' in species time reference")
-                self._expect(TokenKind.RPAREN, "expected ')' after T0")
-                return SpeciesRefNode(ident_tok.text, "T0")
             return SpeciesRefNode(ident_tok.text, "now")
 
         # Ident: could be function call or bare identifier
@@ -489,7 +599,6 @@ def _try_static_eval(node: ExprNode) -> Optional[float]:
 
     Only folds when:
     - No SpeciesRef present.
-    - No T0 reference.
     - No IdentNode (user-defined symbols).
     - All calls are to known builtins/helpers and all arguments are foldable.
 

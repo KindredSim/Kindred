@@ -19,11 +19,9 @@ from typing import Dict, Optional, Set
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
     authority_fields_from_step_entry,
-    effective_equilibrium_forward_rate,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     effective_reverse_rate_from_keq,
-    generated_equilibrium_authority_kind,
     normalize_existing_equilibrium_rate_authority,
     require_step_entry_authored_role_is_editable,
     step_entry_authored_role_is_editable,
@@ -114,15 +112,8 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
                 continue
             eq = eqs[idx]
             if role in {"kf", "kr"}:
-                meta = getattr(eq, "metadata", {}) or {}
-                generated_kind = generated_equilibrium_authority_kind(meta)
-                if generated_kind and role == "kf":
-                    v = effective_equilibrium_forward_rate(eq, temperature_K=float(temperature_K))
-                elif generated_kind and role == "kr":
-                    v = effective_equilibrium_reverse_rate(eq, temperature_K=float(temperature_K))
-                else:
-                    raw_value = getattr(eq, "kf", None) if role == "kf" else getattr(eq, "kr", None)
-                    v = _as_float(raw_value)
+                raw_value = getattr(eq, "kf", None) if role == "kf" else getattr(eq, "kr", None)
+                v = _as_float(raw_value)
                 if role == "kr":
                     authority = normalize_existing_equilibrium_rate_authority(eq)
                     if authority.kind == EquilibriumRateAuthorityKind.KEQ:
@@ -180,6 +171,11 @@ def _set_mechanism_param(
     *,
     require_mutable: bool,
 ) -> None:
+    numeric_value = float(value)
+    if not math.isfinite(numeric_value) or numeric_value <= 0.0:
+        raise DSLError(
+            f"Mechanism parameter {name!r} must be a positive finite real."
+        )
     target = lookup_step_param_target(mechanism, name)
     if target is None:
         raise DSLError(f"Unsupported parameter name {name!r} for parameter algebra")
@@ -192,10 +188,14 @@ def _set_mechanism_param(
         current = getattr(rxn, "rate", None)
         if require_mutable:
             if hasattr(current, "set"):
-                current.set(float(value))  # type: ignore[call-arg]
+                current.set(numeric_value)  # type: ignore[call-arg]
                 return
-            raise DSLError(f"Parameter {name!r} is not mutable in this run (missing binding)")
-        rxns[idx] = replace(rxn, rate=float(value))
+            rxns[idx] = replace(
+                rxn,
+                rate=RateBinding(name=str(name), value=numeric_value),
+            )
+            return
+        rxns[idx] = replace(rxn, rate=numeric_value)
         return
 
     if kind == "equilibrium":
@@ -208,27 +208,32 @@ def _set_mechanism_param(
             current = getattr(eq, "kf", None) if role == "kf" else getattr(eq, "kr", None)
             if require_mutable:
                 if hasattr(current, "set"):
-                    current.set(float(value))  # type: ignore[call-arg]
+                    current.set(numeric_value)  # type: ignore[call-arg]
                     return
-                raise DSLError(f"Parameter {name!r} is not mutable in this run (missing binding)")
+                binding = RateBinding(name=str(name), value=numeric_value)
+                if role == "kf":
+                    eqs[idx] = replace(eq, kf=binding)
+                else:
+                    eqs[idx] = replace(eq, kr=binding)
+                return
             if role == "kf":
-                eqs[idx] = replace(eq, kf=float(value))
+                eqs[idx] = replace(eq, kf=numeric_value)
             else:
-                eqs[idx] = replace(eq, kr=float(value))
+                eqs[idx] = replace(eq, kr=numeric_value)
             return
         if role == "Keq":
             meta = dict(getattr(eq, "metadata", {}) or {})
             current = meta.get("Keq_input")
             if require_mutable:
                 if hasattr(current, "set"):
-                    current.set(float(value))  # type: ignore[call-arg]
+                    current.set(numeric_value)  # type: ignore[call-arg]
                     return
                 # Allow creating a binding for Keq_input if not already mutable.
-                b = RateBinding(name=str(name), value=float(value))
+                b = RateBinding(name=str(name), value=numeric_value)
                 meta["Keq_input"] = b
                 eqs[idx] = replace(eq, metadata=meta)
                 return
-            meta["Keq_input"] = float(value)
+            meta["Keq_input"] = numeric_value
             eqs[idx] = replace(eq, metadata=meta)
             return
 
@@ -298,6 +303,7 @@ def _apply_equilibrium_Keq_constraints_to_values(
                 f"Equilibrium Keq-constraint step_index={entry.get('step_index')!r} is missing equilibrium_authority."
             )
         derive_rate = str(authority.get("derived_role") or "")
+        reverse_std_ratio = authority.get("reverse_std_ratio", 1.0)
         if derive_rate not in {"kf", "kr"}:
             derive_rate = "kr"
         kf_key = f"kf{n}"
@@ -308,11 +314,13 @@ def _apply_equilibrium_Keq_constraints_to_values(
         if keq_key not in base_values:
             raise ValueError(f"Active equilibrium constraint {keq_key!r} has no source value.")
         keq = float(base_values[keq_key])
-        if not math.isfinite(keq) or abs(keq) < 1e-30:
+        if not math.isfinite(keq) or keq <= 0.0:
             raise ValueError(f"Active equilibrium constraint {keq_key!r} has invalid value {keq!r}.")
         if derive_rate == "kf":
             if kr_key in base_values:
-                base_values[kf_key] = float(base_values[kr_key]) * keq
+                base_values[kf_key] = (
+                    float(base_values[kr_key]) * keq * float(reverse_std_ratio)
+                )
             else:
                 raise ValueError(f"Active equilibrium constraint {keq_key!r} cannot derive missing {kf_key!r}.")
         else:
@@ -321,6 +329,7 @@ def _apply_equilibrium_Keq_constraints_to_values(
                     effective_reverse_rate_from_keq(
                         base_values[kf_key],
                         keq,
+                        reverse_std_ratio,
                     )
                 )
             else:
@@ -417,10 +426,7 @@ def apply_parameter_algebra_spec_to_mechanism(
         override_warnings=_parameter_override_warnings_for_spec(spec, mechanism=mechanism),
     )
     meta = getattr(mechanism, "metadata", None)
-    if isinstance(meta, dict):
-        meta[_PARAMETER_ALGEBRA_SPEC_META_KEY] = spec
     _validate_parameter_algebra_editable_targets(mechanism, spec)
-    _ensure_scalar_param_storage(mechanism, require_mutable=require_mutable)
     active_keq_names = _active_equilibrium_keq_names(mechanism, spec)
     base_values: Dict[str, float] = {}
     base_values.update(read_mechanism_parameter_values(mechanism, names=spec.mechanism_param_names))
@@ -433,8 +439,30 @@ def apply_parameter_algebra_spec_to_mechanism(
 
     derived: Dict[str, float] = {}
     if spec.param_statements:
-        # Evaluate derived definitions, seeding scalar defaults in base_values if needed.
+        # Evaluate retained static parameter definitions and seed mechanism
+        # bindings before execution.
         derived = evaluate_parameter_algebra(spec, base_values=base_values)
+
+    proposed_values = dict(base_values)
+    proposed_values.update(derived)
+    for name, value in derived.items():
+        if _MECH_PARAM_RE.match(name) and (
+            not math.isfinite(float(value)) or float(value) <= 0.0
+        ):
+            raise DSLError(
+                f"Mechanism parameter {name!r} must be a positive finite real."
+            )
+    # Validate every thermodynamic consequence against the complete proposed
+    # map before committing any scalar or mechanism binding.
+    _apply_equilibrium_Keq_constraints_to_values(
+        mechanism,
+        proposed_values,
+        active_keq_names=active_keq_names,
+    )
+
+    if isinstance(meta, dict):
+        meta[_PARAMETER_ALGEBRA_SPEC_META_KEY] = spec
+    _ensure_scalar_param_storage(mechanism, require_mutable=require_mutable)
 
     meta = getattr(mechanism, "metadata", {}) or {}
     if require_mutable:
@@ -461,13 +489,12 @@ def apply_parameter_algebra_spec_to_mechanism(
         is_mech = _MECH_PARAM_RE.match(stmt.name) is not None
         # Determine derived-ness for UI metadata: mechanism targets are always constrained.
         try:
-            tmp_spec = ParameterAlgebraSpec(
-                param_statements=[stmt],
-                observable_names=set(spec.observable_names),
-                mechanism_namespace=spec.mechanism_namespace,
-                scalar_input_names=set(spec.scalar_input_names),
+            tmp_spec = replace(spec, param_statements=[stmt])
+            tmp_vals = _evaluate_param_block_in_context(
+                tmp_spec,
+                base_values=dict(base_values),
+                enforce_defaults=False,
             )
-            tmp_vals = _evaluate_param_block_in_context(tmp_spec, base_values=dict(base_values), enforce_defaults=False)
             default_val = float(tmp_vals.get(stmt.name, float("nan")))
         except Exception:
             default_val = float("nan")
@@ -486,7 +513,7 @@ def apply_parameter_algebra_spec_to_mechanism(
                     b = RateBinding(name=str(stmt.name), value=float(cur_val))
                     scalar_bindings[stmt.name] = b
                 # Do not overwrite base scalar params here; only derived scalar
-                # params are present in `derived`.
+                # params are present in ``derived``.
                 if stmt.name in derived:
                     b.set(float(derived[stmt.name]))
                 scalar_info[stmt.name] = {
@@ -544,32 +571,6 @@ def apply_parameter_algebra_spec_to_mechanism(
     return derived
 
 
-def apply_parameter_algebra_to_mechanism(
-    dsl_text: str,
-    *,
-    mechanism: object,
-    require_mutable: bool,
-) -> Dict[str, float]:
-    """
-    Apply `param` algebra from the DSL text to the given mechanism in-place.
-
-    - In non-prepared mode (`require_mutable=False`), the mechanism is updated by
-      replacing Reaction/Equilibrium objects with new numeric values.
-    - In prepared/bound mode (`require_mutable=True`), updates must target mutable
-      bindings (RateBinding-like objects with `.set()`).
-    """
-    mechanism_namespace = mechanism_parameter_namespace(mechanism)
-    spec = parse_parameter_algebra_spec_from_dsl_text(
-        dsl_text,
-        mechanism_namespace=mechanism_namespace,
-    )
-    return apply_parameter_algebra_spec_to_mechanism(
-        spec,
-        mechanism=mechanism,
-        require_mutable=require_mutable,
-    )
-
-
 def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
     """
     Unit map for solver parameters backed by authoritative step metadata.
@@ -597,10 +598,7 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
                 raise ValueError(
                     f"Authoritative step metadata for {name!r} has reaction_index {idx} out of range."
                 )
-            try:
-                order = int(getattr(rxns[idx], "order", 1))
-            except Exception:
-                order = 1
+            order = float(getattr(rxns[idx], "order"))
             units[name] = rate_constant_unit(order)
         elif kind == "equilibrium":
             try:
@@ -615,16 +613,18 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
                 )
             eq = eqs[idx]
             if role == "Keq":
-                units[name] = "1"
+                authority = authority_fields_from_step_entry(entry)
+                if bool(authority.get("has_thermo_param")):
+                    units[name] = "1"
                 continue
-            try:
-                fwd_order = int(round(sum(getattr(eq, "stoich_forward", {}).values())))
-            except Exception:
-                fwd_order = 1
-            try:
-                back_order = int(round(sum(getattr(eq, "stoich_back", {}).values())))
-            except Exception:
-                back_order = 1
+            fwd_order = math.fsum(
+                float(value)
+                for value in getattr(eq, "stoich_forward").values()
+            )
+            back_order = math.fsum(
+                float(value)
+                for value in getattr(eq, "stoich_back").values()
+            )
             if role == "kf":
                 units[name] = rate_constant_unit(fwd_order)
             elif role == "kr":

@@ -126,7 +126,9 @@ def _required_id(value: object, field: str) -> str:
 
 
 def _owned_vector(value: object, *, field: str) -> np.ndarray:
-    candidate = np.asarray(value, dtype=float).reshape(-1)
+    candidate = np.asarray(value, dtype=float)
+    if candidate.ndim != 1:
+        raise ValueError(f"{field} must be one-dimensional.")
     array = (
         value
         if (
@@ -149,7 +151,10 @@ def _owned_identity_vector(
     field: str,
     size: int,
 ) -> np.ndarray:
-    candidate = np.asarray(value, dtype=np.int64).reshape(-1)
+    raw = np.asarray(value)
+    if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
+        raise ValueError(f"{field} must be a one-dimensional integer array.")
+    candidate = raw.astype(np.int64, copy=False)
     array = (
         value
         if (
@@ -164,6 +169,33 @@ def _owned_identity_vector(
         raise ValueError(f"{field} must align with layer time.")
     if np.any(array < 0) or np.any(np.diff(array) < 0):
         raise ValueError(f"{field} must be ordered and nonnegative.")
+    array.setflags(write=False)
+    return array
+
+
+def _owned_source_rows(
+    value: object,
+    *,
+    size: int,
+) -> np.ndarray:
+    raw = np.asarray(value)
+    if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
+        raise ValueError("source_row must be a one-dimensional integer array.")
+    candidate = raw.astype(np.int64, copy=False)
+    array = (
+        value
+        if (
+            isinstance(value, np.ndarray)
+            and value.dtype == np.dtype(np.int64)
+            and value.ndim == 1
+            and not value.flags.writeable
+        )
+        else candidate.copy()
+    )
+    if array.size != int(size):
+        raise ValueError("source_row must align with layer time.")
+    if np.any(array <= 0) or np.unique(array).size != array.size:
+        raise ValueError("source_row must contain unique positive row numbers.")
     array.setflags(write=False)
     return array
 
@@ -210,9 +242,10 @@ class WorkspacePlotLayer:
     kind: ResultLayerKind
     t: np.ndarray
     series: tuple[tuple[str, np.ndarray], ...]
-    segment_ids: np.ndarray
-    segment_keys: tuple[str, ...]
-    discontinuity_ids: np.ndarray
+    segment_ids: np.ndarray | None
+    segment_keys: tuple[str, ...] | None
+    discontinuity_ids: np.ndarray | None
+    source_row: np.ndarray | None
     series_provenance: tuple[tuple[str, Mapping[str, object]], ...] = ()
     color_by_series: tuple[tuple[str, str], ...] = ()
     visible: bool = True
@@ -238,17 +271,47 @@ class WorkspacePlotLayer:
             series.append((name, values))
         if not series:
             raise ValueError("plot layer requires at least one series.")
-        segment_ids = _owned_identity_vector(
-            self.segment_ids,
-            field="plot segment identity",
-            size=time.size,
-        )
-        segment_keys = _segment_keys(self.segment_keys, size=time.size)
-        discontinuity_ids = _owned_identity_vector(
-            self.discontinuity_ids,
-            field="plot discontinuity identity",
-            size=time.size,
-        )
+        if self.kind is ResultLayerKind.EXPERIMENTAL:
+            if any(
+                value is not None
+                for value in (
+                    self.segment_ids,
+                    self.segment_keys,
+                    self.discontinuity_ids,
+                )
+            ):
+                raise ValueError(
+                    "experimental plot layers prohibit solver identity."
+                )
+            source_row = _owned_source_rows(self.source_row, size=time.size)
+            segment_ids = None
+            segment_keys = None
+            discontinuity_ids = None
+        else:
+            if self.source_row is not None:
+                raise ValueError(
+                    "simulation plot layers prohibit observation source_row."
+                )
+            if (
+                self.segment_ids is None
+                or self.segment_keys is None
+                or self.discontinuity_ids is None
+            ):
+                raise ValueError(
+                    "simulation plot layers require complete executor identity."
+                )
+            segment_ids = _owned_identity_vector(
+                self.segment_ids,
+                field="plot segment identity",
+                size=time.size,
+            )
+            segment_keys = _segment_keys(self.segment_keys, size=time.size)
+            discontinuity_ids = _owned_identity_vector(
+                self.discontinuity_ids,
+                field="plot discontinuity identity",
+                size=time.size,
+            )
+            source_row = None
         opacity = float(self.opacity)
         point_size = float(self.point_size)
         if not np.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
@@ -298,6 +361,7 @@ class WorkspacePlotLayer:
         object.__setattr__(self, "segment_ids", segment_ids)
         object.__setattr__(self, "segment_keys", segment_keys)
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
+        object.__setattr__(self, "source_row", source_row)
         object.__setattr__(self, "series_provenance", tuple(provenance))
         object.__setattr__(self, "color_by_series", colors)
         object.__setattr__(self, "visible", bool(self.visible))
@@ -311,16 +375,20 @@ class WorkspacePlotLayer:
 class ResultDataBlock:
     block_id: str
     label: str
+    kind: ResultLayerKind
     t: np.ndarray
     series: tuple[tuple[str, np.ndarray], ...]
-    segment_ids: np.ndarray
-    segment_keys: tuple[str, ...]
-    discontinuity_ids: np.ndarray
+    segment_ids: np.ndarray | None
+    segment_keys: tuple[str, ...] | None
+    discontinuity_ids: np.ndarray | None
+    source_row: np.ndarray | None
     x_name: str = "t"
     series_provenance: tuple[tuple[str, Mapping[str, object]], ...] = ()
     x_provenance: Mapping[str, object] = MappingProxyType({})
 
     def __post_init__(self) -> None:
+        if not isinstance(self.kind, ResultLayerKind):
+            raise TypeError("kind must be a ResultLayerKind.")
         time = _owned_vector(self.t, field="data time")
         normalized: list[tuple[str, np.ndarray]] = []
         names: set[str] = set()
@@ -337,17 +405,45 @@ class ResultDataBlock:
             normalized.append((name, values))
         if not normalized:
             raise ValueError("data block requires at least one series.")
-        segment_ids = _owned_identity_vector(
-            self.segment_ids,
-            field="data segment identity",
-            size=time.size,
-        )
-        segment_keys = _segment_keys(self.segment_keys, size=time.size)
-        discontinuity_ids = _owned_identity_vector(
-            self.discontinuity_ids,
-            field="data discontinuity identity",
-            size=time.size,
-        )
+        if self.kind is ResultLayerKind.EXPERIMENTAL:
+            if any(
+                value is not None
+                for value in (
+                    self.segment_ids,
+                    self.segment_keys,
+                    self.discontinuity_ids,
+                )
+            ):
+                raise ValueError("experimental data blocks prohibit solver identity.")
+            source_row = _owned_source_rows(self.source_row, size=time.size)
+            segment_ids = None
+            segment_keys = None
+            discontinuity_ids = None
+        else:
+            if self.source_row is not None:
+                raise ValueError(
+                    "simulation data blocks prohibit observation source_row."
+                )
+            if (
+                self.segment_ids is None
+                or self.segment_keys is None
+                or self.discontinuity_ids is None
+            ):
+                raise ValueError(
+                    "simulation data blocks require complete executor identity."
+                )
+            segment_ids = _owned_identity_vector(
+                self.segment_ids,
+                field="data segment identity",
+                size=time.size,
+            )
+            segment_keys = _segment_keys(self.segment_keys, size=time.size)
+            discontinuity_ids = _owned_identity_vector(
+                self.discontinuity_ids,
+                field="data discontinuity identity",
+                size=time.size,
+            )
+            source_row = None
         provenance: list[tuple[str, Mapping[str, object]]] = []
         provenance_names: set[str] = set()
         for raw_name, raw_payload in self.series_provenance:
@@ -388,6 +484,7 @@ class ResultDataBlock:
         object.__setattr__(self, "segment_ids", segment_ids)
         object.__setattr__(self, "segment_keys", segment_keys)
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
+        object.__setattr__(self, "source_row", source_row)
         object.__setattr__(self, "series_provenance", tuple(provenance))
         object.__setattr__(
             self,
@@ -496,6 +593,12 @@ class WorkspaceResultProjection:
             raise TypeError(
                 "copy_all_blocks must contain only ResultDataBlock values."
             )
+        layer_kind_by_id = {layer.layer_id: layer.kind for layer in layers}
+        for block in copy_blocks:
+            if layer_kind_by_id.get(block.block_id) is not block.kind:
+                raise ValueError(
+                    "copy blocks must match one projected layer and its kind."
+                )
         selected_y = tuple(
             _required_id(name, "selected_y_series")
             for name in self.selected_y_series
@@ -590,6 +693,7 @@ def _result_layer(
         segment_ids=result.segment_ids,
         segment_keys=result.segment_keys,
         discontinuity_ids=result.discontinuity_ids,
+        source_row=None,
         color_by_series=tuple(
             (name, str(species_colors[name]))
             for name in result.series
@@ -623,11 +727,13 @@ def _data_block(
     return ResultDataBlock(
         block_id=layer.layer_id,
         label=layer.label,
+        kind=layer.kind,
         t=x_values,
         series=selected,
         segment_ids=layer.segment_ids,
         segment_keys=layer.segment_keys,
         discontinuity_ids=layer.discontinuity_ids,
+        source_row=layer.source_row,
         x_name=x_name,
         series_provenance=tuple(
             (name, payload)
@@ -651,16 +757,35 @@ def _export_column_header(
     provenance: Mapping[str, object],
 ) -> str:
     header = f"{block.label}::{name}"
-    dataset_id = str(provenance.get("dataset_id") or "").strip()
-    raw_observation_id = str(
-        provenance.get("raw_observation_id") or ""
-    ).strip()
-    if dataset_id and raw_observation_id:
-        return (
-            f"{header} [dataset_id={dataset_id};"
-            f"raw_observation_id={raw_observation_id}]"
+    identity = {
+        key: str(provenance[key])
+        for key in (
+            "dataset_id",
+            "raw_observation_id",
+            "dataset_name",
+            "raw_column",
+            "model_species",
         )
+        if provenance.get(key) not in {None, ""}
+    }
+    if identity:
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        return f"{header} [provenance={encoded}]"
     return header
+
+
+def _observation_provenance(
+    source: ExperimentalLayerInput,
+) -> Mapping[str, object]:
+    payload: dict[str, object] = {
+        "dataset_id": source.dataset_id,
+        "raw_observation_id": source.raw_observation_id,
+        "dataset_name": source.dataset_name,
+        "raw_column": source.raw_column,
+    }
+    if source.model_species is not None:
+        payload["model_species"] = source.model_species
+    return MappingProxyType(payload)
 
 
 def _same_source_row_values(
@@ -882,9 +1007,7 @@ class WorkspaceResultPresenter:
             experimental_x = np.asarray(experimental.t, dtype=float)
             experimental_y = np.asarray(experimental.y, dtype=float)
             experimental_x_name = "t"
-            experimental_x_provenance: Mapping[str, object] = (
-                MappingProxyType({})
-            )
+            experimental_x_provenance = _observation_provenance(experimental)
             selected_source_rows = tuple(experimental.source_rows)
             if bool(parametric_mode) and selected_x != "t":
                 x_source = experimental_x_by_dataset.get(experimental.dataset_id)
@@ -904,12 +1027,7 @@ class WorkspaceResultPresenter:
                     selected_source_rows,
                 ) = paired
                 experimental_x_name = selected_x
-                experimental_x_provenance = {
-                    "dataset_id": x_source.dataset_id,
-                    "raw_observation_id": x_source.raw_observation_id,
-                    "raw_column": x_source.raw_column,
-                    "source_rows": selected_source_rows,
-                }
+                experimental_x_provenance = _observation_provenance(x_source)
             label = f"{experimental.dataset_name}: {experimental.raw_column}"
             if experimental.model_species:
                 label = f"{label} → {experimental.model_species}"
@@ -925,27 +1043,14 @@ class WorkspaceResultPresenter:
                         experimental_y,
                     ),
                 ),
-                segment_ids=np.zeros(experimental_x.size, dtype=np.int64),
-                segment_keys=tuple(
-                    f"experimental:{experimental.layer_id}"
-                    for _ in experimental_x
-                ),
-                discontinuity_ids=np.zeros(
-                    experimental_x.size,
-                    dtype=np.int64,
-                ),
+                segment_ids=None,
+                segment_keys=None,
+                discontinuity_ids=None,
+                source_row=np.asarray(selected_source_rows, dtype=np.int64),
                 series_provenance=(
                     (
                         experimental.raw_column,
-                        {
-                            "dataset_id": experimental.dataset_id,
-                            "raw_observation_id": (
-                                experimental.raw_observation_id
-                            ),
-                            "raw_column": experimental.raw_column,
-                            "model_species": experimental.model_species,
-                            "source_rows": selected_source_rows,
-                        },
+                        _observation_provenance(experimental),
                     ),
                 ),
                 color_by_series=(
@@ -971,11 +1076,13 @@ class WorkspaceResultPresenter:
                     ResultDataBlock(
                         block_id=layer.layer_id,
                         label=layer.label,
+                        kind=layer.kind,
                         t=experimental_x,
                         series=layer.series,
                         segment_ids=layer.segment_ids,
                         segment_keys=layer.segment_keys,
                         discontinuity_ids=layer.discontinuity_ids,
+                        source_row=layer.source_row,
                         x_name=experimental_x_name,
                         series_provenance=layer.series_provenance,
                         x_provenance=experimental_x_provenance,
@@ -1051,8 +1158,20 @@ class WorkspaceResultPresenter:
                     "float",
                 )
             )
-            columns.extend(
-                (
+            if block.kind is ResultLayerKind.EXPERIMENTAL:
+                if block.source_row is None:
+                    raise ValueError("experimental Copy block lacks source_row.")
+                columns.append(
+                    (f"{block.label} — source_row", block.source_row, "int")
+                )
+            else:
+                if (
+                    block.segment_ids is None
+                    or block.segment_keys is None
+                    or block.discontinuity_ids is None
+                ):
+                    raise ValueError("simulation Copy block lacks executor identity.")
+                columns.extend((
                     (f"{block.label} — segment_id", block.segment_ids, "int"),
                     (f"{block.label} — segment_key", block.segment_keys, "text"),
                     (
@@ -1060,8 +1179,7 @@ class WorkspaceResultPresenter:
                         block.discontinuity_ids,
                         "int",
                     ),
-                )
-            )
+                ))
             provenance_by_name = dict(block.series_provenance)
             columns.extend(
                 (
@@ -1137,7 +1255,11 @@ class WorkspaceResultPresenter:
         if not projection.copy_all_blocks:
             raise ValueError("No visible result, Reference, or experimental data.")
         total_cells = sum(
-            (int(block.t.size) + 1) * (4 + len(block.series))
+            (int(block.t.size) + 1)
+            * (
+                (2 if block.kind is ResultLayerKind.EXPERIMENTAL else 4)
+                + len(block.series)
+            )
             for block in projection.copy_all_blocks
         )
         if total_cells > _MAX_XLSX_CELLS:
@@ -1161,24 +1283,46 @@ class WorkspaceResultPresenter:
                     cancellation_check()
                 title = WorkspaceResultPresenter._worksheet_title(block.label, used)
                 sheet = workbook.create_sheet(title=title)
-                sheet.append(
-                    [
-                        block.x_name,
+                if block.kind is ResultLayerKind.EXPERIMENTAL:
+                    if block.source_row is None:
+                        raise ValueError("experimental XLSX block lacks source_row.")
+                    identity_headers = ["source_row"]
+                else:
+                    if (
+                        block.segment_ids is None
+                        or block.segment_keys is None
+                        or block.discontinuity_ids is None
+                    ):
+                        raise ValueError("simulation XLSX block lacks executor identity.")
+                    identity_headers = [
                         "segment_id",
                         "segment_key",
                         "discontinuity_id",
+                    ]
+                sheet.append(
+                    [
+                        block.x_name,
+                        *identity_headers,
                         *(name for name, _values in block.series),
                     ]
                 )
                 for index in range(block.t.size):
                     if cancellation_check is not None and index % 256 == 0:
                         cancellation_check()
-                    sheet.append(
-                        [
-                            float(block.t[index]),
+                    if block.kind is ResultLayerKind.EXPERIMENTAL:
+                        identity_values: list[object] = [
+                            int(block.source_row[index])
+                        ]
+                    else:
+                        identity_values = [
                             int(block.segment_ids[index]),
                             block.segment_keys[index],
                             int(block.discontinuity_ids[index]),
+                        ]
+                    sheet.append(
+                        [
+                            float(block.t[index]),
+                            *identity_values,
                             *(
                                 float(values[index])
                                 for _name, values in block.series
@@ -1210,9 +1354,9 @@ class WorkspaceResultPresenter:
                         "series",
                         "dataset_id",
                         "raw_observation_id",
+                        "dataset_name",
                         "raw_column",
                         "model_species",
-                        "source_rows",
                     ]
                 )
                 for title, name, provenance in lineage_rows:
@@ -1226,12 +1370,9 @@ class WorkspaceResultPresenter:
                             str(
                                 provenance.get("raw_observation_id") or ""
                             ),
+                            str(provenance.get("dataset_name") or ""),
                             str(provenance.get("raw_column") or ""),
                             str(provenance.get("model_species") or ""),
-                            json.dumps(
-                                tuple(provenance.get("source_rows") or ()),
-                                separators=(",", ":"),
-                            ),
                         ]
                     )
                 lineage_sheet.sheet_state = "hidden"

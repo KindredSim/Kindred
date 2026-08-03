@@ -15,7 +15,7 @@ from kindred.gui.plot_config import try_import_pyqtgraph
 __all__ = ["GridPlotView"]
 
 ColorResolver = Callable[[str], object]
-_FIT_COPY_COLUMNS = 10
+_FIT_COPY_COLUMNS = 14
 _MAX_FIT_COPY_CELLS = 1_000_000
 _MAX_FIT_COPY_CHARACTERS = 64 * 1024 * 1024
 _FIT_COPY_ROWS_PER_CHUNK = 2048
@@ -36,7 +36,7 @@ def _color_value(value: object) -> object:
 
 
 class GridPlotView(QtWidgets.QWidget):
-    """Render immutable live/terminal Fit curves without shared plot authority."""
+    """Render immutable live and terminal Fit curves in the Fit-local plot."""
 
     def __init__(
         self,
@@ -99,8 +99,7 @@ class GridPlotView(QtWidgets.QWidget):
         row_count = sum(
             len(values)
             for dataset in self._curves
-            for values_by_kind in (dataset.model_y, dataset.observed_y)
-            for _species, values in values_by_kind
+            for _species, values in dataset.objective_model_y
         )
         cell_count = (row_count + 1) * _FIT_COPY_COLUMNS
         if cell_count > _MAX_FIT_COPY_CELLS:
@@ -109,87 +108,69 @@ class GridPlotView(QtWidgets.QWidget):
                 f"limit ({_MAX_FIT_COPY_CELLS:,})."
             )
         header = (
-            "dataset\tkind\tseries\traw_observation_id\tsource_row"
-            "\tsegment_id\tdiscontinuity\tx_name\tx\ty"
+            "dataset\tseries\traw_observation_id\traw_column\tsource_row"
+            "\tsegment_id\tsegment_key\tdiscontinuity_id\tselection_provenance"
+            "\tx_name\tobserved_x\tobserved_y\tmodel_x\tmodel_y"
         )
         total_characters = 0
         output = io.StringIO()
         output.write(header)
         rows_in_chunk = 0
         for dataset in self._curves:
-            for kind, axes, values in (
-                ("model", dict(dataset.model_x), dict(dataset.model_y)),
-                (
-                    "observed",
-                    dict(dataset.observed_x),
-                    dict(dataset.observed_y),
-                ),
-            ):
-                segment_ids = (
-                    dict(dataset.model_segment_ids)
-                    if kind == "model"
-                    else {}
+            model_x = dict(dataset.objective_model_x)
+            model_y = dict(dataset.objective_model_y)
+            observed_x = dict(dataset.observed_x)
+            observed_y = dict(dataset.observed_y)
+            segment_ids = dict(dataset.objective_model_segment_ids)
+            segment_keys = dict(dataset.objective_model_segment_keys)
+            discontinuity_ids = dict(dataset.objective_model_discontinuity_ids)
+            selection = dict(dataset.objective_selection_provenance)
+            observation_ids = dict(dataset.objective_observation_ids)
+            raw_columns = dict(dataset.objective_raw_columns)
+            source_rows = dict(dataset.objective_source_rows)
+            for species, model_y_values in model_y.items():
+                rows = zip(
+                    observed_x[species],
+                    observed_y[species],
+                    model_x[species],
+                    model_y_values,
+                    strict=True,
                 )
-                source_rows = (
-                    dict(dataset.observed_source_rows)
-                    if kind == "observed"
-                    else {}
-                )
-                raw_ids = (
-                    dict(dataset.observed_raw_ids)
-                    if kind == "observed"
-                    else {}
-                )
-                for species, y_values in values.items():
-                    x_values = axes.get(species, ())
-                    for index, (x_value, y_value) in enumerate(
-                        zip(x_values, y_values, strict=True)
-                    ):
-                        segment_id = (
-                            segment_ids[species][index]
-                            if species in segment_ids
-                            else ""
-                        )
-                        discontinuity = bool(
-                            kind == "model"
-                            and index > 0
-                            and segment_ids[species][index]
-                            != segment_ids[species][index - 1]
-                        )
-                        output.write("\n")
-                        output.write(
-                            "\t".join(
-                                (
-                                    dataset.display_name,
-                                    kind,
-                                    species,
-                                    raw_ids.get(species, ""),
-                                    (
-                                        str(source_rows[species][index])
-                                        if species in source_rows
-                                        else ""
-                                    ),
-                                    str(segment_id),
-                                    "1" if discontinuity else "0",
-                                    dataset.x_name,
-                                    f"{float(x_value):.17g}",
-                                    f"{float(y_value):.17g}",
-                                )
+                for index, (obs_x, obs_y, selected_x, selected_y) in enumerate(rows):
+                    output.write("\n")
+                    output.write(
+                        "\t".join(
+                            (
+                                dataset.display_name,
+                                species,
+                                observation_ids[species][index],
+                                raw_columns[species][index],
+                                str(source_rows[species][index]),
+                                str(segment_ids[species][index]),
+                                segment_keys[species][index],
+                                str(discontinuity_ids[species][index]),
+                                selection[species][index],
+                                dataset.x_name,
+                                f"{float(obs_x):.17g}",
+                                f"{float(obs_y):.17g}",
+                                f"{float(selected_x):.17g}",
+                                f"{float(selected_y):.17g}",
                             )
                         )
-                        rows_in_chunk += 1
-                        if rows_in_chunk >= _FIT_COPY_ROWS_PER_CHUNK:
-                            chunk = output.getvalue()
-                            total_characters += len(chunk)
-                            if total_characters > _MAX_FIT_COPY_CHARACTERS:
-                                raise ValueError(
-                                    "Fit Copy payload exceeds the bounded "
-                                    "output-size limit "
-                                    f"({_MAX_FIT_COPY_CHARACTERS // (1024 * 1024)} MiB)."
-                                )
-                            yield chunk
-                            output = io.StringIO()
-                            rows_in_chunk = 0
+                    )
+                    rows_in_chunk += 1
+                    if rows_in_chunk >= _FIT_COPY_ROWS_PER_CHUNK:
+                        chunk = output.getvalue()
+                        total_characters += len(chunk)
+                        if total_characters > _MAX_FIT_COPY_CHARACTERS:
+                            raise ValueError(
+                                "Fit Copy payload exceeds the bounded "
+                                "output-size limit "
+                                f"({_MAX_FIT_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+                            )
+                        yield chunk
+                        output = io.StringIO()
+                        rows_in_chunk = 0
         chunk = output.getvalue()
         total_characters += len(chunk)
         if total_characters > _MAX_FIT_COPY_CHARACTERS:
@@ -270,21 +251,33 @@ class GridPlotView(QtWidgets.QWidget):
             if displayed_series_count > 1:
                 plot.addLegend()
             model_segments = dict(dataset.model_segment_ids)
+            model_segment_keys = dict(dataset.model_segment_keys)
+            model_discontinuities = dict(dataset.model_discontinuity_ids)
             for species, values in dataset.model_y:
                 color = _color_value(self._color_resolver(species))
                 x_values = model_x.get(species, ())
                 segment_values = model_segments[species]
+                segment_key_values = model_segment_keys[species]
+                discontinuity_values = model_discontinuities[species]
                 start = 0
                 for index in range(1, len(values) + 1):
                     if (
                         index < len(values)
                         and segment_values[index] == segment_values[start]
+                        and segment_key_values[index] == segment_key_values[start]
+                        and discontinuity_values[index]
+                        == discontinuity_values[start]
                     ):
                         continue
+                    singleton = index - start == 1
                     plot.plot(
                         list(x_values[start:index]),
                         list(values[start:index]),
                         pen=self._pg.mkPen(color=color, width=2),
+                        symbol="o" if singleton else None,
+                        symbolSize=5 if singleton else None,
+                        symbolBrush=self._pg.mkBrush(color) if singleton else None,
+                        symbolPen=self._pg.mkPen(color=color) if singleton else None,
                         name=(
                             f"{species} — model"
                             if start == 0

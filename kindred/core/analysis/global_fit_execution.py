@@ -56,6 +56,7 @@ __all__ = [
     "normalize_weights",
     "evaluate_dataset_simulation",
     "evaluate_dataset_simulations",
+    "select_fit_rows",
     "dataset_evaluation_is_fatal",
     "assemble_global_fit_result",
 ]
@@ -72,14 +73,25 @@ def _raise_if_fitting_cancel_requested(cancellation_check: Optional[Callable[[],
     if bool(cancel_requested()):
         raise FittingCancelled()
 
+
+def _is_expected_candidate_domain_failure(exc: BaseException) -> bool:
+    """Accept penalties only for the evaluator's explicit candidate domain."""
+
+    return bool(
+        isinstance(exc, FitSimulationError)
+        and isinstance(exc.details, Mapping)
+        and exc.details.get("candidate_domain") is True
+    )
+
 @dataclass
 class DatasetFitInfo:
     """Fit statistics for a single dataset within global fit."""
     dataset_id: str  # Identifier for this dataset
-    r_squared: float  # Coefficient of determination
-    residual_mse: float  # Raw residual mean square
-    rmse: float  # Root mean square error
-    mae: float  # Mean absolute error
+    r_squared_by_series: Dict[str, float]  # Ordinary, unweighted R² by series
+    weighted_residual_sse: float  # Exact contribution to the objective
+    weighted_residual_mse: float  # Exact objective contribution per observation
+    weighted_rmse: float
+    weighted_mae: float
     residuals: np.ndarray  # Residuals for this dataset
     n_points: int  # Number of data points
     weight: float  # Weight used in global objective
@@ -98,10 +110,10 @@ class GlobalFitResult:
         Dataset-specific parameters {dataset_id: {name: value}}
     uncertainties : dict, optional
         Parameter uncertainties {name: std_dev}
-    global_residual_mse : float
-        Raw residual mean square across all datasets
-    global_r_squared : float
-        Overall R² (weighted by dataset sizes)
+    weighted_residual_sse : float
+        Exact sum of squares minimized by the weighted objective
+    weighted_residual_mse : float
+        Exact weighted objective sum of squares per observation
     dataset_info : list
         Per-dataset fit statistics (DatasetFitInfo objects)
     nfev : int
@@ -114,8 +126,8 @@ class GlobalFitResult:
     shared_params: Dict[str, float]
     dataset_params: Dict[str, Dict[str, float]]
     uncertainties: Optional[Dict[str, float]]
-    global_residual_mse: float
-    global_r_squared: float
+    weighted_residual_sse: float
+    weighted_residual_mse: float
     dataset_info: List[DatasetFitInfo]
     nfev: int
     message: str
@@ -123,6 +135,14 @@ class GlobalFitResult:
     covariance: Optional[np.ndarray] = None
     objective_residuals: Optional[np.ndarray] = None
     model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
+    model_x_by_species: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
+    model_segment_ids: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
+    model_segment_keys: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
+    model_discontinuity_ids: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
+    model_selection_provenance: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
+    model_observation_ids: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
+    model_raw_columns: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
+    model_source_rows: Dict[str, Dict[str, tuple[int, ...]]] = field(default_factory=dict)
     residual_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     plot_observed_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     plot_observed_x: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
@@ -141,10 +161,102 @@ class GlobalFitResult:
         str,
         Dict[str, tuple[str, ...]],
     ] = field(default_factory=dict)
+    plot_model_discontinuity_ids: Dict[str, Dict[str, np.ndarray]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.completion, GlobalFitCompletion):
             raise TypeError("GlobalFitResult.completion must be a GlobalFitCompletion")
+        identity_maps = (
+            self.model_x_by_species,
+            self.model_segment_ids,
+            self.model_segment_keys,
+            self.model_discontinuity_ids,
+            self.model_selection_provenance,
+            self.model_observation_ids,
+            self.model_raw_columns,
+            self.model_source_rows,
+        )
+        if self.model_series and any(
+            set(mapping) != set(self.model_series) for mapping in identity_maps
+        ):
+            raise ValueError("Fit objective model identity must be complete by dataset.")
+        for dataset_id, series_by_name in self.model_series.items():
+            expected_names = set(series_by_name)
+            if any(
+                set(mapping[dataset_id]) != expected_names
+                for mapping in identity_maps
+            ):
+                raise ValueError(
+                    "Fit objective model identity must be complete by series."
+                )
+            for series_name, values in series_by_name.items():
+                expected_size = np.asarray(values, dtype=float).reshape(-1).size
+                aligned = (
+                    self.model_x_by_species[dataset_id][series_name],
+                    self.model_segment_ids[dataset_id][series_name],
+                    self.model_segment_keys[dataset_id][series_name],
+                    self.model_discontinuity_ids[dataset_id][series_name],
+                    self.model_selection_provenance[dataset_id][series_name],
+                    self.model_observation_ids[dataset_id][series_name],
+                    self.model_raw_columns[dataset_id][series_name],
+                    self.model_source_rows[dataset_id][series_name],
+                )
+                if expected_size == 0 or any(
+                    len(item) != expected_size for item in aligned
+                ):
+                    raise ValueError(
+                        "Fit objective model rows require complete paired identity."
+                    )
+                selection = self.model_selection_provenance[dataset_id][series_name]
+                if (
+                    not np.all(
+                        np.isfinite(
+                            np.asarray(values, dtype=float).reshape(-1)
+                        )
+                    )
+                    or not np.all(
+                        np.isfinite(
+                            np.asarray(
+                                self.model_x_by_species[dataset_id][series_name],
+                                dtype=float,
+                            ).reshape(-1)
+                        )
+                    )
+                    or np.any(
+                        np.asarray(
+                            self.model_segment_ids[dataset_id][series_name],
+                            dtype=np.int64,
+                        )
+                        < 0
+                    )
+                    or any(
+                        not str(value or "").strip()
+                        for value in self.model_segment_keys[dataset_id][series_name]
+                    )
+                    or np.any(
+                        np.asarray(
+                            self.model_discontinuity_ids[dataset_id][series_name],
+                            dtype=np.int64,
+                        )
+                        < 0
+                    )
+                    or any(
+                        not str(value or "").strip()
+                        for value in self.model_observation_ids[dataset_id][series_name]
+                    )
+                    or any(
+                        not str(value or "").strip()
+                        for value in self.model_raw_columns[dataset_id][series_name]
+                    )
+                    or any(
+                        int(value) <= 0
+                        for value in self.model_source_rows[dataset_id][series_name]
+                    )
+                    or any(value not in {"direct", "interpolated"} for value in selection)
+                ):
+                    raise ValueError("Fit objective row selection provenance is invalid.")
 
 
 def _coerce_fit_failure_payload(value: object) -> SimulationFailure:
@@ -297,7 +409,7 @@ def completion_result_message(
             return f"Global fit failed for dataset '{dataset_id}'."
         return f"Global fit failed for datasets: {', '.join(dataset_ids)}."
     if completion.nonfinite_metrics:
-        return "Final residual MSE is non-finite; results are invalid."
+        return "Final weighted residual MSE is non-finite; results are invalid."
     if optimizer_diagnostic is not None:
         detail = _compact_failure_message(optimizer_diagnostic.failure)
         if detail:
@@ -396,241 +508,202 @@ def _robust_span(values: np.ndarray) -> float:
 def _extract_simulation_payload(
     simulation: FittingSeriesEvaluation,
 ) -> Tuple[
-    Optional[np.ndarray],
+    np.ndarray,
     Dict[str, np.ndarray],
     np.ndarray,
     tuple[str, ...],
     np.ndarray,
 ]:
-    """Return time, series, and discontinuity segment identity."""
+    """Return time, series, and direct canonical row identity."""
     payload = simulation.series
     t_sim = np.asarray(payload.t, dtype=float).reshape(-1)
     return (
-        t_sim if t_sim.size else None,
+        t_sim,
         dict(payload.species),
         np.asarray(simulation.segment_ids, dtype=np.int64).reshape(-1),
         tuple(simulation.segment_keys),
-        np.asarray(
-            simulation.pre_boundary_sample_mask,
-            dtype=bool,
-        ).reshape(-1),
+        np.asarray(simulation.discontinuity_ids, dtype=np.int64).reshape(-1),
     )
 
 
 def _align_series(
     series: np.ndarray,
-    sim_time: Optional[np.ndarray],
-    target_time: np.ndarray,
-    segment_ids: np.ndarray,
-    segment_keys: Sequence[str],
-    pre_boundary_sample_mask: np.ndarray,
-    target_source_rows: Sequence[int],
-    pre_boundary_segment_keys_by_source_row: Mapping[int, str],
-) -> np.ndarray:
-    """Align time-fit values without interpolating across a discontinuity."""
-    values = np.asarray(series, dtype=float).reshape(-1)
-    if sim_time is not None and values.size == sim_time.size:
-        sim_t = np.asarray(sim_time, dtype=float).reshape(-1)
-        target_t = np.asarray(target_time, dtype=float).reshape(-1)
-        source_rows = tuple(int(value) for value in target_source_rows)
-        requested_pre = {
-            int(row): str(key or "").strip()
-            for row, key
-            in pre_boundary_segment_keys_by_source_row.items()
-        }
-        if (
-            len(source_rows) != target_t.size
-            or any(not key for key in requested_pre.values())
-            or any(row not in source_rows for row in requested_pre)
-        ):
-            raise FitSimulationError(
-                "Explicit pre-boundary Fit identity is missing or "
-                "misaligned with captured source rows.",
-                details={"fatal": True, "stage": "fit_capture"},
-            )
-        segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
-        if segments.size != sim_t.size:
-            raise FitSimulationError(
-                "Discontinuity segment identity must align with simulation time.",
-                details={
-                    "fatal": True,
-                    "stage": "intervention_execution",
-                },
-            )
-        keys = tuple(str(value or "").strip() for value in segment_keys)
-        if len(keys) != sim_t.size or any(not value for value in keys):
-            raise FitSimulationError(
-                "Exact segment keys must align with simulation time.",
-                details={
-                    "fatal": True,
-                    "stage": "intervention_execution",
-                },
-            )
-        pre_boundary = np.asarray(
-            pre_boundary_sample_mask,
-            dtype=bool,
-        ).reshape(-1)
-        if pre_boundary.size != sim_t.size:
-            raise FitSimulationError(
-                "Pre-boundary sample identity must align with simulation time.",
-                details={
-                    "fatal": True,
-                    "stage": "intervention_execution",
-                },
-            )
-        if (
-            not requested_pre
-            and sim_t.size == target_t.size
-            and np.array_equal(sim_t, target_t)
-        ):
-            return values
-        if sim_t.size < 2 or np.any(np.diff(sim_t) < 0.0):
-            raise ValueError(
-                "Simulation time must be ordered for fitting alignment."
-            )
-        aligned = np.empty(target_t.size, dtype=float)
-        for index, time_value in enumerate(target_t):
-            exact = np.flatnonzero(sim_t == time_value)
-            requested_key = requested_pre.get(source_rows[index])
-            if exact.size:
-                chosen = (
-                    exact[-1:]
-                    if requested_key is None
-                    else np.asarray(
-                        [
-                            candidate
-                            for candidate in exact
-                            if (
-                                pre_boundary[int(candidate)]
-                                and keys[int(candidate)] == requested_key
-                            )
-                        ],
-                        dtype=np.int64,
-                    )
-                )
-                if chosen.size != 1:
-                    raise FitSimulationError(
-                        "Explicit pre-boundary Fit segment key is missing "
-                        "or ambiguous in the exact simulation result.",
-                        details={
-                            "fatal": True,
-                            "stage": "intervention_execution",
-                        },
-                    )
-                aligned[index] = values[int(chosen[0])]
-                continue
-            if requested_key is not None:
-                raise FitSimulationError(
-                    "Explicit pre-boundary Fit identity requires an exact "
-                    "boundary-time simulation sample.",
-                    details={
-                        "fatal": True,
-                        "stage": "intervention_execution",
-                    },
-                )
-            right = int(np.searchsorted(sim_t, time_value, side="right"))
-            left = right - 1
-            if left < 0 or right >= sim_t.size:
-                raise ValueError(
-                    "Dataset time lies outside the simulation time span."
-                )
-            if (
-                segments[left] != segments[right]
-                or keys[left] != keys[right]
-            ):
-                raise FitSimulationError(
-                    "Time-fit interpolation cannot cross an intervention "
-                    "discontinuity or integration-segment boundary."
-                )
-            width = float(sim_t[right] - sim_t[left])
-            if width <= 0.0:
-                raise ValueError(
-                    "Simulation time must increase inside each fitting segment."
-                )
-            fraction = float((time_value - sim_t[left]) / width)
-            aligned[index] = float(
-                values[left] + fraction * (values[right] - values[left])
-            )
-        return aligned
-    if sim_time is None:
-        raise ValueError("Simulation output must include time coordinates for fitting alignment.")
-    raise ValueError(
-        f"Simulation output has {values.size} values but {np.asarray(sim_time).size} time points.",
-    )
-
-
-def _align_segment_ids(
     sim_time: np.ndarray,
     target_time: np.ndarray,
     segment_ids: np.ndarray,
-) -> np.ndarray:
-    """Project exact model segment identity to aligned observation times."""
-
+    segment_keys: Sequence[str],
+    discontinuity_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray, tuple[str, ...]]:
+    """Align values and their direct canonical row identity together."""
+    values = np.asarray(series, dtype=float).reshape(-1)
     sim_t = np.asarray(sim_time, dtype=float).reshape(-1)
     target_t = np.asarray(target_time, dtype=float).reshape(-1)
-    segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
-    if sim_t.size != segments.size:
+    if values.size != sim_t.size:
         raise ValueError(
-            "Discontinuity segment identity must align with simulation time."
+            f"Simulation output has {values.size} values but {sim_t.size} time points."
         )
-    aligned = np.empty(target_t.size, dtype=np.int64)
+    segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
+    keys = tuple(str(value or "").strip() for value in segment_keys)
+    discontinuities = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1)
+    if (
+        sim_t.size < 2
+        or segments.size != sim_t.size
+        or len(keys) != sim_t.size
+        or discontinuities.size != sim_t.size
+        or any(not value for value in keys)
+        or np.any(segments < 0)
+        or np.any(discontinuities < 0)
+    ):
+        raise FitSimulationError(
+            "Fit simulation row identity must align with simulation time.",
+            details={"fatal": True, "stage": "intervention_execution"},
+        )
+    if np.any(np.diff(sim_t) <= 0.0):
+        raise ValueError("Simulation time must be strictly increasing for fitting alignment.")
+
+    aligned = np.empty(target_t.size, dtype=float)
+    aligned_segments = np.empty(target_t.size, dtype=np.int64)
+    aligned_discontinuities = np.empty(target_t.size, dtype=np.int64)
+    aligned_keys: list[str] = []
+    selection: list[str] = []
     for index, time_value in enumerate(target_t):
         exact = np.flatnonzero(sim_t == time_value)
         if exact.size:
-            aligned[index] = segments[int(exact[-1])]
+            if exact.size != 1:
+                raise FitSimulationError(
+                    "Exact Fit time must select one public simulation row.",
+                    details={"fatal": True, "stage": "fit_identity"},
+                )
+            chosen = int(exact[0])
+            aligned[index] = values[chosen]
+            aligned_segments[index] = segments[chosen]
+            aligned_discontinuities[index] = discontinuities[chosen]
+            aligned_keys.append(keys[chosen])
+            selection.append("direct")
             continue
-        right = int(np.searchsorted(sim_t, time_value, side="right"))
+        right_candidates = np.flatnonzero(sim_t > time_value)
+        right = int(right_candidates[0]) if right_candidates.size else sim_t.size
         left = right - 1
-        if left < 0 or right >= sim_t.size or segments[left] != segments[right]:
-            raise FitSimulationError(
-                "Time-fit segment projection cannot cross an intervention "
-                "discontinuity."
-            )
-        aligned[index] = segments[left]
-    aligned.setflags(write=False)
-    return aligned
-
-
-def _align_segment_keys(
-    sim_time: np.ndarray,
-    target_time: np.ndarray,
-    segment_ids: np.ndarray,
-    segment_keys: Sequence[str],
-) -> tuple[str, ...]:
-    """Project exact opaque segment identity to aligned observation times."""
-
-    sim_t = np.asarray(sim_time, dtype=float).reshape(-1)
-    target_t = np.asarray(target_time, dtype=float).reshape(-1)
-    segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
-    keys = tuple(str(value or "").strip() for value in segment_keys)
-    if (
-        sim_t.size != segments.size
-        or len(keys) != sim_t.size
-        or any(not value for value in keys)
-    ):
-        raise ValueError(
-            "Exact segment identity must align with simulation time."
-        )
-    aligned: list[str] = []
-    for time_value in target_t:
-        exact = np.flatnonzero(sim_t == time_value)
-        if exact.size:
-            aligned.append(keys[int(exact[-1])])
-            continue
-        right = int(np.searchsorted(sim_t, time_value, side="right"))
-        left = right - 1
+        if left < 0 or right >= sim_t.size:
+            raise ValueError("Dataset time lies outside the simulation time span.")
         if (
-            left < 0
-            or right >= sim_t.size
-            or segments[left] != segments[right]
+            segments[left] != segments[right]
             or keys[left] != keys[right]
+            or discontinuities[left] != discontinuities[right]
         ):
             raise FitSimulationError(
-                "Time-fit segment projection cannot cross an intervention "
-                "discontinuity or integration-segment boundary."
+                "Time-fit interpolation cannot cross an executor-issued region."
             )
-        aligned.append(keys[left])
-    return tuple(aligned)
+        width = float(sim_t[right] - sim_t[left])
+        fraction = float((time_value - sim_t[left]) / width)
+        aligned[index] = float(
+            values[left] + fraction * (values[right] - values[left])
+        )
+        aligned_segments[index] = segments[left]
+        aligned_discontinuities[index] = discontinuities[left]
+        aligned_keys.append(keys[left])
+        selection.append("interpolated")
+    return (
+        aligned,
+        aligned_segments,
+        tuple(aligned_keys),
+        aligned_discontinuities,
+        tuple(selection),
+    )
+
+
+def select_fit_rows(
+    *,
+    model_y: np.ndarray,
+    model_x: np.ndarray | None,
+    x_name: str,
+    x_mode: str,
+    sim_time: np.ndarray,
+    observation_time: np.ndarray,
+    observation_x: np.ndarray,
+    observation_id: str,
+    raw_column: str,
+    source_rows: Sequence[int],
+    segment_ids: np.ndarray,
+    segment_keys: Sequence[str],
+    discontinuity_ids: np.ndarray,
+    dataset_label: str,
+    y_name: str,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    tuple[str, ...],
+    np.ndarray,
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[int, ...],
+]:
+    """Select model X/Y and complete model/observation identity together."""
+
+    obs_t = np.asarray(observation_time, dtype=float).reshape(-1)
+    obs_x = np.asarray(observation_x, dtype=float).reshape(-1)
+    rows = tuple(int(value) for value in source_rows)
+    raw_id = str(observation_id or "").strip()
+    raw_name = str(raw_column or "").strip()
+    if (
+        not raw_id
+        or not raw_name
+        or obs_t.size == 0
+        or obs_t.size != obs_x.size
+        or len(rows) != obs_t.size
+        or len(rows) != len(set(rows))
+        or any(row <= 0 for row in rows)
+    ):
+        raise FitSimulationError(
+            "Fit selector requires complete row-aligned observation identity.",
+            details={"fatal": True, "stage": "fit_capture"},
+        )
+    if str(x_name) == "t":
+        selected = _align_series(
+            model_y,
+            sim_time,
+            obs_t,
+            segment_ids,
+            segment_keys,
+            discontinuity_ids,
+        )
+        selected_x = obs_t.copy()
+    else:
+        if model_x is None:
+            raise FitSimulationError(
+                f"X series {x_name!r} is missing from the simulation result."
+            )
+        aligner = _ParametricXAligner(
+            mode=x_mode,
+            t_obs=obs_t,
+            x_obs=obs_x,
+            t_sim=sim_time,
+            x_model=np.asarray(model_x, dtype=float),
+            segment_ids=segment_ids,
+            segment_keys=segment_keys,
+            discontinuity_ids=discontinuity_ids,
+            dataset_label=dataset_label,
+            x_name=x_name,
+        )
+        parametric = aligner.align(
+            y_model=np.asarray(model_y, dtype=float),
+            y_name=y_name,
+        )
+        selected_x = np.asarray(parametric[0], dtype=float)
+        selected = parametric[1:]
+    return (
+        selected_x,
+        np.asarray(selected[0], dtype=float),
+        np.asarray(selected[1], dtype=np.int64),
+        tuple(selected[2]),
+        np.asarray(selected[3], dtype=np.int64),
+        tuple(selected[4]),
+        tuple(raw_id for _row in rows),
+        tuple(raw_name for _row in rows),
+        rows,
+    )
 
 
 def _objective_dataset_weight_multiplier(weight: float) -> float:
@@ -651,9 +724,8 @@ def _payload_observations(
                 series.source_rows,
                 dtype=np.int64,
             ).reshape(-1),
-            "pre_boundary_segment_keys_by_source_row": dict(
-                series.pre_boundary_segment_keys_by_source_row
-            ),
+            "raw_observation_id": series.raw_observation_id,
+            "raw_column": series.raw_column,
         }
         for name, series in payload.observations.items()
     }
@@ -888,6 +960,7 @@ class _ParametricXAligner:
         x_model: np.ndarray,
         segment_ids: np.ndarray,
         segment_keys: Sequence[str],
+        discontinuity_ids: np.ndarray,
         dataset_label: str,
         x_name: str,
     ) -> None:
@@ -906,10 +979,26 @@ class _ParametricXAligner:
         self._segment_keys = tuple(
             str(value or "").strip() for value in segment_keys
         )
+        self._discontinuity_ids = np.asarray(
+            discontinuity_ids,
+            dtype=np.int64,
+        )
         self._dataset_label = str(dataset_label)
         self._x_name = str(x_name)
 
-    def align(self, *, y_model: np.ndarray, y_name: str) -> np.ndarray:
+    def align(
+        self,
+        *,
+        y_model: np.ndarray,
+        y_name: str,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        tuple[str, ...],
+        np.ndarray,
+        tuple[str, ...],
+    ]:
         if self._mode == "monotone":
             return align_y_on_x_obs(
                 t_obs=self._t_obs,
@@ -919,6 +1008,7 @@ class _ParametricXAligner:
                 y_model=np.asarray(y_model, dtype=float),
                 segment_ids=self._segment_ids,
                 segment_keys=self._segment_keys,
+                discontinuity_ids=self._discontinuity_ids,
                 dataset_label=self._dataset_label,
                 x_name=self._x_name,
                 y_name=y_name,
@@ -931,6 +1021,7 @@ class _ParametricXAligner:
             y_model=np.asarray(y_model, dtype=float),
             segment_ids=self._segment_ids,
             segment_keys=self._segment_keys,
+            discontinuity_ids=self._discontinuity_ids,
             dataset_label=self._dataset_label,
             x_name=self._x_name,
             y_name=y_name,
@@ -958,18 +1049,62 @@ class DatasetSimulationEvaluation:
     sim_species: Dict[str, np.ndarray]
     segment_ids: Optional[np.ndarray] = None
     segment_keys: tuple[str, ...] | None = None
-    pre_boundary_sample_mask: Optional[np.ndarray] = None
+    discontinuity_ids: Optional[np.ndarray] = None
     error: Optional[BaseException] = None
     error_provenance: Optional[Dict[str, Any]] = None
     final_error_message: Optional[str] = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "sim_species", dict(self.sim_species))
+        species = dict(self.sim_species)
+        object.__setattr__(self, "sim_species", species)
+        if self.error is not None:
+            if (
+                self.sim_time is not None
+                or species
+                or self.segment_ids is not None
+                or self.segment_keys is not None
+                or self.discontinuity_ids is not None
+            ):
+                raise ValueError(
+                    "Failed Fit evaluations cannot publish a partial result."
+                )
+        elif self.segment_ids is None or self.sim_time is None:
+            raise ValueError(
+                "Successful Fit simulation results require complete row identity."
+            )
+        else:
+            times = np.asarray(self.sim_time, dtype=float).reshape(-1).copy()
+            if (
+                times.size == 0
+                or np.any(~np.isfinite(times))
+                or np.any(np.diff(times) <= 0.0)
+                or not species
+            ):
+                raise ValueError(
+                    "Successful Fit simulation results require finite ordered rows."
+                )
+            normalized_species: Dict[str, np.ndarray] = {}
+            for raw_name, raw_values in species.items():
+                name = str(raw_name or "").strip()
+                values = np.asarray(raw_values, dtype=float).reshape(-1).copy()
+                if (
+                    not name
+                    or values.size != times.size
+                    or np.any(~np.isfinite(values))
+                ):
+                    raise ValueError(
+                        "Fit simulation species must align with finite row time."
+                    )
+                values.setflags(write=False)
+                normalized_species[name] = values
+            times.setflags(write=False)
+            object.__setattr__(self, "sim_time", times)
+            object.__setattr__(self, "sim_species", normalized_species)
         if self.segment_ids is not None:
             segments = np.asarray(
                 self.segment_ids,
                 dtype=np.int64,
-            ).reshape(-1)
+            ).reshape(-1).copy()
             keys = tuple(
                 str(value or "").strip()
                 for value in (self.segment_keys or ())
@@ -983,31 +1118,35 @@ class DatasetSimulationEvaluation:
                 segments.size != expected_size
                 or len(keys) != expected_size
                 or any(not value for value in keys)
+                or np.any(segments < 0)
+                or np.any(np.diff(segments) < 0)
             ):
                 raise ValueError(
                     "Fit simulation segment identity must align with time."
                 )
-            pre_boundary = np.asarray(
-                self.pre_boundary_sample_mask,
-                dtype=bool,
-            ).reshape(-1)
-            if pre_boundary.size != expected_size:
+            discontinuities = np.asarray(
+                self.discontinuity_ids,
+                dtype=np.int64,
+            ).reshape(-1).copy()
+            if (
+                discontinuities.size != expected_size
+                or np.any(discontinuities < 0)
+                or np.any(np.diff(discontinuities) < 0)
+            ):
                 raise ValueError(
-                    "Fit pre-boundary identity must align with time."
+                    "Fit direct row identity must align with time."
                 )
             object.__setattr__(self, "segment_ids", segments)
             object.__setattr__(self, "segment_keys", keys)
-            object.__setattr__(
-                self,
-                "pre_boundary_sample_mask",
-                pre_boundary,
-            )
+            segments.setflags(write=False)
+            discontinuities.setflags(write=False)
+            object.__setattr__(self, "discontinuity_ids", discontinuities)
         elif (
             self.segment_keys is not None
-            or self.pre_boundary_sample_mask is not None
+            or self.discontinuity_ids is not None
         ):
             raise ValueError(
-                "Fit simulation segment/pre-boundary identity requires "
+                "Fit simulation row identity requires "
                 "discontinuity identity."
             )
         if self.error_provenance is not None:
@@ -1046,26 +1185,8 @@ def evaluate_dataset_simulation(
             sim_species,
             segment_ids,
             segment_keys,
-            pre_boundary_sample_mask,
+            discontinuity_ids,
         ) = _extract_simulation_payload(sim_result)
-        if item.payload.x_name != "t":
-            keep = ~pre_boundary_sample_mask
-            sim_time = None if sim_time is None else sim_time[keep]
-            sim_species = {
-                name: np.asarray(values, dtype=float).reshape(-1)[keep]
-                for name, values in sim_species.items()
-            }
-            segment_ids = segment_ids[keep]
-            segment_keys = tuple(
-                key
-                for key, retain in zip(
-                    segment_keys,
-                    keep,
-                    strict=True,
-                )
-                if retain
-            )
-            pre_boundary_sample_mask = pre_boundary_sample_mask[keep]
         _raise_if_fitting_cancel_requested(cancellation_check)
         return DatasetSimulationEvaluation(
             index=int(item.index),
@@ -1073,7 +1194,7 @@ def evaluate_dataset_simulation(
             sim_species=sim_species,
             segment_ids=segment_ids,
             segment_keys=segment_keys,
-            pre_boundary_sample_mask=pre_boundary_sample_mask,
+            discontinuity_ids=discontinuity_ids,
         )
     except FitSimulationError as exc:
         return DatasetSimulationEvaluation(
@@ -1311,7 +1432,7 @@ class GlobalFitObjective:
                         context=getattr(exc, "context", None),
                     )
                 self._ctx.set_error(exc, evaluation.error_provenance)
-                if bool(getattr(exc, "details", {}).get("fatal")):
+                if not _is_expected_candidate_domain_failure(exc):
                     raise exc
                 key = (str(ds_id), "__simulation__", str(exc).splitlines()[0])
                 if key not in self._warned_objective_keys:
@@ -1331,13 +1452,11 @@ class GlobalFitObjective:
             sim_species = evaluation.sim_species
             segment_ids = evaluation.segment_ids
             segment_keys = evaluation.segment_keys
-            pre_boundary_sample_mask = (
-                evaluation.pre_boundary_sample_mask
-            )
+            discontinuity_ids = evaluation.discontinuity_ids
             if (
                 segment_ids is None
                 or segment_keys is None
-                or pre_boundary_sample_mask is None
+                or discontinuity_ids is None
             ):
                 raise FitSimulationError(
                     f"Dataset {ds_id!r}: Fit simulation lost exact segment "
@@ -1345,7 +1464,6 @@ class GlobalFitObjective:
                     failed_params=failed_param_snapshot,
                 )
 
-            aligners: Dict[str, _ParametricXAligner] = {}
             for species_name in species_list:
                 _raise_if_fitting_cancelled(self._cancellation_check)
                 species_obs = observations[species_name]
@@ -1365,68 +1483,53 @@ class GlobalFitObjective:
                         failed_params=failed_param_snapshot,
                     )
                     self._ctx.set_error(err, {"dataset": ds_id})
-                    key = (str(ds_id), str(species_name), "missing_species")
-                    if key not in self._warned_objective_keys:
-                        self._warned_objective_keys.add(key)
-                        logger.warning("%s", err)
-                    y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
-                    continue
+                    raise err
 
                 try:
-                    if x_name == "t":
-                        y_sim = _align_series(
-                            model_series,
-                            sim_time,
-                            obs_t,
-                            np.asarray(segment_ids, dtype=np.int64),
-                            segment_keys,
-                            pre_boundary_sample_mask,
-                            species_obs["source_rows"],
-                            species_obs[
-                                "pre_boundary_segment_keys_by_source_row"
-                            ],
-                        )
-                    else:
-                        x_model_series = sim_species.get(x_name)
-                        if x_model_series is None:
-                            raise FitSimulationError(
-                                f"X series '{x_name}' missing in simulation result for dataset '{ds_id}'.",
-                                failed_params=failed_param_snapshot,
-                            )
-                        if species_x_obs is None:
-                            raise FitSimulationError(
-                                f"Dataset '{ds_id}' species '{species_name}' is missing x observations for X='{x_name}'.",
-                                failed_params=failed_param_snapshot,
-                            )
-                        aligner = aligners.get(species_name)
-                        if aligner is None:
-                            aligner = _ParametricXAligner(
-                                mode=x_mode,
-                                t_obs=obs_t,
-                                x_obs=species_x_obs,
-                                t_sim=sim_time,
-                                x_model=np.asarray(x_model_series, dtype=float),
-                                segment_ids=np.asarray(segment_ids, dtype=np.int64),
-                                segment_keys=segment_keys,
-                                dataset_label=ds_id,
-                                x_name=x_name,
-                            )
-                            aligners[species_name] = aligner
-                        y_sim = aligner.align(
-                            y_model=np.asarray(model_series, dtype=float),
-                            y_name=species_name,
-                        )
-                except FitSimulationError as exc:
-                    self._ctx.set_error(
-                        FitSimulationError(
-                            str(exc),
+                    if x_name != "t" and species_x_obs is None:
+                        raise FitSimulationError(
+                            f"Dataset '{ds_id}' species '{species_name}' is missing x observations for X='{x_name}'.",
                             failed_params=failed_param_snapshot,
-                            details=dict(getattr(exc, "details", None) or {}),
-                            context=getattr(exc, "context", None),
+                        )
+                    selected_rows = select_fit_rows(
+                        model_y=np.asarray(model_series, dtype=float),
+                        model_x=(
+                            None
+                            if x_name == "t"
+                            else sim_species.get(x_name)
                         ),
-                        {"dataset": ds_id},
+                        x_name=x_name,
+                        x_mode=x_mode,
+                        sim_time=np.asarray(sim_time, dtype=float),
+                        observation_time=obs_t,
+                        observation_x=(
+                            obs_t
+                            if x_name == "t"
+                            else np.asarray(species_x_obs, dtype=float)
+                        ),
+                        observation_id=species_obs["raw_observation_id"],
+                        raw_column=species_obs["raw_column"],
+                        source_rows=species_obs["source_rows"],
+                        segment_ids=np.asarray(segment_ids, dtype=np.int64),
+                        segment_keys=segment_keys,
+                        discontinuity_ids=np.asarray(
+                            discontinuity_ids,
+                            dtype=np.int64,
+                        ),
+                        dataset_label=ds_id,
+                        y_name=species_name,
                     )
+                    y_sim = selected_rows[1]
+                except FitSimulationError as exc:
+                    err = FitSimulationError(
+                        str(exc),
+                        failed_params=failed_param_snapshot,
+                        details=dict(getattr(exc, "details", None) or {}),
+                        context=getattr(exc, "context", None),
+                    )
+                    self._ctx.set_error(err, {"dataset": ds_id})
+                    if not _is_expected_candidate_domain_failure(err):
+                        raise err
                     key = (str(ds_id), str(species_name), str(exc).splitlines()[0])
                     if key not in self._warned_objective_keys:
                         self._warned_objective_keys.add(key)
@@ -1444,13 +1547,7 @@ class GlobalFitObjective:
                         context=getattr(exc, "context", None),
                     )
                     self._ctx.set_error(err, {"dataset": ds_id})
-                    key = (str(ds_id), str(species_name), str(err).splitlines()[0])
-                    if key not in self._warned_objective_keys:
-                        self._warned_objective_keys.add(key)
-                        logger.warning("%s", err)
-                    y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
-                    continue
+                    raise err from exc
 
                 if not np.all(np.isfinite(y_sim)):
                     err = FitSimulationError(
@@ -1458,13 +1555,7 @@ class GlobalFitObjective:
                         failed_params=failed_param_snapshot,
                     )
                     self._ctx.set_error(err, {"dataset": ds_id})
-                    key = (str(ds_id), str(species_name), "nonfinite_model")
-                    if key not in self._warned_objective_keys:
-                        self._warned_objective_keys.add(key)
-                        logger.warning("%s", err)
-                    y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
-                    continue
+                    raise err
 
                 residual_vector = effective_weight * (
                     np.asarray(y_sim, dtype=float).reshape(-1) - np.asarray(y_exp, dtype=float).reshape(-1)
@@ -1475,13 +1566,7 @@ class GlobalFitObjective:
                         failed_params=failed_param_snapshot,
                     )
                     self._ctx.set_error(err, {"dataset": ds_id})
-                    key = (str(ds_id), str(species_name), "nonfinite_residual")
-                    if key not in self._warned_objective_keys:
-                        self._warned_objective_keys.add(key)
-                        logger.warning("%s", err)
-                    y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
-                    continue
+                    raise err
                 all_residuals.extend(np.asarray(residual_vector, dtype=float).reshape(-1))
 
         residuals = np.asarray(all_residuals, dtype=float).ravel()
@@ -1532,10 +1617,17 @@ def assemble_global_fit_result(
     optimizer_diagnostic: Optional[FitDiagnostic] = None,
 ) -> GlobalFitResult:
     dataset_info = []
-    total_ss_res = 0.0
-    total_ss_tot = 0.0
+    total_weighted_sse = 0.0
     total_points = 0
     model_series_map: Dict[str, Dict[str, np.ndarray]] = {}
+    model_x_by_species_map: Dict[str, Dict[str, np.ndarray]] = {}
+    model_segment_ids_map: Dict[str, Dict[str, np.ndarray]] = {}
+    model_segment_keys_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
+    model_discontinuity_ids_map: Dict[str, Dict[str, np.ndarray]] = {}
+    model_selection_provenance_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
+    model_observation_ids_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
+    model_raw_columns_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
+    model_source_rows_map: Dict[str, Dict[str, tuple[int, ...]]] = {}
     residual_series_map: Dict[str, Dict[str, np.ndarray]] = {}
     plot_observed_series_map: Dict[str, Dict[str, np.ndarray]] = {}
     plot_observed_x_map: Dict[str, Dict[str, np.ndarray]] = {}
@@ -1550,6 +1642,7 @@ def assemble_global_fit_result(
         str,
         Dict[str, tuple[str, ...]],
     ] = {}
+    plot_model_discontinuity_ids_map: Dict[str, Dict[str, np.ndarray]] = {}
     final_dataset_failures: Dict[str, FitDiagnostic] = {}
     final_dataset_warnings: Dict[str, str] = {}
 
@@ -1653,7 +1746,7 @@ def assemble_global_fit_result(
             sim_species = evaluation.sim_species
         segment_ids = evaluation.segment_ids
         segment_keys = evaluation.segment_keys
-        pre_boundary_sample_mask = evaluation.pre_boundary_sample_mask
+        discontinuity_ids = evaluation.discontinuity_ids
 
         plot_mask: Optional[np.ndarray] = None
         plot_x = np.asarray([], dtype=float)
@@ -1672,9 +1765,8 @@ def assemble_global_fit_result(
                 ).reshape(-1)[plot_mask]
 
         residual_blocks: List[np.ndarray] = []
-        exp_blocks: List[np.ndarray] = []
-        aligners: Dict[str, _ParametricXAligner] = {}
-
+        weighted_residual_blocks: List[np.ndarray] = []
+        r_squared_by_series: Dict[str, float] = {}
         for species_name in species_list:
             species_obs = observations[species_name]
             obs_t = np.asarray(species_obs["t"], dtype=float).reshape(-1)
@@ -1684,7 +1776,6 @@ def assemble_global_fit_result(
                 if species_name in x_obs_by_species
                 else None
             )
-            exp_blocks.append(y_exp)
             plot_observed_series_map.setdefault(ds_id, {})[species_name] = y_exp.copy()
             plot_observed_x_map.setdefault(ds_id, {})[species_name] = (
                 obs_t.copy()
@@ -1716,67 +1807,65 @@ def assemble_global_fit_result(
                 continue
 
             try:
-                y_sim_time = _align_series(
-                    sim_species[species_name],
-                    sim_time,
-                    obs_t,
-                    np.asarray(segment_ids, dtype=np.int64),
-                    tuple(segment_keys or ()),
-                    np.asarray(
-                        pre_boundary_sample_mask,
-                        dtype=bool,
+                if x_name != "t" and species_x_obs is None:
+                    raise FitSimulationError(
+                        f"Dataset '{ds_id}' species '{species_name}' is missing x observations for X='{x_name}'.",
+                        failed_params=failed_param_snapshot,
+                    )
+                selected_rows = select_fit_rows(
+                    model_y=np.asarray(sim_species[species_name], dtype=float),
+                    model_x=(
+                        None if x_name == "t" else sim_species.get(x_name)
                     ),
-                    species_obs["source_rows"],
-                    species_obs[
-                        "pre_boundary_segment_keys_by_source_row"
-                    ],
+                    x_name=x_name,
+                    x_mode=x_mode,
+                    sim_time=np.asarray(sim_time, dtype=float),
+                    observation_time=obs_t,
+                    observation_x=(
+                        obs_t
+                        if x_name == "t"
+                        else np.asarray(species_x_obs, dtype=float)
+                    ),
+                    observation_id=species_obs["raw_observation_id"],
+                    raw_column=species_obs["raw_column"],
+                    source_rows=species_obs["source_rows"],
+                    segment_ids=np.asarray(segment_ids, dtype=np.int64),
+                    segment_keys=tuple(segment_keys or ()),
+                    discontinuity_ids=np.asarray(
+                        discontinuity_ids,
+                        dtype=np.int64,
+                    ),
+                    dataset_label=ds_id,
+                    y_name=species_name,
                 )
-                model_series_map.setdefault(ds_id, {})[species_name] = y_sim_time
-            except Exception as exc:
-                if ds_id not in final_dataset_failures:
-                    final_dataset_failures[ds_id] = build_fit_diagnostic_from_exception(
-                        exc,
-                        phase="final_replay",
-                        dataset_id=ds_id,
-                        parameter_snapshot=failed_param_snapshot,
-                    )
-                residual_blocks.append(penalty_block)
-                residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
-                continue
-
-            try:
-                if x_name == "t":
-                    y_sim_resid = y_sim_time
-                else:
-                    x_model_series = sim_species.get(x_name)
-                    if x_model_series is None:
-                        raise FitSimulationError(
-                            f"X series '{x_name}' missing in simulation result for dataset '{ds_id}'.",
-                            failed_params=failed_param_snapshot,
-                        )
-                    if species_x_obs is None:
-                        raise FitSimulationError(
-                            f"Dataset '{ds_id}' species '{species_name}' is missing x observations for X='{x_name}'.",
-                            failed_params=failed_param_snapshot,
-                        )
-                    aligner = aligners.get(species_name)
-                    if aligner is None:
-                        aligner = _ParametricXAligner(
-                            mode=x_mode,
-                            t_obs=obs_t,
-                            x_obs=species_x_obs,
-                            t_sim=sim_time,
-                            x_model=np.asarray(x_model_series, dtype=float),
-                            segment_ids=np.asarray(segment_ids, dtype=np.int64),
-                            segment_keys=tuple(segment_keys or ()),
-                            dataset_label=ds_id,
-                            x_name=x_name,
-                        )
-                        aligners[species_name] = aligner
-                    y_sim_resid = aligner.align(
-                        y_model=np.asarray(sim_species[species_name], dtype=float),
-                        y_name=species_name,
-                    )
+                y_sim_resid = selected_rows[1]
+                model_series_map.setdefault(ds_id, {})[species_name] = np.asarray(
+                    selected_rows[1], dtype=float
+                )
+                model_x_by_species_map.setdefault(ds_id, {})[species_name] = np.asarray(
+                    selected_rows[0], dtype=float
+                )
+                model_segment_ids_map.setdefault(ds_id, {})[species_name] = np.asarray(
+                    selected_rows[2], dtype=np.int64
+                )
+                model_segment_keys_map.setdefault(ds_id, {})[species_name] = tuple(
+                    selected_rows[3]
+                )
+                model_discontinuity_ids_map.setdefault(ds_id, {})[species_name] = np.asarray(
+                    selected_rows[4], dtype=np.int64
+                )
+                model_selection_provenance_map.setdefault(ds_id, {})[species_name] = tuple(
+                    selected_rows[5]
+                )
+                model_observation_ids_map.setdefault(ds_id, {})[species_name] = tuple(
+                    selected_rows[6]
+                )
+                model_raw_columns_map.setdefault(ds_id, {})[species_name] = tuple(
+                    selected_rows[7]
+                )
+                model_source_rows_map.setdefault(ds_id, {})[species_name] = tuple(
+                    selected_rows[8]
+                )
             except Exception as exc:
                 if ds_id not in final_dataset_failures:
                     final_dataset_failures[ds_id] = build_fit_diagnostic_from_exception(
@@ -1806,25 +1895,45 @@ def assemble_global_fit_result(
                 raw_residual = np.asarray(y_sim_resid, dtype=float) - y_exp
                 residual_blocks.append(raw_residual)
                 residual_series_map.setdefault(ds_id, {})[species_name] = raw_residual
+                ss_res = float(np.sum(raw_residual**2))
+                ss_tot = float(
+                    np.sum((y_exp - float(np.mean(y_exp))) ** 2)
+                )
+                r_squared_by_series[str(species_name)] = (
+                    1.0 - (ss_res / ss_tot) if ss_tot > 0.0 else float("nan")
+                )
+                target_multiplier = float(
+                    _normalized_target_weight_multipliers(
+                        species_list=species_list,
+                        target_weights=dict(payload.target_weights),
+                    )[species_name]
+                )
+                weighted_residual_blocks.append(
+                    _objective_dataset_weight_multiplier(
+                        weights.get(ds_id, 1.0)
+                    )
+                    * target_multiplier
+                    * raw_residual
+                )
 
             if x_name == "t":
-                plot_model_series_map.setdefault(ds_id, {})[species_name] = np.asarray(y_sim_resid, dtype=float).reshape(-1)
-                plot_model_x_by_species_map.setdefault(ds_id, {})[species_name] = obs_t.copy()
+                plot_model_series_map.setdefault(ds_id, {})[species_name] = np.asarray(
+                    sim_species[species_name],
+                    dtype=float,
+                ).reshape(-1).copy()
+                plot_model_x_by_species_map.setdefault(ds_id, {})[species_name] = np.asarray(
+                    sim_time,
+                    dtype=float,
+                ).reshape(-1).copy()
                 plot_model_segment_ids_map.setdefault(ds_id, {})[
                     species_name
-                ] = _align_segment_ids(
-                    np.asarray(sim_time, dtype=float),
-                    obs_t,
-                    np.asarray(segment_ids, dtype=np.int64),
-                )
+                ] = np.asarray(segment_ids, dtype=np.int64).reshape(-1).copy()
                 plot_model_segment_keys_map.setdefault(ds_id, {})[
                     species_name
-                ] = _align_segment_keys(
-                    np.asarray(sim_time, dtype=float),
-                    obs_t,
-                    np.asarray(segment_ids, dtype=np.int64),
-                    tuple(segment_keys or ()),
-                )
+                ] = tuple(segment_keys or ())
+                plot_model_discontinuity_ids_map.setdefault(ds_id, {})[
+                    species_name
+                ] = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1).copy()
             else:
                 sliced = None
                 if plot_mask is not None and isinstance(sim_species, dict) and species_name in sim_species:
@@ -1853,6 +1962,9 @@ def assemble_global_fit_result(
                         )
                         if selected
                     )
+                    plot_model_discontinuity_ids_map.setdefault(ds_id, {})[
+                        species_name
+                    ] = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1)[plot_mask].copy()
                 else:
                     full_model_y = np.asarray(
                         sim_species[species_name],
@@ -1887,42 +1999,58 @@ def assemble_global_fit_result(
                     plot_model_segment_keys_map.setdefault(ds_id, {})[
                         species_name
                     ] = tuple(segment_keys or ())
+                    plot_model_discontinuity_ids_map.setdefault(ds_id, {})[
+                        species_name
+                    ] = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1).copy()
 
         residuals = np.concatenate(residual_blocks) if residual_blocks else np.asarray([], dtype=float)
-        y_exp_all = np.concatenate(exp_blocks) if exp_blocks else np.asarray([], dtype=float)
-
-        ss_res = (
-            float(np.sum(residuals**2)) if residuals.size else float((penalty_value**2) * float(y_exp_all.size))
+        weighted_residuals = (
+            np.concatenate(weighted_residual_blocks)
+            if weighted_residual_blocks
+            else np.asarray([], dtype=float)
         )
-        ss_tot = float(np.sum((y_exp_all - float(np.mean(y_exp_all)))**2)) if y_exp_all.size else 0.0
-
-        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-        residual_mse = ss_res / residuals.size if residuals.size else float(penalty_value**2)
-        rmse = np.sqrt(np.mean(residuals**2)) if residuals.size else float(penalty_value)
-        mae = np.mean(np.abs(residuals)) if residuals.size else float(penalty_value)
+        dataset_failed = ds_id in final_dataset_failures
+        if dataset_failed or weighted_residuals.size != residuals.size:
+            weighted_sse = float("nan")
+            weighted_mse = float("nan")
+            weighted_rmse = float("nan")
+            weighted_mae = float("nan")
+            r_squared_by_series = {
+                str(species_name): float("nan")
+                for species_name in species_list
+            }
+        else:
+            weighted_sse = float(np.sum(weighted_residuals**2))
+            weighted_mse = weighted_sse / float(weighted_residuals.size)
+            weighted_rmse = float(np.sqrt(weighted_mse))
+            weighted_mae = float(np.mean(np.abs(weighted_residuals)))
 
         dataset_info.append(
             DatasetFitInfo(
                 dataset_id=ds_id,
-                r_squared=r_squared,
-                residual_mse=residual_mse,
-                rmse=rmse,
-                mae=mae,
+                r_squared_by_series=dict(r_squared_by_series),
+                weighted_residual_sse=weighted_sse,
+                weighted_residual_mse=weighted_mse,
+                weighted_rmse=weighted_rmse,
+                weighted_mae=weighted_mae,
                 residuals=residuals,
                 n_points=int(residuals.size),
                 weight=weights.get(ds_id, 1.0),
             )
         )
 
-        total_ss_res += ss_res
-        total_ss_tot += ss_tot
+        if not dataset_failed:
+            total_weighted_sse += weighted_sse
         total_points += int(residuals.size)
 
-    global_r_squared = 1.0 - (total_ss_res / total_ss_tot) if total_ss_tot > 0 else 0.0
-    global_residual_mse = total_ss_res / total_points if total_points > 0 else float(penalty_value**2)
+    weighted_residual_mse = (
+        total_weighted_sse / total_points
+        if total_points > 0 and not final_dataset_failures
+        else float("nan")
+    )
 
     metrics_finite = bool(
-        np.isfinite(total_ss_res) and np.isfinite(global_r_squared) and np.isfinite(global_residual_mse)
+        np.isfinite(total_weighted_sse) and np.isfinite(weighted_residual_mse)
     )
     optimizer_converged = bool(success)
     completion_optimizer_diagnostic = optimizer_diagnostic
@@ -1954,7 +2082,7 @@ def assemble_global_fit_result(
         if completion_status == "fail" and (not metrics_finite) and not final_dataset_failures:
             completion_optimizer_diagnostic = ensure_failure_diagnostic(
                 completion_optimizer_diagnostic,
-                message="Final residual MSE is non-finite; results are invalid.",
+                message="Final weighted residual MSE is non-finite; results are invalid.",
             )
         completion_detail_sections = build_completion_detail_sections(
             status=completion_status,
@@ -1980,24 +2108,33 @@ def assemble_global_fit_result(
     )
 
     if completion.status == "ok":
-        logger.info("Global fit complete: R²=%.4f, residual MSE=%.4e", global_r_squared, global_residual_mse)
+        logger.info(
+            "Global fit complete: weighted residual SSE=%.4e, weighted residual MSE=%.4e",
+            total_weighted_sse,
+            weighted_residual_mse,
+        )
     elif completion.status == "warn":
         logger.warning("Global fit complete with warnings: %s", completion_message)
     else:
         logger.warning(
-            "Global fit failed: residual MSE=%.4e datasets_failed=%s",
-            global_residual_mse,
+            "Global fit failed: weighted residual MSE=%.4e datasets_failed=%s",
+            weighted_residual_mse,
             ",".join(sorted(final_dataset_failures.keys())),
         )
     for info in dataset_info:
-        logger.debug("  %s: R²=%.4f, RMSE=%.4e", info.dataset_id, info.r_squared, info.rmse)
+        logger.debug(
+            "  %s: weighted SSE=%.4e, weighted RMSE=%.4e",
+            info.dataset_id,
+            info.weighted_residual_sse,
+            info.weighted_rmse,
+        )
 
     return GlobalFitResult(
         shared_params=fitted_params,
         dataset_params=combined_dataset_params,
         uncertainties=uncertainties,
-        global_residual_mse=global_residual_mse,
-        global_r_squared=global_r_squared,
+        weighted_residual_sse=total_weighted_sse,
+        weighted_residual_mse=weighted_residual_mse,
         dataset_info=dataset_info,
         nfev=nfev,
         message=completion_message,
@@ -2005,6 +2142,14 @@ def assemble_global_fit_result(
         covariance=covariance,
         objective_residuals=objective_residuals.copy() if objective_residuals is not None else None,
         model_series=model_series_map,
+        model_x_by_species=model_x_by_species_map,
+        model_segment_ids=model_segment_ids_map,
+        model_segment_keys=model_segment_keys_map,
+        model_discontinuity_ids=model_discontinuity_ids_map,
+        model_selection_provenance=model_selection_provenance_map,
+        model_observation_ids=model_observation_ids_map,
+        model_raw_columns=model_raw_columns_map,
+        model_source_rows=model_source_rows_map,
         residual_series=residual_series_map,
         plot_observed_series=plot_observed_series_map,
         plot_observed_x=plot_observed_x_map,
@@ -2014,4 +2159,5 @@ def assemble_global_fit_result(
         plot_model_series=plot_model_series_map,
         plot_model_segment_ids=plot_model_segment_ids_map,
         plot_model_segment_keys=plot_model_segment_keys_map,
+        plot_model_discontinuity_ids=plot_model_discontinuity_ids_map,
     )

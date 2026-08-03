@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Mapping, TypeAlias
+from typing import Callable, Mapping, TypeAlias
 
 from .constants import R, h, k_B
 
@@ -27,6 +27,7 @@ __all__ = [
     "forward_rate_family",
     "forward_rate_model_for_equilibrium",
     "forward_rate_model_for_reaction",
+    "forward_rate_symbolic_relation",
     "write_reference_rate",
 ]
 
@@ -47,7 +48,7 @@ class EyringRateModel:
     dG_act_J_per_mol: float
     kappa: float
     standard_conc_M: float
-    molecularity: int
+    molecularity: float
 
 
 ForwardRateModel: TypeAlias = (
@@ -62,6 +63,19 @@ def _numeric_float(value: object, *, field: str) -> float:
         return float(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{field} must be numeric.") from exc
+
+
+def _directional_order(value: object, *, field: str = "molecularity") -> float:
+    order = _numeric_float(value, field=field)
+    if not math.isfinite(order) or order < 0.0:
+        raise ValueError(f"{field} must be a finite non-negative real.")
+    return float(order)
+
+
+def _finite_result(value: float, *, field: str) -> float:
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{field} must be positive and finite.")
+    return float(value)
 
 
 def forward_rate_family(model: ForwardRateModel) -> str:
@@ -80,7 +94,7 @@ def _decode_forward_rate_model(
     *,
     family: str,
     constant_rate: object | None,
-    molecularity: int,
+    molecularity: float,
     default_kappa: float = 1.0,
     default_standard_conc_M: float = 1.0,
 ) -> ForwardRateModel:
@@ -92,11 +106,7 @@ def _decode_forward_rate_model(
     """
 
     fields = dict(payload)
-    if type(molecularity) is not int:
-        raise TypeError("molecularity must be an int.")
-    order = molecularity
-    if order < 1:
-        raise ValueError("molecularity must be at least one.")
+    order = _directional_order(molecularity)
     allowed_fields = {
         "Constant": frozenset({"k"}),
         "Arrhenius": frozenset({"A", "Ea_J_per_mol"}),
@@ -169,8 +179,8 @@ def _decode_forward_rate_model(
     # temperature (extreme, otherwise-valid barriers can be temperature-safe
     # only over their declared execution range).
     if isinstance(model, ConstantRateModel):
-        if not math.isfinite(model.k) or model.k < 0.0:
-            raise ValueError("Constant k must be finite and nonnegative.")
+        if not math.isfinite(model.k) or model.k <= 0.0:
+            raise ValueError("Constant k must be positive and finite.")
     elif isinstance(model, ArrheniusRateModel):
         if not math.isfinite(model.A) or model.A <= 0.0:
             raise ValueError("Arrhenius A must be positive and finite.")
@@ -208,10 +218,33 @@ def forward_rate_model_for_reaction(
         for name, value in overrides.items()
         if str(name) != "model"
     }
+    constant_rate = getattr(reaction, "rate", None)
+    bound_model = getattr(constant_rate, "model", None)
+    if isinstance(
+        bound_model,
+        (ConstantRateModel, ArrheniusRateModel, EyringRateModel),
+    ):
+        if forward_rate_family(bound_model) != family:
+            raise ValueError(
+                "Bound reaction rate family conflicts with accepted overrides."
+            )
+        return bound_model
+    if family == "Constant" and callable(constant_rate):
+        if bool(
+            getattr(
+                constant_rate,
+                "accepts_runtime_temperature",
+                False,
+            )
+        ):
+            raise ValueError(
+                "Constant symbolic rate authority cannot depend on runtime temperature."
+            )
+        constant_rate = constant_rate()
     return _decode_forward_rate_model(
         fields,
         family=family,
-        constant_rate=getattr(reaction, "rate", None),
+        constant_rate=constant_rate,
         molecularity=getattr(reaction, "order", 1),
         default_kappa=default_kappa,
         default_standard_conc_M=default_standard_conc_M,
@@ -221,7 +254,7 @@ def forward_rate_model_for_reaction(
 def forward_rate_model_for_equilibrium(
     equilibrium: object,
     *,
-    temperature_K: float,
+    temperature_K: float | None,
     default_kappa: float = 1.0,
     default_standard_conc_M: float = 1.0,
 ) -> ForwardRateModel:
@@ -236,28 +269,58 @@ def forward_rate_model_for_equilibrium(
     model_payload = raw_model if isinstance(raw_model, Mapping) else None
     from .equilibrium_rate_authority import effective_equilibrium_forward_rate
 
-    constant_rate = effective_equilibrium_forward_rate(
-        equilibrium,
-        temperature_K=_numeric_float(
-            temperature_K,
-            field="temperature_K",
-        ),
-    )
-    molecularity = max(
-        1,
-        int(
-            round(
-                sum(
-                    float(value)
-                    for value in dict(
-                        getattr(equilibrium, "stoich_forward", {}) or {}
-                    ).values()
-                )
+    bound_model = getattr(getattr(equilibrium, "kf", None), "model", None)
+    if isinstance(
+        bound_model,
+        (ConstantRateModel, ArrheniusRateModel, EyringRateModel),
+    ):
+        raw_family = str(
+            dict(model_payload or {}).get("type", "Constant")
+            or "Constant"
+        )
+        if forward_rate_family(bound_model) != raw_family:
+            raise ValueError(
+                "Bound equilibrium rate family conflicts with accepted metadata."
             )
+        return bound_model
+
+    if temperature_K is None:
+        constant_rate = getattr(equilibrium, "kf", None)
+        if callable(constant_rate):
+            if bool(
+                getattr(
+                    constant_rate,
+                    "accepts_runtime_temperature",
+                    False,
+                )
+            ):
+                constant_rate = None
+            else:
+                constant_rate = constant_rate()
+    else:
+        constant_rate = effective_equilibrium_forward_rate(
+            equilibrium,
+            temperature_K=_numeric_float(
+                temperature_K,
+                field="temperature_K",
+            ),
+        )
+    molecularity = _directional_order(
+        math.fsum(
+            float(value)
+            for value in dict(
+                getattr(equilibrium, "stoich_forward", {}) or {}
+            ).values()
         ),
+        field="equilibrium forward directional order",
     )
     raw_fields = dict(model_payload or {})
     family = str(raw_fields.pop("type", "Constant") or "Constant")
+    if family == "Constant":
+        # ``equilibrium.kf`` is the live accepted coordinate.  The metadata
+        # copy records authored family shape and must not become a stale mirror
+        # after canonical parameter rebinding.
+        raw_fields.pop("k", None)
     return _decode_forward_rate_model(
         raw_fields,
         family=family,
@@ -275,8 +338,8 @@ def forward_rate_at_temperature(
     """Evaluate exactly one typed forward-rate family."""
     if isinstance(model, ConstantRateModel):
         value = _numeric_float(model.k, field="Constant k")
-        if not math.isfinite(value) or value < 0.0:
-            raise ValueError("Constant k must be finite and nonnegative.")
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("Constant k must be positive and finite.")
         return value
     if isinstance(model, ArrheniusRateModel):
         return arrhenius_rate(model.A, model.Ea_J_per_mol, temperature_K)
@@ -288,6 +351,91 @@ def forward_rate_at_temperature(
             standard_conc_M=model.standard_conc_M,
             molecularity=model.molecularity,
         )
+    raise TypeError("model must be one typed forward-rate model.")
+
+
+def forward_rate_symbolic_relation(
+    model: ForwardRateModel,
+    *,
+    temperature: object,
+    literal: Callable[[float], object],
+    exponential: Callable[[object], object],
+) -> object:
+    """Project one accepted typed rate model onto a symbolic backend.
+
+    Chemistry owns the relation and all canonical-unit inputs.  The caller
+    supplies only the backend's symbolic temperature, exact-literal constructor,
+    and exponential operation; no symbolic backend is imported here.
+    """
+
+    if not callable(literal):
+        raise TypeError("literal must be callable.")
+    if not callable(exponential):
+        raise TypeError("exponential must be callable.")
+
+    def exact(value: object, *, field: str) -> object:
+        number = _numeric_float(value, field=field)
+        if not math.isfinite(number):
+            raise ValueError(f"{field} must be finite.")
+        return literal(float(number))
+
+    if isinstance(model, ConstantRateModel):
+        value = _numeric_float(model.k, field="Constant k")
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("Constant k must be positive and finite.")
+        return literal(float(value))
+    if isinstance(model, ArrheniusRateModel):
+        prefactor = _numeric_float(model.A, field="Arrhenius A")
+        activation = _numeric_float(
+            model.Ea_J_per_mol,
+            field="Arrhenius Ea_J_per_mol",
+        )
+        if not math.isfinite(prefactor) or prefactor <= 0.0:
+            raise ValueError("Arrhenius A must be positive and finite.")
+        if not math.isfinite(activation):
+            raise ValueError("Arrhenius Ea_J_per_mol must be finite.")
+        return literal(float(prefactor)) * exponential(  # type: ignore[operator]
+            -literal(float(activation))
+            / (exact(R, field="R") * temperature)  # type: ignore[operator]
+        )
+    if isinstance(model, EyringRateModel):
+        barrier = _numeric_float(
+            model.dG_act_J_per_mol,
+            field="Eyring dG_act_J_per_mol",
+        )
+        transmission = _numeric_float(model.kappa, field="Eyring kappa")
+        standard = _numeric_float(
+            model.standard_conc_M,
+            field="Eyring standard_conc_M",
+        )
+        order = _directional_order(
+            model.molecularity,
+            field="Eyring molecularity",
+        )
+        if not math.isfinite(barrier):
+            raise ValueError("Eyring dG_act_J_per_mol must be finite.")
+        if not math.isfinite(transmission) or transmission <= 0.0:
+            raise ValueError("Eyring kappa must be positive and finite.")
+        if not math.isfinite(standard) or standard <= 0.0:
+            raise ValueError(
+                "Eyring standard concentration must be positive and finite."
+            )
+        relation = (
+            literal(float(transmission))
+            * exact(k_B, field="k_B")
+            * temperature
+            / exact(h, field="h")
+            * exponential(
+                -literal(float(barrier))
+                / (exact(R, field="R") * temperature)  # type: ignore[operator]
+            )
+        )
+        standard_exponent = 1.0 - float(order)
+        if standard_exponent != 0.0:
+            relation *= literal(float(standard)) ** literal(  # type: ignore[operator]
+                float(standard_exponent)
+            )
+        return relation
     raise TypeError("model must be one typed forward-rate model.")
 
 
@@ -303,18 +451,14 @@ def write_reference_rate(
         reference_temperature_K,
         field="reference_temperature_K",
     )
-    if not math.isfinite(rate) or rate < 0.0:
-        raise ValueError("reference_rate must be finite and nonnegative.")
+    if not math.isfinite(rate) or rate <= 0.0:
+        raise ValueError("reference_rate must be positive and finite.")
     if not math.isfinite(temperature) or temperature <= 0.0:
         raise ValueError(
             "reference_temperature_K must be positive and finite."
         )
     if isinstance(model, ConstantRateModel):
         return ConstantRateModel(k=rate)
-    if rate == 0.0:
-        raise ValueError(
-            "Energy-authored reference_rate must be positive and finite."
-        )
     if isinstance(model, ArrheniusRateModel):
         A = _numeric_float(model.A, field="Arrhenius A")
         if not math.isfinite(A) or A <= 0.0:
@@ -329,20 +473,19 @@ def write_reference_rate(
             model.standard_conc_M,
             field="Eyring standard_conc_M",
         )
-        if type(model.molecularity) is not int:
-            raise TypeError("Eyring molecularity must be an int.")
-        molecularity = model.molecularity
+        molecularity = _directional_order(
+            model.molecularity,
+            field="Eyring molecularity",
+        )
         if kappa <= 0.0 or not math.isfinite(kappa):
             raise ValueError("Eyring kappa must be positive and finite.")
         if standard <= 0.0 or not math.isfinite(standard):
             raise ValueError(
                 "Eyring standard concentration must be positive and finite."
             )
-        if molecularity < 1:
-            raise ValueError("Eyring molecularity must be at least one.")
         log_ratio = (
             math.log(rate)
-            + max(0, molecularity - 1) * math.log(standard)
+            - (1.0 - molecularity) * math.log(standard)
             - math.log(kappa)
             - math.log(eyring_prefactor(temperature))
         )
@@ -363,7 +506,7 @@ def eyring_prefactor(T: float) -> float:
     temperature = _numeric_float(T, field="T")
     if temperature <= 0.0 or not math.isfinite(temperature):
         raise ValueError("T must be positive and finite")
-    return (k_B * temperature) / h
+    return _finite_result((k_B * temperature) / h, field="Eyring prefactor")
 
 
 def eyring_rate(
@@ -371,7 +514,7 @@ def eyring_rate(
     T: float,
     *,
     kappa: float = 1.0,
-    molecularity: int = 1,
+    molecularity: float = 1.0,
     standard_conc_M: float = 1.0,
 ) -> float:
     """
@@ -389,11 +532,7 @@ def eyring_rate(
     )
     if standard <= 0.0 or not math.isfinite(standard):
         raise ValueError("standard_conc_M must be positive and finite")
-    if type(molecularity) is not int:
-        raise TypeError("molecularity must be an int")
-    n = molecularity
-    if n < 1:
-        raise ValueError("molecularity must be >= 1")
+    n = _directional_order(molecularity)
 
     transmission = _numeric_float(kappa, field="kappa")
     if not math.isfinite(transmission) or transmission <= 0.0:
@@ -406,10 +545,16 @@ def eyring_rate(
     if not math.isfinite(dG):
         raise ValueError("dG_act_J_per_mol must be finite")
     exponent = -dG / (R * T)
-    k = transmission * eyring_prefactor(T) * math.exp(exponent)
-    if n >= 2:
-        k /= standard ** (n - 1)
-    return float(k)
+    try:
+        k = (
+            transmission
+            * eyring_prefactor(T)
+            * math.exp(exponent)
+            * math.pow(standard, 1.0 - n)
+        )
+    except OverflowError as exc:
+        raise ValueError("Eyring rate overflows the finite real domain") from exc
+    return _finite_result(k, field="Eyring rate")
 
 
 def arrhenius_rate(A: float, Ea_J_per_mol: float, T: float) -> float:
@@ -433,7 +578,11 @@ def arrhenius_rate(A: float, Ea_J_per_mol: float, T: float) -> float:
     if not math.isfinite(activation):
         raise ValueError("Ea_J_per_mol must be finite")
     exponent = -activation / (R * T)
-    return float(prefactor * math.exp(exponent))
+    try:
+        rate = prefactor * math.exp(exponent)
+    except OverflowError as exc:
+        raise ValueError("Arrhenius rate overflows the finite real domain") from exc
+    return _finite_result(rate, field="Arrhenius rate")
 
 
 def K_from_deltaG_eq(dG_eq_J_per_mol: float, T: float) -> float:
@@ -448,4 +597,8 @@ def K_from_deltaG_eq(dG_eq_J_per_mol: float, T: float) -> float:
     dG = _numeric_float(dG_eq_J_per_mol, field="dG_eq_J_per_mol")
     if not math.isfinite(dG):
         raise ValueError("dG_eq_J_per_mol must be finite")
-    return float(math.exp(-dG / (R * T)))
+    try:
+        value = math.exp(-dG / (R * T))
+    except OverflowError as exc:
+        raise ValueError("equilibrium constant overflows the finite real domain") from exc
+    return _finite_result(value, field="equilibrium constant")

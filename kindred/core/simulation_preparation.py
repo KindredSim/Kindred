@@ -17,7 +17,6 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from kindred.core.equilibrium_rate_authority import generated_fast_equilibrium_runtime_parameter_name
 from kindred.core.rate_binding import ForwardRateBinding, RateBinding
 import kindred.core.simulator.solvers as solver_api
 from kindred.core.exceptions import FitSimulationError
@@ -1743,6 +1742,17 @@ def _apply_parameter_overrides_to_prepared_mechanism(
                 value=float(value),
                 override_values_by_name=override_values_by_name,
             )
+        if (
+            (kind == "reaction" and str(role) == "k")
+            or (
+                kind == "equilibrium"
+                and target_role in {"kf", "kr", "Keq"}
+            )
+        ) and target_value <= 0.0:
+            raise SimulationPreparationError(
+                "parameter_overrides",
+                f"mechanism parameter {target_name!r} must be positive and finite.",
+            )
         candidate = None
         if kind == "reaction" and role == "k":
             candidate = getattr(
@@ -2019,12 +2029,11 @@ def _build_prepared_run_context(
         warnings.append(message)
 
     implicit_jacobian_solver = str(solver_config.solver).upper() in {"RADAU", "BDF"}
-    analytical_jacobian_requested = (
+    analytical_jacobian_preparation_required = (
         not symbolic_jacobian.has_executable_jacobian
-        and solver_config.use_sparse_jacobian
         and implicit_jacobian_solver
     )
-    if analytical_jacobian_requested:
+    if analytical_jacobian_preparation_required:
         try:
             jacobian_func, symbolic_jacobian_identity = _bind_symbolic_jacobian_for_current_mechanism(
                 mechanism=mechanism,
@@ -2412,6 +2421,15 @@ def prepare_simulation_worker_run(
     intervention_execution = compile_intervention_schedule(
         intervention_schedule
     )
+    runtime_symbolic_jacobian = prepared_context.symbolic_jacobian
+    if (
+        str(prepared_solver_config.solver).upper() in {"BDF", "RADAU"}
+        and not prepared_solver_config.use_sparse_jacobian
+    ):
+        runtime_symbolic_jacobian = SymbolicJacobianExecution.disabled(
+            code="policy-disabled",
+            reason="Symbolic Jacobian runtime use disabled by sparse Jacobian policy.",
+        )
     request = SimulationRequest(
         rhs=rhs,
         t_span=(float(t_span[0]), float(t_span[1])),
@@ -2421,7 +2439,7 @@ def prepare_simulation_worker_run(
         rtol=float(prepared_solver_config.rtol),
         atol=float(prepared_solver_config.atol),
         grid=prepared_solver_config.grid,
-        **prepared_context.symbolic_jacobian.to_request_kwargs(),
+        **runtime_symbolic_jacobian.to_request_kwargs(),
         events=list(events) if events is not None else None,
         temperature_schedule=temperature_schedule,
         species_names=tuple(species_names),
@@ -2551,10 +2569,14 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
                             binding.set(float(current()))
                 else:
                     parsed, ok = try_parse_callable_finite_float(current)
-                    init = float(parsed) if ok else 1.0
+                    if not ok or float(parsed) <= 0.0:
+                        raise SimulationPreparationError(
+                            "parameter_binding",
+                            f"Cannot bind {target_name!r}: equilibrium reverse rate must be positive and finite.",
+                        )
                     binding = RateBinding(
                         name=target_name,
-                        value=float(init),
+                        value=float(parsed),
                     )
             elif kind == "equilibrium" and target_role == "Keq":
                 eq = mech.equilibria[idx]
@@ -2577,12 +2599,20 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
                                 "source token."
                             ),
                         )
+                    if float(parsed) <= 0.0:
+                        raise SimulationPreparationError(
+                            "parameter_binding",
+                            f"Cannot bind {target_name!r}: equilibrium constant must be positive and finite.",
+                        )
                     binding = RateBinding(
                         name=target_name,
                         value=float(parsed),
                     )
             else:
-                binding = RateBinding(name=target_name, value=1.0)
+                raise SimulationPreparationError(
+                    "parameter_binding",
+                    f"Cannot bind unsupported mechanism coordinate {target_name!r}.",
+                )
             bindings[target_name] = binding
 
         if kind == "reaction" and role == "k":
@@ -2696,97 +2726,9 @@ def _reject_requested_algebra_owned_mechanism_parameters_for_fitting(
     )
 
 
-@dataclass
-class _FastEquilibriumEnergyBindingState:
-    units: Any
-    temperature_K: float
-    kf_fixed: float
-    std_ratio: float
-    dG_eq_J_per_mol: float
-    metadata: Dict[str, Any]
-    kf_getter: Optional[Callable[[], float]] = None
-    kf_setter: Optional[Callable[[float], None]] = None
-
-    def _sync_metadata(self) -> None:
-        self.metadata[EquilibriumMetadataKeys.DG_EQ_J_PER_MOL] = float(self.dG_eq_J_per_mol)
-        self.metadata["kf"] = float(self.kf())
-        self.metadata["kr"] = float(self.kr())
-        self.metadata["Keq"] = float(self.Keq())
-
-    def Keq(self) -> float:
-        from kindred.core.kinetics import K_from_deltaG_eq
-
-        return float(K_from_deltaG_eq(self.dG_eq_J_per_mol, self.temperature_K))
-
-    def kf(self) -> float:
-        if self.kf_getter is not None:
-            return float(self.kf_getter())
-        return float(self.kf_fixed)
-
-    def kr(self) -> float:
-        return float(self.kf() / (self.Keq() * self.std_ratio))
-
-    def binding_value(self, role: str, temperature_K: float | None = None) -> float:
-        if role == "dG_eq_fast":
-            return float(self.units.from_jmol(self.dG_eq_J_per_mol))
-        if role == "kf":
-            return float(self.kf())
-        if role == "kr":
-            return float(self.kr())
-        if role == "Keq":
-            return float(self.Keq())
-        raise KeyError(f"Unknown fast-equilibrium energy binding role: {role}")
-
-    def apply_slider_value(self, role: str, value: float) -> None:
-        value_f = float(value)
-        if role == "dG_eq_fast":
-            self.dG_eq_J_per_mol = float(self.units.to_jmol(value_f))
-        else:
-            raise KeyError(f"Fast-equilibrium role {role!r} is a generated readout, not runtime write authority")
-        self._sync_metadata()
-
-
-class _StructuredEnergyBinding(RateBinding):
-    accepts_runtime_temperature = True
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        state: Any,
-        role: str,
-        commit_after_set: Callable[[], None] | None = None,
-    ) -> None:
-        super().__init__(name=str(name), value=float(state.binding_value(role)))
-        self._state = state
-        self._role = str(role)
-        self._commit_after_set = commit_after_set
-        self._after_set_callbacks: list[Callable[[], None]] = []
-
-    def __call__(self, temperature_K: float | None = None) -> float:
-        current = float(self._state.binding_value(self._role, temperature_K))
-        self.value = current
-        return current
-
-    def set(self, new_value: float) -> None:
-        self._state.apply_slider_value(self._role, float(new_value))
-        if self._commit_after_set is not None:
-            self._commit_after_set()
-        self.value = float(self._state.binding_value(self._role))
-        for callback in tuple(self._after_set_callbacks):
-            callback()
-
-    def add_after_set_callback(self, callback: Callable[[], None]) -> None:
-        self._after_set_callbacks.append(callback)
-
-
 def _available_energy_binding_names(mechanism: Any) -> frozenset[str]:
-    names: set[str] = set()
-    for eq in getattr(mechanism, "equilibria", []) or []:
-        fast_name = generated_fast_equilibrium_runtime_parameter_name(eq)
-        if fast_name is not None:
-            names.add(fast_name)
-    return frozenset(names)
+    _ = mechanism
+    return frozenset()
 
 
 def _install_requested_energy_runtime_bindings(
@@ -2808,78 +2750,8 @@ def _install_requested_energy_runtime_bindings(
 
 
 def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]:
-    from kindred.core.mechanism_metadata import MechanismMetadataView
-    from kindred.core.rate_binding import RateBinding
-    from kindred.core.units import UnitsModel
-    from kindred.core.validation import try_parse_callable_finite_float
-
-    requested = {str(name) for name in (names or []) if str(name).strip()}
-    if not requested:
-        return {}
-
-    mech_meta = MechanismMetadataView.from_metadata(getattr(mechanism, "metadata", {}) or {})
-    bindings: Dict[str, Any] = {}
-
-    for index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
-        metadata = dict(getattr(eq, "metadata", {}) or {})
-
-        slider_name = generated_fast_equilibrium_runtime_parameter_name(eq)
-        if slider_name is None:
-            continue
-        if slider_name not in requested:
-            continue
-
-        kf_value = getattr(eq, "kf", None)
-        if isinstance(kf_value, RateBinding):
-            kf_fixed = float(kf_value())
-            kf_getter = kf_value
-            kf_setter = kf_value.set
-        else:
-            kf_fixed = float(kf_value if kf_value is not None else 1.0)
-            kf_getter = None
-            kf_setter = None
-        dG_eq_raw = metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL)
-        dG_eq_parsed, dG_eq_ok = try_parse_callable_finite_float(dG_eq_raw)
-        if not dG_eq_ok:
-            continue
-        dG_eq_J_per_mol = float(dG_eq_parsed)
-        std_ratio_raw, std_ratio_ok = try_parse_callable_finite_float(metadata.get("std_ratio"))
-        if not (std_ratio_ok and math.isfinite(float(std_ratio_raw)) and float(std_ratio_raw) > 0.0):
-            continue
-        source_energy_unit = str(metadata.get(EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT) or mech_meta.energy_unit)
-        source_units = UnitsModel(energy_unit=source_energy_unit, temperature_K=float(mech_meta.temperature_K))
-        state = _FastEquilibriumEnergyBindingState(
-            units=source_units,
-            temperature_K=float(mech_meta.temperature_K),
-            kf_fixed=float(kf_fixed),
-            kf_getter=kf_getter,
-            kf_setter=kf_setter,
-            std_ratio=float(std_ratio_raw),
-            dG_eq_J_per_mol=float(dG_eq_J_per_mol),
-            metadata=metadata,
-        )
-        state._sync_metadata()
-        metadata.pop(EquilibriumMetadataKeys.KEQ_INPUT, None)
-        mechanism.equilibria[index] = replace(
-            eq,
-            kr=None,
-            Keq=None,
-            metadata=metadata,
-        )
-        def commit_fast_equilibrium_metadata(idx: int = index, state_ref: Any = state) -> None:
-            mechanism.equilibria[idx] = replace(
-                mechanism.equilibria[idx],
-                metadata=state_ref.metadata,
-            )
-
-        bindings[slider_name] = _StructuredEnergyBinding(
-            name=slider_name,
-            state=state,
-            role="dG_eq_fast",
-            commit_after_set=commit_fast_equilibrium_metadata,
-        )
-
-    return bindings
+    _ = (mechanism, names)
+    return {}
 
 
 def _bind_requested_parameters_to_prepared_mechanism(

@@ -17,11 +17,6 @@ from kindred.core.dataset_mapping import (
     validate_fit_inclusion,
     validate_raw_dataset_record,
 )
-from kindred.core.intervention_schedule import coerce_intervention_schedule
-from kindred.core.intervention_schedule_compiler import (
-    compile_intervention_schedule,
-)
-from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
     FitDefaults,
@@ -33,7 +28,6 @@ from kindred.core.project_document import (
     validate_simulation_execution_settings,
 )
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-from kindred.core.temperature import declared_temperature_step_boundaries
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.fitting.contracts import FitParametricSettings, FitRunIdentity
 from kindred.gui.widgets.batch_initial_conditions_table import (
@@ -53,9 +47,7 @@ __all__ = [
     "FitSetupSnapshot",
     "build_fit_execution_request",
     "capture_fit_origin",
-    "pre_boundary_fit_row_candidates",
     "revalidate_fit_request_inclusions",
-    "resolve_pre_boundary_fit_rows",
     "selected_observations",
 ]
 
@@ -269,10 +261,6 @@ class FitDatasetLocalSettings:
     target_species: tuple[str, ...] = ()
     target_weights: tuple[tuple[str, float], ...] = ()
     observation_targets: tuple[tuple[str, str, str], ...] = ()
-    pre_boundary_segment_keys: tuple[
-        tuple[str, int, str],
-        ...,
-    ] = ()
     parametric: FitParametricSettings | None = None
 
     def __post_init__(self) -> None:
@@ -337,43 +325,8 @@ class FitDatasetLocalSettings:
         object.__setattr__(self, "target_species", targets)
         object.__setattr__(self, "target_weights", target_weights)
         object.__setattr__(self, "observation_targets", mapping)
-        pre_boundary_keys = tuple(
-            (
-                _required(raw_id, "raw observation ID"),
-                int(source_row),
-                _required(segment_key, "pre-boundary segment key"),
-            )
-            for raw_id, source_row, segment_key
-            in self.pre_boundary_segment_keys
-        )
-        identities = [
-            (raw_id, source_row)
-            for raw_id, source_row, _segment_key in pre_boundary_keys
-        ]
-        target_raw_ids = {
-            raw_id for raw_id, _raw, _model in mapping
-        }
-        if (
-            len(identities) != len(set(identities))
-            or any(source_row <= 0 for _raw_id, source_row in identities)
-            or any(raw_id not in target_raw_ids for raw_id, _row in identities)
-        ):
-            raise ValueError(
-                "Pre-boundary Fit identities must uniquely target positive "
-                "source rows of selected raw observations."
-            )
-        object.__setattr__(
-            self,
-            "pre_boundary_segment_keys",
-            pre_boundary_keys,
-        )
         if self.parametric is not None and self.parametric.dataset_id != self.dataset_id:
             raise ValueError("Parametric settings changed stable dataset identity.")
-        if self.parametric is not None and pre_boundary_keys:
-            raise ValueError(
-                "Pre-boundary Fit rows are supported only for time-X "
-                "observations."
-            )
         if self.parametric is not None and self.parametric.x_name in targets:
             raise ValueError(
                 "The selected parametric X series cannot also be a Y target."
@@ -401,7 +354,7 @@ class FitOriginSnapshot:
             raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
         if (
             self.prepared_dsl.analysis.normalized_text
-            != self.mechanism_source.full_dsl.strip()
+            != self.mechanism_source.reactions_text.strip()
         ):
             raise ValueError(
                 "Fit origin prepared DSL must be the retained analysis for "
@@ -439,7 +392,7 @@ class FitOriginSnapshot:
         if not capture_id:
             payload = {
                 "tab_id": self.tab_id,
-                "mechanism_text": self.mechanism_source.full_dsl,
+            "mechanism_text": self.mechanism_source.reactions_text,
                 "prepared_analysis_identity": self.prepared_dsl.analysis.identity,
                 "scientific_settings": {
                     "temperature": self.scientific_settings.temperature,
@@ -524,7 +477,7 @@ class FitExecutionRequest:
             raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
         if (
             self.prepared_dsl.analysis.normalized_text
-            != self.mechanism_source.full_dsl.strip()
+            != self.mechanism_source.reactions_text.strip()
         ):
             raise ValueError(
                 "Fit request prepared DSL must exactly match its effective source."
@@ -605,7 +558,7 @@ class FitSetupSnapshot:
             )
         if (
             self.prepared_dsl.analysis.normalized_text
-            != self.mechanism_source.full_dsl.strip()
+            != self.mechanism_source.reactions_text.strip()
         ):
             raise ValueError(
                 "Fit snapshot prepared DSL must exactly match its source."
@@ -677,10 +630,6 @@ class FitSelectedObservation:
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
-    pre_boundary_segment_keys_by_source_row: tuple[
-        tuple[int, str],
-        ...,
-    ] = ()
 
 
 def _parameter_bounds(value: float) -> tuple[float, float]:
@@ -700,7 +649,7 @@ def _initial_bounds(value: float) -> tuple[float, float]:
 
 
 def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, ...]:
-    if not tab.mechanism_source.full_dsl.strip():
+    if not tab.mechanism_source.reactions_text.strip():
         return ()
     variables: list[FitParameterVariable] = []
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
@@ -817,176 +766,6 @@ def capture_fit_origin(document: ProjectDocument, tab_id: str) -> FitOriginSnaps
     )
 
 
-def _captured_fit_observation(
-    origin: FitOriginSnapshot,
-    *,
-    dataset_id: str,
-    raw_observation_id: str,
-) -> tuple[FitMappedDatasetSnapshot, FitObservationSnapshot]:
-    if not isinstance(origin, FitOriginSnapshot):
-        raise TypeError("origin must be a FitOriginSnapshot.")
-    dataset = next(
-        (
-            item
-            for item in origin.mapped_datasets
-            if item.dataset_id == str(dataset_id)
-        ),
-        None,
-    )
-    observation = (
-        None
-        if dataset is None
-        else next(
-            (
-                item
-                for item in dataset.observations
-                if item.raw_observation_id == str(raw_observation_id)
-            ),
-            None,
-        )
-    )
-    if dataset is None or observation is None:
-        raise ValueError(
-            "Pre-boundary Fit identity must name one exact captured "
-            "observation."
-        )
-    return dataset, observation
-
-
-def _pre_boundary_candidates_for_observation(
-    origin: FitOriginSnapshot,
-    dataset: FitMappedDatasetSnapshot,
-    observation: FitObservationSnapshot,
-    *,
-    execution: SimulationExecutionSettings | None,
-) -> tuple[tuple[int, str], ...]:
-    captured_execution = dataset.execution if execution is None else execution
-    if not isinstance(captured_execution, SimulationExecutionSettings):
-        raise TypeError("execution must be SimulationExecutionSettings.")
-    validate_simulation_execution_settings(captured_execution)
-    schedule = coerce_intervention_schedule(
-        origin.prepared_dsl.intervention_schedule_for_execution()
-    )
-    if schedule is not None and schedule.is_parameterized:
-        raise ValueError(
-            "Pre-boundary Fit identity is ambiguous for a parameterized "
-            "intervention schedule."
-        )
-    contract = compile_intervention_schedule(schedule)
-    if contract.triggers:
-        raise ValueError(
-            "Pre-boundary Fit identity is ambiguous when runtime triggers "
-            "can create earlier integration segments."
-        )
-    mechanism = origin.prepared_dsl.mechanism_for_execution()
-    metadata = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", None)
-    )
-    boundaries = tuple(
-        sorted(
-            set(
-                contract.discontinuities_for_span(
-                    captured_execution.t_start,
-                    captured_execution.t_end,
-                )
-                + declared_temperature_step_boundaries(
-                    metadata.temperature_schedule,
-                    t_start=captured_execution.t_start,
-                    t_end=captured_execution.t_end,
-                )
-            )
-        )
-    )
-    segment_key_by_time = {
-        boundary: f"integration:{index}"
-        for index, boundary in enumerate(boundaries)
-    }
-    return tuple(
-        (int(row), segment_key_by_time[float(time)])
-        for row, time in zip(
-            observation.source_rows,
-            observation.t,
-            strict=True,
-        )
-        if float(time) in segment_key_by_time
-    )
-
-
-def pre_boundary_fit_row_candidates(
-    origin: FitOriginSnapshot,
-    *,
-    dataset_id: str,
-    raw_observation_id: str,
-    execution: SimulationExecutionSettings | None = None,
-) -> tuple[tuple[int, str], ...]:
-    """Discover exact static pre-boundary rows with one boundary build."""
-
-    dataset, observation = _captured_fit_observation(
-        origin,
-        dataset_id=dataset_id,
-        raw_observation_id=raw_observation_id,
-    )
-    return _pre_boundary_candidates_for_observation(
-        origin,
-        dataset,
-        observation,
-        execution=execution,
-    )
-
-
-def resolve_pre_boundary_fit_rows(
-    origin: FitOriginSnapshot,
-    *,
-    dataset_id: str,
-    raw_observation_id: str,
-    source_rows: Iterable[int],
-    execution: SimulationExecutionSettings | None = None,
-) -> tuple[tuple[int, str], ...]:
-    """Resolve authored time-X rows against canonical exact candidates."""
-
-    dataset, observation = _captured_fit_observation(
-        origin,
-        dataset_id=dataset_id,
-        raw_observation_id=raw_observation_id,
-    )
-    requested_rows = tuple(int(value) for value in source_rows)
-    if (
-        len(requested_rows) != len(set(requested_rows))
-        or any(value <= 0 for value in requested_rows)
-    ):
-        raise ValueError(
-            "Pre-boundary Fit rows must uniquely name captured positive "
-            "physical source rows."
-        )
-    captured_rows = set(observation.source_rows)
-    if any(row not in captured_rows for row in requested_rows):
-        raise ValueError(
-            "Pre-boundary Fit rows must belong to the exact captured "
-            "observation."
-        )
-    if not requested_rows:
-        return ()
-    candidate_by_row = dict(
-        _pre_boundary_candidates_for_observation(
-            origin,
-            dataset,
-            observation,
-            execution=execution,
-        )
-    )
-    missing = tuple(
-        row for row in requested_rows if row not in candidate_by_row
-    )
-    if missing:
-        raise ValueError(
-            "Source row(s) "
-            + ", ".join(str(row) for row in missing)
-            + " are not exact, unambiguous pre-boundary times in the "
-            "captured execution."
-        )
-    return tuple((row, candidate_by_row[row]) for row in requested_rows)
-
-
 def selected_observations(
     mapped: FitMappedDatasetSnapshot,
     local: FitDatasetLocalSettings,
@@ -998,13 +777,7 @@ def selected_observations(
     }
     wanted = set(local.target_species)
     selected: list[FitSelectedObservation] = []
-    pre_boundary_by_raw_id: dict[str, dict[int, str]] = {}
-    for raw_id, source_row, segment_key in local.pre_boundary_segment_keys:
-        pre_boundary_by_raw_id.setdefault(raw_id, {})[
-            int(source_row)
-        ] = segment_key
     seen_targets: set[str] = set()
-    consumed_pre_boundary_identities: set[tuple[str, int]] = set()
     for observation in mapped.observations:
         captured_raw, target = target_by_raw_id.get(
             observation.raw_observation_id,
@@ -1049,32 +822,6 @@ def selected_observations(
                     int(observation.source_rows[index])
                     for index in indices
                 ),
-                pre_boundary_segment_keys_by_source_row=tuple(
-                    (
-                        int(observation.source_rows[index]),
-                        pre_boundary_by_raw_id[
-                            observation.raw_observation_id
-                        ][int(observation.source_rows[index])],
-                    )
-                    for index in indices
-                    if int(observation.source_rows[index])
-                    in pre_boundary_by_raw_id.get(
-                        observation.raw_observation_id,
-                        {},
-                    )
-                ),
-            )
-        )
-        consumed_pre_boundary_identities.update(
-            (
-                observation.raw_observation_id,
-                int(observation.source_rows[index]),
-            )
-            for index in indices
-            if int(observation.source_rows[index])
-            in pre_boundary_by_raw_id.get(
-                observation.raw_observation_id,
-                {},
             )
         )
         seen_targets.add(target)
@@ -1083,19 +830,6 @@ def selected_observations(
         raise ValueError(
             f"Dataset {mapped.display_name!r} has no selected observation rows "
             f"for: {', '.join(sorted(missing))}."
-        )
-    requested_pre_boundary_identities = {
-        (raw_id, int(source_row))
-        for raw_id, source_row, _segment_key
-        in local.pre_boundary_segment_keys
-    }
-    if (
-        consumed_pre_boundary_identities
-        != requested_pre_boundary_identities
-    ):
-        raise ValueError(
-            "Explicit pre-boundary Fit identity references a source row "
-            "outside the selected immutable observation capture."
         )
     return tuple(selected)
 

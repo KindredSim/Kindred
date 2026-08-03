@@ -10,7 +10,6 @@ Error codes and kinds:
 - E130 DomainError       (invalid domain such as sqrt of negative in real mode)
 - E140 ZeroDiv           (division by zero)
 - E150 TypeError         (non scalar where scalar required)
-- E160 TimeRefError      (baseline missing or ambiguous for [A](T0))
 - E170 BoolCastError     (boolean in numeric-only context)
 
 Formatting requirements:
@@ -53,7 +52,6 @@ __all__ = [
     "AlgebraDomainError",
     "AlgebraZeroDivError",
     "AlgebraTypeError",
-    "AlgebraTimeRefError",
     "AlgebraBoolCastError",
     "ERROR_CLASSES",
     "error_from_kind",
@@ -173,11 +171,6 @@ class AlgebraTypeError(AlgebraError):
         super().__init__(msg=msg, code="E150", line=line, col=col, end_col=end_col, line_text=line_text)
 
 
-class AlgebraTimeRefError(AlgebraError):
-    def __init__(self, msg: str, *, line: int, col: int, end_col: int | None = None, line_text: str | None = None):
-        super().__init__(msg=msg, code="E160", line=line, col=col, end_col=end_col, line_text=line_text)
-
-
 class AlgebraBoolCastError(AlgebraError):
     def __init__(self, msg: str, *, line: int, col: int, end_col: int | None = None, line_text: str | None = None):
         super().__init__(msg=msg, code="E170", line=line, col=col, end_col=end_col, line_text=line_text)
@@ -191,7 +184,6 @@ ERROR_CLASSES: Dict[str, _ErrorFactory] = {
     "DomainError": AlgebraDomainError,
     "ZeroDiv": AlgebraZeroDivError,
     "TypeError": AlgebraTypeError,
-    "TimeRefError": AlgebraTimeRefError,
     "BoolCastError": AlgebraBoolCastError,
 }
 
@@ -229,7 +221,7 @@ def make_error(
     ----------
     kind : str
         One of: "SyntaxError","NameError","ShadowError","DomainError",
-                "ZeroDiv","TypeError","TimeRefError","BoolCastError".
+                "ZeroDiv","TypeError","BoolCastError".
     msg : str
         Human-readable message (without code prefix).
     line : int

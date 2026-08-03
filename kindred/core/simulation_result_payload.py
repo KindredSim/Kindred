@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping
 
+import numpy as np
+
+from kindred.core.result_repository import SimulationResultValue
+
 
 SimulationSuccessPayload = Dict[str, Any]
 
@@ -11,32 +15,30 @@ _SUCCESS_MESSAGE = "Simulation completed successfully"
 
 def _build_simulation_success_payload_base(
     *,
-    result: Any,
-    y: Any,
-    species_names: list[str],
+    result: SimulationResultValue,
     base_species_count: int | None,
-    algebra_scalars: Mapping[str, Any] | None,
-    algebra_errors: list[dict[str, Any]] | None,
     warnings: list[dict[str, Any]] | None,
     solver: str,
     mechanism_text: str,
     solver_config: Mapping[str, Any] | None,
-    extra_fields: Mapping[str, Any] | None = None,
 ) -> SimulationSuccessPayload:
-    provenance = getattr(result, "provenance", {})
-    if isinstance(provenance, Mapping):
-        provenance_payload: Any = dict(provenance)
-    elif provenance is None:
-        provenance_payload = {}
-    else:
-        provenance_payload = provenance
+    if not isinstance(result, SimulationResultValue):
+        raise TypeError("result must be an admitted SimulationResultValue.")
+    species_names = list(result.series)
+    y = np.vstack([result.series[name] for name in species_names])
+    provenance_payload: Any = dict(result.provenance.solver)
 
     payload: SimulationSuccessPayload = {
         "t": result.t,
         "Y": y,
-        "species_names": list(species_names),
-        "algebra_scalars": dict(algebra_scalars or {}),
-        "algebra_errors": list(algebra_errors or []),
+        "segment_ids": result.segment_ids,
+        "segment_keys": tuple(result.segment_keys),
+        "discontinuity_ids": result.discontinuity_ids,
+        "species_names": species_names,
+        "algebra_scalars": dict(result.scalars),
+        "algebra_errors": [
+            dict(error) for error in result.provenance.algebra_errors
+        ],
         "warnings": list(warnings or []),
         "solver": str(solver),
         "nfev": getattr(result, "nfev", None),
@@ -51,38 +53,26 @@ def _build_simulation_success_payload_base(
     )
     if base_species_count is not None:
         payload["base_species_count"] = max(0, int(base_species_count))
-    if extra_fields:
-        payload.update(dict(extra_fields))
     return payload
 
 
 def build_simulation_success_payload(
     *,
-    result: Any,
-    y: Any,
-    species_names: list[str],
+    result: SimulationResultValue,
     base_species_count: int | None = None,
-    algebra_scalars: Mapping[str, Any] | None,
-    algebra_errors: list[dict[str, Any]] | None,
     warnings: list[dict[str, Any]] | None,
     solver: str,
     mechanism_text: str,
     solver_config: Mapping[str, Any] | None,
     mechanism: Any = _MISSING,
-    extra_fields: Mapping[str, Any] | None = None,
 ) -> SimulationSuccessPayload:
     payload = _build_simulation_success_payload_base(
         result=result,
-        y=y,
-        species_names=species_names,
         base_species_count=base_species_count,
-        algebra_scalars=algebra_scalars,
-        algebra_errors=algebra_errors,
         warnings=warnings,
         solver=solver,
         mechanism_text=mechanism_text,
         solver_config=solver_config,
-        extra_fields=extra_fields,
     )
     if mechanism is not _MISSING:
         payload["mechanism"] = mechanism
@@ -91,28 +81,18 @@ def build_simulation_success_payload(
 
 def build_secondary_simulation_success_payload(
     *,
-    result: Any,
-    y: Any,
-    species_names: list[str],
+    result: SimulationResultValue,
     base_species_count: int | None = None,
-    algebra_scalars: Mapping[str, Any] | None,
-    algebra_errors: list[dict[str, Any]] | None,
     warnings: list[dict[str, Any]] | None,
     solver: str,
     mechanism_text: str,
     solver_config: Mapping[str, Any] | None,
-    extra_fields: Mapping[str, Any] | None = None,
 ) -> SimulationSuccessPayload:
     return _build_simulation_success_payload_base(
         result=result,
-        y=y,
-        species_names=species_names,
         base_species_count=base_species_count,
-        algebra_scalars=algebra_scalars,
-        algebra_errors=algebra_errors,
         warnings=warnings,
         solver=solver,
         mechanism_text=mechanism_text,
         solver_config=solver_config,
-        extra_fields=extra_fields,
     )

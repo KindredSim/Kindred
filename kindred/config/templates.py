@@ -1,19 +1,16 @@
-"""
-Template manager for Kindred mechanism templates.
-
-Allows users to save, load, and manage mechanism templates with metadata.
-Templates are stored in the user's configuration directory as JSON files.
-"""
+"""Current-schema mechanism template persistence and management."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-from dataclasses import dataclass, asdict
+import tempfile
+import uuid
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Mapping
+from typing import Any, Dict, List, Mapping, Optional
 
 from PySide6.QtCore import QStandardPaths
 
@@ -32,7 +29,6 @@ _TEMPLATE_FIELDS = frozenset(
         "category",
         "tags",
         "reactions_text",
-        "state_network_dsl",
         "created_at",
         "modified_at",
         "author",
@@ -45,11 +41,49 @@ _TEMPLATE_STRING_FIELDS = frozenset(
         "description",
         "category",
         "reactions_text",
-        "state_network_dsl",
         "created_at",
         "modified_at",
     }
 )
+_UNSET = object()
+
+
+def _template_name(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("template name must be an exact str.")
+    if not value or value != value.strip():
+        raise ValueError("template name must be nonblank and edge-normalized.")
+    return value
+
+
+def _template_id(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("template ID must be an exact str.")
+    try:
+        parsed = uuid.UUID(hex=value)
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("template ID must be an opaque UUID hex value.") from exc
+    if parsed.hex != value:
+        raise ValueError("template ID must be canonical lowercase UUID hex.")
+    return value
+
+
+def _nonblank_string(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{label} must be an exact str.")
+    if not value.strip():
+        raise ValueError(f"{label} must be nonblank.")
+    return value
+
+
+def _structural_template_source(
+    reactions_text: object,
+) -> MechanismAuthoringSource:
+    """Validate only the current template source-field schema."""
+
+    return MechanismAuthoringSource.from_parts(
+        reactions_text=reactions_text,
+    )
 
 
 def _validate_template_payload(data: Mapping[str, Any]) -> Dict[str, Any]:
@@ -68,267 +102,229 @@ def _validate_template_payload(data: Mapping[str, Any]) -> Dict[str, Any]:
             + ", ".join(unknown_fields)
         )
     for field in sorted(_TEMPLATE_STRING_FIELDS):
-        if not isinstance(data[field], str):
-            raise TypeError(f"template payload field {field!r} must be a str.")
+        if type(data[field]) is not str:
+            raise TypeError(f"template payload field {field!r} must be an exact str.")
     tags = data["tags"]
-    if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
-        raise TypeError("template payload field 'tags' must be a list of str.")
+    if not isinstance(tags, list) or any(type(tag) is not str for tag in tags):
+        raise TypeError("template payload field 'tags' must be a list of exact str.")
     author = data["author"]
-    if author is not None and not isinstance(author, str):
-        raise TypeError("template payload field 'author' must be a str or None.")
-    return dict(data)
+    if author is not None and type(author) is not str:
+        raise TypeError("template payload field 'author' must be an exact str or None.")
+    source = _structural_template_source(data["reactions_text"])
+    return {
+        "id": _template_id(data["id"]),
+        "name": _template_name(data["name"]),
+        "description": str(data["description"]),
+        "category": _nonblank_string(data["category"], "template category"),
+        "tags": list(tags),
+        "reactions_text": source.reactions_text,
+        "created_at": _nonblank_string(data["created_at"], "template created_at"),
+        "modified_at": _nonblank_string(data["modified_at"], "template modified_at"),
+        "author": author,
+    }
+
+
+def _decode_template_json(path: Path) -> Mapping[str, Any]:
+    def no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate template payload field {key!r}.")
+            result[key] = value
+        return result
+
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle, object_pairs_hook=no_duplicate_keys)
+    if not isinstance(data, Mapping):
+        raise TypeError("template JSON root must be an object.")
+    return data
 
 
 @dataclass
 class Template:
-    """
-    Mechanism template with metadata.
+    """One complete current-schema template and its stable identity."""
 
-    Attributes
-    ----------
-    id : str
-        Unique template identifier (generated from name)
-    name : str
-        Human-readable template name
-    description : str
-        Template description
-    category : str
-        Template category (e.g., "Kinetics", "Atmospheric", "Polymer")
-    tags : list of str
-        Searchable tags
-    reactions_text : str
-        Reaction-layer DSL text
-    state_network_dsl : str
-        State Network DSL text
-    created_at : str
-        ISO 8601 timestamp
-    modified_at : str
-        ISO 8601 timestamp
-    author : str, optional
-        Template author name
-    """
     id: str
     name: str
     description: str
     category: str
     tags: List[str]
     reactions_text: str
-    state_network_dsl: str
     created_at: str
     modified_at: str
     author: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        validated = _validate_template_payload(asdict(self))
+        for field_name, value in validated.items():
+            setattr(self, field_name, value)
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert template to dictionary."""
-        return asdict(self)
+        """Return a detached, fully validated persistence payload."""
+
+        return _validate_template_payload(asdict(self))
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> Template:
-        """Create template from dictionary."""
+    def from_dict(cls, data: Mapping[str, Any]) -> "Template":
+        """Construct one template only from the strict current schema."""
+
         return cls(**_validate_template_payload(data))
 
     @property
     def source(self) -> MechanismAuthoringSource:
-        """Return the template as a complete authoring source."""
-        return MechanismAuthoringSource.from_parts(
-            reactions_text=self.reactions_text,
-            state_network_dsl=self.state_network_dsl,
-        )
+        """Return the structurally admitted current authoring source."""
+
+        return _structural_template_source(self.reactions_text)
 
     @staticmethod
-    def generate_id(name: str) -> str:
-        """Generate template ID from name."""
-        # Convert to lowercase, replace spaces with underscores
-        return name.lower().replace(' ', '_').replace('-', '_')
+    def generate_id() -> str:
+        """Allocate an opaque ID independent of the display name."""
+
+        return uuid.uuid4().hex
 
 
 class TemplateManager:
-    """
-    Manager for user-defined mechanism templates.
-
-    Templates are stored as JSON files in the user's configuration directory:
-    - Linux: ~/.config/Kindred/templates/
-    - Windows: C:/Users/<user>/AppData/Local/Kindred/templates/
-    - macOS: ~/Library/Application Support/Kindred/templates/
-    """
+    """Own current-only template identity, collection admission, and writes."""
 
     def __init__(self):
-        """Initialize template manager."""
         self._templates: Dict[str, Template] = {}
         self._templates_dir = self._get_templates_directory()
 
     def _get_templates_directory(self) -> Path:
-        """Get templates directory path."""
         override = os.environ.get("KINDRED_TEMPLATES_DIR")
         if override:
             return Path(str(override)).expanduser().resolve()
-
-        # Get platform-specific config directory
         config_dir = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.AppDataLocation
         )
-
         if not config_dir:
-            # Fallback to home directory
             config_dir = str(Path.home() / ".kindred")
+        return (Path(config_dir) / "templates").resolve()
 
-        templates_dir = Path(config_dir) / "templates"
-        return templates_dir
+    def _templates_root(self, *, create: bool = False) -> Path:
+        root = Path(self._templates_dir).resolve()
+        if root.exists() and not root.is_dir():
+            raise NotADirectoryError(f"Template path is not a directory: {root}")
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
+        return root
 
-    def _ensure_directory_exists(self) -> None:
-        """Ensure templates directory exists."""
-        self._templates_dir.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Templates directory: {self._templates_dir}")
+    def _template_path(self, template_id: str, *, create_root: bool = False) -> Path:
+        normalized_id = _template_id(template_id)
+        root = self._templates_root(create=create_root)
+        path = (root / f"{normalized_id}.json").resolve(strict=False)
+        if path.parent != root:
+            raise ValueError("template path escapes the configured template directory.")
+        return path
+
+    @staticmethod
+    def _name_key(name: str) -> str:
+        return _template_name(name).casefold()
+
+    def _assert_available_name(
+        self,
+        name: str,
+        *,
+        except_template_id: str | None = None,
+    ) -> None:
+        candidate = self._name_key(name)
+        for current_id, template in self._templates.items():
+            if current_id != except_template_id and self._name_key(template.name) == candidate:
+                raise ValueError(f"Template name already exists: {name!r}.")
+
+    def _write_template(self, template: Template) -> None:
+        if not isinstance(template, Template):
+            raise TypeError("template must be a Template.")
+        validated = Template.from_dict(template.to_dict())
+        target = self._template_path(validated.id, create_root=True)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{validated.id}.",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(
+                    validated.to_dict(),
+                    handle,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    indent=2,
+                )
+                handle.write("\n")
+            os.replace(temporary_path, target)
+        except BaseException:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
 
     def load_templates(self) -> None:
-        """Load all templates from disk."""
-        self._templates.clear()
+        """Validate the entire collection before publishing any of it."""
 
-        if not self._templates_dir.exists():
-            logger.debug("Templates directory does not exist yet: %s", self._templates_dir)
+        root = self._templates_root()
+        if not root.exists():
+            self._templates = {}
             return
-
-        for template_file in self._templates_dir.glob("*.json"):
-            try:
-                with open(template_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-
-                template = Template.from_dict(data)
-                self._templates[template.id] = template
-                logger.debug(f"Loaded template: {template.name}")
-
-            except Exception as e:
-                logger.error(f"Failed to load template {template_file}: {e}")
-
-        logger.info(f"Loaded {len(self._templates)} template(s)")
-
-    def save_template(self, template: Template) -> None:
-        """
-        Save template to disk.
-
-        Parameters
-        ----------
-        template : Template
-            Template to save
-        """
-        template_file = self._templates_dir / f"{template.id}.json"
-
-        try:
-            self._ensure_directory_exists()
-            with open(template_file, 'w', encoding='utf-8') as f:
-                json.dump(template.to_dict(), f, indent=2)
-
-            self._templates[template.id] = template
-            logger.info(f"Saved template: {template.name} -> {template_file}")
-
-        except Exception as e:
-            logger.error(f"Failed to save template {template.name}: {e}")
-            raise
+        staged: Dict[str, Template] = {}
+        names: set[str] = set()
+        for template_file in sorted(root.glob("*.json"), key=lambda item: item.name):
+            if template_file.is_symlink() or not template_file.is_file():
+                raise ValueError(f"Template file is not a contained regular file: {template_file}")
+            resolved_file = template_file.resolve(strict=True)
+            if resolved_file.parent != root:
+                raise ValueError(f"Template file escapes the configured directory: {template_file}")
+            template = Template.from_dict(_decode_template_json(resolved_file))
+            if resolved_file != self._template_path(template.id):
+                raise ValueError(
+                    f"Template file name does not match its stable ID: {template_file.name}"
+                )
+            if template.id in staged:
+                raise ValueError(f"Duplicate template ID: {template.id!r}.")
+            name_key = self._name_key(template.name)
+            if name_key in names:
+                raise ValueError(
+                    f"Duplicate case-insensitive template name: {template.name!r}."
+                )
+            staged[template.id] = template
+            names.add(name_key)
+        self._templates = staged
+        logger.info("Loaded %d template(s)", len(staged))
 
     def delete_template(self, template_id: str) -> None:
-        """
-        Delete template from disk.
-
-        Parameters
-        ----------
-        template_id : str
-            Template ID to delete
-        """
-        template_file = self._templates_dir / f"{template_id}.json"
-
-        try:
-            if template_file.exists():
-                template_file.unlink()
-
-            if template_id in self._templates:
-                del self._templates[template_id]
-
-            logger.info(f"Deleted template: {template_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to delete template {template_id}: {e}")
-            raise
+        normalized_id = _template_id(template_id)
+        if normalized_id not in self._templates:
+            raise KeyError(f"Unknown template ID: {normalized_id!r}.")
+        template_file = self._template_path(normalized_id)
+        if template_file.exists():
+            template_file.unlink()
+        del self._templates[normalized_id]
+        logger.info("Deleted template: %s", normalized_id)
 
     def get_template(self, template_id: str) -> Optional[Template]:
-        """
-        Get template by ID.
-
-        Parameters
-        ----------
-        template_id : str
-            Template ID
-
-        Returns
-        -------
-        Template or None
-            Template if found, None otherwise
-        """
-        return self._templates.get(template_id)
+        return self._templates.get(str(template_id))
 
     def get_all_templates(self) -> List[Template]:
-        """
-        Get all templates.
-
-        Returns
-        -------
-        list of Template
-            All loaded templates
-        """
         return list(self._templates.values())
 
     def get_templates_by_category(self, category: str) -> List[Template]:
-        """
-        Get templates by category.
-
-        Parameters
-        ----------
-        category : str
-            Category name
-
-        Returns
-        -------
-        list of Template
-            Templates in the specified category
-        """
-        return [t for t in self._templates.values() if t.category == category]
+        return [template for template in self._templates.values() if template.category == category]
 
     def get_categories(self) -> List[str]:
-        """
-        Get all template categories.
-
-        Returns
-        -------
-        list of str
-            Unique categories
-        """
-        categories = set(t.category for t in self._templates.values())
-        return sorted(categories)
+        return sorted({template.category for template in self._templates.values()})
 
     def search_templates(self, query: str) -> List[Template]:
-        """
-        Search templates by name, description, or tags.
-
-        Parameters
-        ----------
-        query : str
-            Search query (case-insensitive)
-
-        Returns
-        -------
-        list of Template
-            Matching templates
-        """
-        query_lower = query.lower()
-        results = []
-
-        for template in self._templates.values():
-            # Search in name, description, and tags
-            if (query_lower in template.name.lower() or
-                query_lower in template.description.lower() or
-                any(query_lower in tag.lower() for tag in template.tags)):
-                results.append(template)
-
-        return results
+        query_lower = str(query).casefold()
+        return [
+            template
+            for template in self._templates.values()
+            if (
+                query_lower in template.name.casefold()
+                or query_lower in template.description.casefold()
+                or any(query_lower in tag.casefold() for tag in template.tags)
+            )
+        ]
 
     def create_template(
         self,
@@ -339,114 +335,81 @@ class TemplateManager:
         tags: Optional[List[str]] = None,
         author: Optional[str] = None,
     ) -> Template:
-        """
-        Create a new template.
+        """Create a new template; never select or overwrite an existing one."""
 
-        Parameters
-        ----------
-        name : str
-            Template name
-        source : MechanismAuthoringSource
-            Complete mechanism source
-        description : str, optional
-            Template description
-        category : str, optional
-            Template category (default: "General")
-        tags : list of str, optional
-            Searchable tags
-        author : str, optional
-            Template author name
-
-        Returns
-        -------
-        Template
-            Created template
-        """
-        template_id = Template.generate_id(name)
-        now = datetime.now().isoformat()
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be a MechanismAuthoringSource.")
-
+        normalized_name = _template_name(name)
+        self._assert_available_name(normalized_name)
         template = Template(
-            id=template_id,
-            name=name,
+            id=Template.generate_id(),
+            name=normalized_name,
             description=description,
             category=category,
-            tags=tags or [],
+            tags=[] if tags is None else list(tags),
             reactions_text=source.reactions_text,
-            state_network_dsl=source.state_network_dsl,
-            created_at=now,
-            modified_at=now,
+            created_at=datetime.now().isoformat(),
+            modified_at=datetime.now().isoformat(),
             author=author,
         )
-
-        self.save_template(template)
+        self._write_template(template)
+        self._templates[template.id] = template
+        logger.info("Created template: %s", template.id)
         return template
 
     def update_template(
         self,
         template_id: str,
-        name: Optional[str] = None,
-        source: Optional[MechanismAuthoringSource] = None,
-        description: Optional[str] = None,
-        category: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        author: Optional[str] = None,
-    ) -> Optional[Template]:
-        """
-        Update an existing template.
+        *,
+        name: object = _UNSET,
+        source: object = _UNSET,
+        description: object = _UNSET,
+        category: object = _UNSET,
+        tags: object = _UNSET,
+        author: object = _UNSET,
+    ) -> Template:
+        """Update fields of one existing template while preserving its ID."""
 
-        Parameters
-        ----------
-        template_id : str
-            Template ID to update
-        name : str, optional
-            New name
-        source : MechanismAuthoringSource, optional
-            New complete mechanism source
-        description : str, optional
-            New description
-        category : str, optional
-            New category
-        tags : list of str, optional
-            New tags
-        author : str, optional
-            New author
+        normalized_id = _template_id(template_id)
+        current = self._templates.get(normalized_id)
+        if current is None:
+            raise KeyError(f"Unknown template ID: {normalized_id!r}.")
+        if source is not _UNSET and not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("source must be a MechanismAuthoringSource.")
+        candidate = Template(
+            id=current.id,
+            name=current.name if name is _UNSET else name,
+            description=current.description if description is _UNSET else description,
+            category=current.category if category is _UNSET else category,
+            tags=current.tags if tags is _UNSET else tags,
+            reactions_text=(
+                current.reactions_text
+                if source is _UNSET
+                else source.reactions_text
+            ),
+            created_at=current.created_at,
+            modified_at=datetime.now().isoformat(),
+            author=current.author if author is _UNSET else author,
+        )
+        self._assert_available_name(candidate.name, except_template_id=current.id)
+        self._write_template(candidate)
+        self._templates[candidate.id] = candidate
+        logger.info("Updated template: %s", candidate.id)
+        return candidate
 
-        Returns
-        -------
-        Template or None
-            Updated template if found, None otherwise
-        """
-        template = self.get_template(template_id)
-        if not template:
-            return None
+    def replace_template(self, template_id: str, template: Template) -> Template:
+        """Replace one existing template with a complete same-ID value."""
 
-        # Update fields
-        if name is not None:
-            template.name = name
-            # Regenerate ID if name changed
-            new_id = Template.generate_id(name)
-            if new_id != template_id:
-                # Delete old template file
-                self.delete_template(template_id)
-                template.id = new_id
-
-        if source is not None:
-            if not isinstance(source, MechanismAuthoringSource):
-                raise TypeError("source must be a MechanismAuthoringSource.")
-            template.reactions_text = source.reactions_text
-            template.state_network_dsl = source.state_network_dsl
-        if description is not None:
-            template.description = description
-        if category is not None:
-            template.category = category
-        if tags is not None:
-            template.tags = tags
-        if author is not None:
-            template.author = author
-
-        template.modified_at = datetime.now().isoformat()
-
-        self.save_template(template)
-        return template
+        normalized_id = _template_id(template_id)
+        if normalized_id not in self._templates:
+            raise KeyError(f"Unknown template ID: {normalized_id!r}.")
+        if not isinstance(template, Template):
+            raise TypeError("template must be a Template.")
+        candidate = Template.from_dict(template.to_dict())
+        if candidate.id != normalized_id:
+            raise ValueError("Replacement template must retain the target stable ID.")
+        self._assert_available_name(candidate.name, except_template_id=normalized_id)
+        self._write_template(candidate)
+        self._templates[normalized_id] = candidate
+        logger.info("Replaced template: %s", normalized_id)
+        return candidate

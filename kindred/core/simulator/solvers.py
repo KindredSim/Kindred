@@ -65,6 +65,15 @@ from .solver_types import (
 
 logger = logging.getLogger(__name__)
 
+
+class _NonfiniteSymbolicJacobianError(RuntimeError):
+    """Internal signal that permits one same-segment no-Jacobian retry."""
+
+    def __init__(self, *, time: float) -> None:
+        self.time = float(time)
+        super().__init__("Symbolic Jacobian evaluation was non-finite or invalid.")
+
+
 def _solve_ivp(*, fun: Callable[[float, np.ndarray], np.ndarray], t_span: Tuple[float, float], y0: np.ndarray, **kwargs: Any):
     solve_ivp = load_scipy_integrate()
     return solve_ivp(fun=fun, t_span=t_span, y0=y0, **kwargs)
@@ -304,6 +313,30 @@ def _scrub_unused_jacobian_provenance(
     prov.update(disabled_symbolic_jacobian.provenance_fields())
 
 
+def _guard_runtime_symbolic_jacobian(
+    jacobian_func: Callable[[float, np.ndarray], np.ndarray],
+) -> Callable[[float, np.ndarray], np.ndarray]:
+    """Reject a non-finite symbolic Jacobian without reclassifying RHS errors."""
+
+    def guarded(time: float, state: np.ndarray) -> np.ndarray:
+        values = np.asarray(state, dtype=float).reshape(-1)
+        try:
+            matrix = np.asarray(
+                jacobian_func(float(time), values),
+                dtype=float,
+            )
+        except (ArithmeticError, TypeError, ValueError, OverflowError) as exc:
+            raise _NonfiniteSymbolicJacobianError(time=float(time)) from exc
+        if (
+            matrix.shape != (values.size, values.size)
+            or not np.all(np.isfinite(matrix))
+        ):
+            raise _NonfiniteSymbolicJacobianError(time=float(time))
+        return matrix
+
+    return guarded
+
+
 def _execute_scipy(
     req: SimulationRequest,
     *,
@@ -326,9 +359,42 @@ def _execute_scipy(
     if events_list is not None:
         base_kwargs["events"] = events_list
 
+    symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+        jacobian_func=req.jacobian_func,
+        jac_sparsity=req.jac_sparsity,
+        status=req.symbolic_jacobian_status,
+    )
     jac_callable = req.jacobian_func
     jac_sparsity = req.jac_sparsity
+
+    def _disable_symbolic_jacobian_for_segment(
+        *,
+        code: str,
+        reason: str,
+    ) -> None:
+        nonlocal jac_callable, jac_sparsity
+        jac_callable = None
+        jac_sparsity = None
+        prov["symbolic_jacobian"] = False
+        prov["jacobian_sparsity_hint"] = False
+        if symbolic_jacobian.has_executable_jacobian:
+            runtime_symbolic_jacobian = (
+                symbolic_jacobian.with_runtime_disabled(
+                    partially=False,
+                    code=code,
+                    reason=reason,
+                )
+            )
+            prov.pop("symbolic_jacobian_identity", None)
+            prov.update(runtime_symbolic_jacobian.provenance_fields())
+
     implicit_method = str(method) in {"Radau", "BDF"}
+    if (
+        implicit_method
+        and jac_callable is not None
+        and symbolic_jacobian.has_executable_jacobian
+    ):
+        jac_callable = _guard_runtime_symbolic_jacobian(jac_callable)
     prov["symbolic_jacobian"] = bool(
         implicit_method and jac_callable is not None
     )
@@ -373,7 +439,7 @@ def _execute_scipy(
                 return True
         return False
 
-    def _solve_or_cancelled(method_name: str):
+    def _solve_once(method_name: str):
         if _cancel_requested_via_event():
             raise SimulationCancelled()
         try:
@@ -394,7 +460,24 @@ def _execute_scipy(
             raise SimulationCancelled()
         return solved
 
-    sol = _solve_or_cancelled(method)
+    try:
+        sol = _solve_once(method)
+    except _NonfiniteSymbolicJacobianError as exc:
+        _disable_symbolic_jacobian_for_segment(
+            code="nonfinite-runtime",
+            reason=(
+                "Symbolic Jacobian disabled for this segment because a runtime "
+                "evaluation was non-finite or invalid."
+            ),
+        )
+        prov["symbolic_jacobian_runtime_fallback"] = {
+            "code": "nonfinite-runtime",
+            "time": float(exc.time),
+            "segment": segment_identity.to_payload(),
+        }
+        if _cancel_requested_via_event():
+            raise SimulationCancelled() from exc
+        sol = _solve_once(method)
 
     if events_list and getattr(sol, "status", 0) == 1 and getattr(sol, "t_events", None):
         for idx, ev in enumerate(events_list):
@@ -447,14 +530,6 @@ def _execute_scipy(
         prov["event_state_nonnegative_projection"] = (
             event_state_projection.to_payload()
         )
-    prov["result_segment_ids"] = tuple(
-        int(segment_identity.ordinal) for _ in t_out
-    )
-    prov["result_segment_keys"] = tuple(
-        segment_identity.key for _ in t_out
-    )
-    prov["result_discontinuity_ids"] = tuple(0 for _ in t_out)
-    prov["state_at_boundary"] = "post-stage-7"
     if _cancel_requested_via_event():
         raise SimulationCancelled()
     output = SimulationOutput(
@@ -579,36 +654,17 @@ def solve_ode(req: SimulationRequest) -> SimulationOutput:
 
     method = _scipy_method_for(req.solver)
     _scrub_unused_jacobian_provenance(prov, method=method, req=req)
-    intervention_execution = req.intervention_execution
-    if not intervention_execution.is_empty or req.temperature_schedule is not None:
-        return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
-            ScheduleExecutionRequest(
-                request=req,
-                rhs=rhs,
-                rhs_for_jac=rhs_for_jac,
-                t0=t0,
-                t1=t1,
-                y0=y0,
-                t_eval=t_eval,
-                provenance=prov,
-                method=method,
-                schedule=intervention_execution,
-            )
+    return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
+        ScheduleExecutionRequest(
+            request=req,
+            rhs=rhs,
+            rhs_for_jac=rhs_for_jac,
+            t0=t0,
+            t1=t1,
+            y0=y0,
+            t_eval=t_eval,
+            provenance=prov,
+            method=method,
+            schedule=req.intervention_execution,
         )
-    return _execute_scipy(
-        req,
-        segment_identity=SegmentIdentity(
-            kind="unsegmented",
-            ordinal=0,
-            t_start=t0,
-            t_end=t1,
-        ),
-        rhs=rhs,
-        rhs_for_jac=rhs_for_jac,
-        t0=t0,
-        t1=t1,
-        y0=y0,
-        t_eval=t_eval,
-        prov=prov,
-        method=method,
-    ).output
+    )
