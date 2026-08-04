@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Mapping, Optional
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
@@ -73,25 +73,61 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
 
-    def update_results(self, t: np.ndarray, species_data: Dict[str, np.ndarray],
-                       residual_mse: Optional[float] = None):
+    def update_results(
+        self,
+        canonical_time: np.ndarray,
+        species_data: Mapping[str, np.ndarray],
+        residual_mse: Optional[float] = None,
+    ) -> None:
         """
         Update table with simulation results.
 
         Parameters
         ----------
-        t : np.ndarray
-            Time array
+        canonical_time : np.ndarray
+            Canonical ``SimulationResultValue.t`` array. Display X is invalid
+            at this scientific-statistics boundary.
         species_data : dict
             Dictionary of {species_name: concentration_array}
         residual_mse : float, optional
             Result-level raw residual mean square for fitting results
         """
+        time = np.asarray(canonical_time, dtype=float)
+        if (
+            time.ndim != 1
+            or time.size == 0
+            or np.any(~np.isfinite(time))
+            or (time.size > 1 and np.any(np.diff(time) <= 0.0))
+        ):
+            raise ValueError(
+                "Scientific statistics require finite, strictly increasing "
+                "canonical simulation time."
+            )
+        normalized: dict[str, np.ndarray] = {}
+        for raw_name, raw_values in species_data.items():
+            name = str(raw_name or "").strip()
+            values = np.asarray(raw_values, dtype=float)
+            if (
+                not name
+                or values.ndim != 1
+                or values.size != time.size
+                or np.any(~np.isfinite(values))
+            ):
+                raise ValueError(
+                    "Scientific statistics series must be named, finite, and "
+                    "aligned with canonical simulation time."
+                )
+            normalized[name] = values
+        if residual_mse is not None and not np.isfinite(float(residual_mse)):
+            raise ValueError("Result MSE must be finite when provided.")
+
         # Clear existing rows
         self.setRowCount(0)
 
         # Add row for each species
-        for i, (species_name, concentrations) in enumerate(sorted(species_data.items())):
+        for i, (species_name, concentrations) in enumerate(
+            sorted(normalized.items())
+        ):
             self.insertRow(i)
 
             # Column 0: Species name
@@ -113,7 +149,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
 
             # Column 3: Time at maximum (t@Max)
             idx_max = np.argmax(concentrations)
-            t_at_max = t[idx_max]
+            t_at_max = time[idx_max]
             _item3 = QtWidgets.QTableWidgetItem(f"{t_at_max:.6g}")
             _item3.setTextAlignment(QtCore.Qt.AlignCenter)
             self.setItem(i, 3, _item3)
@@ -141,7 +177,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                 else np.abs(concentrations - final_conc)
             )
             ctc, _method, _uniform, _eps, _tail = integrate_ctc(
-                t,
+                time,
                 integrand,
                 uniformity_eps=1e-6,
                 tail_strategy="38",

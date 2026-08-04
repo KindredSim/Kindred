@@ -3,24 +3,47 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+from kindred.core.project_presentation_state import (
+    AxisSeriesSelection,
+    ExperimentalAxisSelection,
+    SimulationSeriesAxisSelection,
+)
 
 __all__ = [
-    "PlotBackend",
-    "get_plot_panel_class",
-    "available_backends",
     "try_import_pyqtgraph",
     "is_pyqtgraph_available",
     "require_pyqtgraph",
     "pyqtgraph_import_error",
+    "AxisSelectionCandidate",
     "PlotPresentationIntent",
 ]
 
 _PYQTGRAPH_IMPORT_CACHE: Optional[Tuple[bool, Any, Optional[BaseException]]] = None
+
+
+@dataclass(frozen=True, slots=True)
+class AxisSelectionCandidate:
+    """One typed axis identity paired with display-only text."""
+
+    selection: AxisSeriesSelection
+    label: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.selection,
+            (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+        ):
+            raise TypeError(
+                "Axis candidate selection must be a typed simulation or "
+                "experimental selection."
+            )
+        label = str(self.label or "").strip()
+        if not label:
+            raise ValueError("Axis candidate label must be nonblank.")
+        object.__setattr__(self, "label", label)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,89 +112,3 @@ def require_pyqtgraph(*, context: str = "Kindred") -> Any:
         f"{context} requires PyQtGraph for plotting.{detail} "
         "Install with: pip install pyqtgraph"
     ) from exc
-
-
-def available_backends() -> list[str]:
-    return ["pyqtgraph"] if is_pyqtgraph_available() else []
-
-
-class PlotBackend:
-    """
-    Plot backend configuration.
-
-    Manages PyQtGraph plotting backend (GPU-accelerated).
-
-    Attributes
-    ----------
-    backend : str
-        Current backend: always 'pyqtgraph'
-    """
-
-    _backend = "pyqtgraph"
-
-    @classmethod
-    def set_backend(cls, backend: str) -> None:
-        """
-        Set plot backend.
-
-        Parameters
-        ----------
-        backend : str
-            Must be 'pyqtgraph' (or 'auto' which resolves to pyqtgraph)
-
-        Raises
-        ------
-        ValueError
-            If backend is not 'pyqtgraph' or 'auto'
-        """
-        if backend == "auto" or backend == "pyqtgraph":
-            if not is_pyqtgraph_available():
-                raise ValueError(
-                    "PyQtGraph backend not available. "
-                    "Install with: pip install pyqtgraph"
-                )
-            cls._backend = "pyqtgraph"
-            logger.info("Plot backend set to PyQtGraph (GPU-accelerated)")
-        else:
-            raise ValueError(
-                f"Unknown backend '{backend}'. "
-                f"Only 'pyqtgraph' is supported."
-            )
-
-    @classmethod
-    def get_backend(cls) -> str:
-        """
-        Get current backend.
-
-        Returns
-        -------
-        str
-            Always 'pyqtgraph'
-        """
-        return "pyqtgraph"
-
-    @classmethod
-    def get_backend_name(cls) -> str:
-        """Get human-readable backend name."""
-        return "PyQtGraph (GPU-accelerated)"
-
-
-def get_plot_panel_class():
-    """
-    Get the configured plot panel class based on PyQtGraph availability.
-
-    Returns
-    -------
-    class
-        PyQtGraphPlotPanel
-
-    Examples
-    --------
-    >>> PlotPanelClass = get_plot_panel_class()
-    >>> plot = PlotPanelClass()
-    """
-    require_pyqtgraph(context="Kindred GUI")
-
-    from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
-    logger.debug("Using PyQtGraph plot panel")
-    return PyQtGraphPlotPanel

@@ -73,52 +73,6 @@ def slider_handle_center(slider: QtWidgets.QSlider) -> QtCore.QPoint:
     return handle.center()
 
 
-def seed_two_datasets(main_window) -> tuple:
-    t = np.linspace(0.0, 1.0, 6)
-    datasets = {
-        "ds1": {
-            "t": t.copy(),
-            "species": {
-                "A": np.linspace(1.0, 0.5, t.size),
-                "B": np.linspace(0.2, 0.9, t.size),
-            },
-        },
-        "ds2": {
-            "t": t.copy(),
-            "species": {
-                "A": np.linspace(0.8, 0.1, t.size),
-                "B": np.linspace(0.0, 0.4, t.size),
-            },
-        },
-    }
-    return commit_datasets(main_window, datasets)
-
-
-def commit_datasets(main_window, datasets: dict[str, dict]) -> tuple:
-    from kindred.gui.widgets.dataset_import_session import (
-        DatasetImportCompletion,
-        DatasetImportUnit,
-    )
-
-    before_ids = {str(record.dataset_id) for record in main_window._dataset_registry.records()}
-    completion = DatasetImportCompletion(
-        session_id=0,
-        units=tuple(
-            DatasetImportUnit(display_name=str(name), payload=dict(payload))
-            for name, payload in datasets.items()
-        ),
-        outcome="completed",
-    )
-    main_window._dataset_import_coordinator.handle_completion(completion)
-    records = tuple(
-        record
-        for record in main_window._dataset_registry.records()
-        if str(record.dataset_id) not in before_ids
-    )
-    assert len(records) == len(datasets)
-    return tuple(records)
-
-
 def dataset_id_for_label(main_window, label: str) -> str:
     record = main_window._dataset_registry.record_by_display_name(str(label))
     assert record is not None

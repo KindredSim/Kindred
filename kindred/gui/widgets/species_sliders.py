@@ -137,16 +137,19 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 )
             normalized[name] = value
             normalized_display_names[name] = display
-        same_scope = (
+        logical_scope_signature = self._logical_visibility_scope(
+            visibility_scope_signature,
+            tuple(normalized),
+        )
+        same_scope = bool(
             preserve_visibility
-            and visibility_scope_signature is not None
-            and visibility_scope_signature == self._scope_signature
+            and logical_scope_signature == self._scope_signature
         )
         if same_scope:
             self._hidden_species.intersection_update(normalized)
         else:
             self._hidden_species.clear()
-        self._scope_signature = visibility_scope_signature
+        self._scope_signature = logical_scope_signature
         self._target_set_ids = tuple(str(item) for item in target_set_ids)
         target_names = tuple(str(item).strip() for item in target_display_names)
         if self._target_set_ids and (
@@ -208,7 +211,13 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         return bool(self._rows)
 
     def visible_row_count(self) -> int:
-        return sum(row.container.isVisible() for row in self._rows.values())
+        """Return logical picker visibility, independent of ancestor widgets."""
+
+        return sum(
+            1
+            for species in self._rows
+            if species not in self._hidden_species
+        )
 
     def has_visible_entries(self) -> bool:
         return any(name not in self._hidden_species for name in self._rows)
@@ -290,6 +299,24 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def _sync_visibility(self) -> None:
         for species, row in self._rows.items():
             row.container.setVisible(species not in self._hidden_species)
+
+    @staticmethod
+    def _logical_visibility_scope(
+        supplied: object,
+        species_names: tuple[str, ...],
+    ) -> object:
+        """Discard volatile values from a name/value scope projection."""
+
+        if isinstance(supplied, tuple) and len(supplied) == len(species_names):
+            projected_names: list[str] = []
+            for item in supplied:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    break
+                projected_names.append(str(item[0]))
+            else:
+                if tuple(projected_names) == species_names:
+                    return species_names
+        return species_names if supplied is None else supplied
 
     @staticmethod
     def _value_to_position(value: float, maximum: float) -> int:

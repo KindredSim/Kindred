@@ -16,6 +16,7 @@ Example DSL:
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import List
 
@@ -48,36 +49,119 @@ class TemperatureDSLError(ValueError):
         super().__init__("\n".join(parts))
 
 
-def _parse_number_list(text: str) -> List[float]:
-    """
-    Parse comma-separated list of numbers from string like '[1,2,3]' or '1,2,3'.
-
-    Parameters
-    ----------
-    text : str
-        Text containing numbers
-
-    Returns
-    -------
-    list of float
-        Parsed numbers
-
-    Raises
-    ------
-    TemperatureDSLError
-        If parsing fails
-    """
-    # Remove brackets if present
-    text = text.strip()
-    if text.startswith('[') and text.endswith(']'):
-        text = text[1:-1]
-
-    # Split by comma and parse
-    parts = [p.strip() for p in text.split(',')]
+def _parse_finite_number(text: str, *, field: str) -> float:
+    token = text.strip()
+    if not token:
+        raise TemperatureDSLError(f"{field} must not be empty.")
     try:
-        return [float(p) for p in parts if p]
-    except ValueError as e:
-        raise TemperatureDSLError(f"Failed to parse number list '{text}': {e}")
+        value = float(token)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TemperatureDSLError(
+            f"{field} must be one finite numeric value."
+        ) from exc
+    if not math.isfinite(value):
+        raise TemperatureDSLError(f"{field} must be finite.")
+    return float(value)
+
+
+def _parse_number_list(text: str, *, field: str) -> List[float]:
+    """Parse one completely consumed, nonempty bracketed numeric list."""
+
+    token = text.strip()
+    if not (token.startswith("[") and token.endswith("]")):
+        raise TemperatureDSLError(f"{field} must be a bracketed numeric list.")
+    contents = token[1:-1]
+    parts = contents.split(",")
+    if not contents.strip() or any(not part.strip() for part in parts):
+        raise TemperatureDSLError(
+            f"{field} must not contain empty list elements."
+        )
+    return [
+        _parse_finite_number(part, field=f"{field} element")
+        for part in parts
+    ]
+
+
+def _split_directive_fields(payload: str, *, syntax_name: str) -> list[str]:
+    fields: list[str] = []
+    start = 0
+    bracket_depth = 0
+    for index, character in enumerate(payload):
+        if character == "[":
+            if bracket_depth:
+                raise TemperatureDSLError(
+                    f"Invalid {syntax_name} syntax: nested lists are not supported."
+                )
+            bracket_depth = 1
+        elif character == "]":
+            if not bracket_depth:
+                raise TemperatureDSLError(
+                    f"Invalid {syntax_name} syntax: unmatched closing bracket."
+                )
+            bracket_depth = 0
+        elif character == "," and not bracket_depth:
+            fields.append(payload[start:index].strip())
+            start = index + 1
+    if bracket_depth:
+        raise TemperatureDSLError(
+            f"Invalid {syntax_name} syntax: unclosed list."
+        )
+    fields.append(payload[start:].strip())
+    if any(not field for field in fields):
+        raise TemperatureDSLError(
+            f"Invalid {syntax_name} syntax: fields must not be empty."
+        )
+    return fields
+
+
+def _parse_directive_fields(
+    line: str,
+    *,
+    syntax_name: str,
+    expected_fields: frozenset[str],
+) -> dict[str, str]:
+    source, _comment_marker, _comment = line.partition("#")
+    match = re.fullmatch(
+        rf"(?is){re.escape(syntax_name)}:(?P<payload>.*)",
+        source.strip(),
+    )
+    if match is None:
+        raise TemperatureDSLError(f"Invalid {syntax_name} syntax.")
+    payload = match.group("payload").strip()
+    if not payload:
+        raise TemperatureDSLError(
+            f"Invalid {syntax_name} syntax: directive fields are required."
+        )
+
+    parsed: dict[str, str] = {}
+    for field in _split_directive_fields(payload, syntax_name=syntax_name):
+        if field.count("=") != 1:
+            raise TemperatureDSLError(
+                f"Invalid {syntax_name} field {field!r}; expected name=value."
+            )
+        name, value = (part.strip() for part in field.split("=", 1))
+        if not name or not value:
+            raise TemperatureDSLError(
+                f"Invalid {syntax_name} field {field!r}; name and value are required."
+            )
+        if name in parsed:
+            raise TemperatureDSLError(
+                f"Duplicate {syntax_name} field {name!r}."
+            )
+        parsed[name] = value
+
+    missing = sorted(expected_fields - set(parsed))
+    unknown = sorted(set(parsed) - expected_fields)
+    if missing or unknown:
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unknown:
+            details.append("unknown " + ", ".join(unknown))
+        raise TemperatureDSLError(
+            f"Invalid {syntax_name} fields: " + "; ".join(details) + "."
+        )
+    return parsed
 
 
 def parse_temperature_schedule(
@@ -163,14 +247,13 @@ def _parse_piecewise_temperature(
     TemperatureSchedule
         Piecewise temperature schedule
     """
-    times, temperatures = _parse_time_temperature_lists(
+    fields = _parse_directive_fields(
         line,
         syntax_name="temp_step",
-        examples=[
-            "temp_step: t=[0,50,100], T=[298,350]",
-            "temp_step: t=[0,25,50,75], T=[298,310,320]",
-        ],
+        expected_fields=frozenset({"t", "T"}),
     )
+    times = _parse_number_list(fields["t"], field="temp_step t")
+    temperatures = _parse_number_list(fields["T"], field="temp_step T")
 
     # Validate
     if len(times) < 2:
@@ -214,27 +297,6 @@ def _parse_piecewise_temperature(
         raise TemperatureDSLError(f"Invalid piecewise schedule: {e}")
 
 
-def _parse_time_temperature_lists(
-    line: str,
-    *,
-    syntax_name: str,
-    examples: list[str],
-) -> tuple[List[float], List[float]]:
-    t_match = re.search(r'\bt\s*=\s*\[([^\]]+)\]', line)
-    T_match = re.search(r'\bT\s*=\s*\[([^\]]+)\]', line)
-
-    if not t_match or not T_match:
-        raise TemperatureDSLError(
-            f"Invalid {syntax_name} syntax",
-            suggestion=f"Format: {syntax_name}: t=[time_points], T=[temperatures]",
-            examples=examples,
-        )
-
-    times = _parse_number_list(t_match.group(1))
-    temperatures = _parse_number_list(T_match.group(1))
-    return times, temperatures
-
-
 def _parse_response_temperature(
     line: str,
     *,
@@ -245,32 +307,16 @@ def _parse_response_temperature(
 
     Format: temp_response: t=[0,50,100], T=[298,320], tau=10
     """
-    times, temperatures = _parse_time_temperature_lists(
+    fields = _parse_directive_fields(
         line,
         syntax_name="temp_response",
-        examples=[
-            "temp_response: t=[0,50,100], T=[298,350], tau=10",
-            "temp_response: t=[0,25,50,75], T=[298,310,320], tau=5",
-        ],
+        expected_fields=frozenset({"t", "T", "tau"}),
     )
-    tau_match = re.search(r'\btau\s*=\s*([0-9.eE+-]+)', line, re.IGNORECASE)
-    if not tau_match:
-        raise TemperatureDSLError(
-            "Invalid temp_response syntax",
-            suggestion="Format: temp_response: t=[time_points], T=[temperatures], tau=<value>",
-            examples=[
-                "temp_response: t=[0,50,100], T=[298,350], tau=10",
-                "temp_response: t=[0,25,50,75], T=[298,310,320], tau=5",
-            ],
-        )
-
-    try:
-        tau = float(tau_match.group(1))
-    except ValueError:
-        raise TemperatureDSLError(
-            f"Invalid tau value: {tau_match.group(1)}",
-            suggestion="tau must be a valid positive number",
-        )
+    times = _parse_number_list(fields["t"], field="temp_response t")
+    temperatures = _parse_number_list(
+        fields["T"], field="temp_response T"
+    )
+    tau = _parse_finite_number(fields["tau"], field="temp_response tau")
     if tau <= 0:
         raise TemperatureDSLError(
             f"tau must be positive, got {tau}",

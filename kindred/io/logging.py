@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
 import sys
 import time
 import traceback
@@ -69,6 +70,8 @@ from datetime import datetime
 from typing import Any, Dict, Optional, Iterator
 
 from kindred.io.logging_config import (
+    BACKUP_COUNT,
+    MAX_LOG_SIZE,
     setup_logging as _setup_basic_logging,
     get_log_dir,
     get_logger as _get_basic_logger,
@@ -209,6 +212,7 @@ def setup_structured_logging(
     level: Optional[str] = None,
     log_file: Optional[str] = None,
     console: bool = True,
+    file_handler: bool = True,
     indent: Optional[int] = None,
 ) -> None:
     """
@@ -222,6 +226,8 @@ def setup_structured_logging(
         JSON log file path. If None, uses default location.
     console : bool
         Enable console output
+    file_handler : bool
+        Enable the bounded rotating JSON-lines file handler
     indent : int, optional
         JSON indentation (None=compact, 2/4=pretty)
 
@@ -259,23 +265,26 @@ def setup_structured_logging(
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
 
-    # File handler
-    if log_file or console:
-        if log_file is None and not console:
-            log_dir = get_log_dir()
-            log_file = str(log_dir / "kindred_structured.jsonl")
-
-        if log_file:
-            try:
-                file_handler = logging.FileHandler(log_file, encoding="utf-8")
-                file_handler.setLevel(numeric_level)
-                file_handler.setFormatter(formatter)
-                root_logger.addHandler(file_handler)
-            except (OSError, PermissionError) as e:
-                if console:
-                    root_logger.warning(f"Failed to create log file: {e}")
-                else:
-                    raise
+    if file_handler:
+        if log_file is None:
+            log_file = str(get_log_dir() / "kindred_structured.jsonl")
+        try:
+            file_handler_obj = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=MAX_LOG_SIZE,
+                backupCount=BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            file_handler_obj.setLevel(numeric_level)
+            file_handler_obj.setFormatter(formatter)
+            root_logger.addHandler(file_handler_obj)
+        except (OSError, PermissionError) as exc:
+            if console:
+                root_logger.warning("Failed to create structured log file: %s", exc)
+            else:
+                raise RuntimeError(
+                    f"Failed to set up structured logging: {exc}"
+                ) from exc
 
 
 # ------------------------------- Configuration ---------------------------------
@@ -566,6 +575,7 @@ def setup_logging(
             level=level,
             log_file=log_file,
             console=console,
+            file_handler=file_handler,
             **kwargs
         )
     else:

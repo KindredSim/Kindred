@@ -1,4 +1,4 @@
-"""Pure observation-column mapping and exact-zero seeding helpers."""
+"""Pure raw-observation mapping and exact-zero seeding helpers."""
 
 from __future__ import annotations
 
@@ -13,70 +13,107 @@ class ObservationMappingError(ValueError):
 
 @dataclass(frozen=True)
 class ObservationMappingSuggestion:
+    raw_observation_id: str
     raw_column: str
     model_species: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.raw_observation_id, "raw observation ID"),
+            (self.raw_column, "raw observation label"),
+            (self.model_species, "model species"),
+        ):
+            if (
+                type(value) is not str
+                or not value
+                or value != value.strip()
+            ):
+                raise ValueError(
+                    f"Observation mapping suggestion {label} must be "
+                    "nonblank and edge-normalized."
+                )
+
+
+def _canonical_text(value: object, label: str) -> str:
+    if type(value) is not str or not value or value != value.strip():
+        raise ObservationMappingError(
+            f"{label} must be a nonblank edge-normalized string."
+        )
+    return value
 
 
 def normalize_observation_mapping(
     mapping: Iterable[tuple[str, str]],
     *,
-    raw_columns: Sequence[str],
+    raw_observations: Sequence[tuple[str, str]],
     model_species: Sequence[str],
 ) -> tuple[tuple[str, str], ...]:
     """Validate and deterministically order an explicit partial bijection."""
-    normalized_columns = tuple(str(value).strip() for value in raw_columns)
-    normalized_species = tuple(str(value).strip() for value in model_species)
-    if any(not value for value in normalized_columns):
-        raise ObservationMappingError("Raw observation column names must be nonblank.")
-    if any(not value for value in normalized_species):
-        raise ObservationMappingError("Model species names must be nonblank.")
-    if len(set(normalized_columns)) != len(normalized_columns):
-        raise ObservationMappingError("Raw observation column names must be unique.")
+    normalized_observations = tuple(
+        (
+            _canonical_text(raw_id, "Raw observation ID"),
+            _canonical_text(raw_column, "Raw observation label"),
+        )
+        for raw_id, raw_column in raw_observations
+    )
+    normalized_ids = tuple(raw_id for raw_id, _ in normalized_observations)
+    normalized_species = tuple(
+        _canonical_text(value, "Model species name")
+        for value in model_species
+    )
+    if len(set(normalized_ids)) != len(normalized_ids):
+        raise ObservationMappingError("Raw observation IDs must be unique.")
     if len(set(normalized_species)) != len(normalized_species):
         raise ObservationMappingError("Model species names must be unique.")
-    available_columns = set(normalized_columns)
+    available_ids = set(normalized_ids)
+    column_by_id = dict(normalized_observations)
     available_species = set(normalized_species)
-    by_column: dict[str, str] = {}
-    by_species: dict[str, str] = {}
-    for raw_column, raw_species in mapping:
-        column = str(raw_column).strip()
-        species = str(raw_species).strip()
-        if not column or not species:
-            raise ObservationMappingError("Observation mappings require nonblank column and species names.")
-        if column not in available_columns:
+    by_raw_id: dict[str, str] = {}
+    raw_id_by_species: dict[str, str] = {}
+    for raw_observation_id, raw_species in mapping:
+        raw_id = _canonical_text(
+            raw_observation_id,
+            "Mapped raw observation ID",
+        )
+        species = _canonical_text(raw_species, "Mapped model species")
+        if raw_id not in available_ids:
             raise ObservationMappingError(
-                f"Explicit observation column '{column}' is no longer present in the raw dataset."
+                f"Explicit raw observation ID {raw_id!r} is no longer present "
+                "in the dataset."
             )
         if species not in available_species:
             raise ObservationMappingError(
                 f"Explicit observation target '{species}' is not present in the active mechanism."
             )
-        previous_species = by_column.get(column)
+        previous_species = by_raw_id.get(raw_id)
         if previous_species is not None:
             if previous_species == species:
                 raise ObservationMappingError(
-                    f"Observation mapping '{column}' to '{species}' is duplicated."
+                    f"Observation mapping for raw ID {raw_id!r} "
+                    f"({column_by_id[raw_id]!r}) to {species!r} is duplicated."
                 )
             raise ObservationMappingError(
-                f"Observation column '{column}' is mapped to more than one mechanism species."
+                f"Raw observation ID {raw_id!r} ({column_by_id[raw_id]!r}) "
+                "is mapped to more than one mechanism species."
             )
-        previous_column = by_species.get(species)
-        if previous_column is not None:
+        previous_raw_id = raw_id_by_species.get(species)
+        if previous_raw_id is not None:
             raise ObservationMappingError(
-                f"Mechanism species '{species}' is mapped from more than one observation column."
+                f"Mechanism species {species!r} is mapped from more than one "
+                "raw observation."
             )
-        by_column[column] = species
-        by_species[species] = column
+        by_raw_id[raw_id] = species
+        raw_id_by_species[species] = raw_id
     return tuple(
-        (column, by_column[column])
-        for column in normalized_columns
-        if column in by_column
+        (raw_id, by_raw_id[raw_id])
+        for raw_id in normalized_ids
+        if raw_id in by_raw_id
     )
 
 
 def suggest_observation_mapping(
     *,
-    raw_columns: Sequence[str],
+    raw_observations: Sequence[tuple[str, str]],
     model_species: Sequence[str],
 ) -> tuple[ObservationMappingSuggestion, ...]:
     """Suggest only unambiguous exact-name matches.
@@ -84,24 +121,35 @@ def suggest_observation_mapping(
     Suggestions are never a confirmed mapping. Callers must present and obtain
     explicit confirmation before passing them to a canonical mutation.
     """
-    columns = tuple(str(value) for value in raw_columns)
+    observations = tuple(
+        (
+            _canonical_text(raw_id, "Raw observation ID"),
+            _canonical_text(raw_column, "Raw observation label"),
+        )
+        for raw_id, raw_column in raw_observations
+    )
     suggestions: list[ObservationMappingSuggestion] = []
-    claimed_columns: set[str] = set()
+    claimed_ids: set[str] = set()
     claimed_species: set[str] = set()
-    candidates: list[tuple[str, str]] = []
+    candidates: list[tuple[str, str, str]] = []
     for species_value in model_species:
-        species = str(species_value)
-        exact = [column for column in columns if column == species]
+        species = _canonical_text(species_value, "Model species name")
+        exact = [
+            (raw_id, raw_column)
+            for raw_id, raw_column in observations
+            if raw_column == species
+        ]
         if len(exact) == 1:
-            candidates.append((exact[0], species))
-    for column, species in candidates:
-        if column in claimed_columns or species in claimed_species:
+            candidates.append((*exact[0], species))
+    for raw_id, raw_column, species in candidates:
+        if raw_id in claimed_ids or species in claimed_species:
             continue
-        claimed_columns.add(column)
+        claimed_ids.add(raw_id)
         claimed_species.add(species)
         suggestions.append(
             ObservationMappingSuggestion(
-                raw_column=column,
+                raw_observation_id=raw_id,
+                raw_column=raw_column,
                 model_species=species,
             )
         )
@@ -115,29 +163,45 @@ def seed_species_values_at_exact_zero(
     confirmed_mapping: Iterable[tuple[str, str]],
 ) -> tuple[tuple[str, float], ...]:
     """Build a complete species vector using only confirmed samples at t == 0.0."""
-    columns = tuple(str(value) for value in observations.keys())
+    raw_observations: list[tuple[str, str]] = []
+    for raw_id_value, raw_spec in observations.items():
+        raw_id = _canonical_text(raw_id_value, "Raw observation ID")
+        if not isinstance(raw_spec, Mapping):
+            raise ObservationMappingError(
+                f"Raw observation {raw_id!r} has an invalid series payload."
+            )
+        raw_observations.append(
+            (
+                raw_id,
+                _canonical_text(
+                    raw_spec.get("raw_column"),
+                    "Raw observation label",
+                ),
+            )
+        )
     mapping = normalize_observation_mapping(
         confirmed_mapping,
-        raw_columns=columns,
+        raw_observations=tuple(raw_observations),
         model_species=model_species,
     )
-    column_by_species = {species: column for column, species in mapping}
+    raw_id_by_species = {species: raw_id for raw_id, species in mapping}
     seeded: list[tuple[str, float]] = []
     for species_value in model_species:
-        species = str(species_value)
+        species = _canonical_text(species_value, "Model species name")
         value = 0.0
-        column = column_by_species.get(species)
-        if column is not None:
-            spec = observations[column]
-            if not isinstance(spec, Mapping):
-                raise ObservationMappingError(
-                    f"Observation column '{column}' has an invalid series payload."
-                )
+        raw_id = raw_id_by_species.get(species)
+        if raw_id is not None:
+            spec = observations[raw_id]
+            raw_column = _canonical_text(
+                spec.get("raw_column"),
+                "Raw observation label",
+            )
             t_values = tuple(float(item) for item in spec.get("t", ()))
             y_values = tuple(float(item) for item in spec.get("y", ()))
             if len(t_values) != len(y_values):
                 raise ObservationMappingError(
-                    f"Observation column '{column}' has mismatched time and value lengths."
+                    f"Observation {raw_column!r} (raw ID {raw_id!r}) has "
+                    "mismatched time and value lengths."
                 )
             source_rows = tuple(int(item) for item in spec.get("source_rows", ()))
             if (
@@ -146,8 +210,8 @@ def seed_species_values_at_exact_zero(
                 or len(set(source_rows)) != len(source_rows)
             ):
                 raise ObservationMappingError(
-                    f"Observation column '{column}' requires one unique positive "
-                    "physical source row per value."
+                    f"Observation {raw_column!r} (raw ID {raw_id!r}) requires "
+                    "one unique positive physical source row per value."
                 )
             zero_indexes = tuple(
                 index
@@ -160,14 +224,16 @@ def seed_species_values_at_exact_zero(
                 )
                 joined = ", ".join(str(identity) for identity in identities)
                 raise ObservationMappingError(
-                    f"Observation column '{column}' mapped to species '{species}' "
-                    f"has multiple exact t=0.0 values at source rows {joined}."
+                    f"Observation {raw_column!r} (raw ID {raw_id!r}) mapped "
+                    f"to species {species!r} has multiple exact t=0.0 values "
+                    f"at source rows {joined}."
                 )
             if zero_indexes:
                 y_value = y_values[zero_indexes[0]]
                 if not math.isfinite(y_value):
                     raise ObservationMappingError(
-                        f"Observation column '{column}' has a non-finite value at t=0."
+                        f"Observation {raw_column!r} (raw ID {raw_id!r}) "
+                        "has a non-finite value at t=0."
                     )
                 value = y_value
         seeded.append((species, value))

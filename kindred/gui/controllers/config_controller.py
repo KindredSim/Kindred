@@ -60,8 +60,11 @@ _FIT_SETTINGS_KEYS = {
     "seed": "fitting/seed",
 }
 _RUN_USER_MAXIMUM_KEY = "simulation/run_user_maximum"
+_RESULT_CACHE_CAPACITY_KEY = "results/cache_capacity"
 _MECHANISM_PARAMETER_DEBOUNCE_KEY = "sliders/mechanism_parameter_debounce_ms"
 _EQUILIBRIUM_K_DEBOUNCE_KEY = "sliders/equilibrium_k_debounce_ms"
+_DEFAULT_RESULT_CACHE_CAPACITY = 32
+_QT_POSITIVE_INT_MAX = (1 << 31) - 1
 _DEFAULT_MECHANISM_PARAMETER_DEBOUNCE_MS = 80
 _DEFAULT_EQUILIBRIUM_K_DEBOUNCE_MS = 150
 
@@ -99,6 +102,7 @@ class ConfigControllerPort:
     splitter: Callable[[], object | None]
     dark_mode_action: Callable[[], object | None]
     apply_theme: Callable[[bool, Callable[[bool], None] | None], bool]
+    actual_dark_mode: Callable[[], bool]
     set_status_text: Callable[[str], None]
     recent_menu: Callable[[], object | None]
     load_recent_project: Callable[[str], None]
@@ -109,6 +113,7 @@ class ConfigController(QtCore.QObject):
 
     applicationPlotPreferencesChanged = QtCore.Signal()
     runUserMaximumChanged = QtCore.Signal(int)
+    resultCacheCapacityChanged = QtCore.Signal(int)
     mechanismParameterDebounceChanged = QtCore.Signal(int)
     equilibriumKDebounceChanged = QtCore.Signal(int)
 
@@ -116,6 +121,13 @@ class ConfigController(QtCore.QObject):
         super().__init__(ui.parent)
         self._ui = ui
         self._species_palette = self._build_species_palette()
+        self._result_cache_capacity_action = QtGui.QAction(
+            "Result Cache Capacity…",
+            self,
+        )
+        self._result_cache_capacity_action.triggered.connect(
+            self._configure_result_cache_capacity
+        )
 
     def _settings(self) -> QtCore.QSettings:
         settings = self._ui.settings()
@@ -158,6 +170,77 @@ class ConfigController(QtCore.QObject):
         if previous != accepted:
             self.runUserMaximumChanged.emit(accepted)
         return accepted
+
+    @property
+    def result_cache_capacity_action(self) -> QtGui.QAction:
+        """Return the controller-owned Preferences action."""
+
+        return self._result_cache_capacity_action
+
+    def result_cache_capacity(self) -> int:
+        """Return the validated per-tab explicit-result cache capacity."""
+
+        parsed = self._parsed_int(
+            self._settings().value(
+                _RESULT_CACHE_CAPACITY_KEY,
+                _DEFAULT_RESULT_CACHE_CAPACITY,
+            )
+        )
+        if parsed is None or not 1 <= parsed <= _QT_POSITIVE_INT_MAX:
+            logger.warning(
+                "Ignoring invalid persisted result cache capacity."
+            )
+            return _DEFAULT_RESULT_CACHE_CAPACITY
+        return parsed
+
+    def set_result_cache_capacity(self, value: int) -> int:
+        """Persist and synchronously publish one positive Qt integer."""
+
+        if type(value) is not int:
+            raise TypeError("Result cache capacity must be an integer.")
+        if not 1 <= value <= _QT_POSITIVE_INT_MAX:
+            raise ValueError(
+                "Result cache capacity must be a positive Qt integer."
+            )
+        previous = self.result_cache_capacity()
+        settings = self._settings()
+        settings.setValue(_RESULT_CACHE_CAPACITY_KEY, value)
+        self._sync_or_raise(settings, "result cache capacity")
+        if previous != value:
+            self.resultCacheCapacityChanged.emit(value)
+        return value
+
+    @QtCore.Slot(bool)
+    def _configure_result_cache_capacity(self, _checked: bool = False) -> None:
+        parent = (
+            self._ui.parent
+            if isinstance(self._ui.parent, QtWidgets.QWidget)
+            else None
+        )
+        value, accepted = QtWidgets.QInputDialog.getInt(
+            parent,
+            "Result Cache Capacity",
+            "Maximum retained explicit results per mechanism tab:",
+            self.result_cache_capacity(),
+            1,
+            _QT_POSITIVE_INT_MAX,
+            1,
+        )
+        if not accepted:
+            return
+        try:
+            saved = self.set_result_cache_capacity(int(value))
+        except Exception as exc:
+            logger.exception("Result cache capacity could not be persisted")
+            QtWidgets.QMessageBox.critical(
+                parent,
+                "Result Cache Capacity",
+                f"Could not save the result cache capacity:\n\n{exc}",
+            )
+            return
+        self._ui.set_status_text(
+            f"Result cache capacity set to {saved} per mechanism tab."
+        )
 
     def mechanism_parameter_debounce_ms(self) -> int:
         return self._debounce_setting(
@@ -493,10 +576,10 @@ class ConfigController(QtCore.QObject):
             self._ui.restore_maximized_state()
 
         requested_dark = bool(self._setting(settings, _THEME_KEY, True, bool))
-        applied = self._ui.apply_theme(requested_dark, None)
+        self._ui.apply_theme(requested_dark, None)
         action = self._ui.dark_mode_action()
         if action is not None:
-            action.setChecked(requested_dark if applied else not requested_dark)
+            action.setChecked(self._actual_dark_mode())
 
     def save_settings(self) -> bool:
         """Save physical layout preferences without copying project state."""
@@ -526,10 +609,19 @@ class ConfigController(QtCore.QObject):
         if action is None:
             return False
         requested = bool(action.isChecked())
-        applied = self._ui.apply_theme(requested, self.persist_theme)
-        if not applied:
-            action.setChecked(not requested)
+        try:
+            applied = self._ui.apply_theme(requested, self.persist_theme)
+        finally:
+            action.setChecked(self._actual_dark_mode())
         return applied
+
+    def _actual_dark_mode(self) -> bool:
+        actual = self._ui.actual_dark_mode()
+        if type(actual) is not bool:
+            raise TypeError(
+                "ConfigControllerPort.actual_dark_mode() must return bool."
+            )
+        return actual
 
     @staticmethod
     def _sync_or_raise(settings: QtCore.QSettings, label: str) -> None:

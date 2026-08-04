@@ -20,7 +20,7 @@ class ActiveDatasetLinkSnapshot:
     set_name: str | None
     observation_mapping: tuple[tuple[str, str], ...]
     include_in_fit: bool
-    overlay_columns: tuple[str, ...] = ()
+    overlay_raw_observation_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,7 +117,9 @@ def build_data_manager_snapshot(
         )
     canonical_links = dict(active_tab.dataset_links)
     overlays = dict(
-        () if presentation is None else presentation.overlay_columns_by_dataset
+        ()
+        if presentation is None
+        else presentation.overlay_raw_observation_ids_by_dataset
     )
     sets_by_id = {
         item.set_id: item.name for item in active_tab.initial_condition_sets
@@ -145,7 +147,9 @@ def build_data_manager_snapshot(
                 if record.dataset_id in canonical_links
                 else False
             ),
-            overlay_columns=tuple(overlays.get(record.dataset_id, ())),
+            overlay_raw_observation_ids=tuple(
+                overlays.get(record.dataset_id, ())
+            ),
         )
         for record in document.datasets
     )
@@ -167,7 +171,9 @@ def build_experimental_layer_inputs(
     presentation: ProjectPresentationState,
 ) -> tuple[ExperimentalLayerInput, ...]:
     """Build the presenter's selected experimental inputs without plotting."""
-    overlays = dict(presentation.overlay_columns_by_dataset)
+    overlays = dict(
+        presentation.overlay_raw_observation_ids_by_dataset
+    )
     links = dict(active_tab.dataset_links)
     layers: list[ExperimentalLayerInput] = []
     for record in document.datasets:
@@ -178,7 +184,8 @@ def build_experimental_layer_inputs(
         mapping = dict(link.observation_mapping) if link is not None else {}
         for series in record.observations:
             raw_column = str(series.column_name)
-            if raw_column not in selected:
+            raw_observation_id = series.raw_observation_id
+            if raw_observation_id not in selected:
                 continue
             layers.append(
                 ExperimentalLayerInput(
@@ -187,10 +194,10 @@ def build_experimental_layer_inputs(
                         f"{series.raw_observation_id}"
                     ),
                     dataset_id=record.dataset_id,
-                    raw_observation_id=series.raw_observation_id,
+                    raw_observation_id=raw_observation_id,
                     dataset_name=record.display_name,
                     raw_column=raw_column,
-                    model_species=mapping.get(raw_column),
+                    model_species=mapping.get(raw_observation_id),
                     t=series.t,
                     y=series.y,
                     source_rows=series.source_rows,

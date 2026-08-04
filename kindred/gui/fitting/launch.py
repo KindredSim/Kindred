@@ -37,16 +37,22 @@ from kindred.gui.widgets.batch_initial_conditions_table import (
 
 __all__ = [
     "FitDatasetLocalSettings",
+    "FitDatasetSetupEdit",
+    "FitDefaultsSetupEdit",
     "FitExecutionRequest",
+    "FitInitialSetupEdit",
     "FitInitialVariable",
     "FitMappedDatasetSnapshot",
     "FitObservationSnapshot",
     "FitOriginSnapshot",
     "FitParameterVariable",
+    "FitParameterSetupEdit",
     "FitSelectedObservation",
     "FitSetupSnapshot",
     "build_fit_execution_request",
     "capture_fit_origin",
+    "create_initial_fit_setup",
+    "fit_origin_science_matches",
     "revalidate_fit_request_inclusions",
     "selected_observations",
 ]
@@ -144,15 +150,10 @@ class FitMappedDatasetSnapshot:
             raise TypeError(
                 "Mapped Fit observations must be FitObservationSnapshot values."
             )
-        raw_columns = [item.raw_column for item in observations]
         raw_ids = [item.raw_observation_id for item in observations]
-        if (
-            len(raw_columns) != len(set(raw_columns))
-            or len(raw_ids) != len(set(raw_ids))
-        ):
+        if len(raw_ids) != len(set(raw_ids)):
             raise ValueError(
-                "Mapped Fit observation columns and dataset-local raw "
-                "observation IDs must be unique."
+                "Mapped Fit dataset-local raw observation IDs must be unique."
             )
         object.__setattr__(self, "observations", observations)
         validate_simulation_execution_settings(self.execution)
@@ -260,7 +261,7 @@ class FitDatasetLocalSettings:
     weight: float = 1.0
     target_species: tuple[str, ...] = ()
     target_weights: tuple[tuple[str, float], ...] = ()
-    observation_targets: tuple[tuple[str, str, str], ...] = ()
+    observation_targets: tuple[tuple[str, str], ...] = ()
     parametric: FitParametricSettings | None = None
 
     def __post_init__(self) -> None:
@@ -296,20 +297,16 @@ class FitDatasetLocalSettings:
         mapping = tuple(
             (
                 _required(raw_id, "raw observation ID"),
-                _required(raw, "raw observation"),
                 _required(model, "model target"),
             )
-            for raw_id, raw, model in self.observation_targets
+            for raw_id, model in self.observation_targets
         )
-        if (
-            len({raw_id for raw_id, _raw, _model in mapping}) != len(mapping)
-            or len({raw for _raw_id, raw, _model in mapping}) != len(mapping)
-        ):
+        if len({raw_id for raw_id, _model in mapping}) != len(mapping):
             raise ValueError(
                 "Observation target overrides must have unique dataset-local "
-                "raw IDs and raw columns."
+                "raw IDs."
             )
-        mapped_targets = [model for _raw_id, _raw, model in mapping]
+        mapped_targets = [model for _raw_id, model in mapping]
         if (
             len(mapped_targets) != len(set(mapped_targets))
             or set(mapped_targets) != set(targets)
@@ -430,7 +427,6 @@ class FitOriginSnapshot:
                         "observations": [
                             {
                                 "raw_observation_id": obs.raw_observation_id,
-                                "raw_column": obs.raw_column,
                                 "model_species": obs.model_species,
                                 "t": obs.t,
                                 "y": obs.y,
@@ -597,6 +593,18 @@ class FitSetupSnapshot:
             raise TypeError(
                 "Fit snapshot observables must be FitLocalObservable values."
             )
+        dataset_ids = [item.dataset_id for item in datasets]
+        parameter_names = [item.name for item in parameters]
+        initial_keys = [(item.set_id, item.species) for item in initials]
+        observable_names = [item.name for item in local_observables]
+        if len(dataset_ids) != len(set(dataset_ids)):
+            raise ValueError("Fit snapshot dataset identities repeat.")
+        if len(parameter_names) != len(set(parameter_names)):
+            raise ValueError("Fit snapshot parameter identities repeat.")
+        if len(initial_keys) != len(set(initial_keys)):
+            raise ValueError("Fit snapshot initial-condition identities repeat.")
+        if len(observable_names) != len(set(observable_names)):
+            raise ValueError("Fit snapshot observable identities repeat.")
         object.__setattr__(self, "datasets", datasets)
         object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "initials", initials)
@@ -630,6 +638,73 @@ class FitSelectedObservation:
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FitDatasetSetupEdit:
+    """Typed replacement intent for one stable dataset setup row."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    dataset: FitDatasetLocalSettings
+    raw_observation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "origin tab ID"))
+        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "origin capture ID"))
+        if not isinstance(self.dataset, FitDatasetLocalSettings):
+            raise TypeError("dataset edit must carry FitDatasetLocalSettings.")
+        if self.raw_observation_id is not None:
+            object.__setattr__(
+                self,
+                "raw_observation_id",
+                _required(self.raw_observation_id, "raw observation ID"),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class FitParameterSetupEdit:
+    """Typed replacement intent for one stable parameter setup row."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    parameter: FitParameterVariable
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "origin tab ID"))
+        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "origin capture ID"))
+        if not isinstance(self.parameter, FitParameterVariable):
+            raise TypeError("parameter edit must carry FitParameterVariable.")
+
+
+@dataclass(frozen=True, slots=True)
+class FitInitialSetupEdit:
+    """Typed replacement intent for one stable set/species setup row."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    initial: FitInitialVariable
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "origin tab ID"))
+        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "origin capture ID"))
+        if not isinstance(self.initial, FitInitialVariable):
+            raise TypeError("initial edit must carry FitInitialVariable.")
+
+
+@dataclass(frozen=True, slots=True)
+class FitDefaultsSetupEdit:
+    """Typed replacement intent for optimizer-only Fit defaults."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    defaults: FitDefaults
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "origin tab ID"))
+        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "origin capture ID"))
+        if not isinstance(self.defaults, FitDefaults):
+            raise TypeError("defaults edit must carry FitDefaults.")
 
 
 def _parameter_bounds(value: float) -> tuple[float, float]:
@@ -684,6 +759,148 @@ def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, .
     return tuple(variables)
 
 
+def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
+    """Build the sole typed Fit-local setup without consulting widget state."""
+
+    if not isinstance(origin, FitOriginSnapshot):
+        raise TypeError("origin must be FitOriginSnapshot.")
+    datasets = tuple(
+        FitDatasetLocalSettings(
+            dataset_id=mapped.dataset_id,
+            included=mapped.included_at_launch,
+            sample_t_min=min(
+                (
+                    value
+                    for observation in mapped.observations
+                    for value in observation.t
+                ),
+                default=mapped.execution.t_start,
+            ),
+            sample_t_max=max(
+                (
+                    value
+                    for observation in mapped.observations
+                    for value in observation.t
+                ),
+                default=mapped.execution.t_end,
+            ),
+            sample_points=None,
+            execution=mapped.execution,
+            weight=1.0,
+            target_species=tuple(
+                observation.model_species
+                for observation in mapped.observations
+            ),
+            target_weights=tuple(
+                (observation.model_species, 1.0)
+                for observation in mapped.observations
+            ),
+            observation_targets=tuple(
+                (
+                    observation.raw_observation_id,
+                    observation.model_species,
+                )
+                for observation in mapped.observations
+            ),
+        )
+        for mapped in origin.mapped_datasets
+    )
+    included_set_ids = {
+        mapped.set_id
+        for mapped in origin.mapped_datasets
+        if mapped.included_at_launch
+    }
+    values_by_key: dict[tuple[str, str], float] = {}
+    for mapped in origin.mapped_datasets:
+        for species, value in mapped.initial_values:
+            key = (mapped.set_id, species)
+            previous = values_by_key.get(key)
+            if previous is not None and previous != value:
+                raise ValueError(
+                    f"Mapped set {mapped.set_id!r} repeats initial {species!r} "
+                    "with conflicting values."
+                )
+            values_by_key[key] = value
+    scope_by_species: dict[str, str] = {}
+    for species in {species for _set_id, species in values_by_key}:
+        active_values = {
+            value
+            for (set_id, row_species), value in values_by_key.items()
+            if row_species == species and set_id in included_set_ids
+        }
+        scope_by_species[species] = (
+            "global" if active_values and len(active_values) == 1 else "local"
+        )
+    initials = tuple(
+        FitInitialVariable(
+            set_id=set_id,
+            species=species,
+            initial=value,
+            minimum=_initial_bounds(value)[0],
+            maximum=_initial_bounds(value)[1],
+            fit=False,
+            log10=False,
+            scope=scope_by_species[species],
+        )
+        for (set_id, species), value in values_by_key.items()
+    )
+    return FitSetupSnapshot(
+        origin_tab_id=origin.tab_id,
+        origin_capture_id=origin.capture_id,
+        mechanism_source=origin.mechanism_source,
+        prepared_dsl=origin.prepared_dsl,
+        datasets=datasets,
+        parameters=origin.parameter_defaults,
+        initials=initials,
+        defaults=origin.fit_defaults,
+        local_observables=(),
+    )
+
+
+def fit_origin_science_matches(
+    captured: FitOriginSnapshot,
+    current: FitOriginSnapshot,
+) -> bool:
+    """Compare Fit admission science while excluding mutable display labels."""
+
+    if not isinstance(captured, FitOriginSnapshot) or not isinstance(
+        current,
+        FitOriginSnapshot,
+    ):
+        raise TypeError("Fit origin comparison requires FitOriginSnapshot values.")
+
+    def dataset_science(
+        item: FitMappedDatasetSnapshot,
+    ) -> tuple[object, ...]:
+        return (
+            item.dataset_id,
+            item.set_id,
+            item.initial_values,
+            item.included_at_launch,
+            item.execution,
+            tuple(
+                (
+                    observation.raw_observation_id,
+                    observation.model_species,
+                    observation.t,
+                    observation.y,
+                    observation.source_rows,
+                )
+                for observation in item.observations
+            ),
+        )
+
+    return bool(
+        captured.tab_id == current.tab_id
+        and captured.mechanism_source == current.mechanism_source
+        and captured.prepared_dsl is current.prepared_dsl
+        and captured.scientific_settings == current.scientific_settings
+        and tuple(dataset_science(item) for item in captured.mapped_datasets)
+        == tuple(dataset_science(item) for item in current.mapped_datasets)
+        and captured.parameter_defaults == current.parameter_defaults
+    )
+
+
 def capture_fit_origin(document: ProjectDocument, tab_id: str) -> FitOriginSnapshot:
     """Copy mapped dataset science from one exact tab."""
     if not isinstance(document, ProjectDocument):
@@ -708,30 +925,30 @@ def capture_fit_origin(document: ProjectDocument, tab_id: str) -> FitOriginSnaps
             if link.include_in_fit
             else None
         )
-        by_column = {
-            observation.column_name: observation
+        by_raw_id = {
+            observation.raw_observation_id: observation
             for observation in dataset.observations
         }
         observations: list[FitObservationSnapshot] = []
         mapping = (
             tuple(
-                (target.raw_column, target.model_target)
+                (target.raw_observation_id, target.model_target)
                 for target in validated.targets
             )
             if validated is not None
             else link.observation_mapping
         )
-        for raw_column, model_species in mapping:
-            observation = by_column.get(raw_column)
+        for raw_observation_id, model_species in mapping:
+            observation = by_raw_id.get(raw_observation_id)
             if observation is None:
                 raise ValueError(
                     f"Dataset {dataset.display_name!r} mapping references "
-                    f"missing column {raw_column!r}."
+                    f"missing raw observation ID {raw_observation_id!r}."
                 )
             observations.append(
                 FitObservationSnapshot(
                     raw_observation_id=observation.raw_observation_id,
-                    raw_column=raw_column,
+                    raw_column=observation.column_name,
                     model_species=model_species,
                     t=observation.t,
                     y=observation.y,
@@ -772,22 +989,16 @@ def selected_observations(
 ) -> tuple[FitSelectedObservation, ...]:
     """Materialize only selected existing rows for one dataset."""
     target_by_raw_id = {
-        raw_id: (raw_column, model_target)
-        for raw_id, raw_column, model_target in local.observation_targets
+        raw_id: model_target
+        for raw_id, model_target in local.observation_targets
     }
     wanted = set(local.target_species)
     selected: list[FitSelectedObservation] = []
     seen_targets: set[str] = set()
     for observation in mapped.observations:
-        captured_raw, target = target_by_raw_id.get(
-            observation.raw_observation_id,
-            (observation.raw_column, observation.model_species),
-        )
-        if captured_raw != observation.raw_column:
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} raw observation identity "
-                "changed columns inside the Fit capture."
-            )
+        if observation.raw_observation_id not in target_by_raw_id:
+            continue
+        target = target_by_raw_id[observation.raw_observation_id]
         if target not in wanted:
             continue
         if target in seen_targets:
@@ -873,18 +1084,16 @@ def revalidate_fit_request_inclusions(
         captured_by_raw = {
             item.raw_observation_id: item for item in captured.observations
         }
-        for raw_id, raw_column, model_target in local.observation_targets:
+        for raw_id, model_target in local.observation_targets:
             authoritative = validated_by_raw.get(raw_id)
             snapshot = captured_by_raw.get(raw_id)
             if authoritative is None or snapshot is None:
                 raise ValueError(
                     f"Dataset {captured.display_name!r} target "
-                    f"{raw_column!r} is no longer eligible."
+                    f"raw observation {raw_id!r} is no longer eligible."
                 )
             if (
-                authoritative.raw_column != raw_column
-                or snapshot.raw_column != raw_column
-                or authoritative.raw_observation_id != raw_id
+                authoritative.raw_observation_id != raw_id
                 or snapshot.raw_observation_id != raw_id
                 or tuple(authoritative.t) != snapshot.t
                 or tuple(authoritative.y) != snapshot.y
@@ -892,7 +1101,7 @@ def revalidate_fit_request_inclusions(
             ):
                 raise ValueError(
                     f"Dataset {captured.display_name!r} observation "
-                    f"{raw_column!r} changed after Fit capture."
+                    f"{raw_id!r} changed after Fit capture."
                 )
             if (
                 model_target != authoritative.model_target

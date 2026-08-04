@@ -74,7 +74,6 @@ __all__ = [
     "DslSourceOrigin",
     "FrozenDslMapping",
     "PreparedDslRequestSet",
-    "executed_parameter_analysis_from_mechanism",
     "derive_prepared_dsl_with_observables",
     "derive_prepared_dsl_with_parameter_updates",
     "prepare_dsl_request_set",
@@ -2213,47 +2212,6 @@ def _parse_equilibrium_step(
         user_kf_explicit=("kf" in params),
         user_kr_explicit=("kr" in params),
         source_energy_unit=str(energy_unit),
-    )
-
-
-def executed_parameter_analysis_from_mechanism(
-    mechanism: object,
-    *,
-    source_analysis: DslAnalysis,
-) -> object:
-    """Project execution parameters from an already prepared mechanism."""
-
-    from kindred.core.simulation_result_payload import (
-        ExecutedParameterAnalysis,
-        ExecutedParameterValue,
-    )
-    from kindred.core.simulator.dsl_parameter_scan import (
-        extract_parameters_from_mechanism,
-    )
-
-    if type(source_analysis) is not DslAnalysis:
-        raise TypeError(
-            "Executed analysis requires exact DslAnalysis evidence."
-        )
-    definitions = extract_parameters_from_mechanism(mechanism)
-    values = tuple(
-        ExecutedParameterValue(
-            name=item.name,
-            value=item.value,
-            context=item.context,
-            source=item.source,
-            step_index=item.step_index,
-            editable=item.editable,
-            unit=item.unit,
-            role=item.role,
-            minimum=item.min,
-            maximum=item.max,
-        )
-        for item in definitions
-    )
-    return ExecutedParameterAnalysis(
-        source_analysis_identity=source_analysis.identity,
-        parameters=values,
     )
 
 

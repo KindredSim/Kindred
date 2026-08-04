@@ -117,6 +117,8 @@ TOKEN_SPEC: List[Tuple[TokenKind, str]] = [
     (TokenKind.NEQ, r"!="),
     (TokenKind.LTE, r"<="),
     (TokenKind.GTE, r">="),
+    (TokenKind.LT, r"<"),
+    (TokenKind.GT, r">"),
     # Single-char operators and punctuation
     (TokenKind.PLUS, r"\+"),
     (TokenKind.MINUS, r"-"),

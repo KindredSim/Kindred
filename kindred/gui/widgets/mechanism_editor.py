@@ -1284,7 +1284,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._emit_native_history_availability()
 
 class MechanismEditorBinding(QtCore.QObject):
-    """Binds the shared editor to the active tab's retained draft."""
+    """Bind one retained editor to one immutable mechanism-tab identity."""
 
     draftStateChanged = QtCore.Signal(str, bool)
     errorRaised = QtCore.Signal(str)
@@ -1292,45 +1292,55 @@ class MechanismEditorBinding(QtCore.QObject):
     def __init__(
         self,
         *,
+        tab_id: str,
         editor: MechanismEditorTabbed,
         registry,
         simulation_jobs,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        target = str(tab_id).strip()
+        if not target:
+            raise ValueError("tab_id must be nonblank.")
+        registry.tab(target)
+        self._tab_id = target
         self._editor = editor
         self._registry = registry
         self._simulation_jobs = simulation_jobs
         self._rendering = False
         self._rendered_document_identity: tuple[int, str] | None = None
         editor.set_detailed_balance_context_provider(
-            self._active_detailed_balance_context
+            self._detailed_balance_context
         )
         editor.set_validation_temperature_provider(
-            lambda: self._registry.active_tab.scientific_settings.temperature
+            lambda: self._registry.tab(self._tab_id).scientific_settings.temperature
         )
         editor.sourceDraftEdited.connect(self._on_source_draft)
         editor.notesEdited.connect(self._on_notes_edited)
 
-    def _active_detailed_balance_context(self) -> tuple[str, str]:
-        tab = self._registry.active_tab
-        runtime = self._registry.active_runtime
+    @property
+    def tab_id(self) -> str:
+        return self._tab_id
+
+    def _detailed_balance_context(self) -> tuple[str, str]:
+        tab = self._registry.tab(self._tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         source = runtime.reactions_draft or tab.mechanism_source
         return tab.tab_id, source.reactions_text
 
-    def prepare_active_render(self) -> _MechanismEditorRenderProjection:
+    def prepare_render(self) -> _MechanismEditorRenderProjection:
         """Prepare every fallible authoring projection before widget mutation."""
 
-        tab = self._registry.active_tab
-        runtime = self._registry.active_runtime
+        tab = self._registry.tab(self._tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         source = runtime.reactions_draft or tab.mechanism_source
-        document_identity = self._registry.active_document_identity
+        document_identity = self._registry.document_identity(self._tab_id)
         if (
             type(document_identity) is not tuple
             or len(document_identity) != 2
         ):
             raise TypeError(
-                "active_document_identity must be (generation, tab_id)."
+                "document_identity must be (generation, tab_id)."
             )
         return _MechanismEditorRenderProjection(
             source=source,
@@ -1375,8 +1385,8 @@ class MechanismEditorBinding(QtCore.QObject):
         finally:
             self._rendering = False
 
-    def render_active(self) -> None:
-        self.apply_render_projection(self.prepare_active_render())
+    def render(self) -> None:
+        self.apply_render_projection(self.prepare_render())
 
     @QtCore.Slot(object)
     def _on_source_draft(self, source: object) -> None:
@@ -1384,8 +1394,8 @@ class MechanismEditorBinding(QtCore.QObject):
 
         if self._rendering or not isinstance(source, MechanismAuthoringSource):
             return
-        tab = self._registry.active_tab
-        runtime = self._registry.active_runtime
+        tab = self._registry.tab(self._tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         was_canonical = runtime.reactions_draft is None
         runtime.reactions_draft = None if source == tab.mechanism_source else source
         if was_canonical and runtime.reactions_draft is not None:
@@ -1399,21 +1409,16 @@ class MechanismEditorBinding(QtCore.QObject):
     def _on_notes_edited(self, notes: str) -> None:
         if self._rendering:
             return
-        tab = self._registry.active_tab
-        runtime = self._registry.active_runtime
+        tab = self._registry.tab(self._tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         visible_notes = str(notes)
         runtime.notes_draft = (
             None if visible_notes == tab.notes else visible_notes
         )
         self.draftStateChanged.emit(tab.tab_id, runtime.has_dirty_drafts)
 
-    def has_reactions_draft(self, tab_id: str | None = None) -> bool:
-        runtime = (
-            self._registry.active_runtime
-            if tab_id is None
-            else self._registry.tab_runtime(tab_id)
-        )
-        return runtime.reactions_draft is not None
+    def has_reactions_draft(self) -> bool:
+        return self._registry.tab_runtime(self._tab_id).reactions_draft is not None
 
     def apply_accepted_source_rewrite(
         self,
@@ -1433,14 +1438,9 @@ class MechanismEditorBinding(QtCore.QObject):
             accepted_text=accepted.reactions_text,
         )
 
-    def discard_reactions_draft(self, tab_id: str | None = None) -> bool:
-        runtime = (
-            self._registry.active_runtime
-            if tab_id is None
-            else self._registry.tab_runtime(tab_id)
-        )
+    def discard_reactions_draft(self) -> bool:
+        runtime = self._registry.tab_runtime(self._tab_id)
         changed = runtime.reactions_draft is not None
         runtime.reactions_draft = None
-        if tab_id is None or str(tab_id) == self._registry.active_tab_id:
-            self.render_active()
+        self.render()
         return changed

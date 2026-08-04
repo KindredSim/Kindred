@@ -9,6 +9,9 @@ from dataclasses import dataclass
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.project_presentation_state import (
+    SimulationSeriesAxisSelection,
+)
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
 from kindred.gui.plot_config import PlotPresentationIntent
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
@@ -72,7 +75,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     referenceLayerVisibilityRequested = QtCore.Signal(bool)
     interventionAnnotationsVisibilityRequested = QtCore.Signal(bool)
-    xSeriesRequested = QtCore.Signal(str)
+    xSeriesRequested = QtCore.Signal(object)
     ySeriesRequested = QtCore.Signal(object)
     parametricModeRequested = QtCore.Signal(bool)
     plotPresentationIntentRequested = QtCore.Signal(object)
@@ -100,7 +103,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         self._applied_projection: WorkspaceResultProjection | None = None
         self._rendered_blocks: tuple[ResultDataBlock, ...] = ()
-        self._copy_all_enabled = False
         self._sampling_limit_by_tab: dict[str, int | None] = {}
         self._curve_items: list[object] = []
         self._annotation_items: list[object] = []
@@ -148,11 +150,34 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._request_plot_presentation
         )
 
+        self._completion_warning_badge = QtWidgets.QLabel(
+            "Completed with warnings",
+            self,
+        )
+        self._completion_warning_badge.setObjectName(
+            "completedWithWarningsBadge"
+        )
+        self._completion_warning_badge.setStyleSheet(
+            "QLabel { border: 1px solid #b7791f; border-radius: 6px; "
+            "padding: 2px 7px; color: #8a5a12; background: #fff7df; }"
+        )
+        self._completion_warning_badge.setVisible(False)
+
         plot_host = QtWidgets.QWidget(self)
         plot_layout = QtWidgets.QVBoxLayout(plot_host)
         plot_layout.setContentsMargins(0, 0, 0, 0)
         plot_layout.setSpacing(4)
-        plot_layout.addWidget(self._axis_toolbar)
+        plot_header = QtWidgets.QWidget(plot_host)
+        plot_header_layout = QtWidgets.QHBoxLayout(plot_header)
+        plot_header_layout.setContentsMargins(0, 0, 0, 0)
+        plot_header_layout.setSpacing(6)
+        plot_header_layout.addWidget(self._axis_toolbar, 1)
+        plot_header_layout.addWidget(
+            self._completion_warning_badge,
+            0,
+            QtCore.Qt.AlignmentFlag.AlignTop,
+        )
+        plot_layout.addWidget(plot_header)
         plot_layout.addWidget(self._plot_widget, 1)
 
         self._parameter_table = ParameterStatisticsTable(self)
@@ -196,6 +221,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def applied_projection(self) -> WorkspaceResultProjection | None:
         return self._applied_projection
 
+    def copy_all_eligible(self) -> bool:
+        projection = self._applied_projection
+        return bool(projection is not None and projection.copy_all_blocks)
+
+    def xlsx_export_projection(self) -> WorkspaceResultProjection | None:
+        """Return this page's export authority, or None when unavailable."""
+
+        return self._applied_projection if self.copy_all_eligible() else None
+
     def apply_workspace_result_projection(
         self,
         projection: WorkspaceResultProjection,
@@ -213,18 +247,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             logger.exception("Workspace projection render failed")
             # A failed projection is ordinary unavailability for this panel:
             # never retain a stale scene or export authority.
-            try:
-                self._clear_plot_items()
-            except Exception:
-                logger.exception("Failed to clear rejected plot projection")
-            self._applied_projection = None
-            self._rendered_blocks = ()
-            self._copy_all_enabled = False
+            self._clear_rejected_result_scene()
             self.renderFailed.emit(str(exc))
             raise
         self._applied_projection = projection
         self._rendered_blocks = rendered
-        self._copy_all_enabled = bool(projection.copy_all_blocks)
 
     def set_persisted_plot_state(
         self,
@@ -285,19 +312,28 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def clear_workspace_result_projection(self) -> None:
         """Clear rejected public truth without affecting other tab-local state."""
 
-        try:
-            self._clear_plot_items()
-            self._parameter_table.setRowCount(0)
-            self._species_table.setRowCount(0)
-        finally:
-            self._applied_projection = None
-            self._rendered_blocks = ()
-            self._copy_all_enabled = False
+        self._clear_rejected_result_scene()
 
-    def set_copy_all_enabled(self, enabled: bool) -> None:
-        """Receive the active workspace's physical Copy capability."""
+    def _clear_rejected_result_scene(self) -> None:
+        """Revoke only this physical page's applied result authority."""
 
-        self._copy_all_enabled = bool(enabled)
+        for clear in (
+            self._clear_plot_items,
+            lambda: self._parameter_table.setRowCount(0),
+            lambda: self._species_table.setRowCount(0),
+            self._clear_completion_warning,
+        ):
+            try:
+                clear()
+            except Exception:
+                logger.exception("Failed to clear rejected plot projection")
+        self._applied_projection = None
+        self._rendered_blocks = ()
+
+    def _clear_completion_warning(self) -> None:
+        self._completion_warning_badge.setText("Completed with warnings")
+        self._completion_warning_badge.setToolTip("")
+        self._completion_warning_badge.setVisible(False)
 
     def _render_projection(
         self,
@@ -309,12 +345,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             for block in projection.copy_all_blocks
         }
         rendered_blocks: list[ResultDataBlock] = []
-        available_y = set(projection.available_y_series)
-        x_candidates = set(available_y)
-        if projection.selected_x_series != "t":
-            x_candidates.add(projection.selected_x_series)
         for layer in projection.plot_layers:
-            x_candidates.update(name for name, _values in layer.series)
             block = block_by_id.get(layer.layer_id)
             if block is None:
                 continue
@@ -329,17 +360,28 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 rendered_blocks.append(rendered)
 
         self._axis_toolbar.set_x_candidates(
-            ["t", *sorted(x_candidates)],
-            default=projection.selected_x_series,
+            projection.axis_candidates,
+            selected=projection.selected_x_series,
+        )
+        y_candidates = tuple(
+            candidate
+            for candidate in projection.axis_candidates
+            if not (
+                isinstance(
+                    candidate.selection,
+                    SimulationSeriesAxisSelection,
+                )
+                and candidate.selection.series_name == "t"
+            )
         )
         self._axis_toolbar.set_y_candidates(
             [
                 (
-                    name,
+                    candidate,
                     projection.selected_y_uses_default_all
-                    or name in projection.selected_y_series,
+                    or candidate.selection in projection.selected_y_series,
                 )
-                for name in sorted(available_y)
+                for candidate in y_candidates
             ]
         )
         self._axis_toolbar.set_parametric(projection.parametric_mode)
@@ -374,6 +416,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 _PlotPresentation(),
             )
         )
+        self._project_completion_warning(projection)
         return tuple(rendered_blocks)
 
     def _render_layer(
@@ -471,6 +514,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             kind=block.kind,
             t=x,
             series=tuple(rendered_series),
+            series_axes=block.series_axes,
+            x_axis=block.x_axis,
+            result_entry=block.result_entry,
             segment_ids=segment_ids,
             segment_keys=segment_keys,
             discontinuity_ids=discontinuity_ids,
@@ -493,17 +539,34 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return
         residual = dict(projection.scalar_values).get("residual_mse")
         self._species_table.update_results(
-            block.t,
-            dict(block.series),
+            canonical_time=block.t,
+            species_data=dict(block.series),
             residual_mse=residual,
         )
+
+    def _project_completion_warning(
+        self,
+        projection: WorkspaceResultProjection,
+    ) -> None:
+        visible = bool(projection.completion_warnings)
+        self._completion_warning_badge.setText("Completed with warnings")
+        self._completion_warning_badge.setToolTip(
+            projection.completion_warning_tooltip if visible else ""
+        )
+        self._completion_warning_badge.setVisible(visible)
 
     def _render_annotations(self, projection: WorkspaceResultProjection) -> None:
         if (
             not projection.intervention_annotations_visible
             or (
                 projection.parametric_mode
-                and projection.selected_x_series != "t"
+                and not (
+                    isinstance(
+                        projection.selected_x_series,
+                        SimulationSeriesAxisSelection,
+                    )
+                    and projection.selected_x_series.series_name == "t"
+                )
             )
         ):
             return
@@ -767,11 +830,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if self._enable_copy_visible_data_action:
             copy_all = menu.addAction("Copy All")
             copy_all.setEnabled(
-                bool(
-                    self._copy_all_enabled
-                    and projection is not None
-                    and projection.copy_all_blocks
-                )
+                self.copy_all_eligible()
             )
             copy_all.triggered.connect(self._copy_all_to_clipboard)
             copy_rendered = menu.addAction("Copy Rendered Points")
@@ -933,9 +992,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _copy_all_to_clipboard(self) -> None:
         projection = self._applied_projection
         if (
-            not self._copy_all_enabled
-            or projection is None
-            or not projection.copy_all_blocks
+            projection is None
+            or not self.copy_all_eligible()
         ):
             QtWidgets.QMessageBox.critical(
                 self,

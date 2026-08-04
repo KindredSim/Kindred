@@ -38,21 +38,30 @@ class FitObservationSeries:
     source_rows: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        raw_observation_id = str(self.raw_observation_id)
-        raw_column = str(self.raw_column)
         if (
-            not raw_observation_id
-            or raw_observation_id != raw_observation_id.strip()
+            type(self.raw_observation_id) is not str
+            or not self.raw_observation_id
+            or self.raw_observation_id != self.raw_observation_id.strip()
         ):
             raise ValueError(
                 "Fit observation raw identity must be a nonblank "
                 "dataset-local opaque string."
             )
-        if not raw_column or raw_column != raw_column.strip():
+        if (
+            type(self.raw_column) is not str
+            or not self.raw_column
+            or self.raw_column != self.raw_column.strip()
+        ):
             raise ValueError("Fit observation raw column must be nonblank.")
         t = _readonly_float_vector(self.t, "observation time")
         y = _readonly_float_vector(self.y, "observation value")
-        rows = tuple(int(value) for value in self.source_rows)
+        if type(self.source_rows) is not tuple or any(
+            type(value) is not int for value in self.source_rows
+        ):
+            raise ValueError(
+                "Fit observation source rows must be an exact integer tuple."
+            )
+        rows = self.source_rows
         if t.size == 0 or t.size != y.size or len(rows) != y.size:
             raise ValueError(
                 "Fit observation time, value, and source-row arrays must have "
@@ -64,8 +73,6 @@ class FitObservationSeries:
             )
         object.__setattr__(self, "t", t)
         object.__setattr__(self, "y", y)
-        object.__setattr__(self, "raw_observation_id", raw_observation_id)
-        object.__setattr__(self, "raw_column", raw_column)
         object.__setattr__(self, "source_rows", rows)
 
 
@@ -127,6 +134,15 @@ class FitDatasetSpec:
                     f"Dataset {dataset_id!r} observation {name!r} must be "
                     "FitObservationSeries."
                 )
+        raw_observation_ids = tuple(
+            series.raw_observation_id
+            for series in observation_map.values()
+        )
+        if len(raw_observation_ids) != len(set(raw_observation_ids)):
+            raise ValueError(
+                f"Dataset {dataset_id!r} Fit targets must use unique stable "
+                "raw observation IDs."
+            )
         x_name = str(self.x_name or "t").strip() or "t"
         x_mode = str(self.x_mode or "").strip().lower()
         axes: dict[str, np.ndarray] = {}

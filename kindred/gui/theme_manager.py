@@ -32,6 +32,12 @@ class ThemeManager:
         self._report_failure = report_failure
         self._applied_dark_mode: bool | None = None
 
+    @property
+    def applied_dark_mode(self) -> bool:
+        """Return the last completely applied physical theme."""
+
+        return bool(self._applied_dark_mode)
+
     def apply(
         self,
         dark_mode: bool,
@@ -51,13 +57,19 @@ class ThemeManager:
             return True
         previous = False if recorded_previous is None else recorded_previous
 
+        physical_applied = False
         try:
             self._apply_physical(requested)
+            physical_applied = True
+            self._applied_dark_mode = requested
             if persist is not None:
                 persist(requested)
         except Exception as exc:
-            self._restore_previous_once(previous, persist)
-            self._applied_dark_mode = previous
+            restored = self._restore_previous_once(previous, persist)
+            if restored:
+                self._applied_dark_mode = previous
+            elif physical_applied:
+                self._applied_dark_mode = requested
             message = (
                 f"Could not apply the {'dark' if requested else 'light'} theme: {exc}"
             )
@@ -69,7 +81,6 @@ class ThemeManager:
                     logger.exception("Theme failure reporter raised an exception.")
             return False
 
-        self._applied_dark_mode = requested
         logger.info("Applied %s theme", "dark" if requested else "light")
         return True
 
@@ -81,9 +92,11 @@ class ThemeManager:
         self,
         previous: bool,
         persist: Callable[[bool], None] | None,
-    ) -> None:
+    ) -> bool:
+        restored = False
         try:
             self._apply_physical(previous)
+            restored = True
         except Exception:
             logger.exception("Failed to restore the previous physical theme.")
         if persist is not None:
@@ -91,3 +104,4 @@ class ThemeManager:
                 persist(previous)
             except Exception:
                 logger.exception("Failed to restore the previous persisted theme.")
+        return restored

@@ -195,12 +195,24 @@ def build_effective_rate_coefficient_evaluator(
     snapshots: list[Mapping[str, object]] = []
 
     for reaction in mechanism.reactions:
+        model = forward_rate_model_for_reaction(
+            reaction,
+            default_kappa=default_kappa,
+            default_standard_conc_M=default_standard_conc,
+        )
         binding = (
             reaction.rate
             if isinstance(reaction.rate, RateBinding)
             else None
         )
         if binding is not None:
+            if not isinstance(binding, ForwardRateBinding) and not isinstance(
+                model, ConstantRateModel
+            ):
+                raise ValueError(
+                    "Arrhenius/Eyring reaction authority requires a "
+                    "family-preserving ForwardRateBinding."
+                )
             if isinstance(binding, ForwardRateBinding):
                 snapshot = {
                     "kind": "reaction",
@@ -227,11 +239,6 @@ def build_effective_rate_coefficient_evaluator(
                 )
 
         else:
-            model = forward_rate_model_for_reaction(
-                reaction,
-                default_kappa=default_kappa,
-                default_standard_conc_M=default_standard_conc,
-            )
             snapshot = {
                 "kind": "reaction",
                 "forward_model": _forward_rate_model_payload(model),
@@ -269,6 +276,13 @@ def build_effective_rate_coefficient_evaluator(
                 default_kappa=default_kappa,
                 default_standard_conc_M=default_standard_conc,
             )
+            if forward_binding is not None and not isinstance(
+                forward_model, ConstantRateModel
+            ):
+                raise ValueError(
+                    "Arrhenius/Eyring equilibrium forward authority requires "
+                    "a family-preserving ForwardRateBinding."
+                )
         snapshot = {
             "kind": "equilibrium",
             "forward_model": _forward_rate_model_payload(forward_model),

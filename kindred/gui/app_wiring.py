@@ -130,13 +130,15 @@ def build_module_dock(
     return PanelDockComponents(dock=dock, container=container, panel=panel)
 
 
-def build_mechanism_dock(main_window: MainWindow) -> PanelDockComponents:
-    from kindred.gui.widgets.editor_panel import EditorPanel
-
+def build_mechanism_dock(
+    main_window: MainWindow,
+    *,
+    panel: QWidget,
+) -> PanelDockComponents:
     return build_module_dock(
         main_window,
         spec=MECHANISM_DOCK_SPEC,
-        panel=EditorPanel(parent=main_window),
+        panel=panel,
     )
 
 

@@ -9,13 +9,16 @@ adapting these objects from raw preview data.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
-from kindred.core.datasets.csv_import import PhysicalColumn
+from kindred.core.datasets.csv_import import (
+    PhysicalColumn,
+    validate_tabular_source_bytes,
+)
 from kindred.core.datasets.units import (
     looks_like_unit_row,
     parse_concentration_unit,
@@ -25,57 +28,79 @@ from kindred.core.datasets.units import (
 
 __all__ = [
     "ImportConfig",
+    "ImportSourceSnapshot",
     "ResolvedSheetPlan",
     "SheetImportIntent",
     "UnitDetection",
     "UserImportIntent",
     "detect_units_from_physical_row",
-    "classify_import_source",
+    "capture_import_source",
     "rebuild_intent_for_target",
     "resolve_import_plans",
-    "validate_import_source_bytes",
 ]
 
-_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-_OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_MAX_SOURCE_BYTES = 32 * 1024 * 1024
 
 
-def validate_import_source_bytes(
-    source_bytes: bytes,
-    *,
-    file_type: str,
-    source_label: str,
-) -> None:
-    """Reject extension-disguised or unsupported binary source content."""
-    owned = bytes(source_bytes)
-    label = str(source_label).strip() or "<dataset>"
-    if not owned:
-        raise ValueError(f"Dataset source {label!r} is empty.")
-    signature = owned[:8]
-    if file_type == "excel":
-        if not signature.startswith(_ZIP_SIGNATURES):
+@dataclass(frozen=True, slots=True)
+class ImportSourceSnapshot:
+    """One immutable source-byte snapshot captured before any preview read."""
+
+    filepath: str
+    file_type: str
+    original_filename: str
+    exact_source_bytes: bytes
+
+    def __post_init__(self) -> None:
+        filepath = os.fspath(self.filepath)
+        filename = str(self.original_filename)
+        source_type = str(self.file_type)
+        source_bytes = self.exact_source_bytes
+        if not filepath:
+            raise ValueError("Dataset import source path must be nonblank.")
+        if (
+            not filename
+            or filename != filename.strip()
+            or os.path.basename(filepath) != filename
+            or os.path.basename(filename) != filename
+        ):
             raise ValueError(
-                f"File {label!r} has an .xlsx extension but is not an XLSX "
-                "workbook."
+                "Dataset import source filename must be the source-path basename."
             )
-        return
-    if file_type != "csv":
-        raise ValueError(f"Unsupported import source type {file_type!r}.")
-    if signature.startswith(_ZIP_SIGNATURES) or signature.startswith(
-        _OLE_SIGNATURE
-    ):
-        raise ValueError(
-            f"File {label!r} has a .csv extension but contains a workbook or "
-            "other binary container."
+        suffix = Path(filename).suffix.lower()
+        expected_type = "excel" if suffix == ".xlsx" else "csv" if suffix == ".csv" else ""
+        if source_type != expected_type:
+            raise ValueError(
+                "Dataset import source type must exactly match its .csv or "
+                ".xlsx filename."
+            )
+        if type(source_bytes) is not bytes:
+            raise TypeError("Dataset import source content must be exact bytes.")
+        if not source_bytes:
+            raise ValueError("Dataset import source content must be nonempty.")
+        if len(source_bytes) > _MAX_SOURCE_BYTES:
+            raise ValueError(
+                "Dataset import source exceeds the 32 MiB supported-size limit."
+            )
+        validate_tabular_source_bytes(
+            source_bytes,
+            source_format="xlsx" if source_type == "excel" else "csv",
+            source_label=filename,
         )
-    if b"\x00" in signature:
-        raise ValueError(
-            f"File {label!r} is binary data, not a UTF-8 CSV source."
-        )
+        object.__setattr__(self, "filepath", filepath)
+        object.__setattr__(self, "file_type", source_type)
+        object.__setattr__(self, "original_filename", filename)
+
+    @property
+    def archive_format(self) -> str:
+        return "xlsx" if self.file_type == "excel" else "csv"
 
 
-def classify_import_source(filepath: str | os.PathLike[str]) -> str:
-    """Admit only extension/content-consistent CSV or XLSX sources."""
+def capture_import_source(
+    filepath: str | os.PathLike[str],
+) -> ImportSourceSnapshot:
+    """Read one source exactly once before any semantic preview or planning."""
+
     path = Path(filepath)
     suffix = path.suffix.lower()
     if suffix == ".xls":
@@ -90,17 +115,25 @@ def classify_import_source(filepath: str | os.PathLike[str]) -> str:
     if not path.is_file():
         raise ValueError(f"Dataset source does not exist: {path}.")
     try:
+        source_size = path.stat().st_size
+        if source_size > _MAX_SOURCE_BYTES:
+            raise ValueError(
+                "Dataset import source exceeds the 32 MiB supported-size limit."
+            )
         with path.open("rb") as source:
-            source_prefix = source.read(8)
+            source_bytes = source.read(_MAX_SOURCE_BYTES + 1)
     except OSError as exc:
         raise ValueError(f"Cannot read dataset source {path!s}: {exc}") from exc
-    file_type = "excel" if suffix == ".xlsx" else "csv"
-    validate_import_source_bytes(
-        source_prefix,
-        file_type=file_type,
-        source_label=path.name,
+    if len(source_bytes) > _MAX_SOURCE_BYTES:
+        raise ValueError(
+            "Dataset import source exceeds the 32 MiB supported-size limit."
+        )
+    return ImportSourceSnapshot(
+        filepath=os.fspath(path),
+        file_type="excel" if suffix == ".xlsx" else "csv",
+        original_filename=path.name,
+        exact_source_bytes=source_bytes,
     )
-    return file_type
 
 
 @dataclass(frozen=True)
@@ -110,9 +143,17 @@ class UnitDetection:
     has_unit_row: bool
     detected_time_unit: Optional[str]
     detected_conc_unit_by_column: Dict[PhysicalColumn, Optional[str]]
+    selected_unit_text_by_column: Dict[PhysicalColumn, str] = field(
+        default_factory=dict
+    )
+    selected_unit_category_by_column: Dict[PhysicalColumn, str] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         detected = dict(self.detected_conc_unit_by_column)
+        selected_text = dict(self.selected_unit_text_by_column)
+        selected_category = dict(self.selected_unit_category_by_column)
         if type(self.has_unit_row) is not bool:
             raise TypeError("Unit detection has_unit_row must be a bool.")
         if self.detected_time_unit is not None and not isinstance(
@@ -129,7 +170,35 @@ class UnitDetection:
                 "Detected concentration units require physical-column keys "
                 "and string-or-None values."
             )
+        if any(
+            not isinstance(column, PhysicalColumn)
+            or not isinstance(text, str)
+            or text != text.strip()
+            for column, text in selected_text.items()
+        ):
+            raise TypeError(
+                "Selected unit cells require physical-column keys and "
+                "edge-normalized text values."
+            )
+        if (
+            any(
+                not isinstance(column, PhysicalColumn)
+                or category not in {"time", "concentration"}
+                for column, category in selected_category.items()
+            )
+            or not set(selected_category).issubset(selected_text)
+        ):
+            raise TypeError(
+                "Selected unit categories require selected physical-column "
+                "unit cells and exact supported categories."
+            )
         object.__setattr__(self, "detected_conc_unit_by_column", detected)
+        object.__setattr__(self, "selected_unit_text_by_column", selected_text)
+        object.__setattr__(
+            self,
+            "selected_unit_category_by_column",
+            selected_category,
+        )
 
     @staticmethod
     def empty() -> UnitDetection:
@@ -215,7 +284,6 @@ class SheetImportIntent:
 class ResolvedSheetPlan:
     """Fully resolved import plan for a single sheet (or CSV file)."""
 
-    filepath: str
     sheet_name: Optional[str]
     time_column: PhysicalColumn
     species_columns: Tuple[PhysicalColumn, ...]
@@ -229,8 +297,6 @@ class ResolvedSheetPlan:
         species_columns = tuple(self.species_columns)
         conc_factors = dict(self.conc_factors)
         original_conc_units = dict(self.original_conc_units)
-        if not isinstance(self.filepath, str) or not self.filepath:
-            raise ValueError("Resolved import filepath must be nonblank.")
         if self.sheet_name is not None and (
             not isinstance(self.sheet_name, str)
             or not self.sheet_name
@@ -297,31 +363,26 @@ class ResolvedSheetPlan:
 
 @dataclass(frozen=True)
 class ImportConfig:
-    """Top-level import configuration grouping file intent, sheet intents, and plans."""
+    """Top-level import configuration grouping source intent and plans."""
 
-    filepath: str
-    file_type: str
+    source: ImportSourceSnapshot
     file_intent: UserImportIntent
-    per_sheet_intents: Tuple[Tuple[Optional[str], SheetImportIntent], ...]
     plans: Tuple[ResolvedSheetPlan, ...]
     remaining_file_template: Optional[SheetImportIntent] = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.source, ImportSourceSnapshot):
+            raise TypeError(
+                "Import configuration requires one immutable source snapshot."
+            )
         if not isinstance(self.file_intent, UserImportIntent):
             raise TypeError("Import configuration requires UserImportIntent.")
-        admitted_type = classify_import_source(self.filepath)
-        if str(self.file_type) != admitted_type:
-            raise ValueError(
-                f"Import type {self.file_type!r} does not match admitted "
-                f"source type {admitted_type!r}."
-            )
+        admitted_type = self.source.file_type
         plans = tuple(self.plans)
         if not plans:
             raise ValueError("Import configuration requires at least one plan.")
-        if any(Path(plan.filepath) != Path(self.filepath) for plan in plans):
-            raise ValueError(
-                "Every import plan must reference the admitted source path."
-            )
+        if any(not isinstance(plan, ResolvedSheetPlan) for plan in plans):
+            raise TypeError("Import configuration plans must be resolved plans.")
         if admitted_type == "csv" and (
             len(plans) != 1 or plans[0].sheet_name is not None
         ):
@@ -330,28 +391,10 @@ class ImportConfig:
             plan.sheet_name is None for plan in plans
         ):
             raise ValueError("Every XLSX import plan requires a sheet name.")
-        intent_items = tuple(self.per_sheet_intents)
-        if (
-            any(
-                not isinstance(intent, SheetImportIntent)
-                for _key, intent in intent_items
-            )
-            or len({key for key, _intent in intent_items})
-            != len(intent_items)
-        ):
-            raise ValueError(
-                "Per-sheet import intents must be unique typed intents."
-            )
-        intent_keys = tuple(key for key, _intent in intent_items)
         plan_keys = tuple(plan.sheet_name for plan in plans)
-        if intent_keys != plan_keys:
-            raise ValueError(
-                "Per-sheet import intent order must exactly match resolved "
-                "plan order."
-            )
         if admitted_type == "excel" and tuple(
             self.file_intent.sheet_names
-        ) != tuple(key for key in intent_keys if key is not None):
+        ) != tuple(key for key in plan_keys if key is not None):
             raise ValueError(
                 "Selected worksheet identity must exactly match resolved plans."
             )
@@ -362,9 +405,7 @@ class ImportConfig:
             raise TypeError(
                 "remaining_file_template must be SheetImportIntent or None."
             )
-        object.__setattr__(self, "per_sheet_intents", intent_items)
         object.__setattr__(self, "plans", plans)
-
 
 def detect_units_from_physical_row(
     row_mapping: Mapping[PhysicalColumn, object],
@@ -394,15 +435,19 @@ def detect_units_from_physical_row(
 
     detected_time_unit: Optional[str] = None
     conc_unit_by_column: Dict[PhysicalColumn, Optional[str]] = {}
+    selected_text_by_column: Dict[PhysicalColumn, str] = {}
+    selected_category_by_column: Dict[PhysicalColumn, str] = {}
 
     for col in scoped_columns:
         val = str(row_mapping[col]).strip()
+        selected_text_by_column[col] = val
         if not val:
             continue
         try:
             category, _factor = parse_unit(val)
         except ValueError:
             continue
+        selected_category_by_column[col] = category
         if category == "time" and detected_time_unit is None:
             detected_time_unit = val
         elif category == "concentration":
@@ -412,6 +457,8 @@ def detect_units_from_physical_row(
         has_unit_row=True,
         detected_time_unit=detected_time_unit,
         detected_conc_unit_by_column=conc_unit_by_column,
+        selected_unit_text_by_column=selected_text_by_column,
+        selected_unit_category_by_column=selected_category_by_column,
     )
 
 
@@ -444,8 +491,7 @@ def rebuild_intent_for_target(
 
 
 def resolve_import_plans(
-    filepath: str,
-    file_type: str,
+    source: ImportSourceSnapshot,
     per_sheet_intents: Dict[Optional[str], SheetImportIntent],
     per_sheet_detections: Dict[Optional[str], UnitDetection],
     per_sheet_columns: Dict[Optional[str], Sequence[PhysicalColumn]],
@@ -456,12 +502,9 @@ def resolve_import_plans(
     file structure (missing sheets, missing columns, or ambiguous
     concentration factors).
     """
-    admitted_type = classify_import_source(filepath)
-    if str(file_type) != admitted_type:
-        raise ValueError(
-            f"Import type {file_type!r} does not match admitted source type "
-            f"{admitted_type!r}."
-        )
+    if not isinstance(source, ImportSourceSnapshot):
+        raise TypeError("Import planning requires one immutable source snapshot.")
+    admitted_type = source.file_type
     target_sheets = list(per_sheet_intents.keys())
     if not target_sheets:
         raise ValueError("Select at least one CSV source or XLSX sheet.")
@@ -517,6 +560,31 @@ def resolve_import_plans(
 
         skip_unit_row = bool(detection.has_unit_row and not sheet_intent.override_no_unit_row)
 
+        if skip_unit_row:
+            selected_text = detection.selected_unit_text_by_column
+            selected_categories = detection.selected_unit_category_by_column
+            selected_roles = (
+                (sheet_intent.time_column, "time"),
+                *((column, "concentration") for column in species_columns),
+            )
+            for column, expected_category in selected_roles:
+                cell_text = selected_text.get(column, "")
+                if not cell_text:
+                    continue
+                actual_category = selected_categories.get(column)
+                if actual_category is None:
+                    raise ValueError(
+                        f"Classified unit row cell for selected column "
+                        f"{column.assigned_name!r} contains unsupported unit "
+                        f"{cell_text!r}."
+                    )
+                if actual_category != expected_category:
+                    raise ValueError(
+                        f"Classified unit row cell for selected column "
+                        f"{column.assigned_name!r} must contain a supported "
+                        f"{expected_category} unit, not {cell_text!r}."
+                    )
+
         if sheet_intent.override_no_unit_row:
             time_unit = "s"
             time_factor = 1.0
@@ -540,7 +608,6 @@ def resolve_import_plans(
 
         plans.append(
             ResolvedSheetPlan(
-                filepath=filepath,
                 sheet_name=sheet,
                 time_column=sheet_intent.time_column,
                 species_columns=species_columns,

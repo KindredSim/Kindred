@@ -23,7 +23,7 @@ from kindred.core.result_repository import (
     standard_concentration_identity,
 )
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
-from kindred.gui.workspace_tab_registry import ScientificDocumentDelta
+from kindred.gui.workspace_tab_registry import CanonicalMutationResult
 
 __all__ = [
     "BatchInitialConditionsTableModel",
@@ -67,7 +67,7 @@ class _ProjectedRow:
 
 
 class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
-    """Resettable view projection; canonical values live in ProjectDocument."""
+    """Retained view projection; canonical values live in ProjectDocument."""
 
     initialValueEditRequested = QtCore.Signal(str, str, str)
     setNameEditRequested = QtCore.Signal(str, str)
@@ -130,14 +130,61 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             )
             for initial_set in tab.initial_condition_sets
         )
-        self.beginResetModel()
-        try:
-            self._binding_generation += 1
+        if rows == self._rows and species == self._species:
+            return
+        structure_changed = bool(
+            species != self._species
+            or tuple(row.set_id for row in rows)
+            != tuple(row.set_id for row in self._rows)
+        )
+        if structure_changed:
+            self.beginResetModel()
+            try:
+                self._binding_generation += 1
+                self._rows = rows
+                self._species = species
+            finally:
+                self.endResetModel()
+        else:
+            previous_rows = self._rows
             self._rows = rows
-            self._species = species
-        finally:
-            self.endResetModel()
+            self._emit_nonstructural_changes(previous_rows, rows)
         self._snapshot_render_timer.start(0)
+
+    def _emit_nonstructural_changes(
+        self,
+        previous_rows: tuple[_ProjectedRow, ...],
+        rows: tuple[_ProjectedRow, ...],
+    ) -> None:
+        """Notify only changed cells so an unrelated active editor survives."""
+
+        for row_index, (previous, current) in enumerate(
+            zip(previous_rows, rows, strict=True)
+        ):
+            changed_columns: set[int] = set()
+            if previous.name != current.name:
+                changed_columns.add(0)
+            previous_invalid = dict(previous.invalid_raw_values)
+            current_invalid = dict(current.invalid_raw_values)
+            for species_index, species in enumerate(self._species, start=1):
+                if (
+                    previous.display_value(species)
+                    != current.display_value(species)
+                    or (species in previous_invalid)
+                    != (species in current_invalid)
+                ):
+                    changed_columns.add(species_index)
+            if previous.slider_pinned != current.slider_pinned:
+                changed_columns.add(self.slider_column())
+            if previous.plot_requested != current.plot_requested:
+                changed_columns.add(self.plot_column())
+            if previous.custom_run_settings != current.custom_run_settings:
+                changed_columns.update(
+                    (self.custom_column(), self.run_gear_column())
+                )
+            for column in sorted(changed_columns):
+                index = self.index(row_index, column)
+                self.dataChanged.emit(index, index, [])
 
     def species_names(self) -> tuple[str, ...]:
         return self._species
@@ -486,7 +533,7 @@ def projected_initial_values(
 
 
 class InitialConditionsTableActions(QtCore.QObject):
-    """Direct active-tab commits plus transient invalid/selection ownership."""
+    """Own IC intents for one immutable mechanism-tab identity."""
 
     errorRaised = QtCore.Signal(str)
     activeSnapshotChanged = QtCore.Signal()
@@ -496,6 +543,7 @@ class InitialConditionsTableActions(QtCore.QObject):
     def __init__(
         self,
         *,
+        tab_id: str,
         registry,
         model: BatchInitialConditionsTableModel,
         table: BatchInitialConditionsTableView,
@@ -504,6 +552,11 @@ class InitialConditionsTableActions(QtCore.QObject):
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        target = str(tab_id).strip()
+        if not target:
+            raise ValueError("tab_id must be nonblank.")
+        registry.tab(target)
+        self._tab_id = target
         self._registry = registry
         self._model = model
         self._table = table
@@ -521,14 +574,18 @@ class InitialConditionsTableActions(QtCore.QObject):
         table.selectionModel().selectionChanged.connect(self._capture_run_selection)
         table.selectionModel().currentChanged.connect(self._capture_current_set)
 
-    def prepare_active_render(self) -> _InitialConditionsRenderProjection:
+    @property
+    def tab_id(self) -> str:
+        return self._tab_id
+
+    def prepare_render(self) -> _InitialConditionsRenderProjection:
         """Prepare the complete table projection without touching widgets."""
 
-        tab = self._registry.active_tab
-        runtime = self._registry.active_runtime
+        tab = self._registry.tab(self._tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         return _InitialConditionsRenderProjection(
             tab=tab,
-            presentation=self._registry.active_presentation,
+            presentation=self._registry.presentation(self._tab_id),
             invalid_raw_by_set=tuple(
                 (
                     str(set_id),
@@ -567,40 +624,51 @@ class InitialConditionsTableActions(QtCore.QObject):
                 },
                 species_names=projection.species_names,
             )
-            selection.clearSelection()
-            selected = set(projection.selected_run_set_ids)
+            selected_ordered = tuple(projection.selected_run_set_ids)
+            selected = set(selected_ordered)
             current_set_id = projection.presentation.current_set_id
-            for row, set_id in enumerate(self._model.set_ids()):
-                index = self._model.index(row, 0)
-                if set_id in selected:
+            if tuple(self._table.selected_set_ids()) != selected_ordered:
+                selection.clearSelection()
+                for row, set_id in enumerate(self._model.set_ids()):
+                    if set_id not in selected:
+                        continue
                     selection.select(
-                        index,
+                        self._model.index(row, 0),
                         QtCore.QItemSelectionModel.SelectionFlag.Select
                         | QtCore.QItemSelectionModel.SelectionFlag.Rows,
                     )
-                if set_id == current_set_id:
+            rendered_current = self._model.set_id_for_live_index(
+                self._table.currentIndex()
+            )
+            if rendered_current != current_set_id:
+                for row, set_id in enumerate(self._model.set_ids()):
+                    if set_id != current_set_id:
+                        continue
                     selection.setCurrentIndex(
-                        index,
+                        self._model.index(row, 0),
                         QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
                     )
+                    break
         finally:
             self._rendering = False
             del selection_blocker
 
-    def render_active(self) -> None:
-        self.apply_render_projection(self.prepare_active_render())
+    def render(self) -> None:
+        self.apply_render_projection(self.prepare_render())
 
     def settle_active_editor(self) -> None:
         self._table.settle_active_editor()
 
     def selected_run_set_ids(self) -> tuple[str, ...]:
-        return tuple(self._registry.active_runtime.selected_run_set_ids)
+        return tuple(
+            self._registry.tab_runtime(self._tab_id).selected_run_set_ids
+        )
 
     def invalid_cells(
         self,
         set_ids: Iterable[str] | None = None,
     ) -> tuple[tuple[str, str, str], ...]:
-        runtime = self._registry.active_runtime
+        runtime = self._registry.tab_runtime(self._tab_id)
         allowed = None if set_ids is None else {str(item) for item in set_ids}
         return tuple(
             (set_id, species, raw)
@@ -613,7 +681,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         return bool(self.invalid_cells(set_ids))
 
     def discard_invalid_cells(self, set_ids: Iterable[str] | None = None) -> bool:
-        runtime = self._registry.active_runtime
+        runtime = self._registry.tab_runtime(self._tab_id)
         allowed = None if set_ids is None else {str(item) for item in set_ids}
         changed = False
         recovered_set_ids: list[str] = []
@@ -626,29 +694,31 @@ class InitialConditionsTableActions(QtCore.QObject):
                 recovered_set_ids.append(set_id)
             for species in values:
                 self.invalidCellStateChanged.emit(
-                    self._registry.active_tab_id,
+                    self._tab_id,
                     set_id,
                     species,
                     False,
                 )
         if changed:
             self._reconcile_canonical_sets(
-                self._registry.active_tab,
+                self._registry.tab(self._tab_id),
                 recovered_set_ids,
             )
-            self.render_active()
+            self.render()
             self.activeSnapshotChanged.emit()
         return changed
 
     @QtCore.Slot(str, str, str)
     def accept_value_edit(self, set_id: str, species: str, raw_text: str) -> bool:
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         initial_set = tab.initial_condition_set(set_id)
         try:
             value = float(raw_text)
         except (TypeError, ValueError):
             value = math.nan
-        invalid = self._registry.active_runtime.invalid_initial_text_by_set_id
+        invalid = self._registry.tab_runtime(
+            self._tab_id
+        ).invalid_initial_text_by_set_id
         was_invalid = species in invalid.get(set_id, {})
         if not math.isfinite(value) or value < 0.0:
             raw = str(raw_text)
@@ -663,26 +733,29 @@ class InitialConditionsTableActions(QtCore.QObject):
             self.invalidCellStateChanged.emit(
                 tab.tab_id, set_id, species, True
             )
-            self.render_active()
+            self.render()
             self.activeSnapshotChanged.emit()
             return False
 
         values = initial_set.values_dict()
         canonical = float(values.get(str(species), 0.0))
         changed = value != canonical
-        delta: ScientificDocumentDelta | None = None
+        result: CanonicalMutationResult | None = None
         if changed:
             values[str(species)] = value
-            delta = self._registry.replace_active_initial_condition_set(
+            result = self._registry.replace_initial_condition_set(
+                self._tab_id,
                 initial_set.with_values(values),
+                expected_token=self._registry.capture_content_token(),
             )
+            if result is None:
+                return False
+            self._consume_document_delta(result)
         invalid_cleared = self._clear_invalid_value(set_id, species)
         if was_invalid and not changed:
             self._reconcile_canonical_sets(tab, (set_id,))
-        self.render_active()
-        if delta is not None:
-            self._consume_document_delta(delta)
-        elif invalid_cleared:
+        self.render()
+        if result is None and invalid_cleared:
             self.activeSnapshotChanged.emit()
         return changed
 
@@ -719,11 +792,13 @@ class InitialConditionsTableActions(QtCore.QObject):
                 "Every pasted concentration must be finite and nonnegative."
             )
 
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         invalid_before = {
             set_id: frozenset(values)
             for set_id, values
-            in self._registry.active_runtime.invalid_initial_text_by_set_id.items()
+            in self._registry.tab_runtime(
+                self._tab_id
+            ).invalid_initial_text_by_set_id.items()
         }
         candidate_sets = list(tab.initial_condition_sets)
         changed_ids: list[str] = []
@@ -744,11 +819,16 @@ class InitialConditionsTableActions(QtCore.QObject):
                 candidate_sets[row_index] = initial_set.with_values(values)
                 changed_ids.append(initial_set.set_id)
 
-        delta: ScientificDocumentDelta | None = None
+        result: CanonicalMutationResult | None = None
         if changed_ids:
-            delta = self._registry.replace_active_tab(
+            result = self._registry.replace_tab(
+                self._tab_id,
                 tab.with_initial_condition_sets(tuple(candidate_sets)),
+                expected_token=self._registry.capture_content_token(),
             )
+            if result is None:
+                return False
+            self._consume_document_delta(result)
         invalid_cleared = False
         for set_id, species in cleared_cells:
             invalid_cleared = (
@@ -765,17 +845,15 @@ class InitialConditionsTableActions(QtCore.QObject):
         )
         if canonical_recovery_ids:
             self._reconcile_canonical_sets(tab, canonical_recovery_ids)
-        self.render_active()
-        if delta is not None:
-            self._consume_document_delta(delta)
-        elif invalid_cleared:
+        self.render()
+        if result is None and invalid_cleared:
             self.activeSnapshotChanged.emit()
-        return bool(delta is not None or invalid_cleared)
+        return bool(result is not None or invalid_cleared)
 
     @QtCore.Slot(str, str)
     def accept_name_edit(self, set_id: str, name: str) -> bool:
         normalized = str(name).strip()
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         if not normalized:
             return self._reject("Initial-condition set names must be nonblank.")
         if any(
@@ -787,14 +865,17 @@ class InitialConditionsTableActions(QtCore.QObject):
                 f"An initial-condition set named {normalized!r} already exists."
             )
         initial_set = tab.initial_condition_set(set_id)
-        delta = self._registry.replace_active_initial_condition_set(
+        result = self._registry.replace_initial_condition_set(
+            self._tab_id,
             replace(initial_set, name=normalized),
+            expected_token=self._registry.capture_content_token(),
         )
-        self.render_active()
-        return self._consume_document_delta(delta)
+        accepted = self._consume_document_delta(result)
+        self.render()
+        return accepted
 
     def add_set(self) -> InitialConditionSet | None:
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         created = InitialConditionSet(
             set_id=new_set_id(),
             name=next_set_name(item.name for item in tab.initial_condition_sets),
@@ -802,18 +883,21 @@ class InitialConditionsTableActions(QtCore.QObject):
                 (str(species), 0.0) for species in self._species_for_tab(tab)
             ),
         )
-        delta = self._registry.mutate_active_tab(
+        result = self._registry.mutate_tab(
+            self._tab_id,
             lambda current: current.add_initial_condition_set(created),
+            expected_token=self._registry.capture_content_token(),
         )
-        self.render_active()
-        return created if self._consume_document_delta(delta) else None
+        accepted = self._consume_document_delta(result)
+        self.render()
+        return created if accepted else None
 
     def move_selected(self, delta: int) -> tuple[str, ...]:
         self.settle_active_editor()
         selected = self.selected_run_set_ids()
         if not selected or int(delta) == 0:
             return selected
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         ordered = list(tab.initial_condition_sets)
         active = {
             index for index, item in enumerate(ordered) if item.set_id in set(selected)
@@ -834,11 +918,13 @@ class InitialConditionsTableActions(QtCore.QObject):
                 ordered[row], ordered[destination] = ordered[destination], ordered[row]
                 active.remove(row)
                 active.add(destination)
-        delta_result = self._registry.mutate_active_tab(
+        mutation_result = self._registry.mutate_tab(
+            self._tab_id,
             lambda current: current.with_initial_condition_sets(tuple(ordered)),
+            expected_token=self._registry.capture_content_token(),
         )
-        self.render_active()
-        self._consume_document_delta(delta_result)
+        self._consume_document_delta(mutation_result)
+        self.render()
         return tuple(ordered[row].set_id for row in sorted(active))
 
     def delete_selected(self) -> bool:
@@ -846,35 +932,52 @@ class InitialConditionsTableActions(QtCore.QObject):
         targets = self.selected_run_set_ids()
         if not targets:
             return False
-        delta = self._registry.remove_initial_condition_sets(targets)
-        self.render_active()
-        return self._consume_document_delta(delta)
+        result = self._registry.remove_initial_condition_sets(
+            self._tab_id,
+            targets,
+            expected_token=self._registry.capture_content_token(),
+        )
+        accepted = self._consume_document_delta(result)
+        self.render()
+        return accepted
 
     @QtCore.Slot(str, bool)
     def set_plot_requested(self, set_id: str, requested: bool) -> bool:
-        state = self._registry.active_presentation
+        state = self._registry.presentation(self._tab_id)
         ids = [item for item in state.plot_set_ids if item != set_id]
         if requested:
             ids.append(set_id)
         next_state = replace(state, plot_set_ids=tuple(ids))
         if next_state == state:
             return False
-        self._registry.set_presentation(self._registry.active_tab_id, next_state)
-        self.render_active()
+        token = self._registry.set_presentation(
+            self._tab_id,
+            next_state,
+            expected_token=self._registry.capture_content_token(),
+        )
+        if token is None:
+            return False
+        self.render()
         self.activeSnapshotChanged.emit()
         return True
 
     @QtCore.Slot(str, bool)
     def set_slider_pinned(self, set_id: str, pinned: bool) -> bool:
-        state = self._registry.active_presentation
+        state = self._registry.presentation(self._tab_id)
         ids = [item for item in state.pinned_slider_set_ids if item != set_id]
         if pinned:
             ids.append(set_id)
         next_state = replace(state, pinned_slider_set_ids=tuple(ids))
         if next_state == state:
             return False
-        self._registry.set_presentation(self._registry.active_tab_id, next_state)
-        self.render_active()
+        token = self._registry.set_presentation(
+            self._tab_id,
+            next_state,
+            expected_token=self._registry.capture_content_token(),
+        )
+        if token is None:
+            return False
+        self.render()
         self.activeSnapshotChanged.emit()
         return True
 
@@ -885,27 +988,37 @@ class InitialConditionsTableActions(QtCore.QObject):
         self,
         settings: SimulationExecutionSettings,
     ) -> bool:
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         if settings == tab.run_defaults:
             return False
-        delta = self._registry.set_active_run_defaults(settings)
-        self.render_active()
-        return self._consume_document_delta(delta)
+        result = self._registry.set_run_defaults(
+            self._tab_id,
+            settings,
+            expected_token=self._registry.capture_content_token(),
+        )
+        accepted = self._consume_document_delta(result)
+        self.render()
+        return accepted
 
     def set_tab_scientific_settings(
         self,
         settings: TabScientificSettings,
     ) -> bool:
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         if settings == tab.scientific_settings:
             return False
-        delta = self._registry.set_active_scientific_settings(settings)
-        self.render_active()
-        return self._consume_document_delta(delta)
+        result = self._registry.set_scientific_settings(
+            self._tab_id,
+            settings,
+            expected_token=self._registry.capture_content_token(),
+        )
+        accepted = self._consume_document_delta(result)
+        self.render()
+        return accepted
 
     @QtCore.Slot(str, bool)
     def toggle_custom_run_settings(self, set_id: str, checked: bool) -> bool:
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         overrides = dict(tab.run_overrides_by_set_id)
         has_override = set_id in overrides
         if checked:
@@ -924,13 +1037,13 @@ class InitialConditionsTableActions(QtCore.QObject):
             QtWidgets.QMessageBox.StandardButton.Cancel,
         )
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-            self.render_active()
+            self.render()
             return False
         return self.set_custom_run_settings(set_id, None)
 
     @QtCore.Slot(str)
     def edit_custom_run_settings(self, set_id: str) -> bool:
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         override = dict(tab.run_overrides_by_set_id).get(set_id)
         if override is None:
             return False
@@ -941,7 +1054,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         set_id: str,
         seed: SimulationExecutionSettings,
     ) -> bool:
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         initial_set = tab.initial_condition_set(set_id)
         dialog = SolverSettingsDialog(
             self._table,
@@ -949,7 +1062,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         )
         dialog.set_execution_settings(seed)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            self.render_active()
+            self.render()
             return False
         return self.set_custom_run_settings(set_id, dialog.execution_settings())
 
@@ -958,13 +1071,19 @@ class InitialConditionsTableActions(QtCore.QObject):
         set_id: str,
         settings: SimulationExecutionSettings | None,
     ) -> bool:
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         current = dict(tab.run_overrides_by_set_id).get(set_id)
         if current == settings:
             return False
-        delta = self._registry.set_active_run_override(set_id, settings)
-        self.render_active()
-        return self._consume_document_delta(delta)
+        result = self._registry.set_run_override(
+            self._tab_id,
+            set_id,
+            settings,
+            expected_token=self._registry.capture_content_token(),
+        )
+        accepted = self._consume_document_delta(result)
+        self.render()
+        return accepted
 
     @QtCore.Slot()
     def _capture_run_selection(self, *_args) -> None:
@@ -974,7 +1093,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         selected = tuple(
             set_id for set_id in self._table.selected_set_ids() if set_id in valid
         )
-        self._registry.active_runtime.selected_run_set_ids = selected
+        self._registry.tab_runtime(self._tab_id).selected_run_set_ids = selected
         self.selectedRunSetIdsChanged.emit(selected)
 
     @QtCore.Slot()
@@ -984,16 +1103,20 @@ class InitialConditionsTableActions(QtCore.QObject):
         set_id = self._model.set_id_for_live_index(self._table.currentIndex())
         if set_id is None:
             return
-        state = self._registry.active_presentation
+        state = self._registry.presentation(self._tab_id)
         if state.current_set_id != set_id:
-            self._registry.set_presentation(
-                self._registry.active_tab_id,
+            token = self._registry.set_presentation(
+                self._tab_id,
                 replace(state, current_set_id=set_id),
+                expected_token=self._registry.capture_content_token(),
             )
-            self.activeSnapshotChanged.emit()
+            if token is not None:
+                self.activeSnapshotChanged.emit()
 
     def _clear_invalid_value(self, set_id: str, species: str) -> bool:
-        invalid = self._registry.active_runtime.invalid_initial_text_by_set_id
+        invalid = self._registry.tab_runtime(
+            self._tab_id
+        ).invalid_initial_text_by_set_id
         set_values = invalid.get(set_id)
         if set_values is None or species not in set_values:
             return False
@@ -1001,7 +1124,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         if not set_values:
             invalid.pop(set_id, None)
         self.invalidCellStateChanged.emit(
-            self._registry.active_tab_id,
+            self._tab_id,
             set_id,
             species,
             False,
@@ -1010,17 +1133,17 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     def _consume_document_delta(
         self,
-        delta: ScientificDocumentDelta | None,
+        result: CanonicalMutationResult | None,
     ) -> bool:
-        if delta is None:
+        if result is None:
             return False
-        if not isinstance(delta, ScientificDocumentDelta):
-            raise TypeError("delta must be ScientificDocumentDelta.")
-        for tab_id, set_ids in delta.affected_targets_by_tab:
+        if not isinstance(result, CanonicalMutationResult):
+            raise TypeError("result must be CanonicalMutationResult.")
+        for tab_id, set_ids in result.delta.affected_targets_by_tab:
             if set_ids:
                 self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
         self.activeSnapshotChanged.emit()
-        return True
+        return result.changed
 
     def _reconcile_canonical_sets(
         self,

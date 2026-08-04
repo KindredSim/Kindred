@@ -13,10 +13,12 @@ from kindred.core.project_document import (
 from kindred.core.project_presentation_state import (
     WorkspacePresentationState,
     default_workspace_presentation_state,
+    reconcile_workspace_presentation_state,
     validate_workspace_presentation_state,
 )
 
 __all__ = [
+    "ProjectContentToken",
     "PreparedProjectInstall",
     "ProjectSession",
     "SavedArchiveBaseline",
@@ -38,6 +40,14 @@ class PreparedProjectInstall:
     saved_baseline: SavedArchiveBaseline
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectContentToken:
+    """Opaque session-local identity for one canonical content revision."""
+
+    _owner: object
+    revision: int
+
+
 class ProjectSession:
     """Own the current document, path, and last saved archive baseline."""
 
@@ -51,7 +61,7 @@ class ProjectSession:
         initial_presentation = (
             default_workspace_presentation_state(validated_document)
             if presentation is None
-            else validate_workspace_presentation_state(
+            else reconcile_workspace_presentation_state(
                 validated_document,
                 presentation,
             )
@@ -65,6 +75,8 @@ class ProjectSession:
             ),
         )
         self._identity_generation = 0
+        self._content_revision = 0
+        self._content_token_owner = object()
 
     @property
     def document(self) -> ProjectDocument:
@@ -83,6 +95,28 @@ class ProjectSession:
         """Session-only generation for real project identity replacement."""
 
         return self._identity_generation
+
+    def capture_content_token(self) -> ProjectContentToken:
+        """Capture the exact current revision for conditional publication."""
+
+        return ProjectContentToken(
+            self._content_token_owner,
+            self._content_revision,
+        )
+
+    def is_content_token_current(self, token: ProjectContentToken) -> bool:
+        """Return whether ``token`` belongs to this session's current content."""
+
+        if not isinstance(token, ProjectContentToken):
+            raise TypeError("token must be ProjectContentToken.")
+        return bool(
+            token._owner is self._content_token_owner
+            and token.revision == self._content_revision
+        )
+
+    def _advance_content_revision(self) -> ProjectContentToken:
+        self._content_revision += 1
+        return self.capture_content_token()
 
     @property
     def is_document_dirty(self) -> bool:
@@ -110,21 +144,50 @@ class ProjectSession:
         self,
         document: ProjectDocument,
         *,
+        expected_token: ProjectContentToken,
         fence_deletions: Callable[
             [ProjectDocument, ProjectDocument],
             None,
         ],
-    ) -> bool:
-        """Validate, fence deletions, then commit one canonical replacement."""
+    ) -> ProjectContentToken | None:
+        """Conditionally validate, fence, and publish one document value.
+
+        ``None`` means a newer canonical document or presentation superseded
+        the caller.  An unchanged document is an accepted no-op and returns
+        the still-current token.
+        """
 
         if not callable(fence_deletions):
             raise TypeError("fence_deletions must be callable.")
+        if not self.is_content_token_current(expected_token):
+            return None
         candidate = validate_project_document(document)
         if candidate == self.document:
-            return False
+            return self.capture_content_token()
         fence_deletions(self.document, candidate)
+        if not self.is_content_token_current(expected_token):
+            return None
         self._state = replace(self._state, document=candidate)
-        return True
+        return self._advance_content_revision()
+
+    def record_presentation_change(
+        self,
+        previous: WorkspacePresentationState,
+        current: WorkspacePresentationState,
+    ) -> ProjectContentToken:
+        """Advance currentness after one accepted presentation mutation."""
+
+        before = validate_workspace_presentation_state(
+            self.document,
+            previous,
+        )
+        after = validate_workspace_presentation_state(
+            self.document,
+            current,
+        )
+        if before == after:
+            return self.capture_content_token()
+        return self._advance_content_revision()
 
     def prepare_install(
         self,
@@ -136,7 +199,7 @@ class ProjectSession:
         """Validate every incoming session value without mutating live state."""
 
         candidate = validate_project_document(document)
-        candidate_presentation = validate_workspace_presentation_state(
+        candidate_presentation = reconcile_workspace_presentation_state(
             candidate,
             presentation,
         )
@@ -154,19 +217,33 @@ class ProjectSession:
             ),
         )
 
-    def commit_install(self, prepared: PreparedProjectInstall) -> None:
-        """Commit one already-prepared replacement using assignments only."""
+    def commit_install(
+        self,
+        prepared: PreparedProjectInstall,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        """Conditionally commit one already-prepared project replacement."""
 
         if not isinstance(prepared, PreparedProjectInstall):
             raise TypeError("prepared must be PreparedProjectInstall.")
+        if not self.is_content_token_current(expected_token):
+            return None
         self._state = prepared
         self._identity_generation += 1
+        return self._advance_content_revision()
 
     def mark_saved(
         self,
         path: str | os.PathLike[str],
         presentation: WorkspacePresentationState,
-    ) -> None:
+        *,
+        expected_token: ProjectContentToken,
+    ) -> bool:
+        """Conditionally publish path and baseline without changing content."""
+
+        if not self.is_content_token_current(expected_token):
+            return False
         candidate_presentation = validate_workspace_presentation_state(
             self.document,
             presentation,
@@ -180,3 +257,4 @@ class ProjectSession:
                 presentation=candidate_presentation,
             ),
         )
+        return True

@@ -61,6 +61,7 @@ __all__ = [
     "FitCandidate",
     "FitCurveDataset",
     "FitLiveUpdate",
+    "FitWorkerTerminal",
     "GlobalFitWorker",
 ]
 
@@ -418,18 +419,27 @@ class FitCandidate:
                 "Fit candidate prepared DSL must exactly match its source."
             )
 
-    @property
-    def available_scopes(self) -> tuple[str, ...]:
-        scopes: list[str] = []
-        if self.parameters:
-            scopes.append("parameters")
-        if self.initial_values_by_set:
-            scopes.append("initial_concentrations")
-        if self.execution_by_set:
-            scopes.append("simulation_setup")
-        if self.local_observables:
-            scopes.append("observable_definitions")
-        return tuple(scopes)
+
+@dataclass(frozen=True, slots=True)
+class FitWorkerTerminal:
+    """The one result retained by a worker until native ``finished``."""
+
+    candidate: FitCandidate | None
+    message: str
+    cancelled: bool = False
+
+    def __post_init__(self) -> None:
+        message = str(self.message or "").strip()
+        if self.candidate is not None:
+            if not isinstance(self.candidate, FitCandidate):
+                raise TypeError("Fit worker candidate must be FitCandidate.")
+            if message or self.cancelled:
+                raise ValueError(
+                    "A successful Fit terminal cannot also be failed or cancelled."
+                )
+        elif not message:
+            raise ValueError("A non-success Fit terminal requires a message.")
+        object.__setattr__(self, "message", message)
 
 
 def _observed_curve_parts(
@@ -1179,9 +1189,6 @@ class GlobalFitWorker(QtCore.QThread):
     auto_modes_resolved = QtCore.Signal(object)
     best_updated = QtCore.Signal(object)
     curves_updated = QtCore.Signal(object)
-    run_identity_ready = QtCore.Signal(object)
-    succeeded = QtCore.Signal(object)
-    failed = QtCore.Signal(str)
     detailed_balance_correction_required = QtCore.Signal(object)
 
     def __init__(
@@ -1207,7 +1214,6 @@ class GlobalFitWorker(QtCore.QThread):
         self._best_iteration = 0
         self._best_params: dict[str, float] = {}
         self._resolved_auto_modes: tuple[tuple[str, str], ...] = ()
-        self._run_identity: FitRunIdentity | None = None
         self._detailed_balance_condition = Condition()
         self._detailed_balance_response: tuple[
             FitExecutionRequest,
@@ -1216,6 +1222,7 @@ class GlobalFitWorker(QtCore.QThread):
         self._detailed_balance_answered = False
         self._pending_detailed_balance_request_id: str | None = None
         self._detailed_balance_rejection_message: str | None = None
+        self._terminal_result: FitWorkerTerminal | None = None
 
     def pause(self) -> None:
         with self._pause_condition:
@@ -1226,12 +1233,14 @@ class GlobalFitWorker(QtCore.QThread):
         return self._resolved_auto_modes
 
     @property
-    def run_identity(self) -> FitRunIdentity | None:
-        return self._run_identity
-
-    @property
     def publication_fenced(self) -> bool:
         return self._cancelled.is_set() or self.isInterruptionRequested()
+
+    @property
+    def terminal_result(self) -> FitWorkerTerminal | None:
+        """Return the retained terminal after the worker's ``run`` exits."""
+
+        return self._terminal_result
 
     def resume(self) -> None:
         with self._pause_condition:
@@ -1293,6 +1302,7 @@ class GlobalFitWorker(QtCore.QThread):
         return self._cancelled.is_set()
 
     def run(self) -> None:
+        terminal: FitWorkerTerminal
         try:
             try:
                 candidate = self._execute(
@@ -1337,27 +1347,45 @@ class GlobalFitWorker(QtCore.QThread):
                 self._best_iteration = 0
                 self._best_params = {}
                 self._resolved_auto_modes = ()
-                self._run_identity = None
                 candidate = self._execute(
                     allow_detailed_balance_correction=False
                 )
         except FittingCancelled:
-            self.failed.emit("Fit cancelled.")
+            terminal = FitWorkerTerminal(
+                candidate=None,
+                message="Fit cancelled.",
+                cancelled=True,
+            )
         except BaseException as exc:  # noqa: BLE001
-            self.failed.emit(str(exc) or type(exc).__name__)
+            terminal = FitWorkerTerminal(
+                candidate=None,
+                message=str(exc) or type(exc).__name__,
+            )
         else:
             if self._checkpoint():
-                self.failed.emit("Fit cancelled.")
+                terminal = FitWorkerTerminal(
+                    candidate=None,
+                    message="Fit cancelled.",
+                    cancelled=True,
+                )
             else:
-                self.succeeded.emit(candidate)
-                if self._checkpoint():
-                    return
+                terminal = FitWorkerTerminal(
+                    candidate=candidate,
+                    message="",
+                )
+        self._terminal_result = terminal
 
     def _execute(
         self,
         *,
         allow_detailed_balance_correction: bool,
     ) -> FitCandidate:
+        def fitting_checkpoint() -> bool:
+            return self._checkpoint()
+
+        fitting_checkpoint._kindred_nonblocking_cancelled = (  # type: ignore[attr-defined]
+            lambda: self._cancelled.is_set() or self.isInterruptionRequested()
+        )
         request = self._request
         included = [item for item in request.datasets if item.included]
         mapped_by_id = {item.dataset_id: item for item in request.origin.mapped_datasets}
@@ -1597,7 +1625,7 @@ class GlobalFitWorker(QtCore.QThread):
                     for name in fixed_by_dataset[local.dataset_id]
                 },
             )
-            evaluator.set_cancellation_check(self._checkpoint)
+            evaluator.set_cancellation_check(fitting_checkpoint)
             evaluators[local.dataset_id] = evaluator
             metadata = evaluator.prepared_metadata
             prepared_ids[local.dataset_id] = {
@@ -1729,14 +1757,13 @@ class GlobalFitWorker(QtCore.QThread):
         if self._checkpoint():
             raise FittingCancelled()
         self._last_curve_emit = time.monotonic()
-        run_identity = FitRunIdentity.build(
-            {
-                "kind": "global_fit_run",
-                "schema_version": 1,
-                "origin_tab_id": request.origin.tab_id,
-                "origin_capture_id": request.origin.capture_id,
-                "mechanism_text": request.mechanism_source.reactions_text,
-                "local_observables": [
+        run_identity_payload = {
+            "kind": "global_fit_run",
+            "schema_version": 1,
+            "origin_tab_id": request.origin.tab_id,
+            "origin_capture_id": request.origin.capture_id,
+            "mechanism_text": request.mechanism_source.reactions_text,
+            "local_observables": [
                     {
                         "name": item.name,
                         "expression": item.expression,
@@ -1753,7 +1780,7 @@ class GlobalFitWorker(QtCore.QThread):
                     }
                     for item in request.local_observables
                 ],
-                "datasets": [
+            "datasets": [
                     {
                         "dataset_id": item.dataset_id,
                         "set_id": mapped_by_id[item.dataset_id].set_id,
@@ -1827,10 +1854,20 @@ class GlobalFitWorker(QtCore.QThread):
                                 "raw_column": raw_column,
                                 "model_target": model_target,
                             }
-                            for raw_id, raw_column, model_target in next(
+                            for raw_id, model_target in next(
                                 local.observation_targets
                                 for local in included
                                 if local.dataset_id == item.dataset_id
+                            )
+                            for raw_column in (
+                                next(
+                                    observation.raw_column
+                                    for observation in mapped_by_id[
+                                        item.dataset_id
+                                    ].observations
+                                    if observation.raw_observation_id
+                                    == raw_id
+                                ),
                             )
                         ],
                         "targets": item.species_list,
@@ -1893,7 +1930,7 @@ class GlobalFitWorker(QtCore.QThread):
                     }
                     for item in datasets
                 ],
-                "parameters": [
+            "parameters": [
                     {
                         "name": item.name,
                         "display_name": item.display_name,
@@ -1910,7 +1947,7 @@ class GlobalFitWorker(QtCore.QThread):
                     }
                     for item in request.parameters
                 ],
-                "initials": [
+            "initials": [
                     {
                         "set_id": item.set_id,
                         "species": item.species,
@@ -1923,7 +1960,7 @@ class GlobalFitWorker(QtCore.QThread):
                     }
                     for item in request.initials
                 ],
-                "settings": {
+            "settings": {
                     "method": request.defaults.method,
                     "max_nfev": request.defaults.max_nfev,
                     "ftol": request.defaults.ftol,
@@ -1931,7 +1968,7 @@ class GlobalFitWorker(QtCore.QThread):
                     "use_seed": request.defaults.use_seed,
                     "seed": request.defaults.seed if request.defaults.use_seed else None,
                 },
-                "scientific_settings": {
+            "scientific_settings": {
                     "temperature": float(
                         request.origin.scientific_settings.temperature
                     ),
@@ -1944,16 +1981,9 @@ class GlobalFitWorker(QtCore.QThread):
                         request.origin.scientific_settings.wegscheider_policy
                     ),
                 },
-                "prepared_identities": prepared_ids,
-                "resolved_auto_modes": dict(resolved_modes),
-            }
-        )
-        self._run_identity = run_identity
-        if self._checkpoint():
-            raise FittingCancelled()
-        self.run_identity_ready.emit(run_identity)
-        if self._checkpoint():
-            raise FittingCancelled()
+            "prepared_identities": prepared_ids,
+            "resolved_auto_modes": dict(resolved_modes),
+        }
 
         def live_evaluations(
             params: Mapping[str, float],
@@ -2040,7 +2070,7 @@ class GlobalFitWorker(QtCore.QThread):
             xtol=float(request.defaults.xtol),
             seed=int(request.defaults.seed) if request.defaults.use_seed else None,
             progress_callback=progress,
-            cancellation_check=self._checkpoint,
+            cancellation_check=fitting_checkpoint,
         )
         if self._checkpoint():
             raise FittingCancelled()
@@ -2090,6 +2120,108 @@ class GlobalFitWorker(QtCore.QThread):
             effective_datasets=effective_local,
             initial_values_by_set=initial_values_by_set,
         )
+        if self._checkpoint():
+            raise FittingCancelled()
+        for dataset_id, evaluator in evaluators.items():
+            prepared_ids[dataset_id]["prepared_simulation"] = (
+                evaluator.prepared_metadata.to_serializable_dict()
+            )
+        run_identity_payload["terminal_replay"] = {
+            "status": result.completion.status,
+            "optimizer_converged": bool(
+                result.completion.optimizer_converged
+            ),
+            "message": str(result.message),
+            "nfev": int(result.nfev),
+            "weighted_residual_sse": float(result.weighted_residual_sse),
+            "weighted_residual_mse": float(result.weighted_residual_mse),
+            "shared_parameters": {
+                str(name): float(value)
+                for name, value in sorted(result.shared_params.items())
+            },
+            "dataset_parameters": {
+                str(dataset_id): {
+                    str(name): float(value)
+                    for name, value in sorted(values.items())
+                }
+                for dataset_id, values in sorted(
+                    result.dataset_params.items()
+                )
+            },
+            "objective_rows": [
+                {
+                    "dataset_id": dataset_id,
+                    "series": [
+                        {
+                            "model_target": series_name,
+                            "model_x": [
+                                float(value)
+                                for value in np.asarray(
+                                    result.model_x_by_species[dataset_id][
+                                        series_name
+                                    ],
+                                    dtype=float,
+                                ).reshape(-1)
+                            ],
+                            "model_y": [
+                                float(value)
+                                for value in np.asarray(
+                                    result.model_series[dataset_id][series_name],
+                                    dtype=float,
+                                ).reshape(-1)
+                            ],
+                            "segment_ids": [
+                                int(value)
+                                for value in np.asarray(
+                                    result.model_segment_ids[dataset_id][
+                                        series_name
+                                    ],
+                                    dtype=np.int64,
+                                ).reshape(-1)
+                            ],
+                            "segment_keys": list(
+                                result.model_segment_keys[dataset_id][
+                                    series_name
+                                ]
+                            ),
+                            "discontinuity_ids": [
+                                int(value)
+                                for value in np.asarray(
+                                    result.model_discontinuity_ids[dataset_id][
+                                        series_name
+                                    ],
+                                    dtype=np.int64,
+                                ).reshape(-1)
+                            ],
+                            "selection_provenance": list(
+                                result.model_selection_provenance[dataset_id][
+                                    series_name
+                                ]
+                            ),
+                            "raw_observation_ids": list(
+                                result.model_observation_ids[dataset_id][
+                                    series_name
+                                ]
+                            ),
+                            "raw_columns": list(
+                                result.model_raw_columns[dataset_id][series_name]
+                            ),
+                            "source_rows": [
+                                int(value)
+                                for value in result.model_source_rows[dataset_id][
+                                    series_name
+                                ]
+                            ],
+                        }
+                        for series_name in sorted(
+                            result.model_series[dataset_id]
+                        )
+                    ],
+                }
+                for dataset_id in sorted(result.model_series)
+            ],
+        }
+        run_identity = FitRunIdentity.build(run_identity_payload)
         if self._checkpoint():
             raise FittingCancelled()
         self.progress.emit(100, f"Fit complete · {run_identity.short_hash}")

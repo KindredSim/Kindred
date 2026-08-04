@@ -173,6 +173,7 @@ def fit_global(
     context = ObjectiveContext()
     objective: Optional[GlobalFitObjective] = None
     optimizer_completed = False
+    de_optimizer_nfev: Optional[int] = None
 
     def failed_result(
         message: str,
@@ -185,15 +186,16 @@ def fit_global(
         )
         return GlobalFitResult(
             shared_params=dict(shared_params),
-            dataset_params={
-                item.dataset_id: dict(fixed_dataset_params.get(item.dataset_id, {}))
-                for item in payloads
-            },
+            dataset_params={item.dataset_id: {} for item in payloads},
             uncertainties=None,
             weighted_residual_sse=np.inf,
             weighted_residual_mse=np.inf,
             dataset_info=[],
-            nfev=int(getattr(objective, "_iteration", 0)),
+            nfev=(
+                de_optimizer_nfev
+                if de_optimizer_nfev is not None
+                else int(getattr(objective, "_iteration", 0))
+            ),
             message=str(message),
             completion=GlobalFitCompletion(
                 status="fail",
@@ -241,6 +243,8 @@ def fit_global(
             cancellation_check=cancellation_check,
             de_penalty=de_penalty,
         )
+        if method_key == "de":
+            de_optimizer_nfev = int(optimizer_result.nfev)
         optimizer_completed = True
         success = bool(optimizer_result.success)
         message = str(optimizer_result.message)
@@ -282,7 +286,7 @@ def fit_global(
         )
         fitted_shared = layout.shared_param_dict_from_vector(vector)
         combined_dataset_params = {
-            item.dataset_id: dict(fixed_dataset_params.get(item.dataset_id, {}))
+            item.dataset_id: {}
             for item in payloads
         }
         for dataset_id, parameter_name in layout.dataset_var_order:
@@ -319,6 +323,7 @@ def fit_global(
             payloads=payloads,
             layout=layout,
             fitted_params=fitted_shared,
+            fixed_dataset_params=fixed_dataset_params,
             combined_dataset_params=combined_dataset_params,
             weights=weights_norm,
             penalty_value=penalty_value,

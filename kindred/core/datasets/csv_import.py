@@ -19,13 +19,88 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CsvImportInterrupted",
     "PhysicalColumn",
+    "UncachedFormulaCell",
     "identify_physical_columns",
     "parse_physical_rows",
+    "validate_tabular_source_bytes",
 ]
+
+_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_MAX_SOURCE_BYTES = 32 * 1024 * 1024
+_MAX_PHYSICAL_ROWS = 100_000
+_MAX_PHYSICAL_COLUMNS = 256
+_MAX_RETAINED_OBSERVATION_CELLS = 1_000_000
 
 
 class CsvImportInterrupted(Exception):
     """Raised internally to unwind when an import is interrupted."""
+
+
+@dataclass(frozen=True, slots=True)
+class UncachedFormulaCell:
+    """Selected XLSX formula text for which no cached value exists."""
+
+    formula: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.formula, str)
+            or not self.formula
+            or not self.formula.startswith("=")
+        ):
+            raise ValueError("Uncached XLSX formulas require authored formula text.")
+
+    def __str__(self) -> str:
+        return self.formula
+
+
+def validate_tabular_source_bytes(
+    source_bytes: bytes,
+    *,
+    source_format: str,
+    source_label: str,
+) -> None:
+    """Admit exact nonempty bytes for one current CSV or XLSX source."""
+
+    if type(source_bytes) is not bytes:
+        raise TypeError("Dataset source content must be exact bytes.")
+    label = str(source_label).strip() or "<dataset>"
+    if not source_bytes:
+        raise ValueError(f"Dataset source {label!r} is empty.")
+    if len(source_bytes) > _MAX_SOURCE_BYTES:
+        raise ValueError(
+            f"File {label!r} exceeds the 32 MiB supported-size limit."
+        )
+    signature = source_bytes[:8]
+    if source_format == "xlsx":
+        if not signature.startswith(_ZIP_SIGNATURES):
+            raise ValueError(
+                f"File {label!r} has an .xlsx extension but is not an XLSX "
+                "workbook."
+            )
+        return
+    if source_format != "csv":
+        raise ValueError(
+            f"Unsupported exact dataset source format {source_format!r}."
+        )
+    if signature.startswith(_ZIP_SIGNATURES) or signature.startswith(
+        _OLE_SIGNATURE
+    ):
+        raise ValueError(
+            f"File {label!r} has a .csv extension but contains a workbook or "
+            "other binary container."
+        )
+    if b"\x00" in source_bytes:
+        raise ValueError(
+            f"File {label!r} is binary data, not a UTF-8 CSV source."
+        )
+    try:
+        source_bytes.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"File {label!r} is not a valid UTF-8 CSV source."
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +177,10 @@ def parse_physical_rows(
     physical_columns = tuple(columns)
     if not physical_columns:
         raise ValueError("The source has no columns.")
+    if len(physical_columns) > _MAX_PHYSICAL_COLUMNS:
+        raise ValueError(
+            "The source exceeds the 256 physical-column supported-size limit."
+        )
     if len({column.source_index for column in physical_columns}) != len(
         physical_columns
     ):
@@ -198,9 +277,15 @@ def parse_physical_rows(
         for column in resolved_species
     }
     saw_nonempty_row = False
+    retained_cells = 0
 
     def _cell(row: Mapping[PhysicalColumn, object], column: PhysicalColumn) -> str:
         value = row.get(column, "")
+        if isinstance(value, UncachedFormulaCell):
+            raise ValueError(
+                f"{_source_prefix()}column {column.assigned_name!r}: selected "
+                f"XLSX formula {value.formula!r} has no cached value."
+            )
         return "" if value is None else str(value).strip()
 
     def _source_prefix() -> str:
@@ -215,14 +300,20 @@ def parse_physical_rows(
         itertools.chain((first,), row_iter),
         start=first_source_row,
     ):
+        if row_index - first_source_row + 1 > _MAX_PHYSICAL_ROWS:
+            raise ValueError(
+                "The source exceeds the 100000 physical-row supported-size "
+                "limit."
+            )
         _raise_if_interrupted()
-        normalized = {
-            column: _cell(row, column) for column in physical_columns
-        }
-        if not any(normalized.values()):
+        raw_values = tuple(row.get(column, "") for column in physical_columns)
+        if not any(
+            value is not None and str(value).strip()
+            for value in raw_values
+        ):
             continue
         saw_nonempty_row = True
-        raw_time = normalized[resolved_time]
+        raw_time = _cell(row, resolved_time)
         if not raw_time:
             raise ValueError(
                 f"{_source_prefix()}row {row_index}, time column "
@@ -244,7 +335,7 @@ def parse_physical_rows(
 
         for column in resolved_species:
             _raise_if_interrupted()
-            raw_value = normalized[column]
+            raw_value = _cell(row, column)
             if not raw_value:
                 continue
             try:
@@ -271,6 +362,12 @@ def parse_physical_rows(
                         f"{column.assigned_name!r}: observation must be finite."
                     )
                 continue
+            retained_cells += 1
+            if retained_cells > _MAX_RETAINED_OBSERVATION_CELLS:
+                raise ValueError(
+                    "The import exceeds the 1000000 retained-observation-cell "
+                    "limit."
+                )
             spec = observations_by_column[column]
             spec["t"].append(parsed_time)
             spec["y"].append(parsed_value)

@@ -384,10 +384,13 @@ class _Evaluator:
             fn = self.ctx.symtab.functions().get(node.name)
             if fn is None:
                 raise AlgebraNameError(f"unknown function {node.name!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-            args: List[float] = []
-            for a in node.args:
+            args: List[Any] = []
+            for index, a in enumerate(node.args):
                 av = self._eval_expr(a, i, stmt=stmt)
-                args.append(_as_float(av, stmt=stmt))
+                if node.name == "ifelse" and index == 0:
+                    args.append(av)
+                else:
+                    args.append(_as_float(av, stmt=stmt))
             try:
                 out = float(fn(*args))
             except ZeroDivisionError:

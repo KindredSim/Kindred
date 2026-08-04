@@ -26,8 +26,17 @@ from kindred.core.equilibrium_rate_authority import (
     require_step_entry_authored_role_is_editable,
     step_entry_authored_role_is_editable,
 )
-from kindred.core.mechanism_metadata import MechanismMetadataKeys
-from kindred.core.rate_binding import RateBinding
+from kindred.core.kinetics import (
+    ConstantRateModel,
+    ForwardRateModel,
+    forward_rate_model_for_equilibrium,
+    forward_rate_model_for_reaction,
+)
+from kindred.core.mechanism_metadata import (
+    MechanismMetadataKeys,
+    MechanismMetadataView,
+)
+from kindred.core.rate_binding import ForwardRateBinding, RateBinding
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import (
     MechanismParameterNamespace,
@@ -164,6 +173,39 @@ def _ensure_scalar_param_storage(mechanism: object, *, require_mutable: bool) ->
         meta.setdefault("scalar_param_info", {})
 
 
+def _written_forward_rate(
+    *,
+    name: str,
+    current: object,
+    model: ForwardRateModel,
+    value: float,
+    reference_temperature_K: float,
+    require_mutable: bool,
+) -> float | RateBinding:
+    """Write k@Tref without changing its accepted scientific family."""
+
+    if isinstance(model, ConstantRateModel):
+        if not require_mutable:
+            return float(value)
+        if isinstance(current, RateBinding) and not isinstance(
+            current, ForwardRateBinding
+        ):
+            current.set(value)
+            return current
+        return RateBinding(name=str(name), value=float(value))
+
+    if isinstance(current, ForwardRateBinding):
+        current.set(value)
+        return current
+    binding = ForwardRateBinding(
+        name=str(name),
+        model=model,
+        reference_temperature_K=float(reference_temperature_K),
+    )
+    binding.set(value)
+    return binding
+
+
 def _set_mechanism_param(
     mechanism: object,
     name: str,
@@ -186,16 +228,25 @@ def _set_mechanism_param(
             raise DSLError(f"Unknown parameter {name!r} (reaction index out of range)")
         rxn = rxns[idx]
         current = getattr(rxn, "rate", None)
-        if require_mutable:
-            if hasattr(current, "set"):
-                current.set(numeric_value)  # type: ignore[call-arg]
-                return
-            rxns[idx] = replace(
-                rxn,
-                rate=RateBinding(name=str(name), value=numeric_value),
-            )
-            return
-        rxns[idx] = replace(rxn, rate=numeric_value)
+        metadata = MechanismMetadataView.from_metadata(
+            getattr(mechanism, "metadata", {}) or {}
+        )
+        model = forward_rate_model_for_reaction(
+            rxn,
+            default_kappa=float(metadata.kappa_global),
+            default_standard_conc_M=float(metadata.standard_conc_M),
+        )
+        rxns[idx] = replace(
+            rxn,
+            rate=_written_forward_rate(
+                name=name,
+                current=current,
+                model=model,
+                value=numeric_value,
+                reference_temperature_K=float(metadata.temperature_K),
+                require_mutable=require_mutable,
+            ),
+        )
         return
 
     if kind == "equilibrium":
@@ -206,20 +257,36 @@ def _set_mechanism_param(
         eq = eqs[idx]
         if role in {"kf", "kr"}:
             current = getattr(eq, "kf", None) if role == "kf" else getattr(eq, "kr", None)
+            if role == "kf":
+                metadata = MechanismMetadataView.from_metadata(
+                    getattr(mechanism, "metadata", {}) or {}
+                )
+                model = forward_rate_model_for_equilibrium(
+                    eq,
+                    temperature_K=float(metadata.temperature_K),
+                    default_kappa=float(metadata.kappa_global),
+                    default_standard_conc_M=float(metadata.standard_conc_M),
+                )
+                eqs[idx] = replace(
+                    eq,
+                    kf=_written_forward_rate(
+                        name=name,
+                        current=current,
+                        model=model,
+                        value=numeric_value,
+                        reference_temperature_K=float(metadata.temperature_K),
+                        require_mutable=require_mutable,
+                    ),
+                )
+                return
             if require_mutable:
                 if hasattr(current, "set"):
                     current.set(numeric_value)  # type: ignore[call-arg]
                     return
                 binding = RateBinding(name=str(name), value=numeric_value)
-                if role == "kf":
-                    eqs[idx] = replace(eq, kf=binding)
-                else:
-                    eqs[idx] = replace(eq, kr=binding)
+                eqs[idx] = replace(eq, kr=binding)
                 return
-            if role == "kf":
-                eqs[idx] = replace(eq, kf=numeric_value)
-            else:
-                eqs[idx] = replace(eq, kr=numeric_value)
+            eqs[idx] = replace(eq, kr=numeric_value)
             return
         if role == "Keq":
             meta = dict(getattr(eq, "metadata", {}) or {})

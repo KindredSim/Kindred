@@ -11,6 +11,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.gui.fitting.worker import FitCurveDataset
 from kindred.gui.plot_config import try_import_pyqtgraph
+from kindred.gui.workspace_result_presenter import encode_tsv_row
 
 __all__ = ["GridPlotView"]
 
@@ -88,7 +89,14 @@ class GridPlotView(QtWidgets.QWidget):
         self._curves = ()
         self._redraw()
 
+    def copy_eligible(self) -> bool:
+        """Whether this Fit-local panel owns a rendered Copy projection."""
+
+        return bool(self._curves)
+
     def copy_all_to_clipboard(self) -> None:
+        if not self.copy_eligible():
+            raise ValueError("No rendered Fit curves are available to copy.")
         if self._copy_timer.isActive():
             return
         self._copy_chunks = iter(self._iter_copy_chunks())
@@ -107,10 +115,23 @@ class GridPlotView(QtWidgets.QWidget):
                 "Fit Copy payload exceeds the bounded full-resolution cell "
                 f"limit ({_MAX_FIT_COPY_CELLS:,})."
             )
-        header = (
-            "dataset\tseries\traw_observation_id\traw_column\tsource_row"
-            "\tsegment_id\tsegment_key\tdiscontinuity_id\tselection_provenance"
-            "\tx_name\tobserved_x\tobserved_y\tmodel_x\tmodel_y"
+        header = encode_tsv_row(
+            (
+                "dataset",
+                "series",
+                "raw_observation_id",
+                "raw_column",
+                "source_row",
+                "segment_id",
+                "segment_key",
+                "discontinuity_id",
+                "selection_provenance",
+                "x_name",
+                "observed_x",
+                "observed_y",
+                "model_x",
+                "model_y",
+            )
         )
         total_characters = 0
         output = io.StringIO()
@@ -137,9 +158,8 @@ class GridPlotView(QtWidgets.QWidget):
                     strict=True,
                 )
                 for index, (obs_x, obs_y, selected_x, selected_y) in enumerate(rows):
-                    output.write("\n")
                     output.write(
-                        "\t".join(
+                        encode_tsv_row(
                             (
                                 dataset.display_name,
                                 species,

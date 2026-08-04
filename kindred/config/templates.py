@@ -189,6 +189,27 @@ class TemplateManager:
     def __init__(self):
         self._templates: Dict[str, Template] = {}
         self._templates_dir = self._get_templates_directory()
+        self._write_disabled_reason: str | None = (
+            "Template persistence is disabled until the stored collection "
+            "has been admitted."
+        )
+
+    @property
+    def write_disabled_reason(self) -> str | None:
+        """Explain why persistence is unavailable for the admitted collection."""
+
+        return self._write_disabled_reason
+
+    def _require_writable_collection(self) -> None:
+        reason = self._write_disabled_reason
+        if reason is not None:
+            raise RuntimeError(reason)
+
+    def _record_storage_failure(self, action: str, exc: Exception) -> None:
+        detail = str(exc).strip() or type(exc).__name__
+        self._write_disabled_reason = (
+            f"Template persistence is disabled because {action}: {detail}"
+        )
 
     def _get_templates_directory(self) -> Path:
         override = os.environ.get("KINDRED_TEMPLATES_DIR")
@@ -233,6 +254,7 @@ class TemplateManager:
                 raise ValueError(f"Template name already exists: {name!r}.")
 
     def _write_template(self, template: Template) -> None:
+        self._require_writable_collection()
         if not isinstance(template, Template):
             raise TypeError("template must be a Template.")
         validated = Template.from_dict(template.to_dict())
@@ -263,36 +285,55 @@ class TemplateManager:
     def load_templates(self) -> None:
         """Validate the entire collection before publishing any of it."""
 
-        root = self._templates_root()
-        if not root.exists():
-            self._templates = {}
-            return
-        staged: Dict[str, Template] = {}
-        names: set[str] = set()
-        for template_file in sorted(root.glob("*.json"), key=lambda item: item.name):
-            if template_file.is_symlink() or not template_file.is_file():
-                raise ValueError(f"Template file is not a contained regular file: {template_file}")
-            resolved_file = template_file.resolve(strict=True)
-            if resolved_file.parent != root:
-                raise ValueError(f"Template file escapes the configured directory: {template_file}")
-            template = Template.from_dict(_decode_template_json(resolved_file))
-            if resolved_file != self._template_path(template.id):
-                raise ValueError(
-                    f"Template file name does not match its stable ID: {template_file.name}"
-                )
-            if template.id in staged:
-                raise ValueError(f"Duplicate template ID: {template.id!r}.")
-            name_key = self._name_key(template.name)
-            if name_key in names:
-                raise ValueError(
-                    f"Duplicate case-insensitive template name: {template.name!r}."
-                )
-            staged[template.id] = template
-            names.add(name_key)
+        try:
+            root = self._templates_root()
+            staged: Dict[str, Template] = {}
+            names: set[str] = set()
+            if root.exists():
+                for template_file in sorted(
+                    root.glob("*.json"), key=lambda item: item.name
+                ):
+                    if template_file.is_symlink() or not template_file.is_file():
+                        raise ValueError(
+                            "Template file is not a contained regular file: "
+                            f"{template_file}"
+                        )
+                    resolved_file = template_file.resolve(strict=True)
+                    if resolved_file.parent != root:
+                        raise ValueError(
+                            "Template file escapes the configured directory: "
+                            f"{template_file}"
+                        )
+                    template = Template.from_dict(
+                        _decode_template_json(resolved_file)
+                    )
+                    if resolved_file != self._template_path(template.id):
+                        raise ValueError(
+                            "Template file name does not match its stable ID: "
+                            f"{template_file.name}"
+                        )
+                    if template.id in staged:
+                        raise ValueError(f"Duplicate template ID: {template.id!r}.")
+                    name_key = self._name_key(template.name)
+                    if name_key in names:
+                        raise ValueError(
+                            "Duplicate case-insensitive template name: "
+                            f"{template.name!r}."
+                        )
+                    staged[template.id] = template
+                    names.add(name_key)
+        except Exception as exc:
+            self._record_storage_failure(
+                "the stored collection could not be admitted",
+                exc,
+            )
+            raise
         self._templates = staged
+        self._write_disabled_reason = None
         logger.info("Loaded %d template(s)", len(staged))
 
     def delete_template(self, template_id: str) -> None:
+        self._require_writable_collection()
         normalized_id = _template_id(template_id)
         if normalized_id not in self._templates:
             raise KeyError(f"Unknown template ID: {normalized_id!r}.")
@@ -337,6 +378,7 @@ class TemplateManager:
     ) -> Template:
         """Create a new template; never select or overwrite an existing one."""
 
+        self._require_writable_collection()
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be a MechanismAuthoringSource.")
         normalized_name = _template_name(name)
@@ -370,6 +412,7 @@ class TemplateManager:
     ) -> Template:
         """Update fields of one existing template while preserving its ID."""
 
+        self._require_writable_collection()
         normalized_id = _template_id(template_id)
         current = self._templates.get(normalized_id)
         if current is None:
@@ -400,6 +443,7 @@ class TemplateManager:
     def replace_template(self, template_id: str, template: Template) -> Template:
         """Replace one existing template with a complete same-ID value."""
 
+        self._require_writable_collection()
         normalized_id = _template_id(template_id)
         if normalized_id not in self._templates:
             raise KeyError(f"Unknown template ID: {normalized_id!r}.")

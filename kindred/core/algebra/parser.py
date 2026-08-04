@@ -462,28 +462,56 @@ class Parser:
 
     def _parse_equality(self) -> ExprNode:
         node = self._parse_comparison()
-        while True:
-            if self._match(TokenKind.EQ2):
-                node = BinaryNode("==", node, self._parse_comparison())
-            elif self._match(TokenKind.NEQ):
-                node = BinaryNode("!=", node, self._parse_comparison())
-            else:
-                break
+        if self._cur().kind in (TokenKind.EQ2, TokenKind.NEQ):
+            if isinstance(node, BinaryNode) and node.op in {"<", "<=", ">", ">="}:
+                t = self._cur()
+                raise AlgebraSyntaxError(
+                    "chained comparisons are not supported",
+                    line=t.line,
+                    col=t.col,
+                    line_text=t.line_text,
+                )
+            op = self._advance()
+            rhs = self._parse_comparison()
+            if isinstance(rhs, BinaryNode) and rhs.op in {"<", "<=", ">", ">="}:
+                t = self._cur()
+                raise AlgebraSyntaxError(
+                    "chained comparisons are not supported",
+                    line=t.line,
+                    col=t.col,
+                    line_text=t.line_text,
+                )
+            node = BinaryNode("==" if op.kind is TokenKind.EQ2 else "!=", node, rhs)
+        if self._cur().kind in (TokenKind.EQ2, TokenKind.NEQ):
+            t = self._cur()
+            raise AlgebraSyntaxError(
+                "chained equality comparisons are not supported",
+                line=t.line,
+                col=t.col,
+                line_text=t.line_text,
+            )
         return node
 
     def _parse_comparison(self) -> ExprNode:
         node = self._parse_term()
-        while True:
-            if self._match(TokenKind.LT):
-                node = BinaryNode("<", node, self._parse_term())
-            elif self._match(TokenKind.LTE):
-                node = BinaryNode("<=", node, self._parse_term())
-            elif self._match(TokenKind.GT):
-                node = BinaryNode(">", node, self._parse_term())
-            elif self._match(TokenKind.GTE):
-                node = BinaryNode(">=", node, self._parse_term())
-            else:
-                break
+        if self._cur().kind in (TokenKind.LT, TokenKind.LTE, TokenKind.GT, TokenKind.GTE):
+            op = self._advance()
+            rhs = self._parse_term()
+            operators = {
+                TokenKind.LT: "<",
+                TokenKind.LTE: "<=",
+                TokenKind.GT: ">",
+                TokenKind.GTE: ">=",
+            }
+            node = BinaryNode(operators[op.kind], node, rhs)
+        if self._cur().kind in (TokenKind.LT, TokenKind.LTE, TokenKind.GT, TokenKind.GTE):
+            t = self._cur()
+            raise AlgebraSyntaxError(
+                "chained comparisons are not supported",
+                line=t.line,
+                col=t.col,
+                line_text=t.line_text,
+            )
         return node
 
     def _parse_term(self) -> ExprNode:

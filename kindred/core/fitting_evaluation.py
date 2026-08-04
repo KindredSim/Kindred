@@ -43,7 +43,6 @@ from kindred.core.simulation_preparation import (
     _prepared_metadata_with_symbolic_jacobian,
     _reject_requested_algebra_owned_mechanism_parameters_for_fitting,
     _scalar_parameter_is_derived,
-    _solve_request,
     _symbolic_jacobian_for_bind_failure,
     build_simulation_request_from_prepared_run,
     canonicalize_request_parameter_names,
@@ -56,7 +55,7 @@ from kindred.core.simulation_preparation import (
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_result_finalization import finalize_simulation_result
 from kindred.core.simulation_series_payload import SimulationSeriesPayload
-from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
+from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, solve_ode
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
@@ -773,6 +772,13 @@ class SerialFittingEvaluator:
             intervention_execution = resolve_prepared_run_intervention_execution(
                 prepared_run,
                 parameter_partition,
+                cancellation_check=(
+                    getattr(
+                        self._cancellation_check,
+                        "_kindred_nonblocking_cancelled",
+                        self._cancellation_check,
+                    )
+                ),
             )
         except SimulationPreparationError as exc:
             schedule_names = {
@@ -802,8 +808,8 @@ class SerialFittingEvaluator:
         prepared_solver_config = self._prepared_solver_config
         if (
             prepared_solver_config is not None
-            and bool(getattr(prepared_solver_config, "use_sparse_jacobian", False))
-            and str(getattr(prepared_solver_config, "solver", prepared_run.request.solver)).upper() in {"BDF", "RADAU"}
+            and prepared_solver_config.use_sparse_jacobian
+            and prepared_solver_config.solver.upper() in {"BDF", "RADAU"}
         ):
             try:
                 jacobian_func, symbolic_identity = _bind_symbolic_jacobian_for_current_mechanism(
@@ -847,7 +853,7 @@ class SerialFittingEvaluator:
             ),
         )
         try:
-            result = _solve_request(request)
+            result = solve_ode(request)
         except (FitSimulationError, SimulationCancelled):
             raise
         except Exception as exc:
@@ -1091,10 +1097,13 @@ class SerialFittingEvaluator:
                 require_mutable=True,
             )
         except SimulationPreparationError as exc:
-            candidate_domain = any(
-                _parameter_origin_for(name, origins)
-                in _OPTIMIZER_PARAMETER_ORIGINS
-                for name in shared_values
+            candidate_domain = bool(
+                exc.stage in {"parameter_algebra", "wegscheider_cyclicity"}
+                and any(
+                    _parameter_origin_for(name, origins)
+                    in _OPTIMIZER_PARAMETER_ORIGINS
+                    for name in shared_values
+                )
             )
             raise FitSimulationError(
                 f"Failed to prepare complete fitting candidate: {exc}",

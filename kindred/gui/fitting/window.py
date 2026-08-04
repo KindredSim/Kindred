@@ -11,25 +11,33 @@ import numpy as np
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices
-from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
     FitDefaults,
     SimulationExecutionSettings,
 )
-from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.gui.fitting.constants import (
+    DE_POPULATION_TOLERANCE_LABEL,
+    DIFFERENTIAL_EVOLUTION_METHOD,
     FITTING_MAX_NFEV_RANGE,
     FITTING_METHODS,
     FITTING_SEED_RANGE,
+    FUNCTION_TOLERANCE_LABEL,
     SIMULATION_SOLVERS,
 )
 from kindred.gui.fitting.contracts import (
+    FitParametricSettings,
     FitRunIdentity,
     FitTargetSelection,
     copy_target_selection,
 )
 from kindred.gui.fitting.launch import (
+    FitDatasetLocalSettings,
+    FitDatasetSetupEdit,
+    FitDefaultsSetupEdit,
+    FitInitialSetupEdit,
+    FitInitialVariable,
     FitOriginSnapshot,
+    FitParameterSetupEdit,
     FitParameterVariable,
     FitSetupSnapshot,
 )
@@ -87,6 +95,7 @@ class FittingWindow(QtWidgets.QDialog):
     resumeRequested = QtCore.Signal()
     applyRequested = QtCore.Signal(object)
     addObservableRequested = QtCore.Signal(str, str, str, str, str)
+    setupEditsRequested = QtCore.Signal(object)
     restoreSetupRequested = QtCore.Signal(object)
     projectDefaultsRequested = QtCore.Signal(object)
 
@@ -106,8 +115,6 @@ class FittingWindow(QtWidgets.QDialog):
         if color_resolver is not None and not callable(color_resolver):
             raise TypeError("color_resolver must be callable.")
         self._origin = origin
-        self._effective_source = origin.mechanism_source
-        self._effective_prepared_dsl = origin.prepared_dsl
         self._close_handler = close_handler
         self._color_resolver = color_resolver
         self._closing_after_cleanup = False
@@ -116,21 +123,26 @@ class FittingWindow(QtWidgets.QDialog):
         self._initial_setup: FitSetupSnapshot | None = None
         self._last_fit_setup: FitSetupSnapshot | None = None
         self._snapshot_capture_id: str | None = None
-        self._effective_source = origin.mechanism_source
-        self._effective_prepared_dsl = origin.prepared_dsl
         self._run_identity = None
         self._candidate_curves: tuple[FitCurveDataset, ...] = ()
         self._species_filter_initialized = False
         self._refreshing_dataset_controls = False
         self._syncing_scopes = False
-        self._committed_targets: dict[tuple[str, str], bool] = {}
+        self._committed_targets: dict[
+            tuple[str, str],
+            tuple[bool, str, str],
+        ] = {}
+        self._projected_setup: FitSetupSnapshot | None = None
+        self._invalid_setup_edits: set[tuple[str, ...]] = set()
+        self._projecting_setup = False
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
         self.setModal(True)
-        self.setWindowTitle(f"Global Fit — {origin.tab_name}")
+        self.setWindowTitle(
+            f"Global Fit — Origin: {origin.tab_name} [{origin.tab_id}]"
+        )
         self.resize(1080, 760)
         self._build_ui()
-        self.rebase(origin)
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
@@ -168,7 +180,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._close_button = QtWidgets.QPushButton("Close", self)
         self._cancel_button.setEnabled(False)
         self._pause_button.setEnabled(False)
-        self._run_button.clicked.connect(self.executeRequested)
+        self._run_button.clicked.connect(self._request_execute)
         self._cancel_button.clicked.connect(self.cancelRequested)
         self._pause_button.clicked.connect(self._toggle_pause)
         self._close_button.clicked.connect(self.close)
@@ -202,9 +214,7 @@ class FittingWindow(QtWidgets.QDialog):
                 "Resolved X Mapping",
             )
         )
-        self._dataset_table.itemChanged.connect(
-            self._on_dataset_item_changed
-        )
+        self._dataset_table.itemChanged.connect(self._on_dataset_item_changed)
         self._dataset_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self._dataset_table, 1)
         targets_header = QtWidgets.QHBoxLayout()
@@ -247,9 +257,7 @@ class FittingWindow(QtWidgets.QDialog):
                 "Weight",
             )
         )
-        self._target_table.itemChanged.connect(
-            lambda _item: self._refresh_dataset_controls()
-        )
+        self._target_table.itemChanged.connect(self._on_target_item_changed)
         self._target_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self._target_table, 1)
 
@@ -279,6 +287,9 @@ class FittingWindow(QtWidgets.QDialog):
         self._parameter_local_table.setHorizontalHeaderLabels(
             ("Parameter", "Dataset", "Per-dataset value")
         )
+        self._parameter_local_table.itemChanged.connect(
+            self._on_parameter_local_item_changed
+        )
         self._parameter_local_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self._parameter_local_table)
         optimizer = QtWidgets.QGroupBox("Optimizer", self._parameters_tab)
@@ -302,14 +313,23 @@ class FittingWindow(QtWidgets.QDialog):
         self._save_project_defaults.clicked.connect(
             self._emit_project_defaults
         )
+        self._ftol_label = QtWidgets.QLabel("Function tolerance", optimizer)
+        self._xtol_label = QtWidgets.QLabel("Step tolerance", optimizer)
         form.addRow("Method", self._method)
         form.addRow("Maximum evaluations", self._max_nfev)
-        form.addRow("Function tolerance", self._ftol)
-        form.addRow("Step tolerance", self._xtol)
+        form.addRow(self._ftol_label, self._ftol)
+        form.addRow(self._xtol_label, self._xtol)
         form.addRow(self._use_seed)
         form.addRow("Seed", self._seed)
         form.addRow(self._save_project_defaults)
         layout.addWidget(optimizer)
+        self._method.currentTextChanged.connect(self._on_method_changed)
+        self._max_nfev.valueChanged.connect(self._emit_defaults_edit)
+        self._ftol.valueChanged.connect(self._emit_defaults_edit)
+        self._xtol.valueChanged.connect(self._emit_defaults_edit)
+        self._use_seed.toggled.connect(self._emit_defaults_edit)
+        self._seed.valueChanged.connect(self._emit_defaults_edit)
+        self._update_method_controls(self._method.currentText())
 
     def _emit_project_defaults(self) -> None:
         self.projectDefaultsRequested.emit(
@@ -325,7 +345,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _show_current_steps(self) -> None:
         MechanismInspectorDialog(
-            self._effective_prepared_dsl,
+            self._require_projected_setup().prepared_dsl,
             self,
         ).exec()
 
@@ -382,6 +402,9 @@ class FittingWindow(QtWidgets.QDialog):
                 "t end",
                 "Integration points",
             )
+        )
+        self._execution_table.itemChanged.connect(
+            self._on_execution_item_changed
         )
         self._execution_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self._execution_table, 1)
@@ -469,104 +492,34 @@ class FittingWindow(QtWidgets.QDialog):
         self,
         origin: FitOriginSnapshot,
         *,
-        preserved: Mapping[str, object] | None = None,
-        canonicalized_scopes: frozenset[str] = frozenset(),
-        supplemental_parameters: Iterable[FitParameterVariable] = (),
+        setup: FitSetupSnapshot,
         preserve_snapshots: bool = False,
     ) -> None:
         if not isinstance(origin, FitOriginSnapshot):
             raise TypeError("origin must be FitOriginSnapshot.")
-        supplemental = tuple(supplemental_parameters)
-        if any(
-            not isinstance(item, FitParameterVariable)
-            for item in supplemental
+        if not isinstance(setup, FitSetupSnapshot):
+            raise TypeError("setup must be FitSetupSnapshot.")
+        if (
+            setup.origin_tab_id != origin.tab_id
+            or setup.origin_capture_id != origin.capture_id
         ):
-            raise TypeError(
-                "supplemental_parameters must contain FitParameterVariable "
-                "values."
-            )
-        supplemental_names = [item.name for item in supplemental]
-        if len(supplemental_names) != len(set(supplemental_names)):
-            raise ValueError("Supplemental Fit parameter identities repeat.")
+            raise ValueError("Fit setup does not match the rebased origin.")
         if self._snapshot_capture_id != origin.capture_id:
-            if preserve_snapshots:
-                retained_dataset_ids = {
-                    item.dataset_id for item in origin.mapped_datasets
-                }
-                retained_set_ids = {
-                    item.set_id for item in origin.mapped_datasets
-                }
-
-                def retained_snapshot(
-                    snapshot: FitSetupSnapshot,
-                ) -> FitSetupSnapshot:
-                    return replace(
-                        snapshot,
-                        origin_tab_id=origin.tab_id,
-                        origin_capture_id=origin.capture_id,
-                        datasets=tuple(
-                            item
-                            for item in snapshot.datasets
-                            if item.dataset_id in retained_dataset_ids
-                        ),
-                        parameters=tuple(
-                            replace(
-                                item,
-                                dataset_values=tuple(
-                                    (dataset_id, value)
-                                    for dataset_id, value
-                                    in item.dataset_values
-                                    if dataset_id in retained_dataset_ids
-                                ),
-                            )
-                            for item in snapshot.parameters
-                        ),
-                        initials=tuple(
-                            item
-                            for item in snapshot.initials
-                            if item.set_id in retained_set_ids
-                        ),
-                    )
-
-                if self._initial_setup is not None:
-                    self._initial_setup = retained_snapshot(
-                        self._initial_setup
-                    )
-                if self._last_fit_setup is not None:
-                    self._last_fit_setup = retained_snapshot(
-                        self._last_fit_setup
-                    )
-            else:
+            if not preserve_snapshots:
                 self._initial_setup = None
                 self._last_fit_setup = None
                 self._view_last_fit.setEnabled(False)
             self._snapshot_capture_id = origin.capture_id
         self._origin = origin
         self._origin_label.setText(
-            f"Origin: {origin.tab_name} ({len(origin.mapped_datasets)} mapped datasets)"
+            f"Origin: {origin.tab_name} [{origin.tab_id}] "
+            f"({len(origin.mapped_datasets)} mapped datasets)"
         )
-        self.setWindowTitle(f"Global Fit — {origin.tab_name}")
+        self.setWindowTitle(
+            f"Global Fit — Origin: {origin.tab_name} [{origin.tab_id}]"
+        )
         self._populate_origin()
-        self._load_defaults()
-        existing_parameter_names = {
-            str(
-                self._parameter_table.item(row, 1).data(
-                    QtCore.Qt.ItemDataRole.UserRole
-                )
-                or self._parameter_table.item(row, 1).text()
-            )
-            for row in range(self._parameter_table.rowCount())
-        }
-        for parameter in supplemental:
-            if parameter.name not in existing_parameter_names:
-                self._append_parameter_row(parameter)
-                existing_parameter_names.add(parameter.name)
-        if preserved:
-            self._restore_raw_state(
-                preserved,
-                canonicalized_scopes=canonicalized_scopes,
-            )
-        self._refresh_dataset_controls()
+        self.project_setup_snapshot(setup)
 
     def install_initial_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         if not isinstance(snapshot, FitSetupSnapshot):
@@ -579,27 +532,23 @@ class FittingWindow(QtWidgets.QDialog):
         self._initial_setup = snapshot
         self._snapshot_capture_id = snapshot.origin_capture_id
 
-    def set_effective_source(
-        self,
-        source: MechanismAuthoringSource,
-        prepared_dsl: PreparedDslRequestSet,
-    ) -> None:
-        if not isinstance(source, MechanismAuthoringSource):
-            raise TypeError("source must be MechanismAuthoringSource.")
-        if not isinstance(prepared_dsl, PreparedDslRequestSet):
-            raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-        if prepared_dsl.analysis.normalized_text != source.reactions_text.strip():
-            raise ValueError(
-                "Fit effective prepared DSL must exactly match its source."
-            )
-        self._effective_source = source
-        self._effective_prepared_dsl = prepared_dsl
-
     def restore_snapshot(
         self,
         snapshot: FitSetupSnapshot,
     ) -> FitSetupSnapshot:
-        """Atomically project one typed setup back into the physical editors."""
+        """Project one owner-retained typed setup into the physical editors."""
+
+        restoring_initial = snapshot is self._initial_setup
+        restoring_last_fit = snapshot is self._last_fit_setup
+        self.project_setup_snapshot(snapshot)
+        if restoring_initial:
+            self._initial_setup = snapshot
+        if restoring_last_fit:
+            self._last_fit_setup = snapshot
+        return snapshot
+
+    def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
+        """Render a typed owner snapshot; widgets never reconstruct this truth."""
 
         if not isinstance(snapshot, FitSetupSnapshot):
             raise TypeError("snapshot must be FitSetupSnapshot.")
@@ -608,111 +557,7 @@ class FittingWindow(QtWidgets.QDialog):
             or snapshot.origin_capture_id != self._origin.capture_id
         ):
             raise ValueError("Fit snapshot does not match this origin.")
-        restoring_initial = snapshot is self._initial_setup
-        restoring_last_fit = snapshot is self._last_fit_setup
-        current_dataset_ids = {
-            str(
-                self._dataset_table.item(row, 0).data(
-                    QtCore.Qt.ItemDataRole.UserRole
-                )
-                or ""
-            )
-            for row in range(self._dataset_table.rowCount())
-        }
-        current_parameter_names = {
-            str(
-                self._parameter_table.item(row, 1).data(
-                    QtCore.Qt.ItemDataRole.UserRole
-                )
-                or self._parameter_table.item(row, 1).text()
-            )
-            for row in range(self._parameter_table.rowCount())
-        }
-        current_parameter_local_keys = {
-            (
-                str(
-                    self._parameter_local_table.item(row, 0).data(
-                        QtCore.Qt.ItemDataRole.UserRole
-                    )
-                    or self._parameter_local_table.item(row, 0).text()
-                ),
-                str(
-                    self._parameter_local_table.item(row, 2).data(
-                        QtCore.Qt.ItemDataRole.UserRole
-                    )
-                    or ""
-                ),
-            )
-            for row in range(self._parameter_local_table.rowCount())
-        }
-        current_initial_keys = {
-            (
-                str(
-                    self._initial_table.item(row, 0).data(
-                        QtCore.Qt.ItemDataRole.UserRole + 1
-                    )
-                    or ""
-                ),
-                self._initial_table.item(row, 3).text(),
-            )
-            for row in range(self._initial_table.rowCount())
-        }
-        origin_dataset_ids = {
-            item.dataset_id for item in self._origin.mapped_datasets
-        }
-        restored_datasets = tuple(
-            item
-            for item in snapshot.datasets
-            if (
-                item.dataset_id in current_dataset_ids
-                and item.dataset_id in origin_dataset_ids
-            )
-        )
-        restored_dataset_ids = {
-            item.dataset_id for item in restored_datasets
-        }
-        restored_parameters = tuple(
-            replace(
-                item,
-                dataset_values=tuple(
-                    (dataset_id, value)
-                    for dataset_id, value in item.dataset_values
-                    if (
-                        dataset_id in restored_dataset_ids
-                        and (
-                            item.name,
-                            dataset_id,
-                        )
-                        in current_parameter_local_keys
-                    )
-                ),
-            )
-            for item in snapshot.parameters
-            if item.name in current_parameter_names
-        )
-        restored_parameter_names = {
-            item.name for item in restored_parameters
-        }
-        restored_observables = tuple(
-            observable
-            for observable in snapshot.local_observables
-            if all(
-                scalar.name in restored_parameter_names
-                for scalar in observable.scalar_parameters
-            )
-        )
-        restored_snapshot = replace(
-            snapshot,
-            datasets=restored_datasets,
-            parameters=restored_parameters,
-            initials=tuple(
-                item
-                for item in snapshot.initials
-                if (item.set_id, item.species) in current_initial_keys
-            ),
-            local_observables=restored_observables,
-        )
-        restored_raw = self._snapshot_raw_state(restored_snapshot)
+        projected = self._setup_projection_values(snapshot)
         tables = (
             self._dataset_table,
             self._target_table,
@@ -723,11 +568,12 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self.setUpdatesEnabled(False)
         self._syncing_scopes = True
+        self._projecting_setup = True
         for table in tables:
             table.blockSignals(True)
         try:
-            restored_parameter_names = {
-                item.name for item in restored_snapshot.parameters
+            snapshot_parameter_names = {
+                item.name for item in snapshot.parameters
             }
             origin_parameter_names = {
                 item.name for item in self._origin.parameter_defaults
@@ -740,7 +586,7 @@ class FittingWindow(QtWidgets.QDialog):
                 )
                 if (
                     name in origin_parameter_names
-                    or name in restored_parameter_names
+                    or name in snapshot_parameter_names
                 ):
                     continue
                 for local_row in reversed(
@@ -748,52 +594,96 @@ class FittingWindow(QtWidgets.QDialog):
                 ):
                     self._parameter_local_table.removeRow(local_row)
                 self._parameter_table.removeRow(row)
-            self._restore_raw_state(
-                restored_raw,
+            existing_parameter_names = {
+                str(
+                    self._parameter_table.item(row, 1).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                    or self._parameter_table.item(row, 1).text()
+                )
+                for row in range(self._parameter_table.rowCount())
+            }
+            for parameter in snapshot.parameters:
+                if parameter.name not in existing_parameter_names:
+                    self._append_parameter_row(parameter)
+                    existing_parameter_names.add(parameter.name)
+            self._render_setup_projection(
+                projected,
                 canonicalized_scopes=frozenset(),
             )
             self._syncing_scopes = False
             self._reconcile_parameter_local_rows()
             self._syncing_scopes = True
-            self._restore_parameter_rows(
-                restored_raw,
+            self._render_parameter_projection(
+                projected,
                 frozenset(),
             )
-            self._effective_source = restored_snapshot.mechanism_source
-            self._effective_prepared_dsl = restored_snapshot.prepared_dsl
             self._committed_targets = self._current_target_state()
+            self._projected_setup = snapshot
+            self._invalid_setup_edits.clear()
         finally:
             for table in tables:
                 table.blockSignals(False)
             self._syncing_scopes = False
+            self._projecting_setup = False
             self.setUpdatesEnabled(True)
         self._refresh_dataset_controls()
-        if restoring_initial:
-            self._initial_setup = restored_snapshot
-        if restoring_last_fit:
-            self._last_fit_setup = restored_snapshot
-            resolved_by_id = {
-                item.dataset_id: item.parametric.resolved_mode
-                for item in restored_snapshot.datasets
+        self.set_resolved_auto_modes(
+            tuple(
+                (item.dataset_id, item.parametric.resolved_mode)
+                for item in snapshot.datasets
                 if item.parametric is not None
-            }
-            for row in range(self._dataset_table.rowCount()):
-                dataset_id = str(
-                    self._dataset_table.item(row, 0).data(
-                        QtCore.Qt.ItemDataRole.UserRole
-                    )
-                    or ""
-                )
-                resolved = resolved_by_id.get(dataset_id)
-                if resolved is not None:
-                    self._dataset_table.item(row, 10).setText(
-                        "Time-guided"
-                        if resolved == "time_guided"
-                        else "Monotone"
-                    )
-        return restored_snapshot
+            )
+        )
+        self._update_method_controls(snapshot.defaults.method)
 
-    def _snapshot_raw_state(
+    def accept_setup_edits(
+        self,
+        snapshot: FitSetupSnapshot,
+        intents: tuple[object, ...],
+    ) -> None:
+        """Acknowledge typed edits accepted by the sole setup owner."""
+
+        if not isinstance(snapshot, FitSetupSnapshot):
+            raise TypeError("snapshot must be FitSetupSnapshot.")
+        if not isinstance(intents, tuple):
+            raise TypeError("Fit setup acknowledgement must carry a tuple.")
+        self._projected_setup = snapshot
+        self._invalid_setup_edits.difference_update(
+            self._intent_key(intent) for intent in intents
+        )
+
+    def reject_setup_edits(
+        self,
+        intents: tuple[object, ...],
+        message: str,
+    ) -> None:
+        """Keep rejected widget text visibly invalid without changing truth."""
+
+        if not isinstance(intents, tuple):
+            raise TypeError("Fit setup rejection must carry a tuple.")
+        self._invalid_setup_edits.update(
+            self._intent_key(intent) for intent in intents
+        )
+        self.set_status(str(message))
+
+    @property
+    def has_invalid_setup_edits(self) -> bool:
+        return bool(self._invalid_setup_edits)
+
+    @staticmethod
+    def _intent_key(intent: object) -> tuple[str, ...]:
+        if isinstance(intent, FitDatasetSetupEdit):
+            return ("dataset", intent.dataset.dataset_id)
+        if isinstance(intent, FitParameterSetupEdit):
+            return ("parameter", intent.parameter.name)
+        if isinstance(intent, FitInitialSetupEdit):
+            return ("initial", intent.initial.set_id, intent.initial.species)
+        if isinstance(intent, FitDefaultsSetupEdit):
+            return ("defaults",)
+        return ("unknown", type(intent).__name__)
+
+    def _setup_projection_values(
         self,
         snapshot: FitSetupSnapshot,
     ) -> dict[str, object]:
@@ -807,9 +697,8 @@ class FittingWindow(QtWidgets.QDialog):
             if mapped is None:
                 continue
             targets = {
-                raw_id: (raw_column, model_target)
-                for raw_id, raw_column, model_target
-                in local.observation_targets
+                raw_id: model_target
+                for raw_id, model_target in local.observation_targets
             }
             weights = dict(local.target_weights)
             selected = set(local.target_species)
@@ -834,30 +723,21 @@ class FittingWindow(QtWidgets.QDialog):
                         {
                             "use": targets.get(
                                 observation.raw_observation_id,
-                                (
-                                    observation.raw_column,
-                                    observation.model_species,
-                                ),
-                            )[1] in selected,
+                                observation.model_species,
+                            ) in selected,
                             "raw_observation_id": (
                                 observation.raw_observation_id
                             ),
                             "raw_column": observation.raw_column,
                             "model_target": targets.get(
                                 observation.raw_observation_id,
-                                (
-                                    observation.raw_column,
-                                    observation.model_species,
-                                ),
-                            )[1],
+                                observation.model_species,
+                            ),
                             "weight": weights.get(
                                 targets.get(
                                     observation.raw_observation_id,
-                                    (
-                                        observation.raw_column,
-                                        observation.model_species,
-                                    ),
-                                )[1],
+                                    observation.model_species,
+                                ),
                                 1.0,
                             ),
                         }
@@ -972,13 +852,17 @@ class FittingWindow(QtWidgets.QDialog):
             ):
                 x_selector.addItem(model_name, model_name)
             x_selector.currentIndexChanged.connect(
-                lambda _index: self._refresh_dataset_controls()
+                lambda _index, dataset_id=mapped.dataset_id: (
+                    self._on_dataset_selector_changed(dataset_id)
+                )
             )
             self._dataset_table.setCellWidget(row, 8, x_selector)
             mapping_selector = QtWidgets.QComboBox(self._dataset_table)
             mapping_selector.addItems(("Auto", "Monotone", "Time-guided"))
             mapping_selector.currentTextChanged.connect(
-                lambda _text: self._refresh_dataset_controls()
+                lambda _text, dataset_id=mapped.dataset_id: (
+                    self._on_dataset_selector_changed(dataset_id)
+                )
             )
             self._dataset_table.setCellWidget(row, 9, mapping_selector)
             self._dataset_table.setItem(
@@ -997,6 +881,11 @@ class FittingWindow(QtWidgets.QDialog):
             solver = QtWidgets.QComboBox(self._execution_table)
             solver.addItems(SIMULATION_SOLVERS)
             solver.setCurrentText(mapped.execution.solver)
+            solver.currentTextChanged.connect(
+                lambda _text, dataset_id=mapped.dataset_id: (
+                    self._emit_dataset_edit(dataset_id)
+                )
+            )
             self._execution_table.setCellWidget(execution_row, 2, solver)
             self._execution_table.setItem(execution_row, 3, _text_item(_float_text(mapped.execution.t_start)))
             self._execution_table.setItem(execution_row, 4, _text_item(_float_text(mapped.execution.t_end)))
@@ -1034,7 +923,7 @@ class FittingWindow(QtWidgets.QDialog):
                 self._target_table.setItem(target_row, 4, _text_item("1"))
                 self._committed_targets[
                     (mapped.dataset_id, observation.raw_observation_id)
-                ] = True
+                ] = (True, observation.model_species, "1")
 
             existing_initial_keys = {
                 (
@@ -1457,7 +1346,11 @@ class FittingWindow(QtWidgets.QDialog):
             self._syncing_scopes = False
 
     def _on_parameter_scope_changed(self, name: str, text: str) -> None:
-        if self._syncing_scopes:
+        if (
+            self._syncing_scopes
+            or self._projecting_setup
+            or self._refreshing_dataset_controls
+        ):
             return
         row = self._parameter_row(name)
         if row < 0:
@@ -1476,18 +1369,33 @@ class FittingWindow(QtWidgets.QDialog):
                 shared_value,
             )
         self._reconcile_parameter_local_rows((name,))
-        if str(text).lower() == "per-dataset":
-            return
-        self._project_shared_parameter_from_local_rows(name)
+        if str(text).lower() != "per-dataset":
+            self._project_shared_parameter_from_local_rows(name)
+        self._emit_parameter_edit(name)
 
     def _on_parameter_value_item_changed(
         self,
         item: QtWidgets.QTableWidgetItem,
     ) -> None:
-        if self._syncing_scopes or item.column() != 2:
+        if (
+            self._syncing_scopes
+            or self._projecting_setup
+            or self._refreshing_dataset_controls
+            or item.column() not in {0, 2, 3, 4, 5}
+        ):
             return
+        name_item = self._parameter_table.item(item.row(), 1)
+        name = str(
+            name_item.data(QtCore.Qt.ItemDataRole.UserRole)
+            or name_item.text()
+        )
         selector = self._parameter_table.cellWidget(item.row(), 6)
-        if not isinstance(selector, QtWidgets.QComboBox) or selector.currentText() != "Shared":
+        if (
+            item.column() != 2
+            or not isinstance(selector, QtWidgets.QComboBox)
+            or selector.currentText() != "Shared"
+        ):
+            self._emit_parameter_edit(name)
             return
         try:
             value = _read_float(
@@ -1495,15 +1403,11 @@ class FittingWindow(QtWidgets.QDialog):
                 "shared parameter value",
             )
         except ValueError:
+            self._emit_parameter_edit(name)
             return
         item.setData(
             _PARAMETER_SHARED_BASELINE_ROLE,
             value,
-        )
-        name_item = self._parameter_table.item(item.row(), 1)
-        name = str(
-            name_item.data(QtCore.Qt.ItemDataRole.UserRole)
-            or name_item.text()
         )
         self._syncing_scopes = True
         try:
@@ -1517,9 +1421,33 @@ class FittingWindow(QtWidgets.QDialog):
                     local_item.setText(item.text())
         finally:
             self._syncing_scopes = False
+        self._emit_parameter_edit(name)
+
+    def _on_parameter_local_item_changed(
+        self,
+        item: QtWidgets.QTableWidgetItem,
+    ) -> None:
+        if (
+            self._syncing_scopes
+            or self._projecting_setup
+            or self._refreshing_dataset_controls
+            or item.column() != 2
+        ):
+            return
+        name_item = self._parameter_local_table.item(item.row(), 0)
+        name = str(
+            name_item.data(QtCore.Qt.ItemDataRole.UserRole)
+            or name_item.text()
+        )
+        self._project_shared_parameter_from_local_rows(name)
+        self._emit_parameter_edit(name)
 
     def _on_initial_scope_changed(self, species: str, text: str) -> None:
-        if self._syncing_scopes:
+        if (
+            self._syncing_scopes
+            or self._projecting_setup
+            or self._refreshing_dataset_controls
+        ):
             return
         rows = self._initial_rows_for_species(species)
         if not rows:
@@ -1549,6 +1477,8 @@ class FittingWindow(QtWidgets.QDialog):
                 blocker = QtCore.QSignalBlocker(sender)
                 sender.setCurrentText("Local")
                 del blocker
+                if source_row is not None:
+                    self._emit_initial_edit(source_row)
                 return
         active_rows = [
             row
@@ -1583,6 +1513,7 @@ class FittingWindow(QtWidgets.QDialog):
                         saved = item.data(QtCore.Qt.ItemDataRole.UserRole + 10)
                         if saved is not None:
                             item.setText(str(saved))
+                self._emit_initial_edits(tuple(active_rows))
                 return
             values = [
                 self._initial_table.item(row, 4).text()
@@ -1602,6 +1533,7 @@ class FittingWindow(QtWidgets.QDialog):
                 value = _float_text(parsed_values.pop())
                 for row in active_rows:
                     self._initial_table.item(row, 4).setText(value)
+                self._emit_initial_edits(tuple(active_rows))
                 return
             for row, value in zip(active_rows, values):
                 item = self._initial_table.item(row, 4)
@@ -1609,6 +1541,7 @@ class FittingWindow(QtWidgets.QDialog):
                 item.setText("Multiple values")
         finally:
             self._syncing_scopes = False
+        self._emit_initial_edits(tuple(active_rows))
 
     def _on_initial_value_item_changed(
         self,
@@ -1616,12 +1549,18 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> None:
         if (
             self._syncing_scopes
+            or self._projecting_setup
+            or self._refreshing_dataset_controls
             or item.column() not in {0, 4, 5, 6, 7}
         ):
             return
         row = item.row()
         selector = self._initial_table.cellWidget(row, 8)
-        if not isinstance(selector, QtWidgets.QComboBox) or selector.currentText() != "Global":
+        if (
+            not isinstance(selector, QtWidgets.QComboBox)
+            or selector.currentText() != "Global"
+        ):
+            self._emit_initial_edit(row)
             return
         included_set_ids = self._included_set_ids()
         source_set_id = str(
@@ -1631,11 +1570,13 @@ class FittingWindow(QtWidgets.QDialog):
             or ""
         )
         if source_set_id not in included_set_ids:
+            self._emit_initial_edit(row)
             return
         if item.column() in {4, 5, 6}:
             try:
                 float(item.text())
             except ValueError:
+                self._emit_initial_edit(row)
                 return
         species = self._initial_table.item(row, 3).text()
         self._syncing_scopes = True
@@ -1664,150 +1605,445 @@ class FittingWindow(QtWidgets.QDialog):
                     )
         finally:
             self._syncing_scopes = False
+        self._emit_initial_edits(
+            tuple(
+                target_row
+                for target_row in self._initial_rows_for_species(species)
+                if str(
+                    self._initial_table.item(target_row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole + 1
+                    )
+                    or ""
+                )
+                in included_set_ids
+            )
+        )
 
-    def raw_request_values(self) -> dict[str, object]:
-        execution_by_dataset: dict[str, dict[str, object]] = {}
-        for row in range(self._execution_table.rowCount()):
-            identity = self._execution_table.item(row, 0)
-            dataset_id = str(identity.data(QtCore.Qt.ItemDataRole.UserRole) or "")
-            set_id = str(identity.data(QtCore.Qt.ItemDataRole.UserRole + 1) or "")
-            solver = self._execution_table.cellWidget(row, 2)
-            execution_by_dataset[dataset_id] = {
-                "set_id": set_id,
-                "solver": solver.currentText() if isinstance(solver, QtWidgets.QComboBox) else "",
-                "t_start": self._execution_table.item(row, 3).text(),
-                "t_end": self._execution_table.item(row, 4).text(),
-                "integration_points": self._execution_table.item(row, 5).text(),
-            }
-        targets_by_dataset: dict[str, list[dict[str, object]]] = {}
-        for row in range(self._target_table.rowCount()):
-            use_item = self._target_table.item(row, 0)
-            dataset_id = str(use_item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
-            raw_observation_id = str(
-                self._target_table.item(row, 2).data(
+    def _require_projected_setup(self) -> FitSetupSnapshot:
+        setup = self._projected_setup
+        if setup is None:
+            raise RuntimeError("The owner has not installed a typed Fit setup.")
+        return setup
+
+    def _dataset_projection(
+        self,
+        dataset_id: str,
+        *,
+        include_pending_targets: bool,
+    ) -> FitDatasetLocalSettings:
+        setup = self._require_projected_setup()
+        current = next(
+            item for item in setup.datasets if item.dataset_id == dataset_id
+        )
+        dataset_row = next(
+            row
+            for row in range(self._dataset_table.rowCount())
+            if str(
+                self._dataset_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or ""
+            )
+            == dataset_id
+        )
+        execution_row = next(
+            row
+            for row in range(self._execution_table.rowCount())
+            if str(
+                self._execution_table.item(row, 0).data(
+                    QtCore.Qt.ItemDataRole.UserRole
+                )
+                or ""
+            )
+            == dataset_id
+        )
+        solver = self._execution_table.cellWidget(execution_row, 2)
+        x_selector = self._dataset_table.cellWidget(dataset_row, 8)
+        mapping_selector = self._dataset_table.cellWidget(dataset_row, 9)
+        points_text = self._dataset_table.item(dataset_row, 5).text().strip()
+        target_species = current.target_species
+        target_weights = current.target_weights
+        observation_targets = current.observation_targets
+        if include_pending_targets:
+            selected: list[tuple[str, str, float]] = []
+            for row in range(self._target_table.rowCount()):
+                use = self._target_table.item(row, 0)
+                if (
+                    str(use.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                    != dataset_id
+                    or use.checkState() != QtCore.Qt.CheckState.Checked
+                ):
+                    continue
+                selected.append(
+                    (
+                        str(
+                            self._target_table.item(row, 2).data(
+                                QtCore.Qt.ItemDataRole.UserRole + 1
+                            )
+                            or ""
+                        ),
+                        self._target_table.item(row, 3).text().strip(),
+                        _read_float(
+                            self._target_table.item(row, 4).text(),
+                            "target weight",
+                        ),
+                    )
+                )
+            target_species = tuple(model for _raw_id, model, _weight in selected)
+            target_weights = tuple(
+                (model, weight) for _raw_id, model, weight in selected
+            )
+            observation_targets = tuple(
+                (raw_id, model) for raw_id, model, _weight in selected
+            )
+        x_name = (
+            str(x_selector.currentData() or "t")
+            if isinstance(x_selector, QtWidgets.QComboBox)
+            else "t"
+        )
+        mode_text = (
+            str(mapping_selector.currentText() or "Auto").strip().lower()
+            if isinstance(mapping_selector, QtWidgets.QComboBox)
+            else "auto"
+        )
+        requested_mode = {
+            "auto": "auto",
+            "monotone": "monotone",
+            "time-guided": "time_guided",
+        }[mode_text]
+        return FitDatasetLocalSettings(
+            dataset_id=dataset_id,
+            included=(
+                self._dataset_table.item(dataset_row, 0).checkState()
+                == QtCore.Qt.CheckState.Checked
+            ),
+            sample_t_min=_read_float(
+                self._dataset_table.item(dataset_row, 3).text(),
+                "sampling t min",
+            ),
+            sample_t_max=_read_float(
+                self._dataset_table.item(dataset_row, 4).text(),
+                "sampling t max",
+            ),
+            sample_points=(
+                None if points_text.casefold() == "all" else int(points_text)
+            ),
+            execution=SimulationExecutionSettings(
+                solver=(
+                    solver.currentText()
+                    if isinstance(solver, QtWidgets.QComboBox)
+                    else ""
+                ),
+                t_start=_read_float(
+                    self._execution_table.item(execution_row, 3).text(),
+                    "t start",
+                ),
+                t_end=_read_float(
+                    self._execution_table.item(execution_row, 4).text(),
+                    "t end",
+                ),
+                integration_points=int(
+                    self._execution_table.item(execution_row, 5).text()
+                ),
+            ),
+            weight=_read_float(
+                self._dataset_table.item(dataset_row, 7).text(),
+                "dataset weight",
+            ),
+            target_species=target_species,
+            target_weights=target_weights,
+            observation_targets=observation_targets,
+            parametric=(
+                None
+                if x_name == "t"
+                else FitParametricSettings(
+                    dataset_id=dataset_id,
+                    x_name=x_name,
+                    requested_mode=requested_mode,
+                    resolved_mode=(
+                        "time_guided"
+                        if requested_mode == "time_guided"
+                        else "monotone"
+                    ),
+                )
+            ),
+        )
+
+    def _parameter_projection(self, name: str) -> FitParameterVariable:
+        setup = self._require_projected_setup()
+        current = next(item for item in setup.parameters if item.name == name)
+        row = self._parameter_row(name)
+        if row < 0:
+            raise KeyError(f"Parameter {name!r} has no projection row.")
+        scope = self._parameter_table.cellWidget(row, 6)
+        per_dataset = (
+            isinstance(scope, QtWidgets.QComboBox)
+            and scope.currentText() == "Per-dataset"
+        )
+        return replace(
+            current,
+            initial=(
+                current.initial
+                if per_dataset
+                else _read_float(
+                    self._parameter_table.item(row, 2).text(),
+                    f"{name} initial",
+                )
+            ),
+            minimum=float(self._parameter_table.item(row, 3).text()),
+            maximum=float(self._parameter_table.item(row, 4).text()),
+            fit=(
+                self._parameter_table.item(row, 0).checkState()
+                == QtCore.Qt.CheckState.Checked
+            ),
+            log10=(
+                self._parameter_table.item(row, 5).checkState()
+                == QtCore.Qt.CheckState.Checked
+            ),
+            scope="per_dataset" if per_dataset else "shared",
+            dataset_values=tuple(
+                (
+                    str(
+                        self._parameter_local_table.item(local_row, 2).data(
+                            QtCore.Qt.ItemDataRole.UserRole
+                        )
+                        or ""
+                    ),
+                    _read_float(
+                        self._parameter_local_table.item(local_row, 2).text(),
+                        f"{name} per-dataset value",
+                    ),
+                )
+                for local_row in self._parameter_local_rows(name)
+                if per_dataset
+            ),
+        )
+
+    def _initial_projection(self, row: int) -> FitInitialVariable:
+        setup = self._require_projected_setup()
+        set_id = str(
+            self._initial_table.item(row, 0).data(
+                QtCore.Qt.ItemDataRole.UserRole + 1
+            )
+            or ""
+        )
+        species = self._initial_table.item(row, 3).text()
+        current = next(
+            item
+            for item in setup.initials
+            if item.set_id == set_id and item.species == species
+        )
+        scope = self._initial_table.cellWidget(row, 8)
+        return replace(
+            current,
+            initial=_read_float(
+                self._initial_table.item(row, 4).text(),
+                f"{species} initial",
+            ),
+            minimum=_read_float(
+                self._initial_table.item(row, 5).text(),
+                f"{species} minimum",
+            ),
+            maximum=_read_float(
+                self._initial_table.item(row, 6).text(),
+                f"{species} maximum",
+            ),
+            fit=(
+                self._initial_table.item(row, 0).checkState()
+                == QtCore.Qt.CheckState.Checked
+            ),
+            log10=(
+                self._initial_table.item(row, 7).checkState()
+                == QtCore.Qt.CheckState.Checked
+            ),
+            scope=(
+                "local"
+                if isinstance(scope, QtWidgets.QComboBox)
+                and scope.currentText() == "Local"
+                else "global"
+            ),
+        )
+
+    def _defaults_projection(self) -> FitDefaults:
+        return FitDefaults(
+            method=self._method.currentText(),
+            max_nfev=self._max_nfev.value(),
+            ftol=self._ftol.value(),
+            xtol=self._xtol.value(),
+            use_seed=self._use_seed.isChecked(),
+            seed=self._seed.value(),
+        )
+
+    def _record_invalid_edit(
+        self,
+        key: tuple[str, ...],
+        error: BaseException,
+    ) -> None:
+        self._invalid_setup_edits.add(key)
+        self.set_status(f"Fit setup edit is invalid: {error}")
+
+    def _emit_dataset_edit(
+        self,
+        dataset_id: str,
+        *,
+        include_pending_targets: bool = False,
+        raw_observation_id: str | None = None,
+    ) -> bool:
+        if raw_observation_id is not None:
+            if self._projecting_setup or self._projected_setup is None:
+                return False
+            key = ("dataset", str(dataset_id))
+            try:
+                intent = FitDatasetSetupEdit(
+                    origin_tab_id=self._origin.tab_id,
+                    origin_capture_id=self._origin.capture_id,
+                    dataset=self._dataset_projection(
+                        str(dataset_id),
+                        include_pending_targets=include_pending_targets,
+                    ),
+                    raw_observation_id=raw_observation_id,
+                )
+            except (
+                KeyError,
+                StopIteration,
+                TypeError,
+                ValueError,
+                OverflowError,
+            ) as exc:
+                self._record_invalid_edit(key, exc)
+                return False
+            self.setupEditsRequested.emit((intent,))
+            return key not in self._invalid_setup_edits
+        return self._emit_dataset_edits(
+            (str(dataset_id),),
+            include_pending_targets=include_pending_targets,
+        )
+
+    def _emit_dataset_edits(
+        self,
+        dataset_ids: tuple[str, ...],
+        *,
+        include_pending_targets: bool = False,
+    ) -> bool:
+        if self._projecting_setup or self._projected_setup is None:
+            return False
+        intents: list[object] = []
+        keys: list[tuple[str, ...]] = []
+        for dataset_id in dataset_ids:
+            key = ("dataset", str(dataset_id))
+            try:
+                intent = FitDatasetSetupEdit(
+                    origin_tab_id=self._origin.tab_id,
+                    origin_capture_id=self._origin.capture_id,
+                    dataset=self._dataset_projection(
+                        str(dataset_id),
+                        include_pending_targets=include_pending_targets,
+                    ),
+                )
+            except (
+                KeyError,
+                StopIteration,
+                TypeError,
+                ValueError,
+                OverflowError,
+            ) as exc:
+                self._record_invalid_edit(key, exc)
+                return False
+            intents.append(intent)
+            keys.append(key)
+        self.setupEditsRequested.emit(tuple(intents))
+        return not any(key in self._invalid_setup_edits for key in keys)
+
+    def _emit_parameter_edit(self, name: str) -> bool:
+        if self._projecting_setup or self._projected_setup is None:
+            return False
+        key = ("parameter", str(name))
+        try:
+            intent = FitParameterSetupEdit(
+                origin_tab_id=self._origin.tab_id,
+                origin_capture_id=self._origin.capture_id,
+                parameter=self._parameter_projection(str(name)),
+            )
+        except (KeyError, StopIteration, TypeError, ValueError, OverflowError) as exc:
+            self._record_invalid_edit(key, exc)
+            return False
+        self.setupEditsRequested.emit((intent,))
+        return key not in self._invalid_setup_edits
+
+    def _emit_initial_edit(self, row: int) -> bool:
+        return self._emit_initial_edits((row,))
+
+    def _emit_initial_edits(self, rows: tuple[int, ...]) -> bool:
+        if self._projecting_setup or self._projected_setup is None:
+            return False
+        intents: list[object] = []
+        keys: list[tuple[str, ...]] = []
+        for row in rows:
+            set_id = str(
+                self._initial_table.item(row, 0).data(
                     QtCore.Qt.ItemDataRole.UserRole + 1
                 )
                 or ""
             )
-            targets_by_dataset.setdefault(dataset_id, []).append(
-                {
-                    "use": use_item.checkState() == QtCore.Qt.CheckState.Checked,
-                    "raw_observation_id": raw_observation_id,
-                    "raw_column": self._target_table.item(row, 2).text(),
-                    "model_target": self._target_table.item(row, 3).text(),
-                    "weight": self._target_table.item(row, 4).text(),
-                }
-            )
-        datasets: list[dict[str, object]] = []
-        for row in range(self._dataset_table.rowCount()):
-            use_item = self._dataset_table.item(row, 0)
-            dataset_id = str(use_item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
-            points_text = self._dataset_table.item(row, 5).text().strip()
-            x_selector = self._dataset_table.cellWidget(row, 8)
-            mapping_selector = self._dataset_table.cellWidget(row, 9)
-            datasets.append(
-                {
-                    "dataset_id": dataset_id,
-                    "included": use_item.checkState() == QtCore.Qt.CheckState.Checked,
-                    "sample_t_min": self._dataset_table.item(row, 3).text(),
-                    "sample_t_max": self._dataset_table.item(row, 4).text(),
-                    "sample_points": None if points_text.lower() == "all" else points_text,
-                    "weight": self._dataset_table.item(row, 7).text(),
-                    "execution": execution_by_dataset[dataset_id],
-                    "targets": targets_by_dataset.get(dataset_id, []),
-                    "x_name": (
-                        str(x_selector.currentData() or "t")
-                        if isinstance(x_selector, QtWidgets.QComboBox)
-                        else "t"
-                    ),
-                    "x_mapping_mode": (
-                        str(mapping_selector.currentText() or "Auto")
-                        if isinstance(mapping_selector, QtWidgets.QComboBox)
-                        else "Auto"
-                    ),
-                }
-            )
-        parameters = [
-            {
-                "fit": self._parameter_table.item(row, 0).checkState() == QtCore.Qt.CheckState.Checked,
-                "name": str(
-                    self._parameter_table.item(row, 1).data(
-                        QtCore.Qt.ItemDataRole.UserRole
-                    )
-                    or self._parameter_table.item(row, 1).text()
-                ),
-                "initial": self._parameter_table.item(row, 2).text(),
-                "minimum": self._parameter_table.item(row, 3).text(),
-                "maximum": self._parameter_table.item(row, 4).text(),
-                "log10": self._parameter_table.item(row, 5).checkState() == QtCore.Qt.CheckState.Checked,
-                "scope": (
-                    str(scope.currentText())
-                    if isinstance(
-                        (scope := self._parameter_table.cellWidget(row, 6)),
-                        QtWidgets.QComboBox,
-                    )
-                    else "Shared"
-                ),
-                "dataset_values": [
-                    {
-                        "dataset_id": str(
-                            self._parameter_local_table.item(local_row, 2).data(
-                                QtCore.Qt.ItemDataRole.UserRole
-                            )
-                            or ""
-                        ),
-                        "value": self._parameter_local_table.item(
-                            local_row,
-                            2,
-                        ).text(),
-                    }
-                    for local_row in self._parameter_local_rows(
-                        str(
-                            self._parameter_table.item(row, 1).data(
-                                QtCore.Qt.ItemDataRole.UserRole
-                            )
-                            or self._parameter_table.item(row, 1).text()
-                        )
-                    )
-                ],
-            }
-            for row in range(self._parameter_table.rowCount())
-        ]
-        initials = [
-            {
-                "fit": self._initial_table.item(row, 0).checkState() == QtCore.Qt.CheckState.Checked,
-                "set_id": self._initial_table.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole + 1),
-                "species": self._initial_table.item(row, 3).text(),
-                "initial": self._initial_table.item(row, 4).text(),
-                "minimum": self._initial_table.item(row, 5).text(),
-                "maximum": self._initial_table.item(row, 6).text(),
-                "log10": self._initial_table.item(row, 7).checkState() == QtCore.Qt.CheckState.Checked,
-                "scope": (
-                    str(scope.currentText())
-                    if isinstance(
-                        (scope := self._initial_table.cellWidget(row, 8)),
-                        QtWidgets.QComboBox,
-                    )
-                    else "Global"
-                ),
-            }
-            for row in range(self._initial_table.rowCount())
-        ]
-        return {
-            "datasets": datasets,
-            "parameters": parameters,
-            "initials": initials,
-            "defaults": {
-                "method": self._method.currentText(),
-                "max_nfev": self._max_nfev.value(),
-                "ftol": self._ftol.value(),
-                "xtol": self._xtol.value(),
-                "use_seed": self._use_seed.isChecked(),
-                "seed": self._seed.value(),
-            },
-        }
+            species = self._initial_table.item(row, 3).text()
+            key = ("initial", set_id, species)
+            try:
+                intent = FitInitialSetupEdit(
+                    origin_tab_id=self._origin.tab_id,
+                    origin_capture_id=self._origin.capture_id,
+                    initial=self._initial_projection(row),
+                )
+            except (
+                KeyError,
+                StopIteration,
+                TypeError,
+                ValueError,
+                OverflowError,
+            ) as exc:
+                self._record_invalid_edit(key, exc)
+                return False
+            intents.append(intent)
+            keys.append(key)
+        self.setupEditsRequested.emit(tuple(intents))
+        return not any(key in self._invalid_setup_edits for key in keys)
 
-    def _restore_raw_state(
+    def _emit_defaults_edit(self, *_args: object) -> bool:
+        if self._projecting_setup or self._projected_setup is None:
+            return False
+        key = ("defaults",)
+        try:
+            intent = FitDefaultsSetupEdit(
+                origin_tab_id=self._origin.tab_id,
+                origin_capture_id=self._origin.capture_id,
+                defaults=self._defaults_projection(),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            self._record_invalid_edit(key, exc)
+            return False
+        self.setupEditsRequested.emit((intent,))
+        return key not in self._invalid_setup_edits
+
+    def _on_method_changed(self, method: str) -> None:
+        self._update_method_controls(method)
+        self._emit_defaults_edit()
+
+    def _update_method_controls(self, method: str) -> None:
+        is_de = str(method) == DIFFERENTIAL_EVOLUTION_METHOD
+        self._ftol_label.setText(
+            DE_POPULATION_TOLERANCE_LABEL
+            if is_de
+            else FUNCTION_TOLERANCE_LABEL
+        )
+        self._ftol.setToolTip(
+            "Passed directly to SciPy differential_evolution(tol=...)."
+            if is_de
+            else "Optimizer function-value convergence tolerance."
+        )
+        self._xtol_label.setVisible(not is_de)
+        self._xtol.setVisible(not is_de)
+        self._xtol.setEnabled(not is_de)
+
+    def _render_setup_projection(
         self,
         preserved: Mapping[str, object],
         *,
@@ -1883,9 +2119,9 @@ class FittingWindow(QtWidgets.QDialog):
             )
             self._target_table.item(row, 3).setText(str(prior.get("model_target")))
             self._target_table.item(row, 4).setText(str(prior.get("weight")))
-        self._restore_parameter_rows(preserved, canonicalized_scopes)
-        self._restore_initial_rows(preserved, canonicalized_scopes)
-        self._restore_execution_rows(datasets, canonicalized_scopes)
+        self._render_parameter_projection(preserved, canonicalized_scopes)
+        self._render_initial_projection(preserved, canonicalized_scopes)
+        self._render_execution_projection(datasets, canonicalized_scopes)
         defaults = preserved.get("defaults")
         if isinstance(defaults, Mapping):
             self._method.setCurrentText(str(defaults.get("method")))
@@ -1896,7 +2132,7 @@ class FittingWindow(QtWidgets.QDialog):
             self._seed.setValue(int(defaults.get("seed")))
         self._refresh_dataset_controls()
 
-    def _restore_parameter_rows(
+    def _render_parameter_projection(
         self,
         preserved: Mapping[str, object],
         canonicalized_scopes: frozenset[str],
@@ -1941,7 +2177,7 @@ class FittingWindow(QtWidgets.QDialog):
                 if dataset_id in local_values:
                     value_item.setText(local_values[dataset_id])
 
-    def _restore_initial_rows(
+    def _render_initial_projection(
         self,
         preserved: Mapping[str, object],
         canonicalized_scopes: frozenset[str],
@@ -1977,7 +2213,7 @@ class FittingWindow(QtWidgets.QDialog):
                         str(prior.get("scope") or "Global")
                     )
 
-    def _restore_execution_rows(
+    def _render_execution_projection(
         self,
         datasets: Mapping[str, object],
         canonicalized_scopes: frozenset[str],
@@ -1998,53 +2234,6 @@ class FittingWindow(QtWidgets.QDialog):
                 solver.setCurrentText(str(execution.get("solver")))
             for column, key in ((3, "t_start"), (4, "t_end"), (5, "integration_points")):
                 self._execution_table.item(row, column).setText(str(execution.get(key)))
-
-    def install_local_observable(
-        self,
-        *,
-        dataset_id: str,
-        raw_column: str,
-        observable_name: str,
-        scalar_parameters: tuple[object, ...] = (),
-    ) -> None:
-        for row in range(self._target_table.rowCount()):
-            identity = self._target_table.item(row, 0)
-            if (
-                str(identity.data(QtCore.Qt.ItemDataRole.UserRole) or "") == dataset_id
-                and self._target_table.item(row, 2).text() == raw_column
-            ):
-                self._target_table.item(row, 3).setText(observable_name)
-                identity.setCheckState(QtCore.Qt.CheckState.Checked)
-                self.set_status(
-                    f"Observable {observable_name!r} is local to this Fit until Apply."
-                )
-                for scalar in scalar_parameters:
-                    scalar_name = str(getattr(scalar, "name"))
-                    if self._parameter_row(scalar_name) >= 0:
-                        continue
-                    self._append_parameter_row(
-                        FitParameterVariable(
-                            name=scalar_name,
-                            display_name=scalar_name,
-                            initial=float(getattr(scalar, "value", 1.0)),
-                            minimum=float(
-                                getattr(scalar, "minimum", float("-inf"))
-                            ),
-                            maximum=float(
-                                getattr(scalar, "maximum", float("inf"))
-                            ),
-                            fit=True,
-                            log10=False,
-                            scope=str(
-                                getattr(scalar, "scope", "shared")
-                            ),
-                            family="scalar",
-                            role="scalar",
-                            unit="1",
-                        )
-                    )
-                return
-        raise KeyError("Selected dataset observation is no longer available.")
 
     def _show_add_observable_dialog(self) -> None:
         if not self._origin.mapped_datasets:
@@ -2070,7 +2259,10 @@ class FittingWindow(QtWidgets.QDialog):
                 if item.dataset_id == dataset_id
             )
             for observation in mapped.observations:
-                column.addItem(observation.raw_column, observation.raw_column)
+                column.addItem(
+                    observation.raw_column,
+                    observation.raw_observation_id,
+                )
 
         dataset.currentIndexChanged.connect(refresh_columns)
         refresh_columns()
@@ -2229,26 +2421,19 @@ class FittingWindow(QtWidgets.QDialog):
         self,
         item: QtWidgets.QTableWidgetItem,
     ) -> None:
+        if self._projecting_setup or self._refreshing_dataset_controls:
+            return
+        dataset_id = str(
+            self._dataset_table.item(item.row(), 0).data(
+                QtCore.Qt.ItemDataRole.UserRole
+            )
+            or ""
+        )
         if (
             item.column() == 0
             and not self._refreshing_dataset_controls
         ):
             self._reconcile_parameter_local_rows()
-            included_set_ids = self._included_set_ids()
-            for initial_row in range(self._initial_table.rowCount()):
-                set_id = str(
-                    self._initial_table.item(initial_row, 0).data(
-                        QtCore.Qt.ItemDataRole.UserRole + 1
-                    )
-                    or ""
-                )
-                if set_id in included_set_ids:
-                    continue
-                selector = self._initial_table.cellWidget(initial_row, 8)
-                if isinstance(selector, QtWidgets.QComboBox):
-                    blocker = QtCore.QSignalBlocker(selector)
-                    selector.setCurrentText("Local")
-                    del blocker
             for row in range(self._parameter_table.rowCount()):
                 name_item = self._parameter_table.item(row, 1)
                 self._project_shared_parameter_from_local_rows(
@@ -2260,6 +2445,35 @@ class FittingWindow(QtWidgets.QDialog):
                     )
                 )
         self._refresh_dataset_controls()
+        self._emit_dataset_edit(dataset_id)
+
+    def _on_target_item_changed(
+        self,
+        _item: QtWidgets.QTableWidgetItem,
+    ) -> None:
+        if self._projecting_setup:
+            return
+        self._refresh_dataset_controls()
+
+    def _on_execution_item_changed(
+        self,
+        item: QtWidgets.QTableWidgetItem,
+    ) -> None:
+        if self._projecting_setup:
+            return
+        dataset_id = str(
+            self._execution_table.item(item.row(), 0).data(
+                QtCore.Qt.ItemDataRole.UserRole
+            )
+            or ""
+        )
+        self._emit_dataset_edit(dataset_id)
+
+    def _on_dataset_selector_changed(self, dataset_id: str) -> None:
+        if self._projecting_setup:
+            return
+        self._refresh_dataset_controls()
+        self._emit_dataset_edit(dataset_id)
 
     def _refresh_dataset_controls(self) -> None:
         if self._refreshing_dataset_controls:
@@ -2468,13 +2682,30 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _apply_target_changes(self) -> None:
+        dataset_ids = tuple(
+            dict.fromkeys(
+                str(
+                    self._target_table.item(row, 0).data(
+                        QtCore.Qt.ItemDataRole.UserRole
+                    )
+                    or ""
+                )
+                for row in range(self._target_table.rowCount())
+            )
+        )
+        if not self._emit_dataset_edits(
+            dataset_ids,
+            include_pending_targets=True,
+        ):
+            self.set_status("Pending Fit target selections are invalid.")
+            return
         self._committed_targets = self._current_target_state()
         self._refresh_dataset_controls()
         self.set_status("Pending Fit target selections applied locally.")
 
     def _current_target_state(
         self,
-    ) -> dict[tuple[str, str], bool]:
+    ) -> dict[tuple[str, str], tuple[bool, str, str]]:
         return {
             (
                 str(
@@ -2489,8 +2720,12 @@ class FittingWindow(QtWidgets.QDialog):
                     )
                     or ""
                 ),
-            ): self._target_table.item(row, 0).checkState()
-            == QtCore.Qt.CheckState.Checked
+            ): (
+                self._target_table.item(row, 0).checkState()
+                == QtCore.Qt.CheckState.Checked,
+                self._target_table.item(row, 3).text(),
+                self._target_table.item(row, 4).text(),
+            )
             for row in range(self._target_table.rowCount())
         }
 
@@ -2502,23 +2737,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._committed_targets = self._current_target_state()
 
     def _revert_target_changes(self) -> None:
-        for row in range(self._target_table.rowCount()):
-            item = self._target_table.item(row, 0)
-            key = (
-                str(item.data(QtCore.Qt.ItemDataRole.UserRole) or ""),
-                str(
-                    self._target_table.item(row, 2).data(
-                        QtCore.Qt.ItemDataRole.UserRole + 1
-                    )
-                    or ""
-                ),
-            )
-            item.setCheckState(
-                QtCore.Qt.CheckState.Checked
-                if self._committed_targets.get(key, False)
-                else QtCore.Qt.CheckState.Unchecked
-            )
-        self._refresh_dataset_controls()
+        self.project_setup_snapshot(self._require_projected_setup())
         self.set_status("Pending Fit target selections reverted.")
 
     def _toggle_pause(self) -> None:
@@ -2529,6 +2748,14 @@ class FittingWindow(QtWidgets.QDialog):
         else:
             self.resumeRequested.emit()
 
+    def _request_execute(self) -> None:
+        if self.has_invalid_setup_edits:
+            self.set_status(
+                "Fit setup contains an invalid edit; correct it before running."
+            )
+            return
+        self.executeRequested.emit()
+
     def _restore_named_snapshot(self, name: str) -> None:
         snapshot = self._initial_setup if name == "initial" else self._last_fit_setup
         if snapshot is None:
@@ -2537,6 +2764,9 @@ class FittingWindow(QtWidgets.QDialog):
         self.restoreSetupRequested.emit(snapshot)
 
     def set_executing(self, executing: bool) -> None:
+        if executing:
+            self._revoke_curve_copy()
+            self._copy_run_json.setEnabled(False)
         self._run_button.setEnabled(not executing)
         self._cancel_button.setEnabled(executing)
         self._pause_button.setEnabled(executing)
@@ -2666,10 +2896,33 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_identity = identity
         self._copy_run_json.setEnabled(True)
 
-    def set_candidate(self, candidate: FitCandidate) -> bool:
+    def set_candidate(
+        self,
+        candidate: FitCandidate,
+        *,
+        available_scopes: frozenset[str],
+        unavailable_reasons: Mapping[str, str],
+    ) -> bool:
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be FitCandidate.")
-        available = set(candidate.available_scopes)
+        available = set(available_scopes)
+        reasons = {
+            str(scope): str(reason or "").strip()
+            for scope, reason in unavailable_reasons.items()
+        }
+        known_scopes = {
+            "parameters",
+            "initial_concentrations",
+            "simulation_setup",
+            "observable_definitions",
+        }
+        if (
+            not available.issubset(known_scopes)
+            or not set(reasons).issubset(known_scopes - available)
+            or any(not reason for reason in reasons.values())
+        ):
+            raise ValueError("Fit Apply feasibility is invalid.")
+        self._revoke_curve_copy()
         for checkbox, scope in (
             (self._apply_parameters, "parameters"),
             (self._apply_initials, "initial_concentrations"),
@@ -2678,6 +2931,7 @@ class FittingWindow(QtWidgets.QDialog):
         ):
             checkbox.setEnabled(scope in available)
             checkbox.setChecked(scope in available)
+            checkbox.setToolTip(reasons.get(scope, ""))
         self._apply_button.setEnabled(bool(available))
         result = candidate.result
         dataset_labels = {
@@ -2692,23 +2946,6 @@ class FittingWindow(QtWidgets.QDialog):
             item.name: item.display_name
             for item in candidate.setup_snapshot.parameters
         }
-        set_id_by_dataset = {
-            item.dataset_id: item.set_id
-            for item in self._origin.mapped_datasets
-        }
-        execution_by_set: dict[
-            str,
-            SimulationExecutionSettings,
-        ] = {}
-        execution_apply_conflict = False
-        for local in candidate.setup_snapshot.datasets:
-            if not local.included:
-                continue
-            set_id = set_id_by_dataset[local.dataset_id]
-            previous = execution_by_set.get(set_id)
-            if previous is not None and previous != local.execution:
-                execution_apply_conflict = True
-            execution_by_set[set_id] = local.execution
         self._result_summary.setPlainText(
             "\n".join(
                 (
@@ -2718,12 +2955,7 @@ class FittingWindow(QtWidgets.QDialog):
                     f"Weighted residual MSE: {float(result.weighted_residual_mse):.8g}",
                     f"Function evaluations: {int(result.nfev)}",
                     f"Pending local observables: {len(candidate.local_observables)}",
-                    *((
-                        (
-                            "Simulation Setup Apply is unavailable because "
-                            "datasets mapped to one set used different settings."
-                        ),
-                    ) if execution_apply_conflict else ()),
+                    *(reasons[scope] for scope in sorted(reasons)),
                     *(
                         f"{dataset_labels.get(info.dataset_id, 'Dataset')}: "
                         f"weighted SSE={info.weighted_residual_sse:.8g}, "
@@ -2792,21 +3024,34 @@ class FittingWindow(QtWidgets.QDialog):
         self._candidate_curves = candidate.curves
         self._last_fit_setup = candidate.setup_snapshot
         self._view_last_fit.setEnabled(True)
-        self._effective_source = candidate.mechanism_source
-        self._effective_prepared_dsl = candidate.prepared_dsl
         self.set_run_identity(candidate.run_identity)
-        self._copy_button.setEnabled(True)
         self.set_resolved_auto_modes(candidate.resolved_auto_modes)
         try:
             self._apply_species_filter()
-        except Exception as exc:
-            self.set_status(
-                f"Fit completed, but plotting failed: {exc}. "
-                "The candidate remains available to Apply."
-            )
+        except Exception:
+            self._revoke_curve_copy()
             return False
+        self._copy_button.setEnabled(self._all_datasets_view.copy_eligible())
         self._tabs.setCurrentWidget(self._results_tab)
         return True
+
+    def _revoke_curve_copy(self) -> None:
+        """Clear every physical and semantic Fit-curve Copy route."""
+
+        self._copy_button.setEnabled(False)
+        self._candidate_curves = ()
+        try:
+            self.set_live_curves(())
+        except Exception:
+            try:
+                self._all_datasets_view.set_curves(())
+            except Exception:
+                pass
+            for view in self._dataset_view_by_id.values():
+                try:
+                    view.set_curves(())
+                except Exception:
+                    pass
 
     def clear_candidate(self) -> None:
         for checkbox in (
@@ -2817,12 +3062,12 @@ class FittingWindow(QtWidgets.QDialog):
         ):
             checkbox.setChecked(False)
             checkbox.setEnabled(False)
+            checkbox.setToolTip("")
         self._apply_button.setEnabled(False)
         self._run_identity = None
         self._copy_button.setEnabled(False)
         self._copy_run_json.setEnabled(False)
-        self._candidate_curves = ()
-        self.set_live_curves(())
+        self._revoke_curve_copy()
         self._tracker_summary.setText(
             "Run a fit to see the best candidate."
         )
@@ -2948,6 +3193,7 @@ class FittingWindow(QtWidgets.QDialog):
             if any(name in selected for name, _values in curve.model_y)
         )
         self.set_live_curves(filtered)
+        self._copy_button.setEnabled(self._all_datasets_view.copy_eligible())
 
     def force_close_after_cleanup(self) -> None:
         self._closing_after_cleanup = True

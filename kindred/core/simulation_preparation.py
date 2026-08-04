@@ -18,7 +18,6 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 import numpy as np
 
 from kindred.core.rate_binding import ForwardRateBinding, RateBinding
-import kindred.core.simulator.solvers as solver_api
 from kindred.core.exceptions import FitSimulationError
 from kindred.core.mechanism_metadata import (
     EquilibriumMetadataKeys,
@@ -52,7 +51,6 @@ from kindred.core.simulator.solvers import (
     DEFAULT_SOLVER_NAME,
     SimulationRequest,
     normalize_solver_name,
-    solve_ode,
 )
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.identity import normalize_symbolic_identity_mapping
@@ -433,12 +431,23 @@ class SimulationPreparationError(RuntimeError):
         self.stage = str(stage or "unknown")
 
 
-def _solve_request(request: SimulationRequest):
-    # Resolve through the solver module so callers that monkeypatch
-    # `kindred.core.simulator.solvers.solve_ode` keep working even if this
-    # module was imported before the patch was applied.
-    solver = getattr(solver_api, solve_ode.__name__, solve_ode)
-    return solver(request)
+def _cancellation_check_from_events(
+    events: Iterable[Callable[..., object]] | None,
+) -> Callable[[], bool] | None:
+    callbacks = tuple(
+        callback
+        for event in tuple(events or ())
+        if bool(getattr(event, "_kindred_cancel_event", False))
+        for callback in (getattr(event, "_kindred_cancelled", None),)
+        if callable(callback)
+    )
+    if not callbacks:
+        return None
+
+    def cancellation_requested() -> bool:
+        return any(bool(callback()) for callback in callbacks)
+
+    return cancellation_requested
 
 
 @dataclass(frozen=True)
@@ -463,6 +472,8 @@ class PreparedSimulationRun:
 def resolve_prepared_run_intervention_execution(
     prepared_run: PreparedSimulationRun,
     parameter_partition: SimulationParameterValuePartition,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> InterventionExecutionContract:
     """Return the one resolved Run-owned contract consumed by Fit."""
 
@@ -480,7 +491,10 @@ def resolve_prepared_run_intervention_execution(
                 mechanism=prepared_run.mechanism,
             ),
         )
-        return compile_intervention_schedule(resolved_schedule)
+        return compile_intervention_schedule(
+            resolved_schedule,
+            cancellation_check=cancellation_check,
+        )
     except InterventionScheduleError as exc:
         raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
 
@@ -988,7 +1002,10 @@ def materialize_request_intervention_schedule_for_parameter_values(
         return replace(
             request,
             intervention_execution=compile_intervention_schedule(
-                resolved_schedule
+                resolved_schedule,
+                cancellation_check=_cancellation_check_from_events(
+                    request.events
+                ),
             ),
         )
     raise SimulationPreparationError(
@@ -2222,6 +2239,7 @@ def prepare_simulation_worker_run(
     - Generated symbolic Jacobian construction when supported by the solver path
     """
 
+    event_values = tuple(events or ())
     request_payload = coerce_simulation_execution_request(execution_request)
     if request_payload is None:
         raise SimulationPreparationError(
@@ -2419,7 +2437,8 @@ def prepare_simulation_worker_run(
         raise SimulationPreparationError("initials_for_algebra", str(exc)) from exc
 
     intervention_execution = compile_intervention_schedule(
-        intervention_schedule
+        intervention_schedule,
+        cancellation_check=_cancellation_check_from_events(event_values),
     )
     runtime_symbolic_jacobian = prepared_context.symbolic_jacobian
     if (
@@ -2440,7 +2459,7 @@ def prepare_simulation_worker_run(
         atol=float(prepared_solver_config.atol),
         grid=prepared_solver_config.grid,
         **runtime_symbolic_jacobian.to_request_kwargs(),
-        events=list(events) if events is not None else None,
+        events=list(event_values) if events is not None else None,
         temperature_schedule=temperature_schedule,
         species_names=tuple(species_names),
         progress_callback=progress_callback,

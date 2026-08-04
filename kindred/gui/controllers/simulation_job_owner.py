@@ -9,7 +9,7 @@ from numbers import Real
 import os
 from threading import Event
 from time import monotonic
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Literal, Mapping
 
 import numpy as np
 from PySide6 import QtCore
@@ -482,12 +482,36 @@ class SimulationTerminalSummary:
 
 
 @dataclass(frozen=True, slots=True)
-class _TargetExecutionOutcome:
+class _TargetTerminalOutcome:
     key: ExplicitResultKey | PreviewResultKey
-    accepted: bool
-    cancelled: bool
+    state: Literal["success", "failure", "cancelled"]
+    stage: Literal["preparation", "execution"]
     result: SimulationResultValue | None = None
     message: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, (ExplicitResultKey, PreviewResultKey)):
+            raise TypeError(
+                "terminal outcome key must be an explicit or Preview result key."
+            )
+        if self.state not in {"success", "failure", "cancelled"}:
+            raise ValueError(
+                "terminal outcome state must be success, failure, or cancelled."
+            )
+        if self.stage not in {"preparation", "execution"}:
+            raise ValueError(
+                "terminal outcome stage must be preparation or execution."
+            )
+        if self.state == "success":
+            if not isinstance(self.result, SimulationResultValue):
+                raise TypeError(
+                    "a successful terminal outcome requires a simulation result."
+                )
+        elif self.result is not None:
+            raise ValueError(
+                "a failed or cancelled terminal outcome cannot carry a result."
+            )
+        object.__setattr__(self, "message", str(self.message or ""))
 
 
 def build_explicit_target(
@@ -800,9 +824,7 @@ def _solve_prepared(
 
 
 class _DirectSimulationWorker(QtCore.QThread):
-    target_accepted = QtCore.Signal(int, object)
-    target_succeeded = QtCore.Signal(int, object, object)
-    target_failed = QtCore.Signal(int, object, str, bool, bool)
+    target_terminal = QtCore.Signal(int, object)
 
     def __init__(
         self,
@@ -843,50 +865,17 @@ class _DirectSimulationWorker(QtCore.QThread):
                     outcome = future.result()
                 except BaseException as exc:  # noqa: BLE001
                     target = futures[future]
-                    outcome = _TargetExecutionOutcome(
+                    outcome = _TargetTerminalOutcome(
                         key=target.key,
-                        accepted=False,
-                        cancelled=self._cancelled.is_set(),
+                        state=(
+                            "cancelled"
+                            if self._cancelled.is_set()
+                            else "failure"
+                        ),
+                        stage="preparation",
                         message=str(exc) or type(exc).__name__,
                     )
-                if outcome.result is not None and self._cancelled.is_set():
-                    outcome = _TargetExecutionOutcome(
-                        key=outcome.key,
-                        accepted=True,
-                        cancelled=True,
-                        message="Simulation cancelled before publication.",
-                    )
-                if outcome.accepted:
-                    self.target_accepted.emit(self._job_id, outcome.key)
-                if outcome.result is not None and self._cancelled.is_set():
-                    outcome = _TargetExecutionOutcome(
-                        key=outcome.key,
-                        accepted=True,
-                        cancelled=True,
-                        message="Simulation cancelled before publication.",
-                    )
-                if outcome.result is not None:
-                    self.target_succeeded.emit(
-                        self._job_id,
-                        outcome.key,
-                        outcome.result,
-                    )
-                    if self._cancelled.is_set():
-                        self.target_failed.emit(
-                            self._job_id,
-                            outcome.key,
-                            "Simulation cancelled during publication.",
-                            True,
-                            True,
-                        )
-                else:
-                    self.target_failed.emit(
-                        self._job_id,
-                        outcome.key,
-                        outcome.message,
-                        outcome.cancelled,
-                        outcome.accepted,
-                    )
+                self.target_terminal.emit(self._job_id, outcome)
                 if self._cancelled.is_set():
                     for pending in futures:
                         pending.cancel()
@@ -894,12 +883,12 @@ class _DirectSimulationWorker(QtCore.QThread):
     def _execute_target(
         self,
         target: ExplicitRunTarget | PreviewTarget,
-    ) -> _TargetExecutionOutcome:
+    ) -> _TargetTerminalOutcome:
         if self._cancelled.is_set():
-            return _TargetExecutionOutcome(
+            return _TargetTerminalOutcome(
                 key=target.key,
-                accepted=False,
-                cancelled=True,
+                state="cancelled",
+                stage="preparation",
                 message="Simulation cancelled before preparation.",
             )
         try:
@@ -908,17 +897,17 @@ class _DirectSimulationWorker(QtCore.QThread):
                 cancelled=self._cancelled,
             )
         except SimulationCancelled:
-            return _TargetExecutionOutcome(
+            return _TargetTerminalOutcome(
                 key=target.key,
-                accepted=False,
-                cancelled=True,
+                state="cancelled",
+                stage="preparation",
                 message="Simulation cancelled.",
             )
         except BaseException as exc:  # noqa: BLE001
-            return _TargetExecutionOutcome(
+            return _TargetTerminalOutcome(
                 key=target.key,
-                accepted=False,
-                cancelled=False,
+                state="failure",
+                stage="preparation",
                 message=str(exc) or type(exc).__name__,
             )
         try:
@@ -928,23 +917,23 @@ class _DirectSimulationWorker(QtCore.QThread):
                 cancelled=self._cancelled,
             )
         except SimulationCancelled:
-            return _TargetExecutionOutcome(
+            return _TargetTerminalOutcome(
                 key=target.key,
-                accepted=True,
-                cancelled=True,
+                state="cancelled",
+                stage="execution",
                 message="Simulation cancelled.",
             )
         except BaseException as exc:  # noqa: BLE001
-            return _TargetExecutionOutcome(
+            return _TargetTerminalOutcome(
                 key=target.key,
-                accepted=True,
-                cancelled=False,
+                state="failure",
+                stage="execution",
                 message=str(exc) or type(exc).__name__,
             )
-        return _TargetExecutionOutcome(
+        return _TargetTerminalOutcome(
             key=target.key,
-            accepted=True,
-            cancelled=False,
+            state="success",
+            stage="execution",
             result=result,
         )
 
@@ -1270,11 +1259,7 @@ class SimulationJobOwner(QtCore.QObject):
         )
         if not targets:
             return ()
-        pending = self._pending_preview
-        if pending is not None and pending.tab_id == tid and any(
-            target.key.set_id in targets for target in pending.targets
-        ):
-            self.drop_pending_preview(tid)
+        self._drop_pending_preview_for_targets(tid, targets)
         target_set = set(targets)
         self._advance_preview_publication_generations(tid, targets)
         self._retire_preview_keys(tid, targets)
@@ -1290,15 +1275,12 @@ class SimulationJobOwner(QtCore.QObject):
             self._abort_pending_detailed_balance(
                 "Run detailed-balance correction aborted: a target was deleted."
             )
-        self._targets = tuple(
-            target
-            for target in self._targets
-            if not (
-                target.key.tab_id == tid
-                and target.key.set_id in target_set
-            )
-        )
         generations = self.advance_explicit_publication_generations(tid, targets)
+        self._discard_purged_admitted_targets(
+            tid,
+            target_set,
+            reason="its set was purged and publication was deauthorized",
+        )
         self._repository(tid).purge_sets(targets)
         self.results_changed.emit(tid)
         return generations
@@ -1324,10 +1306,21 @@ class SimulationJobOwner(QtCore.QObject):
             self._abort_pending_detailed_balance(
                 "Run detailed-balance correction aborted: its tab was deleted."
             )
-        self._targets = tuple(
-            target for target in self._targets if target.key.tab_id != tid
+        admitted_set_ids = {
+            target.key.set_id
+            for target in self._targets
+            if target.key.tab_id == tid
+        }
+        deauthorized_set_ids = tuple(dict.fromkeys((*targets, *admitted_set_ids)))
+        generations = self.advance_explicit_publication_generations(
+            tid,
+            deauthorized_set_ids,
         )
-        generations = self.advance_explicit_publication_generations(tid, targets)
+        self._discard_purged_admitted_targets(
+            tid,
+            None,
+            reason="its tab was purged and publication was deauthorized",
+        )
         try:
             self._repository(tid).clear()
         except LookupError:
@@ -1375,7 +1368,7 @@ class SimulationJobOwner(QtCore.QObject):
                     "Run rejected: another computation is active."
                 )
                 return False
-            self.drop_pending_preview()
+            self.drop_pending_preview(capture.tab_id)
             self._detailed_balance_generation += 1
             self._pending_detailed_balance = (
                 _PendingRunDetailedBalanceCorrection(
@@ -1414,27 +1407,25 @@ class SimulationJobOwner(QtCore.QObject):
                 f"{type(exc).__name__}: {exc}"
             )
             return False
-        if gate_already_owned:
-            if not self._gate.is_owned_by(self):
-                self.status_changed.emit(
-                    "Run continuation rejected: its admission is no longer owned."
-                )
-                return False
-        elif not self._gate.try_acquire(self, "run"):
-            self.status_changed.emit("Run rejected: another computation is active.")
-            return False
-        self.drop_pending_preview()
+        self.drop_pending_preview(capture.tab_id)
         try:
-            self._start_worker(
+            started = self._start_worker(
                 "run",
                 capture.tab_id,
                 capture.targets,
                 max_parallel=capacity.effective,
+                gate_already_owned=gate_already_owned,
             )
         except Exception as exc:
-            self._gate.release(self)
             self.status_changed.emit(
                 f"Run dispatch failed: {type(exc).__name__}: {exc}"
+            )
+            return False
+        if not started:
+            self.status_changed.emit(
+                "Run continuation rejected: its admission is no longer owned."
+                if gate_already_owned
+                else "Run rejected: another computation is active."
             )
             return False
         self.status_changed.emit(
@@ -1583,6 +1574,13 @@ class SimulationJobOwner(QtCore.QObject):
                 gate_already_owned=True,
             )
             if not launched:
+                if self._worker is not None:
+                    self.status_changed.emit(
+                        "Detailed-balance correction committed; Run worker "
+                        "startup remains uncertain and owner-retained pending "
+                        "native terminal delivery."
+                    )
+                    return False
                 self._gate.release(self)
                 raise RuntimeError("Corrected Run could not be dispatched.")
         except Exception as exc:
@@ -1633,7 +1631,20 @@ class SimulationJobOwner(QtCore.QObject):
             )
             self.state_changed.emit()
             return False
-        if not self._gate.try_acquire(self, "preview"):
+        try:
+            started = self._start_worker(
+                "preview",
+                intent.tab_id,
+                intent.targets,
+                max_parallel=1,
+                gate_already_owned=False,
+            )
+        except Exception as exc:
+            self.status_changed.emit(
+                f"Preview dispatch failed: {type(exc).__name__}: {exc}"
+            )
+            return False
+        if not started:
             self._pending_preview = intent
             self.status_changed.emit(
                 "Preview not admitted while another computation is active; "
@@ -1641,20 +1652,6 @@ class SimulationJobOwner(QtCore.QObject):
             )
             self.state_changed.emit()
             return False
-        admitted_intent = self._current_preview_intent(intent)
-        if admitted_intent is None:
-            self._gate.release(self)
-            self.status_changed.emit(
-                "Preview rejected: every exact key changed during admission."
-            )
-            return False
-        intent = admitted_intent
-        self._start_worker(
-            "preview",
-            intent.tab_id,
-            intent.targets,
-            max_parallel=1,
-        )
         self.status_changed.emit("Preview started.")
         return True
 
@@ -1771,47 +1768,146 @@ class SimulationJobOwner(QtCore.QObject):
         targets: tuple[ExplicitRunTarget | PreviewTarget, ...],
         *,
         max_parallel: int,
-    ) -> None:
-        self._job_id += 1
-        self._job_kind = kind
-        self._origin_tab_id = tab_id
-        self._targets = tuple(targets)
-        self._outcomes = {}
-        self._details = []
-        worker = _DirectSimulationWorker(
-            job_id=self._job_id,
-            targets=self._targets,
-            max_parallel=max_parallel,
-            parent=self,
-        )
-        worker.target_accepted.connect(self._on_target_accepted)
-        worker.target_succeeded.connect(self._on_target_succeeded)
-        worker.target_failed.connect(self._on_target_failed)
-        worker.finished.connect(self._on_worker_finished)
-        self._worker = worker
+        gate_already_owned: bool,
+    ) -> bool:
+        """Acquire/install atomically; roll back only a verified unstarted worker."""
+
+        if self._worker is not None:
+            return False
+        worker: _DirectSimulationWorker | None = None
+        installed = False
+        try:
+            if gate_already_owned:
+                if not self._gate.is_owned_by(self):
+                    return False
+            elif not self._gate.try_acquire(self, kind):
+                return False
+            next_job_id = self._job_id + 1
+            admitted_targets = tuple(targets)
+            if kind == "run":
+                if any(
+                    not isinstance(target, ExplicitRunTarget)
+                    or not self._explicit_completion_is_current(target)
+                    for target in admitted_targets
+                ):
+                    raise RuntimeError(
+                        "Run targets changed during worker admission."
+                    )
+            elif kind == "preview":
+                admitted_targets = tuple(
+                    target
+                    for target in admitted_targets
+                    if isinstance(target, PreviewTarget)
+                    and self.preview_key_is_current(target.key)
+                )
+                if not admitted_targets:
+                    raise RuntimeError(
+                        "Every Preview target changed during worker admission."
+                    )
+            else:
+                raise ValueError("worker kind must be 'run' or 'preview'.")
+            worker = _DirectSimulationWorker(
+                job_id=next_job_id,
+                targets=admitted_targets,
+                max_parallel=max_parallel,
+                parent=self,
+            )
+            worker.target_terminal.connect(self._on_target_terminal)
+            worker.finished.connect(self._on_worker_finished)
+            self._job_id = next_job_id
+            self._job_kind = kind
+            self._origin_tab_id = tab_id
+            self._targets = admitted_targets
+            self._outcomes = {}
+            self._details = []
+            self._worker = worker
+            installed = True
+            worker.start()
+        except BaseException as exc:  # noqa: BLE001
+            if installed and worker is not None:
+                try:
+                    verified_unstarted = bool(
+                        not worker.isRunning()
+                        and not worker.isFinished()
+                    )
+                except BaseException:  # noqa: BLE001
+                    verified_unstarted = False
+                if not verified_unstarted:
+                    self.owned_qthreads_changed.emit()
+                    self.state_changed.emit()
+                    raise RuntimeError(
+                        f"{kind.capitalize()} worker startup is uncertain; "
+                        "native execution began or could not be disproved, so "
+                        "the worker and computation gate remain owner-retained."
+                    ) from exc
+            if worker is not None:
+                worker.cancel()
+                try:
+                    worker.target_terminal.disconnect(self._on_target_terminal)
+                except (RuntimeError, TypeError):
+                    pass
+                try:
+                    worker.finished.disconnect(self._on_worker_finished)
+                except (RuntimeError, TypeError):
+                    pass
+            if installed and self._worker is worker:
+                self._worker = None
+                self._job_kind = None
+                self._origin_tab_id = None
+                self._targets = ()
+                self._outcomes = {}
+                self._details = []
+            self._gate.release(self)
+            if worker is not None:
+                worker.deleteLater()
+            if installed:
+                self.owned_qthreads_changed.emit()
+                self.state_changed.emit()
+            raise
         self.owned_qthreads_changed.emit()
         self.state_changed.emit()
-        worker.start()
+        return True
 
     @QtCore.Slot(int, object)
-    def _on_target_accepted(self, job_id: int, key: object) -> None:
-        if (
-            int(job_id) == self._job_id
-            and self._worker is not None
-            and not self._worker.cancelled
-            and not self._application_close_fenced
-        ):
-            self._outcomes.setdefault(key, "accepted")
-
-    @QtCore.Slot(int, object, object)
-    def _on_target_succeeded(self, job_id: int, key: object, result: object) -> None:
+    def _on_target_terminal(
+        self,
+        job_id: int,
+        outcome: object,
+    ) -> None:
         if (
             int(job_id) != self._job_id
             or self._worker is None
-            or self._worker.cancelled
-            or self._application_close_fenced
-            or not isinstance(result, SimulationResultValue)
+            or not isinstance(outcome, _TargetTerminalOutcome)
         ):
+            return
+        key = outcome.key
+        if self._target_for_key(key) is None:
+            return
+        if key in self._outcomes:
+            return
+        if outcome.state != "success":
+            target_name = self._target_display_name(key)
+            detail = (
+                f"{target_name} {outcome.stage} {outcome.state}: "
+                f"{outcome.message}"
+            )
+            self._record_terminal(key, outcome.state, detail)
+            return
+        result = outcome.result
+        if not isinstance(result, SimulationResultValue):
+            self._record_terminal(
+                key,
+                "failure",
+                f"{self._target_display_name(key)} execution failed: "
+                "worker returned no admitted result.",
+            )
+            return
+        if self._worker.cancelled or self._application_close_fenced:
+            self._record_terminal(
+                key,
+                "cancelled",
+                f"{self._target_display_name(key)} cancelled before publication.",
+            )
             return
         if isinstance(key, ExplicitResultKey) and self._job_kind == "run":
             target = self._target_for_key(key)
@@ -1837,14 +1933,29 @@ class SimulationJobOwner(QtCore.QObject):
                     "the live result repository is unavailable.",
                 )
                 return
-            repository.put_explicit(key, result)
+            if self._worker.cancelled or self._application_close_fenced:
+                self._record_terminal(
+                    key,
+                    "cancelled",
+                    f"Run result for {target.set_name} cancelled before publication.",
+                )
+                return
+            try:
+                repository.put_explicit(key, result)
+            except Exception as exc:
+                self._record_discard(
+                    key,
+                    f"Run result discarded for {target.set_name}: "
+                    f"repository rejected publication ({type(exc).__name__}: {exc}).",
+                )
+                return
             if self._preview_target_is_active(key.tab_id, key.set_id):
                 self._advance_preview_publication_generations(
                     key.tab_id,
                     (key.set_id,),
                 )
                 self._retire_preview_keys(key.tab_id, (key.set_id,))
-            self._outcomes[key] = "success"
+            self._record_terminal(key, "success")
             self.results_changed.emit(key.tab_id)
             return
         if isinstance(key, PreviewResultKey) and self._job_kind == "preview":
@@ -1865,8 +1976,23 @@ class SimulationJobOwner(QtCore.QObject):
                     "the live result repository is unavailable.",
                 )
                 return
-            repository.store_preview(key, result)
-            self._outcomes[key] = "success"
+            if self._worker.cancelled or self._application_close_fenced:
+                self._record_terminal(
+                    key,
+                    "cancelled",
+                    f"Preview result for {target_name} cancelled before publication.",
+                )
+                return
+            try:
+                repository.store_preview(key, result)
+            except Exception as exc:
+                self._record_discard(
+                    key,
+                    f"Preview result discarded for {target_name}: "
+                    f"repository rejected publication ({type(exc).__name__}: {exc}).",
+                )
+                return
+            self._record_terminal(key, "success")
             # Semantic publication is complete before any render attempt,
             # including for inactive tabs and non-plotted targets.
             self.results_changed.emit(key.tab_id)
@@ -1876,38 +2002,11 @@ class SimulationJobOwner(QtCore.QObject):
             "Simulation result discarded: its job kind no longer matches.",
         )
 
-    @QtCore.Slot(int, object, str, bool, bool)
-    def _on_target_failed(
-        self,
-        job_id: int,
-        key: object,
-        message: str,
-        cancelled: bool,
-        accepted: bool,
-    ) -> None:
-        if (
-            int(job_id) != self._job_id
-            or self._worker is None
-            or self._application_close_fenced
-        ):
-            return
-        outcome = "cancelled" if cancelled else "failure"
-        self._outcomes[key] = outcome
-        target_name = self._target_display_name(key)
-        stage = "execution" if accepted else "preparation"
-        detail = (
-            f"{target_name} {stage} "
-            f"{'cancelled' if cancelled else 'failed'}: {message}"
-        )
-        self._details.append(detail)
-        self.status_changed.emit(detail)
-        # Prior current/cache entries remain untouched for preparation failure,
-        # execution failure, and cancellation.
-
     @QtCore.Slot()
     def _on_worker_finished(self) -> None:
         if self.sender() is not self._worker:
             return
+        self._settle_missing_terminal_outcomes()
         summary = self._terminal_summary()
         self._finish_current()
         if self._application_close_fenced:
@@ -1923,34 +2022,6 @@ class SimulationJobOwner(QtCore.QObject):
         cancelled = sum(value == "cancelled" for value in self._outcomes.values())
         discarded = sum(value == "discarded" for value in self._outcomes.values())
         details = list(self._details)
-        unresolved = tuple(
-            key
-            for key, value in self._outcomes.items()
-            if value == "accepted"
-        )
-        if unresolved:
-            if self._worker is not None and self._worker.cancelled:
-                cancelled += len(unresolved)
-                details.extend(
-                    f"{self._target_display_name(key)} "
-                    "cancelled before publication."
-                    for key in unresolved
-                )
-            else:
-                failed += len(unresolved)
-                details.extend(
-                    f"{self._target_display_name(key)} "
-                    "ended without a terminal outcome."
-                    for key in unresolved
-                )
-        unprocessed = max(0, len(self._targets) - len(self._outcomes))
-        if self._worker is not None and self._worker.cancelled:
-            cancelled += unprocessed
-        elif unprocessed:
-            failed += unprocessed
-            details.append(
-                f"{unprocessed} target(s) ended without preparation or execution."
-            )
         total = succeeded + failed + cancelled + discarded
         if total and succeeded == total:
             state = "success"
@@ -1982,6 +2053,7 @@ class SimulationJobOwner(QtCore.QObject):
         return status
 
     def _finish_after_synchronous_wait(self) -> None:
+        self._settle_missing_terminal_outcomes()
         summary = self._terminal_summary()
         self._job_id += 1
         self._finish_current()
@@ -2049,10 +2121,89 @@ class SimulationJobOwner(QtCore.QObject):
         target = self._target_for_key(key)
         return target.set_name if target is not None else "target"
 
-    def _record_discard(self, key: object, detail: str) -> None:
-        self._outcomes[key] = "discarded"
-        self._details.append(str(detail))
-        self.status_changed.emit(str(detail))
+    def _discard_purged_admitted_targets(
+        self,
+        tab_id: str,
+        set_ids: set[str] | None,
+        *,
+        reason: str,
+    ) -> None:
+        """Deauthorize purged work without mutating its admitted roster."""
+
+        worker = self._worker
+        if worker is None:
+            return
+        for target in self._targets:
+            key = target.key
+            if key.tab_id != tab_id:
+                continue
+            if set_ids is not None and key.set_id not in set_ids:
+                continue
+            self._record_discard(
+                key,
+                f"{target.set_name} discarded: {reason}.",
+            )
+        if not any(
+            target.key not in self._outcomes
+            and self._admitted_target_is_publishable(target)
+            for target in self._targets
+        ):
+            worker.cancel()
+
+    def _admitted_target_is_publishable(
+        self,
+        target: ExplicitRunTarget | PreviewTarget,
+    ) -> bool:
+        if self._application_close_fenced:
+            return False
+        if isinstance(target, ExplicitRunTarget) and self._job_kind == "run":
+            return self._explicit_completion_is_current(target)
+        if isinstance(target, PreviewTarget) and self._job_kind == "preview":
+            return self.preview_key_is_current(target.key)
+        return False
+
+    def _record_discard(self, key: object, detail: str) -> bool:
+        return self._record_terminal(key, "discarded", detail)
+
+    def _record_terminal(
+        self,
+        key: object,
+        state: str,
+        detail: str | None = None,
+    ) -> bool:
+        if state not in {"success", "failure", "cancelled", "discarded"}:
+            raise ValueError(f"unsupported target terminal state {state!r}.")
+        if key in self._outcomes:
+            return False
+        if not isinstance(key, (ExplicitResultKey, PreviewResultKey)):
+            raise TypeError("a target terminal outcome requires a result key.")
+        if self._target_for_key(key) is None:
+            raise RuntimeError(
+                "a terminal outcome must belong to the immutable admitted roster."
+            )
+        self._outcomes[key] = state
+        if detail is not None:
+            message = str(detail)
+            self._details.append(message)
+            self.status_changed.emit(message)
+        return True
+
+    def _settle_missing_terminal_outcomes(self) -> None:
+        """Close every target exactly once if a worker ended without a signal."""
+
+        worker_cancelled = bool(
+            self._worker is not None and self._worker.cancelled
+        )
+        for target in self._targets:
+            key = target.key
+            if key in self._outcomes:
+                continue
+            state = "cancelled" if worker_cancelled else "failure"
+            self._record_terminal(
+                key,
+                state,
+                f"{target.set_name} {state}: worker ended without a terminal signal.",
+            )
 
     def _explicit_completion_is_current(self, target: ExplicitRunTarget) -> bool:
         key = target.key

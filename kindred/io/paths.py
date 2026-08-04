@@ -83,36 +83,44 @@ def _default_user_data_dir() -> Path:
 
 def _app_base_dir() -> Path:
     """
-    Resolve the app/repo root deterministically without relying on cwd.
+    Resolve a writable application base without relying on cwd.
 
     Priority:
-      1) KINDRED_BASE_DIR for frozen/Windows builds (user-writable default)
-      2) repository root inferred from this file location (two levels up from 'kindred')
+      1) KINDRED_BASE_DIR explicit override
+      2) repository root for a source checkout
+      3) platform user-data directory for an installed application
     """
-    if _is_frozen() or sys.platform == "win32":
-        # In frozen builds (and on Windows generally), avoid writing beside the executable.
-        # Default to a user-writable location unless explicitly overridden.
-        override = _dir_from_env("KINDRED_BASE_DIR")
-        return override or _default_user_data_dir()
+    override = _dir_from_env("KINDRED_BASE_DIR")
+    if override is not None:
+        return override
+    if _is_frozen():
+        return _default_user_data_dir()
 
-    # Repo root: <repo_root> / kindred / io / paths.py  => parents[2] = <repo_root>
     here = Path(__file__).resolve()
-    # parents[0]=.../io, [1]=.../kindred, [2]=<repo_root>
     try:
-        return here.parents[2]
+        candidate = here.parents[2]
     except Exception as exc:
-        # Fallback to the package root if unusual layout
-        logger.warning(f"Failed to access parents[2] for base directory, using fallback: {exc}")
-        return here.parents[1]
+        logger.warning(
+            "Failed to inspect the package location; using user data: %s",
+            exc,
+        )
+        return _default_user_data_dir()
+    if (
+        (candidate / "pyproject.toml").is_file()
+        and (candidate / "kindred" / "io" / "paths.py").resolve() == here
+    ):
+        return candidate
+    return _default_user_data_dir()
 
 
 def find_outputs_dir() -> str:
-    """Return default outputs directory path (user-writable when frozen/Windows)."""
+    """Return an override, source-checkout, or installed user-data output path."""
     override = _dir_from_env("KINDRED_OUTPUT_DIR")
     if override is not None:
         return str(override)
     base = _app_base_dir()
     return str((base / "outputs").resolve())
+
 
 def _is_dirlike(path: Optional[str]) -> TypeGuard[str]:
     return isinstance(path, str) and bool(path.strip())

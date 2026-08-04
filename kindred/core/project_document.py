@@ -78,6 +78,9 @@ _FITTING_METHODS = ("trf", "dogbox", "differential_evolution")
 _FITTING_MAX_NFEV_RANGE = (10, 10_000)
 _FITTING_SEED_RANGE = (0, 999_999)
 _SCIENTIFIC_VALUE_MAX = 1e300
+_MAX_CANONICAL_DATASETS = 256
+_MAX_PROJECT_SOURCE_BYTES = 256 * 1024 * 1024
+_MAX_PROJECT_RETAINED_OBSERVATION_CELLS = 1_000_000
 
 
 def _new_id(prefix: str) -> str:
@@ -1214,8 +1217,9 @@ def reconcile_tab_mechanism_source(
         reconciled_links: list[tuple[str, DatasetLink]] = []
         for dataset_id, link in tab.dataset_links:
             observation_mapping = tuple(
-                (raw_column, model_species)
-                for raw_column, model_species in link.observation_mapping
+                (raw_observation_id, model_species)
+                for raw_observation_id, model_species
+                in link.observation_mapping
                 if model_species in new_species_set
             )
             reconciled_links.append(
@@ -1269,10 +1273,32 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
 
     if not document.tabs:
         raise ValueError("A project must contain at least one mechanism tab.")
+    if type(document.datasets) is not tuple:
+        raise TypeError("Project datasets must be an immutable tuple.")
+    if len(document.datasets) > _MAX_CANONICAL_DATASETS:
+        raise ValueError(
+            "A project cannot contain more than 256 canonical datasets."
+        )
     _validate_fit_defaults(document.fit_defaults)
 
+    project_source_bytes = 0
+    project_retained_cells = 0
     for dataset in document.datasets:
         validate_raw_dataset_record(dataset)
+        project_source_bytes += len(dataset.exact_source_bytes)
+        project_retained_cells += sum(
+            len(series.t) for series in dataset.observations
+        )
+        if project_source_bytes > _MAX_PROJECT_SOURCE_BYTES:
+            raise ValueError(
+                "Project canonical dataset sources exceed the 256 MiB "
+                "aggregate exact-source limit."
+            )
+        if project_retained_cells > _MAX_PROJECT_RETAINED_OBSERVATION_CELLS:
+            raise ValueError(
+                "Project datasets exceed the 1000000 retained-observation-cell "
+                "limit."
+            )
         raw_observation_ids = tuple(
             validate_raw_observation_id(
                 series.raw_observation_id,
@@ -1496,14 +1522,22 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                     f"Dataset link references missing dataset ID "
                     f"{dataset_id!r}."
                 )
-            normalize_observation_mapping(
+            normalized_observation_mapping = normalize_observation_mapping(
                 link.observation_mapping,
-                raw_columns=tuple(
-                    series.column_name
+                raw_observations=tuple(
+                    (
+                        series.raw_observation_id,
+                        series.column_name,
+                    )
                     for series in dataset.observations
                 ),
                 model_species=mechanism_species,
             )
+            if normalized_observation_mapping != link.observation_mapping:
+                raise ValueError(
+                    f"Dataset {dataset_id!r} observation mapping must already "
+                    "be canonical and ordered by raw observation identity."
+                )
         _validate_unique(
             mapped_set_ids,
             f"mapped set IDs in tab {tab.name!r}",

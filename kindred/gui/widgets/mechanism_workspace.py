@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import ProjectDocument
-from kindred.gui.plot_config import get_plot_panel_class
-
-if TYPE_CHECKING:
-    from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
+from kindred.gui.plot_config import require_pyqtgraph
+from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
 
 __all__ = ["MechanismWorkspaceView"]
 
@@ -62,8 +58,8 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         layout.addWidget(self._plot_stack, 1)
 
     def _new_plot_panel(self) -> PyQtGraphPlotPanel:
-        plot_class = get_plot_panel_class()
-        plot = plot_class(
+        require_pyqtgraph(context="Kindred GUI")
+        plot = PyQtGraphPlotPanel(
             embed_analysis_tabs=self._embed_analysis_tabs,
             workspace_splitter_object_name="mainPlotWorkspaceSplitter",
             enable_axis_inversion_actions=True,
@@ -218,7 +214,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         self._plot_stack.setCurrentWidget(active_plot)
         analysis = active_plot.analysis_tabs_for_workspace(detached=False)
         self._analysis_stack.setCurrentWidget(analysis)
-        self.set_active_copy_all_enabled(False)
 
     def select_tab_surface(self, tab_id: str) -> None:
         """Switch to an already-rendered tab surface without rebuilding it."""
@@ -280,13 +275,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
             self._initial_plot.set_theme(dark_mode=self._dark_mode)
         for plot in self._plot_by_tab_id.values():
             plot.set_theme(dark_mode=self._dark_mode)
-
-    def set_active_copy_all_enabled(self, enabled: bool) -> None:
-        """Expose Copy All only from the physical active tab surface."""
-
-        active = self._active_tab_id
-        for tab_id, plot in self._plot_by_tab_id.items():
-            plot.set_copy_all_enabled(bool(enabled) and tab_id == active)
 
     def set_tab_close_enabled(self, tab_id: str, enabled: bool) -> None:
         index = self._index_for_tab_id(tab_id)

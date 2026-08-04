@@ -158,6 +158,50 @@ def _ensure_species_exist(stoich: Mapping[str, float], declared: Mapping[str, Sp
             raise KeyError(f"unknown species in stoichiometry: {n!r}")
 
 
+def _algebra_references_species(mechanism: object, species_name: str) -> bool:
+    """Inspect the retained typed Algebra AST without reparsing source text."""
+
+    from .algebra.parser import (
+        BinaryNode,
+        CallNode,
+        SpeciesRefNode,
+        UnaryNode,
+    )
+
+    def references(expression: object) -> bool:
+        if isinstance(expression, SpeciesRefNode):
+            return expression.name == species_name
+        if isinstance(expression, UnaryNode):
+            return references(expression.rhs)
+        if isinstance(expression, BinaryNode):
+            return references(expression.lhs) or references(expression.rhs)
+        if isinstance(expression, CallNode):
+            return any(references(argument) for argument in expression.args)
+        return False
+
+    metadata = getattr(mechanism, "metadata", {}) or {}
+    spec = (
+        metadata.get("parameter_algebra_spec")
+        if isinstance(metadata, MappingABC)
+        else None
+    )
+    compiled = getattr(mechanism, "_compiled_algebra_series", None)
+    blocks = (
+        getattr(spec, "parameter_block", None),
+        getattr(spec, "observable_block", None),
+        getattr(compiled, "block", None),
+    )
+    seen: set[int] = set()
+    for block in blocks:
+        if block is None or id(block) in seen:
+            continue
+        seen.add(id(block))
+        for statement in tuple(getattr(block, "lines", ()) or ()):
+            if references(getattr(statement, "expr", None)):
+                return True
+    return False
+
+
 def derive_molecularity(rate_orders: Mapping[str, float]) -> float:
     """
     Derive reaction molecularity (order) as the sum of kinetic exponents.
@@ -468,6 +512,27 @@ class Mechanism:
             raise ValueError(f"species {nn!r} already exists")
         if nn == o:
             return
+        if any(
+            o in reaction.reactants
+            or o in reaction.products
+            or o in reaction.rate_orders
+            for reaction in self.reactions
+        ):
+            raise ValueError(
+                f"cannot rename species {o!r}: referenced by a reaction"
+            )
+        if any(
+            o in equilibrium.stoich_forward
+            or o in equilibrium.stoich_back
+            for equilibrium in self.equilibria
+        ):
+            raise ValueError(
+                f"cannot rename species {o!r}: referenced by an equilibrium"
+            )
+        if _algebra_references_species(self, o):
+            raise ValueError(
+                f"cannot rename species {o!r}: referenced by Algebra"
+            )
         new_map: "OrderedDict[str, Species]" = _SpeciesMap()
         for k, sp in self.species.items():
             if k == o:

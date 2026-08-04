@@ -1,4 +1,4 @@
-"""Active-tab parameter/species Slider drafts and exact Preview intent."""
+"""Tab-bound parameter/species Slider drafts and exact Preview intent."""
 
 from __future__ import annotations
 
@@ -47,10 +47,9 @@ from kindred.gui.widgets.mechanism_editor import (
     DetailedBalanceCorrectionRequest,
     MechanismEditorTabbed,
 )
-from kindred.gui.workspace_tab_registry import ScientificDocumentDelta
 
 __all__ = [
-    "ActiveTabSliderBinding",
+    "TabSliderBinding",
     "ParameterSliderProjection",
     "build_parameter_slider_projection",
 ]
@@ -148,8 +147,8 @@ def build_parameter_slider_projection(
     )
 
 
-class ActiveTabSliderBinding(QtCore.QObject):
-    """Own transient Slider drafts; SimulationJobOwner owns Preview execution."""
+class TabSliderBinding(QtCore.QObject):
+    """Own one tab's Slider drafts; SimulationJobOwner owns Preview execution."""
 
     draftStateChanged = QtCore.Signal(str, bool)
     sliderDraftStateChanged = QtCore.Signal(str, bool)
@@ -162,10 +161,12 @@ class ActiveTabSliderBinding(QtCore.QObject):
     def __init__(
         self,
         *,
+        tab_id: str,
         registry,
         table: BatchInitialConditionsTableView,
         variable_sliders,
         species_sliders,
+        slider_workspace_owner: MechanismEditorTabbed,
         simulation_jobs,
         preview_preflight: Callable[[tuple[str, ...]], bool] | None = None,
         parameter_preview_debounce_ms: int = 80,
@@ -173,32 +174,25 @@ class ActiveTabSliderBinding(QtCore.QObject):
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        target = str(tab_id).strip()
+        if not target:
+            raise ValueError("tab_id must be nonblank.")
+        registry.tab(target)
+        if not isinstance(slider_workspace_owner, MechanismEditorTabbed):
+            raise TypeError(
+                "slider_workspace_owner must be MechanismEditorTabbed."
+            )
+        self._tab_id = target
         self._registry = registry
         self._table = table
         self._variable_sliders = variable_sliders
         self._species_sliders = species_sliders
-        slider_workspace_owner = variable_sliders.parentWidget()
-        while (
-            slider_workspace_owner is not None
-            and not isinstance(slider_workspace_owner, MechanismEditorTabbed)
-        ):
-            slider_workspace_owner = slider_workspace_owner.parentWidget()
-        if not isinstance(slider_workspace_owner, MechanismEditorTabbed):
-            raise TypeError("Slider widgets must belong to MechanismEditorTabbed.")
-        species_owner = species_sliders.parentWidget()
-        while (
-            species_owner is not None
-            and not isinstance(species_owner, MechanismEditorTabbed)
-        ):
-            species_owner = species_owner.parentWidget()
-        if species_owner is not slider_workspace_owner:
-            raise TypeError("Slider widgets must share one MechanismEditorTabbed.")
         self._slider_workspace_owner = slider_workspace_owner
         self._simulation_jobs = simulation_jobs
         self._preview_preflight = preview_preflight
-        self._projection_by_tab: dict[str, ParameterSliderProjection] = {}
-        self._tab_snapshot_by_id: dict[str, MechanismTabDocument] = {}
-        self._last_targets_by_tab: dict[str, tuple[str, ...]] = {}
+        self._projection: ParameterSliderProjection | None = None
+        self._tab_snapshot: MechanismTabDocument | None = None
+        self._last_targets: tuple[str, ...] = ()
         self._preview_capture: _PreviewCapture | None = None
         self._suspended_preview_disposition: (
             _SuspendedPreviewDisposition | None
@@ -222,6 +216,10 @@ class ActiveTabSliderBinding(QtCore.QObject):
             raise TypeError("table must use BatchInitialConditionsTableModel.")
         table.selectionModel().currentChanged.connect(self._on_live_current_changed)
         model.snapshotRendered.connect(self._on_table_snapshot_rendered)
+
+    @property
+    def tab_id(self) -> str:
+        return self._tab_id
 
     def _make_preview_timer(self, interval_ms: int) -> QtCore.QTimer:
         interval = int(interval_ms)
@@ -254,22 +252,24 @@ class ActiveTabSliderBinding(QtCore.QObject):
         self._species_timer.stop()
 
     def resolve_target_set_ids(self) -> tuple[str, ...]:
-        tab = self._registry.active_tab
+        tab = self._registry.tab(self._tab_id)
         return resolve_live_slider_target_set_ids(
             table=self._table,
-            pinned_set_ids=self._registry.active_presentation.pinned_slider_set_ids,
+            pinned_set_ids=self._registry.presentation(
+                self._tab_id
+            ).pinned_slider_set_ids,
             existing_set_ids=(item.set_id for item in tab.initial_condition_sets),
         )
 
-    def prepare_active_render(
+    def prepare_render(
         self,
         *,
         preserve_visibility: bool = True,
     ) -> _ActiveSliderRenderProjection:
         """Prepare one complete parameter/species view without widget mutation."""
 
-        tab = self._registry.active_tab
-        runtime = self._registry.active_runtime
+        tab = self._registry.tab(self._tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         projection = (
             ParameterSliderProjection((), ())
             if tab.prepared_dsl is None
@@ -335,8 +335,8 @@ class ActiveTabSliderBinding(QtCore.QObject):
             del species_blocker
             del variable_blocker
             self._rendering = False
-        self._projection_by_tab[prepared.tab.tab_id] = prepared.projection
-        self._tab_snapshot_by_id[prepared.tab.tab_id] = prepared.tab
+        self._projection = prepared.projection
+        self._tab_snapshot = prepared.tab
         self._slider_workspace_owner.render_slider_workspace_presentation()
 
     def settle_render_projection(
@@ -374,9 +374,9 @@ class ActiveTabSliderBinding(QtCore.QObject):
                         ),
                     )
 
-    def render_active(self, *, preserve_visibility: bool = True) -> bool:
+    def render(self, *, preserve_visibility: bool = True) -> bool:
         try:
-            prepared = self.prepare_active_render(
+            prepared = self.prepare_render(
                 preserve_visibility=preserve_visibility
             )
         except (TypeError, ValueError) as exc:
@@ -389,15 +389,29 @@ class ActiveTabSliderBinding(QtCore.QObject):
         self.settle_render_projection(prepared)
         return True
 
+    def clear_projection(self) -> None:
+        """Clear only physical Slider projection state."""
+        variable_blocker = QtCore.QSignalBlocker(self._variable_sliders)
+        species_blocker = QtCore.QSignalBlocker(self._species_sliders)
+        try:
+            self._variable_sliders.clear()
+            self._species_sliders.clear()
+        finally:
+            del species_blocker
+            del variable_blocker
+        self._projection = None
+        self._tab_snapshot = None
+        self._slider_workspace_owner.render_slider_workspace_presentation()
+
     def _reconcile_target_change(
         self,
         tab: MechanismTabDocument,
         targets: tuple[str, ...],
     ) -> bool:
         existing = {item.set_id for item in tab.initial_condition_sets}
-        previous = self._last_targets_by_tab.get(tab.tab_id, ())
+        previous = self._last_targets
         current = tuple(targets)
-        self._last_targets_by_tab[tab.tab_id] = current
+        self._last_targets = current
         if current != previous:
             self.targetSetIdsChanged.emit(current)
         removed = tuple(
@@ -434,36 +448,14 @@ class ActiveTabSliderBinding(QtCore.QObject):
             )
         return current != previous
 
-    def drop_tab_runtime(self, tab_id: str) -> None:
+    def dispose(self) -> None:
         """Forget Slider-owned captures after the Run owner purges a tab."""
 
-        target = str(tab_id)
-        self.cancel_pending_preview_intent(target)
-        self._projection_by_tab.pop(target, None)
-        self._tab_snapshot_by_id.pop(target, None)
-        previous = self._last_targets_by_tab.pop(target, ())
-        self.clear_preview_detailed_balance_block(target)
-        if previous and target == self._registry.active_tab_id:
-            self.targetSetIdsChanged.emit(())
-
-    def reset_project_session_state(self) -> None:
-        """Reset only transient Slider/Preview state after project replacement."""
-
-        self._stop_preview_timers()
-        self._preview_capture = None
-        self._suspended_preview_disposition = None
-        self._simulation_jobs.drop_pending_preview()
-        for tab_id, _presentation in self._registry.presentation_items():
-            runtime = self._registry.tab_runtime(tab_id)
-            runtime.slider_parameter_draft.clear()
-            runtime.slider_species_drafts_by_set_id.clear()
-        self._projection_by_tab.clear()
-        self._tab_snapshot_by_id.clear()
-        self._last_targets_by_tab.clear()
-        self._pending_detailed_balance_request = None
-        self._rendering = False
-
-        self._slider_workspace_owner.reset_slider_session_presentation()
+        self.cancel_pending_preview_intent()
+        self._projection = None
+        self._tab_snapshot = None
+        self._last_targets = ()
+        self.clear_preview_detailed_balance_block()
 
     def _project_species_targets(
         self,
@@ -510,12 +502,12 @@ class ActiveTabSliderBinding(QtCore.QObject):
         _previous: QtCore.QModelIndex,
     ) -> None:
         if not self._rendering:
-            self.render_active(preserve_visibility=True)
+            self.render(preserve_visibility=True)
 
     @QtCore.Slot()
     def _on_table_snapshot_rendered(self) -> None:
         if not self._rendering:
-            self.render_active(preserve_visibility=True)
+            self.render(preserve_visibility=True)
 
     @QtCore.Slot(str, float)
     def stage_parameter(self, name: str, value: float) -> bool:
@@ -591,7 +583,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
                     dirty_unselected,
                 )
         if not targets:
-            self.cancel_pending_preview_intent(tab.tab_id)
+            self.cancel_pending_preview_intent()
         else:
             role = str(coordinate_metadata.get("role") or "")
             self._begin_preview_cycle(
@@ -601,7 +593,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
                     "equilibrium" if role == "Keq" else "parameter"
                 ),
             )
-        self._emit_draft_state(tab.tab_id)
+        self._emit_draft_state()
         return True
 
     def _reconcile_canonical_set_ids(
@@ -672,7 +664,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
             targets,
             debounce_kind="species",
         )
-        self._emit_draft_state(tab.tab_id)
+        self._emit_draft_state()
         return True
 
     def _preflight_preview_action(
@@ -681,8 +673,8 @@ class ActiveTabSliderBinding(QtCore.QObject):
     ) -> tuple[MechanismTabDocument, ParameterSliderProjection] | None:
         """Settle visible science before any Slider draft/currentness mutation."""
 
-        tab = self._registry.active_tab
-        runtime = self._registry.active_runtime
+        tab = self._registry.tab(self._tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         visible_source = runtime.reactions_draft or tab.mechanism_source
         visible_projection: ParameterSliderProjection | None = None
         visible_prepared: PreparedDslRequestSet | None = None
@@ -736,8 +728,8 @@ class ActiveTabSliderBinding(QtCore.QObject):
         elif not bool(callback(targets)):
             return None
 
-        tab = self._registry.active_tab
-        runtime = self._registry.active_runtime
+        tab = self._registry.tab(self._tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         try:
             if tab.prepared_dsl is None:
                 raise ValueError(
@@ -780,9 +772,9 @@ class ActiveTabSliderBinding(QtCore.QObject):
                 "Reactions: " + ", ".join(sorted(missing))
             )
             return None
-        self._projection_by_tab[tab.tab_id] = projection
-        self._tab_snapshot_by_id[tab.tab_id] = tab
-        self.clear_preview_detailed_balance_block(tab.tab_id)
+        self._projection = projection
+        self._tab_snapshot = tab
+        self.clear_preview_detailed_balance_block()
         return tab, projection
 
     def _begin_preview_cycle(
@@ -811,7 +803,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
         if canonical_targets:
             self._reconcile_canonical_set_ids(tab, canonical_targets)
         if not dirty_targets:
-            self.cancel_pending_preview_intent(tab.tab_id)
+            self.cancel_pending_preview_intent()
             return
         prepared_dsl = tab.prepared_dsl
         if not isinstance(prepared_dsl, PreparedDslRequestSet):
@@ -830,7 +822,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
             if key is not None:
                 captured.append((key, tab.initial_condition_set(set_id).name))
         if not captured:
-            self.cancel_pending_preview_intent(tab.tab_id)
+            self.cancel_pending_preview_intent()
             return
         self._preview_capture = _PreviewCapture(
             tab_id=tab.tab_id,
@@ -919,11 +911,11 @@ class ActiveTabSliderBinding(QtCore.QObject):
         if corrected is None:
             raise ValueError("Accepted correction has no corrected source.")
         current_visible_source = (
-            self._registry.active_runtime.reactions_draft
-            or self._registry.active_tab.mechanism_source
+            self._registry.tab_runtime(self._tab_id).reactions_draft
+            or self._registry.tab(self._tab_id).mechanism_source
         )
         if (
-            self._registry.active_tab_id != pending.tab_id
+            self._tab_id != pending.tab_id
             or current_visible_source.reactions_text
             not in {pending.source, corrected}
         ):
@@ -941,15 +933,9 @@ class ActiveTabSliderBinding(QtCore.QObject):
         self.previewDetailedBalanceCommitRequested.emit(outcome)
         return True
 
-    def clear_preview_detailed_balance_block(
-        self,
-        tab_id: str | None = None,
-    ) -> bool:
+    def clear_preview_detailed_balance_block(self) -> bool:
         pending = self._pending_detailed_balance_request
         if pending is None:
-            return False
-        target = None if tab_id is None else str(tab_id)
-        if target is not None and pending.tab_id != target:
             return False
         self._pending_detailed_balance_request = None
         self.previewDetailedBalanceBlockCleared.emit(pending.tab_id)
@@ -984,7 +970,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
         validate_wegscheider_cyclicity_resolved(mechanism)
 
     def _preview_inputs_valid(self, targets: tuple[str, ...]) -> bool:
-        runtime = self._registry.active_runtime
+        runtime = self._registry.tab_runtime(self._tab_id)
         invalid_targets = tuple(
             set_id
             for set_id in targets
@@ -1025,12 +1011,8 @@ class ActiveTabSliderBinding(QtCore.QObject):
                 PreviewIntent(tab_id=capture.tab_id, targets=targets)
             )
 
-    def has_slider_draft(self, tab_id: str | None = None) -> bool:
-        runtime = (
-            self._registry.active_runtime
-            if tab_id is None
-            else self._registry.tab_runtime(tab_id)
-        )
+    def has_slider_draft(self) -> bool:
+        runtime = self._registry.tab_runtime(self._tab_id)
         return bool(
             runtime.slider_parameter_draft
             or runtime.slider_species_drafts_by_set_id
@@ -1047,7 +1029,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
         )
         self._preview_capture = None
         self._suspended_preview_disposition = transaction
-        self._simulation_jobs.drop_pending_preview()
+        self._simulation_jobs.drop_pending_preview(self._tab_id)
         return transaction
 
     def resume_preview_disposition(
@@ -1075,15 +1057,12 @@ class ActiveTabSliderBinding(QtCore.QObject):
             raise ValueError("Slider Preview disposition is not current.")
         self._suspended_preview_disposition = None
         self._preview_capture = None
-        self._simulation_jobs.drop_pending_preview()
+        self._simulation_jobs.drop_pending_preview(self._tab_id)
 
-    def discard_slider_draft(self, tab_id: str | None = None) -> bool:
+    def discard_slider_draft(self) -> bool:
         if self._suspended_preview_disposition is not None:
             return False
-        target_tab_id = (
-            self._registry.active_tab_id if tab_id is None else str(tab_id)
-        )
-        runtime = self._registry.tab_runtime(target_tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         parameter_dirty = bool(runtime.slider_parameter_draft)
         changed = bool(
             runtime.slider_parameter_draft
@@ -1091,14 +1070,10 @@ class ActiveTabSliderBinding(QtCore.QObject):
         )
         if not changed:
             return False
-        tab = (
-            self._registry.active_tab
-            if target_tab_id == self._registry.active_tab_id
-            else self._tab_snapshot_by_id.get(target_tab_id)
-        )
+        tab = self._tab_snapshot or self._registry.tab(self._tab_id)
         if tab is None:
             return self._reject(
-                f"Cannot discard Slider draft for unavailable tab {target_tab_id!r}."
+                f"Cannot discard Slider draft for unavailable tab {self._tab_id!r}."
             )
         affected = (
             tuple(item.set_id for item in tab.initial_condition_sets)
@@ -1107,26 +1082,24 @@ class ActiveTabSliderBinding(QtCore.QObject):
         )
         runtime.slider_parameter_draft.clear()
         runtime.slider_species_drafts_by_set_id.clear()
-        self.cancel_pending_preview_intent(target_tab_id)
-        self.clear_preview_detailed_balance_block(target_tab_id)
+        self.cancel_pending_preview_intent()
+        self.clear_preview_detailed_balance_block()
         self._reconcile_canonical_set_ids(tab, affected)
-        if target_tab_id == self._registry.active_tab_id:
-            self.render_active()
-        self._emit_draft_state(target_tab_id)
+        self.render()
+        self._emit_draft_state()
         return changed
 
-    def cancel_pending_preview_intent(self, tab_id: str | None = None) -> None:
-        target = None if tab_id is None else str(tab_id)
+    def cancel_pending_preview_intent(self) -> None:
         capture = self._preview_capture
-        if capture is not None and (target is None or capture.tab_id == target):
+        if capture is not None:
             self._stop_preview_timers()
             self._preview_capture = None
-        self._simulation_jobs.drop_pending_preview(target)
+        self._simulation_jobs.drop_pending_preview(self._tab_id)
 
     def apply(self) -> bool:
         if self._suspended_preview_disposition is not None:
             return False
-        runtime = self._registry.active_runtime
+        runtime = self._registry.tab_runtime(self._tab_id)
         parameter_updates = dict(runtime.slider_parameter_draft)
         species_updates = {
             set_id: dict(values)
@@ -1144,7 +1117,7 @@ class ActiveTabSliderBinding(QtCore.QObject):
         if prepared is None:
             return False
         tab, _projection = prepared
-        runtime = self._registry.active_runtime
+        runtime = self._registry.tab_runtime(self._tab_id)
         parameter_updates = dict(runtime.slider_parameter_draft)
         species_updates = {
             set_id: dict(values)
@@ -1196,23 +1169,29 @@ class ActiveTabSliderBinding(QtCore.QObject):
             mechanism_source=source,
             prepared_dsl=candidate_prepared_dsl,
         ).with_initial_condition_sets(tuple(candidate_sets))
-        delta = self._registry.replace_active_tab(candidate)
-        if delta is None:
+        result = self._registry.replace_tab(
+            self._tab_id,
+            candidate,
+            expected_token=self._registry.capture_content_token(),
+        )
+        if result is None:
             return False
-        self.cancel_pending_preview_intent(tab.tab_id)
-        self._consume_document_delta(delta)
-        self.clear_preview_detailed_balance_block(tab.tab_id)
+        self.cancel_pending_preview_intent()
+        for tab_id, set_ids in result.delta.affected_targets_by_tab:
+            if set_ids:
+                self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
+        self.clear_preview_detailed_balance_block()
         runtime.slider_parameter_draft.clear()
         runtime.slider_species_drafts_by_set_id.clear()
-        self.render_active()
-        self._emit_draft_state(tab.tab_id)
+        self.render()
+        self._emit_draft_state()
         return True
 
     def reset(self) -> bool:
         if self._suspended_preview_disposition is not None:
             return False
-        tab = self._registry.active_tab
-        runtime = self._registry.active_runtime
+        tab = self._registry.tab(self._tab_id)
+        runtime = self._registry.tab_runtime(self._tab_id)
         targets = self.resolve_target_set_ids()
         parameter_dirty = bool(runtime.slider_parameter_draft)
         if not parameter_dirty and not any(
@@ -1226,8 +1205,8 @@ class ActiveTabSliderBinding(QtCore.QObject):
             changed = bool(
                 runtime.slider_species_drafts_by_set_id.pop(set_id, None)
             ) or changed
-        self.cancel_pending_preview_intent(tab.tab_id)
-        self.clear_preview_detailed_balance_block(tab.tab_id)
+        self.cancel_pending_preview_intent()
+        self.clear_preview_detailed_balance_block()
         reconciled_targets = (
             tuple(item.set_id for item in tab.initial_condition_sets)
             if parameter_dirty
@@ -1251,8 +1230,8 @@ class ActiveTabSliderBinding(QtCore.QObject):
                 tab.tab_id,
                 still_dirty_targets,
             )
-        self.render_active()
-        self._emit_draft_state(tab.tab_id)
+        self.render()
+        self._emit_draft_state()
         return changed
 
     def _preview_identity(
@@ -1282,13 +1261,6 @@ class ActiveTabSliderBinding(QtCore.QObject):
             scientific_settings=tab.scientific_settings,
         )
 
-    def _consume_document_delta(self, delta: ScientificDocumentDelta) -> None:
-        if not isinstance(delta, ScientificDocumentDelta):
-            raise TypeError("delta must be ScientificDocumentDelta.")
-        for tab_id, set_ids in delta.affected_targets_by_tab:
-            if set_ids:
-                self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
-
     @staticmethod
     def _explicit_key(
         tab: MechanismTabDocument,
@@ -1308,20 +1280,20 @@ class ActiveTabSliderBinding(QtCore.QObject):
             scientific_settings=tab.scientific_settings,
         )
 
-    def _emit_draft_state(self, tab_id: str) -> None:
-        slider_dirty = self.has_slider_draft(tab_id)
+    def _emit_draft_state(self) -> None:
+        slider_dirty = self.has_slider_draft()
         self.draftStateChanged.emit(
-            str(tab_id),
-            self._registry.tab_runtime(tab_id).has_dirty_drafts,
+            self._tab_id,
+            self._registry.tab_runtime(self._tab_id).has_dirty_drafts,
         )
-        self.sliderDraftStateChanged.emit(str(tab_id), slider_dirty)
+        self.sliderDraftStateChanged.emit(self._tab_id, slider_dirty)
 
     def _reject(self, message: str) -> bool:
         self.errorRaised.emit(str(message))
         return False
 
     def _restore_rejected_slider_action(self) -> bool:
-        self.render_active(preserve_visibility=True)
+        self.render(preserve_visibility=True)
         return False
 
     def _reject_slider_action(self, message: str) -> bool:

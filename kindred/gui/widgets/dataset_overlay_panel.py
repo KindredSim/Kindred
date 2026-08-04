@@ -31,7 +31,7 @@ class DatasetStyle:
 @dataclass(frozen=True)
 class OverlaySelectionIntent:
     dataset_id: str
-    columns: tuple[str, ...]
+    raw_observation_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if (
@@ -43,28 +43,31 @@ class OverlaySelectionIntent:
                 "Overlay selection requires a nonblank edge-normalized "
                 "dataset ID."
             )
-        columns = tuple(self.columns)
+        raw_observation_ids = tuple(self.raw_observation_ids)
         if (
             any(
-                not isinstance(column, str)
-                or not column
-                or column != column.strip()
-                for column in columns
+                not isinstance(raw_observation_id, str)
+                or not raw_observation_id
+                or raw_observation_id != raw_observation_id.strip()
+                for raw_observation_id in raw_observation_ids
             )
-            or len(columns) != len(set(columns))
+            or len(raw_observation_ids) != len(set(raw_observation_ids))
         ):
             raise ValueError(
-                "Overlay selection columns must be unique nonblank "
-                "edge-normalized names."
+                "Overlay selection raw observation IDs must be unique "
+                "nonblank edge-normalized strings."
             )
-        object.__setattr__(self, "columns", columns)
+        object.__setattr__(
+            self,
+            "raw_observation_ids",
+            raw_observation_ids,
+        )
 
 
 class DatasetOverlayPanel(QtWidgets.QWidget):
     """Render global records with persisted active-tab overlay membership."""
 
     overlaySelectionRequested = QtCore.Signal(object)
-    styleChanged = QtCore.Signal()
 
     def __init__(
         self,
@@ -92,6 +95,8 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._style = DatasetStyle()
         self._preferences_loaded = False
         self._color_buttons: dict[tuple[str, str], QtWidgets.QPushButton] = {}
+        self._raw_columns_by_key: dict[tuple[str, str], str] = {}
+        self._has_rendered_snapshot = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -146,28 +151,43 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         active_links: Iterable[ActiveDatasetLinkSnapshot],
         known_species: Iterable[str] = (),
     ) -> None:
-        """Rebuild physical state directly from one immutable snapshot."""
+        """Render one snapshot while retaining expansion and scroll position."""
         rendered_records = tuple(records)
+        expanded_dataset_ids = {
+            str(item.data(0, Qt.UserRole))
+            for index in range(self._tree.topLevelItemCount())
+            if (item := self._tree.topLevelItem(index)).isExpanded()
+        }
+        vertical_scroll = self._tree.verticalScrollBar().value()
+        horizontal_scroll = self._tree.horizontalScrollBar().value()
         self._links_by_dataset_id = {
             link.dataset_id: link for link in active_links
         }
         self._known_species = tuple(str(value) for value in known_species)
         self._color_buttons.clear()
+        self._raw_columns_by_key.clear()
         self._tree.blockSignals(True)
         try:
             self._tree.clear()
             for record in rendered_records:
                 dataset_id = str(record.dataset_id)
                 link = self._links_by_dataset_id.get(dataset_id)
-                enabled_columns = set(link.overlay_columns if link is not None else ())
+                enabled_raw_ids = set(
+                    link.overlay_raw_observation_ids
+                    if link is not None
+                    else ()
+                )
                 parent = QtWidgets.QTreeWidgetItem([record.display_name, ""])
                 parent.setData(0, Qt.UserRole, dataset_id)
                 parent.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
                 self._tree.addTopLevelItem(parent)
                 for series in record.observations:
                     column = str(series.column_name)
+                    raw_observation_id = series.raw_observation_id
                     mapped_species = (
-                        dict(link.observation_mapping).get(column)
+                        dict(link.observation_mapping).get(
+                            raw_observation_id
+                        )
                         if link is not None
                         else None
                     )
@@ -178,28 +198,101 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
                     )
                     child = QtWidgets.QTreeWidgetItem([display_name, ""])
                     child.setData(0, Qt.UserRole, dataset_id)
-                    child.setData(0, Qt.UserRole + 1, column)
+                    child.setData(
+                        0,
+                        Qt.UserRole + 1,
+                        raw_observation_id,
+                    )
                     child.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
                     child.setCheckState(
                         0,
-                        Qt.CheckState.Checked if column in enabled_columns else Qt.CheckState.Unchecked,
+                        Qt.CheckState.Checked
+                        if raw_observation_id in enabled_raw_ids
+                        else Qt.CheckState.Unchecked,
                     )
                     parent.addChild(child)
-                    button = self._create_color_button(dataset_id, column)
+                    button = self._create_color_button(
+                        dataset_id,
+                        raw_observation_id,
+                        column,
+                    )
                     self._tree.setItemWidget(child, 1, button)
-                    self._color_buttons[(dataset_id, column)] = button
+                    key = (dataset_id, raw_observation_id)
+                    self._color_buttons[key] = button
+                    self._raw_columns_by_key[key] = column
                 parent.setCheckState(
                     0,
-                    Qt.CheckState.Checked if enabled_columns else Qt.CheckState.Unchecked,
+                    Qt.CheckState.Checked
+                    if enabled_raw_ids
+                    else Qt.CheckState.Unchecked,
                 )
-                parent.setExpanded(bool(enabled_columns))
+                parent.setExpanded(
+                    dataset_id in expanded_dataset_ids
+                    if self._has_rendered_snapshot
+                    else bool(enabled_raw_ids)
+                )
         finally:
             self._tree.blockSignals(False)
+        self._has_rendered_snapshot = True
         has_records = bool(rendered_records)
         self._tree.setVisible(has_records)
         self._empty_label.setVisible(not has_records)
         self._render_application_style()
         self._refresh_color_swatches()
+        self._tree.verticalScrollBar().setValue(vertical_scroll)
+        self._tree.horizontalScrollBar().setValue(horizontal_scroll)
+
+    def clear_projection(self) -> None:
+        """Clear only rendered Overlay state and revoke Overlay actions."""
+        self._links_by_dataset_id.clear()
+        self._known_species = ()
+        self._color_buttons.clear()
+        self._raw_columns_by_key.clear()
+        blocker = QtCore.QSignalBlocker(self._tree)
+        try:
+            self._tree.clear()
+        finally:
+            del blocker
+        self._has_rendered_snapshot = False
+        self._tree.hide()
+        self._empty_label.show()
+
+    def render_overlay_selection(
+        self,
+        *,
+        active_links: Iterable[ActiveDatasetLinkSnapshot],
+    ) -> None:
+        """Project authoritative membership without rebuilding the dataset tree."""
+
+        links = tuple(active_links)
+        if any(
+            not isinstance(link, ActiveDatasetLinkSnapshot)
+            for link in links
+        ):
+            raise TypeError(
+                "active_links must contain ActiveDatasetLinkSnapshot values."
+            )
+        dataset_ids = tuple(link.dataset_id for link in links)
+        if len(dataset_ids) != len(set(dataset_ids)):
+            raise ValueError("Active overlay dataset IDs must be unique.")
+        self._links_by_dataset_id = {
+            link.dataset_id: link for link in links
+        }
+        self._render_authoritative_overlay_selection()
+
+    def refresh_application_style_controls(self) -> None:
+        """Rerender only application-wide point-size and opacity controls."""
+
+        self._render_application_style()
+
+    def refresh_color_swatches(
+        self,
+        *,
+        known_species: Iterable[str] | None = None,
+    ) -> None:
+        """Rerender only application-wide color swatches."""
+
+        self._refresh_color_swatches(known_species=known_species)
 
     def _refresh_color_swatches(
         self,
@@ -220,13 +313,23 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
                 "border: 1px solid; border-radius: 3px;"
             )
 
-    def _create_color_button(self, dataset_id: str, column: str) -> QtWidgets.QPushButton:
+    def _create_color_button(
+        self,
+        dataset_id: str,
+        raw_observation_id: str,
+        raw_column: str,
+    ) -> QtWidgets.QPushButton:
         button = QtWidgets.QPushButton()
         button.setFixedSize(30, 20)
         button.setFlat(True)
-        button.setToolTip(f"Set the global display color for {column}.")
+        button.setToolTip(
+            f"Set the global display color for {raw_column}."
+        )
         button.clicked.connect(
-            lambda _checked=False, key=(dataset_id, column): self._choose_color(key)
+            lambda _checked=False, key=(
+                dataset_id,
+                raw_observation_id,
+            ): self._choose_color(key)
         )
         return button
 
@@ -246,16 +349,24 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
             color,
             self._known_species,
         )
-        self._refresh_color_swatches()
-        self.styleChanged.emit()
+        self.refresh_color_swatches()
 
-    def _color_species_name(self, dataset_id: str, raw_column: str) -> str:
+    def _color_species_name(
+        self,
+        dataset_id: str,
+        raw_observation_id: str,
+    ) -> str:
         link = self._links_by_dataset_id.get(str(dataset_id))
         if link is not None:
-            mapped = dict(link.observation_mapping).get(str(raw_column))
+            mapped = dict(link.observation_mapping).get(
+                str(raw_observation_id)
+            )
             if mapped:
                 return str(mapped)
-        return str(raw_column)
+        return self._raw_columns_by_key[(
+            str(dataset_id),
+            str(raw_observation_id),
+        )]
 
     def _on_item_changed(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
         _ = column
@@ -279,14 +390,55 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         finally:
             self._tree.blockSignals(False)
         dataset_id = str(parent.data(0, Qt.UserRole))
-        columns = tuple(
+        raw_observation_ids = tuple(
             str(parent.child(index).data(0, Qt.UserRole + 1))
             for index in range(parent.childCount())
             if parent.child(index).checkState(0) == Qt.CheckState.Checked
         )
-        self.overlaySelectionRequested.emit(
-            OverlaySelectionIntent(dataset_id=dataset_id, columns=columns)
-        )
+        try:
+            self.overlaySelectionRequested.emit(
+                OverlaySelectionIntent(
+                    dataset_id=dataset_id,
+                    raw_observation_ids=raw_observation_ids,
+                )
+            )
+        finally:
+            # Direct handlers update ``_links_by_dataset_id`` on acceptance.
+            # Rejection/cancellation leaves the prior authoritative snapshot,
+            # so either outcome is rendered without optimistic checkbox drift.
+            self._render_authoritative_overlay_selection()
+
+    def _render_authoritative_overlay_selection(self) -> None:
+        self._tree.blockSignals(True)
+        try:
+            for parent_index in range(self._tree.topLevelItemCount()):
+                parent = self._tree.topLevelItem(parent_index)
+                dataset_id = str(parent.data(0, Qt.UserRole))
+                link = self._links_by_dataset_id.get(dataset_id)
+                selected = set(
+                    ()
+                    if link is None
+                    else link.overlay_raw_observation_ids
+                )
+                for child_index in range(parent.childCount()):
+                    child = parent.child(child_index)
+                    raw_observation_id = str(
+                        child.data(0, Qt.UserRole + 1)
+                    )
+                    child.setCheckState(
+                        0,
+                        Qt.CheckState.Checked
+                        if raw_observation_id in selected
+                        else Qt.CheckState.Unchecked,
+                    )
+                parent.setCheckState(
+                    0,
+                    Qt.CheckState.Checked
+                    if selected
+                    else Qt.CheckState.Unchecked,
+                )
+        finally:
+            self._tree.blockSignals(False)
 
     def _on_style_changed(self) -> None:
         if not self._preferences_loaded:
@@ -298,7 +450,6 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._set_experimental_style(requested)
         self._style = self._read_application_style()
         self._render_application_style()
-        self.styleChanged.emit()
 
     def _read_application_style(self) -> DatasetStyle:
         style = self._experimental_style()

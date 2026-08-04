@@ -20,32 +20,30 @@ from kindred.core.datasets.csv_import import (
     PhysicalColumn,
     identify_physical_columns,
     parse_physical_rows,
+    validate_tabular_source_bytes,
 )
 from kindred.core.datasets.excel_import import (
-    list_sheets,
-    read_excel_sheet_rows,
+    list_sheets_from_bytes,
     read_excel_sheet_rows_from_bytes,
 )
 from kindred.core.datasets.observation_payload import (
     DatasetObservationPayload,
-    dense_view_from_observations,
 )
 from kindred.gui.widgets.import_config import (
     ImportConfig,
+    ImportSourceSnapshot,
     ResolvedSheetPlan,
     SheetImportIntent,
     UnitDetection,
     UserImportIntent,
-    classify_import_source,
+    capture_import_source,
     detect_units_from_physical_row,
     rebuild_intent_for_target,
     resolve_import_plans,
-    validate_import_source_bytes,
 )
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
 from kindred.gui.controllers.dataset_errors import (
     DatasetImportAdmissionError,
-    DatasetImportStateError,
 )
 from kindred.gui.dataset_import_staging import (
     DatasetImportCancellation,
@@ -53,8 +51,6 @@ from kindred.gui.dataset_import_staging import (
     DatasetImportProgress,
     DatasetImportRequest,
     DatasetImportStaging,
-    DatasetImportSuccess,
-    DatasetImportUnit,
     DatasetImportWorker,
     DatasetImportWorkerRequest,
 )
@@ -66,6 +62,9 @@ from kindred.core.project_document import RawDatasetRecord, thaw_json_value
 from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label
 
 logger = logging.getLogger(__name__)
+
+_MAX_SELECTED_SOURCES = 16
+_MAX_SELECTED_SOURCE_BYTES = 128 * 1024 * 1024
 
 __all__ = [
     "CSVLoaderWorker",
@@ -118,26 +117,29 @@ class DatasetFitInclusionIntent:
 class CSVLoaderWorker(DatasetImportWorker):
     """Background worker for loading CSV files without blocking UI."""
 
-    def __init__(self, plan: ResolvedSheetPlan):
-        super().__init__()
-        if classify_import_source(plan.filepath) != "csv":
-            raise ValueError("CSVLoaderWorker requires an admitted .csv source.")
+    def __init__(
+        self,
+        source: ImportSourceSnapshot,
+        plan: ResolvedSheetPlan,
+    ):
+        super().__init__(source)
+        if source.file_type != "csv":
+            raise ValueError("CSVLoaderWorker requires an admitted CSV snapshot.")
         if plan.sheet_name is not None:
             raise ValueError("CSVLoaderWorker cannot accept a worksheet plan.")
         self._plan = plan
-        self.filepath = plan.filepath
         self._time_column = plan.time_column
         self._species_columns = tuple(plan.species_columns)
         self._skip_unit_row = plan.skip_unit_row
 
     def _load_csv_payload(self) -> DatasetObservationPayload:
-        validate_import_source_bytes(
-            self.exact_source_bytes,
-            file_type="csv",
-            source_label=os.path.basename(self.filepath),
+        validate_tabular_source_bytes(
+            self.source.exact_source_bytes,
+            source_format="csv",
+            source_label=self.source.original_filename,
         )
         with io.TextIOWrapper(
-            io.BytesIO(self.exact_source_bytes),
+            io.BytesIO(self.source.exact_source_bytes),
             encoding="utf-8-sig",
             newline="",
         ) as handle:
@@ -171,7 +173,7 @@ class CSVLoaderWorker(DatasetImportWorker):
                 time_column=self._time_column,
                 species_columns=self._species_columns,
                 interruption_checker=self.isInterruptionRequested,
-                source_label=os.path.basename(self.filepath),
+                source_label=self.source.original_filename,
                 source_row_start=3 if self._skip_unit_row else 2,
                 time_factor=self._plan.time_factor,
                 observation_factors=self._plan.conc_factors,
@@ -186,8 +188,8 @@ class CSVLoaderWorker(DatasetImportWorker):
 
     def run(self):
         """Load CSV file in background thread."""
-        filename = self.filepath
-        dataset_name = os.path.basename(filename)
+        filename = self.source.filepath
+        dataset_name = self.source.original_filename
 
         def _check_cancel(stage: str) -> bool:
             if self.isInterruptionRequested():
@@ -210,8 +212,6 @@ class CSVLoaderWorker(DatasetImportWorker):
 
             # Stream CSV rows through the shared core importer so interruption can
             # be observed during file iteration rather than only after full read.
-            with open(self.filepath, "rb") as source:
-                self.retain_exact_source_bytes(source.read())
             data = self._load_csv_payload()
             logger.debug(
                 "Parsed CSV dataset with observation columns: %s",
@@ -249,22 +249,26 @@ class CSVLoaderWorker(DatasetImportWorker):
 class ExcelLoaderWorker(DatasetImportWorker):
     """Background worker for loading Excel sheets without blocking UI."""
 
-    def __init__(self, filepath: str, plans: Sequence[ResolvedSheetPlan]):
-        super().__init__()
-        if classify_import_source(filepath) != "excel":
-            raise ValueError("ExcelLoaderWorker requires an admitted .xlsx source.")
+    def __init__(
+        self,
+        source: ImportSourceSnapshot,
+        plans: Sequence[ResolvedSheetPlan],
+    ):
+        super().__init__(source)
+        if source.file_type != "excel":
+            raise ValueError(
+                "ExcelLoaderWorker requires an admitted XLSX snapshot."
+            )
         owned_plans = tuple(plans)
         if not owned_plans or any(
             plan.sheet_name is None
-            or os.path.abspath(plan.filepath) != os.path.abspath(filepath)
             for plan in owned_plans
         ):
             raise ValueError(
                 "ExcelLoaderWorker requires nonempty plans for the admitted "
                 "workbook."
             )
-        self.filepath = str(filepath)
-        self._plans = list(owned_plans)
+        self._plans = owned_plans
 
     def _load_sheet_payload(
         self,
@@ -272,9 +276,9 @@ class ExcelLoaderWorker(DatasetImportWorker):
     ) -> Tuple[str, DatasetObservationPayload]:
         with closing(
             read_excel_sheet_rows_from_bytes(
-                self.exact_source_bytes,
+                self.source.exact_source_bytes,
                 plan.sheet_name,
-                source_label=os.path.basename(self.filepath),
+                source_label=self.source.original_filename,
             )
         ) as rows:
             row_iter = iter(rows)
@@ -292,7 +296,7 @@ class ExcelLoaderWorker(DatasetImportWorker):
                 time_column=plan.time_column,
                 species_columns=plan.species_columns,
                 interruption_checker=self.isInterruptionRequested,
-                source_label=os.path.basename(self.filepath),
+                source_label=self.source.original_filename,
                 sheet_name=plan.sheet_name,
                 source_row_start=3 if plan.skip_unit_row else 2,
                 time_factor=plan.time_factor,
@@ -304,10 +308,10 @@ class ExcelLoaderWorker(DatasetImportWorker):
                     ),
                 },
             )
-        return f"{os.path.basename(self.filepath)}::{plan.sheet_name}", data
+        return f"{self.source.original_filename}::{plan.sheet_name}", data
 
     def run(self):
-        dataset_name = os.path.basename(self.filepath)
+        dataset_name = self.source.original_filename
         total = len(self._plans)
 
         if total <= 0:
@@ -315,12 +319,10 @@ class ExcelLoaderWorker(DatasetImportWorker):
             return
 
         try:
-            with open(self.filepath, "rb") as source:
-                self.retain_exact_source_bytes(source.read())
-            validate_import_source_bytes(
-                self.exact_source_bytes,
-                file_type="excel",
-                source_label=os.path.basename(self.filepath),
+            validate_tabular_source_bytes(
+                self.source.exact_source_bytes,
+                source_format="xlsx",
+                source_label=self.source.original_filename,
             )
             self.progress.emit(0)
             for index, plan in enumerate(self._plans, start=1):
@@ -374,10 +376,11 @@ class DataManagerPanel(QtWidgets.QWidget):
     datasetMappingRequested = QtCore.Signal(object)
     datasetObservationMappingRequested = QtCore.Signal(object)
     datasetFitInclusionRequested = QtCore.Signal(object)
-
     def __init__(
         self,
         staging: DatasetImportStaging,
+        *,
+        origin_tab_id: str,
         parent: Optional[QtWidgets.QWidget] = None,
     ):
         """
@@ -391,7 +394,17 @@ class DataManagerPanel(QtWidgets.QWidget):
         super().__init__(parent)
         if not isinstance(staging, DatasetImportStaging):
             raise TypeError("DataManagerPanel requires the application DatasetImportStaging owner.")
+        if (
+            type(origin_tab_id) is not str
+            or not origin_tab_id
+            or origin_tab_id != origin_tab_id.strip()
+        ):
+            raise ValueError(
+                "DataManagerPanel requires one stable edge-normalized origin "
+                "tab ID."
+            )
         self._staging = staging
+        self._origin_tab_id = origin_tab_id
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -464,10 +477,10 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._visible_records_by_id: Dict[str, RawDatasetRecord] = {}
 
         self._progress_dialog: Optional[QtWidgets.QProgressDialog] = None
+        self._initiating_import_request: DatasetImportRequest | None = None
         self._staging.busyChanged.connect(self._on_staging_busy_changed)
         self._staging.completionAvailable.connect(self._on_completion_available)
         self._staging.workerProgressed.connect(self._on_import_progress)
-        self._staging.workerSucceeded.connect(self._on_import_success)
         self._staging.workerFailed.connect(self._on_import_failure)
         self._staging.workerCanceled.connect(self._on_import_cancellation)
         self._set_mapping_controls_enabled(False)
@@ -475,6 +488,24 @@ class DataManagerPanel(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
+    def clear_projection(self) -> None:
+        """Clear only rendered Data state and revoke all Data actions."""
+        self._snapshot = DataManagerSnapshot((), None, (), ())
+        self._visible_records_by_id.clear()
+        self._dataset_list.clear()
+        self._preview_label.setText("No dataset selected")
+        self._preview_label.hide()
+        self._mapping_status.setText("Select a dataset")
+        self._set_mapping_controls_enabled(False)
+        self._rename_btn.setEnabled(False)
+        self._remove_btn.setEnabled(False)
+        self._export_original_btn.setEnabled(False)
+        blocker = QtCore.QSignalBlocker(self._fit_include)
+        try:
+            self._fit_include.setChecked(False)
+        finally:
+            del blocker
+
     def trigger_load_dialog(self) -> None:
         """Programmatically invoke the load dialog (mirrors Load button)."""
         self._load_dataset()
@@ -517,9 +548,34 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         if not filenames:
             return
+        if len(filenames) > _MAX_SELECTED_SOURCES:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Unsupported Dataset Selection",
+                "Select no more than 16 dataset sources at once.",
+            )
+            return
         try:
-            for filepath in filenames:
-                classify_import_source(filepath)
+            selected_size = sum(os.stat(filepath).st_size for filepath in filenames)
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Unsupported Dataset Selection",
+                f"Cannot inspect the selected dataset sources:\n\n{exc}",
+            )
+            return
+        if selected_size > _MAX_SELECTED_SOURCE_BYTES:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Unsupported Dataset Selection",
+                "The selected dataset sources exceed the 128 MiB total limit.",
+            )
+            return
+        try:
+            sources = tuple(
+                capture_import_source(filepath)
+                for filepath in filenames
+            )
         except ValueError as exc:
             QtWidgets.QMessageBox.critical(
                 self,
@@ -527,13 +583,20 @@ class DataManagerPanel(QtWidgets.QWidget):
                 str(exc),
             )
             return
+        if sum(len(source.exact_source_bytes) for source in sources) > _MAX_SELECTED_SOURCE_BYTES:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Unsupported Dataset Selection",
+                "The selected dataset sources exceed the 128 MiB total limit.",
+            )
+            return
 
         configs: List[ImportConfig] = []
         index = 0
-        while index < len(filenames):
-            filepath = str(filenames[index])
-            remaining = len(filenames) - index - 1
-            result = self._collect_import_config(filepath, remaining)
+        while index < len(sources):
+            source = sources[index]
+            remaining = len(sources) - index - 1
+            result = self._collect_import_config(source, remaining)
             if result.action == "cancel":
                 return
             if result.action == "skip":
@@ -550,11 +613,12 @@ class DataManagerPanel(QtWidgets.QWidget):
                         "apply_to_remaining is True but remaining_file_template is None"
                     )
                 source_sheet_names = result.config.file_intent.sheet_names
-                for remaining_idx in range(index + 1, len(filenames)):
-                    remaining_path = str(filenames[remaining_idx])
+                for remaining_idx in range(index + 1, len(sources)):
+                    remaining_source = sources[remaining_idx]
                     try:
                         remaining_config = self._build_remaining_file_config(
-                            remaining_path, source_intent,
+                            remaining_source,
+                            source_intent,
                             source_sheet_names=source_sheet_names,
                         )
                     except (ValueError, OSError, UnicodeDecodeError) as exc:
@@ -562,7 +626,7 @@ class DataManagerPanel(QtWidgets.QWidget):
                             self,
                             "Import Error",
                             f"Cannot apply settings to "
-                            f"'{os.path.basename(remaining_path)}':\n\n{exc}",
+                            f"'{remaining_source.original_filename}':\n\n{exc}",
                         )
                         continue
                     configs.append(remaining_config)
@@ -578,11 +642,13 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         try:
             import_request: DatasetImportRequest = self._staging.begin(
-                expected_units=expected_count
+                expected_units=expected_count,
+                origin_tab_id=self._origin_tab_id,
             )
         except DatasetImportAdmissionError as exc:
             QtWidgets.QMessageBox.warning(self, "Dataset Import", str(exc))
             return
+        self._initiating_import_request = import_request
         dataset_label = f"{expected_count} dataset{'s' if expected_count != 1 else ''}"
         logger.info("User initiated dataset import: %s", dataset_label)
 
@@ -596,23 +662,24 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._progress_dialog.show()
 
         for config in configs:
-            result_units = self._expected_dataset_count_for_config(config)
             worker: CSVLoaderWorker | ExcelLoaderWorker | None = None
             request: DatasetImportWorkerRequest | None = None
             try:
-                if config.file_type == "excel":
-                    worker = ExcelLoaderWorker(config.filepath, list(config.plans))
+                if config.source.file_type == "excel":
+                    worker = ExcelLoaderWorker(
+                        config.source,
+                        list(config.plans),
+                    )
                 else:
-                    worker = CSVLoaderWorker(config.plans[0])
+                    worker = CSVLoaderWorker(
+                        config.source,
+                        config.plans[0],
+                    )
                 request = self._staging.register_worker(
                     import_request,
                     worker,
-                    expected_units=result_units,
-                    config=config,
-                    source_path=config.filepath,
-                    source_format=(
-                        "xlsx" if config.file_type == "excel" else "csv"
-                    ),
+                    source=config.source,
+                    admitted_plans=tuple(config.plans),
                 )
                 worker.start()
             except Exception as exc:
@@ -640,14 +707,23 @@ class DataManagerPanel(QtWidgets.QWidget):
     def _expected_dataset_count_for_config(self, config: ImportConfig) -> int:
         return len(config.plans)
 
-    def _collect_import_config(self, filepath: str, remaining_count: int) -> ImportDialogResult:
+    def _collect_import_config(
+        self,
+        source: ImportSourceSnapshot,
+        remaining_count: int,
+    ) -> ImportDialogResult:
         try:
-            dialog = ImportConfigDialog(filepath, remaining_count=remaining_count, parent=self)
+            dialog = ImportConfigDialog(
+                source,
+                remaining_count=remaining_count,
+                parent=self,
+            )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self,
                 "Load Error",
-                f"Failed to open import configuration for '{os.path.basename(filepath)}':\n\n{type(exc).__name__}: {exc}",
+                f"Failed to open import configuration for "
+                f"'{source.original_filename}':\n\n{type(exc).__name__}: {exc}",
             )
             return ImportDialogResult(config=None, action="skip")
         dialog.exec()
@@ -655,7 +731,7 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def _build_remaining_file_config(
         self,
-        filepath: str,
+        source: ImportSourceSnapshot,
         source_intent: SheetImportIntent,
         *,
         source_sheet_names: Tuple[str, ...] = (),
@@ -664,7 +740,7 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         Raises ValueError if the source intent is incompatible with the file.
         """
-        file_type = classify_import_source(filepath)
+        file_type = source.file_type
 
         per_sheet_intents: Dict[Optional[str], SheetImportIntent] = {}
         per_sheet_detections: Dict[Optional[str], UnitDetection] = {}
@@ -677,7 +753,11 @@ class DataManagerPanel(QtWidgets.QWidget):
             selected_keys.add(source_intent.time_column)
 
         if file_type == "csv":
-            with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
+            with io.TextIOWrapper(
+                io.BytesIO(source.exact_source_bytes),
+                encoding="utf-8-sig",
+                newline="",
+            ) as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
                 if header is None:
@@ -705,7 +785,10 @@ class DataManagerPanel(QtWidgets.QWidget):
             per_sheet_detections[None] = det
             per_sheet_columns[None] = columns
         else:
-            sheets = list_sheets(filepath)
+            sheets = list_sheets_from_bytes(
+                source.exact_source_bytes,
+                source_label=source.original_filename,
+            )
             if not sheets:
                 raise ValueError("Excel file has no sheets")
             # Filter sheets by source's checked set
@@ -715,7 +798,13 @@ class DataManagerPanel(QtWidgets.QWidget):
                 if not sheets:
                     raise ValueError("No matching sheets found")
             for sheet_name in sheets:
-                with closing(read_excel_sheet_rows(filepath, sheet_name)) as rows:
+                with closing(
+                    read_excel_sheet_rows_from_bytes(
+                        source.exact_source_bytes,
+                        sheet_name,
+                        source_label=source.original_filename,
+                    )
+                ) as rows:
                     first_row = next(iter(rows), None)
                 if first_row is None:
                     per_sheet_columns[sheet_name] = []
@@ -731,7 +820,7 @@ class DataManagerPanel(QtWidgets.QWidget):
             target_sheet_names = tuple(sheets)
 
         plans = resolve_import_plans(
-            filepath, file_type,
+            source,
             per_sheet_intents, per_sheet_detections, per_sheet_columns,
         )
 
@@ -740,10 +829,8 @@ class DataManagerPanel(QtWidgets.QWidget):
             apply_to_remaining=False,
         )
         return ImportConfig(
-            filepath=filepath,
-            file_type=file_type,
+            source=source,
             file_intent=file_intent,
-            per_sheet_intents=tuple(per_sheet_intents.items()),
             plans=tuple(plans),
         )
 
@@ -751,58 +838,17 @@ class DataManagerPanel(QtWidgets.QWidget):
         """Render one staging-owned typed worker progress event."""
         if not isinstance(event, DatasetImportProgress):
             raise TypeError("Dataset import progress event has the wrong type.")
+        if not self._owns_worker_request(event.request):
+            return
         if self._progress_dialog:
             self._progress_dialog.setValue(min(event.percent, 99))
-
-    def _on_import_success(self, event: DatasetImportSuccess) -> None:
-        """Normalize one typed parsed result into a staging-owned unit."""
-
-        if not isinstance(event, DatasetImportSuccess):
-            raise TypeError("Dataset import success event has the wrong type.")
-        request = event.request
-        config = self._staging.worker_config(request)
-        try:
-            if not isinstance(config, ImportConfig):
-                raise TypeError("Dataset import request lost its ImportConfig.")
-            if request.source.original_format == "xlsx":
-                if "::" not in event.display_name:
-                    raise ValueError(
-                        "XLSX result identity must include its worksheet name."
-                    )
-                sheet_name = event.display_name.split("::", 1)[1]
-                plan = next(
-                    (
-                        candidate
-                        for candidate in config.plans
-                        if candidate.sheet_name == sheet_name
-                    ),
-                    None,
-                )
-            else:
-                plan = config.plans[0] if len(config.plans) == 1 else None
-            if plan is None:
-                raise ValueError(
-                    "Dataset result does not match an admitted import plan."
-                )
-            unit = DatasetImportUnit(
-                display_name=event.display_name,
-                payload=event.payload,
-                original_filename=request.source.original_filename,
-                original_format=request.source.original_format,
-                exact_source_bytes=event.exact_source_bytes,
-            )
-        except (DatasetImportStateError, TypeError, ValueError) as exc:
-            self._staging.stage_error(
-                request,
-                f"{type(exc).__name__}: {exc}",
-            )
-            return
-        self._staging.stage_unit(request, unit)
 
     def _on_import_failure(self, event: DatasetImportFailure) -> None:
         """Present one staging-owned typed worker failure."""
         if not isinstance(event, DatasetImportFailure):
             raise TypeError("Dataset import failure event has the wrong type.")
+        if not self._owns_worker_request(event.request):
+            return
         QtWidgets.QMessageBox.critical(
             self,
             "Load Error",
@@ -816,6 +862,8 @@ class DataManagerPanel(QtWidgets.QWidget):
         """Observe one staging-owned typed worker cancellation."""
         if not isinstance(event, DatasetImportCancellation):
             raise TypeError("Dataset import cancellation event has the wrong type.")
+        if not self._owns_worker_request(event.request):
+            return
         logger.info("Dataset import canceled: %s", event.source_label)
 
     def _on_load_canceled(self):
@@ -884,17 +932,15 @@ class DataManagerPanel(QtWidgets.QWidget):
             return
 
         name = str(record.display_name)
-        observations = {
-            series.column_name: {
-                "raw_observation_id": series.raw_observation_id,
-                "t": series.t,
-                "y": series.y,
-                "source_rows": series.source_rows,
-            }
-            for series in record.observations
-        }
         self._preview_label.show()
-        t, species = dense_view_from_observations(observations)
+        unique_times = {
+            time_value
+            for series in record.observations
+            for time_value in series.t
+        }
+        observation_labels = tuple(
+            series.column_name for series in record.observations
+        )
 
         thawed_metadata = thaw_json_value(record.source_metadata)
         metadata = dict(thawed_metadata) if isinstance(thawed_metadata, dict) else {}
@@ -904,11 +950,14 @@ class DataManagerPanel(QtWidgets.QWidget):
             f"Original source: {record.original_filename} "
             f"({record.original_format})<br>"
         )
-        preview += f"{len(t)} time points<br>"
+        preview += f"{len(unique_times)} time points<br>"
         preview += f"Time column: {metadata.get('time_column', 'unknown')} ({mapping_source})<br>"
-        preview += f"{len(species)} species: {', '.join(list(species.keys())[:5])}"
-        if len(species) > 5:
-            preview += f", ... ({len(species)-5} more)"
+        preview += (
+            f"{len(observation_labels)} species: "
+            f"{', '.join(observation_labels[:5])}"
+        )
+        if len(observation_labels) > 5:
+            preview += f", ... ({len(observation_labels)-5} more)"
 
         self._preview_label.setText(preview)
         self._update_mapping_area()
@@ -1058,10 +1107,24 @@ class DataManagerPanel(QtWidgets.QWidget):
         )
 
     def _on_completion_available(self, import_id: int) -> None:
-        _ = import_id
+        request = self._initiating_import_request
+        if request is None or request.import_id != int(import_id):
+            return
         self._finalize_progress_dialog()
+        self._initiating_import_request = None
 
     def _on_staging_busy_changed(self, busy: bool) -> None:
         self._load_btn.setEnabled(not bool(busy))
         if not busy:
             self._finalize_progress_dialog()
+            self._initiating_import_request = None
+
+    def _owns_worker_request(
+        self,
+        request: DatasetImportWorkerRequest,
+    ) -> bool:
+        initiating = self._initiating_import_request
+        return bool(
+            initiating is not None
+            and request.import_request is initiating
+        )

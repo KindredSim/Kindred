@@ -9,7 +9,7 @@ configuration only.
 from __future__ import annotations
 
 import csv
-import os
+import io
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -20,7 +20,10 @@ from kindred.core.datasets.csv_import import (
     PhysicalColumn,
     identify_physical_columns,
 )
-from kindred.core.datasets.excel_import import list_sheets, read_excel_sheet_rows
+from kindred.core.datasets.excel_import import (
+    list_sheets_from_bytes,
+    read_excel_sheet_rows_from_bytes,
+)
 from kindred.core.datasets.units import (
     CONCENTRATION_UNIT_DISPLAY,
     TIME_UNIT_DISPLAY,
@@ -28,10 +31,10 @@ from kindred.core.datasets.units import (
 )
 from kindred.gui.widgets.import_config import (
     ImportConfig,
+    ImportSourceSnapshot,
     SheetImportIntent,
     UnitDetection,
     UserImportIntent,
-    classify_import_source,
     detect_units_from_physical_row,
     resolve_import_plans,
 )
@@ -54,14 +57,18 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     def __init__(
         self,
-        filepath: str,
+        source: ImportSourceSnapshot,
         remaining_count: int = 0,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self._filepath = filepath
+        if not isinstance(source, ImportSourceSnapshot):
+            raise TypeError(
+                "ImportConfigDialog requires one immutable source snapshot."
+            )
+        self._source = source
         self._remaining_count = remaining_count
-        self._file_type = classify_import_source(filepath)
+        self._file_type = source.file_type
         self._result: Optional[ImportDialogResult] = None
 
         # State populated during preview reading
@@ -80,7 +87,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._sheet_names: List[str] = []
         self._previewed_sheet_name: Optional[str] = None
 
-        self.setWindowTitle(f"Import: {os.path.basename(filepath)}")
+        self.setWindowTitle(f"Import: {source.original_filename}")
         self.setModal(True)
         self.resize(700, 550)
 
@@ -274,7 +281,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._previewed_sheet_name = None
         self._clear_preview_error()
         try:
-            with open(self._filepath, "r", encoding="utf-8-sig", newline="") as f:
+            with io.TextIOWrapper(
+                io.BytesIO(self._source.exact_source_bytes),
+                encoding="utf-8-sig",
+                newline="",
+            ) as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
                 if header is None:
@@ -297,7 +308,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._save_current_sheet_state(None)
 
     def _load_excel_preview(self) -> None:
-        self._sheet_names = list_sheets(self._filepath)
+        self._sheet_names = list_sheets_from_bytes(
+            self._source.exact_source_bytes,
+            source_label=self._source.original_filename,
+        )
         self._sheet_list.blockSignals(True)
         self._sheet_list.clear()
         for name in self._sheet_names:
@@ -316,7 +330,13 @@ class ImportConfigDialog(QtWidgets.QDialog):
     ) -> tuple[list[PhysicalColumn], list[list[str]]]:
         rows_raw: List[Dict[PhysicalColumn, str]] = []
         columns: List[PhysicalColumn] = []
-        with closing(read_excel_sheet_rows(self._filepath, sheet_name)) as row_iter:
+        with closing(
+            read_excel_sheet_rows_from_bytes(
+                self._source.exact_source_bytes,
+                sheet_name,
+                source_label=self._source.original_filename,
+            )
+        ) as row_iter:
             for i, row_dict in enumerate(row_iter):
                 if i == 0:
                     columns = list(row_dict.keys())
@@ -527,7 +547,13 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 relevant_columns,
             )
             return det, list(self._columns)
-        with closing(read_excel_sheet_rows(self._filepath, sheet_name)) as rows:
+        with closing(
+            read_excel_sheet_rows_from_bytes(
+                self._source.exact_source_bytes,
+                sheet_name,
+                source_label=self._source.original_filename,
+            )
+        ) as rows:
             first_row = next(iter(rows), None)
         if first_row is None:
             return UnitDetection.empty(), []
@@ -1038,7 +1064,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
         try:
             plans = resolve_import_plans(
-                self._filepath, self._file_type,
+                self._source,
                 per_sheet_intents, per_sheet_detections, per_sheet_columns,
             )
         except ValueError as exc:
@@ -1050,12 +1076,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
         remaining_template = self._build_remaining_template()
 
         config = ImportConfig(
-            filepath=self._filepath,
-            file_type=self._file_type,
+            source=self._source,
             file_intent=file_intent,
-            per_sheet_intents=tuple(
-                (key, per_sheet_intents[key]) for key in checked_keys
-            ),
             plans=tuple(plans),
             remaining_file_template=remaining_template,
         )

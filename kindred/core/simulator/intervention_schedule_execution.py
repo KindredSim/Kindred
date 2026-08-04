@@ -264,6 +264,12 @@ class InterventionScheduleExecutionOwner:
                 sub_end = outer_end if next_rearm is None else float(next_rearm)
                 active_fluxes = _active_fluxes(contract, sub_start)
                 active_holds = _active_holds(contract, sub_start)
+                current_y = _apply_holds(
+                    current_y,
+                    active_holds,
+                    species_index=species_index,
+                    cancellation_check=cancellation_check,
+                )
                 segment_rhs: Rhs2 = request.rhs
                 segment_rhs_for_jac: Rhs2 = request.rhs_for_jac
                 if active_fluxes or active_holds:
@@ -379,6 +385,19 @@ class InterventionScheduleExecutionOwner:
                     count=len(segment_events),
                     species_count=current_y.size,
                 )
+                if active_holds:
+                    event_states = [
+                        [
+                            _apply_holds(
+                                state,
+                                active_holds,
+                                species_index=species_index,
+                                cancellation_check=cancellation_check,
+                            )
+                            for state in states
+                        ]
+                        for states in event_states
+                    ]
                 for index, times in enumerate(event_times[: len(user_events)]):
                     user_event_provenance[index].extend(times)
                 terminal_event_time = _terminal_user_event_time(
@@ -396,7 +415,12 @@ class InterventionScheduleExecutionOwner:
                     )
                 )
                 seg_t = np.asarray(segment_result.output.t, dtype=float).reshape(-1)
-                seg_y = np.asarray(segment_result.output.Y, dtype=float)
+                seg_y = _apply_holds_to_trajectory(
+                    segment_result.output.Y,
+                    active_holds,
+                    species_index=species_index,
+                    cancellation_check=cancellation_check,
+                )
                 _validate_segment_output(
                     seg_t,
                     seg_y,
@@ -478,9 +502,14 @@ class InterventionScheduleExecutionOwner:
                     root_time, trigger_indices, root_state = trigger_hit
                     current_y = root_state.copy()
                 elif not terminal_stop:
-                    current_y = _required_raw_terminal_state(
-                        segment_result,
-                        species_count=current_y.size,
+                    current_y = _apply_holds(
+                        _required_raw_terminal_state(
+                            segment_result,
+                            species_count=current_y.size,
+                        ),
+                        active_holds,
+                        species_index=species_index,
+                        cancellation_check=cancellation_check,
                     )
                 scheduled_discontinuity = (
                     trigger_hit is None
@@ -979,6 +1008,16 @@ def _apply_boundary(
         if trigger_state is not None
         else np.asarray(state, dtype=float).reshape(-1).copy()
     )
+    active_holds = _active_holds(contract, boundary)
+    persisting_holds = tuple(
+        hold for hold in active_holds if hold.start_time < boundary
+    )
+    current = _apply_holds(
+        current,
+        persisting_holds,
+        species_index=species_index,
+        cancellation_check=cancellation_check,
+    )
     exact_root = current.copy()
     projectable_solver_negatives = (
         exact_root < 0.0
@@ -990,7 +1029,6 @@ def _apply_boundary(
         for species, index in species_index.items()
     }
     static = _static_instants_at(contract, boundary)
-    active_holds = _active_holds(contract, boundary)
     entering_holds = tuple(
         hold for hold in active_holds if hold.start_time == boundary
     )
@@ -1001,6 +1039,7 @@ def _apply_boundary(
     validate_boundary_conflicts(
         instants=static + trigger_instants,
         entering_holds=entering_holds,
+        cancellation_check=cancellation_check,
     )
     stage_three = tuple(
         sorted(
@@ -1065,6 +1104,12 @@ def _apply_boundary(
     current = _apply_instants(
         current,
         stage_seven,
+        species_index=species_index,
+        cancellation_check=cancellation_check,
+    )
+    current = _apply_holds(
+        current,
+        active_holds,
         species_index=species_index,
         cancellation_check=cancellation_check,
     )
@@ -1153,6 +1198,28 @@ def _apply_holds(
             )
         output[species_index[hold.species]] = value
         _raise_if_cancelled(cancellation_check)
+    return output
+
+
+def _apply_holds_to_trajectory(
+    states: object,
+    holds: Sequence[ExecutableHold],
+    *,
+    species_index: Mapping[str, int],
+    cancellation_check: Callable[[], bool] | None,
+) -> np.ndarray:
+    output = np.asarray(states, dtype=float).copy()
+    if output.ndim != 2:
+        return output
+    for hold in holds:
+        _raise_if_cancelled(cancellation_check)
+        value = float(hold.value)
+        if not math.isfinite(value) or value < 0.0:
+            raise InterventionScheduleError(
+                "Intervention hold produced an invalid published state."
+            )
+        output[species_index[hold.species], :] = value
+    _raise_if_cancelled(cancellation_check)
     return output
 
 

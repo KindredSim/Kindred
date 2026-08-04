@@ -5,8 +5,9 @@ import json
 import math
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
+from kindred.core.exceptions import SimulationCancelled
 from kindred.core.intervention_schedule import (
     InterventionFlux,
     InterventionHold,
@@ -56,6 +57,13 @@ def _finite_derived(value: object, *, context: str) -> float:
     if not math.isfinite(number):
         raise InterventionScheduleError(f"{context} must remain finite.")
     return number
+
+
+def _raise_if_cancelled(
+    cancellation_check: Callable[[], bool] | None,
+) -> None:
+    if cancellation_check is not None and bool(cancellation_check()):
+        raise SimulationCancelled()
 
 
 def _protocol_boundary(
@@ -585,7 +593,10 @@ def _execution_order(item: ExecutableInstant) -> tuple[float, int, int, int, int
 
 def compile_intervention_schedule(
     schedule: InterventionSchedule | Mapping[str, Any] | None,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> InterventionExecutionContract:
+    _raise_if_cancelled(cancellation_check)
     schedule_obj = coerce_intervention_schedule(schedule) or InterventionSchedule()
     if schedule_obj.is_parameterized:
         raise InterventionScheduleError(
@@ -597,6 +608,7 @@ def compile_intervention_schedule(
     triggers: list[ExecutableTrigger] = []
     lineage: list[dict[str, Any]] = []
     for operation in schedule_obj.operations:
+        _raise_if_cancelled(cancellation_check)
         if isinstance(operation, (InterventionSet, InterventionJump)):
             instants.append(_instant_from_direct(operation))
         elif isinstance(operation, InterventionFlux):
@@ -642,6 +654,7 @@ def compile_intervention_schedule(
             )
             previous_window_start: float | None = None
             for window_ordinal in range(operation.count):
+                _raise_if_cancelled(cancellation_check)
                 window_start = _protocol_boundary(
                     start, operation.every, window_ordinal
                 )
@@ -667,6 +680,7 @@ def compile_intervention_schedule(
                             "after binary64 expansion."
                         )
                 for nested in operation.before:
+                    _raise_if_cancelled(cancellation_check)
                     primitive = _protocol_instant(
                         operation,
                         nested,
@@ -683,6 +697,7 @@ def compile_intervention_schedule(
                         )
                     )
                 for nested in operation.during:
+                    _raise_if_cancelled(cancellation_check)
                     if window_end is None:
                         raise InterventionScheduleError(
                             "Protocol during requires a finite duration."
@@ -707,6 +722,7 @@ def compile_intervention_schedule(
                         )
                     )
                 for nested in operation.after:
+                    _raise_if_cancelled(cancellation_check)
                     if window_end is None:
                         raise InterventionScheduleError(
                             "Protocol after requires a finite duration."
@@ -744,8 +760,15 @@ def compile_intervention_schedule(
         )
     )
     triggers.sort(key=lambda item: item.declaration_ordinal)
-    validate_boundary_conflicts(instants=instants, entering_holds=holds)
-    _validate_hold_overlaps(holds)
+    validate_boundary_conflicts(
+        instants=instants,
+        entering_holds=holds,
+        cancellation_check=cancellation_check,
+    )
+    _validate_hold_overlaps(
+        holds,
+        cancellation_check=cancellation_check,
+    )
     executable_operations = [
         *(item.to_payload() for item in instants),
         *(item.to_payload() for item in fluxes),
@@ -799,13 +822,17 @@ def validate_boundary_conflicts(
     *,
     instants: Sequence[ExecutableInstant],
     entering_holds: Sequence[ExecutableHold],
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> None:
     by_key: dict[tuple[float, str], list[ExecutableInstant | ExecutableHold]] = {}
     for instant in instants:
+        _raise_if_cancelled(cancellation_check)
         by_key.setdefault((instant.time, instant.species), []).append(instant)
     for hold in entering_holds:
+        _raise_if_cancelled(cancellation_check)
         by_key.setdefault((hold.start_time, hold.species), []).append(hold)
     for (time, species), candidates in by_key.items():
+        _raise_if_cancelled(cancellation_check)
         sets = [
             item
             for item in candidates
@@ -837,9 +864,15 @@ def validate_boundary_conflicts(
             )
 
 
-def _validate_hold_overlaps(holds: Sequence[ExecutableHold]) -> None:
+def _validate_hold_overlaps(
+    holds: Sequence[ExecutableHold],
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
+) -> None:
     for index, left in enumerate(holds):
+        _raise_if_cancelled(cancellation_check)
         for right in holds[index + 1 :]:
+            _raise_if_cancelled(cancellation_check)
             if left.species != right.species:
                 continue
             if left.start_time < right.end_time and right.start_time < left.end_time:

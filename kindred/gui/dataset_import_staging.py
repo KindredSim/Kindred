@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import os
 import time
-from typing import Any
-
 from PySide6 import QtCore
 
 from kindred.core.datasets.observation_payload import DatasetObservationPayload
@@ -14,64 +11,48 @@ from kindred.gui.controllers.dataset_errors import (
     DatasetImportAdmissionError,
     DatasetImportStateError,
 )
+from kindred.core.dataset_mapping import validate_raw_dataset_record
 from kindred.core.project_document import (
     RawDatasetRecord,
     new_dataset_id,
 )
+from kindred.gui.widgets.import_config import (
+    ImportSourceSnapshot,
+    ResolvedSheetPlan,
+)
+
+_MAX_IMPORT_UNITS = 64
+_MAX_IMPORT_RETAINED_OBSERVATION_CELLS = 1_000_000
 
 
 @dataclass(frozen=True)
 class DatasetImportUnit:
+    source: ImportSourceSnapshot
     display_name: str
     payload: DatasetObservationPayload
-    original_filename: str = ""
-    original_format: str = ""
-    exact_source_bytes: bytes = b""
 
     def __post_init__(self) -> None:
+        if not isinstance(self.source, ImportSourceSnapshot):
+            raise TypeError(
+                "Imported datasets require their immutable source snapshot."
+            )
         if not isinstance(self.display_name, str):
             raise TypeError("Imported dataset display name must be a string.")
         name = self.display_name.strip()
         if not name:
             raise ValueError("Imported datasets require a nonblank display name.")
-        if not isinstance(self.original_filename, str):
-            raise TypeError("Imported dataset filename must be a string.")
-        original_filename = self.original_filename
-        if (
-            not original_filename
-            or os.path.basename(original_filename) != original_filename
-        ):
-            raise ValueError("Imported datasets require their original filename.")
-        if not isinstance(self.original_format, str):
-            raise TypeError("Imported dataset format must be a string.")
-        original_format = self.original_format
-        if original_format not in {"csv", "xlsx"}:
-            raise ValueError("Imported dataset format must be 'csv' or 'xlsx'.")
-        expected_suffix = f".{original_format}"
-        if os.path.splitext(original_filename)[1].lower() != expected_suffix:
-            raise ValueError(
-                f"Imported source filename must end in {expected_suffix!r}."
-            )
-        if type(self.exact_source_bytes) is not bytes:
-            raise TypeError("Imported dataset source content must be exact bytes.")
-        source_bytes = self.exact_source_bytes
-        if not source_bytes:
-            raise ValueError("Imported datasets require their exact nonempty source bytes.")
         if not isinstance(self.payload, DatasetObservationPayload):
             raise TypeError(
                 "Imported dataset payload must be a DatasetObservationPayload."
-            )
+        )
         object.__setattr__(self, "display_name", name)
-        object.__setattr__(self, "original_filename", original_filename)
-        object.__setattr__(self, "original_format", original_format)
-        object.__setattr__(self, "exact_source_bytes", source_bytes)
 
 
 @dataclass(frozen=True)
-class DatasetImportCompletionIntent:
+class _DatasetImportCompletion:
     import_id: int
+    origin_tab_id: str
     units: tuple[DatasetImportUnit, ...]
-    errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,12 +60,21 @@ class RawDatasetBatchProposal:
     """One complete immutable all-or-none project dataset proposal."""
 
     import_id: int
+    origin_tab_id: str
     records: tuple[RawDatasetRecord, ...]
-    errors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.import_id) is not int or self.import_id <= 0:
             raise ValueError("Raw dataset batch import ID must be positive.")
+        if (
+            type(self.origin_tab_id) is not str
+            or not self.origin_tab_id
+            or self.origin_tab_id != self.origin_tab_id.strip()
+        ):
+            raise ValueError(
+                "Raw dataset batch origin tab ID must be nonblank and "
+                "edge-normalized."
+            )
         if type(self.records) is not tuple or any(
             not isinstance(record, RawDatasetRecord)
             for record in self.records
@@ -93,59 +83,26 @@ class RawDatasetBatchProposal:
                 "Raw dataset batch records must be an exact "
                 "RawDatasetRecord tuple."
             )
-        if type(self.errors) is not tuple or any(
-            type(message) is not str
-            or not message
-            or message != message.strip()
-            for message in self.errors
-        ):
-            raise ValueError(
-                "Raw dataset batch errors must be normalized nonblank text."
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class DatasetImportSource:
-    filepath: str
-    original_filename: str
-    original_format: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.filepath, str) or not self.filepath:
-            raise ValueError("Dataset import source path must be nonblank.")
-        if not isinstance(self.original_filename, str):
-            raise TypeError("Dataset import source filename must be a string.")
-        if not isinstance(self.original_format, str):
-            raise TypeError("Dataset import source format must be a string.")
-        filepath = self.filepath
-        filename = self.original_filename
-        source_format = self.original_format
-        if (
-            not filename
-            or os.path.basename(filename) != filename
-            or os.path.basename(filepath) != filename
-        ):
-            raise ValueError(
-                "Dataset import source filename must be the source-path basename."
-            )
-        if source_format not in {"csv", "xlsx"}:
-            raise ValueError(
-                "Dataset import source format must be exactly 'csv' or 'xlsx'."
-            )
-        if os.path.splitext(filename)[1].lower() != f".{source_format}":
-            raise ValueError(
-                "Dataset import source filename and format do not agree."
-            )
 
 
 @dataclass(frozen=True, slots=True)
 class DatasetImportRequest:
     import_id: int
+    origin_tab_id: str
     expected_units: int
 
     def __post_init__(self) -> None:
         if type(self.import_id) is not int or self.import_id <= 0:
             raise ValueError("Dataset import ID must be a positive integer.")
+        if (
+            type(self.origin_tab_id) is not str
+            or not self.origin_tab_id
+            or self.origin_tab_id != self.origin_tab_id.strip()
+        ):
+            raise ValueError(
+                "Dataset import origin tab ID must be nonblank and "
+                "edge-normalized."
+            )
         if type(self.expected_units) is not int or self.expected_units <= 0:
             raise ValueError(
                 "Dataset import expected_units must be a positive integer."
@@ -156,8 +113,9 @@ class DatasetImportRequest:
 class DatasetImportWorkerRequest:
     import_request: DatasetImportRequest
     worker_id: int
-    source: DatasetImportSource
+    source: ImportSourceSnapshot
     expected_units: int
+    admitted_plans: tuple[ResolvedSheetPlan, ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.import_request, DatasetImportRequest):
@@ -166,11 +124,41 @@ class DatasetImportWorkerRequest:
             )
         if type(self.worker_id) is not int or self.worker_id <= 0:
             raise ValueError("Dataset import worker ID must be a positive integer.")
-        if not isinstance(self.source, DatasetImportSource):
-            raise TypeError("Dataset import worker source must be DatasetImportSource.")
+        if not isinstance(self.source, ImportSourceSnapshot):
+            raise TypeError(
+                "Dataset import worker source must be ImportSourceSnapshot."
+            )
         if type(self.expected_units) is not int or self.expected_units <= 0:
             raise ValueError(
                 "Dataset import worker expected_units must be a positive integer."
+            )
+        plans = self.admitted_plans
+        if type(plans) is not tuple or any(
+            not isinstance(plan, ResolvedSheetPlan)
+            for plan in plans
+        ):
+            raise TypeError(
+                "Dataset import worker admitted plans must be an exact "
+                "ResolvedSheetPlan tuple."
+            )
+        if len(plans) != self.expected_units:
+            raise ValueError(
+                "A dataset import worker must retain one typed plan per "
+                "expected result."
+            )
+        if self.source.file_type == "csv":
+            if len(plans) != 1 or plans[0].sheet_name is not None:
+                raise ValueError(
+                    "A CSV import worker must admit exactly one non-sheet plan."
+                )
+            return
+        if any(
+            plan.sheet_name is None
+            for plan in plans
+        ):
+            raise ValueError(
+                "Every admitted XLSX plan must identify one worksheet in the "
+                "worker source."
             )
 
     @property
@@ -192,41 +180,6 @@ class DatasetImportProgress:
             raise ValueError(
                 "Dataset import progress must be an integer from 0 to 100."
             )
-
-
-@dataclass(frozen=True, slots=True)
-class DatasetImportSuccess:
-    request: DatasetImportWorkerRequest
-    display_name: str
-    payload: DatasetObservationPayload
-    exact_source_bytes: bytes
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.request, DatasetImportWorkerRequest):
-            raise TypeError(
-                "Dataset import success requires DatasetImportWorkerRequest."
-            )
-        if not isinstance(self.display_name, str):
-            raise TypeError("Dataset import success name must be a string.")
-        name = self.display_name.strip()
-        if type(self.exact_source_bytes) is not bytes:
-            raise TypeError(
-                "Dataset import success source content must be exact bytes."
-            )
-        source_bytes = self.exact_source_bytes
-        if not name:
-            raise ValueError("Dataset import success name must be nonblank.")
-        if not source_bytes:
-            raise ValueError(
-                "Dataset import success requires exact nonempty source bytes."
-            )
-        if not isinstance(self.payload, DatasetObservationPayload):
-            raise TypeError(
-                "Dataset import success payload must be a "
-                "DatasetObservationPayload."
-            )
-        object.__setattr__(self, "display_name", name)
-        object.__setattr__(self, "exact_source_bytes", source_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,32 +230,20 @@ class DatasetImportWorker(QtCore.QThread):
     error = QtCore.Signal(str)
     progress = QtCore.Signal(int)
 
-    def __init__(self) -> None:
+    def __init__(self, source: ImportSourceSnapshot) -> None:
         super().__init__()
-        self._exact_source_bytes = b""
+        if not isinstance(source, ImportSourceSnapshot):
+            raise TypeError(
+                "Dataset import workers require one immutable source snapshot."
+            )
+        self._source = source
 
     @property
-    def exact_source_bytes(self) -> bytes:
-        return self._exact_source_bytes
+    def source(self) -> ImportSourceSnapshot:
+        return self._source
 
-    def retain_exact_source_bytes(self, source_bytes: bytes) -> None:
-        if type(source_bytes) is not bytes:
-            raise TypeError(
-                "Dataset import worker source content must be exact bytes."
-            )
-        if not source_bytes:
-            raise ValueError(
-                "Dataset import worker cannot retain an empty source."
-            )
-        if self._exact_source_bytes:
-            raise DatasetImportStateError(
-                "Dataset import worker source bytes are already retained."
-            )
-        self._exact_source_bytes = source_bytes
-
-
-def raw_record_batch_proposal(
-    completion: DatasetImportCompletionIntent,
+def _raw_record_batch_proposal(
+    completion: _DatasetImportCompletion,
     *,
     existing_records: tuple[RawDatasetRecord, ...],
 ) -> RawDatasetBatchProposal:
@@ -313,7 +254,7 @@ def raw_record_batch_proposal(
     Optional active-tab mapping remains a later transaction over committed raw
     records.
     """
-    if not isinstance(completion, DatasetImportCompletionIntent):
+    if not isinstance(completion, _DatasetImportCompletion):
         raise TypeError(
             "Raw dataset batch proposal requires a dataset import completion."
         )
@@ -337,21 +278,21 @@ def raw_record_batch_proposal(
             display_name = f"{base}_{counter}{extension}"
             counter += 1
         used_names.add(display_name.casefold())
-        candidates.append(
-            RawDatasetRecord(
-                dataset_id=new_dataset_id(),
-                display_name=display_name,
-                original_filename=unit.original_filename,
-                original_format=unit.original_format,
-                exact_source_bytes=unit.exact_source_bytes,
-                source_metadata=unit.payload.source_metadata,
-                observations=unit.payload.observations,
-            )
+        candidate = RawDatasetRecord(
+            dataset_id=new_dataset_id(),
+            display_name=display_name,
+            original_filename=unit.source.original_filename,
+            original_format=unit.source.archive_format,
+            exact_source_bytes=unit.source.exact_source_bytes,
+            source_metadata=unit.payload.source_metadata,
+            observations=unit.payload.observations,
         )
+        validate_raw_dataset_record(candidate)
+        candidates.append(candidate)
     return RawDatasetBatchProposal(
         import_id=completion.import_id,
+        origin_tab_id=completion.origin_tab_id,
         records=tuple(candidates),
-        errors=completion.errors,
     )
 
 
@@ -359,7 +300,6 @@ def raw_record_batch_proposal(
 class _RegisteredWorker:
     request: DatasetImportWorkerRequest
     worker: DatasetImportWorker
-    config: Any
     accounted_units: int = 0
 
 
@@ -368,17 +308,17 @@ class _ActiveImport:
     request: DatasetImportRequest
     workers: dict[int, _RegisteredWorker] = field(default_factory=dict)
     units: list[DatasetImportUnit] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
     completed_units: int = 0
+    retained_cells: int = 0
     terminal_outcome: str | None = None
 
 
 class DatasetImportStaging(QtCore.QObject):
     """Own live QThreads until finish and exactly one normalized completion.
 
-    The object does not mutate ProjectDocument. A GUI-thread integration owner
-    takes the emitted completion intent, commits raw records through
-    ProjectSession, and only then offers optional active-tab mapping.
+    The object admits one complete raw-record batch before a GUI-thread
+    integration owner commits it through ProjectSession and only then offers
+    optional active-tab mapping.
     """
 
     completionAvailable = QtCore.Signal(int)
@@ -386,7 +326,6 @@ class DatasetImportStaging(QtCore.QObject):
     owned_qthreads_changed = QtCore.Signal()
     discarded = QtCore.Signal(str)
     workerProgressed = QtCore.Signal(object)
-    workerSucceeded = QtCore.Signal(object)
     workerFailed = QtCore.Signal(object)
     workerCanceled = QtCore.Signal(object)
 
@@ -399,19 +338,20 @@ class DatasetImportStaging(QtCore.QObject):
         self._next_import_id = 1
         self._next_worker_id = 1
         self._active: _ActiveImport | None = None
-        self._completion: DatasetImportCompletionIntent | None = None
+        self._completion: _DatasetImportCompletion | None = None
         self._project_replacement_admission_fenced = False
         self._application_close_fenced = False
-
-    @property
-    def has_uncommitted_completion(self) -> bool:
-        return self._completion is not None
 
     @property
     def busy(self) -> bool:
         return self._active is not None or self._completion is not None
 
-    def begin(self, *, expected_units: int) -> DatasetImportRequest:
+    def begin(
+        self,
+        *,
+        expected_units: int,
+        origin_tab_id: str,
+    ) -> DatasetImportRequest:
         """Admit a new import on the GUI thread."""
         if (
             self._application_close_fenced
@@ -423,10 +363,15 @@ class DatasetImportStaging(QtCore.QObject):
         expected = int(expected_units)
         if expected <= 0:
             raise DatasetImportAdmissionError("Dataset import requires at least one result unit.")
+        if expected > _MAX_IMPORT_UNITS:
+            raise DatasetImportAdmissionError(
+                "A dataset import cannot contain more than 64 resolved units."
+            )
         import_id = self._next_import_id
         self._next_import_id += 1
         request = DatasetImportRequest(
             import_id=import_id,
+            origin_tab_id=origin_tab_id,
             expected_units=expected,
         )
         self._active = _ActiveImport(request=request)
@@ -438,10 +383,8 @@ class DatasetImportStaging(QtCore.QObject):
         import_request: DatasetImportRequest,
         worker: DatasetImportWorker,
         *,
-        expected_units: int,
-        config: Any,
-        source_path: str,
-        source_format: str,
+        source: ImportSourceSnapshot,
+        admitted_plans: tuple[ResolvedSheetPlan, ...],
     ) -> DatasetImportWorkerRequest:
         if not isinstance(import_request, DatasetImportRequest):
             raise TypeError(
@@ -464,6 +407,16 @@ class DatasetImportStaging(QtCore.QObject):
             raise TypeError(
                 "Dataset import workers must implement DatasetImportWorker."
             )
+        if not isinstance(source, ImportSourceSnapshot):
+            raise TypeError(
+                "Dataset import worker registration requires one immutable "
+                "source snapshot."
+            )
+        if worker.source != source:
+            raise DatasetImportStateError(
+                "Dataset import worker source does not match the admitted "
+                "immutable snapshot."
+            )
         if any(
             registration.worker is worker
             for registration in active.workers.values()
@@ -471,7 +424,8 @@ class DatasetImportStaging(QtCore.QObject):
             raise DatasetImportStateError(
                 "Dataset import worker is already registered."
             )
-        expected = int(expected_units)
+        plans = tuple(admitted_plans)
+        expected = len(plans)
         if expected <= 0:
             raise DatasetImportStateError(
                 "Dataset import workers must account for at least one result unit."
@@ -484,23 +438,22 @@ class DatasetImportStaging(QtCore.QObject):
             raise DatasetImportStateError(
                 "Dataset import workers exceed the admitted result-unit count."
             )
+        if registered_total + expected > _MAX_IMPORT_UNITS:
+            raise DatasetImportStateError(
+                "A dataset import cannot contain more than 64 resolved units."
+            )
         worker_id = self._next_worker_id
         self._next_worker_id += 1
-        source = DatasetImportSource(
-            filepath=source_path,
-            original_filename=os.path.basename(source_path),
-            original_format=source_format,
-        )
         request = DatasetImportWorkerRequest(
             import_request=active.request,
             worker_id=worker_id,
             source=source,
             expected_units=expected,
+            admitted_plans=plans,
         )
         registration = _RegisteredWorker(
             request=request,
             worker=worker,
-            config=config,
         )
         worker.loaded.connect(
             lambda display_name, payload, request=request, worker=worker: (
@@ -562,38 +515,6 @@ class DatasetImportStaging(QtCore.QObject):
             for registration in active.workers.values()
         )
 
-    def worker_config(
-        self,
-        request: DatasetImportWorkerRequest,
-    ) -> Any:
-        _active, registration = self._require_request(request)
-        return registration.config
-
-    def stage_unit(
-        self,
-        request: DatasetImportWorkerRequest,
-        unit: DatasetImportUnit,
-    ) -> bool:
-        active, registration = self._require_request(request)
-        if active.terminal_outcome is not None:
-            return False
-        if not isinstance(unit, DatasetImportUnit):
-            raise TypeError("Dataset import success requires DatasetImportUnit.")
-        self._account_worker_units(active, registration, 1)
-        active.units.append(unit)
-        return True
-
-    def stage_error(
-        self,
-        request: DatasetImportWorkerRequest,
-        message: str,
-    ) -> bool:
-        active, registration = self._require_request(request)
-        if active.terminal_outcome is not None:
-            return False
-        self._record_failure(active, registration, request, message)
-        return True
-
     def release_unstarted_worker(
         self,
         request: DatasetImportWorkerRequest,
@@ -627,13 +548,23 @@ class DatasetImportStaging(QtCore.QObject):
         if active.terminal_outcome is not None:
             return False
         try:
-            event = DatasetImportSuccess(
-                request=request,
+            plan = request.admitted_plans[registration.accounted_units]
+            expected_display_name = request.source.original_filename
+            if plan.sheet_name is not None:
+                expected_display_name = (
+                    f"{expected_display_name}::{plan.sheet_name}"
+                )
+            if display_name != expected_display_name:
+                raise ValueError(
+                    "Dataset worker result label does not match its next "
+                    "admitted typed plan."
+                )
+            unit = DatasetImportUnit(
+                source=request.source,
                 display_name=display_name,
                 payload=payload,
-                exact_source_bytes=worker.exact_source_bytes,
             )
-        except (TypeError, ValueError) as exc:
+        except (IndexError, TypeError, ValueError) as exc:
             self._record_failure(
                 active,
                 registration,
@@ -641,7 +572,21 @@ class DatasetImportStaging(QtCore.QObject):
                 f"{type(exc).__name__}: {exc}",
             )
             return False
-        self.workerSucceeded.emit(event)
+        retained_cells = sum(len(series.t) for series in payload.observations)
+        if (
+            active.retained_cells + retained_cells
+            > _MAX_IMPORT_RETAINED_OBSERVATION_CELLS
+        ):
+            self._record_failure(
+                active,
+                registration,
+                request,
+                "The import exceeds the 1000000 retained-observation-cell limit.",
+            )
+            return False
+        self._account_worker_units(active, registration, 1)
+        active.units.append(unit)
+        active.retained_cells += retained_cells
         return True
 
     def _worker_progressed(
@@ -728,7 +673,7 @@ class DatasetImportStaging(QtCore.QObject):
             failure = DatasetImportFailure(request=request, message=message)
         self._account_worker_units(active, registration, missing)
         if failure is not None:
-            active.errors.append(failure.message)
+            self._latch_failure(active)
         active.workers.pop(request.worker_id)
         try:
             worker.deleteLater()
@@ -746,6 +691,7 @@ class DatasetImportStaging(QtCore.QObject):
         if active.terminal_outcome is None:
             active.terminal_outcome = str(outcome or "user_canceled")
             active.units.clear()
+            active.retained_cells = 0
             for registration in tuple(active.workers.values()):
                 try:
                     registration.worker.requestInterruption()
@@ -754,22 +700,24 @@ class DatasetImportStaging(QtCore.QObject):
         self._finish_if_ready()
         return True
 
-    def take_completion_for_commit(self, import_id: int) -> DatasetImportCompletionIntent | None:
-        """Take one admitted import completion for raw-record commit."""
+    def take_batch_for_commit(
+        self,
+        import_id: int,
+        *,
+        existing_records: tuple[RawDatasetRecord, ...],
+    ) -> RawDatasetBatchProposal | None:
+        """Take one complete staging-admitted raw-record batch."""
         completion = self._completion
         if completion is None or completion.import_id != int(import_id):
             return None
-        self._completion = None
-        self.busyChanged.emit(False)
-        return completion
-
-    def discard_completion(self, *, reason: str) -> bool:
-        if self._completion is None:
-            return False
-        self._completion = None
-        self.discarded.emit(str(reason))
-        self.busyChanged.emit(self.busy)
-        return True
+        try:
+            return _raw_record_batch_proposal(
+                completion,
+                existing_records=existing_records,
+            )
+        finally:
+            self._completion = None
+            self.busyChanged.emit(False)
 
     def fence_application_close_admission(self) -> None:
         """Permanently reject every later dataset-import admission."""
@@ -780,9 +728,6 @@ class DatasetImportStaging(QtCore.QObject):
         """Suppress publication and request cancellation without waiting."""
 
         self.fence_application_close_admission()
-        self.discard_completion(
-            reason="Uncommitted dataset import was discarded during Close."
-        )
         self.cancel_active(outcome="application_close")
 
     def fence_for_project_replacement(self) -> None:
@@ -799,9 +744,6 @@ class DatasetImportStaging(QtCore.QObject):
         """Blocking cleanup solely for an accepted project replacement."""
 
         self.fence_for_project_replacement()
-        self.discard_completion(
-            reason="Uncommitted dataset import was discarded during project replacement."
-        )
         self.cancel_active(outcome="project_replacement")
         active = self._active
         if active is None:
@@ -836,14 +778,22 @@ class DatasetImportStaging(QtCore.QObject):
             return
         if active.completed_units < active.request.expected_units:
             return
-        completion = DatasetImportCompletionIntent(
+        completion = _DatasetImportCompletion(
             import_id=active.request.import_id,
+            origin_tab_id=active.request.origin_tab_id,
             units=tuple(active.units),
-            errors=tuple(active.errors),
         )
         self._active = None
         self._completion = completion
-        self.completionAvailable.emit(completion.import_id)
+        try:
+            self.completionAvailable.emit(completion.import_id)
+        finally:
+            if self._completion is completion:
+                self._completion = None
+                self.discarded.emit(
+                    "Dataset import completion was not consumed synchronously."
+                )
+                self.busyChanged.emit(False)
 
     def _require_active(self, import_id: int) -> _ActiveImport:
         active = self._active
@@ -928,9 +878,21 @@ class DatasetImportStaging(QtCore.QObject):
         message: str,
     ) -> None:
         event = DatasetImportFailure(request=request, message=message)
-        self._account_worker_units(active, registration, 1)
-        active.errors.append(event.message)
+        self._latch_failure(active)
         self.workerFailed.emit(event)
+
+    @staticmethod
+    def _latch_failure(active: _ActiveImport) -> None:
+        if active.terminal_outcome is not None:
+            return
+        active.terminal_outcome = "worker_failed"
+        active.units.clear()
+        active.retained_cells = 0
+        for registration in tuple(active.workers.values()):
+            try:
+                registration.worker.requestInterruption()
+            except RuntimeError:
+                continue
 
     @staticmethod
     def _remaining_worker_units(

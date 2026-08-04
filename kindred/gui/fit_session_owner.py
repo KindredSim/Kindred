@@ -18,7 +18,6 @@ from kindred.core.project_document import (
     FitDefaults,
     InitialConditionSet,
     MechanismTabDocument,
-    SimulationExecutionSettings,
 )
 from kindred.core.project_session import ProjectSession
 from kindred.core.simulator.dsl_parse import (
@@ -31,21 +30,25 @@ from kindred.core.simulator.dsl_parse import (
 )
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.fitting.launch import (
-    FitDatasetLocalSettings,
+    FitDatasetSetupEdit,
+    FitDefaultsSetupEdit,
     FitExecutionRequest,
-    FitInitialVariable,
+    FitInitialSetupEdit,
     FitOriginSnapshot,
+    FitParameterSetupEdit,
     FitParameterVariable,
     FitSetupSnapshot,
     build_fit_execution_request,
     capture_fit_origin,
+    create_initial_fit_setup,
+    fit_origin_science_matches,
     revalidate_fit_request_inclusions,
 )
-from kindred.gui.fitting.contracts import FitParametricSettings, FitRunIdentity
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.fitting.worker import (
     FitCandidate,
     FitLiveUpdate,
+    FitWorkerTerminal,
     GlobalFitWorker,
 )
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
@@ -74,33 +77,6 @@ class _PendingFitDetailedBalanceCorrection:
     generation: int
     correction: DetailedBalanceCorrectionRequest
     execution_request: FitExecutionRequest
-
-
-def _finite_float(value: object, field: str) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field} must be numeric.") from exc
-    if not math.isfinite(number):
-        raise ValueError(f"{field} must be finite.")
-    return number
-
-
-def _bound(value: object, field: str) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field} must be numeric.") from exc
-    if math.isnan(number):
-        raise ValueError(f"{field} cannot be NaN.")
-    return number
-
-
-def _int(value: object, field: str) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field} must be an integer.") from exc
 
 
 class FitSessionOwner(QtCore.QObject):
@@ -152,6 +128,8 @@ class FitSessionOwner(QtCore.QObject):
         self._window: FittingWindow | None = None
         self._worker: GlobalFitWorker | None = None
         self._candidate: FitCandidate | None = None
+        self._candidate_available_scopes: frozenset[str] = frozenset()
+        self._candidate_unavailable_reasons: dict[str, str] = {}
         self._origin: FitOriginSnapshot | None = None
         self._local_observables: tuple[FitLocalObservable, ...] = ()
         self._local_request: FitExecutionRequest | None = None
@@ -187,9 +165,23 @@ class FitSessionOwner(QtCore.QObject):
             return None
         window = self._window
         if window is not None:
-            window.show()
-            window.raise_()
-            window.activateWindow()
+            requested_id = str(tab_id or "").strip()
+            if (
+                requested_id
+                and self._origin is not None
+                and requested_id != self._origin.tab_id
+            ):
+                try:
+                    requested_name = self._session.document.tab(
+                        requested_id
+                    ).name
+                except Exception:
+                    requested_name = requested_id
+                window.show_origin_conflict(requested_name)
+            else:
+                window.show()
+                window.raise_()
+                window.activateWindow()
             return window
         if not self._gate.is_idle:
             self._set_status(
@@ -214,18 +206,15 @@ class FitSessionOwner(QtCore.QObject):
         self._window = window
         self._local_observables = ()
         self._local_request = None
-        self._local_setup_snapshot = None
+        initial_setup = create_initial_fit_setup(origin)
+        self._local_setup_snapshot = initial_setup
         self._pending_detailed_balance = None
         self._candidate = None
+        self._candidate_available_scopes = frozenset()
+        self._candidate_unavailable_reasons = {}
         try:
-            initial_request = self._parse_request(window.raw_request_values())
-            window.install_initial_snapshot(
-                FitSetupSnapshot.from_request(initial_request)
-            )
-            window.set_effective_source(
-                initial_request.mechanism_source,
-                initial_request.prepared_dsl,
-            )
+            window.rebase(origin, setup=initial_setup)
+            window.install_initial_snapshot(initial_setup)
         except (TypeError, ValueError, KeyError) as exc:
             window.deleteLater()
             self._window = None
@@ -238,6 +227,7 @@ class FitSessionOwner(QtCore.QObject):
         window.resumeRequested.connect(self.resume)
         window.applyRequested.connect(self.apply_candidate)
         window.addObservableRequested.connect(self.add_local_observable)
+        window.setupEditsRequested.connect(self._on_setup_edits)
         window.restoreSetupRequested.connect(self.restore_setup_snapshot)
         window.projectDefaultsRequested.connect(self.set_project_defaults)
         window.destroyed.connect(self._on_window_destroyed)
@@ -276,8 +266,13 @@ class FitSessionOwner(QtCore.QObject):
                 "Fit rejected: Apply or Revert the pending target edits first."
             )
             return False
+        if window.has_invalid_setup_edits:
+            self._set_status(
+                "Fit rejected: correct the invalid setup edit first."
+            )
+            return False
         try:
-            request = self._build_request(window.raw_request_values())
+            request = self._build_request()
         except (TypeError, ValueError, KeyError) as exc:
             self._set_status(f"Fit setup is invalid: {exc}")
             return False
@@ -295,61 +290,305 @@ class FitSessionOwner(QtCore.QObject):
             self._gate.release(self)
             self._set_status(f"Fit preparation failed before dispatch: {exc}")
             return False
-        self._local_observables = request.local_observables
-        window.set_effective_source(
-            request.mechanism_source,
-            request.prepared_dsl,
-        )
-        self._local_request = request
-        self._local_setup_snapshot = setup_snapshot
-        self._pending_detailed_balance = None
         self._worker_generation += 1
         generation = self._worker_generation
         self._publication_fenced_generation = None
-        worker.progress.connect(
-            lambda value, text, g=generation: self._on_progress(g, value, text)
-        )
-        worker.auto_modes_resolved.connect(
-            lambda modes, g=generation: self._on_auto_modes(g, modes)
-        )
-        worker.best_updated.connect(
-            lambda update, g=generation: self._on_best(g, update)
-        )
-        worker.curves_updated.connect(
-            lambda curves, g=generation: self._on_live_curves(g, curves)
-        )
-        worker.run_identity_ready.connect(
-            lambda identity, g=generation: self._on_run_identity(
-                g,
-                identity,
-            )
-        )
-        worker.succeeded.connect(
-            lambda candidate, g=generation: self._on_succeeded(g, candidate)
-        )
-        worker.failed.connect(
-            lambda message, g=generation: self._on_failed(g, message)
-        )
-        worker.detailed_balance_correction_required.connect(
-            lambda correction, g=generation: (
-                self._on_detailed_balance_correction_required(
+        connection_specs = (
+            (
+                worker.progress,
+                lambda value, text, g=generation: self._on_progress(
                     g,
-                    correction,
+                    value,
+                    text,
+                ),
+            ),
+            (
+                worker.auto_modes_resolved,
+                lambda modes, g=generation: self._on_auto_modes(g, modes),
+            ),
+            (
+                worker.best_updated,
+                lambda update, g=generation: self._on_best(g, update),
+            ),
+            (
+                worker.curves_updated,
+                lambda curves, g=generation: self._on_live_curves(g, curves),
+            ),
+            (
+                worker.detailed_balance_correction_required,
+                lambda correction, g=generation: (
+                    self._on_detailed_balance_correction_required(
+                        g,
+                        correction,
+                    )
+                ),
+            ),
+            (
+                worker.finished,
+                lambda g=generation, w=worker: self._on_worker_finished(g, w),
+            ),
+        )
+        connected_signals: list[tuple[object, object]] = []
+        start_attempted = False
+        try:
+            for signal, callback in connection_specs:
+                signal.connect(callback)
+                connected_signals.append((signal, callback))
+            self._worker = worker
+            start_attempted = True
+            worker.start()
+        except Exception as exc:
+            running: bool | None = False if not start_attempted else None
+            finished: bool | None = False if not start_attempted else None
+            if start_attempted:
+                try:
+                    running = bool(worker.isRunning())
+                except Exception:
+                    running = None
+                try:
+                    finished = bool(worker.isFinished())
+                except Exception:
+                    finished = None
+            verified_unstarted = running is False and finished is False
+            if verified_unstarted:
+                if self._worker is worker:
+                    self._worker = None
+                for signal, callback in reversed(connected_signals):
+                    try:
+                        signal.disconnect(callback)
+                    except (RuntimeError, TypeError):
+                        pass
+                self._publication_fenced_generation = generation
+                self._gate.release(self)
+                worker.deleteLater()
+                window.set_executing(False)
+                self._set_status(
+                    f"Fit dispatch failed before QThread start: {exc}"
                 )
+                return False
+
+            if running is True or finished is True:
+                self._install_started_request_state(
+                    request=request,
+                    setup_snapshot=setup_snapshot,
+                    window=window,
+                )
+                custody_state = "running" if running is True else "finished"
+            else:
+                custody_state = "unknown"
+            self.owned_qthreads_changed.emit()
+            window.set_executing(True)
+            self.execution_changed.emit(True)
+            self._set_status(
+                "Fit QThread start raised; native state is "
+                f"{custody_state}. Retaining worker and computation gate for "
+                f"native terminal cleanup: {exc}"
             )
+            return True
+        self._install_started_request_state(
+            request=request,
+            setup_snapshot=setup_snapshot,
+            window=window,
         )
-        worker.finished.connect(
-            lambda g=generation: self._on_worker_finished(g)
-        )
-        self._worker = worker
         self.owned_qthreads_changed.emit()
-        self._candidate = None
-        window.clear_candidate()
         window.set_executing(True)
         self.execution_changed.emit(True)
         self._set_status("Fit started.")
-        worker.start()
         return True
+
+    def _install_started_request_state(
+        self,
+        *,
+        request: FitExecutionRequest,
+        setup_snapshot: FitSetupSnapshot,
+        window: FittingWindow,
+    ) -> None:
+        """Replace prior local/candidate state only after native start is known."""
+
+        self._local_observables = request.local_observables
+        self._local_request = request
+        self._local_setup_snapshot = setup_snapshot
+        self._pending_detailed_balance = None
+        self._candidate = None
+        self._candidate_available_scopes = frozenset()
+        self._candidate_unavailable_reasons = {}
+        window.clear_candidate()
+
+    @QtCore.Slot(object)
+    def _on_setup_edits(self, intents: object) -> None:
+        """Fold one or more typed UI intents into the sole local setup owner."""
+
+        window = self._window
+        origin = self._origin
+        setup = self._local_setup_snapshot
+        if window is None or origin is None or setup is None:
+            return
+        if not isinstance(intents, tuple) or not intents:
+            window.set_status("Fit setup edits must be a nonempty tuple.")
+            return
+        try:
+            if self._worker is not None:
+                raise ValueError("Fit setup is locked while execution is active.")
+            for intent in intents:
+                intent_tab_id = str(getattr(intent, "origin_tab_id", ""))
+                intent_capture_id = str(
+                    getattr(intent, "origin_capture_id", "")
+                )
+                if (
+                    intent_tab_id != origin.tab_id
+                    or intent_capture_id != origin.capture_id
+                ):
+                    raise ValueError(
+                        "Fit setup edit no longer matches its origin."
+                    )
+                if isinstance(intent, FitDatasetSetupEdit):
+                    replacement = intent.dataset
+                    existing_ids = [item.dataset_id for item in setup.datasets]
+                    if replacement.dataset_id not in existing_ids:
+                        raise ValueError(
+                            "Fit dataset edit changed stable identity."
+                        )
+                    captured = next(
+                        item
+                        for item in origin.mapped_datasets
+                        if item.dataset_id == replacement.dataset_id
+                    )
+                    allowed_raw_ids = {
+                        item.raw_observation_id for item in captured.observations
+                    }
+                    edited_raw_ids = {
+                        raw_id
+                        for raw_id, _model in replacement.observation_targets
+                    }
+                    if not edited_raw_ids.issubset(allowed_raw_ids):
+                        raise ValueError(
+                            "Fit dataset edit references an uncaptured raw observation ID."
+                        )
+                    if (
+                        intent.raw_observation_id is not None
+                        and intent.raw_observation_id not in allowed_raw_ids
+                    ):
+                        raise ValueError(
+                            "Fit observation edit changed raw observation identity."
+                        )
+                    setup = replace(
+                        setup,
+                        datasets=tuple(
+                            replacement
+                            if item.dataset_id == replacement.dataset_id
+                            else item
+                            for item in setup.datasets
+                        ),
+                    )
+                elif isinstance(intent, FitParameterSetupEdit):
+                    replacement = intent.parameter
+                    existing_names = [item.name for item in setup.parameters]
+                    if replacement.name not in existing_names:
+                        raise ValueError(
+                            "Fit parameter edit changed stable identity."
+                        )
+                    parameters = tuple(
+                        replacement if item.name == replacement.name else item
+                        for item in setup.parameters
+                    )
+                    by_name = {item.name: item for item in parameters}
+                    local_observables = tuple(
+                        replace(
+                            observable,
+                            scalar_parameters=tuple(
+                                replace(
+                                    scalar,
+                                    value=by_name[scalar.name].initial,
+                                    minimum=by_name[scalar.name].minimum,
+                                    maximum=by_name[scalar.name].maximum,
+                                    scope=by_name[scalar.name].scope,
+                                )
+                                for scalar in observable.scalar_parameters
+                            ),
+                        )
+                        for observable in setup.local_observables
+                    )
+                    setup = self._setup_with_local_observables(
+                        replace(setup, parameters=parameters),
+                        local_observables,
+                    )
+                elif isinstance(intent, FitInitialSetupEdit):
+                    replacement = intent.initial
+                    key = (replacement.set_id, replacement.species)
+                    existing_keys = {
+                        (item.set_id, item.species) for item in setup.initials
+                    }
+                    if key not in existing_keys:
+                        raise ValueError(
+                            "Fit initial edit changed stable identity."
+                        )
+                    setup = replace(
+                        setup,
+                        initials=tuple(
+                            replacement
+                            if (item.set_id, item.species) == key
+                            else item
+                            for item in setup.initials
+                        ),
+                    )
+                elif isinstance(intent, FitDefaultsSetupEdit):
+                    setup = replace(setup, defaults=intent.defaults)
+                else:
+                    raise TypeError(
+                        "Fit window emitted an unknown setup edit intent."
+                    )
+        except (KeyError, StopIteration, TypeError, ValueError) as exc:
+            window.reject_setup_edits(
+                intents,
+                f"Fit setup edit rejected: {exc}",
+            )
+            return
+        self._local_setup_snapshot = setup
+        self._local_observables = setup.local_observables
+        self._local_request = None
+        window.accept_setup_edits(setup, intents)
+
+    def _setup_with_local_observables(
+        self,
+        setup: FitSetupSnapshot,
+        observables: tuple[FitLocalObservable, ...],
+    ) -> FitSetupSnapshot:
+        origin = self._origin
+        if origin is None:
+            raise RuntimeError("Fit has no origin.")
+        definitions = tuple(
+            DslDerivedObservableDefinition(
+                name=item.name,
+                expression=item.expression,
+                scalar_parameters=tuple(
+                    DslDerivedScalarDefinition(
+                        name=scalar.name,
+                        value=scalar.value,
+                        minimum=scalar.minimum,
+                        maximum=scalar.maximum,
+                        scope=scalar.scope,
+                    )
+                    for scalar in item.scalar_parameters
+                ),
+            )
+            for item in observables
+        )
+        effective_prepared = (
+            origin.prepared_dsl
+            if not definitions
+            else derive_prepared_dsl_with_observables(
+                origin.prepared_dsl,
+                definitions,
+            )
+        )
+        return replace(
+            setup,
+            mechanism_source=MechanismAuthoringSource.from_parts(
+                reactions_text=effective_prepared.analysis.normalized_text
+            ),
+            prepared_dsl=effective_prepared,
+            local_observables=observables,
+        )
 
     @QtCore.Slot()
     def cancel(self) -> bool:
@@ -438,10 +677,32 @@ class FitSessionOwner(QtCore.QObject):
             )
         )
         try:
+            if (
+                self._pending_detailed_balance is not pending
+                or self._worker is not worker
+                or not self._gate.is_owned_by(self)
+                or worker.publication_fenced
+            ):
+                raise RuntimeError(
+                    "Detailed-balance correction no longer owns the exact "
+                    "waiting Fit admission."
+                )
             canonical_prepared = self._commit_detailed_balance_source(
                 request.tab_id,
                 corrected_canonical,
             )
+            if (
+                self._application_close_fenced
+                or self._closing
+                or self._pending_detailed_balance is not pending
+                or self._worker is not worker
+                or not self._gate.is_owned_by(self)
+                or worker.publication_fenced
+            ):
+                raise RuntimeError(
+                    "Detailed-balance correction was retired during its "
+                    "canonical commit."
+                )
             if not isinstance(canonical_prepared, PreparedDslRequestSet):
                 raise RuntimeError(
                     "Canonical source admission rejected the correction."
@@ -467,6 +728,7 @@ class FitSessionOwner(QtCore.QObject):
                 rebased.scientific_settings
                 != previous_origin.scientific_settings
                 or rebased.mapped_datasets != previous_origin.mapped_datasets
+                or rebased.fit_defaults != previous_origin.fit_defaults
             ):
                 raise RuntimeError(
                     "Fit origin changed beyond the committed mechanism source."
@@ -522,6 +784,22 @@ class FitSessionOwner(QtCore.QObject):
                     "coordinates: "
                     + ", ".join(missing_parameters)
                 )
+            changed_parameter_ownership = sorted(
+                parameter.name
+                for parameter in pending.execution_request.parameters
+                if (
+                    (coordinate := writable_coordinates[parameter.name]).family
+                    != parameter.family
+                    or coordinate.role != parameter.role
+                    or not coordinate.writable
+                    or coordinate.derived
+                )
+            )
+            if changed_parameter_ownership:
+                raise RuntimeError(
+                    "Detailed-balance correction changed Fit coordinate "
+                    "ownership: " + ", ".join(changed_parameter_ownership)
+                )
             prior_parameters = {
                 parameter.name: parameter
                 for parameter in pending.execution_request.parameters
@@ -531,23 +809,37 @@ class FitSessionOwner(QtCore.QObject):
             for canonical_default in rebased.parameter_defaults:
                 canonical_names.add(canonical_default.name)
                 prior = prior_parameters.get(canonical_default.name)
+                coordinate = writable_coordinates[canonical_default.name]
+                if prior is not None and not prior.fit:
+                    corrected_dataset_values = (
+                        tuple(
+                            (dataset_id, canonical_default.initial)
+                            for dataset_id, _value in prior.dataset_values
+                        )
+                        if prior.scope == "per_dataset"
+                        else ()
+                    )
+                    corrected_parameter_items.append(
+                        replace(
+                            prior,
+                            initial=canonical_default.initial,
+                            dataset_values=corrected_dataset_values,
+                            display_name=coordinate.display_name,
+                            family=coordinate.family,
+                            role=coordinate.role,
+                            unit=coordinate.unit,
+                        )
+                    )
+                    continue
                 corrected_parameter_items.append(
                     canonical_default
                     if prior is None
                     else replace(
                         prior,
-                        display_name=writable_coordinates[
-                            prior.name
-                        ].display_name,
-                        family=writable_coordinates[
-                            prior.name
-                        ].family,
-                        role=writable_coordinates[
-                            prior.name
-                        ].role,
-                        unit=writable_coordinates[
-                            prior.name
-                        ].unit,
+                        display_name=coordinate.display_name,
+                        family=coordinate.family,
+                        role=coordinate.role,
+                        unit=coordinate.unit,
                     )
                 )
             corrected_parameter_items.extend(
@@ -611,27 +903,12 @@ class FitSessionOwner(QtCore.QObject):
         self._local_request = corrected_request
         self._local_setup_snapshot = corrected_snapshot
         if self._window is not None:
-            preserved = self._window.raw_request_values()
-            local_scalar_names = {
-                scalar.name
-                for observable in corrected_request.local_observables
-                for scalar in observable.scalar_parameters
-            }
             self._window.rebase(
                 rebased,
-                preserved=preserved,
-                supplemental_parameters=tuple(
-                    parameter
-                    for parameter in corrected_request.parameters
-                    if parameter.name in local_scalar_names
-                ),
+                setup=corrected_snapshot,
             )
             self._window.commit_current_target_selection()
             self._window.install_initial_snapshot(corrected_snapshot)
-            self._window.set_effective_source(
-                corrected_effective,
-                corrected_prepared,
-            )
             self._window.set_executing(True)
         self._set_status(
             "Detailed-balance correction committed; continuing Fit once."
@@ -644,7 +921,7 @@ class FitSessionOwner(QtCore.QObject):
         name: str,
         expression: str,
         dataset_id: str,
-        raw_column: str,
+        raw_observation_id: str,
         scalar_scope: str,
     ) -> bool:
         """Validate and retain a local observable without project mutation."""
@@ -653,7 +930,13 @@ class FitSessionOwner(QtCore.QObject):
             return False
         window = self._window
         origin = self._origin
-        if window is None or origin is None or self._worker is not None:
+        setup = self._local_setup_snapshot
+        if (
+            window is None
+            or origin is None
+            or setup is None
+            or self._worker is not None
+        ):
             return False
         try:
             prior_definitions = tuple(
@@ -700,46 +983,108 @@ class FitSessionOwner(QtCore.QObject):
                 if item.dataset_id == str(dataset_id)
             )
             if not any(
-                item.raw_column == str(raw_column)
+                item.raw_observation_id == str(raw_observation_id)
                 for item in mapped.observations
             ):
-                raise ValueError("Selected observation column is not captured.")
-            self._local_observables = (*self._local_observables, observable)
-            definitions = (
-                *prior_definitions,
-                DslDerivedObservableDefinition(
-                    name=observable.name,
-                    expression=observable.expression,
-                    scalar_parameters=tuple(
-                        DslDerivedScalarDefinition(
-                            name=scalar.name,
-                            value=scalar.value,
-                            minimum=scalar.minimum,
-                            maximum=scalar.maximum,
-                            scope=scalar.scope,
-                        )
-                        for scalar in observable.scalar_parameters
-                    ),
+                raise ValueError(
+                    "Selected raw observation ID is not captured."
+                )
+            local = next(
+                item
+                for item in setup.datasets
+                if item.dataset_id == mapped.dataset_id
+            )
+            targets_by_raw_id = dict(local.observation_targets)
+            previous_target = targets_by_raw_id.get(str(raw_observation_id))
+            targets_by_raw_id[str(raw_observation_id)] = observable.name
+            weight_by_target = dict(local.target_weights)
+            previous_weight = weight_by_target.get(previous_target or "", 1.0)
+            selected_raw_ids = set(targets_by_raw_id)
+            ordered_targets = tuple(
+                (
+                    observation.raw_observation_id,
+                    targets_by_raw_id[observation.raw_observation_id],
+                )
+                for observation in mapped.observations
+                if observation.raw_observation_id in selected_raw_ids
+            )
+            updated_local = replace(
+                local,
+                target_species=tuple(
+                    model_target for _raw_id, model_target in ordered_targets
                 ),
+                target_weights=tuple(
+                    (
+                        model_target,
+                        previous_weight
+                        if raw_id == str(raw_observation_id)
+                        else weight_by_target.get(model_target, 1.0),
+                    )
+                    for raw_id, model_target in ordered_targets
+                ),
+                observation_targets=ordered_targets,
             )
-            effective_prepared = derive_prepared_dsl_with_observables(
-                origin.prepared_dsl,
-                definitions,
+            retained_dataset_ids = tuple(
+                item.dataset_id for item in setup.datasets
             )
-            effective = MechanismAuthoringSource.from_parts(
-                reactions_text=effective_prepared.analysis.normalized_text
+            supplemental_parameters = tuple(
+                FitParameterVariable(
+                    name=scalar.name,
+                    display_name=scalar.name,
+                    initial=scalar.value,
+                    minimum=scalar.minimum,
+                    maximum=scalar.maximum,
+                    fit=True,
+                    log10=False,
+                    scope=scalar.scope,
+                    dataset_values=(
+                        tuple(
+                            (retained_id, scalar.value)
+                            for retained_id in retained_dataset_ids
+                        )
+                        if scalar.scope == "per_dataset"
+                        else ()
+                    ),
+                    family="scalar",
+                    role="scalar",
+                    unit="1",
+                )
+                for scalar in observable.scalar_parameters
             )
-            window.install_local_observable(
-                dataset_id=mapped.dataset_id,
-                raw_column=str(raw_column),
-                observable_name=observable.name,
-                scalar_parameters=observable.scalar_parameters,
+            existing_parameter_names = {
+                item.name for item in setup.parameters
+            }
+            if any(
+                item.name in existing_parameter_names
+                for item in supplemental_parameters
+            ):
+                raise ValueError(
+                    "Fit-local observable scalar identity already exists."
+                )
+            local_observables = (*setup.local_observables, observable)
+            setup = self._setup_with_local_observables(
+                replace(
+                    setup,
+                    datasets=tuple(
+                        updated_local
+                        if item.dataset_id == updated_local.dataset_id
+                        else item
+                        for item in setup.datasets
+                    ),
+                    parameters=(*setup.parameters, *supplemental_parameters),
+                ),
+                tuple(local_observables),
             )
-            window.set_effective_source(effective, effective_prepared)
+            self._local_observables = tuple(local_observables)
+            self._local_setup_snapshot = setup
+            window.project_setup_snapshot(setup)
+            window.commit_current_target_selection()
         except (StopIteration, TypeError, ValueError, KeyError) as exc:
             self._set_status(f"Add Observable rejected: {exc}")
             return False
         self._candidate = None
+        self._candidate_available_scopes = frozenset()
+        self._candidate_unavailable_reasons = {}
         self._local_request = None
         window.clear_candidate()
         self._set_status(
@@ -772,46 +1117,20 @@ class FitSessionOwner(QtCore.QObject):
             return False
         try:
             window.clear_candidate()
-            restored_snapshot = window.restore_snapshot(snapshot)
-            definitions = tuple(
-                DslDerivedObservableDefinition(
-                    name=item.name,
-                    expression=item.expression,
-                    scalar_parameters=tuple(
-                        DslDerivedScalarDefinition(
-                            name=scalar.name,
-                            value=scalar.value,
-                            minimum=scalar.minimum,
-                            maximum=scalar.maximum,
-                            scope=scalar.scope,
-                        )
-                        for scalar in item.scalar_parameters
-                    ),
-                )
-                for item in restored_snapshot.local_observables
+            restored_snapshot = self._setup_with_local_observables(
+                snapshot,
+                snapshot.local_observables,
             )
-            effective_prepared = (
-                origin.prepared_dsl
-                if not definitions
-                else derive_prepared_dsl_with_observables(
-                    origin.prepared_dsl,
-                    definitions,
-                )
-            )
-            effective_source = MechanismAuthoringSource.from_parts(
-                reactions_text=effective_prepared.analysis.normalized_text
-            )
+            window.restore_snapshot(restored_snapshot)
         except (TypeError, ValueError, KeyError) as exc:
             self._set_status(f"Fit setup reset failed: {exc}")
             return False
         self._local_observables = restored_snapshot.local_observables
         self._local_request = None
-        self._local_setup_snapshot = None
+        self._local_setup_snapshot = restored_snapshot
         self._candidate = None
-        window.set_effective_source(
-            effective_source,
-            effective_prepared,
-        )
+        self._candidate_available_scopes = frozenset()
+        self._candidate_unavailable_reasons = {}
         self._set_status("Fit setup snapshot restored.")
         return True
 
@@ -828,15 +1147,26 @@ class FitSessionOwner(QtCore.QObject):
             self._set_status("There is no completed Fit candidate to Apply.")
             return False
         selected = frozenset(str(item) for item in self._scope_items(scopes))
-        available = frozenset(candidate.available_scopes)
+        available = self._candidate_available_scopes
         if not selected or not selected.issubset(available):
             self._set_status("Apply contains an unavailable or empty scope selection.")
             return False
         if not self._origin_is_current():
             self._set_status("Apply rejected: origin science is no longer current.")
             return False
-        target_changes_pending = window.has_pending_target_changes
-        preserved = window.raw_request_values()
+        origin = self._origin
+        if origin is None:
+            return False
+        if window.has_pending_target_changes:
+            self._set_status(
+                "Apply rejected: Apply or Revert pending target edits first."
+            )
+            return False
+        preserved = self._local_setup_snapshot
+        if preserved is None:
+            self._set_status("Apply rejected: Fit has no typed local setup.")
+            return False
+        expected_token = self._session.capture_content_token()
         previous_document = self._session.document
         try:
             local_scalar_names = self._candidate_local_scalar_names(
@@ -868,7 +1198,7 @@ class FitSessionOwner(QtCore.QObject):
                 candidate,
                 selected,
             )
-            preserved = self._preserved_state_with_terminal_values(
+            preserved = self._preserved_setup_with_terminal_values(
                 preserved,
                 candidate,
             )
@@ -884,18 +1214,26 @@ class FitSessionOwner(QtCore.QObject):
             self._set_status(f"Apply rejected: {exc}")
             return False
         try:
-            delta = self._registry.replace_document(next_document)
-            changed = delta is not None
-            if delta is not None:
-                for affected_tab_id, set_ids in delta.affected_targets_by_tab:
-                    self._deauthorize_targets(affected_tab_id, set_ids)
+            result = self._registry.replace_document(
+                next_document,
+                expected_token=expected_token,
+            )
+            if result is None:
+                self._set_status(
+                    "Apply rejected: project content changed before publication."
+                )
+                return False
+            for affected_tab_id, set_ids in (
+                result.delta.affected_targets_by_tab
+            ):
+                self._deauthorize_targets(affected_tab_id, set_ids)
+            changed = result.changed
         except Exception as exc:
             self._set_status(
                 f"Apply failed at the document boundary: {exc}"
             )
             return False
         self._local_request = None
-        self._local_setup_snapshot = None
         self._local_observables = (
             ()
             if remaining_candidate is None
@@ -905,77 +1243,48 @@ class FitSessionOwner(QtCore.QObject):
         try:
             rebased = capture_fit_origin(self._session.document, origin.tab_id)
             self._origin = rebased
-            remaining_local_scalar_names = {
-                scalar.name
-                for observable in self._local_observables
-                for scalar in observable.scalar_parameters
-            }
+            refreshed_snapshot = self._rebase_setup_after_apply(
+                preserved,
+                rebased,
+                selected,
+                self._local_observables,
+            )
+            self._local_setup_snapshot = refreshed_snapshot
             window.rebase(
                 rebased,
-                preserved=preserved,
-                canonicalized_scopes=(
-                    selected
-                    & frozenset(
-                        {
-                            "initial_concentrations",
-                            "simulation_setup",
-                        }
-                    )
-                ),
-                supplemental_parameters=tuple(
-                    parameter
-                    for parameter in candidate.setup_snapshot.parameters
-                    if parameter.name in remaining_local_scalar_names
-                ),
+                setup=refreshed_snapshot,
                 preserve_snapshots=True,
             )
-            if not target_changes_pending:
-                window.commit_current_target_selection()
-            refreshed_request = self._parse_request(
-                window.raw_request_values()
-            )
-            refreshed_snapshot = FitSetupSnapshot.from_request(
-                refreshed_request
-            )
-            window.set_effective_source(
-                refreshed_request.mechanism_source,
-                refreshed_request.prepared_dsl,
-            )
-            self._local_observables = refreshed_request.local_observables
+            window.commit_current_target_selection()
+            self._local_observables = refreshed_snapshot.local_observables
             if remaining_candidate is None:
                 self._candidate = None
+                self._candidate_available_scopes = frozenset()
+                self._candidate_unavailable_reasons = {}
                 window.clear_candidate()
             else:
-                remaining_setup = replace(
-                    candidate.setup_snapshot,
-                    origin_tab_id=rebased.tab_id,
-                    origin_capture_id=rebased.capture_id,
-                    mechanism_source=refreshed_request.mechanism_source,
-                    prepared_dsl=refreshed_request.prepared_dsl,
-                    datasets=(
-                        refreshed_snapshot.datasets
-                        if "simulation_setup" in selected
-                        else candidate.setup_snapshot.datasets
-                    ),
-                    initials=(
-                        refreshed_snapshot.initials
-                        if "initial_concentrations" in selected
-                        else candidate.setup_snapshot.initials
-                    ),
-                    local_observables=refreshed_request.local_observables,
-                )
                 remaining_candidate = replace(
                     remaining_candidate,
                     origin_capture_id=rebased.capture_id,
-                    mechanism_source=refreshed_request.mechanism_source,
-                    prepared_dsl=refreshed_request.prepared_dsl,
-                    local_observables=refreshed_request.local_observables,
-                    setup_snapshot=remaining_setup,
+                    mechanism_source=refreshed_snapshot.mechanism_source,
+                    prepared_dsl=refreshed_snapshot.prepared_dsl,
+                    local_observables=refreshed_snapshot.local_observables,
+                    setup_snapshot=refreshed_snapshot,
                 )
                 self._candidate = remaining_candidate
-                window.set_candidate(remaining_candidate)
+                (
+                    self._candidate_available_scopes,
+                    self._candidate_unavailable_reasons,
+                ) = self._candidate_apply_feasibility(remaining_candidate)
+                window.set_candidate(
+                    remaining_candidate,
+                    available_scopes=self._candidate_available_scopes,
+                    unavailable_reasons=self._candidate_unavailable_reasons,
+                )
         except Exception as exc:
             self._candidate = None
+            self._candidate_available_scopes = frozenset()
+            self._candidate_unavailable_reasons = {}
             self._set_status(
                 "Fit values were applied, but local setup could not rebase: "
                 f"{exc}"
@@ -1016,26 +1325,33 @@ class FitSessionOwner(QtCore.QObject):
             return False
         if not isinstance(defaults, FitDefaults):
             raise TypeError("defaults must be FitDefaults.")
+        expected_token = self._session.capture_content_token()
         try:
-            delta = self._registry.replace_document(
-                replace(self._session.document, fit_defaults=defaults)
+            result = self._registry.replace_document(
+                replace(self._session.document, fit_defaults=defaults),
+                expected_token=expected_token,
             )
-            if delta is not None:
-                for affected_tab_id, set_ids in (
-                    delta.affected_targets_by_tab
-                ):
-                    self._deauthorize_targets(
-                        affected_tab_id,
-                        set_ids,
-                    )
+            if result is None:
+                self._set_status(
+                    "Project Fit defaults update rejected: project content "
+                    "changed before publication."
+                )
+                return False
+            for affected_tab_id, set_ids in (
+                result.delta.affected_targets_by_tab
+            ):
+                self._deauthorize_targets(
+                    affected_tab_id,
+                    set_ids,
+                )
         except Exception as exc:
             self._set_status(
                 f"Project Fit defaults update failed: {exc}"
             )
             return False
-        if delta is not None:
+        if result.changed:
             self._set_status("Current-project Fit defaults updated.")
-        return delta is not None
+        return result.changed
 
     def close_for_project_replacement(self, deadline: float) -> bool:
         """Blocking, resumable cleanup solely for project replacement."""
@@ -1051,6 +1367,8 @@ class FitSessionOwner(QtCore.QObject):
         self._application_close_fenced = True
         self._publication_fenced_generation = self._worker_generation
         self._candidate = None
+        self._candidate_available_scopes = frozenset()
+        self._candidate_unavailable_reasons = {}
         self._local_request = None
         self._local_setup_snapshot = None
         self._pending_detailed_balance = None
@@ -1122,6 +1440,8 @@ class FitSessionOwner(QtCore.QObject):
 
     def _discard_local(self) -> None:
         self._candidate = None
+        self._candidate_available_scopes = frozenset()
+        self._candidate_unavailable_reasons = {}
         self._local_request = None
         self._local_setup_snapshot = None
         self._local_observables = ()
@@ -1136,6 +1456,8 @@ class FitSessionOwner(QtCore.QObject):
             return
         self._window = None
         self._candidate = None
+        self._candidate_available_scopes = frozenset()
+        self._candidate_unavailable_reasons = {}
         self._local_request = None
         self._local_setup_snapshot = None
         self._local_observables = ()
@@ -1213,69 +1535,6 @@ class FitSessionOwner(QtCore.QObject):
         if self._window is not None:
             self._window.set_live_curves(curves)
 
-    def _on_run_identity(self, generation: int, identity: object) -> None:
-        if (
-            self._application_close_fenced
-            or self._closing
-            or generation != self._worker_generation
-            or generation == self._publication_fenced_generation
-            or self._worker is None
-            or self._worker.publication_fenced
-            or not isinstance(identity, FitRunIdentity)
-        ):
-            return
-        if self._window is not None:
-            self._window.set_run_identity(identity)
-
-    def _on_succeeded(self, generation: int, candidate: object) -> None:
-        if (
-            self._application_close_fenced
-            or self._closing
-            or generation != self._worker_generation
-            or generation == self._publication_fenced_generation
-            or self._worker is None
-            or self._worker.publication_fenced
-        ):
-            return
-        if not isinstance(candidate, FitCandidate):
-            self._on_failed(generation, "Fit returned an invalid candidate.")
-            return
-        if (
-            self._origin is None
-            or candidate.origin_capture_id != self._origin.capture_id
-        ):
-            self._on_failed(generation, "Fit candidate no longer matches this origin capture.")
-            return
-        self._candidate = candidate
-        rendered = True
-        if self._window is not None:
-            rendered = self._window.set_candidate(candidate)
-        self._set_status(
-            "Fit completed; candidate is ready to Apply."
-            if rendered
-            else "Fit completed; plotting failed, but the candidate remains ready to Apply."
-        )
-
-    def _on_failed(self, generation: int, message: str) -> None:
-        if (
-            self._application_close_fenced
-            or self._closing
-            or generation != self._worker_generation
-            or generation == self._publication_fenced_generation
-            or self._worker is None
-            or self._worker.publication_fenced
-        ):
-            return
-        worker = self._worker
-        if self._window is not None and worker is not None:
-            if worker.resolved_auto_modes:
-                self._window.set_resolved_auto_modes(
-                    worker.resolved_auto_modes
-                )
-            if worker.run_identity is not None:
-                self._window.set_run_identity(worker.run_identity)
-        self._set_status(str(message))
-
     def _on_detailed_balance_correction_required(
         self,
         generation: int,
@@ -1299,36 +1558,11 @@ class FitSessionOwner(QtCore.QObject):
             return
         execution_request = self._local_request
         setup_snapshot = self._local_setup_snapshot
-        expected_request_id = (
-            ""
-            if execution_request is None
-            else FitRunIdentity.build(
-                {
-                    "kind": "detailed_balance_correction",
-                    "schema_version": 1,
-                    "origin_capture_id": (
-                        execution_request.origin.capture_id
-                    ),
-                    "tab_id": execution_request.origin.tab_id,
-                    "source": (
-                        execution_request.origin.mechanism_source.reactions_text
-                    ),
-                    "temperature_K": float(
-                        execution_request.origin.scientific_settings.temperature
-                    ),
-                    "wegscheider_cyclicity_enabled": bool(
-                        execution_request.origin.scientific_settings.wegscheider_policy
-                    ),
-                    "issue": correction.issue,
-                }
-            ).short_hash
-        )
         if (
             execution_request is None
             or setup_snapshot is None
             or correction.origin.casefold() != "fit"
             or correction.tab_id != execution_request.origin.tab_id
-            or correction.request_id != expected_request_id
             or correction.source
             != execution_request.origin.mechanism_source.reactions_text
             or correction.temperature_K
@@ -1360,16 +1594,84 @@ class FitSessionOwner(QtCore.QObject):
         )
         self.detailed_balance_correction_requested.emit(correction)
 
-    def _on_worker_finished(self, generation: int) -> None:
-        if generation != self._worker_generation or self._worker is None:
+    def _on_worker_finished(
+        self,
+        generation: int,
+        worker: GlobalFitWorker,
+    ) -> None:
+        if (
+            generation != self._worker_generation
+            or self._worker is not worker
+        ):
             return
-        self._finish_worker()
+        terminal = worker.terminal_result
+        publication_allowed = bool(
+            not self._application_close_fenced
+            and not self._closing
+            and generation != self._publication_fenced_generation
+            and not worker.publication_fenced
+            and isinstance(terminal, FitWorkerTerminal)
+            and terminal.candidate is not None
+            and self._origin_is_current()
+        )
+        candidate = (
+            terminal.candidate
+            if isinstance(terminal, FitWorkerTerminal)
+            else None
+        )
+        if publication_allowed:
+            origin = self._origin
+            publication_allowed = bool(
+                origin is not None
+                and candidate is not None
+                and candidate.origin_tab_id == origin.tab_id
+                and candidate.origin_capture_id == origin.capture_id
+            )
+        failure_message = (
+            "Fit worker exited without one terminal result."
+            if not isinstance(terminal, FitWorkerTerminal)
+            else terminal.message
+        )
+        self._finish_worker(worker)
         if self._closing and self._window is not None:
             self._discard_local()
             self._window.force_close_after_cleanup()
+            return
+        if not publication_allowed or candidate is None:
+            if (
+                not self._application_close_fenced
+                and not self._closing
+                and failure_message
+            ):
+                self._set_status(failure_message)
+            return
+        self._candidate = candidate
+        (
+            self._candidate_available_scopes,
+            self._candidate_unavailable_reasons,
+        ) = self._candidate_apply_feasibility(candidate)
+        rendered = (
+            self._window.set_candidate(
+                candidate,
+                available_scopes=self._candidate_available_scopes,
+                unavailable_reasons=self._candidate_unavailable_reasons,
+            )
+            if self._window
+            else False
+        )
+        self._set_status(
+            "Fit completed; candidate is ready to Apply."
+            if rendered
+            else "Fit completed; plotting failed, but the candidate remains ready to Apply."
+        )
 
-    def _finish_worker(self) -> None:
+    def _finish_worker(
+        self,
+        expected: GlobalFitWorker | None = None,
+    ) -> None:
         worker = self._worker
+        if expected is not None and worker is not expected:
+            return
         self._worker = None
         self._pending_detailed_balance = None
         self._gate.release(self)
@@ -1413,339 +1715,46 @@ class FitSessionOwner(QtCore.QObject):
             )
         except Exception:
             return False
-        return bool(
-            current.mechanism_source == origin.mechanism_source
-            and current.scientific_settings == origin.scientific_settings
-            and current.mapped_datasets == origin.mapped_datasets
-        )
+        if not fit_origin_science_matches(origin, current):
+            return False
+        if current != origin:
+            setup = self._local_setup_snapshot
+            self._origin = current
+            if setup is not None:
+                setup = replace(
+                    setup,
+                    origin_tab_id=current.tab_id,
+                    origin_capture_id=current.capture_id,
+                )
+                self._local_setup_snapshot = setup
+                if self._window is not None:
+                    self._window.rebase(
+                        current,
+                        setup=setup,
+                        preserve_snapshots=True,
+                    )
+        return True
 
-    def _build_request(
-        self,
-        raw: Mapping[str, object],
-    ) -> FitExecutionRequest:
-        request = self._parse_request(raw)
+    def _build_request(self) -> FitExecutionRequest:
+        origin = self._origin
+        setup = self._local_setup_snapshot
+        if origin is None or setup is None:
+            raise RuntimeError("Fit has no typed local setup.")
         validated = build_fit_execution_request(
-            origin=request.origin,
-            mechanism_source=request.mechanism_source,
-            prepared_dsl=request.prepared_dsl,
-            local_observables=request.local_observables,
-            datasets=request.datasets,
-            parameters=request.parameters,
-            initials=request.initials,
-            defaults=request.defaults,
+            origin=origin,
+            mechanism_source=setup.mechanism_source,
+            prepared_dsl=setup.prepared_dsl,
+            local_observables=setup.local_observables,
+            datasets=setup.datasets,
+            parameters=setup.parameters,
+            initials=setup.initials,
+            defaults=setup.defaults,
         )
         revalidate_fit_request_inclusions(
             document=self._session.document,
             request=validated,
         )
         return validated
-
-    def _parse_request(
-        self,
-        raw: Mapping[str, object],
-    ) -> FitExecutionRequest:
-        origin = self._origin
-        if origin is None:
-            raise RuntimeError("Fit has no origin.")
-        datasets: list[FitDatasetLocalSettings] = []
-        for item in self._mapping_items(raw.get("datasets"), "datasets"):
-            execution_raw = item.get("execution")
-            if not isinstance(execution_raw, Mapping):
-                raise ValueError("Each dataset requires complete simulation setup.")
-            execution = SimulationExecutionSettings(
-                solver=str(execution_raw.get("solver") or ""),
-                t_start=_finite_float(execution_raw.get("t_start"), "t start"),
-                t_end=_finite_float(execution_raw.get("t_end"), "t end"),
-                integration_points=_int(
-                    execution_raw.get("integration_points"),
-                    "integration points",
-                ),
-            )
-            targets = [
-                target
-                for target in self._mapping_items(
-                    item.get("targets"),
-                    "targets",
-                )
-                if bool(target.get("use"))
-            ]
-            points = item.get("sample_points")
-            datasets.append(
-                FitDatasetLocalSettings(
-                    dataset_id=str(item.get("dataset_id") or ""),
-                    included=bool(item.get("included")),
-                    sample_t_min=_finite_float(
-                        item.get("sample_t_min"),
-                        "sampling t min",
-                    ),
-                    sample_t_max=_finite_float(
-                        item.get("sample_t_max"),
-                        "sampling t max",
-                    ),
-                    sample_points=(
-                        None
-                        if points is None
-                        else _int(points, "sampling Points")
-                    ),
-                    execution=execution,
-                    weight=_finite_float(item.get("weight"), "dataset weight"),
-                    target_species=tuple(
-                        str(target.get("model_target") or "")
-                        for target in targets
-                    ),
-                    target_weights=tuple(
-                        (
-                            str(target.get("model_target") or ""),
-                            _finite_float(
-                                target.get("weight"),
-                                "target weight",
-                            ),
-                        )
-                        for target in targets
-                    ),
-                    observation_targets=tuple(
-                        (
-                            str(target.get("raw_observation_id") or ""),
-                            str(target.get("raw_column") or ""),
-                            str(target.get("model_target") or ""),
-                        )
-                        for target in targets
-                    ),
-                    parametric=(
-                        None
-                        if str(item.get("x_name") or "t") == "t"
-                        else FitParametricSettings(
-                            dataset_id=str(item.get("dataset_id") or ""),
-                            x_name=str(item.get("x_name") or ""),
-                            requested_mode={
-                                "auto": "auto",
-                                "monotone": "monotone",
-                                "time-guided": "time_guided",
-                            }[
-                                str(item.get("x_mapping_mode") or "Auto")
-                                .strip()
-                                .lower()
-                            ],
-                            resolved_mode=(
-                                "time_guided"
-                                if str(item.get("x_mapping_mode") or "")
-                                .strip()
-                                .lower()
-                                == "time-guided"
-                                else "monotone"
-                            ),
-                        )
-                    ),
-                )
-            )
-        captured_parameters = {
-            item.name: item for item in origin.parameter_defaults
-        }
-        local_scalars = {
-            scalar.name: scalar
-            for observable in self._local_observables
-            for scalar in observable.scalar_parameters
-        }
-
-        def parameter_variable(
-            item: Mapping[str, object],
-        ) -> FitParameterVariable:
-            name = str(item.get("name") or "").strip()
-            captured = captured_parameters.get(name)
-            scalar = local_scalars.get(name)
-            if captured is None and scalar is None:
-                raise ValueError(
-                    f"Parameter {name!r} is not a captured writable coordinate."
-                )
-            return FitParameterVariable(
-                name=name,
-                display_name=(
-                    captured.display_name
-                    if captured is not None
-                    else name
-                ),
-                initial=_finite_float(
-                    item.get("initial"),
-                    "parameter initial",
-                ),
-                minimum=_bound(
-                    item.get("minimum"),
-                    "parameter minimum",
-                ),
-                maximum=_bound(
-                    item.get("maximum"),
-                    "parameter maximum",
-                ),
-                fit=bool(item.get("fit")),
-                log10=bool(item.get("log10")),
-                scope=(
-                    "per_dataset"
-                    if str(item.get("scope") or "").strip().lower()
-                    == "per-dataset"
-                    else "shared"
-                ),
-                dataset_values=tuple(
-                    (
-                        str(value_item.get("dataset_id") or ""),
-                        _finite_float(
-                            value_item.get("value"),
-                            "per-dataset parameter value",
-                        ),
-                    )
-                    for value_item in self._mapping_items(
-                        item.get("dataset_values"),
-                        "dataset parameter values",
-                    )
-                ),
-                family=(
-                    captured.family
-                    if captured is not None
-                    else "scalar"
-                ),
-                role=(
-                    captured.role
-                    if captured is not None
-                    else "scalar"
-                ),
-                unit=(
-                    captured.unit
-                    if captured is not None
-                    else "1"
-                ),
-            )
-        parameters = tuple(
-            parameter_variable(item)
-            for item in self._mapping_items(raw.get("parameters"), "parameters")
-        )
-        parameter_by_name = {
-            parameter.name: parameter for parameter in parameters
-        }
-        local_observables = tuple(
-            replace(
-                observable,
-                scalar_parameters=tuple(
-                    replace(
-                        scalar,
-                        value=parameter_by_name[scalar.name].initial,
-                        minimum=parameter_by_name[scalar.name].minimum,
-                        maximum=parameter_by_name[scalar.name].maximum,
-                        scope=parameter_by_name[scalar.name].scope,
-                    )
-                    for scalar in observable.scalar_parameters
-                ),
-            )
-            for observable in self._local_observables
-        )
-        initials = tuple(
-            FitInitialVariable(
-                set_id=str(item.get("set_id") or ""),
-                species=str(item.get("species") or ""),
-                initial=_finite_float(
-                    item.get("initial"),
-                    "initial concentration",
-                ),
-                minimum=_finite_float(
-                    item.get("minimum"),
-                    "initial minimum",
-                ),
-                maximum=_finite_float(
-                    item.get("maximum"),
-                    "initial maximum",
-                ),
-                fit=bool(item.get("fit")),
-                log10=bool(item.get("log10")),
-                scope=str(item.get("scope") or "Global").strip().lower(),
-            )
-            for item in self._mapping_items(raw.get("initials"), "initials")
-        )
-        included_dataset_ids = {
-            item.dataset_id for item in datasets if item.included
-        }
-        included_set_ids = {
-            mapped.set_id
-            for mapped in origin.mapped_datasets
-            if mapped.dataset_id in included_dataset_ids
-        }
-        for species in {item.species for item in initials}:
-            global_rows = [
-                item for item in initials
-                if (
-                    item.species == species
-                    and item.scope == "global"
-                    and item.set_id in included_set_ids
-                )
-            ]
-            if len({item.initial for item in global_rows}) > 1:
-                raise ValueError(
-                    f"Initial {species!r} has Multiple values after Local→Global; "
-                    "enter one explicit replacement value or switch back to Local."
-                )
-        defaults_raw = raw.get("defaults")
-        if not isinstance(defaults_raw, Mapping):
-            raise ValueError("Optimizer defaults are missing.")
-        defaults = FitDefaults(
-            method=str(defaults_raw.get("method") or ""),
-            max_nfev=_int(defaults_raw.get("max_nfev"), "maximum evaluations"),
-            ftol=_finite_float(
-                defaults_raw.get("ftol"),
-                "function tolerance",
-            ),
-            xtol=_finite_float(
-                defaults_raw.get("xtol"),
-                "step tolerance",
-            ),
-            use_seed=bool(defaults_raw.get("use_seed")),
-            seed=_int(defaults_raw.get("seed"), "seed"),
-        )
-        definitions = tuple(
-            DslDerivedObservableDefinition(
-                name=item.name,
-                expression=item.expression,
-                scalar_parameters=tuple(
-                    DslDerivedScalarDefinition(
-                        name=scalar.name,
-                        value=scalar.value,
-                        minimum=scalar.minimum,
-                        maximum=scalar.maximum,
-                        scope=scalar.scope,
-                    )
-                    for scalar in item.scalar_parameters
-                ),
-            )
-            for item in local_observables
-        )
-        effective_prepared = (
-            origin.prepared_dsl
-            if not definitions
-            else derive_prepared_dsl_with_observables(
-                origin.prepared_dsl,
-                definitions,
-            )
-        )
-        return FitExecutionRequest(
-            origin=origin,
-            mechanism_source=MechanismAuthoringSource.from_parts(
-                reactions_text=effective_prepared.analysis.normalized_text
-            ),
-            prepared_dsl=effective_prepared,
-            local_observables=local_observables,
-            datasets=tuple(datasets),
-            parameters=parameters,
-            initials=initials,
-            defaults=defaults,
-        )
-
-    @staticmethod
-    def _mapping_items(
-        value: object,
-        field: str,
-    ) -> tuple[Mapping[str, object], ...]:
-        if not isinstance(value, (list, tuple)):
-            raise ValueError(f"{field} must be a sequence.")
-        items = tuple(value)
-        if any(not isinstance(item, Mapping) for item in items):
-            raise ValueError(f"{field} must contain mappings.")
-        return items
 
     @staticmethod
     def _scope_items(scopes: object) -> tuple[str, ...]:
@@ -1768,12 +1777,12 @@ class FitSessionOwner(QtCore.QObject):
             )
         return frozenset(names)
 
-    @staticmethod
-    def _preserved_state_with_terminal_values(
-        preserved: Mapping[str, object],
+    def _preserved_setup_with_terminal_values(
+        self,
+        preserved: FitSetupSnapshot,
         candidate: FitCandidate,
-    ) -> dict[str, object]:
-        """Overlay terminal fitted values without replacing unrelated UI state."""
+    ) -> FitSetupSnapshot:
+        """Overlay terminal values into the owner-held typed setup."""
 
         terminal_parameters = {
             item.name: item
@@ -1786,79 +1795,147 @@ class FitSessionOwner(QtCore.QObject):
             raise ValueError(
                 "Fit terminal setup repeats a fitted parameter identity."
             )
-        parameters: list[object] = []
-        for raw_item in list(preserved.get("parameters") or ()):
-            if not isinstance(raw_item, Mapping):
-                parameters.append(raw_item)
-                continue
-            item = dict(raw_item)
-            terminal = terminal_parameters.get(
-                str(item.get("name") or "")
-            )
-            if terminal is not None:
-                item["initial"] = terminal.initial
-                item["dataset_values"] = [
-                    {
-                        "dataset_id": dataset_id,
-                        "value": value,
-                    }
-                    for dataset_id, value in terminal.dataset_values
-                ]
-            parameters.append(item)
-
-        terminal_initials: dict[tuple[str, str], float] = {}
-        seen_sets: set[str] = set()
-        for set_id, values in candidate.initial_values_by_set:
-            if set_id in seen_sets:
-                raise ValueError(
-                    f"Fit candidate repeats initial set {set_id!r}."
+        terminal_initials = {
+            (item.set_id, item.species): item
+            for item in candidate.setup_snapshot.initials
+            if item.fit
+        }
+        parameters = tuple(
+            (
+                replace(
+                    item,
+                    initial=terminal_parameters[item.name].initial,
+                    dataset_values=terminal_parameters[
+                        item.name
+                    ].dataset_values,
                 )
-            seen_sets.add(set_id)
-            for species, raw_value in values:
-                key = (set_id, species)
-                if key in terminal_initials:
-                    raise ValueError(
-                        f"Fit candidate repeats fitted initial {key!r}."
-                    )
-                value = float(raw_value)
-                if not math.isfinite(value) or value < 0.0:
-                    raise ValueError(
-                        f"Fitted initial {key!r} must be finite and "
-                        "nonnegative."
-                    )
-                terminal_initials[key] = value
-        for initial in candidate.setup_snapshot.initials:
-            if not initial.fit or initial.scope != "global":
+                if item.name in terminal_parameters
+                else item
+            )
+            for item in preserved.parameters
+        )
+        initials = tuple(
+            (
+                replace(
+                    item,
+                    initial=terminal_initials[
+                        (item.set_id, item.species)
+                    ].initial,
+                )
+                if (item.set_id, item.species) in terminal_initials
+                else item
+            )
+            for item in preserved.initials
+        )
+        return self._setup_with_local_observables(
+            replace(
+                preserved,
+                parameters=parameters,
+                initials=initials,
+            ),
+            candidate.setup_snapshot.local_observables,
+        )
+
+    def _rebase_setup_after_apply(
+        self,
+        preserved: FitSetupSnapshot,
+        origin: FitOriginSnapshot,
+        canonicalized_scopes: frozenset[str],
+        local_observables: tuple[FitLocalObservable, ...],
+    ) -> FitSetupSnapshot:
+        """Re-key retained typed setup directly onto the new canonical origin."""
+
+        baseline = create_initial_fit_setup(origin)
+        prior_datasets = {item.dataset_id: item for item in preserved.datasets}
+        datasets = tuple(
+            replace(
+                prior,
+                execution=(
+                    fresh.execution
+                    if "simulation_setup" in canonicalized_scopes
+                    else prior.execution
+                ),
+            )
+            if (prior := prior_datasets.get(fresh.dataset_id)) is not None
+            else fresh
+            for fresh in baseline.datasets
+        )
+        retained_dataset_ids = {item.dataset_id for item in datasets}
+        prior_parameters = {
+            item.name: item for item in preserved.parameters
+        }
+        canonical_parameters: list[FitParameterVariable] = []
+        for fresh in baseline.parameters:
+            prior = prior_parameters.get(fresh.name)
+            if prior is None:
+                canonical_parameters.append(fresh)
                 continue
-            key = (initial.set_id, initial.species)
-            previous = terminal_initials.get(key)
+            canonical_parameters.append(
+                replace(
+                    prior,
+                    display_name=fresh.display_name,
+                    initial=(
+                        fresh.initial
+                        if "parameters" in canonicalized_scopes
+                        else prior.initial
+                    ),
+                    dataset_values=tuple(
+                        (dataset_id, value)
+                        for dataset_id, value in prior.dataset_values
+                        if dataset_id in retained_dataset_ids
+                    ),
+                    family=fresh.family,
+                    role=fresh.role,
+                    unit=fresh.unit,
+                )
+            )
+        local_scalar_names = {
+            scalar.name
+            for observable in local_observables
+            for scalar in observable.scalar_parameters
+        }
+        supplemental = tuple(
+            replace(
+                item,
+                dataset_values=tuple(
+                    (dataset_id, value)
+                    for dataset_id, value in item.dataset_values
+                    if dataset_id in retained_dataset_ids
+                ),
+            )
+            for item in preserved.parameters
+            if item.name in local_scalar_names
+        )
+        prior_initials = {
+            (item.set_id, item.species): item for item in preserved.initials
+        }
+        initials = tuple(
+            replace(
+                prior,
+                initial=(
+                    fresh.initial
+                    if "initial_concentrations" in canonicalized_scopes
+                    else prior.initial
+                ),
+            )
             if (
-                previous is not None
-                and previous != initial.initial
-            ):
-                raise ValueError(
-                    f"Global fitted initial {key!r} disagrees with its "
-                    "terminal setup row."
-                )
-            terminal_initials[key] = initial.initial
-        initials: list[object] = []
-        for raw_item in list(preserved.get("initials") or ()):
-            if not isinstance(raw_item, Mapping):
-                initials.append(raw_item)
-                continue
-            item = dict(raw_item)
-            key = (
-                str(item.get("set_id") or ""),
-                str(item.get("species") or ""),
+                prior := prior_initials.get((fresh.set_id, fresh.species))
             )
-            if key in terminal_initials:
-                item["initial"] = terminal_initials[key]
-            initials.append(item)
-
-        merged = dict(preserved)
-        merged["parameters"] = parameters
-        merged["initials"] = initials
-        return merged
+            is not None
+            else fresh
+            for fresh in baseline.initials
+        )
+        rebased = replace(
+            baseline,
+            datasets=datasets,
+            parameters=(*canonical_parameters, *supplemental),
+            initials=initials,
+            defaults=preserved.defaults,
+        )
+        return self._setup_with_local_observables(
+            rebased,
+            local_observables,
+        )
 
     @classmethod
     def _remaining_candidate_after_apply(
@@ -1910,7 +1987,47 @@ class FitSessionOwner(QtCore.QObject):
                 else candidate.local_observables
             ),
         )
-        return remaining if remaining.available_scopes else None
+        return (
+            remaining
+            if (
+                remaining.parameters
+                or remaining.initial_values_by_set
+                or remaining.execution_by_set
+                or remaining.local_observables
+            )
+            else None
+        )
+
+    @classmethod
+    def _candidate_apply_feasibility(
+        cls,
+        candidate: FitCandidate,
+    ) -> tuple[frozenset[str], dict[str, str]]:
+        """Decide terminal Apply feasibility once in the sole Fit owner."""
+
+        local_scalar_names = cls._candidate_local_scalar_names(candidate)
+        available: set[str] = set()
+        unavailable: dict[str, str] = {}
+        if any(
+            name not in local_scalar_names
+            for name, _value in candidate.parameters
+        ):
+            available.add("parameters")
+        if candidate.initial_values_by_set:
+            available.add("initial_concentrations")
+        if candidate.execution_by_set:
+            available.add("simulation_setup")
+        if candidate.local_observables:
+            try:
+                cls._validate_terminal_observable_definitions(candidate)
+            except ValueError as exc:
+                unavailable["observable_definitions"] = (
+                    "Observable Definitions Apply is unavailable because "
+                    f"{exc}"
+                )
+            else:
+                available.add("observable_definitions")
+        return frozenset(available), unavailable
 
     @classmethod
     def _validate_terminal_observable_definitions(

@@ -3,7 +3,7 @@ Inline Axis Toolbar widget.
 
 Control-surface contract
 ------------------------
-- X dropdown: `t` by default. Any time-varying algebra symbol is allowed.
+- X dropdown: typed simulation or experimental identity, with `t` by default.
 - Y multi-select: all time-varying species and algebra series. Scalars disabled.
 - Add Guide from Scalar (exposed via Options menu stub entry).
 - Parametric toggle: plot X(t) vs each Y_i(t). Plotting may resample for
@@ -18,19 +18,19 @@ This widget provides a deterministic, fully functional control strip with:
 
 Signals emitted
 --------------
-xChanged(name: str)
-ySelectionChanged(selected: list[str])
+xChanged(selection: SimulationSeriesAxisSelection | ExperimentalAxisSelection)
+ySelectionChanged(selected: tuple[AxisSeriesSelection, ...])
 parametricToggled(enabled: bool)
 addGuideRequested(from_scalar: str | None)   # None means show chooser upstream
 optionsRequested(action: str, data: object)  # generic hook (e.g. "sampling", ...)
 
 Public API
 ----------
-set_x_candidates(names: list[str], default: str | None = None)
-set_y_candidates(series: list[tuple[str, bool]], *, disabled: list[str] = [])
-select_y(names: list[str])
-selected_y() -> list[str]
-current_x() -> str
+set_x_candidates(candidates, *, selected)
+set_y_candidates(candidates, *, disabled=())
+select_y(selections)
+selected_y() -> tuple[AxisSeriesSelection, ...]
+current_x() -> AxisSeriesSelection
 set_parametric(enabled: bool) -> None
 parametric_enabled() -> bool
 is_auto_range() -> bool
@@ -46,19 +46,26 @@ No filesystem, no network, no cwd usage.
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from PySide6.QtCore import Qt
+
+from kindred.core.project_presentation_state import (
+    AxisSeriesSelection,
+    ExperimentalAxisSelection,
+    SimulationSeriesAxisSelection,
+)
+from kindred.gui.plot_config import AxisSelectionCandidate
 
 __all__ = ["AxisToolbar"]
 
 
 class AxisToolbar(QtWidgets.QWidget):
     # High-level signals
-    xChanged = QtCore.Signal(str)
-    ySelectionChanged = QtCore.Signal(list)
+    xChanged = QtCore.Signal(object)
+    ySelectionChanged = QtCore.Signal(object)
     parametricToggled = QtCore.Signal(bool)
     addGuideRequested = QtCore.Signal(object)          # scalar name or None
     optionsRequested = QtCore.Signal(str, object)      # action, data
@@ -224,7 +231,7 @@ class AxisToolbar(QtWidgets.QWidget):
             self._build_horizontal_layout(x_label, y_label)
 
         # Wiring
-        self._x_combo.currentTextChanged.connect(self._on_x_changed)
+        self._x_combo.currentIndexChanged.connect(self._on_x_changed)
         self._parametric.toggled.connect(self._on_parametric_toggled)
         self._y_list.itemChanged.connect(self._on_y_item_changed)
         self._invert_y_selection_btn.clicked.connect(self.invert_y_selection)
@@ -250,52 +257,93 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_max.editingFinished.connect(self._on_range_changed)
 
         # Sensible defaults
-        self.set_x_candidates(["t"], default="t")
+        time_selection = SimulationSeriesAxisSelection("t")
+        self.set_x_candidates(
+            (AxisSelectionCandidate(time_selection, "t"),),
+            selected=time_selection,
+        )
         self.set_tab_order()
 
     # ----------------------- public API -----------------------
 
-    def set_x_candidates(self, names: Sequence[str], default: Optional[str] = None) -> None:
-        """Populate the X dropdown; if default provided and present, select it."""
-        prev = self._x_combo.currentText()
+    def set_x_candidates(
+        self,
+        candidates: Sequence[AxisSelectionCandidate],
+        *,
+        selected: AxisSeriesSelection,
+    ) -> None:
+        """Render one already-reconciled typed X selection exactly."""
+
+        values = tuple(candidates)
+        if any(not isinstance(item, AxisSelectionCandidate) for item in values):
+            raise TypeError(
+                "X candidates must contain AxisSelectionCandidate values."
+            )
+        identities = tuple(item.selection for item in values)
+        if len(identities) != len(set(identities)):
+            raise ValueError("X candidate identities must be unique.")
+        if not isinstance(
+            selected,
+            (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+        ):
+            raise TypeError("Selected X must be a typed axis identity.")
+        if selected not in identities:
+            raise ValueError(
+                "Selected X must already be reconciled into the candidate roster."
+            )
         self._x_combo.blockSignals(True)
-        self._x_combo.clear()
-        for n in names:
-            self._x_combo.addItem(str(n))
-        # pick default or keep previous if still present
-        if default and default in names:
-            self._x_combo.setCurrentText(default)
-        elif prev in names:
-            self._x_combo.setCurrentText(prev)
-        elif names:
-            self._x_combo.setCurrentIndex(0)
-        self._x_combo.blockSignals(False)
+        try:
+            self._x_combo.clear()
+            for candidate in values:
+                self._x_combo.addItem(
+                    candidate.label,
+                    candidate.selection,
+                )
+            self._x_combo.setCurrentIndex(identities.index(selected))
+        finally:
+            self._x_combo.blockSignals(False)
 
     def set_y_candidates(
         self,
-        series: Sequence[Tuple[str, bool]],
+        candidates: Sequence[tuple[AxisSelectionCandidate, bool]],
         *,
-        disabled: Sequence[str] = (),
+        disabled: Sequence[AxisSeriesSelection] = (),
     ) -> None:
         """
         Populate Y list.
 
         Parameters
         ----------
-        series : list of (name, checked)
-            Names of time-varying series and whether they should start checked.
-        disabled : list of names
-            Items that must be visible but not selectable (e.g., scalars).
+        candidates
+            Typed candidates paired with their projected checked state.
+        disabled
+            Typed identities that must remain visible but not selectable.
         """
-        disabled_set = set(map(str, disabled))
+        values = tuple(candidates)
+        if any(
+            not isinstance(candidate, AxisSelectionCandidate)
+            or type(checked) is not bool
+            for candidate, checked in values
+        ):
+            raise TypeError(
+                "Y candidates must pair AxisSelectionCandidate with bool."
+            )
+        identities = tuple(candidate.selection for candidate, _ in values)
+        if len(identities) != len(set(identities)):
+            raise ValueError("Y candidate identities must be unique.")
+        disabled_set = set(disabled)
 
         self._y_list.blockSignals(True)
         self._y_list.clear()
-        for name, checked in series:
-            it = QtWidgets.QListWidgetItem(str(name))
+        for candidate, checked in values:
+            it = QtWidgets.QListWidgetItem(candidate.label)
+            it.setData(
+                Qt.ItemDataRole.UserRole,
+                candidate.selection,
+            )
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             # Disable scalars as Y selections per spec
-            if str(name) in disabled_set:
+            if candidate.selection in disabled_set:
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEnabled)
                 it.setToolTip("Scalar values cannot be plotted as Y; use 'Add Guide from Scalar' in Options.")
                 it.setCheckState(Qt.CheckState.Unchecked)
@@ -305,14 +353,40 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_list.blockSignals(False)
         self._update_y_selector_text()
 
-    def select_y(self, names: Iterable[str]) -> None:
-        target = set(map(str, names))
+    def select_y(self, selections: Iterable[AxisSeriesSelection]) -> None:
+        values = tuple(selections)
+        if any(
+            not isinstance(
+                selection,
+                (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+            )
+            for selection in values
+        ):
+            raise TypeError("Selected Y values must be typed axis identities.")
+        target = set(values)
+        candidates = {
+            self._y_list.item(index).data(Qt.ItemDataRole.UserRole)
+            for index in range(self._y_list.count())
+        }
+        missing = target - candidates
+        if missing:
+            raise ValueError(
+                "Selected Y values must already be reconciled into the "
+                "candidate roster."
+            )
         self._y_list.blockSignals(True)
-        for i in range(self._y_list.count()):
-            it = self._y_list.item(i)
-            if it.flags() & Qt.ItemFlag.ItemIsEnabled:
-                it.setCheckState(Qt.CheckState.Checked if it.text() in target else Qt.CheckState.Unchecked)
-        self._y_list.blockSignals(False)
+        try:
+            for i in range(self._y_list.count()):
+                it = self._y_list.item(i)
+                if it.flags() & Qt.ItemFlag.ItemIsEnabled:
+                    selection = it.data(Qt.ItemDataRole.UserRole)
+                    it.setCheckState(
+                        Qt.CheckState.Checked
+                        if selection in target
+                        else Qt.CheckState.Unchecked
+                    )
+        finally:
+            self._y_list.blockSignals(False)
         self._update_y_selector_text()
 
     def invert_y_selection(self) -> None:
@@ -333,19 +407,33 @@ class AxisToolbar(QtWidgets.QWidget):
         self._update_y_selector_text()
         self.ySelectionChanged.emit(self.selected_y())
 
-    def selected_y(self) -> List[str]:
-        out: List[str] = []
+    def selected_y(self) -> tuple[AxisSeriesSelection, ...]:
+        out: list[AxisSeriesSelection] = []
         for i in range(self._y_list.count()):
             it = self._y_list.item(i)
             if (
                 it.flags() & Qt.ItemFlag.ItemIsEnabled
                 and it.checkState() == Qt.CheckState.Checked
             ):
-                out.append(it.text())
-        return out
+                selection = it.data(Qt.ItemDataRole.UserRole)
+                if not isinstance(
+                    selection,
+                    (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+                ):
+                    raise TypeError(
+                        "Y selector item lacks a typed axis identity."
+                    )
+                out.append(selection)
+        return tuple(out)
 
-    def current_x(self) -> str:
-        return self._x_combo.currentText()
+    def current_x(self) -> AxisSeriesSelection:
+        selection = self._x_combo.currentData()
+        if not isinstance(
+            selection,
+            (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+        ):
+            raise TypeError("X selector lacks a typed axis identity.")
+        return selection
 
     def set_parametric(self, enabled: bool) -> None:
         if self._parametric.isChecked() == bool(enabled):
@@ -564,19 +652,30 @@ class AxisToolbar(QtWidgets.QWidget):
         lay.addWidget(self._options_btn, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
 
     def _update_y_selector_text(self) -> None:
-        selected = self.selected_y()
-        if not selected:
+        selected_labels = [
+            self._y_list.item(index).text()
+            for index in range(self._y_list.count())
+            if (
+                self._y_list.item(index).flags()
+                & Qt.ItemFlag.ItemIsEnabled
+                and self._y_list.item(index).checkState()
+                == Qt.CheckState.Checked
+            )
+        ]
+        if not selected_labels:
             summary = "Y: none"
             tooltip = "No visible series selected"
-        elif len(selected) == 1:
-            summary = f"Y: {selected[0]}"
-            tooltip = selected[0]
-        elif len(selected) == 2:
-            summary = f"Y: {selected[0]}, {selected[1]}"
-            tooltip = ", ".join(selected)
+        elif len(selected_labels) == 1:
+            summary = f"Y: {selected_labels[0]}"
+            tooltip = selected_labels[0]
+        elif len(selected_labels) == 2:
+            summary = f"Y: {selected_labels[0]}, {selected_labels[1]}"
+            tooltip = ", ".join(selected_labels)
         else:
-            summary = f"Y: {selected[0]} +{len(selected) - 1}"
-            tooltip = ", ".join(selected)
+            summary = (
+                f"Y: {selected_labels[0]} +{len(selected_labels) - 1}"
+            )
+            tooltip = ", ".join(selected_labels)
         self._y_selector_btn.setText(summary)
         self._y_selector_btn.setToolTip(tooltip)
         self._y_selector_btn.setEnabled(self._y_list.count() > 0)
@@ -586,8 +685,9 @@ class AxisToolbar(QtWidgets.QWidget):
     def _emit_option(self, action: str, data: object) -> None:
         self.optionsRequested.emit(action, data)
 
-    def _on_x_changed(self, text: str) -> None:
-        self.xChanged.emit(text)
+    def _on_x_changed(self, _index: int) -> None:
+        if self._x_combo.count():
+            self.xChanged.emit(self.current_x())
 
     def _on_parametric_toggled(self, state: bool) -> None:
         self.parametricToggled.emit(bool(state))

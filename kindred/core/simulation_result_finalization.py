@@ -10,7 +10,6 @@ from kindred.core import simulation_algebra_policy
 from kindred.core.equilibrium_rate_authority import effective_equilibrium_keq
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
-from kindred.core.simulation_failure import build_simulation_failure
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.result_repository import (
     SimulationResultProvenance,
@@ -27,14 +26,9 @@ from kindred.core.algebra.simulation_series import (
     evaluate_compiled_algebra_series_for_simulation,
     evaluate_compiled_algebra_series_for_simulation_partial,
 )
-from kindred.core.simulation_result_payload import (
-    build_secondary_simulation_success_payload,
-    build_simulation_success_payload,
-)
 
 __all__ = [
     "FinalizedSimulationResult",
-    "build_finalized_simulation_result_payload",
     "build_simulation_row_algebra_context",
     "evaluate_simulation_result_algebra",
     "finalize_simulation_result",
@@ -47,14 +41,12 @@ class FinalizedSimulationResult:
     base_species_count: int
     algebra_scalars: dict[str, float]
     algebra_errors: list[dict[str, Any]]
-    warnings: list[dict[str, Any]]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "y", self.y.copy())
         object.__setattr__(self, "species_names", list(self.species_names))
         object.__setattr__(self, "algebra_scalars", deepcopy(dict(self.algebra_scalars)))
         object.__setattr__(self, "algebra_errors", [deepcopy(dict(error)) for error in self.algebra_errors])
-        object.__setattr__(self, "warnings", [deepcopy(dict(warning)) for warning in self.warnings])
 
 
 def _initials_for_algebra(
@@ -247,7 +239,6 @@ def evaluate_simulation_result_algebra(
         )
     algebra_scalars: dict[str, float] = {}
     algebra_errors: list[dict[str, Any]] = []
-    warnings: list[dict[str, Any]] = []
 
     if compiled_algebra_for_mechanism(mechanism) is None:
         return FinalizedSimulationResult(
@@ -256,7 +247,6 @@ def evaluate_simulation_result_algebra(
             base_species_count=len(base_species_names),
             algebra_scalars=algebra_scalars,
             algebra_errors=algebra_errors,
-            warnings=warnings,
         )
 
     species_series = {
@@ -271,7 +261,6 @@ def evaluate_simulation_result_algebra(
             base_species_count=len(base_species_names),
             algebra_scalars=algebra_scalars,
             algebra_errors=algebra_errors,
-            warnings=warnings,
         )
     policy = simulation_algebra_policy.algebra_policy_from_simulation_plan(
         simulation_plan,
@@ -358,8 +347,6 @@ def evaluate_simulation_result_algebra(
         )
     algebra_scalars = dict(evaluation.scalars)
     algebra_errors = list(evaluation.errors)
-    if evaluation.warning is not None:
-        warnings.append(dict(evaluation.warning))
     if not evaluation.series:
         return FinalizedSimulationResult(
             y=result_y,
@@ -367,7 +354,6 @@ def evaluate_simulation_result_algebra(
             base_species_count=len(base_species_names),
             algebra_scalars=algebra_scalars,
             algebra_errors=algebra_errors,
-            warnings=warnings,
         )
 
     algebra_names = [str(name) for name in evaluation.series.keys()]
@@ -378,7 +364,6 @@ def evaluate_simulation_result_algebra(
         base_species_count=len(base_species_names),
         algebra_scalars=algebra_scalars,
         algebra_errors=algebra_errors,
-        warnings=warnings,
     )
 
 
@@ -474,6 +459,36 @@ def finalize_simulation_result(
     solver_provenance = getattr(result, "provenance", None)
     if not isinstance(solver_provenance, Mapping):
         raise TypeError("solver result provenance must be a mapping.")
+    compiled_algebra = compiled_algebra_for_mechanism(mechanism)
+    requested_algebra_outputs = (
+        ()
+        if compiled_algebra is None
+        else tuple(compiled_algebra.observable_names)
+    )
+    succeeded_names = set(finalized.algebra_scalars)
+    succeeded_names.update(
+        finalized.species_names[finalized.base_species_count :]
+    )
+    failed_names = {
+        str(error.get("name") or "")
+        for error in finalized.algebra_errors
+        if str(error.get("name") or "") in requested_algebra_outputs
+    }
+    succeeded_algebra_outputs = tuple(
+        name
+        for name in requested_algebra_outputs
+        if name in succeeded_names
+    )
+    failed_algebra_outputs = tuple(
+        name
+        for name in requested_algebra_outputs
+        if name in failed_names and name not in succeeded_names
+    )
+    omitted_algebra_outputs = tuple(
+        name
+        for name in requested_algebra_outputs
+        if name not in succeeded_names and name not in failed_names
+    )
     return SimulationResultValue(
         t=result_time,
         series={
@@ -488,57 +503,11 @@ def finalize_simulation_result(
         provenance=SimulationResultProvenance(
             solver=dict(solver_provenance),
             preparation_warnings=tuple(preparation_warnings),
+            requested_algebra_outputs=requested_algebra_outputs,
+            succeeded_algebra_outputs=succeeded_algebra_outputs,
+            failed_algebra_outputs=failed_algebra_outputs,
+            omitted_algebra_outputs=omitted_algebra_outputs,
             algebra_errors=tuple(finalized.algebra_errors),
-            warnings=tuple(finalized.warnings),
         ),
         intervention_execution=getattr(result, "intervention_execution"),
     )
-
-
-def build_finalized_simulation_result_payload(
-    *,
-    mechanism: object,
-    result: object,
-    species_names: list[str],
-    initials_for_algebra: Mapping[str, Any] | None,
-    temperature_schedule: TemperatureScheduleProtocol | Mapping[str, object] | None,
-    simulation_plan: SimulationPlan | Mapping[str, Any] | None,
-    preparation_warnings: list[str] | tuple[str, ...],
-    solver: str,
-    mechanism_text: str,
-    solver_config: Mapping[str, Any] | None,
-    include_mechanism: bool,
-    parameters: tuple[tuple[str, float, str], ...] = (),
-) -> dict[str, Any]:
-    admitted = finalize_simulation_result(
-        mechanism=mechanism,
-        result=result,
-        species_names=species_names,
-        initials_for_algebra=initials_for_algebra,
-        temperature_schedule=temperature_schedule,
-        simulation_plan=simulation_plan,
-        parameters=parameters,
-        preparation_warnings=preparation_warnings,
-    )
-    warnings = [
-        build_simulation_failure(
-            "preparation_warning",
-            str(message),
-            details={"stage": "prepare_run_context"},
-        )
-        for message in list(preparation_warnings or [])
-    ]
-    warnings.extend(dict(value) for value in admitted.provenance.warnings)
-
-    builder = build_simulation_success_payload if include_mechanism else build_secondary_simulation_success_payload
-    kwargs: dict[str, Any] = {
-        "result": admitted,
-        "base_species_count": len(species_names),
-        "warnings": warnings,
-        "solver": str(solver),
-        "mechanism_text": str(mechanism_text or ""),
-        "solver_config": dict(solver_config or {}),
-    }
-    if include_mechanism:
-        kwargs["mechanism"] = mechanism
-    return builder(**kwargs)

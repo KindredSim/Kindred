@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from kindred.core.analysis.parametric_alignment import (
+    DeterministicParametricResolutionError,
     align_y_on_x_obs,
     align_y_on_x_obs_time_guided,
 )
@@ -81,6 +82,26 @@ def _is_expected_candidate_domain_failure(exc: BaseException) -> bool:
         isinstance(exc, FitSimulationError)
         and isinstance(exc.details, Mapping)
         and exc.details.get("candidate_domain") is True
+        and exc.details.get("fatal") is False
+    )
+
+
+def _candidate_trajectory_failure(
+    exc: FitSimulationError,
+    *,
+    stage: str,
+) -> FitSimulationError:
+    """Classify one proven optimizer-trajectory outcome, never configuration."""
+
+    return FitSimulationError(
+        exc.message,
+        failed_params=exc.failed_params,
+        details={
+            "fatal": False,
+            "candidate_domain": True,
+            "stage": str(stage),
+        },
+        context=exc.context,
     )
 
 @dataclass
@@ -191,6 +212,7 @@ class GlobalFitResult:
                 raise ValueError(
                     "Fit objective model identity must be complete by series."
                 )
+            stable_raw_ids: set[str] = set()
             for series_name, values in series_by_name.items():
                 expected_size = np.asarray(values, dtype=float).reshape(-1).size
                 aligned = (
@@ -210,6 +232,9 @@ class GlobalFitResult:
                         "Fit objective model rows require complete paired identity."
                     )
                 selection = self.model_selection_provenance[dataset_id][series_name]
+                observation_ids = self.model_observation_ids[
+                    dataset_id
+                ][series_name]
                 if (
                     not np.all(
                         np.isfinite(
@@ -244,8 +269,9 @@ class GlobalFitResult:
                     )
                     or any(
                         not str(value or "").strip()
-                        for value in self.model_observation_ids[dataset_id][series_name]
+                        for value in observation_ids
                     )
+                    or len(set(observation_ids)) != 1
                     or any(
                         not str(value or "").strip()
                         for value in self.model_raw_columns[dataset_id][series_name]
@@ -257,6 +283,12 @@ class GlobalFitResult:
                     or any(value not in {"direct", "interpolated"} for value in selection)
                 ):
                     raise ValueError("Fit objective row selection provenance is invalid.")
+                stable_raw_ids.add(observation_ids[0])
+            if len(stable_raw_ids) != len(series_by_name):
+                raise ValueError(
+                    "Fit objective series must retain unique dataset-local "
+                    "raw observation IDs."
+                )
 
 
 def _coerce_fit_failure_payload(value: object) -> SimulationFailure:
@@ -673,24 +705,83 @@ def select_fit_rows(
     else:
         if model_x is None:
             raise FitSimulationError(
-                f"X series {x_name!r} is missing from the simulation result."
+                f"X series {x_name!r} is missing from the simulation result.",
+                details={"fatal": True, "stage": "fit_identity"},
+            )
+        mode = str(x_mode or "").strip().lower()
+        if mode not in {"monotone", "time_guided"}:
+            raise FitSimulationError(
+                f"Dataset {dataset_label!r}: Fit requires a locked parametric-X "
+                f"mode; got {x_mode!r}.",
+                details={"fatal": True, "stage": "fit_configuration"},
+            )
+        sim_t = np.asarray(sim_time, dtype=float).reshape(-1)
+        sim_y = np.asarray(model_y, dtype=float).reshape(-1)
+        sim_x = np.asarray(model_x, dtype=float).reshape(-1)
+        segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
+        keys = tuple(str(value or "").strip() for value in segment_keys)
+        discontinuities = np.asarray(
+            discontinuity_ids,
+            dtype=np.int64,
+        ).reshape(-1)
+        if (
+            obs_t.size == 0
+            or obs_t.size != obs_x.size
+            or not np.all(np.isfinite(obs_t))
+            or not np.all(np.isfinite(obs_x))
+            or sim_t.size < 2
+            or sim_y.size != sim_t.size
+            or sim_x.size != sim_t.size
+            or not np.all(np.isfinite(sim_t))
+            or not np.all(np.isfinite(sim_y))
+            or not np.all(np.isfinite(sim_x))
+            or segments.size != sim_t.size
+            or len(keys) != sim_t.size
+            or discontinuities.size != sim_t.size
+            or any(not value for value in keys)
+            or np.any(segments < 0)
+            or np.any(np.diff(segments) < 0)
+            or np.any(discontinuities < 0)
+            or np.any(np.diff(discontinuities) < 0)
+            or np.any(np.diff(sim_t) <= 0.0)
+        ):
+            raise FitSimulationError(
+                "Parametric Fit received malformed observation or simulation "
+                "row identity.",
+                details={"fatal": True, "stage": "fit_identity"},
             )
         aligner = _ParametricXAligner(
-            mode=x_mode,
+            mode=mode,
             t_obs=obs_t,
             x_obs=obs_x,
-            t_sim=sim_time,
-            x_model=np.asarray(model_x, dtype=float),
-            segment_ids=segment_ids,
-            segment_keys=segment_keys,
-            discontinuity_ids=discontinuity_ids,
+            t_sim=sim_t,
+            x_model=sim_x,
+            segment_ids=segments,
+            segment_keys=keys,
+            discontinuity_ids=discontinuities,
             dataset_label=dataset_label,
             x_name=x_name,
         )
-        parametric = aligner.align(
-            y_model=np.asarray(model_y, dtype=float),
-            y_name=y_name,
-        )
+        try:
+            parametric = aligner.align(
+                y_model=sim_y,
+                y_name=y_name,
+            )
+        except DeterministicParametricResolutionError as exc:
+            raise _candidate_trajectory_failure(
+                exc,
+                stage="parametric_alignment",
+            ) from exc
+        except FitSimulationError as exc:
+            if mode != "time_guided":
+                raise
+            # With the complete typed inputs above, the time-guided aligner can
+            # now fail only because this candidate trajectory has no admissible
+            # crossing or produces a non-finite interpolated trajectory value.
+            raise _candidate_trajectory_failure(
+                exc,
+                stage="parametric_alignment",
+            ) from exc
         selected_x = np.asarray(parametric[0], dtype=float)
         selected = parametric[1:]
     return (
@@ -1154,9 +1245,8 @@ class DatasetSimulationEvaluation:
 
 
 def dataset_evaluation_is_fatal(result: DatasetSimulationEvaluation) -> bool:
-    return isinstance(result.error, FitSimulationError) and bool(
-        getattr(result.error, "details", {}).get("fatal")
-    )
+    error = result.error
+    return error is not None and not _is_expected_candidate_domain_failure(error)
 
 
 def evaluate_dataset_simulation(
@@ -1351,7 +1441,10 @@ class GlobalFitObjective:
             parameter_origins: Dict[str, str] = {}
             for values, origin in (
                 (param_dict, FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED),
-                (self._dataset_params.get(ds_id, {}), FITTING_PARAM_ORIGIN_CONFIGURED_DATASET),
+                (
+                    self._dataset_params.get(ds_id, {}),
+                    FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
+                ),
                 (optimizer_dataset_params, FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET),
                 (coupled_dataset_params, FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET),
             ):
@@ -1604,6 +1697,7 @@ def assemble_global_fit_result(
     payloads: List[FitDatasetSpec],
     layout: FitParameterLayout,
     fitted_params: Dict[str, float],
+    fixed_dataset_params: Dict[str, Dict[str, float]],
     combined_dataset_params: Dict[str, Dict[str, float]],
     weights: Dict[str, float],
     penalty_value: float,
@@ -1652,11 +1746,14 @@ def assemble_global_fit_result(
         _raise_if_fitting_cancelled(cancellation_check)
 
         full_params = dict(fitted_params)
+        full_params.update(fixed_dataset_params.get(ds_id, {}))
         full_params.update(combined_dataset_params.get(ds_id, {}))
         parameter_origins = {
             name: FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED
             for name in fitted_params
         }
+        for name in fixed_dataset_params.get(ds_id, {}):
+            parameter_origins[name] = FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
         for name in combined_dataset_params.get(ds_id, {}):
             coupled_names = {
                 item.parameter_name

@@ -9,7 +9,7 @@ import json
 import math
 from numbers import Real
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, TypeAlias
 
 import numpy as np
 
@@ -29,6 +29,7 @@ __all__ = [
     "PreviewResultIdentity",
     "PreviewResultEntry",
     "PreviewResultKey",
+    "ResultEntry",
     "ResultRepository",
     "SimulationResultProvenance",
     "SimulationResultValue",
@@ -132,6 +133,17 @@ def scientific_identity(prepared_dsl: object) -> str:
         raise TypeError("prepared_dsl must provide mechanism_for_execution().")
     mechanism = mechanism_for_execution()
     c0_identity = standard_concentration_identity(prepared_dsl)
+    metadata = getattr(mechanism, "metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise TypeError("prepared DSL mechanism metadata must be a mapping.")
+    from kindred.core.temperature import temperature_schedule_execution_identity
+
+    schedule = metadata.get("temperature_schedule")
+    schedule_identity = temperature_schedule_execution_identity(schedule)
+    if schedule is not None and schedule_identity is None:
+        raise TypeError(
+            "scientific identity requires a serializable temperature schedule."
+        )
 
     def canonical(value: object) -> object:
         if isinstance(value, Mapping):
@@ -155,6 +167,8 @@ def scientific_identity(prepared_dsl: object) -> str:
             return value
         if isinstance(value, Real):
             return {"float_hex": float(value).hex()}
+        if value is schedule:
+            return canonical(schedule_identity)
         if callable(value):
             model = getattr(value, "model", None)
             if model is not None:
@@ -179,9 +193,6 @@ def scientific_identity(prepared_dsl: object) -> str:
             f"{value.__class__.__qualname__}."
         )
 
-    metadata = getattr(mechanism, "metadata", {})
-    if not isinstance(metadata, Mapping):
-        raise TypeError("prepared DSL mechanism metadata must be a mapping.")
     from kindred.core.ode_builder import (
         build_effective_rate_coefficient_evaluator,
     )
@@ -206,7 +217,6 @@ def scientific_identity(prepared_dsl: object) -> str:
                 "stoich_back": canonical(getattr(equilibrium, "stoich_back", {})),
             }
         )
-    schedule = metadata.get("temperature_schedule")
     intervention_for_execution = getattr(
         prepared_dsl,
         "intervention_schedule_for_execution",
@@ -832,13 +842,69 @@ class SimulationResultProvenance:
 
     solver: Mapping[str, Any]
     preparation_warnings: tuple[str, ...] = ()
+    requested_algebra_outputs: tuple[str, ...] = ()
+    succeeded_algebra_outputs: tuple[str, ...] = ()
+    failed_algebra_outputs: tuple[str, ...] = ()
+    omitted_algebra_outputs: tuple[str, ...] = ()
     algebra_errors: tuple[Mapping[str, Any], ...] = ()
-    warnings: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.solver, Mapping):
             raise TypeError("solver provenance must be a mapping.")
-        warnings = tuple(str(value) for value in self.preparation_warnings)
+        preparation_warnings = tuple(
+            str(value) for value in self.preparation_warnings
+        )
+        requested = self._normalized_algebra_names(
+            self.requested_algebra_outputs,
+            field="requested_algebra_outputs",
+        )
+        succeeded = self._normalized_algebra_names(
+            self.succeeded_algebra_outputs,
+            field="succeeded_algebra_outputs",
+        )
+        failed = self._normalized_algebra_names(
+            self.failed_algebra_outputs,
+            field="failed_algebra_outputs",
+        )
+        omitted = self._normalized_algebra_names(
+            self.omitted_algebra_outputs,
+            field="omitted_algebra_outputs",
+        )
+        requested_set = set(requested)
+        partitions = {
+            "succeeded_algebra_outputs": set(succeeded),
+            "failed_algebra_outputs": set(failed),
+            "omitted_algebra_outputs": set(omitted),
+        }
+        for field, values in partitions.items():
+            unexpected = values.difference(requested_set)
+            if unexpected:
+                raise ValueError(
+                    f"{field} contains unrequested output(s): "
+                    + ", ".join(sorted(unexpected))
+                )
+        overlap = (
+            partitions["succeeded_algebra_outputs"]
+            & partitions["failed_algebra_outputs"]
+        ) | (
+            partitions["succeeded_algebra_outputs"]
+            & partitions["omitted_algebra_outputs"]
+        ) | (
+            partitions["failed_algebra_outputs"]
+            & partitions["omitted_algebra_outputs"]
+        )
+        if overlap:
+            raise ValueError(
+                "algebra output outcome partitions overlap: "
+                + ", ".join(sorted(overlap))
+            )
+        classified = set().union(*partitions.values())
+        missing = requested_set.difference(classified)
+        if missing:
+            raise ValueError(
+                "requested algebra outputs lack a terminal outcome: "
+                + ", ".join(sorted(missing))
+            )
         errors: list[Mapping[str, Any]] = []
         for value in self.algebra_errors:
             if not isinstance(value, Mapping):
@@ -846,19 +912,42 @@ class SimulationResultProvenance:
                     "algebra_errors must contain only mapping values."
                 )
             errors.append(_frozen_provenance_mapping(value))
-        warnings_payload: list[Mapping[str, Any]] = []
-        for value in self.warnings:
-            if not isinstance(value, Mapping):
-                raise TypeError("warnings must contain only mapping values.")
-            warnings_payload.append(_frozen_provenance_mapping(value))
         object.__setattr__(
             self,
             "solver",
             _frozen_provenance_mapping(self.solver),
         )
-        object.__setattr__(self, "preparation_warnings", warnings)
+        object.__setattr__(
+            self,
+            "preparation_warnings",
+            preparation_warnings,
+        )
+        object.__setattr__(self, "requested_algebra_outputs", requested)
+        object.__setattr__(self, "succeeded_algebra_outputs", succeeded)
+        object.__setattr__(self, "failed_algebra_outputs", failed)
+        object.__setattr__(self, "omitted_algebra_outputs", omitted)
         object.__setattr__(self, "algebra_errors", tuple(errors))
-        object.__setattr__(self, "warnings", tuple(warnings_payload))
+
+    @staticmethod
+    def _normalized_algebra_names(
+        values: Iterable[str],
+        *,
+        field: str,
+    ) -> tuple[str, ...]:
+        normalized = tuple(_required_id(value, field) for value in values)
+        if len(normalized) != len(set(normalized)):
+            raise ValueError(f"{field} contains duplicate output names.")
+        return normalized
+
+    @property
+    def completed_with_warnings(self) -> bool:
+        """Whether prominent completion warning presentation is required."""
+
+        return bool(
+            self.preparation_warnings
+            or self.failed_algebra_outputs
+            or self.omitted_algebra_outputs
+        )
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -980,20 +1069,23 @@ class PreviewResultEntry:
     result: SimulationResultValue
 
 
+ResultEntry: TypeAlias = ExplicitResultEntry | PreviewResultEntry
+
+
 class ResultRepository:
     """Store results while enforcing owner-issued Preview display eligibility."""
-
-    DEFAULT_CACHE_CAPACITY = 32
 
     def __init__(
         self,
         tab_id: str,
         *,
-        cache_capacity: int = DEFAULT_CACHE_CAPACITY,
+        cache_capacity: int,
     ) -> None:
         self._tab_id = _required_id(tab_id, "tab_id")
-        self._cache_capacity = int(cache_capacity)
-        if self._cache_capacity < 1:
+        if type(cache_capacity) is not int:
+            raise TypeError("cache_capacity must be an int.")
+        self._cache_capacity = cache_capacity
+        if cache_capacity < 1:
             raise ValueError("cache_capacity must be at least one.")
         self._explicit_by_set_id: dict[str, ExplicitResultEntry] = {}
         self._preview_by_set_id: dict[str, PreviewResultEntry] = {}
@@ -1014,6 +1106,16 @@ class ResultRepository:
     @property
     def cache_capacity(self) -> int:
         return self._cache_capacity
+
+    def resize_cache_capacity(self, cache_capacity: int) -> None:
+        """Apply a positive capacity immediately and trim this repository's LRU."""
+
+        if type(cache_capacity) is not int:
+            raise TypeError("cache_capacity must be an int.")
+        if cache_capacity < 1:
+            raise ValueError("cache_capacity must be at least one.")
+        self._cache_capacity = cache_capacity
+        self._trim_explicit_cache()
 
     def explicit_entry(self, set_id: str) -> ExplicitResultEntry | None:
         return self._explicit_by_set_id.get(str(set_id or ""))

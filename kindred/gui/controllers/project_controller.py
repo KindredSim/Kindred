@@ -15,8 +15,13 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.project_document import ProjectDocument
 from kindred.core.project_presentation_state import (
     default_workspace_presentation_state,
+    reconcile_workspace_presentation_state,
 )
-from kindred.core.project_session import PreparedProjectInstall, ProjectSession
+from kindred.core.project_session import (
+    PreparedProjectInstall,
+    ProjectContentToken,
+    ProjectSession,
+)
 from kindred.gui.controllers.config_controller import ConfigController
 from kindred.gui.controllers.simulation_job_owner import SimulationJobOwner
 from kindred.gui.dataset_import_staging import DatasetImportStaging
@@ -38,13 +43,17 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class ProjectTransientState:
-    """Exact unsaved Integration state relevant to one project disposition."""
+    """Exact transient authoring and active-work disposition state."""
 
     reactions_draft: bool = False
     notes_draft: bool = False
     invalid_reactions: bool = False
     invalid_initial_conditions: bool = False
     slider_drafts: bool = False
+    active_run_or_preview: bool = False
+    active_fit: bool = False
+    active_import: bool = False
+    active_xlsx_export: bool = False
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -53,6 +62,10 @@ class ProjectTransientState:
             "invalid_reactions",
             "invalid_initial_conditions",
             "slider_drafts",
+            "active_run_or_preview",
+            "active_fit",
+            "active_import",
+            "active_xlsx_export",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise TypeError(f"{field_name} must be bool.")
@@ -72,8 +85,21 @@ class ProjectTransientState:
         return bool(self.invalid_reactions or self.invalid_initial_conditions)
 
     @property
+    def has_active_work(self) -> bool:
+        return bool(
+            self.active_run_or_preview
+            or self.active_fit
+            or self.active_import
+            or self.active_xlsx_export
+        )
+
+    @property
     def has_any(self) -> bool:
-        return bool(self.has_authoring_edits or self.slider_drafts)
+        return bool(
+            self.has_authoring_edits
+            or self.slider_drafts
+            or self.has_active_work
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +109,7 @@ class _ProjectDispositionRequest:
     action: str
     archive_dirty: bool
     transient: ProjectTransientState
+    application_close: bool = False
 
 
 class _DispositionChoice(Enum):
@@ -101,6 +128,8 @@ class AuthoringDiscardMode(Enum):
 
 @dataclass(frozen=True, slots=True)
 class _DispositionResult:
+    content_token: ProjectContentToken
+    saved: bool = False
     discard_all_authoring: bool = False
     discard_slider_drafts: bool = False
 
@@ -131,8 +160,11 @@ class ProjectController(QtCore.QObject):
         xlsx_exports: object,
         set_status_text: Callable[[str], None],
         settle_execution_candidate: Callable[[], bool],
-        prepare_before_save: Callable[[], ProjectDocument | None],
-        commit_saved_document: Callable[[ProjectDocument], None],
+        prepare_before_save: Callable[[bool], ProjectDocument | None],
+        commit_saved_document: Callable[
+            [ProjectDocument, ProjectContentToken],
+            ProjectContentToken | None,
+        ],
         inspect_transient_state: Callable[[], ProjectTransientState],
         discard_authoring: Callable[[AuthoringDiscardMode], None],
         discard_slider_drafts: Callable[[], None],
@@ -247,6 +279,19 @@ class ProjectController(QtCore.QObject):
         logger.error("%s: %s", title, message)
         QtWidgets.QMessageBox.critical(self._parent_widget, title, message)
 
+    def _content_token_is_current(
+        self,
+        token: ProjectContentToken,
+        *,
+        action: str,
+    ) -> bool:
+        if self._session.is_content_token_current(token):
+            return True
+        self._set_status(
+            f"{action} was not completed because the current project changed."
+        )
+        return False
+
     def _transient_state(self) -> ProjectTransientState:
         state = self._inspect_transient_state()
         if not isinstance(state, ProjectTransientState):
@@ -255,38 +300,54 @@ class ProjectController(QtCore.QObject):
             )
         return state
 
-    def _disposition_request(self, action: str) -> _ProjectDispositionRequest:
-        return _ProjectDispositionRequest(
+    def _resolve_disposition(
+        self,
+        action: str,
+        *,
+        expected_token: ProjectContentToken,
+        application_close: bool = False,
+    ) -> _DispositionResult | None:
+        if not self._content_token_is_current(
+            expected_token,
+            action=action,
+        ):
+            return None
+        request = _ProjectDispositionRequest(
             action=str(action),
             archive_dirty=self._session.is_dirty(
                 self._tabs.workspace_presentation()
             ),
             transient=self._transient_state(),
+            application_close=bool(application_close),
         )
-
-    def _resolve_disposition(
-        self,
-        action: str,
-    ) -> _DispositionResult | None:
-        request = self._disposition_request(action)
         if not request.archive_dirty and not request.transient.has_any:
-            return _DispositionResult()
+            return _DispositionResult(content_token=expected_token)
         choice = self._prompt_disposition(request)
+        if not self._content_token_is_current(
+            expected_token,
+            action=action,
+        ):
+            return None
         if choice in {
             _DispositionChoice.CANCEL,
             _DispositionChoice.RETURN_AND_FIX,
         }:
             return None
         if choice is _DispositionChoice.SAVE:
-            if request.transient.has_invalid_authoring:
-                self._discard_authoring(AuthoringDiscardMode.INVALID_ONLY)
-            if not self.save_project():
+            saved_token = self._save_project_from_token(
+                expected_token,
+                discard_invalid_authoring=request.transient.has_invalid_authoring,
+            )
+            if saved_token is None:
                 return None
             return _DispositionResult(
+                content_token=saved_token,
+                saved=True,
                 discard_slider_drafts=request.transient.slider_drafts,
             )
         if choice is _DispositionChoice.DISCARD:
             return _DispositionResult(
+                content_token=expected_token,
                 discard_all_authoring=request.transient.has_authoring_edits,
                 discard_slider_drafts=request.transient.slider_drafts,
             )
@@ -313,6 +374,14 @@ class ProjectController(QtCore.QObject):
             details.append("One or more visible initial-condition cells are invalid.")
         if transient.slider_drafts:
             details.append("Slider Preview drafts are not project content.")
+        if transient.active_run_or_preview:
+            details.append("Run or Preview work is still active.")
+        if transient.active_fit:
+            details.append("Fit work is still active.")
+        if transient.active_import:
+            details.append("A dataset import is still active.")
+        if transient.active_xlsx_export:
+            details.append("An XLSX export is still active.")
         details.append(f"Choose once how to proceed before {request.action}.")
 
         dialog = QtWidgets.QMessageBox(self._parent_widget)
@@ -329,11 +398,25 @@ class ProjectController(QtCore.QObject):
                 and not transient.invalid_reactions
             )
         ):
-            label = (
-                "Discard Invalid Edits, Save, and Continue"
-                if transient.has_invalid_authoring
-                else "Save and Continue"
-            )
+            if request.application_close:
+                if transient.has_active_work:
+                    label = (
+                        "Discard Invalid Edits, Save, Stop Active Work, and Close"
+                        if transient.has_invalid_authoring
+                        else "Save, Stop Active Work, and Close"
+                    )
+                else:
+                    label = (
+                        "Discard Invalid Edits, Save, and Close"
+                        if transient.has_invalid_authoring
+                        else "Save and Close"
+                    )
+            else:
+                label = (
+                    "Discard Invalid Edits, Save, and Continue"
+                    if transient.has_invalid_authoring
+                    else "Save and Continue"
+                )
             button = dialog.addButton(
                 label,
                 QtWidgets.QMessageBox.ButtonRole.AcceptRole,
@@ -355,9 +438,11 @@ class ProjectController(QtCore.QObject):
             discard_parts.append("Invalid Cell Edit(s)")
         if transient.slider_drafts:
             discard_parts.append("Slider Preview")
-        if not discard_parts:
+        if not discard_parts and not transient.has_active_work:
             raise RuntimeError("Disposition prompt has no discardable work.")
-        if len(discard_parts) == 1:
+        if not discard_parts:
+            discard_subject = ""
+        elif len(discard_parts) == 1:
             discard_subject = discard_parts[0]
         elif len(discard_parts) == 2:
             discard_subject = " and ".join(discard_parts)
@@ -367,7 +452,23 @@ class ProjectController(QtCore.QObject):
                 + ", and "
                 + discard_parts[-1]
             )
-        discard_label = f"Discard {discard_subject} and Continue"
+        if request.application_close:
+            if transient.has_active_work:
+                discard_label = (
+                    f"Discard {discard_subject}, Stop Active Work, and Close"
+                    if discard_subject
+                    else "Stop Active Work and Close"
+                )
+            else:
+                discard_label = f"Discard {discard_subject} and Close"
+        elif transient.has_active_work:
+            discard_label = (
+                f"Discard {discard_subject}, Stop Active Work, and Continue"
+                if discard_subject
+                else "Stop Active Work and Continue"
+            )
+        else:
+            discard_label = f"Discard {discard_subject} and Continue"
         discard_button = dialog.addButton(
             discard_label,
             QtWidgets.QMessageBox.ButtonRole.DestructiveRole,
@@ -383,6 +484,8 @@ class ProjectController(QtCore.QObject):
             dialog.setDefaultButton(return_button)
         cancel_button = dialog.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
         choices[cancel_button] = _DispositionChoice.CANCEL
+        if transient.has_active_work:
+            dialog.setDefaultButton(cancel_button)
         dialog.exec()
         return choices.get(dialog.clickedButton(), _DispositionChoice.CANCEL)
 
@@ -482,12 +585,26 @@ class ProjectController(QtCore.QObject):
         prepared_workspace: PreparedWorkspaceInstall,
         disposition: _DispositionResult,
     ) -> bool:
+        if not self._content_token_is_current(
+            disposition.content_token,
+            action="Project replacement",
+        ):
+            return False
         if not self._settle_replacement_workers():
             return False
         previous_document = self._session.document
         try:
             self._apply_discard(disposition)
-            self._session.commit_install(prepared_session)
+            committed_token = self._session.commit_install(
+                prepared_session,
+                expected_token=disposition.content_token,
+            )
+            if committed_token is None:
+                self._content_token_is_current(
+                    disposition.content_token,
+                    action="Project replacement",
+                )
+                return False
             self._tabs.commit_install(prepared_workspace)
         finally:
             self._dataset_imports.resume_after_project_replacement()
@@ -516,6 +633,9 @@ class ProjectController(QtCore.QObject):
                 )
 
     def new_project(self) -> bool:
+        if not self._settle_execution_candidate():
+            return False
+        expected_token = self._session.capture_content_token()
         candidate = self._config.default_project_document()
         if not isinstance(candidate, ProjectDocument):
             raise TypeError(
@@ -529,9 +649,10 @@ class ProjectController(QtCore.QObject):
             ),
             path=None,
         )
-        if not self._settle_execution_candidate():
-            return False
-        disposition = self._resolve_disposition("starting a new project")
+        disposition = self._resolve_disposition(
+            "starting a new project",
+            expected_token=expected_token,
+        )
         if disposition is None:
             return False
         if not self._commit_project_install(
@@ -544,6 +665,7 @@ class ProjectController(QtCore.QObject):
         return True
 
     def load_project(self) -> bool:
+        chooser_token = self._session.capture_content_token()
         path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
             self._parent_widget,
             "Open Project",
@@ -552,21 +674,35 @@ class ProjectController(QtCore.QObject):
         )
         if not path:
             return False
+        if not self._content_token_is_current(
+            chooser_token,
+            action="Open Project",
+        ):
+            return False
+        if not self._settle_execution_candidate():
+            return False
         return self._open_project_candidate(
             path,
             remove_missing_recent=False,
+            expected_token=self._session.capture_content_token(),
         )
 
     def load_recent_project(self, path: str) -> bool:
+        if not self._settle_execution_candidate():
+            return False
         return self._open_project_candidate(
             path,
             remove_missing_recent=True,
+            expected_token=self._session.capture_content_token(),
         )
 
     def open_project_path(self, path: str) -> bool:
+        if not self._settle_execution_candidate():
+            return False
         return self._open_project_candidate(
             path,
             remove_missing_recent=False,
+            expected_token=self._session.capture_content_token(),
         )
 
     def _open_project_candidate(
@@ -574,8 +710,9 @@ class ProjectController(QtCore.QObject):
         path: str,
         *,
         remove_missing_recent: bool,
+        expected_token: ProjectContentToken,
     ) -> bool:
-        absolute_path = os.path.abspath(os.fspath(path))
+        absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
         if remove_missing_recent and not os.path.isfile(absolute_path):
             try:
                 self._config.remove_recent_project(absolute_path)
@@ -595,6 +732,11 @@ class ProjectController(QtCore.QObject):
         except Exception as exc:
             self._show_error("Open Error", f"Failed to open project:\n\n{exc}")
             return False
+        if not self._content_token_is_current(
+            expected_token,
+            action="Open Project",
+        ):
+            return False
         try:
             prepared_session, prepared_workspace = (
                 self._prepare_project_install(
@@ -608,11 +750,47 @@ class ProjectController(QtCore.QObject):
                 f"Failed to prepare project installation:\n\n{exc}",
             )
             return False
-        if not self._settle_execution_candidate():
-            return False
-        disposition = self._resolve_disposition("opening another project")
+        disposition = self._resolve_disposition(
+            "opening another project",
+            expected_token=expected_token,
+        )
         if disposition is None:
             return False
+        if (
+            disposition.saved
+            and self._same_canonical_path(
+                absolute_path,
+                self._session.current_path,
+            )
+        ):
+            self._apply_discard(disposition)
+            self._set_status(f"Project is already open: {absolute_path}")
+            try:
+                self._config.record_recent_project(absolute_path)
+            except Exception:
+                logger.warning("Recent-project promotion failed", exc_info=True)
+            return True
+        if disposition.saved:
+            if not self._content_token_is_current(
+                disposition.content_token,
+                action="Open Project",
+            ):
+                return False
+            try:
+                decoded = self._archive_store.load(absolute_path)
+                prepared_session, prepared_workspace = (
+                    self._prepare_project_install(
+                        decoded,
+                        path=absolute_path,
+                    )
+                )
+            except Exception as exc:
+                self._show_error(
+                    "Open Error",
+                    "Failed to reload the project after saving the current "
+                    f"project:\n\n{exc}",
+                )
+                return False
         if not self._commit_project_install(
             prepared_session,
             prepared_workspace,
@@ -626,23 +804,90 @@ class ProjectController(QtCore.QObject):
             logger.warning("Recent-project promotion failed", exc_info=True)
         return True
 
+    @staticmethod
+    def _same_canonical_path(
+        first: str | os.PathLike[str],
+        second: str | os.PathLike[str] | None,
+    ) -> bool:
+        if second is None:
+            return False
+        first_path = os.path.normcase(
+            os.path.realpath(os.path.abspath(os.fsdecode(os.fspath(first))))
+        )
+        second_path = os.path.normcase(
+            os.path.realpath(os.path.abspath(os.fsdecode(os.fspath(second))))
+        )
+        return first_path == second_path
+
     def save_project(self) -> bool:
-        candidate = self._prepared_save_document()
+        if not self._settle_execution_candidate():
+            return False
+        expected_token = self._session.capture_content_token()
+        candidate = self._prepared_save_document(
+            discard_invalid_authoring=False,
+        )
         if candidate is None:
             return False
-        path = self._session.current_path
-        if path is None:
-            return self._choose_save_path_and_write(candidate)
-        return self._write_project(path, candidate)
+        return (
+            self._save_prepared_document(
+                candidate,
+                expected_token=expected_token,
+                choose_destination=self._session.current_path is None,
+            )
+            is not None
+        )
 
     def save_project_as(self) -> bool:
-        candidate = self._prepared_save_document()
+        if not self._settle_execution_candidate():
+            return False
+        expected_token = self._session.capture_content_token()
+        candidate = self._prepared_save_document(
+            discard_invalid_authoring=False,
+        )
         if candidate is None:
             return False
-        return self._choose_save_path_and_write(candidate)
+        return (
+            self._save_prepared_document(
+                candidate,
+                expected_token=expected_token,
+                choose_destination=True,
+            )
+            is not None
+        )
 
-    def _prepared_save_document(self) -> ProjectDocument | None:
-        candidate = self._prepare_before_save()
+    def _save_project_from_token(
+        self,
+        expected_token: ProjectContentToken,
+        *,
+        discard_invalid_authoring: bool,
+    ) -> ProjectContentToken | None:
+        """Save during one already-fenced project disposition."""
+
+        if not self._content_token_is_current(
+            expected_token,
+            action="Save Project",
+        ):
+            return None
+        if not self._settle_execution_candidate():
+            return None
+        operative_token = self._session.capture_content_token()
+        candidate = self._prepared_save_document(
+            discard_invalid_authoring=discard_invalid_authoring,
+        )
+        if candidate is None:
+            return None
+        return self._save_prepared_document(
+            candidate,
+            expected_token=operative_token,
+            choose_destination=self._session.current_path is None,
+        )
+
+    def _prepared_save_document(
+        self,
+        *,
+        discard_invalid_authoring: bool,
+    ) -> ProjectDocument | None:
+        candidate = self._prepare_before_save(discard_invalid_authoring)
         if candidate is None:
             return None
         if not isinstance(candidate, ProjectDocument):
@@ -651,10 +896,22 @@ class ProjectController(QtCore.QObject):
             )
         return candidate
 
-    def _choose_save_path_and_write(
+    def _save_prepared_document(
         self,
         candidate: ProjectDocument,
-    ) -> bool:
+        *,
+        expected_token: ProjectContentToken,
+        choose_destination: bool,
+    ) -> ProjectContentToken | None:
+        if not choose_destination:
+            current_path = self._session.current_path
+            if current_path is None:
+                raise RuntimeError("Current project path is unavailable.")
+            return self._write_project(
+                current_path,
+                candidate,
+                expected_token=expected_token,
+            )
         path, _selected_filter = QtWidgets.QFileDialog.getSaveFileName(
             self._parent_widget,
             "Save Project As",
@@ -662,17 +919,53 @@ class ProjectController(QtCore.QObject):
             "Kindred Project (*.kin)",
         )
         if not path:
-            return False
-        return self._write_project(path, candidate)
+            return None
+        if not self._content_token_is_current(
+            expected_token,
+            action="Save Project",
+        ):
+            return None
+        return self._write_project(
+            path,
+            candidate,
+            expected_token=expected_token,
+        )
+
+    @staticmethod
+    def _canonical_save_path(path: str | os.PathLike[str]) -> str:
+        absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
+        directory, filename = os.path.split(absolute_path)
+        while filename.casefold().endswith(".kin"):
+            filename = filename[:-4]
+        if not filename:
+            raise ValueError("Project save destination requires a file name.")
+        return os.path.join(directory, f"{filename}.kin")
 
     def _write_project(
         self,
         path: str,
         candidate: ProjectDocument,
-    ) -> bool:
-        absolute_path = os.path.abspath(os.fspath(path))
-        presentation = self._tabs.workspace_presentation()
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        if not self._content_token_is_current(
+            expected_token,
+            action="Save Project",
+        ):
+            return None
         try:
+            absolute_path = self._canonical_save_path(path)
+        except (TypeError, ValueError, OSError) as exc:
+            self._show_error(
+                "Save Error",
+                f"Invalid project destination:\n\n{exc}",
+            )
+            return None
+        try:
+            presentation = reconcile_workspace_presentation_state(
+                candidate,
+                self._tabs.workspace_presentation(),
+            )
             self._archive_store.save(
                 absolute_path,
                 candidate,
@@ -680,9 +973,50 @@ class ProjectController(QtCore.QObject):
             )
         except Exception as exc:
             self._show_error("Save Error", f"Failed to save project:\n\n{exc}")
-            return False
-        self._commit_saved_document(candidate)
-        self._session.mark_saved(absolute_path, presentation)
+            return None
+        if not self._content_token_is_current(
+            expected_token,
+            action="Save Project",
+        ):
+            self._set_status(
+                "The selected snapshot was written, but the current project "
+                "changed and remains unsaved."
+            )
+            return None
+        committed_token = self._commit_saved_document(
+            candidate,
+            expected_token,
+        )
+        if committed_token is None:
+            self._set_status(
+                "The selected snapshot was written, but its stale document "
+                "was not published."
+            )
+            return None
+        if not isinstance(committed_token, ProjectContentToken):
+            raise TypeError(
+                "commit_saved_document must return ProjectContentToken or None."
+            )
+        if (
+            not self._session.is_content_token_current(committed_token)
+            or self._session.document != candidate
+        ):
+            self._set_status(
+                "The selected snapshot was written, but the current project "
+                "changed before save publication."
+            )
+            return None
+        if not self._session.mark_saved(
+            absolute_path,
+            presentation,
+            expected_token=committed_token,
+        ):
+            self._set_status(
+                "The selected snapshot was written, but the current project "
+                "changed before save publication."
+            )
+            return None
+        self._discard_authoring(AuthoringDiscardMode.ALL_UNACCEPTED)
         self._set_status(f"Saved project: {absolute_path}")
         try:
             self._config.record_recent_project(absolute_path)
@@ -690,7 +1024,7 @@ class ProjectController(QtCore.QObject):
             logger.warning("Recent-project update failed", exc_info=True)
         self.projectSaved.emit()
         self.projectStateChanged.emit()
-        return True
+        return committed_token
 
     def request_close(self) -> bool:
         """Start application Close once; subsequent requests only advance it."""
@@ -700,8 +1034,17 @@ class ProjectController(QtCore.QObject):
             return self._close_authorization is not None
         if not self._settle_execution_candidate():
             return False
-        disposition = self._resolve_disposition("closing Kindred")
+        disposition = self._resolve_disposition(
+            "closing Kindred",
+            expected_token=self._session.capture_content_token(),
+            application_close=True,
+        )
         if disposition is None:
+            return False
+        if not self._content_token_is_current(
+            disposition.content_token,
+            action="Close",
+        ):
             return False
         self._apply_discard(disposition)
         self._close_started = True

@@ -28,7 +28,10 @@ from kindred.core.project_document import (
     validate_project_document,
 )
 from kindred.core.project_presentation_state import (
+    AxisSeriesSelection,
+    ExperimentalAxisSelection,
     ProjectPresentationState,
+    SimulationSeriesAxisSelection,
     WorkspacePresentationState,
     validate_workspace_presentation_state,
 )
@@ -42,6 +45,11 @@ __all__ = [
 CURRENT_PROJECT_FORMAT = "kindred-kin-3"
 _PROJECT_MEMBER = "project.json"
 _SOURCE_MEMBER_PREFIX = "sources/"
+_MAX_ARCHIVE_MEMBERS = 257
+_MAX_SOURCE_MEMBER_BYTES = 32 * 1024 * 1024
+_MAX_PROJECT_MEMBER_BYTES = 128 * 1024 * 1024
+_MAX_ARCHIVE_MEMBER_BYTES = 512 * 1024 * 1024
+_MAX_ARCHIVE_FILE_BYTES = 513 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,8 +345,8 @@ def _encode_document(
                         "dataset_id": dataset_id,
                         "set_id": link.set_id,
                         "observation_mapping": [
-                            [raw_column, model_species]
-                            for raw_column, model_species
+                            [raw_observation_id, model_species]
+                            for raw_observation_id, model_species
                             in link.observation_mapping
                         ],
                         "include_in_fit": link.include_in_fit,
@@ -738,16 +746,19 @@ def _encode_presentation(
         "current_set_id": state.current_set_id,
         "plot_set_ids": list(state.plot_set_ids),
         "pinned_slider_set_ids": list(state.pinned_slider_set_ids),
-        "overlay_columns_by_dataset": [
+        "overlay_raw_observation_ids_by_dataset": [
             {
                 "dataset_id": dataset_id,
-                "columns": list(columns),
+                "raw_observation_ids": list(raw_observation_ids),
             }
-            for dataset_id, columns
-            in state.overlay_columns_by_dataset
+            for dataset_id, raw_observation_ids
+            in state.overlay_raw_observation_ids_by_dataset
         ],
-        "selected_x_series": state.selected_x_series,
-        "selected_y_series": list(state.selected_y_series),
+        "selected_x_series": _encode_axis_selection(state.selected_x_series),
+        "selected_y_series": [
+            _encode_axis_selection(selection)
+            for selection in state.selected_y_series
+        ],
         "selected_y_uses_default_all": state.selected_y_uses_default_all,
         "parametric_mode": state.parametric_mode,
         "reference_lines_visible": state.reference_lines_visible,
@@ -760,6 +771,65 @@ def _encode_presentation(
         "x_inverted": state.x_inverted,
         "y_inverted": state.y_inverted,
     }
+
+
+def _encode_axis_selection(
+    selection: AxisSeriesSelection,
+) -> dict[str, object]:
+    if isinstance(selection, SimulationSeriesAxisSelection):
+        return {
+            "kind": "simulation",
+            "series_name": selection.series_name,
+        }
+    if isinstance(selection, ExperimentalAxisSelection):
+        return {
+            "kind": "experimental",
+            "dataset_id": selection.dataset_id,
+            "raw_observation_id": selection.raw_observation_id,
+        }
+    raise TypeError("Axis selection has an unsupported type.")
+
+
+def _decode_axis_selection(
+    value: object,
+    label: str,
+) -> AxisSeriesSelection:
+    data = _object(value, label)
+    kind = _string(data.get("kind"), f"{label}.kind", nonblank=True)
+    if kind == "simulation":
+        fields = _exact_fields(
+            data,
+            label,
+            {"kind", "series_name"},
+        )
+        return SimulationSeriesAxisSelection(
+            series_name=_string(
+                fields["series_name"],
+                f"{label}.series_name",
+                nonblank=True,
+            )
+        )
+    if kind == "experimental":
+        fields = _exact_fields(
+            data,
+            label,
+            {"kind", "dataset_id", "raw_observation_id"},
+        )
+        return ExperimentalAxisSelection(
+            dataset_id=_string(
+                fields["dataset_id"],
+                f"{label}.dataset_id",
+                nonblank=True,
+            ),
+            raw_observation_id=_string(
+                fields["raw_observation_id"],
+                f"{label}.raw_observation_id",
+                nonblank=True,
+            ),
+        )
+    raise ValueError(
+        f"{label}.kind must be exactly 'simulation' or 'experimental'."
+    )
 
 
 def _optional_string(
@@ -782,7 +852,7 @@ def _decode_presentation(
             "current_set_id",
             "plot_set_ids",
             "pinned_slider_set_ids",
-            "overlay_columns_by_dataset",
+            "overlay_raw_observation_ids_by_dataset",
             "selected_x_series",
             "selected_y_series",
             "selected_y_uses_default_all",
@@ -799,17 +869,17 @@ def _decode_presentation(
     overlays: list[tuple[str, tuple[str, ...]]] = []
     for index, raw_overlay in enumerate(
         _array(
-            data["overlay_columns_by_dataset"],
-            f"{label}.overlay_columns_by_dataset",
+            data["overlay_raw_observation_ids_by_dataset"],
+            f"{label}.overlay_raw_observation_ids_by_dataset",
         )
     ):
         overlay_label = (
-            f"{label}.overlay_columns_by_dataset[{index}]"
+            f"{label}.overlay_raw_observation_ids_by_dataset[{index}]"
         )
         overlay = _exact_fields(
             raw_overlay,
             overlay_label,
-            {"dataset_id", "columns"},
+            {"dataset_id", "raw_observation_ids"},
         )
         overlays.append(
             (
@@ -820,14 +890,15 @@ def _decode_presentation(
                 ),
                 tuple(
                     _string(
-                        column,
-                        f"{overlay_label}.columns[{column_index}]",
+                        raw_observation_id,
+                        f"{overlay_label}.raw_observation_ids["
+                        f"{raw_observation_index}]",
                         nonblank=True,
                     )
-                    for column_index, column in enumerate(
+                    for raw_observation_index, raw_observation_id in enumerate(
                         _array(
-                            overlay["columns"],
-                            f"{overlay_label}.columns",
+                            overlay["raw_observation_ids"],
+                            f"{overlay_label}.raw_observation_ids",
                         )
                     )
                 ),
@@ -864,16 +935,15 @@ def _decode_presentation(
                 )
             )
         ),
-        overlay_columns_by_dataset=tuple(overlays),
-        selected_x_series=_optional_string(
+        overlay_raw_observation_ids_by_dataset=tuple(overlays),
+        selected_x_series=_decode_axis_selection(
             data["selected_x_series"],
             f"{label}.selected_x_series",
         ),
         selected_y_series=tuple(
-            _string(
+            _decode_axis_selection(
                 item,
                 f"{label}.selected_y_series[{index}]",
-                nonblank=True,
             )
             for index, item in enumerate(
                 _array(
@@ -1023,9 +1093,19 @@ class KinArchiveStore:
 
     def load(self, path: str | os.PathLike[str]) -> ArchiveProject:
         archive_path = os.path.abspath(os.fspath(path))
+        if os.stat(archive_path).st_size > _MAX_ARCHIVE_FILE_BYTES:
+            raise ValueError(
+                "Current project archive exceeds the 513 MiB "
+                "supported-size limit."
+            )
         try:
             with zipfile.ZipFile(archive_path, mode="r") as archive:
                 members = archive.infolist()
+                if len(members) > _MAX_ARCHIVE_MEMBERS:
+                    raise ValueError(
+                        "Current project archive exceeds the 257-member "
+                        "supported-size limit."
+                    )
                 names = [member.filename for member in members]
                 if len(names) != len(set(names)):
                     raise ValueError(
@@ -1048,6 +1128,27 @@ class KinArchiveStore:
                         "Current project archive members must be stored "
                         "without compression."
                     )
+                aggregate_member_bytes = 0
+                for member in members:
+                    member_bytes = int(member.file_size)
+                    aggregate_member_bytes += member_bytes
+                    if aggregate_member_bytes > _MAX_ARCHIVE_MEMBER_BYTES:
+                        raise ValueError(
+                            "Current project archive exceeds the 512 MiB "
+                            "aggregate-member supported-size limit."
+                        )
+                    member_limit = (
+                        _MAX_PROJECT_MEMBER_BYTES
+                        if member.filename == _PROJECT_MEMBER
+                        else _MAX_SOURCE_MEMBER_BYTES
+                    )
+                    if member_bytes > member_limit:
+                        raise ValueError(
+                            f"Current project archive member "
+                            f"{member.filename!r} exceeds the "
+                            f"{member_limit // (1024 * 1024)} MiB "
+                            "supported-size limit."
+                        )
                 project_bytes = archive.read(_PROJECT_MEMBER)
                 source_bytes = {
                     name: archive.read(name)
@@ -1088,6 +1189,30 @@ class KinArchiveStore:
             )
             + "\n"
         ).encode("utf-8")
+        if len(source_members) + 1 > _MAX_ARCHIVE_MEMBERS:
+            raise ValueError(
+                "Current project archive exceeds the 257-member "
+                "supported-size limit."
+            )
+        if len(encoded) > _MAX_PROJECT_MEMBER_BYTES:
+            raise ValueError(
+                "Current project archive project.json exceeds the 128 MiB "
+                "supported-size limit."
+            )
+        aggregate_member_bytes = len(encoded)
+        for member_name, source_bytes in source_members:
+            source_size = len(source_bytes)
+            if source_size > _MAX_SOURCE_MEMBER_BYTES:
+                raise ValueError(
+                    f"Current project archive member {member_name!r} "
+                    "exceeds the 32 MiB supported-size limit."
+                )
+            aggregate_member_bytes += source_size
+        if aggregate_member_bytes > _MAX_ARCHIVE_MEMBER_BYTES:
+            raise ValueError(
+                "Current project archive exceeds the 512 MiB "
+                "aggregate-member supported-size limit."
+            )
 
         descriptor: int | None = None
         temporary_path = ""
@@ -1119,6 +1244,12 @@ class KinArchiveStore:
                     archive.writestr(_PROJECT_MEMBER, encoded)
                     for member_name, source_bytes in source_members:
                         archive.writestr(member_name, source_bytes)
+                handle.flush()
+                if os.fstat(handle.fileno()).st_size > _MAX_ARCHIVE_FILE_BYTES:
+                    raise ValueError(
+                        "Current project archive exceeds the 513 MiB "
+                        "supported-size limit."
+                    )
             try:
                 existing_mode = stat.S_IMODE(os.stat(archive_path).st_mode)
             except FileNotFoundError:

@@ -7,13 +7,18 @@ from enum import Enum
 import math
 import os
 from pathlib import Path
+import stat
 from typing import Iterable, Mapping, Sequence
+import uuid
 
 from kindred.core.datasets.observation_mapping import (
     normalize_observation_mapping,
     seed_species_values_at_exact_zero,
 )
-from kindred.core.datasets.csv_import import identify_physical_columns
+from kindred.core.datasets.csv_import import (
+    identify_physical_columns,
+    validate_tabular_source_bytes,
+)
 from kindred.core.project_document import (
     DatasetLink,
     InitialConditionSet,
@@ -25,6 +30,10 @@ from kindred.core.project_document import (
     thaw_json_value,
     validate_simulation_execution_settings,
 )
+
+_MAX_SOURCE_BYTES = 32 * 1024 * 1024
+_MAX_PHYSICAL_COLUMNS = 256
+_MAX_RETAINED_OBSERVATION_CELLS = 1_000_000
 
 
 class DatasetMappingError(ValueError):
@@ -211,6 +220,22 @@ def validate_raw_dataset_record(
             f"Raw dataset {record.dataset_id!r} exact source bytes must be "
             "nonempty."
         )
+    if len(record.exact_source_bytes) > _MAX_SOURCE_BYTES:
+        raise DatasetMappingError(
+            f"Raw dataset {record.dataset_id!r} exact source exceeds the "
+            "32 MiB supported-size limit."
+        )
+    try:
+        validate_tabular_source_bytes(
+            record.exact_source_bytes,
+            source_format=record.original_format,
+            source_label=record.original_filename,
+        )
+    except (TypeError, ValueError) as exc:
+        raise DatasetMappingError(
+            f"Raw dataset {record.dataset_id!r} exact source admission failed: "
+            f"{exc}"
+        ) from exc
     if type(record.observations) is not tuple:
         raise DatasetMappingError(
             f"Raw dataset {record.dataset_id!r} observations must be an "
@@ -233,6 +258,11 @@ def validate_raw_dataset_record(
         raise DatasetMappingError(
             f"Raw dataset {record.dataset_id!r} must retain its physical "
             "source-column catalog."
+        )
+    if len(physical_values) > _MAX_PHYSICAL_COLUMNS:
+        raise DatasetMappingError(
+            f"Raw dataset {record.dataset_id!r} exceeds the 256 physical-"
+            "column supported-size limit."
         )
     physical_rows: list[tuple[int, str, str]] = []
     for index, raw_physical in enumerate(physical_values):
@@ -284,6 +314,7 @@ def validate_raw_dataset_record(
 
     observation_names: list[str] = []
     raw_observation_ids: set[str] = set()
+    retained_cells = 0
     for series in record.observations:
         if not isinstance(series, ObservationSeries):
             raise DatasetMappingError(
@@ -357,15 +388,21 @@ def validate_raw_dataset_record(
                 f"Raw dataset {record.dataset_id!r} observation {name!r} "
                 "contains duplicate physical source-row identities."
             )
+        retained_cells += len(series.t)
+        if retained_cells > _MAX_RETAINED_OBSERVATION_CELLS:
+            raise DatasetMappingError(
+                f"Raw dataset {record.dataset_id!r} exceeds the 1000000 "
+                "retained-observation-cell limit."
+            )
         observation_names.append(name)
-    observation_columns = thawed_metadata.get("observation_columns")
+    source_observation_columns = thawed_metadata.get("observation_columns")
     if (
-        not isinstance(observation_columns, list)
-        or tuple(observation_columns) != tuple(observation_names)
+        not isinstance(source_observation_columns, list)
+        or tuple(source_observation_columns) != tuple(observation_names)
     ):
         raise DatasetMappingError(
             f"Raw dataset {record.dataset_id!r} observation-column metadata "
-            "does not match its immutable observation order."
+            "must exactly match its immutable ordered series labels."
         )
     physical_assigned = {
         assigned_name
@@ -376,7 +413,10 @@ def validate_raw_dataset_record(
         not isinstance(time_column, str)
         or time_column not in physical_assigned
         or time_column in observation_names
-        or any(name not in physical_assigned for name in observation_names)
+        or any(
+            name not in physical_assigned
+            for name in observation_names
+        )
     ):
         raise DatasetMappingError(
             f"Raw dataset {record.dataset_id!r} time/observation columns do "
@@ -425,8 +465,32 @@ def export_original_source(
         raise DatasetMappingError(
             f"Export directory does not exist: {target.parent}."
         )
-    with target.open("wb") as handle:
-        handle.write(source_bytes)
+    temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o666,
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            handle.write(source_bytes)
+        try:
+            existing_mode = stat.S_IMODE(target.stat().st_mode)
+        except FileNotFoundError:
+            pass
+        else:
+            os.chmod(temporary, existing_mode)
+        os.replace(temporary, target)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
     return target
 
 
@@ -454,8 +518,8 @@ def create_set_from_exact_zero(
     if any(existing.name.casefold() == clean_name.casefold() for existing in tab.initial_condition_sets):
         raise DatasetMappingError(f"An initial-condition set named '{clean_name}' already exists.")
     observations = {
-        series.column_name: {
-            "raw_observation_id": series.raw_observation_id,
+        series.raw_observation_id: {
+            "raw_column": series.column_name,
             "t": series.t,
             "y": series.y,
             "source_rows": series.source_rows,
@@ -464,7 +528,10 @@ def create_set_from_exact_zero(
     }
     normalized_mapping = normalize_observation_mapping(
         confirmed_mapping,
-        raw_columns=tuple(observations),
+        raw_observations=tuple(
+            (series.raw_observation_id, series.column_name)
+            for series in dataset.observations
+        ),
         model_species=model_species,
     )
     values = seed_species_values_at_exact_zero(
@@ -536,7 +603,10 @@ def with_confirmed_observation_mapping(
     """Replace only one active-tab explicit observation mapping."""
     normalized = normalize_observation_mapping(
         confirmed_mapping,
-        raw_columns=tuple(series.column_name for series in dataset.observations),
+        raw_observations=tuple(
+            (series.raw_observation_id, series.column_name)
+            for series in dataset.observations
+        ),
         model_species=model_species,
     )
     current = tab.dataset_link(dataset.dataset_id)
@@ -605,23 +675,30 @@ def validate_fit_inclusion(
         raise DatasetMappingError(
             "Mapped initial-condition state must be finite and nonnegative."
         )
-    raw_columns = tuple(
-        series.column_name for series in dataset.observations
+    raw_observations = tuple(
+        (series.raw_observation_id, series.column_name)
+        for series in dataset.observations
     )
     normalized_mapping = normalize_observation_mapping(
         current.observation_mapping,
-        raw_columns=raw_columns,
+        raw_observations=raw_observations,
         model_species=roster,
     )
+    if normalized_mapping != current.observation_mapping:
+        raise DatasetMappingError(
+            "Fit inclusion observation mapping must already be canonical and "
+            "ordered by raw observation identity."
+        )
     if not normalized_mapping:
         raise DatasetMappingError(
             "Fit inclusion requires at least one valid mapped observation target."
         )
-    series_by_name = {
-        series.column_name: series for series in dataset.observations
+    series_by_raw_id = {
+        series.raw_observation_id: series
+        for series in dataset.observations
     }
-    for raw_column, _model_target in normalized_mapping:
-        series = series_by_name[raw_column]
+    for raw_observation_id, _model_target in normalized_mapping:
+        series = series_by_raw_id[raw_observation_id]
         if (
             not series.source_rows
             or len(series.source_rows) != len(series.t)
@@ -629,8 +706,9 @@ def validate_fit_inclusion(
             or any(type(row) is not int or row <= 0 for row in series.source_rows)
         ):
             raise DatasetMappingError(
-                f"Observation {raw_column!r} does not retain complete "
-                "positive physical source-row identity."
+                f"Observation {series.column_name!r} (raw ID "
+                f"{raw_observation_id!r}) does not retain complete positive "
+                "physical source-row identity."
             )
     execution = validate_simulation_execution_settings(
         tab.resolved_execution_settings(initial_set.set_id),
@@ -643,16 +721,18 @@ def validate_fit_inclusion(
         targets=tuple(
             DatasetMappedTarget(
                 dataset_id=dataset.dataset_id,
-                raw_observation_id=(
-                    series_by_name[raw_column].raw_observation_id
-                ),
-                raw_column=raw_column,
+                raw_observation_id=raw_observation_id,
+                raw_column=series_by_raw_id[
+                    raw_observation_id
+                ].column_name,
                 model_target=model_target,
-                t=series_by_name[raw_column].t,
-                y=series_by_name[raw_column].y,
-                source_rows=series_by_name[raw_column].source_rows,
+                t=series_by_raw_id[raw_observation_id].t,
+                y=series_by_raw_id[raw_observation_id].y,
+                source_rows=series_by_raw_id[
+                    raw_observation_id
+                ].source_rows,
             )
-            for raw_column, model_target in normalized_mapping
+            for raw_observation_id, model_target in normalized_mapping
         ),
     )
 

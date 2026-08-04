@@ -14,6 +14,8 @@ from kindred.core.project_document import (
     freeze_json_value,
 )
 
+_MAX_RETAINED_OBSERVATION_CELLS = 1_000_000
+
 
 @dataclass(frozen=True, slots=True)
 class DatasetObservationPayload:
@@ -31,21 +33,28 @@ class DatasetObservationPayload:
             )
         names: set[str] = set()
         identities: set[str] = set()
+        retained_cells = 0
         for series in observations:
             if not isinstance(series, ObservationSeries):
                 raise TypeError(
                     "Dataset payload observations must be ObservationSeries "
                     "values."
                 )
-            if series.column_name in names:
-                raise ValueError(
-                    f"Observation series name {series.column_name!r} is duplicated."
-                )
             if series.raw_observation_id in identities:
                 raise ValueError(
                     "Raw observation identity "
                     f"{series.raw_observation_id!r} is duplicated within the "
                     "dataset."
+                )
+            if series.column_name in names:
+                raise ValueError(
+                    f"Observation series name {series.column_name!r} is duplicated."
+                )
+            retained_cells += len(series.t)
+            if retained_cells > _MAX_RETAINED_OBSERVATION_CELLS:
+                raise ValueError(
+                    "Dataset payload exceeds the 1000000 retained-observation-"
+                    "cell limit."
                 )
             names.add(series.column_name)
             identities.add(series.raw_observation_id)
@@ -58,7 +67,7 @@ def new_raw_observation_id() -> str:
 
 def normalize_raw_observation_id(value: object) -> str:
     """Validate one already-allocated opaque raw observation identity."""
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise ValueError("Raw observation identity must be a string.")
     normalized = value.strip()
     if not normalized or normalized != value:
@@ -132,6 +141,7 @@ def immutable_dataset_payload(
     materialized: list[ObservationSeries] = []
     names: set[str] = set()
     identities: set[str] = set()
+    retained_cells = 0
     for raw_name, raw_spec in observations.items():
         name = str(raw_name).strip()
         if not name:
@@ -163,6 +173,12 @@ def immutable_dataset_payload(
             raise ValueError(
                 f"Observation series {name!r} requires equal nonempty time, "
                 "value, and source-row sequences."
+            )
+        retained_cells += len(times)
+        if retained_cells > _MAX_RETAINED_OBSERVATION_CELLS:
+            raise ValueError(
+                "Dataset payload exceeds the 1000000 retained-observation-cell "
+                "limit."
             )
         if len(set(rows)) != len(rows):
             raise ValueError(
@@ -271,26 +287,3 @@ def copy_observations_map(
             "source_rows": source_rows,
         }
     return copied
-
-
-def dense_view_from_observations(
-    observations: Mapping[str, Mapping[str, object]] | None,
-) -> tuple[np.ndarray, Dict[str, np.ndarray]]:
-    copied = copy_observations_map(observations)
-    all_times: list[float] = []
-    for spec in copied.values():
-        all_times.extend(float(value) for value in np.asarray(spec["t"], dtype=float).reshape(-1))
-    if not all_times:
-        return np.asarray([], dtype=float), {}
-    union_t = np.unique(np.asarray(all_times, dtype=float))
-    dense_species: Dict[str, np.ndarray] = {}
-    for name, spec in copied.items():
-        dense = np.full(union_t.shape, np.nan, dtype=float)
-        t_values = np.asarray(spec["t"], dtype=float).reshape(-1)
-        y_values = np.asarray(spec["y"], dtype=float).reshape(-1)
-        if t_values.size:
-            positions = np.searchsorted(union_t, t_values)
-            valid = (positions >= 0) & (positions < union_t.size) & np.isclose(union_t[positions], t_values)
-            dense[positions[valid]] = y_values[valid]
-        dense_species[name] = dense
-    return union_t, dense_species
