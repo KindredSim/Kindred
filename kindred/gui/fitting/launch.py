@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Iterable
+from dataclasses import dataclass, replace
+from typing import Iterable, Literal
 
 import numpy as np
 
@@ -38,6 +38,8 @@ from kindred.gui.widgets.batch_initial_conditions_table import (
 __all__ = [
     "FitDatasetLocalSettings",
     "FitDatasetSetupEdit",
+    "FitDatasetWeightMode",
+    "FitDatasetWeightModeSetupEdit",
     "FitDefaultsSetupEdit",
     "FitExecutionRequest",
     "FitInitialSetupEdit",
@@ -57,6 +59,8 @@ __all__ = [
     "selected_observations",
 ]
 
+FitDatasetWeightMode = Literal["implicit", "user"]
+
 
 def _required(value: object, field: str) -> str:
     normalized = str(value or "").strip()
@@ -70,6 +74,16 @@ def _finite(value: object, field: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError(f"{field} must be finite.")
     return parsed
+
+
+def _validated_dataset_weight_mode(
+    value: object,
+) -> FitDatasetWeightMode:
+    if value == "implicit":
+        return "implicit"
+    if value == "user":
+        return "user"
+    raise ValueError("Dataset weight mode must be implicit or user.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,9 +392,14 @@ class FitOriginSnapshot:
                 "Fit origin parameters must be FitParameterVariable values."
             )
         dataset_ids = [item.dataset_id for item in mapped_datasets]
+        set_ids = [item.set_id for item in mapped_datasets]
         parameter_names = [item.name for item in parameter_defaults]
         if len(dataset_ids) != len(set(dataset_ids)):
             raise ValueError("Fit origin dataset IDs must be unique.")
+        if len(set_ids) != len(set(set_ids)):
+            raise ValueError(
+                "Fit origin mapped set IDs must be unique across datasets."
+            )
         if len(parameter_names) != len(set(parameter_names)):
             raise ValueError("Fit origin parameter names must be unique.")
         object.__setattr__(self, "mapped_datasets", mapped_datasets)
@@ -463,6 +482,7 @@ class FitExecutionRequest:
     parameters: tuple[FitParameterVariable, ...]
     initials: tuple[FitInitialVariable, ...]
     defaults: FitDefaults
+    dataset_weight_mode: FitDatasetWeightMode
 
     def __post_init__(self) -> None:
         if not isinstance(self.origin, FitOriginSnapshot):
@@ -481,6 +501,11 @@ class FitExecutionRequest:
         if not isinstance(self.defaults, FitDefaults):
             raise TypeError("defaults must be FitDefaults.")
         default_project_document(fit_defaults=self.defaults)
+        object.__setattr__(
+            self,
+            "dataset_weight_mode",
+            _validated_dataset_weight_mode(self.dataset_weight_mode),
+        )
         local_observables = tuple(self.local_observables)
         datasets = tuple(self.datasets)
         parameters = tuple(self.parameters)
@@ -532,6 +557,7 @@ class FitSetupSnapshot:
     initials: tuple[FitInitialVariable, ...]
     defaults: FitDefaults
     local_observables: tuple[FitLocalObservable, ...]
+    dataset_weight_mode: FitDatasetWeightMode
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -561,6 +587,11 @@ class FitSetupSnapshot:
             )
         if not isinstance(self.defaults, FitDefaults):
             raise TypeError("snapshot defaults must be FitDefaults.")
+        object.__setattr__(
+            self,
+            "dataset_weight_mode",
+            _validated_dataset_weight_mode(self.dataset_weight_mode),
+        )
         datasets = tuple(self.datasets)
         parameters = tuple(self.parameters)
         initials = tuple(self.initials)
@@ -605,6 +636,23 @@ class FitSetupSnapshot:
             raise ValueError("Fit snapshot initial-condition identities repeat.")
         if len(observable_names) != len(set(observable_names)):
             raise ValueError("Fit snapshot observable identities repeat.")
+        retained_dataset_ids = set(dataset_ids)
+        incomplete_parameter_maps = sorted(
+            item.name
+            for item in parameters
+            if {
+                dataset_id
+                for dataset_id, _value in item.dataset_values
+            }
+            != retained_dataset_ids
+        )
+        if incomplete_parameter_maps:
+            raise ValueError(
+                "Fit snapshot parameters require one retained value for "
+                "every captured dataset: "
+                + ", ".join(incomplete_parameter_maps)
+                + "."
+            )
         object.__setattr__(self, "datasets", datasets)
         object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "initials", initials)
@@ -627,6 +675,7 @@ class FitSetupSnapshot:
             initials=request.initials,
             defaults=request.defaults,
             local_observables=request.local_observables,
+            dataset_weight_mode=request.dataset_weight_mode,
         )
 
 
@@ -660,6 +709,32 @@ class FitDatasetSetupEdit:
                 "raw_observation_id",
                 _required(self.raw_observation_id, "raw observation ID"),
             )
+
+
+@dataclass(frozen=True, slots=True)
+class FitDatasetWeightModeSetupEdit:
+    """Typed replacement intent for the one run-wide dataset-weight mode."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    dataset_weight_mode: FitDatasetWeightMode
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "origin_tab_id",
+            _required(self.origin_tab_id, "origin tab ID"),
+        )
+        object.__setattr__(
+            self,
+            "origin_capture_id",
+            _required(self.origin_capture_id, "origin capture ID"),
+        )
+        object.__setattr__(
+            self,
+            "dataset_weight_mode",
+            _validated_dataset_weight_mode(self.dataset_weight_mode),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -844,16 +919,28 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
         )
         for (set_id, species), value in values_by_key.items()
     )
+    retained_dataset_ids = tuple(item.dataset_id for item in datasets)
+    parameters = tuple(
+        replace(
+            parameter,
+            dataset_values=tuple(
+                (dataset_id, parameter.initial)
+                for dataset_id in retained_dataset_ids
+            ),
+        )
+        for parameter in origin.parameter_defaults
+    )
     return FitSetupSnapshot(
         origin_tab_id=origin.tab_id,
         origin_capture_id=origin.capture_id,
         mechanism_source=origin.mechanism_source,
         prepared_dsl=origin.prepared_dsl,
         datasets=datasets,
-        parameters=origin.parameter_defaults,
+        parameters=parameters,
         initials=initials,
         defaults=origin.fit_defaults,
         local_observables=(),
+        dataset_weight_mode="implicit",
     )
 
 
@@ -1122,6 +1209,7 @@ def build_fit_execution_request(
     datasets: Iterable[FitDatasetLocalSettings],
     parameters: Iterable[FitParameterVariable],
     initials: Iterable[FitInitialVariable],
+    dataset_weight_mode: FitDatasetWeightMode,
     defaults: FitDefaults | None = None,
 ) -> FitExecutionRequest:
     """Validate a complete owner-built Fit request at the execution boundary."""
@@ -1134,6 +1222,7 @@ def build_fit_execution_request(
         parameters=tuple(parameters),
         initials=tuple(initials),
         defaults=defaults or origin.fit_defaults,
+        dataset_weight_mode=dataset_weight_mode,
     )
     mapped_by_id = {item.dataset_id: item for item in origin.mapped_datasets}
     requested_ids = [item.dataset_id for item in request.datasets]
@@ -1168,18 +1257,10 @@ def build_fit_execution_request(
         local_ids = {
             dataset_id for dataset_id, _value in parameter.dataset_values
         }
-        if not local_ids.issubset(retained_dataset_ids):
+        if local_ids != retained_dataset_ids:
             raise ValueError(
-                f"Parameter {parameter.name!r} has values outside the "
-                "retained mapped datasets."
-            )
-        if (
-            parameter.scope == "per_dataset"
-            and not included.issubset(local_ids)
-        ):
-            raise ValueError(
-                f"Per-dataset parameter {parameter.name!r} requires one "
-                "value for every currently included dataset."
+                f"Parameter {parameter.name!r} requires one retained value "
+                "for every captured dataset."
             )
     initial_keys = [(item.set_id, item.species) for item in request.initials]
     expected_initial_keys = {

@@ -9,8 +9,6 @@ import numpy as np
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
 from kindred.core.temperature import TemperatureScheduleProtocol
 
-from .jacobian import JacobianConfig
-
 DEFAULT_SOLVER_NAME = "BDF"
 
 
@@ -40,7 +38,6 @@ class SimulationRequest:
     first_step: Optional[float] = None
     t_eval: Optional[np.ndarray] = None
     grid: Optional[Mapping[str, float | int]] = None
-    rosenbrock_jacobian: JacobianConfig = JacobianConfig()
     jacobian_func: Optional[Callable[[float, np.ndarray], np.ndarray]] = None
     jac_sparsity: Optional[Any] = None
     events: Optional[Iterable[Callable[[float, np.ndarray], float]]] = None

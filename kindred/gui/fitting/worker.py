@@ -418,6 +418,40 @@ class FitCandidate:
             raise ValueError(
                 "Fit candidate prepared DSL must exactly match its source."
             )
+        resolved_auto_modes = tuple(
+            (str(dataset_id or "").strip(), str(mode or "").strip())
+            for dataset_id, mode in self.resolved_auto_modes
+        )
+        resolved_dataset_ids = [
+            dataset_id for dataset_id, _mode in resolved_auto_modes
+        ]
+        expected_dataset_ids = {
+            item.dataset_id
+            for item in self.setup_snapshot.datasets
+            if (
+                item.included
+                and item.parametric is not None
+                and item.parametric.requested_mode == "auto"
+            )
+        }
+        if (
+            any(not dataset_id for dataset_id in resolved_dataset_ids)
+            or len(resolved_dataset_ids) != len(set(resolved_dataset_ids))
+            or set(resolved_dataset_ids) != expected_dataset_ids
+            or any(
+                mode not in {"monotone", "time_guided"}
+                for _dataset_id, mode in resolved_auto_modes
+            )
+        ):
+            raise ValueError(
+                "Fit candidate resolved parametric modes must exactly match "
+                "the included parametric datasets."
+            )
+        object.__setattr__(
+            self,
+            "resolved_auto_modes",
+            resolved_auto_modes,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,6 +552,12 @@ def _dataset_spec(
     mapped: FitMappedDatasetSnapshot,
     local: FitDatasetLocalSettings,
 ) -> FitDatasetSpec:
+    parametric = local.parametric
+    if parametric is not None and parametric.resolved_mode is None:
+        raise ValueError(
+            f"Dataset {mapped.display_name!r}: Auto parametric mode must be "
+            "resolved once before execution lowering."
+        )
     selected = selected_observations(mapped, local)
     observation_map = {
         item.model_species: FitObservationSeries(
@@ -535,10 +575,10 @@ def _dataset_spec(
         species_list=tuple(item.model_species for item in selected),
         observations=observation_map,
         target_weights=dict(local.target_weights),
-        x_name=local.parametric.x_name if local.parametric is not None else "t",
+        x_name=parametric.x_name if parametric is not None else "t",
         x_mode=(
-            local.parametric.resolved_mode
-            if local.parametric is not None
+            parametric.resolved_mode
+            if parametric is not None
             else "monotone"
         ),
         x_obs_by_species=x_by_target,
@@ -1723,11 +1763,20 @@ class GlobalFitWorker(QtCore.QThread):
                         resolved_mode=resolved_mode,
                     ),
                 )
-            if chosen.parametric is not None:
+            if (
+                chosen.parametric is not None
+                and chosen.parametric.requested_mode == "auto"
+            ):
+                resolved_mode = chosen.parametric.resolved_mode
+                if resolved_mode is None:
+                    raise ValueError(
+                        f"Dataset {mapped.display_name!r}: parametric mode "
+                        "remained unresolved after starting evaluation."
+                    )
                 resolved_mode_items.append(
                     (
                         chosen.dataset_id,
-                        chosen.parametric.resolved_mode,
+                        resolved_mode,
                     )
                 )
             effective_local[local.dataset_id] = chosen
@@ -1763,6 +1812,7 @@ class GlobalFitWorker(QtCore.QThread):
             "origin_tab_id": request.origin.tab_id,
             "origin_capture_id": request.origin.capture_id,
             "mechanism_text": request.mechanism_source.reactions_text,
+            "dataset_weight_mode": request.dataset_weight_mode,
             "local_observables": [
                     {
                         "name": item.name,
@@ -1885,8 +1935,14 @@ class GlobalFitWorker(QtCore.QThread):
                                 ].sample_points
                             ),
                         },
-                        "dataset_weight": float(
-                            effective_local[item.dataset_id].weight
+                        **(
+                            {
+                                "dataset_weight": float(
+                                    effective_local[item.dataset_id].weight
+                                )
+                            }
+                            if request.dataset_weight_mode == "user"
+                            else {}
                         ),
                         "execution": {
                             "solver": effective_local[
@@ -2063,7 +2119,14 @@ class GlobalFitWorker(QtCore.QThread):
             shared_variables=shared_variables,
             dataset_overrides=overrides,
             coupled_variables=coupled_variables,
-            weights={item.dataset_id: item.weight for item in included},
+            weights=(
+                {
+                    item.dataset_id: item.weight
+                    for item in included
+                }
+                if request.dataset_weight_mode == "user"
+                else None
+            ),
             method="de" if method == "differential_evolution" else method,
             max_nfev=int(request.defaults.max_nfev),
             ftol=float(request.defaults.ftol),
@@ -2077,6 +2140,40 @@ class GlobalFitWorker(QtCore.QThread):
         if result.completion.status == "fail":
             message = result.message or "Fit did not produce a candidate."
             raise RuntimeError(message)
+
+        effective_dataset_weights: dict[str, float] = {}
+        for info in result.dataset_info:
+            dataset_id = str(info.dataset_id or "").strip()
+            weight = float(info.weight)
+            if (
+                not dataset_id
+                or dataset_id in effective_dataset_weights
+                or not math.isfinite(weight)
+                or weight <= 0.0
+            ):
+                raise ValueError(
+                    "Fit terminal contains invalid effective dataset weights."
+                )
+            effective_dataset_weights[dataset_id] = weight
+        if set(effective_dataset_weights) != set(included_ids):
+            raise ValueError(
+                "Fit terminal effective weights do not exactly match the "
+                "included datasets."
+            )
+        solver_provenance_by_dataset = {
+            str(dataset_id or "").strip(): provenance
+            for dataset_id, provenance in (
+                result.solver_provenance_by_dataset.items()
+            )
+        }
+        if (
+            any(not dataset_id for dataset_id in solver_provenance_by_dataset)
+            or set(solver_provenance_by_dataset) != set(included_ids)
+        ):
+            raise ValueError(
+                "Fit terminal solver provenance does not exactly match the "
+                "included datasets."
+            )
 
         scalar_values = tuple(
             (
@@ -2135,6 +2232,14 @@ class GlobalFitWorker(QtCore.QThread):
             "nfev": int(result.nfev),
             "weighted_residual_sse": float(result.weighted_residual_sse),
             "weighted_residual_mse": float(result.weighted_residual_mse),
+            "effective_dataset_weights": {
+                dataset_id: effective_dataset_weights[dataset_id]
+                for dataset_id in sorted(effective_dataset_weights)
+            },
+            "solver_provenance_by_dataset": {
+                dataset_id: solver_provenance_by_dataset[dataset_id]
+                for dataset_id in sorted(solver_provenance_by_dataset)
+            },
             "shared_parameters": {
                 str(name): float(value)
                 for name, value in sorted(result.shared_params.items())

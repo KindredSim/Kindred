@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -13,6 +13,9 @@ from typing import Any, Iterable, Mapping, TypeAlias
 
 import numpy as np
 
+from kindred.core.intervention_schedule import (
+    intervention_schedule_identity_fingerprints,
+)
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -159,35 +162,10 @@ def scientific_identity(prepared_dsl: object) -> str:
             }
         if isinstance(value, (tuple, list)):
             return [canonical(item) for item in value]
-        if isinstance(value, (set, frozenset)):
-            return sorted((canonical(item) for item in value), key=repr)
-        if isinstance(value, np.ndarray):
-            return canonical(value.tolist())
         if isinstance(value, bool) or value is None or isinstance(value, str):
             return value
         if isinstance(value, Real):
             return {"float_hex": float(value).hex()}
-        if value is schedule:
-            return canonical(schedule_identity)
-        if callable(value):
-            model = getattr(value, "model", None)
-            if model is not None:
-                return {"callable": value.__class__.__name__, "model": canonical(model)}
-            return {"callable": value.__class__.__name__}
-        if is_dataclass(value) and not isinstance(value, type):
-            return {
-                "type": value.__class__.__qualname__,
-                "fields": {
-                    item.name: canonical(getattr(value, item.name))
-                    for item in fields(value)
-                },
-            }
-        attrs = getattr(value, "__dict__", None)
-        if isinstance(attrs, Mapping):
-            return {
-                "type": value.__class__.__qualname__,
-                "attrs": canonical(attrs),
-            }
         raise TypeError(
             "scientific identity cannot encode executable value "
             f"{value.__class__.__qualname__}."
@@ -227,6 +205,10 @@ def scientific_identity(prepared_dsl: object) -> str:
             "prepared_dsl must provide intervention_schedule_for_execution()."
         )
     intervention = intervention_for_execution()
+    (
+        intervention_declarative_fingerprint,
+        intervention_executable_fingerprint,
+    ) = intervention_schedule_identity_fingerprints(intervention)
     payload: dict[str, object] = {
         "species": tuple(str(name) for name in getattr(mechanism, "species_names", lambda: ())()),
         "reactions": reactions,
@@ -235,8 +217,11 @@ def scientific_identity(prepared_dsl: object) -> str:
             coefficient_authority.authority_snapshot
         ),
         "temperature_K": canonical(metadata.get("temperature_K", 298.15)),
-        "temperature_schedule": canonical(schedule),
-        "intervention_schedule": canonical(intervention),
+        "temperature_schedule": canonical(schedule_identity),
+        "intervention_schedule": {
+            "declarative_fingerprint": intervention_declarative_fingerprint,
+            "executable_fingerprint": intervention_executable_fingerprint,
+        },
         "c0": c0_identity,
     }
     from kindred.core.algebra.simulation_series import algebra_block_to_source

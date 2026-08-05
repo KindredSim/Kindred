@@ -996,6 +996,7 @@ class SimulationJobOwner(QtCore.QObject):
         self._detailed_balance_generation = 0
         self._explicit_generation_by_target: dict[tuple[str, str], int] = {}
         self._preview_generation_by_target: dict[tuple[str, str], int] = {}
+        self._retire_on_settlement: set[tuple[str, str]] = set()
         self._current_preview_key_by_target: dict[
             tuple[str, str],
             PreviewResultKey,
@@ -1103,6 +1104,78 @@ class SimulationJobOwner(QtCore.QObject):
             advanced.append((sid, generation))
         return tuple(advanced)
 
+    def _cancel_generation_counter_retirement(
+        self,
+        tab_id: str,
+        set_ids: Iterable[str],
+    ) -> None:
+        tid = _required_id(tab_id, "tab_id")
+        for set_id in set_ids:
+            sid = _required_id(set_id, "set_id")
+            self._retire_on_settlement.discard((tid, sid))
+
+    def _settle_retired_generation_target(
+        self,
+        tab_id: str,
+        set_id: str,
+    ) -> None:
+        target = (
+            _required_id(tab_id, "tab_id"),
+            _required_id(set_id, "set_id"),
+        )
+        if target not in self._retire_on_settlement:
+            return
+        self._explicit_generation_by_target.pop(target, None)
+        self._preview_generation_by_target.pop(target, None)
+        self._retire_on_settlement.discard(target)
+
+    def _retire_generation_counters(
+        self,
+        tab_id: str,
+        set_ids: Iterable[str],
+    ) -> None:
+        tid = _required_id(tab_id, "tab_id")
+        targets = {
+            (tid, _required_id(set_id, "set_id")) for set_id in set_ids
+        }
+        awaiting_native_settlement = set(self._retire_on_settlement)
+        awaiting_native_settlement.update(
+            (target.key.tab_id, target.key.set_id)
+            for target in self._targets
+            if target.key not in self._outcomes
+        )
+        for target in targets:
+            if target in awaiting_native_settlement:
+                self._retire_on_settlement.add(target)
+                continue
+            self._explicit_generation_by_target.pop(target, None)
+            self._preview_generation_by_target.pop(target, None)
+            self._retire_on_settlement.discard(target)
+
+    def _retire_all_generation_counters_for_tab(
+        self,
+        tab_id: str,
+        set_ids: Iterable[str],
+    ) -> None:
+        tid = _required_id(tab_id, "tab_id")
+        targets = {_required_id(set_id, "set_id") for set_id in set_ids}
+        targets.update(
+            set_id
+            for target_tab_id, set_id in self._explicit_generation_by_target
+            if target_tab_id == tid
+        )
+        targets.update(
+            set_id
+            for target_tab_id, set_id in self._preview_generation_by_target
+            if target_tab_id == tid
+        )
+        targets.update(
+            set_id
+            for target_tab_id, set_id in self._retire_on_settlement
+            if target_tab_id == tid
+        )
+        self._retire_generation_counters(tid, targets)
+
     def preview_key_is_current(self, key: PreviewResultKey) -> bool:
         """Authorize publication only for the owner's exact latest Preview key."""
 
@@ -1199,6 +1272,10 @@ class SimulationJobOwner(QtCore.QObject):
         self._current_preview_key_by_target[
             (identity.tab_id, identity.set_id)
         ] = key
+        self._cancel_generation_counter_retirement(
+            identity.tab_id,
+            (identity.set_id,),
+        )
         self.results_changed.emit(identity.tab_id)
         return key
 
@@ -1228,6 +1305,7 @@ class SimulationJobOwner(QtCore.QObject):
             if self._explicit_completion_is_live_key(key)
         )
         live_set_ids = tuple(key.set_id for key in live_keys)
+        self._cancel_generation_counter_retirement(tab_id, live_set_ids)
         self._drop_pending_preview_for_targets(tab_id, live_set_ids)
         self._advance_preview_publication_generations(tab_id, live_set_ids)
         hydrated_by_set_id: dict[str, bool] = {}
@@ -1252,7 +1330,7 @@ class SimulationJobOwner(QtCore.QObject):
         tab_id: str,
         set_ids: Iterable[str],
     ) -> tuple[tuple[str, int], ...]:
-        """Purge captures/results but retain monotonic generation tombstones."""
+        """Purge results and retire counters after native work settles."""
         tid = _required_id(tab_id, "tab_id")
         targets = tuple(
             dict.fromkeys(_required_id(value, "set_id") for value in set_ids)
@@ -1276,6 +1354,7 @@ class SimulationJobOwner(QtCore.QObject):
                 "Run detailed-balance correction aborted: a target was deleted."
             )
         generations = self.advance_explicit_publication_generations(tid, targets)
+        self._retire_generation_counters(tid, targets)
         self._discard_purged_admitted_targets(
             tid,
             target_set,
@@ -1290,7 +1369,7 @@ class SimulationJobOwner(QtCore.QObject):
         tab_id: str,
         set_ids: Iterable[str],
     ) -> tuple[tuple[str, int], ...]:
-        """Fence a removed tab while preserving all generation tombstones."""
+        """Fence a removed tab and retire counters after native settlement."""
         tid = _required_id(tab_id, "tab_id")
         targets = tuple(
             dict.fromkeys(_required_id(value, "set_id") for value in set_ids)
@@ -1313,6 +1392,10 @@ class SimulationJobOwner(QtCore.QObject):
         }
         deauthorized_set_ids = tuple(dict.fromkeys((*targets, *admitted_set_ids)))
         generations = self.advance_explicit_publication_generations(
+            tid,
+            deauthorized_set_ids,
+        )
+        self._retire_all_generation_counters_for_tab(
             tid,
             deauthorized_set_ids,
         )
@@ -1823,6 +1906,10 @@ class SimulationJobOwner(QtCore.QObject):
             self._worker = worker
             installed = True
             worker.start()
+            self._cancel_generation_counter_retirement(
+                tab_id,
+                (target.key.set_id for target in admitted_targets),
+            )
         except BaseException as exc:  # noqa: BLE001
             if installed and worker is not None:
                 try:
@@ -1883,6 +1970,7 @@ class SimulationJobOwner(QtCore.QObject):
         key = outcome.key
         if self._target_for_key(key) is None:
             return
+        self._settle_retired_generation_target(key.tab_id, key.set_id)
         if key in self._outcomes:
             return
         if outcome.state != "success":
@@ -2062,6 +2150,11 @@ class SimulationJobOwner(QtCore.QObject):
 
     def _finish_current(self) -> None:
         worker = self._worker
+        for target in self._targets:
+            self._settle_retired_generation_target(
+                target.key.tab_id,
+                target.key.set_id,
+            )
         self._worker = None
         self._job_kind = None
         self._origin_tab_id = None

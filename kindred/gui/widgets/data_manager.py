@@ -1063,13 +1063,34 @@ class DataManagerPanel(QtWidgets.QWidget):
         )
         occupied_choice = None
         if occupant is not None:
+            occupant_name = next(
+                record.display_name
+                for record in self._snapshot.datasets
+                if record.dataset_id == occupant
+            )
             box = QtWidgets.QMessageBox(self)
             box.setIcon(QtWidgets.QMessageBox.Icon.Question)
-            box.setWindowTitle("Set Already Mapped")
-            box.setText(f"Set '{label}' is already mapped in the active tab.")
-            override_button = box.addButton("Override", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-            copy_button = box.addButton("Create Copy", QtWidgets.QMessageBox.ButtonRole.ActionRole)
-            cancel_button = box.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.setWindowTitle("Initial-condition set already in use")
+            box.setText(
+                f'"{label}" is already mapped to "{occupant_name}" in this '
+                "mechanism tab. Each dataset must use its own initial-condition set."
+            )
+            box.setInformativeText(
+                f'Moving the set unmaps "{occupant_name}" and turns off '
+                "its Fit inclusion."
+            )
+            override_button = box.addButton(
+                "Move set to this dataset",
+                QtWidgets.QMessageBox.ButtonRole.AcceptRole,
+            )
+            copy_button = box.addButton(
+                "Create a separate copy",
+                QtWidgets.QMessageBox.ButtonRole.ActionRole,
+            )
+            cancel_button = box.addButton(
+                "Cancel",
+                QtWidgets.QMessageBox.ButtonRole.RejectRole,
+            )
             box.setDefaultButton(cancel_button)
             box.exec()
             clicked = box.clickedButton()

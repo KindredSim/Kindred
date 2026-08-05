@@ -46,6 +46,7 @@ No filesystem, no network, no cwd usage.
 
 from __future__ import annotations
 
+import math
 from typing import Iterable, Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -527,9 +528,10 @@ class AxisToolbar(QtWidgets.QWidget):
         """
         def parse_float(text: str) -> Optional[float]:
             try:
-                return float(text.strip()) if text.strip() else None
+                value = float(text.strip()) if text.strip() else None
             except ValueError:
                 return None
+            return value if value is None or math.isfinite(value) else None
 
         x_min = parse_float(self._x_min.text())
         x_max = parse_float(self._x_max.text())

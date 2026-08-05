@@ -38,7 +38,7 @@ class FitParametricSettings:
     dataset_id: str
     x_name: str
     requested_mode: Literal["auto", "monotone", "time_guided"]
-    resolved_mode: FitResolvedXMode
+    resolved_mode: FitResolvedXMode | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dataset_id", _name(self.dataset_id, "dataset ID"))
@@ -47,12 +47,10 @@ class FitParametricSettings:
             raise ValueError("Parametric-X settings cannot target time.")
         if self.requested_mode not in {"auto", "monotone", "time_guided"}:
             raise ValueError("Unknown parametric-X mode.")
-        if self.resolved_mode not in {"monotone", "time_guided"}:
-            raise ValueError("Parametric-X mode must be resolved before dispatch.")
-        if (
-            self.requested_mode != "auto"
-            and self.requested_mode != self.resolved_mode
-        ):
+        if self.requested_mode == "auto":
+            if self.resolved_mode not in {None, "monotone", "time_guided"}:
+                raise ValueError("Unknown resolved parametric-X mode.")
+        elif self.requested_mode != self.resolved_mode:
             raise ValueError(
                 "An explicit parametric-X mode cannot resolve to another mode."
             )

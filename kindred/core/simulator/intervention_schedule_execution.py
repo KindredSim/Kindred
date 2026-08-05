@@ -73,7 +73,6 @@ class SegmentExecutionRequest:
     identity: SegmentIdentity
     request: SimulationRequest
     rhs: Rhs2
-    rhs_for_jac: Rhs2
     t0: float
     t1: float
     y0: np.ndarray
@@ -149,7 +148,6 @@ class BaseSegmentRunner(Protocol):
 class ScheduleExecutionRequest:
     request: SimulationRequest
     rhs: Rhs2
-    rhs_for_jac: Rhs2
     t0: float
     t1: float
     y0: np.ndarray
@@ -271,16 +269,9 @@ class InterventionScheduleExecutionOwner:
                     cancellation_check=cancellation_check,
                 )
                 segment_rhs: Rhs2 = request.rhs
-                segment_rhs_for_jac: Rhs2 = request.rhs_for_jac
                 if active_fluxes or active_holds:
                     segment_rhs = _InterventionRhs(
                         request.rhs,
-                        fluxes=active_fluxes,
-                        holds=active_holds,
-                        species_index=species_index,
-                    )
-                    segment_rhs_for_jac = _InterventionRhs(
-                        request.rhs_for_jac,
                         fluxes=active_fluxes,
                         holds=active_holds,
                         species_index=species_index,
@@ -363,7 +354,6 @@ class InterventionScheduleExecutionOwner:
                         identity=segment_identity,
                         request=segment_request,
                         rhs=segment_rhs,
-                        rhs_for_jac=segment_rhs_for_jac,
                         t0=sub_start,
                         t1=sub_end,
                         y0=current_y,

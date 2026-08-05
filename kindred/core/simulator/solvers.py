@@ -238,16 +238,17 @@ def _prepare_time_grid(req: SimulationRequest, *, t0: float, t1: float) -> np.nd
     return t_eval
 
 
-def _prepare_rhs(req: SimulationRequest, *, t0: float, t1: float) -> tuple[Rhs2, Rhs2]:
+def _prepare_rhs(req: SimulationRequest, *, t0: float, t1: float) -> Rhs2:
     if req.temperature_schedule is None:
-        rhs_for_jac: Rhs2 = cast(ODERhsNoTemp, req.rhs)
+        rhs: Rhs2 = cast(ODERhsNoTemp, req.rhs)
     else:
-        rhs_for_jac = _TemperatureInjectedRhs(cast(ODERhsWithTemp, req.rhs), req.temperature_schedule)
+        rhs = _TemperatureInjectedRhs(
+            cast(ODERhsWithTemp, req.rhs), req.temperature_schedule
+        )
 
-    rhs: Rhs2 = rhs_for_jac
     if req.progress_callback is not None:
-        rhs = _ProgressRhs(rhs_for_jac, callback=req.progress_callback, t0=t0, t1=t1)
-    return rhs, rhs_for_jac
+        rhs = _ProgressRhs(rhs, callback=req.progress_callback, t0=t0, t1=t1)
+    return rhs
 
 
 def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
@@ -264,11 +265,6 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
         "first_step": (None if req.first_step is None else float(req.first_step)),
         "grid_type": ("explicit" if req.t_eval is not None else ("dt" if "dt" in (req.grid or {}) else "N")),
         "grid_params": ({"t_eval": list(t_eval)} if req.t_eval is not None else dict(req.grid or {})),
-        "rosenbrock_jacobian": {
-            "mode": getattr(req.rosenbrock_jacobian, "mode", None),
-            "ml": getattr(req.rosenbrock_jacobian, "ml", None),
-            "mu": getattr(req.rosenbrock_jacobian, "mu", None),
-        },
         "has_temperature_schedule": req.temperature_schedule is not None,
     }
     prov.update(symbolic_jacobian.provenance_fields())
@@ -342,7 +338,6 @@ def _execute_scipy(
     *,
     segment_identity: SegmentIdentity,
     rhs: Rhs2,
-    rhs_for_jac: Rhs2,
     t0: float,
     t1: float,
     y0: np.ndarray,
@@ -403,23 +398,11 @@ def _execute_scipy(
         and jac_callable is None
         and jac_sparsity is not None
     )
-    banded_jacobian_active = (
-        jac_callable is not None
-        and
-        getattr(req.rosenbrock_jacobian, "mode", None) == "banded"
-        and req.rosenbrock_jacobian.ml is not None
-        and req.rosenbrock_jacobian.mu is not None
-    )
-
     def _kwargs_for_method(method_name: str) -> Dict[str, Any]:
         kwargs = dict(base_kwargs)
         kwargs["method"] = method_name
         if method_name in ("Radau", "BDF") and jac_callable is not None:
             kwargs["jac"] = jac_callable
-            if banded_jacobian_active:
-                # SciPy implicit solvers expect an n x n Jacobian when a jac
-                # callable is supplied; jac_sparsity is ignored in that case.
-                kwargs.pop("jac_sparsity", None)
         elif method_name in ("Radau", "BDF") and jac_sparsity is not None:
             kwargs["jac_sparsity"] = jac_sparsity
         else:
@@ -564,7 +547,6 @@ def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
         request.request,
         segment_identity=request.identity,
         rhs=request.rhs,
-        rhs_for_jac=request.rhs_for_jac,
         t0=request.t0,
         t1=request.t1,
         y0=request.y0,
@@ -649,7 +631,7 @@ def solve_ode(req: SimulationRequest) -> SimulationOutput:
         raise InitialConditionError("y0 must contain non-negative concentrations")
     t0, t1 = map(float, req.t_span)
     t_eval = _prepare_time_grid(req, t0=t0, t1=t1)
-    rhs, rhs_for_jac = _prepare_rhs(req, t0=t0, t1=t1)
+    rhs = _prepare_rhs(req, t0=t0, t1=t1)
     prov = _build_provenance(req, t_eval=t_eval)
 
     method = _scipy_method_for(req.solver)
@@ -658,7 +640,6 @@ def solve_ode(req: SimulationRequest) -> SimulationOutput:
         ScheduleExecutionRequest(
             request=req,
             rhs=rhs,
-            rhs_for_jac=rhs_for_jac,
             t0=t0,
             t1=t1,
             y0=y0,

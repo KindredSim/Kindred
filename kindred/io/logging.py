@@ -9,9 +9,6 @@ Features
 --------
 - **Basic logging**: Simple setup with rotating file handlers
 - **Structured logging**: JSON-formatted logs for production/analysis
-- **Operation tracking**: Automatic timing and success/failure logging
-- **Per-module levels**: Fine-grained log level control
-- **Lazy evaluation**: Performance-optimized debug logging
 
 Usage Examples
 --------------
@@ -36,24 +33,6 @@ Structured logging (JSON)::
         "solver": "BDF"
     })
 
-Operation tracking::
-
-    from kindred.io.logging import log_operation, get_logger
-
-    logger = get_logger(__name__)
-    with log_operation("Parameter fitting", logger, level="INFO"):
-        # Fitting code here
-        pass
-    # Automatically logs start, duration, and success/failure
-
-Per-module levels::
-
-    from kindred.io.logging import configure_module_levels
-
-    configure_module_levels({
-        "kindred.core": "DEBUG",
-        "kindred.gui": "WARNING",
-    })
 """
 
 from __future__ import annotations
@@ -62,12 +41,10 @@ import json
 import logging
 import logging.handlers
 import sys
-import time
 import traceback
-from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Any, Dict, Optional, Iterator
+from typing import Any, Dict, Optional
 
 from kindred.io.logging_config import (
     BACKUP_COUNT,
@@ -87,14 +64,6 @@ __all__ = [
     "setup_structured_logging",
     "JSONFormatter",
     "StructuredMessage",
-    # Configuration
-    "configure_module_levels",
-    "set_log_level",
-    # Operation tracking
-    "log_operation",
-    "OperationTimer",
-    # Performance
-    "LazyMessage",
 ]
 
 
@@ -285,230 +254,6 @@ def setup_structured_logging(
                 raise RuntimeError(
                     f"Failed to set up structured logging: {exc}"
                 ) from exc
-
-
-# ------------------------------- Configuration ---------------------------------
-
-
-def configure_module_levels(module_levels: Dict[str, str]) -> None:
-    """
-    Configure per-module log levels.
-
-    Parameters
-    ----------
-    module_levels : dict
-        Mapping of module names to log levels
-        Example: {"kindred.core": "DEBUG", "kindred.gui": "WARNING"}
-
-    Examples
-    --------
-    >>> configure_module_levels({
-    ...     "kindred.core": "DEBUG",
-    ...     "kindred.core.simulator": "INFO",
-    ...     "kindred.gui": "WARNING",
-    ... })
-    """
-    for module_name, level_str in module_levels.items():
-        level = getattr(logging, level_str.upper(), logging.INFO)
-        logger = logging.getLogger(module_name)
-        logger.setLevel(level)
-
-
-def set_log_level(level: str, module: Optional[str] = None) -> None:
-    """
-    Set log level for a specific module or root logger.
-
-    Parameters
-    ----------
-    level : str
-        Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-    module : str, optional
-        Module name. If None, sets root logger level.
-
-    Examples
-    --------
-    >>> set_log_level("DEBUG")  # All modules
-    >>> set_log_level("WARNING", "kindred.gui")  # Specific module
-    """
-    numeric_level = getattr(logging, level.upper(), logging.INFO)
-    if module:
-        logger = logging.getLogger(module)
-    else:
-        logger = logging.getLogger()
-    logger.setLevel(numeric_level)
-
-
-# ----------------------------- Operation Tracking ------------------------------
-
-
-@dataclass
-class OperationTimer:
-    """
-    Timer for tracking operation duration.
-
-    Attributes
-    ----------
-    name : str
-        Operation name
-    start_time : float
-        Start timestamp
-    end_time : float, optional
-        End timestamp
-    success : bool
-        Whether operation succeeded
-    error : Exception, optional
-        Exception if operation failed
-    metadata : dict
-        Additional operation metadata
-    """
-    name: str
-    start_time: float
-    end_time: Optional[float] = None
-    success: bool = True
-    error: Optional[Exception] = None
-    metadata: Optional[Dict[str, Any]] = None
-
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
-
-    @property
-    def duration(self) -> Optional[float]:
-        """Duration in seconds."""
-        if self.end_time is None:
-            return None
-        return self.end_time - self.start_time
-
-    def stop(self, success: bool = True, error: Optional[Exception] = None) -> None:
-        """
-        Stop the timer.
-
-        Parameters
-        ----------
-        success : bool
-            Whether operation succeeded
-        error : Exception, optional
-            Exception if operation failed
-        """
-        self.end_time = time.time()
-        self.success = success
-        self.error = error
-
-    def to_log_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for logging."""
-        data = {
-            "operation": self.name,
-            "duration_ms": int(self.duration * 1000) if self.duration else None,
-            "success": self.success,
-        }
-        if self.error:
-            data["error"] = str(self.error)
-        if self.metadata:
-            data.update(self.metadata)
-        return data
-
-
-@contextmanager
-def log_operation(
-    name: str,
-    logger: logging.Logger,
-    level: str = "INFO",
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Iterator[OperationTimer]:
-    """
-    Context manager for logging operation duration and success/failure.
-
-    Parameters
-    ----------
-    name : str
-        Operation name
-    logger : logging.Logger
-        Logger instance
-    level : str
-        Log level (INFO, DEBUG, etc.)
-    metadata : dict, optional
-        Additional metadata to include in logs
-
-    Yields
-    ------
-    OperationTimer
-        Timer object (can be used to add metadata during operation)
-
-    Examples
-    --------
-    >>> logger = get_logger(__name__)
-    >>> with log_operation("Parameter fitting", logger) as timer:
-    ...     # Do fitting
-    ...     timer.metadata["n_params"] = 5
-    # Logs: "Parameter fitting started"
-    # Logs: "Parameter fitting completed in 1.23s" (with metadata)
-
-    >>> with log_operation("Simulation", logger):
-    ...     raise ValueError("Solver failed")
-    # Logs: "Simulation started"
-    # Logs: "Simulation failed after 0.01s: Solver failed"
-    """
-    timer = OperationTimer(name=name, start_time=time.time(), metadata=metadata or {})
-
-    log_level = getattr(logging, level.upper(), logging.INFO)
-    logger.log(log_level, f"{name} started")
-
-    try:
-        yield timer
-        timer.stop(success=True)
-
-        # Log completion
-        logger.log(
-            log_level,
-            f"{name} completed in {timer.duration:.3f}s",
-            extra=timer.to_log_dict()
-        )
-
-    except Exception as e:
-        timer.stop(success=False, error=e)
-
-        # Log failure
-        logger.log(
-            logging.ERROR,
-            f"{name} failed after {timer.duration:.3f}s: {e}",
-            extra=timer.to_log_dict(),
-            exc_info=True
-        )
-        raise
-
-
-# ---------------------------- Performance Utilities ----------------------------
-
-
-class LazyMessage:
-    """
-    Lazy log message evaluation for performance.
-
-    Delays expensive string formatting until message is actually logged.
-    Useful for DEBUG-level logs with complex formatting that won't be shown
-    in production.
-
-    Examples
-    --------
-    >>> logger = get_logger(__name__)
-    >>> logger.debug(LazyMessage(lambda: f"Complex data: {expensive_operation()}"))
-    # expensive_operation() only called if DEBUG level is enabled
-    """
-
-    def __init__(self, func):
-        """
-        Initialize lazy message.
-
-        Parameters
-        ----------
-        func : callable
-            Function returning message string
-        """
-        self.func = func
-
-    def __str__(self):
-        """Evaluate message when needed."""
-        return str(self.func())
 
 
 # ------------------------------- helpers ---------------------------------------

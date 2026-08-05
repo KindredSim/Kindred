@@ -146,7 +146,7 @@ from kindred.gui.workspace_tab_registry import (
     WorkspaceTabRegistry,
 )
 from kindred.io.kin_archive_store import KinArchiveStore
-from kindred.io.paths import resolve_start_dir
+from kindred.io.paths import resolve_export_start_dir
 from kindred.io.resources import (
     InterventionExampleCatalogError,
     get_all_intervention_example_specs,
@@ -484,10 +484,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rendering_workspace = False
         self._recent_menu: QtWidgets.QMenu | None = None
         self._tab_surfaces: dict[str, _TabSurfaceBundle] = {}
-        self._fit_color_by_species: dict[str, QtGui.QColor] = {}
         self._dark_mode_action: QtGui.QAction | None = None
         self._run_action: QtGui.QAction | None = None
         self._xlsx_export_action: QtGui.QAction | None = None
+        self._last_export_directory: str | None = None
 
         self.setObjectName("kindredMainWindow")
         self.setWindowTitle("Kindred")
@@ -537,12 +537,7 @@ class MainWindow(QtWidgets.QMainWindow):
             gate=self._computation_gate,
             deauthorize_targets=self._simulation_jobs.deauthorize_targets,
             commit_detailed_balance_source=self._commit_detailed_balance_source,
-            color_resolver=lambda species: QtGui.QColor(
-                self._fit_color_by_species.get(
-                    str(species),
-                    self.config_controller.species_color(str(species)),
-                )
-            ),
+            color_resolver=self.config_controller.species_color,
             parent_widget=self,
             parent=self,
         )
@@ -1112,7 +1107,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._apply_persisted_plot_states(document)
             for tab in document.tabs:
                 self._refresh_tab_controls(tab.tab_id)
-                self._render_results_for_tab(tab.tab_id)
             self._render_tab_state()
             self._select_tab_surfaces(self._workspace_tab_registry.active_tab_id)
             self._refresh_title()
@@ -1414,6 +1408,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         repository = self._repository_for_tab(tab_id)
         analysis = tab.dsl_analysis
+        modeled_species = tuple(projected_species_names(tab))
         simulation_series_names = list(
             ()
             if analysis is None
@@ -1429,20 +1424,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if entry is not None:
                     simulation_series_names.extend(entry.result.series)
         simulation_series = tuple(dict.fromkeys(simulation_series_names))
-        configured_names = tuple(
-            dict.fromkeys(
-                simulation_series
-                + tuple(
-                    layer.model_species or layer.raw_column
-                    for layer in experimental_layers
-                )
-            )
-        )
         color_by_axis_selection: dict[AxisSeriesSelection, str] = {
             SimulationSeriesAxisSelection(species): (
                 self.config_controller.species_color(
                     species,
-                    configured_names,
+                    modeled_species,
                 ).name(QtGui.QColor.NameFormat.HexRgb)
             )
             for species in simulation_series
@@ -1456,7 +1442,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             ] = self.config_controller.species_color(
                 color_name,
-                configured_names,
+                modeled_species,
             ).name(QtGui.QColor.NameFormat.HexRgb)
         return self._result_presenter.compose(
             tab_id=tab_id,
@@ -1653,7 +1639,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_workspace_tab_structure()
         self._apply_persisted_plot_state(tab.tab_id)
         self._refresh_tab_controls(tab.tab_id)
-        self._render_results_for_tab(tab.tab_id)
 
     @QtCore.Slot(str, str)
     def _rename_tab(self, tab_id: str, name: str) -> None:
@@ -2197,7 +2182,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         )
         for tab_id in refresh_tab_ids:
             self._refresh_tab_controls(tab_id)
-            self._render_results_for_tab(tab_id)
         self._refresh_project_state()
         return result.token
 
@@ -2315,7 +2299,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if any(species in valid_species for species in values)
         }
         self._refresh_tab_controls(tab_id)
-        self._render_results_for_tab(tab_id)
         return True
 
     def _prepare_source_reconciliation(
@@ -2419,7 +2402,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 "adjust a Slider to request a new Preview."
             )
             self._refresh_tab_controls(outcome.tab_id)
-            self._render_results_for_tab(outcome.tab_id)
 
     @QtCore.Slot(str)
     def _clear_preview_detailed_balance_block(self, tab_id: str) -> None:
@@ -2468,7 +2450,6 @@ class MainWindow(QtWidgets.QMainWindow):
         runtime.reactions_draft = None
         self._tab_surfaces[target].slider_binding.discard_slider_draft()
         self._refresh_tab_controls(target)
-        self._render_results_for_tab(target)
         return True
 
     def _load_preset_mechanism(self, preset_id: str) -> None:
@@ -2717,18 +2698,27 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         occupied_choice = None
         if occupant is not None:
+            occupant_name = self._project_session.document.dataset(
+                occupant
+            ).display_name
             dialog = QtWidgets.QMessageBox(self)
-            dialog.setWindowTitle("Set Already Mapped")
+            dialog.setWindowTitle("Initial-condition set already in use")
             dialog.setIcon(QtWidgets.QMessageBox.Icon.Question)
             dialog.setText(
-                f"Set '{target.name}' is already mapped in this mechanism tab."
+                f'"{target.name}" is already mapped to "{occupant_name}" '
+                "in this mechanism tab. Each dataset must use its own "
+                "initial-condition set."
+            )
+            dialog.setInformativeText(
+                f'Moving the set unmaps "{occupant_name}" and turns off '
+                "its Fit inclusion."
             )
             override = dialog.addButton(
-                "Override",
+                "Move set to this dataset",
                 QtWidgets.QMessageBox.ButtonRole.AcceptRole,
             )
             create_copy = dialog.addButton(
-                "Create Copy",
+                "Create a separate copy",
                 QtWidgets.QMessageBox.ButtonRole.ActionRole,
             )
             cancel = dialog.addButton(
@@ -2832,14 +2822,26 @@ class MainWindow(QtWidgets.QMainWindow):
             record = self._project_session.document.dataset(intent.dataset_id)
         except KeyError:
             return
+        try:
+            start_directory = resolve_export_start_dir(
+                self._last_export_directory
+            )
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export Original Dataset",
+                str(exc),
+            )
+            return
         path, _selected = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Export Original Dataset",
-            os.path.join(resolve_start_dir(None), record.original_filename),
+            os.path.join(start_directory, record.original_filename),
             "All Files (*)",
         )
         if not path:
             return
+        self._remember_export_directory(path)
         try:
             exported = export_original_source(record, path)
             self.set_status_text(f"Exported original dataset: {exported}")
@@ -3677,12 +3679,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return False
         bundle.slider_binding.cancel_pending_preview_intent()
-        if not self._fit_session_owner.has_window:
-            species = tuple(projected_species_names(tab))
-            self._fit_color_by_species = {
-                name: self.config_controller.species_color(name, species)
-                for name in species
-            }
         return self._fit_session_owner.open_or_focus(tab.tab_id) is not None
 
     def _configure_fitting(self) -> bool:
@@ -3783,19 +3779,36 @@ class MainWindow(QtWidgets.QMainWindow):
         if projection is None:
             self.set_status_text("No result data is available to export.")
             return
+        try:
+            start_directory = resolve_export_start_dir(
+                self._last_export_directory
+            )
+        except OSError as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export Results XLSX",
+                str(exc),
+            )
+            return
         path, _selected = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Export Results XLSX",
-            resolve_start_dir(None),
+            start_directory,
             "Excel Workbook (*.xlsx)",
         )
         if not path:
             return
         if not path.casefold().endswith(".xlsx"):
             path += ".xlsx"
+        self._remember_export_directory(path)
         if self._xlsx_export_owner.start(projection, path):
             self.set_status_text(f"Exporting XLSX: {path}")
             self._refresh_actions()
+
+    def _remember_export_directory(self, path: str) -> None:
+        directory = os.path.dirname(os.path.abspath(os.fspath(path)))
+        if os.path.isdir(directory):
+            self._last_export_directory = directory
 
     @QtCore.Slot(object)
     def _on_xlsx_export_succeeded(self, outcome: object) -> None:

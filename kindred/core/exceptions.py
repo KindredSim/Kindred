@@ -12,9 +12,6 @@ Error Categories
 - **Validation**: Input validation failures (E200-E299)
 - **Simulation**: Runtime simulation errors (E300-E399)
 - **Fitting**: Parameter estimation errors (E400-E499)
-- **Configuration**: Settings errors (E500-E599)
-- **Integration**: System integration errors (E600-E699)
-- **IO**: File and data handling errors (E700-E799)
 """
 
 from __future__ import annotations
@@ -29,34 +26,17 @@ __all__ = [
     "ErrorContext",
     # Validation
     "ValidationError",
-    "ParameterValidationError",
-    "SpeciesValidationError",
     "ReactionValidationError",
     "InitialConditionError",
     # Simulation
     "SimulationError",
     "SolverError",
-    "IntegrationError",
     "TimeGridError",
-    "JacobianError",
     # Fitting
     "FittingError",
     "FitSimulationError",
     "FittingCancelled",
     "OptimizationError",
-    "ConvergenceError",
-    "DataMismatchError",
-    # Configuration
-    "ConfigurationError",
-    "SettingsError",
-    # Integration
-    "IntegrationFailureError",
-    "SimulationBuilderContractError",
-    "DependencyError",
-    # IO
-    "IOError",
-    "FileFormatError",
-    "ExportError",
 ]
 
 
@@ -202,20 +182,6 @@ class ValidationError(KindredError):
         super().__init__(message, **kwargs)
 
 
-class ParameterValidationError(ValidationError):
-    """Error for invalid parameter values or specifications."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E201")
-        super().__init__(message, **kwargs)
-
-
-class SpeciesValidationError(ValidationError):
-    """Error for invalid species definitions or references."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E202")
-        super().__init__(message, **kwargs)
-
-
 class ReactionValidationError(ValidationError):
     """Error for invalid reaction specifications."""
     def __init__(self, message: str, **kwargs):
@@ -247,24 +213,10 @@ class SolverError(SimulationError):
         super().__init__(message, **kwargs)
 
 
-class IntegrationError(SimulationError):
-    """Error during numerical integration."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E302")
-        super().__init__(message, **kwargs)
-
-
 class TimeGridError(SimulationError):
     """Error in time grid specification or generation."""
     def __init__(self, message: str, **kwargs):
         kwargs.setdefault("code", "E303")
-        super().__init__(message, **kwargs)
-
-
-class JacobianError(SimulationError):
-    """Error in Jacobian computation or structure."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E304")
         super().__init__(message, **kwargs)
 
 
@@ -309,201 +261,7 @@ class OptimizationError(FittingError):
         super().__init__(message, **kwargs)
 
 
-class ConvergenceError(FittingError):
-    """Error when optimization fails to converge."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E402")
-        super().__init__(message, **kwargs)
-
-
-class DataMismatchError(FittingError):
-    """Error when experimental data doesn't match model outputs."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E403")
-        super().__init__(message, **kwargs)
-
-
-# -------------------------- Configuration Errors -------------------------------
-
-
-class ConfigurationError(KindredError):
-    """Base class for configuration errors (E500-E599)."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E500")
-        super().__init__(message, **kwargs)
-
-
-class SettingsError(ConfigurationError):
-    """Error in user settings or preferences."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E502")
-        super().__init__(message, **kwargs)
-
-
-# -------------------------- Integration Errors ---------------------------------
-
-
-class IntegrationFailureError(KindredError):
-    """Base class for system integration errors (E600-E699)."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E600")
-        super().__init__(message, **kwargs)
-
-
-class SimulationBuilderContractError(IntegrationFailureError):
-    """Injected simulation builder does not honor the core solver contract."""
-
-    def __init__(self, message: str | None = None, **kwargs):
-        kwargs.setdefault("code", "E602")
-        kwargs.setdefault(
-            "suggestion",
-            "Update the simulation builder to accept solver, rtol, and atol keyword arguments.",
-        )
-        details = dict(kwargs.pop("details", {}) or {})
-        details.setdefault("contract", "(mechanism_text, param_names, *, solver, rtol, atol)")
-        details.setdefault("missing_kwargs", ["solver", "rtol", "atol"])
-        super().__init__(
-            message
-            or "Simulation builder must accept solver settings: "
-            "(mechanism_text, param_names, *, solver, rtol, atol).",
-            details=details,
-            **kwargs,
-        )
-
-
-class DependencyError(IntegrationFailureError):
-    """Error with missing or incompatible dependencies."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E601")
-        super().__init__(message, **kwargs)
-
-
-# ------------------------------- IO Errors -------------------------------------
-
-
-class IOError(KindredError):
-    """Base class for I/O errors (E700-E799)."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E700")
-        super().__init__(message, **kwargs)
-
-
-class FileFormatError(IOError):
-    """Error parsing or writing file formats."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E701")
-        super().__init__(message, **kwargs)
-
-
-class ExportError(IOError):
-    """Error during data or results export."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E702")
-        super().__init__(message, **kwargs)
-
-
 # ----------------------------- Helper Functions --------------------------------
-
-
-def create_validation_error(
-    param_name: str,
-    value: Any,
-    expected: str,
-    *,
-    examples: Optional[List[str]] = None,
-) -> ParameterValidationError:
-    """
-    Factory for common parameter validation errors.
-
-    Parameters
-    ----------
-    param_name : str
-        Parameter name
-    value : any
-        Invalid value provided
-    expected : str
-        Description of expected value
-    examples : list of str, optional
-        Valid examples
-
-    Returns
-    -------
-    ParameterValidationError
-    """
-    return ParameterValidationError(
-        f"Invalid value for parameter '{param_name}': {value}",
-        suggestion=f"Expected: {expected}",
-        examples=examples or [],
-        details={"parameter": param_name, "provided_value": str(value)},
-    )
-
-
-def create_missing_dependency_error(
-    module_name: str,
-    feature: str,
-    install_command: str,
-) -> DependencyError:
-    """
-    Factory for missing dependency errors.
-
-    Parameters
-    ----------
-    module_name : str
-        Name of missing module
-    feature : str
-        Feature that requires the module
-    install_command : str
-        Pip install command
-
-    Returns
-    -------
-    DependencyError
-    """
-    return DependencyError(
-        f"Missing optional dependency: {module_name}",
-        suggestion=f"Install with: {install_command}",
-        details={
-            "module": module_name,
-            "feature": feature,
-            "install_command": install_command,
-        },
-    )
-
-
-def create_convergence_error(
-    optimizer: str,
-    iterations: int,
-    tolerance: float,
-    final_cost: float,
-) -> ConvergenceError:
-    """
-    Factory for optimization convergence errors.
-
-    Parameters
-    ----------
-    optimizer : str
-        Optimizer name
-    iterations : int
-        Number of iterations performed
-    tolerance : float
-        Target tolerance
-    final_cost : float
-        Final cost function value
-
-    Returns
-    -------
-    ConvergenceError
-    """
-    return ConvergenceError(
-        f"Optimization failed to converge after {iterations} iterations",
-        suggestion="Try adjusting initial parameters, bounds, or increasing max iterations",
-        details={
-            "optimizer": optimizer,
-            "iterations": iterations,
-            "tolerance": tolerance,
-            "final_cost": final_cost,
-        },
-    )
 
 
 def create_solver_error(

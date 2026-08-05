@@ -33,24 +33,6 @@ except ImportError:  # pragma: no cover - plot_config rejects this before constr
 
 __all__ = ["PyQtGraphPlotPanel"]
 
-_FALLBACK_COLORS = (
-    "#4c78a8",
-    "#f58518",
-    "#54a24b",
-    "#e45756",
-    "#72b7b2",
-    "#b279a2",
-    "#ff9da6",
-    "#9d755d",
-)
-
-
-def _fallback_color(name: str) -> str:
-    return _FALLBACK_COLORS[
-        sum((index + 1) * ord(char) for index, char in enumerate(str(name)))
-        % len(_FALLBACK_COLORS)
-    ]
-
 
 @dataclass(frozen=True, slots=True)
 class _PlotPresentation:
@@ -470,7 +452,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         rendered_series: list[tuple[str, np.ndarray]] = []
         for series_name, values in block.series:
             y = values[sample]
-            color = colors.get(series_name, _fallback_color(series_name))
+            color = colors[series_name]
             name = f"{layer.label}: {series_name}"
             for chunk_index, (start, end) in enumerate(chunks):
                 singleton = end - start == 1

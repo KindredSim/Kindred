@@ -13,7 +13,11 @@ from typing import Optional, TypeGuard
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["find_outputs_dir", "resolve_start_dir"]
+__all__ = [
+    "find_outputs_dir",
+    "resolve_export_start_dir",
+    "resolve_start_dir",
+]
 
 _APP_NAME = "Kindred"
 
@@ -138,3 +142,47 @@ def resolve_start_dir(last_folder: Optional[str]) -> str:
 
     # Do not create directories during startup/browse; provide a deterministic default.
     return find_outputs_dir()
+
+
+def resolve_export_start_dir(last_folder: Optional[str]) -> str:
+    """Return an existing directory for a request-time export dialog.
+
+    An existing explicit last-export directory remains authoritative.  Without
+    one, the configured/default outputs directory is created lazily.  If that
+    creation fails, only the configured path's finite parent chain is searched
+    for the nearest existing directory.
+    """
+
+    if _is_dirlike(last_folder):
+        explicit = Path(last_folder).expanduser().resolve()
+        if explicit.is_dir():
+            return str(explicit)
+
+    configured = Path(find_outputs_dir()).expanduser().resolve()
+    try:
+        configured.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Could not create configured export directory %s: %s",
+            configured,
+            exc,
+        )
+    else:
+        if configured.is_dir():
+            return str(configured)
+
+    candidate = configured
+    while True:
+        try:
+            if candidate.is_dir():
+                return str(candidate)
+        except OSError:
+            pass
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    raise FileNotFoundError(
+        "Configured export path has no existing directory in its parent chain: "
+        f"{configured}"
+    )

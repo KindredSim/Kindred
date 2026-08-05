@@ -529,10 +529,13 @@ class WorkspacePlotLayer:
                 _required_id(color, "plot series color"),
             )
             for name, color in self.color_by_series
-            if str(name) in names
         )
+        if any(name not in names for name, _color in colors):
+            raise ValueError("plot series colors must reference plot series.")
         if len(colors) != len({name for name, _ in colors}):
             raise ValueError("plot series colors must be unique by series.")
+        if {name for name, _color in colors} != names:
+            raise ValueError("plot series colors must cover every plot series.")
         provenance: list[tuple[str, Mapping[str, object]]] = []
         provenance_names: set[str] = set()
         for raw_name, raw_payload in self.series_provenance:
@@ -1099,7 +1102,6 @@ def _result_layer(
         color_by_series=tuple(
             (name, str(color_by_axis_selection[selection]))
             for name, selection in series_axes
-            if selection in color_by_axis_selection
         ),
         dashed=kind is ResultLayerKind.REFERENCE,
         opacity=0.42 if kind is ResultLayerKind.REFERENCE else 1.0,
@@ -1575,7 +1577,6 @@ class WorkspaceResultPresenter:
                 experimental_x_axis = selected_x
                 experimental_x_provenance = _observation_provenance(x_source)
             label = candidate_label
-            configured_color = colors.get(y_axis)
             layer = WorkspacePlotLayer(
                 layer_id=f"experimental:{experimental.layer_id}",
                 source_id=experimental.layer_id,
@@ -1601,9 +1602,7 @@ class WorkspaceResultPresenter:
                     ),
                 ),
                 color_by_series=(
-                    ()
-                    if configured_color is None
-                    else ((experimental.raw_column, configured_color),)
+                    (experimental.raw_column, colors[y_axis]),
                 ),
                 opacity=point_opacity,
                 markers=True,

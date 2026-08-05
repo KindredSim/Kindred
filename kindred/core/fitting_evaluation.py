@@ -179,6 +179,7 @@ class FittingSeriesEvaluation:
     segment_keys: tuple[str, ...]
     discontinuity_ids: np.ndarray
     intervention_execution: InterventionExecutionContract
+    solver_provenance: Mapping[str, Any]
 
     def __post_init__(self) -> None:
         if not isinstance(self.series, SimulationSeriesPayload):
@@ -192,6 +193,8 @@ class FittingSeriesEvaluation:
                 "Fit intervention execution must be an "
                 "InterventionExecutionContract."
             )
+        if not isinstance(self.solver_provenance, Mapping):
+            raise TypeError("Fit solver provenance must be a mapping.")
         segment_ids = np.asarray(self.segment_ids, dtype=np.int64).reshape(-1).copy()
         times = np.asarray(self.series.t, dtype=float).reshape(-1)
         if segment_ids.size != times.size:
@@ -228,6 +231,11 @@ class FittingSeriesEvaluation:
         object.__setattr__(self, "segment_ids", segment_ids)
         object.__setattr__(self, "segment_keys", segment_keys)
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
+        object.__setattr__(
+            self,
+            "solver_provenance",
+            copy.deepcopy(dict(self.solver_provenance)),
+        )
 
 
 def evaluate_fitting_series(
@@ -952,6 +960,7 @@ class SerialFittingEvaluator:
             segment_keys=segment_keys,
             discontinuity_ids=discontinuity_ids,
             intervention_execution=result_execution,
+            solver_provenance=admitted.provenance.solver,
         )
 
     def _ensure_prepared(self) -> None:

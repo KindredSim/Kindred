@@ -8,6 +8,7 @@ diagnostics, and result/completion assembly. Public API composition remains in
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from dataclasses import dataclass, field
@@ -164,8 +165,9 @@ class GlobalFitResult:
     model_observation_ids: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
     model_raw_columns: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
     model_source_rows: Dict[str, Dict[str, tuple[int, ...]]] = field(default_factory=dict)
-    residual_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
-    plot_observed_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
+    solver_provenance_by_dataset: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict
+    )
     plot_observed_x: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     plot_observed_source_rows: Dict[str, Dict[str, tuple[int, ...]]] = field(
         default_factory=dict
@@ -189,6 +191,21 @@ class GlobalFitResult:
     def __post_init__(self) -> None:
         if not isinstance(self.completion, GlobalFitCompletion):
             raise TypeError("GlobalFitResult.completion must be a GlobalFitCompletion")
+        solver_provenance: Dict[str, Dict[str, Any]] = {}
+        for raw_dataset_id, provenance in self.solver_provenance_by_dataset.items():
+            dataset_id = str(raw_dataset_id or "").strip()
+            if not dataset_id or dataset_id in solver_provenance:
+                raise ValueError(
+                    "Fit solver provenance requires distinct stable dataset IDs."
+                )
+            if not isinstance(provenance, Mapping):
+                raise TypeError("Fit solver provenance entries must be mappings.")
+            solver_provenance[dataset_id] = copy.deepcopy(dict(provenance))
+        object.__setattr__(
+            self,
+            "solver_provenance_by_dataset",
+            solver_provenance,
+        )
         identity_maps = (
             self.model_x_by_species,
             self.model_segment_ids,
@@ -545,6 +562,7 @@ def _extract_simulation_payload(
     np.ndarray,
     tuple[str, ...],
     np.ndarray,
+    Dict[str, Any],
 ]:
     """Return time, series, and direct canonical row identity."""
     payload = simulation.series
@@ -555,6 +573,7 @@ def _extract_simulation_payload(
         np.asarray(simulation.segment_ids, dtype=np.int64).reshape(-1),
         tuple(simulation.segment_keys),
         np.asarray(simulation.discontinuity_ids, dtype=np.int64).reshape(-1),
+        dict(simulation.solver_provenance),
     )
 
 
@@ -1141,6 +1160,7 @@ class DatasetSimulationEvaluation:
     segment_ids: Optional[np.ndarray] = None
     segment_keys: tuple[str, ...] | None = None
     discontinuity_ids: Optional[np.ndarray] = None
+    solver_provenance: Optional[Dict[str, Any]] = None
     error: Optional[BaseException] = None
     error_provenance: Optional[Dict[str, Any]] = None
     final_error_message: Optional[str] = None
@@ -1155,6 +1175,7 @@ class DatasetSimulationEvaluation:
                 or self.segment_ids is not None
                 or self.segment_keys is not None
                 or self.discontinuity_ids is not None
+                or self.solver_provenance is not None
             ):
                 raise ValueError(
                     "Failed Fit evaluations cannot publish a partial result."
@@ -1242,6 +1263,14 @@ class DatasetSimulationEvaluation:
             )
         if self.error_provenance is not None:
             object.__setattr__(self, "error_provenance", dict(self.error_provenance))
+        if self.solver_provenance is not None:
+            if not isinstance(self.solver_provenance, Mapping):
+                raise TypeError("Fit solver provenance must be a mapping.")
+            object.__setattr__(
+                self,
+                "solver_provenance",
+                copy.deepcopy(dict(self.solver_provenance)),
+            )
 
 
 def dataset_evaluation_is_fatal(result: DatasetSimulationEvaluation) -> bool:
@@ -1254,6 +1283,7 @@ def evaluate_dataset_simulation(
     item: ObjectiveDatasetInput,
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
+    retain_solver_provenance: bool = False,
 ) -> DatasetSimulationEvaluation:
     ds_id = item.payload.dataset_id
     try:
@@ -1276,6 +1306,7 @@ def evaluate_dataset_simulation(
             segment_ids,
             segment_keys,
             discontinuity_ids,
+            solver_provenance,
         ) = _extract_simulation_payload(sim_result)
         _raise_if_fitting_cancel_requested(cancellation_check)
         return DatasetSimulationEvaluation(
@@ -1285,6 +1316,9 @@ def evaluate_dataset_simulation(
             segment_ids=segment_ids,
             segment_keys=segment_keys,
             discontinuity_ids=discontinuity_ids,
+            solver_provenance=(
+                solver_provenance if retain_solver_provenance else None
+            ),
         )
     except FitSimulationError as exc:
         return DatasetSimulationEvaluation(
@@ -1324,6 +1358,7 @@ def evaluate_dataset_simulations(
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
     stop_on_fatal: bool = True,
+    retain_solver_provenance: bool = False,
 ) -> List[DatasetSimulationEvaluation]:
     if not items:
         return []
@@ -1332,6 +1367,7 @@ def evaluate_dataset_simulations(
         items,
         cancellation_check=cancellation_check,
         stop_on_fatal=stop_on_fatal,
+        retain_solver_provenance=retain_solver_provenance,
     )
 
 
@@ -1341,6 +1377,7 @@ def evaluate_dataset_simulations_serial(
     *,
     cancellation_check: Optional[Callable[[], bool]],
     stop_on_fatal: bool,
+    retain_solver_provenance: bool,
 ) -> List[DatasetSimulationEvaluation]:
     results = []
     for item in items:
@@ -1349,6 +1386,7 @@ def evaluate_dataset_simulations_serial(
             fit_evaluators,
             item,
             cancellation_check=cancellation_check,
+            retain_solver_provenance=retain_solver_provenance,
         )
         results.append(result)
         if stop_on_fatal and dataset_evaluation_is_fatal(result):
@@ -1722,8 +1760,7 @@ def assemble_global_fit_result(
     model_observation_ids_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
     model_raw_columns_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
     model_source_rows_map: Dict[str, Dict[str, tuple[int, ...]]] = {}
-    residual_series_map: Dict[str, Dict[str, np.ndarray]] = {}
-    plot_observed_series_map: Dict[str, Dict[str, np.ndarray]] = {}
+    solver_provenance_by_dataset: Dict[str, Dict[str, Any]] = {}
     plot_observed_x_map: Dict[str, Dict[str, np.ndarray]] = {}
     plot_observed_source_rows_map: Dict[
         str, Dict[str, tuple[int, ...]]
@@ -1786,6 +1823,7 @@ def assemble_global_fit_result(
             dataset_inputs,
             cancellation_check=cancellation_check,
             stop_on_fatal=False,
+            retain_solver_provenance=True,
         )
     }
 
@@ -1841,6 +1879,13 @@ def assemble_global_fit_result(
         else:
             sim_time = evaluation.sim_time
             sim_species = evaluation.sim_species
+            if evaluation.solver_provenance is None:
+                raise RuntimeError(
+                    f"Final Fit replay omitted solver provenance for dataset {ds_id!r}."
+                )
+            solver_provenance_by_dataset[ds_id] = dict(
+                evaluation.solver_provenance
+            )
         segment_ids = evaluation.segment_ids
         segment_keys = evaluation.segment_keys
         discontinuity_ids = evaluation.discontinuity_ids
@@ -1873,7 +1918,6 @@ def assemble_global_fit_result(
                 if species_name in x_obs_by_species
                 else None
             )
-            plot_observed_series_map.setdefault(ds_id, {})[species_name] = y_exp.copy()
             plot_observed_x_map.setdefault(ds_id, {})[species_name] = (
                 obs_t.copy()
                 if x_name == "t"
@@ -1900,7 +1944,6 @@ def assemble_global_fit_result(
                         parameter_snapshot=failed_param_snapshot,
                     )
                 residual_blocks.append(penalty_block)
-                residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
                 continue
 
             try:
@@ -1972,7 +2015,6 @@ def assemble_global_fit_result(
                         parameter_snapshot=failed_param_snapshot,
                     )
                 residual_blocks.append(penalty_block)
-                residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
                 continue
 
             if not np.all(np.isfinite(y_sim_resid)):
@@ -1987,11 +2029,9 @@ def assemble_global_fit_result(
                         parameter_snapshot=failed_param_snapshot,
                     )
                 residual_blocks.append(penalty_block)
-                residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
             else:
                 raw_residual = np.asarray(y_sim_resid, dtype=float) - y_exp
                 residual_blocks.append(raw_residual)
-                residual_series_map.setdefault(ds_id, {})[species_name] = raw_residual
                 ss_res = float(np.sum(raw_residual**2))
                 ss_tot = float(
                     np.sum((y_exp - float(np.mean(y_exp))) ** 2)
@@ -2247,8 +2287,7 @@ def assemble_global_fit_result(
         model_observation_ids=model_observation_ids_map,
         model_raw_columns=model_raw_columns_map,
         model_source_rows=model_source_rows_map,
-        residual_series=residual_series_map,
-        plot_observed_series=plot_observed_series_map,
+        solver_provenance_by_dataset=solver_provenance_by_dataset,
         plot_observed_x=plot_observed_x_map,
         plot_observed_source_rows=plot_observed_source_rows_map,
         plot_observed_raw_ids=plot_observed_raw_ids_map,
