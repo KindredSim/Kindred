@@ -6,11 +6,9 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 
-import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.gui.fitting.contracts import FitParametricSettings, FitRunIdentity
-from kindred.gui.fitting.constants import SIMULATION_SOLVERS
+from kindred.gui.fitting.contracts import FitRunIdentity
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.launch import (
@@ -19,10 +17,10 @@ from kindred.gui.fitting.launch import (
     FitDatasetWeightModeSetupEdit,
     FitDefaultsSetupEdit,
     FitInitialSetupEdit,
-    FitMappedDatasetSnapshot,
     FitOriginSnapshot,
     FitParameterSetupEdit,
     FitSetupSnapshot,
+    selected_observations,
 )
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 from kindred.gui.fitting.run_results_tab import RunResultsTab
@@ -77,16 +75,11 @@ class FittingWindow(QtWidgets.QDialog):
         self._snapshot_capture_id: str | None = None
         self._projected_setup: FitSetupSnapshot | None = None
         self._invalid_setup_edits: set[tuple[str, ...]] = set()
-        self._execution_invalid_raw: dict[tuple[str, str], str] = {}
-        self._execution_invalid_messages: dict[tuple[str, str], str] = {}
         self._pending_target_changes = False
         self._resolved_auto_modes: tuple[tuple[str, str], ...] = ()
         self._run_identity: FitRunIdentity | None = None
-        self._candidate: FitCandidate | None = None
-        self._candidate_available_scopes: frozenset[str] = frozenset()
-        self._candidate_unavailable_reasons: dict[str, str] = {}
         self._executing = False
-        self._execution_projecting = False
+        self._setup_projecting = False
 
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
@@ -114,17 +107,13 @@ class FittingWindow(QtWidgets.QDialog):
             parent=self,
         )
         self._data_tab = DataTab(
-            sampling_applied_config_getter=self._sampling_applied_config,
-            sampling_default_config_getter=self._sampling_default_config,
-            fit_targets_full_t_getter=self._selected_target_times_for_dataset,
-            fit_targets_available_getter=self._available_targets_for_dataset,
-            fit_targets_full_series_getter=self._full_series_for_dataset,
-            fit_targets_selection_applied_getter=self._applied_targets_for_dataset,
-            modeled_series_getter=self._modeled_series,
+            settings_getter=self._fit_settings_for_dataset,
+            default_settings_getter=self._fit_default_settings_for_dataset,
+            retained_observations_getter=self._retained_observations_for_dataset,
             parent=self,
         )
         self._data_targets_tab = DataTargetsTab(
-            sampling_panel=self._data_tab,
+            data_settings_panel=self._data_tab,
             species_table=self._species_table,
             parent=self,
         )
@@ -139,7 +128,6 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._project_result_identity_labels()
         self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
-        self._build_execution_presentation()
 
         self._tabs = QtWidgets.QTabBar(self)
         self._tabs.setObjectName("global_fit_top_tabs")
@@ -244,16 +232,14 @@ class FittingWindow(QtWidgets.QDialog):
 
         self._apply_parameters = QtWidgets.QCheckBox("Parameters", footer)
         self._apply_initials = QtWidgets.QCheckBox(
-            "Initial Concentrations", footer
+            "Initial Conditions", footer
         )
-        self._apply_setup = QtWidgets.QCheckBox("Simulation Setup", footer)
         self._apply_observables = QtWidgets.QCheckBox(
             "Observable Definitions", footer
         )
         for checkbox in (
             self._apply_parameters,
             self._apply_initials,
-            self._apply_setup,
             self._apply_observables,
         ):
             checkbox.setEnabled(False)
@@ -281,6 +267,10 @@ class FittingWindow(QtWidgets.QDialog):
     def _connect_leaf_signals(self) -> None:
         self._connect_origin_dependent_leaf_signals()
 
+        self._data_tab.fitSettingsApplied.connect(self._on_fit_settings_applied)
+        self._data_tab.statusMessage.connect(self.set_status)
+        self._data_tab.validityChanged.connect(self._refresh_setup_validity)
+
         self._params_ics_tab.setupEditsRequested.connect(
             self._on_leaf_setup_edits
         )
@@ -304,9 +294,6 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _connect_origin_dependent_leaf_signals(self) -> None:
-        self._data_tab.samplingApplied.connect(self._on_sampling_applied)
-        self._data_tab.statusMessage.connect(self.set_status)
-        self._data_tab.validityChanged.connect(self._refresh_setup_validity)
         self._species_table.setupEditsRequested.connect(
             self._on_leaf_setup_edits
         )
@@ -335,28 +322,6 @@ class FittingWindow(QtWidgets.QDialog):
                 item.set_id: item.set_name
                 for item in self._origin.mapped_datasets
             },
-        )
-
-    def _build_execution_presentation(self) -> None:
-        self._execution_table = QtWidgets.QTableWidget(self._params_ics_tab)
-        self._execution_table.setObjectName("global_fit_execution_table")
-        self._execution_table.setColumnCount(6)
-        self._execution_table.setHorizontalHeaderLabels(
-            (
-                "Dataset",
-                "Mapped set",
-                "Solver",
-                "t start",
-                "t end",
-                "Integration points",
-            )
-        )
-        self._execution_table.horizontalHeader().setStretchLastSection(True)
-        self._execution_table.itemChanged.connect(
-            self._on_execution_item_changed
-        )
-        self._params_ics_tab.set_execution_presentation_widget(
-            self._execution_table
         )
 
     def _parameter_choices_for_origin(self) -> dict[str, object]:
@@ -401,7 +366,7 @@ class FittingWindow(QtWidgets.QDialog):
             parent=self,
         )
         self._data_targets_tab = DataTargetsTab(
-            sampling_panel=self._data_tab,
+            data_settings_panel=self._data_tab,
             species_table=self._species_table,
             parent=self,
         )
@@ -436,8 +401,6 @@ class FittingWindow(QtWidgets.QDialog):
                 self._initial_setup = None
                 self._last_fit_setup = None
                 self._invalid_setup_edits.clear()
-                self._execution_invalid_raw.clear()
-                self._execution_invalid_messages.clear()
                 self._pending_target_changes = False
                 self._clear_resolved_auto_modes()
             else:
@@ -470,13 +433,11 @@ class FittingWindow(QtWidgets.QDialog):
     def restore_snapshot(self, snapshot: FitSetupSnapshot) -> FitSetupSnapshot:
         self._check_snapshot(snapshot)
         # Initial/Last Fit are whole-setup replacements.  Rebuild the first
-        # presentation page so every target, sampling, weight, IC, and raw
+        # presentation page so every target, data-range, weight, IC, and raw
         # validation overlay is cleared without altering the retained reset
         # snapshots themselves.
         self._replace_origin_dependent_presentation(self._origin)
         self._invalid_setup_edits.clear()
-        self._execution_invalid_raw.clear()
-        self._execution_invalid_messages.clear()
         self._pending_target_changes = False
         self._clear_resolved_auto_modes()
         self._params_ics_tab._clear_invalid_numeric_state()  # noqa: SLF001
@@ -488,7 +449,7 @@ class FittingWindow(QtWidgets.QDialog):
 
         self._check_snapshot(snapshot)
         self._projected_setup = snapshot
-        self._execution_projecting = True
+        self._setup_projecting = True
         try:
             self._species_table.project_setup_snapshot(snapshot)
             self._params_ics_tab.project_setup_snapshot(snapshot)
@@ -500,10 +461,9 @@ class FittingWindow(QtWidgets.QDialog):
             self._params_ics_tab.set_selected_dataset_ids(
                 self._included_dataset_ids(snapshot)
             )
-            self._project_execution_table(snapshot)
             self._populate_dataset_list(snapshot)
         finally:
-            self._execution_projecting = False
+            self._setup_projecting = False
         self._species_table.refresh_validity_ui()
         self._refresh_setup_validity()
 
@@ -543,9 +503,8 @@ class FittingWindow(QtWidgets.QDialog):
     def has_invalid_setup_edits(self) -> bool:
         return bool(
             self._invalid_setup_edits
-            or self._execution_invalid_raw
             or self._data_tab.invalid_editor_keys
-            or self._data_sampling_validation_errors()
+            or self._data_range_validation_errors()
             or self._species_table.invalid_editor_keys
             or self._params_ics_tab.has_invalid_edits
         )
@@ -609,7 +568,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _on_leaf_setup_edits(self, intents: object) -> None:
-        if self._execution_projecting:
+        if self._setup_projecting:
             return
         if not isinstance(intents, tuple) or not intents:
             self.set_status("Fit setup edits must be a nonempty tuple.")
@@ -668,10 +627,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_block_reason_label.setText(reason)
         self._refresh_apply_button()
 
-    def _data_sampling_validation_errors(self) -> tuple[str, ...]:
+    def _data_range_validation_errors(self) -> tuple[str, ...]:
         pending_by_dataset = getattr(
             self._data_tab,
-            "_sampling_pending_by_dataset",
+            "_pending",
             {},
         )
         if not isinstance(pending_by_dataset, Mapping):
@@ -680,7 +639,7 @@ class FittingWindow(QtWidgets.QDialog):
             error
             for dataset_id, config in pending_by_dataset.items()
             for error in (
-                self._data_tab.sampling_validation_error(
+                self._data_tab.data_range_validation_error(
                     dataset_id=str(dataset_id),
                     config=dict(config),
                 ),
@@ -711,181 +670,6 @@ class FittingWindow(QtWidgets.QDialog):
         if selected:
             self._species_table.load_for_dataset(selected)
             self._data_tab.select_dataset(selected)
-
-    def _project_execution_table(self, snapshot: FitSetupSnapshot) -> None:
-        table = self._execution_table
-        table.blockSignals(True)
-        try:
-            table.setRowCount(len(snapshot.datasets))
-            mapped_by_id = {
-                item.dataset_id: item for item in self._origin.mapped_datasets
-            }
-            for row, dataset in enumerate(snapshot.datasets):
-                mapped = mapped_by_id.get(dataset.dataset_id)
-                identity = QtWidgets.QTableWidgetItem(
-                    mapped.display_name if mapped is not None else dataset.dataset_id
-                )
-                identity.setData(QtCore.Qt.ItemDataRole.UserRole, dataset.dataset_id)
-                identity.setFlags(
-                    QtCore.Qt.ItemFlag.ItemIsEnabled
-                    | QtCore.Qt.ItemFlag.ItemIsSelectable
-                )
-                table.setItem(row, 0, identity)
-                set_item = QtWidgets.QTableWidgetItem(
-                    mapped.set_name if mapped is not None else ""
-                )
-                set_item.setFlags(
-                    QtCore.Qt.ItemFlag.ItemIsEnabled
-                    | QtCore.Qt.ItemFlag.ItemIsSelectable
-                )
-                table.setItem(row, 1, set_item)
-                solver = QtWidgets.QComboBox(table)
-                solver.addItems(list(SIMULATION_SOLVERS))
-                solver.setCurrentText(dataset.execution.solver)
-                solver.currentTextChanged.connect(
-                    lambda _text, r=row: self._emit_execution_edit(r)
-                )
-                table.setCellWidget(row, 2, solver)
-                for column, value in (
-                    (3, dataset.execution.t_start),
-                    (4, dataset.execution.t_end),
-                    (5, dataset.execution.integration_points),
-                ):
-                    item = QtWidgets.QTableWidgetItem(str(value))
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, dataset.dataset_id)
-                    field = self._execution_field(column)
-                    key = (dataset.dataset_id, field)
-                    if key in self._execution_invalid_raw:
-                        item.setText(self._execution_invalid_raw[key])
-                        self._set_execution_item_invalid(
-                            item,
-                            self._execution_invalid_messages.get(
-                                key,
-                                "Invalid execution value.",
-                            ),
-                        )
-                    table.setItem(row, column, item)
-        finally:
-            table.blockSignals(False)
-
-    @staticmethod
-    def _execution_field(column: int) -> str:
-        return {
-            3: "t_start",
-            4: "t_end",
-            5: "integration_points",
-        }[int(column)]
-
-    @staticmethod
-    def _set_execution_item_invalid(
-        item: QtWidgets.QTableWidgetItem,
-        message: str,
-    ) -> None:
-        item.setBackground(QtGui.QColor(255, 200, 200))
-        item.setForeground(QtGui.QColor(80, 0, 0))
-        item.setToolTip(str(message))
-
-    @staticmethod
-    def _clear_execution_item_invalid(
-        item: QtWidgets.QTableWidgetItem,
-    ) -> None:
-        item.setBackground(QtGui.QBrush())
-        item.setForeground(QtGui.QBrush())
-        item.setToolTip("")
-
-    def _emit_execution_edit(
-        self,
-        row: int,
-        *,
-        changed_column: int | None = None,
-    ) -> None:
-        if self._execution_projecting or self._projected_setup is None:
-            return
-        table = self._execution_table
-        identity = table.item(row, 0)
-        if identity is None:
-            return
-        dataset_id = str(identity.data(QtCore.Qt.ItemDataRole.UserRole) or "")
-        current = next(
-            item
-            for item in self._projected_setup.datasets
-            if item.dataset_id == dataset_id
-        )
-        solver = table.cellWidget(row, 2)
-        parsed: dict[str, float | int] = {}
-        errors: list[str] = []
-        for column in (3, 4, 5):
-            item = table.item(row, column)
-            if item is None:
-                continue
-            field = self._execution_field(column)
-            key = (dataset_id, field)
-            raw = item.text()
-            try:
-                if field == "integration_points":
-                    value: float | int = int(raw)
-                    if value <= 0:
-                        raise ValueError("Integration points must be positive.")
-                else:
-                    value = float(raw)
-                    if not np.isfinite(value):
-                        raise ValueError(f"{field} must be finite.")
-            except (TypeError, ValueError, OverflowError) as exc:
-                message = str(exc) or f"{field} is invalid."
-                self._execution_invalid_raw[key] = raw
-                self._execution_invalid_messages[key] = message
-                self._set_execution_item_invalid(item, message)
-                errors.append(message)
-            else:
-                parsed[field] = value
-                self._execution_invalid_raw.pop(key, None)
-                self._execution_invalid_messages.pop(key, None)
-                self._clear_execution_item_invalid(item)
-        if errors:
-            self.set_status(f"Fit execution settings are invalid: {errors[0]}")
-            self._refresh_setup_validity()
-            return
-        try:
-            execution = replace(
-                current.execution,
-                solver=(
-                    solver.currentText()
-                    if isinstance(solver, QtWidgets.QComboBox)
-                    else current.execution.solver
-                ),
-                t_start=float(parsed["t_start"]),
-                t_end=float(parsed["t_end"]),
-                integration_points=int(parsed["integration_points"]),
-            )
-            edited = replace(current, execution=execution)
-            intent = FitDatasetSetupEdit(
-                origin_tab_id=self._origin.tab_id,
-                origin_capture_id=self._origin.capture_id,
-                dataset=edited,
-            )
-        except (TypeError, ValueError, OverflowError) as exc:
-            column = changed_column if changed_column in {3, 4, 5} else 3
-            item = table.item(row, column)
-            field = self._execution_field(column)
-            key = (dataset_id, field)
-            if item is not None:
-                self._execution_invalid_raw[key] = item.text()
-                self._execution_invalid_messages[key] = str(exc)
-                self._set_execution_item_invalid(item, str(exc))
-            self.set_status(f"Fit execution settings are invalid: {exc}")
-            self._refresh_setup_validity()
-            return
-        self._refresh_setup_validity()
-        self._on_leaf_setup_edits((intent,))
-
-    def _on_execution_item_changed(
-        self,
-        item: QtWidgets.QTableWidgetItem,
-    ) -> None:
-        self._emit_execution_edit(
-            int(item.row()),
-            changed_column=int(item.column()),
-        )
 
     # ------------------------------------------------------------------
     # Fit-local data and setup presentation adapters
@@ -918,128 +702,7 @@ class FittingWindow(QtWidgets.QDialog):
             None,
         )
 
-    def _selected_target_times_for_dataset(
-        self,
-        dataset_id: str,
-    ) -> dict[str, np.ndarray]:
-        mapped = self._mapped_dataset(dataset_id)
-        if mapped is None:
-            return {}
-        captured_by_raw_id = {
-            observation.raw_observation_id: observation
-            for observation in mapped.observations
-        }
-        dataset = (
-            next(
-                (
-                    item
-                    for item in (self._projected_setup.datasets if self._projected_setup else ())
-                    if item.dataset_id == dataset_id
-                ),
-                None,
-            )
-        )
-        selected = self._observation_targets(mapped, dataset)
-        selected_targets = (
-            set(dataset.target_species)
-            if dataset is not None
-            else {target for _raw_id, target in selected}
-        )
-        target_times: dict[str, np.ndarray] = {}
-        for raw_observation_id, model_target in selected:
-            target = str(model_target or "").strip()
-            observation = captured_by_raw_id.get(str(raw_observation_id))
-            if (
-                not target
-                or target not in selected_targets
-                or observation is None
-            ):
-                continue
-            target_times.setdefault(
-                target,
-                np.asarray(observation.t, dtype=float).reshape(-1),
-            )
-        return target_times
-
-    def _available_targets_for_dataset(self, dataset_id: str) -> list[str]:
-        mapped = self._mapped_dataset(dataset_id)
-        if mapped is None:
-            return []
-        dataset = self._projected_dataset(dataset_id)
-        return list(
-            dict.fromkeys(
-                target
-                for _raw_observation_id, target in self._observation_targets(
-                    mapped,
-                    dataset,
-                )
-            )
-        )
-
-    def _full_series_for_dataset(self, dataset_id: str) -> dict[str, np.ndarray]:
-        mapped = self._mapped_dataset(dataset_id)
-        if mapped is None:
-            return {}
-        dataset = self._projected_dataset(dataset_id)
-        target_by_raw_id = dict(self._observation_targets(mapped, dataset))
-        return {
-            target_by_raw_id[observation.raw_observation_id]: np.asarray(
-                observation.y,
-                dtype=float,
-            )
-            for observation in mapped.observations
-            if observation.raw_observation_id in target_by_raw_id
-        }
-
-    def _projected_dataset(
-        self,
-        dataset_id: str,
-    ) -> FitDatasetLocalSettings | None:
-        setup = self._projected_setup
-        if setup is None:
-            return None
-        return next(
-            (
-                item
-                for item in setup.datasets
-                if item.dataset_id == dataset_id
-            ),
-            None,
-        )
-
-    @staticmethod
-    def _observation_targets(
-        mapped: FitMappedDatasetSnapshot,
-        dataset: FitDatasetLocalSettings | None,
-    ) -> tuple[tuple[str, str], ...]:
-        overrides = (
-            dict(dataset.observation_targets)
-            if dataset is not None
-            else {}
-        )
-        return tuple(
-            (
-                observation.raw_observation_id,
-                overrides.get(
-                    observation.raw_observation_id,
-                    observation.model_species,
-                ),
-            )
-            for observation in mapped.observations
-        )
-
-    def _applied_targets_for_dataset(self, dataset_id: str) -> list[str]:
-        setup = self._projected_setup
-        if setup is None:
-            mapped = self._mapped_dataset(dataset_id)
-            return [] if mapped is None else [item.model_species for item in mapped.observations]
-        dataset = next(
-            (item for item in setup.datasets if item.dataset_id == dataset_id),
-            None,
-        )
-        return [] if dataset is None else list(dataset.target_species)
-
-    def _sampling_applied_config(self, dataset_id: str) -> dict[str, float | int | str]:
+    def _fit_settings_for_dataset(self, dataset_id: str) -> dict[str, object]:
         setup = self._projected_setup
         dataset = (
             next(
@@ -1050,55 +713,62 @@ class FittingWindow(QtWidgets.QDialog):
             else None
         )
         if dataset is None:
-            return self._sampling_default_config(
-                self._selected_target_times_for_dataset(dataset_id)
-            )
+            return self._fit_default_settings_for_dataset(dataset_id)
         return {
-            "t_min": dataset.sample_t_min,
-            "t_max": dataset.sample_t_max,
-            "n_points": dataset.sample_points or 0,
-            "x_name": dataset.parametric.x_name if dataset.parametric else "t",
-            "x_mapping_mode": (
-                dataset.parametric.requested_mode if dataset.parametric else "auto"
-            ),
+            "t_start": dataset.t_start,
+            "solver": dataset.solver,
+            "data_range_min": dataset.data_range_min,
+            "data_range_max": dataset.data_range_max,
+            "maximum_observations_per_target": dataset.maximum_observations_per_target,
         }
 
-    @staticmethod
-    def _sampling_default_config(
-        target_times: Mapping[str, object],
-    ) -> dict[str, float | int | str]:
-        finite_ranges: list[tuple[float, float]] = []
-        for values in target_times.values():
-            array = np.asarray(values, dtype=float).reshape(-1)
-            finite = array[np.isfinite(array)]
-            if finite.size:
-                finite_ranges.append((float(np.min(finite)), float(np.max(finite))))
+    def _fit_default_settings_for_dataset(self, dataset_id: str) -> dict[str, object]:
+        mapped = self._mapped_dataset(dataset_id)
+        if mapped is None:
+            return {
+                "t_start": 0.0,
+                "solver": "BDF",
+                "data_range_min": 0.0,
+                "data_range_max": 0.0,
+                "maximum_observations_per_target": None,
+            }
+        times = [float(value) for item in mapped.observations for value in item.t]
         return {
-            "t_min": min(low for low, _high in finite_ranges)
-            if finite_ranges
-            else 0.0,
-            "t_max": max(high for _low, high in finite_ranges)
-            if finite_ranges
-            else 0.0,
-            "n_points": 0,
-            "x_name": "t",
-            "x_mapping_mode": "auto",
+            "t_start": mapped.resolved_t_start,
+            "solver": "BDF",
+            "data_range_min": min(times, default=mapped.resolved_t_start),
+            "data_range_max": max(times, default=mapped.resolved_t_start),
+            "maximum_observations_per_target": None,
         }
 
-    def _modeled_series(self) -> set[str]:
-        names = {
-            observation.model_species
-            for mapped in self._origin.mapped_datasets
-            for observation in mapped.observations
-        }
-        names.update(
-            species
-            for mapped in self._origin.mapped_datasets
-            for species, _value in mapped.initial_values
+    def _retained_observations_for_dataset(
+        self,
+        dataset_id: str,
+        config: Mapping[str, object],
+    ) -> tuple[object, ...]:
+        setup = self._projected_setup
+        mapped = self._mapped_dataset(dataset_id)
+        if setup is None or mapped is None:
+            return ()
+        current = next(
+            item for item in setup.datasets if item.dataset_id == dataset_id
         )
-        if self._projected_setup is not None:
-            names.update(item.name for item in self._projected_setup.local_observables)
-        return names
+        edited = replace(
+            current,
+            t_start=float(config.get("t_start", current.t_start)),
+            solver=str(config.get("solver", current.solver)),
+            data_range_min=float(
+                config.get("data_range_min", current.data_range_min)
+            ),
+            data_range_max=float(
+                config.get("data_range_max", current.data_range_max)
+            ),
+            maximum_observations_per_target=config.get(
+                "maximum_observations_per_target",
+                current.maximum_observations_per_target,
+            ),
+        )
+        return selected_observations(mapped, edited)
 
     def _on_dataset_selected(self, dataset_id: str) -> None:
         if not dataset_id:
@@ -1131,7 +801,7 @@ class FittingWindow(QtWidgets.QDialog):
             )
         )
 
-    def _on_sampling_applied(self, dataset_id: str, config: dict) -> None:
+    def _on_fit_settings_applied(self, dataset_id: str, config: dict) -> None:
         setup = self._projected_setup
         if setup is None:
             return
@@ -1142,31 +812,20 @@ class FittingWindow(QtWidgets.QDialog):
         if current is None:
             return
         try:
-            x_name = str(config.get("x_name") or "t").strip() or "t"
-            requested = str(config.get("x_mapping_mode") or "auto").strip()
-            requested = requested.lower().replace("-", "_").replace(" ", "_")
-            if requested not in {"auto", "monotone", "time_guided"}:
-                requested = "auto"
-            parametric = None
-            if x_name != "t":
-                parametric = FitParametricSettings(
-                    dataset_id=dataset_id,
-                    x_name=x_name,
-                    requested_mode=requested,
-                    resolved_mode=(
-                        None if requested == "auto" else requested
-                    ),
-                )
             edited = replace(
                 current,
-                sample_t_min=float(config.get("t_min", current.sample_t_min)),
-                sample_t_max=float(config.get("t_max", current.sample_t_max)),
-                sample_points=(
-                    None
-                    if int(config.get("n_points", 0)) == 0
-                    else int(config["n_points"])
+                t_start=float(config.get("t_start", current.t_start)),
+                solver=str(config.get("solver", current.solver)),
+                data_range_min=float(
+                    config.get("data_range_min", current.data_range_min)
                 ),
-                parametric=parametric,
+                data_range_max=float(
+                    config.get("data_range_max", current.data_range_max)
+                ),
+                maximum_observations_per_target=config.get(
+                    "maximum_observations_per_target",
+                    current.maximum_observations_per_target,
+                ),
             )
             intent = FitDatasetSetupEdit(
                 origin_tab_id=self._origin.tab_id,
@@ -1336,11 +995,9 @@ class FittingWindow(QtWidgets.QDialog):
         if len(normalized) != len({dataset_id for dataset_id, _mode in normalized}):
             raise ValueError("Resolved Auto modes repeat a dataset ID.")
         self._resolved_auto_modes = normalized
-        self._data_tab.set_resolved_auto_modes(normalized)
 
     def _clear_resolved_auto_modes(self) -> None:
         self._resolved_auto_modes = ()
-        self._data_tab.set_resolved_auto_modes({})
 
     def set_run_identity(self, identity: FitRunIdentity) -> None:
         if not isinstance(identity, FitRunIdentity):
@@ -1362,7 +1019,6 @@ class FittingWindow(QtWidgets.QDialog):
         known = {
             "parameters",
             "initial_concentrations",
-            "simulation_setup",
             "observable_definitions",
         }
         available = frozenset(str(scope) for scope in available_scopes)
@@ -1375,9 +1031,6 @@ class FittingWindow(QtWidgets.QDialog):
             or any(not reason for reason in reasons.values())
         ):
             raise ValueError("Fit Apply feasibility is invalid.")
-        self._candidate = candidate
-        self._candidate_available_scopes = available
-        self._candidate_unavailable_reasons = reasons
         self._last_fit_setup = candidate.setup_snapshot
         self._params_ics_tab.set_last_fit_snapshot(self._last_fit_setup)
         self._run_identity = candidate.run_identity
@@ -1399,9 +1052,6 @@ class FittingWindow(QtWidgets.QDialog):
         return bool(rendered)
 
     def clear_candidate(self) -> None:
-        self._candidate = None
-        self._candidate_available_scopes = frozenset()
-        self._candidate_unavailable_reasons = {}
         self._run_results_tab.clear_candidate()
         self._run_identity = None
         self._clear_resolved_auto_modes()
@@ -1414,11 +1064,38 @@ class FittingWindow(QtWidgets.QDialog):
         self._copy_run_json.setEnabled(False)
         self._results_summary_button.setEnabled(False)
 
+    def update_candidate_apply_feasibility(
+        self,
+        available_scopes: frozenset[str],
+        unavailable_reasons: Mapping[str, str],
+    ) -> None:
+        known = {
+            "parameters",
+            "initial_concentrations",
+            "observable_definitions",
+        }
+        available = frozenset(str(scope) for scope in available_scopes)
+        reasons = {
+            str(scope): str(reason or "")
+            for scope, reason in unavailable_reasons.items()
+        }
+        if (
+            not available.issubset(known)
+            or set(reasons) != known - available
+            or any(not reason for reason in reasons.values())
+        ):
+            raise ValueError("Fit Apply feasibility is invalid.")
+        for checkbox, scope in self._apply_controls():
+            checkbox.setEnabled(scope in available)
+            if scope not in available:
+                checkbox.setChecked(False)
+            checkbox.setToolTip(reasons.get(scope, ""))
+        self._refresh_apply_button()
+
     def _apply_controls(self):
         return (
             (self._apply_parameters, "parameters"),
             (self._apply_initials, "initial_concentrations"),
-            (self._apply_setup, "simulation_setup"),
             (self._apply_observables, "observable_definitions"),
         )
 

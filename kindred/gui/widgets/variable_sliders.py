@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from functools import partial
 import logging
-from typing import Dict, Optional, Tuple
 import math
+import sys
+from typing import Dict, Iterable, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
@@ -31,6 +32,26 @@ _LOG_SLIDER_VALUE_MIN = 1e-12
 _LOG_SLIDER_VALUE_MAX = 1e12
 _LOG_SLIDER_EXP_MIN = -12.0
 _LOG_SLIDER_EXP_MAX = 12.0
+_LOG_DOMAIN_MIN = math.log10(float.fromhex("0x0.0000000000001p-1022"))
+_LOG_DOMAIN_MAX = math.log10(sys.float_info.max)
+
+
+class _NumericValueEdit(QtWidgets.QLineEdit):
+    """A raw numeric draft editor with local Escape/focus notifications."""
+
+    editStarted = Signal()
+    editEscape = Signal()
+
+    def focusInEvent(self, event: QtGui.QFocusEvent) -> None:
+        super().focusInEvent(event)
+        self.editStarted.emit()
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            self.editEscape.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class _GrooveJumpSlider(QtWidgets.QSlider):
@@ -114,7 +135,7 @@ class VariableSliders(QtWidgets.QWidget):
         self._variables: Dict[str, float] = {}  # {name: value}
         self._sliders: Dict[str, QtWidgets.QSlider] = {}
         self._labels: Dict[str, QtWidgets.QLabel] = {}
-        self._value_labels: Dict[str, QtWidgets.QLabel] = {}
+        self._value_labels: Dict[str, QtWidgets.QWidget] = {}
         self._slider_ranges: Dict[
             str, Tuple[float, float]
         ] = {}  # log10 min/max per slider
@@ -131,6 +152,10 @@ class VariableSliders(QtWidgets.QWidget):
         self._visibility_scope_signature: object | None = None
         self._placeholder: QtWidgets.QLabel | None = None
         self._hidden_placeholder: QtWidgets.QLabel | None = None
+        self._active_drag_names: set[str] = set()
+        self._editor_pre_edit_values: Dict[str, float] = {}
+        self._editor_pre_edit_text: Dict[str, str] = {}
+        self._last_committed_editor_text: Dict[str, str] = {}
 
         # Layout
         main_layout = QtWidgets.QVBoxLayout(self)
@@ -204,18 +229,12 @@ class VariableSliders(QtWidgets.QWidget):
         """
         logger.info(f"Setting {len(variables)} variables")
 
-        # Visibility choices are scoped to the currently loaded variable set.
         current_names = {str(name) for name in variables}
-        same_visibility_scope = (
-            bool(preserve_visibility)
-            and visibility_scope_signature is not None
-            and self._visibility_scope_signature == visibility_scope_signature
+        self._reconcile_visibility_scope(
+            current_names,
+            visibility_scope_signature,
+            preserve_visibility=preserve_visibility,
         )
-        if same_visibility_scope:
-            self._hidden_names.intersection_update(current_names)
-        else:
-            self._hidden_names.clear()
-        self._visibility_scope_signature = visibility_scope_signature
 
         # Clear existing sliders
         self._clear_sliders()
@@ -255,6 +274,10 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_scales.clear()
         self._metadata.clear()
         self._last_valid_values.clear()
+        self._active_drag_names.clear()
+        self._editor_pre_edit_values.clear()
+        self._editor_pre_edit_text.clear()
+        self._last_committed_editor_text.clear()
 
         if self._placeholder is not None:
             self._placeholder.show()
@@ -278,7 +301,10 @@ class VariableSliders(QtWidgets.QWidget):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(2)
 
-        # Top row: name label and value label
+        meta = self._metadata.get(name) or {}
+        scale = str(meta.get("scale") or "log").strip().lower()
+
+        # Top row: name label and writable/read-only value projection.
         top_row = QtWidgets.QHBoxLayout()
         top_row.setSpacing(8)
 
@@ -291,15 +317,31 @@ class VariableSliders(QtWidgets.QWidget):
 
         top_row.addStretch()
 
-        value_label = QtWidgets.QLabel(self._format_value(value))
-        value_label.setMinimumWidth(80)
-        value_label.setAlignment(QtCore.Qt.AlignRight)
+        if meta.get("editable") is False:
+            value_label: QtWidgets.QWidget = QtWidgets.QLabel(
+                self._format_value(value)
+            )
+            value_label.setAlignment(QtCore.Qt.AlignRight)
+        else:
+            value_editor = _NumericValueEdit(self._format_value(value))
+            value_editor.setMinimumWidth(100)
+            value_editor.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+            value_editor.editStarted.connect(
+                lambda item=name: self._on_editor_started(item)
+            )
+            value_editor.editEscape.connect(
+                lambda item=name: self._on_editor_escape(item)
+            )
+            value_editor.textChanged.connect(
+                lambda _text, item=name: self._decorate_editor(item)
+            )
+            value_editor.editingFinished.connect(
+                lambda item=name: self._commit_editor(item)
+            )
+            value_label = value_editor
         top_row.addWidget(value_label)
 
         layout.addLayout(top_row)
-
-        meta = self._metadata.get(name) or {}
-        scale = str(meta.get("scale") or "log").strip().lower()
 
         # Slider
         slider = _GrooveJumpSlider(QtCore.Qt.Horizontal)
@@ -343,6 +385,8 @@ class VariableSliders(QtWidgets.QWidget):
         # Store slider reference early so _value_to_slider_pos can access it
         self._sliders[name] = slider
 
+        if self._slider_scales.get(name) == "log":
+            self._ensure_range_covers(name, float(value))
         slider_pos = self._value_to_slider_pos(name, float(value))
         slider.setValue(slider_pos)
         self._last_valid_values[name] = self._slider_pos_to_value(name, slider_pos)
@@ -408,10 +452,12 @@ class VariableSliders(QtWidgets.QWidget):
         self._apply_variable_visibility(name)
 
     def _on_slider_pressed(self, name: str) -> None:
+        self._active_drag_names.add(str(name))
         self.sliderDragStarted.emit(name)
 
     def _on_slider_released(self, name: str) -> None:
         self.sliderDragFinished.emit(name)
+        self._active_drag_names.discard(str(name))
 
     def _format_label_text(self, name: str) -> str:
         meta = self._metadata.get(name)
@@ -477,10 +523,7 @@ class VariableSliders(QtWidgets.QWidget):
                 with QtCore.QSignalBlocker(slider):
                     slider.setValue(restore_pos)
 
-            if name in self._value_labels:
-                self._value_labels[name].setText(self._format_value(value))
-            self._variables[name] = value
-            self._last_valid_values[name] = float(value)
+            self._set_value_projection(name, value, editor_text=None, emit=False)
 
             logger.warning(
                 "Slider conversion failed for %s at pos=%s (%s); restored last valid value %.12g",
@@ -491,18 +534,7 @@ class VariableSliders(QtWidgets.QWidget):
             )
             return
 
-        # Update stored value
-        self._variables[name] = value
-        self._last_valid_values[name] = float(value)
-
-        # Update display
-        self._set_name_label_text(name)
-        if name in self._value_labels:
-            self._value_labels[name].setText(self._format_value(value))
-
-        # Emit signal
-        logger.debug("Variable changed: %s = %.12g", str(name), float(value))
-        self.variableChanged.emit(name, value)
+        self._set_value_projection(name, value, editor_text=None, emit=True)
 
     def _format_value(self, value: float) -> str:
         """
@@ -562,19 +594,18 @@ class VariableSliders(QtWidgets.QWidget):
             and all(name in self._containers for name in normalized_variables)
         )
         if same_coordinates:
-            same_visibility_scope = (
-                bool(preserve_visibility)
-                and visibility_scope_signature is not None
-                and self._visibility_scope_signature
-                == visibility_scope_signature
+            self._reconcile_visibility_scope(
+                set(normalized_variables),
+                visibility_scope_signature,
+                preserve_visibility=preserve_visibility,
             )
-            if not same_visibility_scope:
-                self._hidden_names.clear()
-            else:
-                self._hidden_names.intersection_update(normalized_variables)
-            self._visibility_scope_signature = visibility_scope_signature
             for name, value in normalized_variables.items():
-                self.update_variable(name, value)
+                if name in self._active_drag_names:
+                    self.update_variable_readout(name, value)
+                elif self._editor_has_focus(name):
+                    continue
+                else:
+                    self.update_variable(name, value)
             self._sync_visibility_state()
             return
         self.set_variables(
@@ -603,30 +634,14 @@ class VariableSliders(QtWidgets.QWidget):
             logger.warning(f"Cannot update unknown variable: {name}")
             return
 
-        value_f = float(value)
-        if self._slider_scales.get(name, "log") == "log":
-            sign = 1.0 if value_f >= 0 else -1.0
-            self._slider_signs[name] = sign
-            magnitude = self._clamp_log_magnitude(value_f)
-            value_f = magnitude if sign >= 0 else -magnitude
-            self._ensure_range_covers(name, value_f)
-
-        self._variables[name] = value_f
-        self._last_valid_values[name] = value_f
-
-        # Update slider position
-        if name in self._sliders:
-            slider_pos = self._value_to_slider_pos(name, value_f)
-
-            slider = self._sliders[name]
-            with QtCore.QSignalBlocker(slider):
-                slider.setValue(slider_pos)
-
-        # Update display
-        if name in self._value_labels:
-            self._value_labels[name].setText(self._format_value(value_f))
-
-        logger.debug("Variable updated: %s = %.12g", str(name), float(value_f))
+        if self._editor_has_focus(name):
+            return
+        self._set_value_projection(
+            name,
+            float(value),
+            editor_text=None,
+            emit=False,
+        )
 
     def update_variable_readout(self, name: str, value: float) -> None:
         """
@@ -640,21 +655,24 @@ class VariableSliders(QtWidgets.QWidget):
             logger.warning(f"Cannot update unknown variable: {name}")
             return
 
-        self._variables[name] = value
+        value_f = float(value)
+        self._variables[name] = value_f
         try:
-            self._last_valid_values[name] = float(value)
+            self._last_valid_values[name] = value_f
         except (TypeError, ValueError, OverflowError):
             self._last_valid_values.pop(name, None)
         if self._slider_scales.get(name, "log") == "log":
-            self._slider_signs[name] = 1.0 if value >= 0 else -1.0
+            self._slider_signs[name] = 1.0 if value_f >= 0 else -1.0
+            self._ensure_range_covers(name, value_f, project_slider=False)
 
-        if name in self._value_labels:
-            self._value_labels[name].setText(self._format_value(value))
+        value_label = self._value_labels.get(name)
+        if isinstance(value_label, QtWidgets.QLabel):
+            value_label.setText(self._format_value(value_f))
 
         logger.debug(f"Variable readout updated: {name} = {value}")
 
-    def clear(self) -> None:
-        """Clear all variables and sliders."""
+    def clear(self, *, preserve_visibility: bool = True) -> None:
+        """Clear physical controls, optionally retaining visibility preference."""
         self._clear_sliders()
         self._variables.clear()
         self._slider_ranges.clear()
@@ -662,8 +680,9 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_scales.clear()
         self._range_labels.clear()
         self._last_valid_values.clear()
-        self._hidden_names.clear()
-        self._visibility_scope_signature = None
+        if not preserve_visibility:
+            self._hidden_names.clear()
+            self._visibility_scope_signature = None
         if self._placeholder is not None:
             self._placeholder.show()
         if self._hidden_placeholder is not None:
@@ -709,6 +728,19 @@ class VariableSliders(QtWidgets.QWidget):
         else:
             self._hidden_names.add(name_s)
         self._apply_variable_visibility(name_s)
+        self._sync_visibility_state()
+
+    def apply_visibility_projection(
+        self, visibility: Dict[str, bool] | Iterable[tuple[str, bool]]
+    ) -> None:
+        """Apply one complete visibility projection without workspace callbacks."""
+        projected = dict(visibility)
+        for name in tuple(self._containers):
+            if name in projected:
+                if bool(projected[name]):
+                    self._hidden_names.discard(name)
+                else:
+                    self._hidden_names.add(name)
         self._sync_visibility_state()
 
     def begin_live_drag(self) -> None:
@@ -783,6 +815,141 @@ class VariableSliders(QtWidgets.QWidget):
                 has_variables and bool(self._containers) and visible_count == 0
             )
 
+    def _reconcile_visibility_scope(
+        self,
+        names: set[str],
+        supplied_signature: object | None,
+        *,
+        preserve_visibility: bool,
+    ) -> None:
+        """Reconcile visibility once for a structural scope transition."""
+        signature = (
+            tuple(sorted(names))
+            if supplied_signature is None
+            else supplied_signature
+        )
+        same_scope = bool(
+            preserve_visibility
+            and self._visibility_scope_signature == signature
+        )
+        if names:
+            if same_scope:
+                self._hidden_names.intersection_update(names)
+            else:
+                self._hidden_names = set(names)
+        elif not preserve_visibility:
+            self._hidden_names.clear()
+        self._visibility_scope_signature = signature
+
+    def _editor_has_focus(self, name: str) -> bool:
+        editor = self._value_labels.get(str(name))
+        return isinstance(editor, _NumericValueEdit) and editor.hasFocus()
+
+    def _on_editor_started(self, name: str) -> None:
+        editor = self._value_labels.get(str(name))
+        if not isinstance(editor, _NumericValueEdit):
+            return
+        self._editor_pre_edit_values[str(name)] = float(
+            self._variables.get(str(name), 0.0)
+        )
+        self._editor_pre_edit_text[str(name)] = editor.text()
+        self._last_committed_editor_text.pop(str(name), None)
+        self._decorate_editor(str(name))
+
+    def _on_editor_escape(self, name: str) -> None:
+        editor = self._value_labels.get(str(name))
+        if not isinstance(editor, _NumericValueEdit):
+            return
+        value = self._editor_pre_edit_values.get(
+            str(name), self._variables.get(str(name), 0.0)
+        )
+        text = self._editor_pre_edit_text.get(str(name), self._format_value(value))
+        self._set_value_projection(
+            str(name), value, editor_text=text, emit=False
+        )
+        self._last_committed_editor_text[str(name)] = text
+        self._decorate_editor(str(name))
+
+    def _decorate_editor(self, name: str) -> None:
+        editor = self._value_labels.get(str(name))
+        if not isinstance(editor, _NumericValueEdit):
+            return
+        try:
+            value = float(editor.text().strip())
+            valid = bool(math.isfinite(value))
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        editor.setProperty("invalidNumeric", not valid)
+        editor.setStyleSheet(
+            "QLineEdit { border: 1px solid #c0392b; }"
+            if not valid
+            else ""
+        )
+
+    def _commit_editor(self, name: str) -> None:
+        name_s = str(name)
+        editor = self._value_labels.get(name_s)
+        if not isinstance(editor, _NumericValueEdit):
+            return
+        raw = editor.text()
+        if raw == self._last_committed_editor_text.get(name_s):
+            return
+        try:
+            value = float(raw.strip())
+        except (TypeError, ValueError, OverflowError):
+            self._decorate_editor(name_s)
+            return
+        if not math.isfinite(value):
+            self._decorate_editor(name_s)
+            return
+        self._last_committed_editor_text[name_s] = raw
+        self._set_value_projection(
+            name_s, value, editor_text=raw, emit=True
+        )
+
+    def _set_value_projection(
+        self,
+        name: str,
+        value: float,
+        *,
+        editor_text: str | None,
+        emit: bool,
+    ) -> None:
+        name_s = str(name)
+        if name_s not in self._sliders:
+            return
+        value_f = float(value)
+        if not math.isfinite(value_f):
+            return
+        if self._slider_scales.get(name_s, "log") == "log":
+            self._slider_signs[name_s] = 1.0 if value_f >= 0 else -1.0
+            self._ensure_range_covers(name_s, value_f)
+        self._variables[name_s] = value_f
+        self._last_valid_values[name_s] = value_f
+        slider = self._sliders[name_s]
+        with QtCore.QSignalBlocker(slider):
+            slider.setValue(self._value_to_slider_pos(name_s, value_f))
+        value_label = self._value_labels.get(name_s)
+        if isinstance(value_label, _NumericValueEdit):
+            self._set_editor_text(
+                value_label,
+                self._format_value(value_f) if editor_text is None else editor_text,
+            )
+            self._decorate_editor(name_s)
+        elif isinstance(value_label, QtWidgets.QLabel):
+            value_label.setText(self._format_value(value_f))
+        logger.debug("Variable projected: %s = %.12g", name_s, value_f)
+        if emit:
+            self.variableChanged.emit(name_s, value_f)
+
+    @staticmethod
+    def _set_editor_text(editor: QtWidgets.QLineEdit, text: str) -> None:
+        blocker = QtCore.QSignalBlocker(editor)
+        try:
+            editor.setText(str(text))
+        finally:
+            del blocker
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -796,25 +963,25 @@ class VariableSliders(QtWidgets.QWidget):
         magnitude = self._clamp_log_magnitude(value)
         log_center = math.log10(magnitude)
         span = 4.0  # ±4 orders of magnitude around current value
-        log_min = max(log_center - span, _LOG_SLIDER_EXP_MIN)
-        log_max = min(log_center + span, _LOG_SLIDER_EXP_MAX)
+        log_min = max(log_center - span, _LOG_DOMAIN_MIN)
+        log_max = min(log_center + span, _LOG_DOMAIN_MAX)
 
         if log_max - log_min < 0.5:
-            log_min = max(log_center - 0.25, _LOG_SLIDER_EXP_MIN)
-            log_max = min(log_center + 0.25, _LOG_SLIDER_EXP_MAX)
+            log_min = max(log_center - 0.25, _LOG_DOMAIN_MIN)
+            log_max = min(log_center + 0.25, _LOG_DOMAIN_MAX)
 
         # Ensure sane ordering
         if log_max <= log_min:
-            if log_center <= _LOG_SLIDER_EXP_MIN:
-                return _LOG_SLIDER_EXP_MIN, min(
-                    _LOG_SLIDER_EXP_MIN + 1.0, _LOG_SLIDER_EXP_MAX
+            if log_center <= _LOG_DOMAIN_MIN:
+                return _LOG_DOMAIN_MIN, min(
+                    _LOG_DOMAIN_MIN + 1.0, _LOG_DOMAIN_MAX
                 )
-            if log_center >= _LOG_SLIDER_EXP_MAX:
+            if log_center >= _LOG_DOMAIN_MAX:
                 return max(
-                    _LOG_SLIDER_EXP_MAX - 1.0, _LOG_SLIDER_EXP_MIN
-                ), _LOG_SLIDER_EXP_MAX
-            log_min = max(log_center - 0.5, _LOG_SLIDER_EXP_MIN)
-            log_max = min(log_center + 0.5, _LOG_SLIDER_EXP_MAX)
+                    _LOG_DOMAIN_MAX - 1.0, _LOG_DOMAIN_MIN
+                ), _LOG_DOMAIN_MAX
+            log_min = max(log_center - 0.5, _LOG_DOMAIN_MIN)
+            log_max = min(log_center + 0.5, _LOG_DOMAIN_MAX)
             if log_max <= log_min:
                 return default_min, default_max
 
@@ -829,7 +996,7 @@ class VariableSliders(QtWidgets.QWidget):
 
         if not math.isfinite(magnitude) or magnitude <= 0.0:
             return _LOG_SLIDER_VALUE_MIN
-        return min(max(magnitude, _LOG_SLIDER_VALUE_MIN), _LOG_SLIDER_VALUE_MAX)
+        return min(max(magnitude, float.fromhex("0x0.0000000000001p-1022")), sys.float_info.max)
 
     def _validated_log_range(self, name: str) -> Tuple[float, float]:
         """Return a finite, ordered, bounded log10 range for a slider."""
@@ -850,10 +1017,10 @@ class VariableSliders(QtWidgets.QWidget):
         if not math.isfinite(log_max):
             log_max = _LOG_SLIDER_EXP_MAX
 
-        log_min = min(max(log_min, _LOG_SLIDER_EXP_MIN), _LOG_SLIDER_EXP_MAX)
-        log_max = min(max(log_max, _LOG_SLIDER_EXP_MIN), _LOG_SLIDER_EXP_MAX)
+        log_min = min(max(log_min, _LOG_DOMAIN_MIN), _LOG_DOMAIN_MAX)
+        log_max = min(max(log_max, _LOG_DOMAIN_MIN), _LOG_DOMAIN_MAX)
         if log_max <= log_min:
-            log_min, log_max = _LOG_SLIDER_EXP_MIN, _LOG_SLIDER_EXP_MAX
+            log_min, log_max = _LOG_DOMAIN_MIN, _LOG_DOMAIN_MAX
         return log_min, log_max
 
     def _slider_pos_to_value(self, name: str, slider_pos: int) -> float:
@@ -880,7 +1047,10 @@ class VariableSliders(QtWidgets.QWidget):
         log_value = log_min + frac * (log_max - log_min)
         log_value = min(max(log_value, log_min), log_max)
         magnitude = 10 ** float(log_value)
-        magnitude = min(max(magnitude, _LOG_SLIDER_VALUE_MIN), _LOG_SLIDER_VALUE_MAX)
+        magnitude = min(
+            max(magnitude, float.fromhex("0x0.0000000000001p-1022")),
+            sys.float_info.max,
+        )
         sign = self._slider_signs.get(name, 1.0)
         return magnitude if sign >= 0 else -magnitude
 
@@ -900,7 +1070,7 @@ class VariableSliders(QtWidgets.QWidget):
         log_min, log_max = self._validated_log_range(name)
         log_span = log_max - log_min
         if log_span <= 0:
-            log_span = _LOG_SLIDER_EXP_MAX - _LOG_SLIDER_EXP_MIN
+            log_span = _LOG_DOMAIN_MAX - _LOG_DOMAIN_MIN
 
         sign = self._slider_signs.get(name, 1.0)
         magnitude = self._clamp_log_magnitude(value_abs)
@@ -912,7 +1082,13 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_signs[name] = 1.0 if sign >= 0 else -1.0
         return max(0, min(pos, int(steps)))
 
-    def _ensure_range_covers(self, name: str, value: float) -> None:
+    def _ensure_range_covers(
+        self,
+        name: str,
+        value: float,
+        *,
+        project_slider: bool = True,
+    ) -> None:
         """Expand the slider range if needed to include the given value."""
         if self._slider_scales.get(name, "log") != "log":
             return
@@ -936,7 +1112,7 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_ranges[name] = (new_log_min, new_log_max)
         self._update_range_labels(name)
 
-        if name in self._sliders:
+        if project_slider and name in self._sliders:
             slider = self._sliders[name]
             with QtCore.QSignalBlocker(slider):
                 slider.setValue(self._value_to_slider_pos(name, value))
@@ -956,7 +1132,7 @@ class VariableSliders(QtWidgets.QWidget):
         """Format a base-10 exponent as a compact string."""
         if not math.isfinite(log_value):
             log_value = _LOG_SLIDER_EXP_MIN
-        log_value = min(max(float(log_value), _LOG_SLIDER_EXP_MIN), _LOG_SLIDER_EXP_MAX)
+        log_value = min(max(float(log_value), _LOG_DOMAIN_MIN), _LOG_DOMAIN_MAX)
         exponent = int(round(log_value))
         if abs(log_value - exponent) < 1e-6:
             return f"10<sup>{exponent}</sup>"

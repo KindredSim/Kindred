@@ -30,6 +30,7 @@ from kindred.core.result_repository import (
     PreviewResultKey,
     ResultRepository,
     SimulationResultValue,
+    explicit_result_key_from_values,
     scientific_identity,
     standard_concentration_identity,
 )
@@ -527,15 +528,12 @@ def build_explicit_target(
     publication_generation: int,
 ) -> ExplicitRunTarget:
     values = _validated_initial_values(initial_values)
-    key = ExplicitResultKey(
+    key = explicit_result_key_from_values(
         tab_id=tab_id,
         set_id=set_id,
         mechanism_source=mechanism_source,
+        prepared_dsl=prepared_dsl,
         analysis_identity=prepared_dsl.analysis.identity,
-        standard_concentration_identity=standard_concentration_identity(
-            prepared_dsl
-        ),
-        scientific_identity=scientific_identity(prepared_dsl),
         initial_values=values,
         execution_settings=execution_settings,
         scientific_settings=scientific_settings,
@@ -951,6 +949,7 @@ class SimulationJobOwner(QtCore.QObject):
     status_changed = QtCore.Signal(str)
     results_changed = QtCore.Signal(str)
     terminal = QtCore.Signal(object)
+    run_dispatched = QtCore.Signal(str, object)
     detailed_balance_correction_requested = QtCore.Signal(object)
 
     def __init__(
@@ -1511,6 +1510,10 @@ class SimulationJobOwner(QtCore.QObject):
                 else "Run rejected: another computation is active."
             )
             return False
+        self.run_dispatched.emit(
+            capture.tab_id,
+            tuple(target.key.set_id for target in capture.targets),
+        )
         self.status_changed.emit(
             f"Run started with capacity {capacity.effective}."
         )

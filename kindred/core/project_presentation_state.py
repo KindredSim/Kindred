@@ -82,7 +82,6 @@ class ProjectPresentationState:
     selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
     selected_y_series: tuple[AxisSeriesSelection, ...] = ()
     selected_y_uses_default_all: bool = True
-    parametric_mode: bool = False
     reference_lines_visible: bool = True
     intervention_annotations_visible: bool = True
     log_x: bool = False
@@ -179,7 +178,6 @@ class ProjectPresentationState:
             selected_x_series=selected_x,
             selected_y_series=selected_y,
             selected_y_uses_default_all=self.selected_y_uses_default_all,
-            parametric_mode=self.parametric_mode,
             reference_lines_visible=self.reference_lines_visible,
             intervention_annotations_visible=(
                 self.intervention_annotations_visible
@@ -325,7 +323,6 @@ def validate_project_presentation_state(
     ):
         raise TypeError("current_set_id must be a str or None.")
     for field_name in (
-        "parametric_mode",
         "selected_y_uses_default_all",
         "reference_lines_visible",
         "intervention_annotations_visible",

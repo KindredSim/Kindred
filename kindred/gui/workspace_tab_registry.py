@@ -12,7 +12,6 @@ from kindred.core.project_document import (
     ProjectDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
-    validate_project_document,
 )
 from kindred.core.project_session import ProjectContentToken, ProjectSession
 from kindred.core.project_presentation_state import (
@@ -198,24 +197,25 @@ class WorkspaceTabRegistry:
         document: ProjectDocument,
         presentation: WorkspacePresentationState,
     ) -> PreparedWorkspaceInstall:
-        """Validate and construct all replacement state without live mutation."""
+        """Construct presentation and transient replacement state."""
 
-        candidate = validate_project_document(document)
+        if not isinstance(document, ProjectDocument):
+            raise TypeError("document must be a ProjectDocument.")
         validated_presentation = reconcile_workspace_presentation_state(
-            candidate,
+            document,
             presentation,
         )
         target_active = validated_presentation.active_tab_id
         supplied = dict(validated_presentation.presentation_by_tab_id)
         next_presentation: list[tuple[str, ProjectPresentationState]] = []
         next_runtime: list[tuple[str, TabRuntimeState]] = []
-        for tab in candidate.tabs:
+        for tab in document.tabs:
             state = supplied[tab.tab_id]
             next_presentation.append(
                 (
                     tab.tab_id,
                     validate_project_presentation_state(
-                        candidate,
+                        document,
                         tab,
                         state,
                     ),

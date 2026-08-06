@@ -6,21 +6,17 @@ Control-surface contract
 - X dropdown: typed simulation or experimental identity, with `t` by default.
 - Y multi-select: all time-varying species and algebra series. Scalars disabled.
 - Add Guide from Scalar (exposed via Options menu stub entry).
-- Parametric toggle: plot X(t) vs each Y_i(t). Plotting may resample for
-  smoothness, but resampling never affects CTC (enforced in plotting layer).
 - Options: sampling choice for plotting and guide management.
 
 This widget provides a deterministic, fully functional control strip with:
 - A labeled X combobox
 - A labeled, checkable Y list
-- A Parametric toggle
 - An Options toolbutton with a QMenu exposing actions/signals
 
 Signals emitted
 --------------
 xChanged(selection: SimulationSeriesAxisSelection | ExperimentalAxisSelection)
 ySelectionChanged(selected: tuple[AxisSeriesSelection, ...])
-parametricToggled(enabled: bool)
 addGuideRequested(from_scalar: str | None)   # None means show chooser upstream
 optionsRequested(action: str, data: object)  # generic hook (e.g. "sampling", ...)
 
@@ -31,8 +27,6 @@ set_y_candidates(candidates, *, disabled=())
 select_y(selections)
 selected_y() -> tuple[AxisSeriesSelection, ...]
 current_x() -> AxisSeriesSelection
-set_parametric(enabled: bool) -> None
-parametric_enabled() -> bool
 is_auto_range() -> bool
 set_auto_range(enabled: bool) -> None
 get_manual_ranges() -> tuple[float|None, float|None, float|None, float|None]
@@ -67,7 +61,6 @@ class AxisToolbar(QtWidgets.QWidget):
     # High-level signals
     xChanged = QtCore.Signal(object)
     ySelectionChanged = QtCore.Signal(object)
-    parametricToggled = QtCore.Signal(bool)
     addGuideRequested = QtCore.Signal(object)          # scalar name or None
     optionsRequested = QtCore.Signal(str, object)      # action, data
     axisRangeChanged = QtCore.Signal()                 # axis range manually changed
@@ -123,9 +116,6 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_menu_action.setDefaultWidget(self._y_popup_container)
         self._y_menu.addAction(self._y_menu_action)
         self._y_selector_btn.setMenu(self._y_menu)
-
-        self._parametric = QtWidgets.QCheckBox("Parametric", self)
-        self._parametric.setToolTip("Plot selected Y variables against each other instead of against time")
 
         self._pan_button = QtWidgets.QToolButton(self)
         self._pan_button.setText("Pan")
@@ -233,7 +223,6 @@ class AxisToolbar(QtWidgets.QWidget):
 
         # Wiring
         self._x_combo.currentIndexChanged.connect(self._on_x_changed)
-        self._parametric.toggled.connect(self._on_parametric_toggled)
         self._y_list.itemChanged.connect(self._on_y_item_changed)
         self._invert_y_selection_btn.clicked.connect(self.invert_y_selection)
 
@@ -436,18 +425,6 @@ class AxisToolbar(QtWidgets.QWidget):
             raise TypeError("X selector lacks a typed axis identity.")
         return selection
 
-    def set_parametric(self, enabled: bool) -> None:
-        if self._parametric.isChecked() == bool(enabled):
-            return
-        blocker = QtCore.QSignalBlocker(self._parametric)
-        try:
-            self._parametric.setChecked(bool(enabled))
-        finally:
-            del blocker
-
-    def parametric_enabled(self) -> bool:
-        return self._parametric.isChecked()
-
     def interaction_mode(self) -> str:
         return (
             "rectangle_zoom"
@@ -574,7 +551,6 @@ class AxisToolbar(QtWidgets.QWidget):
         lay.addWidget(x_label, stretch=0)
         lay.addWidget(self._x_combo, stretch=0)
         lay.addWidget(self._y_selector_btn, stretch=0)
-        lay.addWidget(self._parametric, stretch=0)
         lay.addWidget(self._pan_button, stretch=0)
         lay.addWidget(self._rectangle_zoom_button, stretch=0)
         lay.addWidget(self._auto_range, stretch=0)
@@ -620,7 +596,6 @@ class AxisToolbar(QtWidgets.QWidget):
         lay.addWidget(x_label, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(self._x_combo, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        lay.addWidget(self._parametric, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(self._pan_button, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(
             self._rectangle_zoom_button,
@@ -691,9 +666,6 @@ class AxisToolbar(QtWidgets.QWidget):
         if self._x_combo.count():
             self.xChanged.emit(self.current_x())
 
-    def _on_parametric_toggled(self, state: bool) -> None:
-        self.parametricToggled.emit(bool(state))
-
     def _on_interaction_requested(self, mode: str) -> None:
         self.interactionModeRequested.emit(str(mode))
 
@@ -733,14 +705,12 @@ class AxisToolbar(QtWidgets.QWidget):
     def set_tab_order(self) -> None:
         if self._orientation == "horizontal":
             QtWidgets.QWidget.setTabOrder(self._x_combo, self._y_selector_btn)
-            QtWidgets.QWidget.setTabOrder(self._y_selector_btn, self._parametric)
-            QtWidgets.QWidget.setTabOrder(self._parametric, self._auto_range)
+            QtWidgets.QWidget.setTabOrder(self._y_selector_btn, self._auto_range)
             QtWidgets.QWidget.setTabOrder(self._auto_range, self._x_min)
             QtWidgets.QWidget.setTabOrder(self._x_min, self._x_max)
             QtWidgets.QWidget.setTabOrder(self._x_max, self._y_min)
             QtWidgets.QWidget.setTabOrder(self._y_min, self._y_max)
             QtWidgets.QWidget.setTabOrder(self._y_max, self._options_btn)
             return
-        QtWidgets.QWidget.setTabOrder(self._x_combo, self._parametric)
-        QtWidgets.QWidget.setTabOrder(self._parametric, self._y_list)
+        QtWidgets.QWidget.setTabOrder(self._x_combo, self._y_list)
         QtWidgets.QWidget.setTabOrder(self._y_list, self._options_btn)

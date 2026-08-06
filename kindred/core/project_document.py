@@ -16,11 +16,16 @@ from kindred.core.simulator.dsl_parse import (
     PreparedDslRequestSet,
     prepare_dsl_request_set,
 )
+from kindred.core.simulator.wegscheider_symbolic import (
+    WegscheiderCyclicityReport,
+    analyze_wegscheider_cyclicity,
+)
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.units import UnitsModel
 
 __all__ = [
     "DatasetLink",
+    "DetailedBalanceAdmission",
     "FitDefaults",
     "FrozenJsonArray",
     "FrozenJsonObject",
@@ -47,6 +52,9 @@ __all__ = [
     "new_tab_id",
     "next_mechanism_name",
     "next_set_name",
+    "canonical_analysis_identity",
+    "canonical_initial_values",
+    "canonical_species_names",
     "reconcile_tab_mechanism_source",
     "resolve_simulation_execution_settings",
     "thaw_json_value",
@@ -558,14 +566,12 @@ class ProjectDocument:
             raise TypeError("tab must be a MechanismTabDocument.")
         if not any(item.tab_id == tab.tab_id for item in self.tabs):
             raise KeyError(f"Unknown mechanism tab ID: {tab.tab_id!r}.")
-        return validate_project_document(
-            replace(
-                self,
-                tabs=tuple(
-                    tab if item.tab_id == tab.tab_id else item
-                    for item in self.tabs
-                ),
-            )
+        return replace(
+            self,
+            tabs=tuple(
+                tab if item.tab_id == tab.tab_id else item
+                for item in self.tabs
+            ),
         )
 
     def add_tab(
@@ -580,7 +586,7 @@ class ProjectDocument:
             run_defaults=run_defaults,
             scientific_settings=scientific_settings,
         )
-        return validate_project_document(replace(self, tabs=(*self.tabs, new_tab)))
+        return replace(self, tabs=(*self.tabs, new_tab))
 
     def rename_tab(self, tab_id: str, name: str) -> "ProjectDocument":
         tab = self.tab(tab_id)
@@ -595,13 +601,13 @@ class ProjectDocument:
         tabs = tuple(item for item in self.tabs if item.tab_id != target)
         if len(tabs) == len(self.tabs):
             raise KeyError(f"Unknown mechanism tab ID: {target!r}.")
-        return validate_project_document(replace(self, tabs=tabs))
+        return replace(self, tabs=tabs)
 
     def add_datasets(
         self,
         records: tuple[RawDatasetRecord, ...],
     ) -> "ProjectDocument":
-        """Validate one complete dataset batch as one atomic proposal."""
+        """Prepare one complete dataset batch as one atomic proposal."""
 
         if type(records) is not tuple or any(
             not isinstance(record, RawDatasetRecord) for record in records
@@ -611,9 +617,7 @@ class ProjectDocument:
             )
         if not records:
             return self
-        return validate_project_document(
-            replace(self, datasets=(*self.datasets, *records))
-        )
+        return replace(self, datasets=(*self.datasets, *records))
 
     def replace_dataset(self, record: RawDatasetRecord) -> "ProjectDocument":
         if not isinstance(record, RawDatasetRecord):
@@ -622,14 +626,12 @@ class ProjectDocument:
             item.dataset_id == record.dataset_id for item in self.datasets
         ):
             raise KeyError(f"Unknown dataset ID: {record.dataset_id!r}.")
-        return validate_project_document(
-            replace(
-                self,
-                datasets=tuple(
-                    record if item.dataset_id == record.dataset_id else item
-                    for item in self.datasets
-                ),
-            )
+        return replace(
+            self,
+            datasets=tuple(
+                record if item.dataset_id == record.dataset_id else item
+                for item in self.datasets
+            ),
         )
 
     def rename_dataset(
@@ -652,17 +654,37 @@ class ProjectDocument:
         target = str(dataset_id)
         if not any(item.dataset_id == target for item in self.datasets):
             raise KeyError(f"Unknown dataset ID: {target!r}.")
-        return validate_project_document(
-            replace(
-                self,
-                datasets=tuple(
-                    item
-                    for item in self.datasets
-                    if item.dataset_id != target
-                ),
-                tabs=tuple(tab.without_dataset(target) for tab in self.tabs),
-            )
+        return replace(
+            self,
+            datasets=tuple(
+                item
+                for item in self.datasets
+                if item.dataset_id != target
+            ),
+            tabs=tuple(tab.without_dataset(target) for tab in self.tabs),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class DetailedBalanceAdmission:
+    """Typed detailed-balance truth derived from one prepared DSL request."""
+
+    report: WegscheiderCyclicityReport
+    policy_enabled: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.report, WegscheiderCyclicityReport):
+            raise TypeError("report must be a WegscheiderCyclicityReport.")
+        if type(self.policy_enabled) is not bool:
+            raise TypeError("policy_enabled must be a bool.")
+
+    @property
+    def requires_correction(self) -> bool:
+        return bool(self.policy_enabled and self.report.unresolved_cycles)
+
+    @property
+    def resolved(self) -> bool:
+        return not self.report.unresolved_cycles
 
 
 @dataclass(frozen=True, slots=True)
@@ -671,6 +693,8 @@ class MechanismSourceReconciliation:
     introduced_species: tuple[str, ...]
     removed_species: tuple[str, ...]
     inline_initial_conditions: DslInitialConditionAdmission
+    prepared_dsl: PreparedDslRequestSet | None
+    detailed_balance: DetailedBalanceAdmission
     materialized_set_ids: tuple[str, ...] = ()
 
 
@@ -930,6 +954,81 @@ def _prepare_source_dsl(
         units=UnitsModel(
             temperature_K=scientific_settings.temperature,
         )
+    )
+
+
+def canonical_species_names(tab: MechanismTabDocument) -> tuple[str, ...]:
+    """Return the accepted mechanism species in canonical document order."""
+
+    if not isinstance(tab, MechanismTabDocument):
+        raise TypeError("tab must be a MechanismTabDocument.")
+    prepared_dsl = tab.prepared_dsl
+    if prepared_dsl is None:
+        return ()
+    if type(prepared_dsl) is not PreparedDslRequestSet:
+        raise TypeError("tab prepared_dsl must be PreparedDslRequestSet.")
+    return tuple(str(name) for name in prepared_dsl.analysis.species_names)
+
+
+def canonical_analysis_identity(tab: MechanismTabDocument) -> str:
+    """Return the exact identity of the accepted retained DSL analysis."""
+
+    if not isinstance(tab, MechanismTabDocument):
+        raise TypeError("tab must be a MechanismTabDocument.")
+    prepared_dsl = tab.prepared_dsl
+    if type(prepared_dsl) is not PreparedDslRequestSet:
+        raise ValueError(
+            f"Mechanism tab {tab.tab_id!r} has no accepted DSL analysis."
+        )
+    identity = prepared_dsl.analysis.identity
+    if type(identity) is not str or not identity or identity != identity.strip():
+        raise ValueError(
+            f"Mechanism tab {tab.tab_id!r} has an invalid analysis identity."
+        )
+    return identity
+
+
+def canonical_initial_values(
+    tab: MechanismTabDocument,
+    set_id: str,
+) -> tuple[tuple[str, float], ...]:
+    """Project every accepted species, using exact zero for an absent value."""
+
+    canonical = tab.initial_condition_set(set_id).values_dict()
+    return tuple(
+        (species, float(canonical.get(species, 0.0)))
+        for species in canonical_species_names(tab)
+    )
+
+
+def _detailed_balance_admission(
+    prepared_dsl: PreparedDslRequestSet | None,
+    *,
+    policy_enabled: bool,
+) -> DetailedBalanceAdmission:
+    if prepared_dsl is None:
+        report = WegscheiderCyclicityReport(cycles=())
+    else:
+        from kindred.core.simulator.parameter_algebra import (
+            apply_parameter_algebra_spec_to_mechanism,
+        )
+
+        mechanism = prepared_dsl.mechanism_for_execution()
+        parameter_algebra_spec = (
+            prepared_dsl.parameter_algebra_spec_for_execution()
+        )
+        apply_parameter_algebra_spec_to_mechanism(
+            parameter_algebra_spec,
+            mechanism=mechanism,
+            require_mutable=False,
+        )
+        report = analyze_wegscheider_cyclicity(
+            mechanism,
+            parameter_algebra_spec=parameter_algebra_spec,
+        )
+    return DetailedBalanceAdmission(
+        report=report,
+        policy_enabled=bool(policy_enabled),
     )
 
 
@@ -1253,6 +1352,11 @@ def reconcile_tab_mechanism_source(
             introduced_species=introduced,
             removed_species=removed,
             inline_initial_conditions=admission,
+            prepared_dsl=prepared_dsl,
+            detailed_balance=_detailed_balance_admission(
+                prepared_dsl,
+                policy_enabled=tab.scientific_settings.wegscheider_policy,
+            ),
             materialized_set_ids=tuple(dict.fromkeys(materialized_ids)),
         )
     except (DSLError, KeyError, TypeError, ValueError) as exc:

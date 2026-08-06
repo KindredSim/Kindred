@@ -46,8 +46,7 @@ DatasetMetricPresentation: TypeAlias = tuple[
 ]
 _APPLY_SCOPE_LABELS = {
     "parameters": "Parameters",
-    "initial_concentrations": "Initial Concentrations",
-    "simulation_setup": "Simulation Setup",
+    "initial_concentrations": "Initial Conditions",
     "observable_definitions": "Observable Definitions",
 }
 
@@ -599,7 +598,6 @@ class RunResultsTab(QtWidgets.QWidget):
         if color_resolver is not None and not callable(color_resolver):
             raise TypeError("color_resolver must be callable.")
         self._color_resolver = color_resolver
-        self._candidate: FitCandidate | None = None
         self._run_identity: FitRunIdentity | None = None
         self._last_stats: dict[str, object] = {}
         self._last_fitted_params: tuple[tuple[str, float], ...] = ()
@@ -727,7 +725,6 @@ class RunResultsTab(QtWidgets.QWidget):
             available_scopes,
             unavailable_reasons,
         )
-        self._candidate = candidate
         self._available_apply_scopes = available
         self._unavailable_apply_reasons = MappingProxyType(reasons)
         self._project_apply_availability()
@@ -748,7 +745,6 @@ class RunResultsTab(QtWidgets.QWidget):
     def clear_candidate(self) -> None:
         """Clear all terminal/live result presentation without touching ownership."""
 
-        self._candidate = None
         self._run_identity = None
         self._last_stats = {}
         self._last_fitted_params = ()

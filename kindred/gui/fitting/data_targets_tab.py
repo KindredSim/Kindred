@@ -16,7 +16,7 @@ class DataTargetsTab(QtWidgets.QWidget):
     def __init__(
         self,
         *,
-        sampling_panel: QtWidgets.QWidget,
+        data_settings_panel: QtWidgets.QWidget,
         species_table: QtWidgets.QWidget,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -24,7 +24,7 @@ class DataTargetsTab(QtWidgets.QWidget):
         # The caller supplies the panel that is meant to be visible here.  In
         # the restored composition it is a panel-only DataTab, so no complete
         # DataTab is constructed and hidden behind this master/detail view.
-        self.sampling_panel = sampling_panel
+        self.data_settings_panel = data_settings_panel
         self.species_table = species_table
         self._current_detail_dataset_id: Optional[str] = None
         self._build_ui()
@@ -35,7 +35,7 @@ class DataTargetsTab(QtWidgets.QWidget):
 
         splitter = QtWidgets.QSplitter(Qt.Horizontal, self)
 
-        # LEFT: unified dataset list + sampling panel, scrollable
+        # LEFT: unified dataset list + Fit data panel, scrollable
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -44,7 +44,7 @@ class DataTargetsTab(QtWidgets.QWidget):
         self.unified_list = UnifiedDatasetList(parent=left_panel)
         left_layout.addWidget(self.unified_list, stretch=1)
 
-        left_layout.addWidget(self.sampling_panel)
+        left_layout.addWidget(self.data_settings_panel)
 
         left_scroll = QtWidgets.QScrollArea()
         left_scroll.setWidgetResizable(True)
@@ -97,7 +97,7 @@ class DataTargetsTab(QtWidgets.QWidget):
         if ds_id == self._current_detail_dataset_id:
             return
         self._current_detail_dataset_id = ds_id
-        select_dataset = getattr(self.sampling_panel, "select_dataset", None)
+        select_dataset = getattr(self.data_settings_panel, "select_dataset", None)
         if callable(select_dataset):
             select_dataset(
                 ds_id,

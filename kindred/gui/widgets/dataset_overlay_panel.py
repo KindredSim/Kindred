@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -101,7 +101,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(5)
-        header = QtWidgets.QLabel("Dataset Overlays")
+        header = QtWidgets.QLabel("Plot Overlays")
         header.setStyleSheet("font-weight: bold;")
         layout.addWidget(header)
 
@@ -121,7 +121,9 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._tree = QtWidgets.QTreeWidget()
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["Dataset / Observation", "Color"])
-        self._tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self._tree.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
         self._tree.itemChanged.connect(self._on_item_changed)
         self._tree.hide()
         layout.addWidget(self._tree)
@@ -260,25 +262,39 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
     def render_overlay_selection(
         self,
         *,
-        active_links: Iterable[ActiveDatasetLinkSnapshot],
+        dataset_id: str,
+        raw_observation_ids: Iterable[str],
     ) -> None:
-        """Project authoritative membership without rebuilding the dataset tree."""
+        """Project one accepted membership change without rebuilding the tree."""
 
-        links = tuple(active_links)
-        if any(
-            not isinstance(link, ActiveDatasetLinkSnapshot)
-            for link in links
-        ):
-            raise TypeError(
-                "active_links must contain ActiveDatasetLinkSnapshot values."
-            )
-        dataset_ids = tuple(link.dataset_id for link in links)
-        if len(dataset_ids) != len(set(dataset_ids)):
-            raise ValueError("Active overlay dataset IDs must be unique.")
-        self._links_by_dataset_id = {
-            link.dataset_id: link for link in links
-        }
+        target = str(dataset_id)
+        link = self._links_by_dataset_id.get(target)
+        if link is None:
+            return
+        selected = tuple(str(raw_id) for raw_id in raw_observation_ids)
+        if len(selected) != len(set(selected)):
+            raise ValueError("Overlay raw observation IDs must be unique.")
+        self._links_by_dataset_id[target] = replace(
+            link,
+            overlay_raw_observation_ids=selected,
+        )
         self._render_authoritative_overlay_selection()
+
+    def navigate_to_dataset(self, dataset_id: str) -> None:
+        """Select and reveal one existing dataset without changing its state."""
+
+        target = str(dataset_id)
+        for index in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(index)
+            if str(item.data(0, Qt.UserRole)) != target:
+                continue
+            item.setExpanded(True)
+            self._tree.setCurrentItem(item)
+            self._tree.scrollToItem(
+                item,
+                QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
+            return
 
     def refresh_application_style_controls(self) -> None:
         """Rerender only application-wide point-size and opacity controls."""

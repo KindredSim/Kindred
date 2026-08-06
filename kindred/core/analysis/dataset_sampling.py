@@ -46,10 +46,12 @@ def compute_sampled_indices(
         requested = int(n_points)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("n_points must be an int or None.") from exc
-    if requested <= 0 or requested >= int(windowed.size):
+    if requested <= 0:
         return windowed
     if requested < 2:
         raise ValueError("n_points must be All/None or >= 2.")
+    if requested >= int(windowed.size):
+        return windowed
 
     count = int(windowed.size)
     denominator = requested - 1

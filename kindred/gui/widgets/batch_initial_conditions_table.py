@@ -13,14 +13,13 @@ from kindred.core.project_document import (
     MechanismTabDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
+    canonical_species_names,
     new_set_id,
     next_set_name,
 )
 from kindred.core.project_presentation_state import ProjectPresentationState
 from kindred.core.result_repository import (
-    ExplicitResultKey,
-    scientific_identity,
-    standard_concentration_identity,
+    explicit_result_key_for_tab,
 )
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
 from kindred.gui.workspace_tab_registry import CanonicalMutationResult
@@ -29,15 +28,18 @@ __all__ = [
     "BatchInitialConditionsTableModel",
     "BatchInitialConditionsTableView",
     "InitialConditionsTableActions",
-    "projected_initial_values",
-    "projected_analysis_identity",
-    "projected_species_names",
     "resolve_live_slider_target_set_ids",
 ]
 
 
 _INVALID_BRUSH = QtGui.QBrush(QtGui.QColor(255, 210, 210))
 _RUN_GEAR = "\N{GEAR}"
+_MAX_SET_COLUMN_WIDTH = 220
+_MAX_SPECIES_COLUMN_WIDTH = 160
+_SLIDER_COLUMN_WIDTH = 72
+_PLOT_COLUMN_WIDTH = 56
+_CUSTOM_COLUMN_WIDTH = 72
+_RUN_GEAR_COLUMN_WIDTH = 36
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +105,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         if not isinstance(presentation, ProjectPresentationState):
             raise TypeError("presentation must be ProjectPresentationState.")
         if species_names is None:
-            species = projected_species_names(tab)
+            species = canonical_species_names(tab)
         else:
             species = tuple(
                 dict.fromkeys(str(item) for item in species_names if str(item))
@@ -408,7 +410,90 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
             | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
         )
+        self.horizontalHeader().setStretchLastSection(False)
+        self.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         self.setAlternatingRowColors(True)
+
+    def setModel(
+        self, model: QtCore.QAbstractItemModel | None
+    ) -> None:  # noqa: N802
+        old_model = self.model()
+        if isinstance(old_model, BatchInitialConditionsTableModel):
+            try:
+                old_model.modelReset.disconnect(self._apply_column_presentation)
+            except (TypeError, RuntimeError):
+                pass
+        super().setModel(model)
+        if isinstance(model, BatchInitialConditionsTableModel):
+            model.modelReset.connect(self._apply_column_presentation)
+        self._apply_column_presentation()
+
+    def _apply_column_presentation(self) -> None:
+        model = self.model()
+        if not isinstance(model, BatchInitialConditionsTableModel):
+            return
+        header = self.horizontalHeader()
+        desired_order = [
+            0,
+            model.slider_column(),
+            model.plot_column(),
+            model.custom_column(),
+            model.run_gear_column(),
+            *range(1, len(model.species_names()) + 1),
+        ]
+        movable_before = header.sectionsMovable()
+        header.setSectionsMovable(True)
+        for visual_index, logical_index in enumerate(desired_order):
+            current_visual = header.visualIndex(int(logical_index))
+            if current_visual != visual_index:
+                header.moveSection(current_visual, visual_index)
+        header.setSectionsMovable(bool(movable_before))
+
+        for column in range(model.columnCount()):
+            header.setSectionResizeMode(
+                column,
+                QtWidgets.QHeaderView.ResizeMode.Interactive,
+            )
+        self._auto_fit_columns()
+        for column, width in (
+            (model.slider_column(), _SLIDER_COLUMN_WIDTH),
+            (model.plot_column(), _PLOT_COLUMN_WIDTH),
+            (model.custom_column(), _CUSTOM_COLUMN_WIDTH),
+            (model.run_gear_column(), _RUN_GEAR_COLUMN_WIDTH),
+        ):
+            header.setSectionResizeMode(
+                column,
+                QtWidgets.QHeaderView.ResizeMode.Fixed,
+            )
+            self.setColumnWidth(column, width)
+
+    def _auto_fit_columns(self) -> None:
+        model = self.model()
+        if not isinstance(model, BatchInitialConditionsTableModel):
+            return
+        header = self.horizontalHeader()
+        header.setMaximumSectionSize(_MAX_SET_COLUMN_WIDTH)
+        header_text = model.headerData(
+            0,
+            QtCore.Qt.Orientation.Horizontal,
+            QtCore.Qt.ItemDataRole.DisplayRole,
+        )
+        header_minimum = header.fontMetrics().horizontalAdvance(
+            f" {str(header_text or '')} "
+        ) + 20
+        for column in range(len(model.species_names()) + 1):
+            self.resizeColumnToContents(column)
+            maximum = (
+                _MAX_SET_COLUMN_WIDTH
+                if column == 0
+                else _MAX_SPECIES_COLUMN_WIDTH
+            )
+            width = min(self.columnWidth(column), maximum)
+            if column == 0:
+                width = max(width, header_minimum)
+            self.setColumnWidth(column, width)
 
     def selected_set_ids(self) -> tuple[str, ...]:
         model = self.model()
@@ -488,50 +573,6 @@ def resolve_live_slider_target_set_ids(
     return (set_id,) if set_id in existing else ()
 
 
-def projected_species_names(tab: MechanismTabDocument) -> tuple[str, ...]:
-    """Return accepted-mechanism species without materializing absent zeros."""
-
-    prepared_dsl = tab.prepared_dsl
-    if prepared_dsl is None:
-        return ()
-    from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("tab prepared_dsl must be PreparedDslRequestSet.")
-    return tuple(prepared_dsl.analysis.species_names)
-
-
-def projected_analysis_identity(tab: MechanismTabDocument) -> str:
-    """Return the exact retained accepted analysis identity."""
-
-    from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-
-    prepared_dsl = tab.prepared_dsl
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise ValueError(
-            f"Mechanism tab {tab.tab_id!r} has no accepted DSL analysis."
-        )
-    identity = prepared_dsl.analysis.identity
-    if type(identity) is not str or not identity or identity != identity.strip():
-        raise ValueError(
-            f"Mechanism tab {tab.tab_id!r} has an invalid analysis identity."
-        )
-    return identity
-
-
-def projected_initial_values(
-    tab: MechanismTabDocument,
-    set_id: str,
-) -> tuple[tuple[str, float], ...]:
-    """Project absent accepted species as exact zero without changing the set."""
-
-    canonical = tab.initial_condition_set(set_id).values_dict()
-    return tuple(
-        (species, float(canonical.get(species, 0.0)))
-        for species in projected_species_names(tab)
-    )
-
-
 class InitialConditionsTableActions(QtCore.QObject):
     """Own IC intents for one immutable mechanism-tab identity."""
 
@@ -561,7 +602,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._model = model
         self._table = table
         self._simulation_jobs = simulation_jobs
-        self._species_for_tab = species_for_tab or projected_species_names
+        self._species_for_tab = species_for_tab or canonical_species_names
         self._rendering = False
         model.initialValueEditRequested.connect(self.accept_value_edit)
         model.setNameEditRequested.connect(self.accept_name_edit)
@@ -961,6 +1002,23 @@ class InitialConditionsTableActions(QtCore.QObject):
         self.activeSnapshotChanged.emit()
         return True
 
+    @QtCore.Slot(object)
+    def union_plot_membership(self, set_ids: Iterable[str]) -> bool:
+        admitted = tuple(str(set_id) for set_id in set_ids)
+        state = self._registry.presentation(self._tab_id)
+        next_ids = tuple(dict.fromkeys((*state.plot_set_ids, *admitted)))
+        if next_ids == state.plot_set_ids:
+            return False
+        token = self._registry.set_presentation(
+            self._tab_id,
+            replace(state, plot_set_ids=next_ids),
+            expected_token=self._registry.capture_content_token(),
+        )
+        if token is None:
+            return False
+        self.render()
+        return True
+
     @QtCore.Slot(str, bool)
     def set_slider_pinned(self, set_id: str, pinned: bool) -> bool:
         state = self._registry.presentation(self._tab_id)
@@ -1151,19 +1209,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         set_ids: Iterable[str],
     ) -> None:
         keys = tuple(
-            ExplicitResultKey(
-                tab_id=tab.tab_id,
-                set_id=set_id,
-                mechanism_source=tab.mechanism_source,
-                analysis_identity=projected_analysis_identity(tab),
-                standard_concentration_identity=standard_concentration_identity(
-                    tab.prepared_dsl
-                ),
-                scientific_identity=scientific_identity(tab.prepared_dsl),
-                initial_values=projected_initial_values(tab, set_id),
-                execution_settings=tab.resolved_execution_settings(set_id),
-                scientific_settings=tab.scientific_settings,
-            )
+            explicit_result_key_for_tab(tab, set_id)
             for set_id in dict.fromkeys(str(item) for item in set_ids)
         )
         self._simulation_jobs.reconcile_canonical_targets(keys)

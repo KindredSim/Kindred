@@ -24,7 +24,7 @@ __all__ = ["DatasetPlotPresentation", "GridPlotView"]
 
 ColorResolver = Callable[[str], object]
 DatasetPlotPresentation: TypeAlias = tuple[str, str]
-_FIT_COPY_COLUMNS = 14
+_FIT_COPY_COLUMNS = 15
 _MAX_FIT_COPY_CELLS = 1_000_000
 _MAX_FIT_COPY_CHARACTERS = 64 * 1024 * 1024
 _FIT_COPY_ROWS_PER_CHUNK = 2048
@@ -244,7 +244,8 @@ class GridPlotView(QtWidgets.QWidget):
             )
         header = encode_tsv_row(
             (
-                "dataset",
+                "dataset_id",
+                "dataset_label",
                 "series",
                 "raw_observation_id",
                 "raw_column",
@@ -288,6 +289,7 @@ class GridPlotView(QtWidgets.QWidget):
                     output.write(
                         encode_tsv_row(
                             (
+                                dataset.dataset_id,
                                 dataset.display_name,
                                 species,
                                 observation_ids[species][index],

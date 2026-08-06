@@ -39,6 +39,8 @@ from kindred.core.project_document import (
     MechanismSourceReconciliation,
     ProjectDocument,
     SimulationExecutionSettings,
+    canonical_species_names,
+    canonical_initial_values,
     new_set_id,
     next_set_name,
     reconcile_tab_mechanism_source,
@@ -52,8 +54,7 @@ from kindred.core.project_presentation_state import (
 from kindred.core.result_repository import (
     ExplicitResultKey,
     ResultRepository,
-    scientific_identity,
-    standard_concentration_identity,
+    explicit_result_key_for_tab,
 )
 from kindred.core.simulator.dsl_parse import (
     PreparedDslRequestSet,
@@ -61,12 +62,13 @@ from kindred.core.simulator.dsl_parse import (
 )
 from kindred.core.units import UnitsModel
 from kindred.gui.app_wiring import (
-    build_analysis_dock,
-    build_data_dock,
-    build_initial_conditions_dock,
-    build_mechanism_dock,
-    build_sliders_dock,
-    build_symbolic_calculator_dock,
+    ANALYSIS_DOCK_SPEC,
+    BATCH_DOCK_SPEC,
+    MECHANISM_DOCK_SPEC,
+    RIGHT_DOCK_SPEC,
+    SLIDERS_DOCK_SPEC,
+    SYMBOLIC_CALCULATOR_DOCK_SPEC,
+    build_module_dock,
     dock_default_area,
     dock_shell_specs,
 )
@@ -107,9 +109,6 @@ from kindred.gui.theme_manager import ThemeManager
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
     InitialConditionsTableActions,
-    projected_analysis_identity,
-    projected_initial_values,
-    projected_species_names,
 )
 from kindred.gui.widgets.data_manager import (
     DataManagerPanel,
@@ -117,6 +116,7 @@ from kindred.gui.widgets.data_manager import (
     DatasetFitInclusionIntent,
     DatasetMappingIntent,
     DatasetObservationMappingIntent,
+    DatasetPlotOverlayIntent,
     DatasetRenameIntent,
     DatasetExportOriginalIntent,
 )
@@ -640,41 +640,53 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_physical_shell(self) -> None:
         self._mechanism_stack = QtWidgets.QStackedWidget(self)
         self._mechanism_stack.setObjectName("mechanismSurfaceStack")
-        mechanism = build_mechanism_dock(
+        mechanism = build_module_dock(
             self,
+            spec=MECHANISM_DOCK_SPEC,
             panel=self._mechanism_stack,
         )
         self._mechanism_dock = mechanism.dock
         self._slider_stack = QtWidgets.QStackedWidget(self)
         self._slider_stack.setObjectName("sliderSurfaceStack")
-        sliders = build_sliders_dock(self, panel=self._slider_stack)
+        sliders = build_module_dock(
+            self,
+            spec=SLIDERS_DOCK_SPEC,
+            panel=self._slider_stack,
+        )
         self._sliders_dock = sliders.dock
 
         self._initial_conditions_stack = QtWidgets.QStackedWidget(self)
         self._initial_conditions_stack.setObjectName(
             "initialConditionsSurfaceStack"
         )
-        initials = build_initial_conditions_dock(
+        initials = build_module_dock(
             self,
+            spec=BATCH_DOCK_SPEC,
             panel=self._initial_conditions_stack,
         )
         self._batch_dock = initials.dock
 
         self._data_stack = QtWidgets.QStackedWidget(self)
         self._data_stack.setObjectName("dataSurfaceStack")
-        data = build_data_dock(self, panel=self._data_stack)
+        data = build_module_dock(
+            self,
+            spec=RIGHT_DOCK_SPEC,
+            panel=self._data_stack,
+        )
         self._right_dock = data.dock
 
-        analysis = build_analysis_dock(
+        analysis = build_module_dock(
             self,
+            spec=ANALYSIS_DOCK_SPEC,
             panel=self._workspace.main_plot_analysis_widget(),
         )
         self._analysis_dock = analysis.dock
 
         self._calculator_stack = QtWidgets.QStackedWidget(self)
         self._calculator_stack.setObjectName("symbolicCalculatorSurfaceStack")
-        symbolic = build_symbolic_calculator_dock(
+        symbolic = build_module_dock(
             self,
+            spec=SYMBOLIC_CALCULATOR_DOCK_SPEC,
             panel=self._calculator_stack,
         )
         self._symbolic_calculator_dock = symbolic.dock
@@ -921,6 +933,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 intent,
             )
         )
+        data.datasetPlotOverlayRequested.connect(
+            lambda intent, captured=tab_id: self._show_plot_overlay(
+                captured,
+                intent,
+            )
+        )
         data.datasetFitInclusionRequested.connect(
             lambda intent, captured=tab_id: self._set_dataset_fit_inclusion(
                 captured,
@@ -979,6 +997,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         self._simulation_jobs.state_changed.connect(
             self._on_simulation_state_changed
+        )
+        self._simulation_jobs.run_dispatched.connect(
+            self._on_run_dispatched
         )
         self._simulation_jobs.results_changed.connect(self._on_results_changed)
         self._simulation_jobs.status_changed.connect(self.set_status_text)
@@ -1056,7 +1077,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "interventionAnnotationsVisibilityRequested",
             "xSeriesRequested",
             "ySeriesRequested",
-            "parametricModeRequested",
             "plotPresentationIntentRequested",
         )
         if any(
@@ -1079,9 +1099,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         plot.ySeriesRequested.connect(
             lambda selections: self._set_y_series(target, selections)
-        )
-        plot.parametricModeRequested.connect(
-            lambda enabled: self._set_parametric_mode(target, enabled)
         )
         plot.plotPresentationIntentRequested.connect(
             lambda intent: self._set_plot_presentation(target, intent)
@@ -1220,6 +1237,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     target,
                 )
                 failures.append(f"datasets clear: {clear_exc}")
+            try:
+                bundle.overlay_panel.clear_projection()
+            except Exception as clear_exc:
+                logger.exception(
+                    "Tab %s Overlay invalidation failed",
+                    target,
+                )
+                failures.append(f"dataset overlays clear: {clear_exc}")
         else:
             refresh(
                 "datasets",
@@ -1231,7 +1256,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda: bundle.overlay_panel.render_snapshot(
                     records=data_snapshot.datasets,
                     active_links=data_snapshot.active_links,
-                    known_species=tuple(projected_species_names(tab)),
+                    known_species=tuple(canonical_species_names(tab)),
                 ),
                 bundle.overlay_panel.clear_projection,
             )
@@ -1275,7 +1300,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             bundle.overlay_panel.refresh_application_style_controls()
             bundle.overlay_panel.refresh_color_swatches(
-                known_species=tuple(projected_species_names(tab)),
+                known_species=tuple(canonical_species_names(tab)),
             )
             self._render_results_for_tab(tab.tab_id)
 
@@ -1320,6 +1345,16 @@ class MainWindow(QtWidgets.QMainWindow):
                             tab_id,
                         )
                         failures.append(f"{tab_id} datasets clear: {clear_exc}")
+                    try:
+                        bundle.overlay_panel.clear_projection()
+                    except Exception as clear_exc:
+                        logger.exception(
+                            "Tab %s Overlay invalidation failed",
+                            tab_id,
+                        )
+                        failures.append(
+                            f"{tab_id} dataset overlays clear: {clear_exc}"
+                        )
                     self._render_results_for_tab(tab_id)
                     continue
                 try:
@@ -1339,7 +1374,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     bundle.overlay_panel.render_snapshot(
                         records=snapshot.datasets,
                         active_links=snapshot.active_links,
-                        known_species=tuple(projected_species_names(tab)),
+                        known_species=tuple(canonical_species_names(tab)),
                     )
                 except Exception as exc:
                     logger.exception("Tab %s Overlay refresh failed", tab_id)
@@ -1408,7 +1443,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         repository = self._repository_for_tab(tab_id)
         analysis = tab.dsl_analysis
-        modeled_species = tuple(projected_species_names(tab))
+        modeled_species = tuple(canonical_species_names(tab))
         simulation_series_names = list(
             ()
             if analysis is None
@@ -1466,7 +1501,6 @@ class MainWindow(QtWidgets.QMainWindow):
             selected_y_uses_default_all=(
                 presentation.selected_y_uses_default_all
             ),
-            parametric_mode=presentation.parametric_mode,
         )
 
     def _render_results_for_tab(self, tab_id: str) -> bool:
@@ -1498,6 +1532,17 @@ class MainWindow(QtWidgets.QMainWindow):
         """Ignore late results from a replaced/closed semantic tab."""
 
         self._render_results_for_tab(str(tab_id))
+
+    @QtCore.Slot(str, object)
+    def _on_run_dispatched(self, tab_id: str, set_ids: object) -> None:
+        target = str(tab_id)
+        bundle = self._tab_surfaces.get(target)
+        if bundle is None:
+            return
+        if not bundle.initial_actions.union_plot_membership(set_ids):
+            return
+        self._render_results_for_tab(target)
+        self._refresh_project_state()
 
     def _invalidate_result_projection(self, tab_id: str) -> None:
         """Remove a failed tab's physical result surface without touching others."""
@@ -1548,17 +1593,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         try:
             tab = self._project_session.document.tab(key.tab_id)
-            initial_values = projected_initial_values(tab, key.set_id)
-            resolved_settings = tab.resolved_execution_settings(key.set_id)
-        except (KeyError, ValueError):
+            current = explicit_result_key_for_tab(tab, key.set_id)
+        except (KeyError, TypeError, ValueError):
             return False
-        return bool(
-            key.mechanism_source == tab.mechanism_source
-            and key.analysis_identity == projected_analysis_identity(tab)
-            and key.initial_values == initial_values
-            and key.execution_settings == resolved_settings
-            and key.scientific_settings == tab.scientific_settings
-        )
+        return key == current
 
     def _render_tab_state(self) -> None:
         tabs = self._project_session.document.tabs
@@ -1819,12 +1857,6 @@ class MainWindow(QtWidgets.QMainWindow):
         set_id: str,
         requested: bool,
     ) -> None:
-        if not self._accept_visible_source(
-            tab_id,
-            description="Plot membership",
-        ):
-            self._tab_surfaces[tab_id].initial_actions.render()
-            return
         self._tab_surfaces[tab_id].initial_actions.set_plot_requested(
             set_id,
             requested,
@@ -1834,19 +1866,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         tab = self._workspace_tab_registry.tab(tab_id)
         try:
-            key = ExplicitResultKey(
-                tab_id=tab.tab_id,
-                set_id=set_id,
-                mechanism_source=tab.mechanism_source,
-                analysis_identity=projected_analysis_identity(tab),
-                standard_concentration_identity=standard_concentration_identity(
-                    tab.prepared_dsl
-                ),
-                scientific_identity=scientific_identity(tab.prepared_dsl),
-                initial_values=projected_initial_values(tab, set_id),
-                execution_settings=tab.resolved_execution_settings(set_id),
-                scientific_settings=tab.scientific_settings,
-            )
+            key = explicit_result_key_for_tab(tab, set_id)
             if not self._simulation_jobs.show_cached(key):
                 self._render_results_for_tab(tab_id)
         except Exception as exc:
@@ -1870,11 +1890,10 @@ class MainWindow(QtWidgets.QMainWindow):
             selected & {"observable_definitions", "parameters"}
         )
         initials_changed = "initial_concentrations" in selected
-        setup_changed = "simulation_setup" in selected
         if source_changed:
             bundle.editor_binding.render()
             self._refresh_symbolic_calculator(tab_id)
-        if initials_changed or setup_changed:
+        if initials_changed:
             bundle.initial_actions.render()
         if source_changed or initials_changed:
             bundle.slider_binding.render()
@@ -1919,19 +1938,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         tab_id: str,
         target_ids: tuple[str, ...],
-    ) -> bool:
+    ) -> MechanismSourceReconciliation | None:
         if not self._settle_execution_candidate(tab_id):
-            return False
-        if not self._accept_visible_source(tab_id, description="Preview"):
-            return False
+            return None
+        proposal = self._accept_visible_source_result(
+            tab_id,
+            description="Preview",
+        )
+        if proposal is None:
+            return None
         if self._tab_surfaces[tab_id].initial_actions.has_invalid_cells(
             target_ids
         ):
             self.set_status_text(
                 "Preview blocked by invalid visible Initial Conditions."
             )
-            return False
-        return True
+            return None
+        return proposal
 
     def _confirm_discard_slider_preview(
         self,
@@ -2010,7 +2033,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     set_id=set_id,
                     set_name=tab.initial_condition_set(set_id).name,
                     mechanism_source=tab.mechanism_source,
-                    initial_values=projected_initial_values(tab, set_id),
+                    initial_values=canonical_initial_values(tab, set_id),
                     execution_settings=tab.resolved_execution_settings(set_id),
                     scientific_settings=tab.scientific_settings,
                     publication_generation=(
@@ -2244,14 +2267,14 @@ class MainWindow(QtWidgets.QMainWindow):
             or self._project_session.document.tab(tab_id).mechanism_source
         )
 
-    def _accept_visible_source(
+    def _accept_visible_source_result(
         self,
         tab_id: str | None = None,
         *,
         description: str,
         source: MechanismAuthoringSource | None = None,
         report_error: bool = True,
-    ) -> bool:
+    ) -> MechanismSourceReconciliation | None:
         """Run the one pure reconciliation and commit its complete proposal once."""
         tab_id = (
             self._workspace_tab_registry.active_tab_id
@@ -2269,7 +2292,7 @@ class MainWindow(QtWidgets.QMainWindow):
             report_error=report_error,
         )
         if proposal is None:
-            return False
+            return None
 
         proposed_document = proposal.proposed_document
         proposed_tab = proposed_document.tab(tab_id)
@@ -2280,7 +2303,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 expected_token=expected_token,
             )
             if result is None:
-                return False
+                return None
             self._consume_canonical_mutation(result)
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
         self._tab_surfaces[tab_id].editor_binding.apply_accepted_source_rewrite(
@@ -2288,7 +2311,7 @@ class MainWindow(QtWidgets.QMainWindow):
             proposed_tab.mechanism_source,
         )
         runtime.reactions_draft = None
-        valid_species = set(projected_species_names(proposed_tab))
+        valid_species = set(canonical_species_names(proposed_tab))
         runtime.invalid_initial_text_by_set_id = {
             set_id: {
                 species: raw
@@ -2299,7 +2322,22 @@ class MainWindow(QtWidgets.QMainWindow):
             if any(species in valid_species for species in values)
         }
         self._refresh_tab_controls(tab_id)
-        return True
+        return proposal
+
+    def _accept_visible_source(
+        self,
+        tab_id: str | None = None,
+        *,
+        description: str,
+        source: MechanismAuthoringSource | None = None,
+        report_error: bool = True,
+    ) -> bool:
+        return self._accept_visible_source_result(
+            tab_id,
+            description=description,
+            source=source,
+            report_error=report_error,
+        ) is not None
 
     def _prepare_source_reconciliation(
         self,
@@ -2351,11 +2389,11 @@ class MainWindow(QtWidgets.QMainWindow):
             raise TypeError("Mechanism reconciliation returned an invalid result.")
         return proposal
 
-    def _commit_detailed_balance_source(
+    def _commit_detailed_balance_source_result(
         self,
         tab_id: str,
         source: MechanismAuthoringSource,
-    ) -> PreparedDslRequestSet | None:
+    ) -> MechanismSourceReconciliation | None:
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be MechanismAuthoringSource.")
         target = str(tab_id)
@@ -2363,19 +2401,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self._project_session.document.tab(target)
         except KeyError:
             return None
-        if not self._accept_visible_source(
+        proposal = self._accept_visible_source_result(
             target,
             description="Apply detailed-balance correction",
             source=source,
             report_error=False,
-        ):
+        )
+        if proposal is None:
             return None
-        accepted = self._project_session.document.tab(target).prepared_dsl
-        if not isinstance(accepted, PreparedDslRequestSet):
+        if not isinstance(proposal.prepared_dsl, PreparedDslRequestSet):
             raise RuntimeError(
                 "Accepted detailed-balance source has no retained prepared DSL."
             )
-        return accepted
+        if not proposal.detailed_balance.resolved:
+            raise RuntimeError(
+                "Accepted detailed-balance correction did not resolve its "
+                "canonical admission report."
+            )
+        return proposal
+
+    def _commit_detailed_balance_source(
+        self,
+        tab_id: str,
+        source: MechanismAuthoringSource,
+    ) -> PreparedDslRequestSet | None:
+        proposal = self._commit_detailed_balance_source_result(tab_id, source)
+        return None if proposal is None else proposal.prepared_dsl
 
     @QtCore.Slot(object)
     def _commit_preview_detailed_balance_source(
@@ -2396,7 +2447,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if current.reactions_text not in {outcome.source, corrected}:
             return
         candidate = replace(current, reactions_text=corrected)
-        if self._commit_detailed_balance_source(outcome.tab_id, candidate):
+        if self._commit_detailed_balance_source_result(
+            outcome.tab_id,
+            candidate,
+        ) is not None:
             self.set_status_text(
                 "Detailed-balance correction applied. Preview was not retried; "
                 "adjust a Slider to request a new Preview."
@@ -2876,7 +2930,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             dataset = self._project_session.document.dataset(intent.dataset_id)
             if choice is DatasetMappingChoice.CREATE_SET:
-                species = projected_species_names(tab)
+                species = canonical_species_names(tab)
                 if not species:
                     raise ValueError(
                         "Apply a valid mechanism before creating a set from observations."
@@ -2942,7 +2996,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     document=self._project_session.document,
                     tab=tab,
                     plan=plan,
-                    mechanism_species=projected_species_names(tab),
+                    mechanism_species=canonical_species_names(tab),
                 )
             else:
                 plan = plan_leave_unmapped(
@@ -2953,7 +3007,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     document=self._project_session.document,
                     tab=tab,
                     plan=plan,
-                    mechanism_species=projected_species_names(tab),
+                    mechanism_species=canonical_species_names(tab),
                 )
             result = self._workspace_tab_registry.replace_tab(
                 tab_id,
@@ -2993,7 +3047,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             tab = self._workspace_tab_registry.tab(tab_id)
             dataset = self._project_session.document.dataset(intent.dataset_id)
-            species = projected_species_names(tab)
+            species = canonical_species_names(tab)
             current = tab.dataset_link(dataset.dataset_id)
             mapping = self._prompt_observation_mapping(
                 dataset,
@@ -3021,6 +3075,19 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Observation Mapping", str(exc))
         if changed:
             self._refresh_dataset_views((tab_id,))
+
+    def _show_plot_overlay(
+        self,
+        tab_id: str,
+        intent: DatasetPlotOverlayIntent,
+    ) -> None:
+        if not isinstance(intent, DatasetPlotOverlayIntent):
+            return
+        bundle = self._tab_surfaces.get(str(tab_id))
+        if bundle is None:
+            return
+        bundle.right_panel.select_plot_overlays_page()
+        bundle.overlay_panel.navigate_to_dataset(intent.dataset_id)
 
     def _prompt_observation_mapping(
         self,
@@ -3113,7 +3180,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 tab=tab,
                 dataset_id=intent.dataset_id,
                 include=intent.include,
-                mechanism_species=projected_species_names(tab),
+                mechanism_species=canonical_species_names(tab),
             )
             result = self._workspace_tab_registry.replace_tab(
                 tab_id,
@@ -3134,11 +3201,6 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         if not isinstance(intent, OverlaySelectionIntent):
             return
-        if not self._accept_visible_source(
-            tab_id,
-            description="Change Dataset Overlay Plot Membership"
-        ):
-            return
         state = self._workspace_tab_registry.presentation(tab_id)
         overlays = dict(state.overlay_raw_observation_ids_by_dataset)
         if intent.raw_observation_ids:
@@ -3155,14 +3217,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if token is None:
             return
-        tab = self._project_session.document.tab(tab_id)
-        data_snapshot = build_data_manager_snapshot(
-            document=self._project_session.document,
-            active_tab=tab,
-            presentation=self._workspace_tab_registry.presentation(tab_id),
-        )
         self._tab_surfaces[tab_id].overlay_panel.render_overlay_selection(
-            active_links=data_snapshot.active_links,
+            dataset_id=intent.dataset_id,
+            raw_observation_ids=intent.raw_observation_ids,
         )
         self._render_results_for_tab(tab_id)
         self._refresh_project_state()
@@ -3237,18 +3294,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 selected_y_series=selected,
                 selected_y_uses_default_all=False,
             ),
-            expected_token=self._project_session.capture_content_token(),
-        )
-        if token is None:
-            return
-        self._refresh_project_state()
-        self._render_results_for_tab(tab_id)
-
-    def _set_parametric_mode(self, tab_id: str, enabled: bool) -> None:
-        state = self._workspace_tab_registry.presentation(tab_id)
-        token = self._workspace_tab_registry.set_presentation(
-            tab_id,
-            replace(state, parametric_mode=bool(enabled)),
             expected_token=self._project_session.capture_content_token(),
         )
         if token is None:

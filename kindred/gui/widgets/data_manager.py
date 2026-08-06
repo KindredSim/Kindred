@@ -74,6 +74,7 @@ __all__ = [
     "DatasetFitInclusionIntent",
     "DatasetMappingIntent",
     "DatasetObservationMappingIntent",
+    "DatasetPlotOverlayIntent",
     "DatasetRenameIntent",
     "ExcelLoaderWorker",
 ]
@@ -106,6 +107,21 @@ class DatasetMappingIntent:
 @dataclass(frozen=True)
 class DatasetObservationMappingIntent:
     dataset_id: str
+
+
+@dataclass(frozen=True)
+class DatasetPlotOverlayIntent:
+    dataset_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.dataset_id) is not str
+            or not self.dataset_id
+            or self.dataset_id != self.dataset_id.strip()
+        ):
+            raise ValueError(
+                "Plot Overlay navigation requires one stable dataset ID."
+            )
 
 
 @dataclass(frozen=True)
@@ -375,6 +391,7 @@ class DataManagerPanel(QtWidgets.QWidget):
     datasetExportOriginalRequested = QtCore.Signal(object)
     datasetMappingRequested = QtCore.Signal(object)
     datasetObservationMappingRequested = QtCore.Signal(object)
+    datasetPlotOverlayRequested = QtCore.Signal(object)
     datasetFitInclusionRequested = QtCore.Signal(object)
     def __init__(
         self,
@@ -457,7 +474,12 @@ class DataManagerPanel(QtWidgets.QWidget):
         mapping_layout.addLayout(mapping_actions)
         self._observation_mapping_btn = QtWidgets.QPushButton("Observation Mapping…")
         self._observation_mapping_btn.clicked.connect(self._request_observation_mapping)
-        mapping_layout.addWidget(self._observation_mapping_btn)
+        self._plot_overlay_btn = QtWidgets.QPushButton("Plot Overlay…")
+        self._plot_overlay_btn.clicked.connect(self._request_plot_overlay)
+        observation_actions = QtWidgets.QHBoxLayout()
+        observation_actions.addWidget(self._observation_mapping_btn)
+        observation_actions.addWidget(self._plot_overlay_btn)
+        mapping_layout.addLayout(observation_actions)
         self._fit_include = QtWidgets.QCheckBox("Include mapped dataset in Fit")
         self._fit_include.toggled.connect(self._on_fit_include_toggled)
         mapping_layout.addWidget(self._fit_include)
@@ -500,6 +522,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._rename_btn.setEnabled(False)
         self._remove_btn.setEnabled(False)
         self._export_original_btn.setEnabled(False)
+        self._plot_overlay_btn.setEnabled(False)
         blocker = QtCore.QSignalBlocker(self._fit_include)
         try:
             self._fit_include.setChecked(False)
@@ -986,6 +1009,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._rename_btn.setEnabled(record is not None)
         self._remove_btn.setEnabled(record is not None)
         self._export_original_btn.setEnabled(record is not None)
+        self._plot_overlay_btn.setEnabled(record is not None)
         self._set_mapping_controls_enabled(enabled)
         link = self._active_link(dataset_id)
         self._leave_unmapped_btn.setEnabled(
@@ -1112,6 +1136,14 @@ class DataManagerPanel(QtWidgets.QWidget):
             return
         self.datasetObservationMappingRequested.emit(
             DatasetObservationMappingIntent(dataset_id=dataset_id)
+        )
+
+    def _request_plot_overlay(self) -> None:
+        dataset_id = self._selected_dataset_id()
+        if not dataset_id:
+            return
+        self.datasetPlotOverlayRequested.emit(
+            DatasetPlotOverlayIntent(dataset_id=dataset_id)
         )
 
     def _on_fit_include_toggled(self, checked: bool) -> None:

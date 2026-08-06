@@ -769,6 +769,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         mechanism_entries = list(self._variable_sliders.slider_picker_entries())
         species_entries = list(self._species_sliders.slider_picker_entries())
+        invert_action = menu.addAction("Invert selection")
+        invert_action.setEnabled(bool(mechanism_entries or species_entries))
+        invert_action.triggered.connect(
+            lambda _checked=False: self._invert_slider_visibility()
+        )
         if not mechanism_entries and not species_entries:
             action = menu.addAction("No sliders available")
             action.setEnabled(False)
@@ -790,6 +795,28 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
                 entry_kind="species",
                 entries=species_entries,
             )
+
+    def _invert_slider_visibility(self) -> None:
+        """Invert both complete child rosters in one workspace transaction."""
+        mechanism_entries = tuple(
+            self._variable_sliders.slider_picker_entries()
+        )
+        species_entries = tuple(
+            self._species_sliders.slider_picker_entries()
+        )
+        mechanism_projection = {
+            name: not bool(visible)
+            for name, _label, visible in mechanism_entries
+        }
+        species_projection = {
+            name: not bool(visible)
+            for name, _label, visible in species_entries
+        }
+        self._variable_sliders.apply_visibility_projection(
+            mechanism_projection
+        )
+        self._species_sliders.apply_visibility_projection(species_projection)
+        self._sync_slider_workspace_state()
 
     def _add_slider_visibility_entries(
         self,
@@ -998,8 +1025,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         variable_blocker = QtCore.QSignalBlocker(self._variable_sliders)
         species_blocker = QtCore.QSignalBlocker(self._species_sliders)
         try:
-            self._variable_sliders.clear()
-            self._species_sliders.clear()
+            self._variable_sliders.clear(preserve_visibility=False)
+            self._species_sliders.clear(preserve_visibility=False)
             self._fine_btn.setChecked(False)
         finally:
             del species_blocker

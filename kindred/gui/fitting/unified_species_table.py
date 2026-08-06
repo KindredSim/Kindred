@@ -163,12 +163,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._pending_dataset_weights: dict[str, float] = {}
         self._pending_initials: dict[tuple[str, str], FitInitialVariable] = {}
         self._invalid_raw: dict[tuple[str, ...], str] = {}
-        self._unresolved_global_species: set[str] = set()
-        self._pre_global_local_backups: dict[
-            str, dict[tuple[str, str], FitInitialVariable]
-        ] = {}
-        self._global_draft_raw: dict[tuple[str, str], str] = {}
-        self._global_draft_checks: dict[tuple[str, str], Qt.CheckState] = {}
         self._refreshing = False
         self._running = False
 
@@ -207,55 +201,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._context_label = QtWidgets.QLabel("Selected dataset: —", group)
         self._context_label.setStyleSheet("font-weight: bold;")
         self._footer.body_layout.addWidget(self._context_label)
-
-        scope_form = QtWidgets.QFormLayout()
-        scope_form.setContentsMargins(0, 0, 0, 0)
-        self._initial_scope_species = QtWidgets.QComboBox(group)
-        self._initial_scope_species.setObjectName(
-            "global_fit_initial_scope_species"
-        )
-        self._initial_scope_species.addItems(list(self._mechanism_species))
-        scope_form.addRow("Initial concentration:", self._initial_scope_species)
-
-        mode_row = QtWidgets.QHBoxLayout()
-        self._initial_global_radio = QtWidgets.QRadioButton("Global", group)
-        self._initial_local_radio = QtWidgets.QRadioButton("Local", group)
-        self._initial_scope_group = QtWidgets.QButtonGroup(group)
-        self._initial_scope_group.addButton(self._initial_global_radio)
-        self._initial_scope_group.addButton(self._initial_local_radio)
-        mode_row.addWidget(self._initial_global_radio)
-        mode_row.addWidget(self._initial_local_radio)
-        mode_row.addStretch(1)
-        mode_widget = QtWidgets.QWidget(group)
-        mode_widget.setLayout(mode_row)
-        scope_form.addRow("Mode:", mode_widget)
-        self._initial_scope_dataset_label = QtWidgets.QLabel(group)
-        scope_form.addRow("", self._initial_scope_dataset_label)
-        self._footer.body_layout.addLayout(scope_form)
-
-        self._initial_scope_status = QtWidgets.QLabel(group)
-        self._initial_scope_status.setObjectName(
-            "global_fit_initial_scope_status"
-        )
-        self._initial_scope_status.setWordWrap(True)
-        self._footer.body_layout.addWidget(self._initial_scope_status)
-        initial_help = QtWidgets.QLabel(
-            "Global: one parameter updates the initial value for all selected "
-            "datasets.\nLocal: a separate parameter is created for each "
-            "selected dataset.",
-            group,
-        )
-        initial_help.setWordWrap(True)
-        self._footer.body_layout.addWidget(initial_help)
-        self._initial_scope_species.currentTextChanged.connect(
-            self._refresh_initial_scope_controls
-        )
-        self._initial_global_radio.toggled.connect(
-            self._on_initial_scope_toggled
-        )
-        self._initial_local_radio.toggled.connect(
-            self._on_initial_scope_toggled
-        )
 
         weighting_form = QtWidgets.QFormLayout()
         weighting_form.setContentsMargins(0, 0, 0, 0)
@@ -368,13 +313,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if requested_id and requested_id not in available_ids:
             raise ValueError("Fit snapshot does not contain the selected dataset.")
 
-        previous = self._projected_setup
-        inclusion_edits = self._global_inclusion_transition_edits(
-            previous,
-            snapshot,
-        )
         self._projected_setup = snapshot
-        self._resolve_unresolved_globals_if_identical()
         self._current_dataset_id = requested_id or (
             available_ids[0] if available_ids else None
         )
@@ -390,7 +329,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._weight_mode_combo.setCurrentIndex(max(0, mode_index))
             self._populate_table()
             self._refresh_dataset_weight_editor()
-            self._refresh_initial_scope_controls()
         finally:
             self._dataset_weight_edit.blockSignals(False)
             self._weight_mode_combo.blockSignals(False)
@@ -399,8 +337,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self.setUpdatesEnabled(True)
         self._refresh_footer_dirty()
         self._refresh_footer_validity()
-        if inclusion_edits:
-            self.setupEditsRequested.emit(inclusion_edits)
 
     def load_for_dataset(self, dataset_id: str) -> None:
         """Select one projected dataset and repaint the table."""
@@ -756,11 +692,23 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 bound_item.setToolTip(f"Set ID: {set_id}\nSpecies ID: {species}")
                 self._table.setItem(row, column, bound_item)
 
-            self._restore_initial_raw_presentation(
-                row=row,
-                set_id=set_id,
-                species=species,
-            )
+            for column, field in (
+                (_Col.INITIAL, "initial"),
+                (_Col.MIN, "minimum"),
+                (_Col.MAX, "maximum"),
+            ):
+                key = (
+                    "initial",
+                    dataset.dataset_id,
+                    set_id,
+                    species,
+                    field,
+                )
+                item = self._table.item(row, column)
+                if item is not None and key in self._invalid_raw:
+                    item.setText(self._invalid_raw[key])
+                    item.setBackground(_INVALID_BG)
+                    item.setForeground(_INVALID_FG)
 
     def _refresh_visible_presentation(self) -> None:
         self._refreshing = True
@@ -771,7 +719,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         try:
             self._populate_table()
             self._refresh_dataset_weight_editor()
-            self._refresh_initial_scope_controls()
         finally:
             self._dataset_weight_edit.blockSignals(False)
             self._weight_mode_combo.blockSignals(False)
@@ -1001,9 +948,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         field = self._initial_field(item.column())
         if current is None or field is None:
             return
-        if species in self._unresolved_global_species:
-            self._update_unresolved_global_draft(item, species)
-            return
         raw_key = (
             "initial",
             dataset_id,
@@ -1034,24 +978,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
         self._invalid_raw.pop(raw_key, None)
         self._clear_invalid(item)
-        if current.scope == "global" and set_id in self._included_set_ids():
-            for active_set_id in self._included_set_ids():
-                active = self._initial_variable(active_set_id, species)
-                if active is None:
-                    continue
-                self._set_pending_initial(
-                    replace(
-                        active,
-                        initial=replacement.initial,
-                        minimum=replacement.minimum,
-                        maximum=replacement.maximum,
-                        fit=replacement.fit,
-                        log10=replacement.log10,
-                        scope="global",
-                    )
-                )
-        else:
-            self._set_pending_initial(replacement)
+        self._set_pending_initial(replacement)
         self._refresh_footer_dirty()
         self._refresh_footer_validity()
 
@@ -1120,10 +1047,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._pending_dataset_weights.clear()
         self._pending_initials.clear()
         self._invalid_raw.clear()
-        self._unresolved_global_species.clear()
-        self._pre_global_local_backups.clear()
-        self._global_draft_raw.clear()
-        self._global_draft_checks.clear()
         self._refresh_visible_presentation()
         self.set_status("Pending Fit target and initial-condition edits reverted.")
 
@@ -1192,288 +1115,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._refresh_visible_presentation()
         self.set_status(f"Copy Targets: {copied} copied, {skipped} skipped.")
 
-    # ------------------------------------------------------------------
-    # Global / Local initial-concentration presentation
-    # ------------------------------------------------------------------
-    def _included_set_ids(
-        self,
-        snapshot: FitSetupSnapshot | None = None,
-    ) -> tuple[str, ...]:
-        setup = snapshot or self._current_setup()
-        if setup is None:
-            return ()
-        included_dataset_ids = {
-            dataset.dataset_id for dataset in setup.datasets if dataset.included
-        }
-        return tuple(
-            mapped.set_id
-            for mapped in self._origin.mapped_datasets
-            if mapped.dataset_id in included_dataset_ids
-        )
-
-    @staticmethod
-    def _initial_signature(initial: FitInitialVariable) -> tuple[object, ...]:
-        return (
-            initial.initial,
-            initial.minimum,
-            initial.maximum,
-            initial.fit,
-            initial.log10,
-        )
-
-    def _active_initials(self, species: str) -> tuple[FitInitialVariable, ...]:
-        return tuple(
-            initial
-            for set_id in self._included_set_ids()
-            for initial in (self._initial_variable(set_id, species),)
-            if initial is not None
-        )
-
-    def _refresh_initial_scope_controls(self) -> None:
-        if not hasattr(self, "_initial_scope_species"):
-            return
-        species = str(self._initial_scope_species.currentText() or "").strip()
-        active = self._active_initials(species) if species else ()
-        count = len(self._included_set_ids())
-        self._initial_scope_dataset_label.setText(
-            f"Applies to {count} selected dataset{'s' if count != 1 else ''}."
-        )
-        enabled = bool(species and active and not self._running)
-        self._initial_scope_species.setEnabled(not self._running)
-        self._initial_global_radio.setEnabled(enabled)
-        self._initial_local_radio.setEnabled(enabled)
-        previous_global = self._initial_global_radio.blockSignals(True)
-        previous_local = self._initial_local_radio.blockSignals(True)
-        try:
-            if species in self._unresolved_global_species:
-                self._initial_global_radio.setChecked(True)
-                self._initial_scope_status.setText(
-                    "Global setup: Multiple values. Enter one explicit value, "
-                    "bounds, and Fit/Log10 selection in the species row."
-                )
-                return
-            scopes = {item.scope for item in active}
-            if scopes == {"global"}:
-                self._initial_global_radio.setChecked(True)
-                self._initial_scope_status.setText(
-                    "Global: one parameter updates the initial value for all "
-                    "selected datasets."
-                )
-            elif scopes == {"local"}:
-                self._initial_local_radio.setChecked(True)
-                self._initial_scope_status.setText(
-                    "Local: a separate parameter is used for each selected dataset."
-                )
-            else:
-                self._initial_global_radio.setChecked(False)
-                self._initial_local_radio.setChecked(False)
-                self._initial_scope_status.setText(
-                    "Initial scope is unavailable until included rows agree."
-                )
-        finally:
-            self._initial_global_radio.blockSignals(previous_global)
-            self._initial_local_radio.blockSignals(previous_local)
-
-    def _on_initial_scope_toggled(self, checked: bool) -> None:
-        if self._refreshing or self._running or not checked:
-            return
-        species = str(self._initial_scope_species.currentText() or "").strip()
-        if not species:
-            return
-        if self._initial_global_radio.isChecked():
-            self._stage_global_scope(species)
-        elif self._initial_local_radio.isChecked():
-            self._stage_local_scope(species)
-        self._refresh_visible_presentation()
-
-    def _stage_global_scope(self, species: str) -> None:
-        active = self._active_initials(species)
-        if not active:
-            return
-        if {item.scope for item in active} == {"global"} and len(
-            {self._initial_signature(item) for item in active}
-        ) == 1:
-            return
-        self._pre_global_local_backups.setdefault(
-            species,
-            {(item.set_id, species): item for item in active},
-        )
-        signatures = {self._initial_signature(item) for item in active}
-        if len(signatures) == 1:
-            template = active[0]
-            for initial in active:
-                self._set_pending_initial(
-                    replace(
-                        initial,
-                        initial=template.initial,
-                        minimum=template.minimum,
-                        maximum=template.maximum,
-                        fit=template.fit,
-                        log10=template.log10,
-                        scope="global",
-                    )
-                )
-            self._clear_unresolved_global(species)
-            self.set_status(
-                f"Global {species} initial staged for all included datasets."
-            )
-            return
-        self._unresolved_global_species.add(species)
-        self._invalid_raw[("initial_scope", species)] = "Multiple values"
-        for field in ("initial", "minimum", "maximum"):
-            self._global_draft_raw[(species, field)] = "Multiple values"
-        self._global_draft_checks[(species, "fit")] = Qt.CheckState.PartiallyChecked
-        self._global_draft_checks[(species, "log10")] = Qt.CheckState.PartiallyChecked
-        self.set_status(
-            f"Global {species} requires one explicit complete setup."
-        )
-
-    def _stage_local_scope(self, species: str) -> None:
-        backup = self._pre_global_local_backups.get(species)
-        if species in self._unresolved_global_species or backup is not None:
-            for initial in (backup or {}).values():
-                self._set_pending_initial(initial)
-            self._pre_global_local_backups.pop(species, None)
-            self._clear_unresolved_global(species)
-            self.set_status(
-                f"Restored the untouched Local {species} setups."
-            )
-            return
-        active = self._active_initials(species)
-        if not active or {item.scope for item in active} == {"local"}:
-            return
-        for initial in active:
-            self._set_pending_initial(replace(initial, scope="local"))
-        self.set_status(
-            f"Local {species} initials staged from the accepted Global setup."
-        )
-
-    def _clear_unresolved_global(self, species: str) -> None:
-        self._unresolved_global_species.discard(species)
-        self._invalid_raw.pop(("initial_scope", species), None)
-        for key in tuple(self._global_draft_raw):
-            if key[0] == species:
-                self._global_draft_raw.pop(key, None)
-        for key in tuple(self._global_draft_checks):
-            if key[0] == species:
-                self._global_draft_checks.pop(key, None)
-
-    def _restore_initial_raw_presentation(
-        self,
-        *,
-        row: int,
-        set_id: str,
-        species: str,
-    ) -> None:
-        field_by_column = {
-            _Col.INITIAL: "initial",
-            _Col.MIN: "minimum",
-            _Col.MAX: "maximum",
-        }
-        if species in self._unresolved_global_species and set_id in self._included_set_ids():
-            for column, field in field_by_column.items():
-                item = self._table.item(row, column)
-                if item is not None:
-                    item.setText(
-                        self._global_draft_raw.get(
-                            (species, field),
-                            "Multiple values",
-                        )
-                    )
-                    item.setBackground(_INVALID_BG)
-                    item.setForeground(_INVALID_FG)
-            for column, field in (
-                (_Col.FIT_IC, "fit"),
-                (_Col.LOG10, "log10"),
-            ):
-                item = self._table.item(row, column)
-                if item is not None:
-                    item.setFlags(
-                        Qt.ItemFlag.ItemIsEnabled
-                        | Qt.ItemFlag.ItemIsSelectable
-                        | Qt.ItemFlag.ItemIsUserCheckable
-                    )
-                    item.setCheckState(
-                        self._global_draft_checks.get(
-                            (species, field),
-                            Qt.CheckState.PartiallyChecked,
-                        )
-                    )
-            return
-        for column, field in field_by_column.items():
-            key = (
-                "initial",
-                self._dataset_id_for_set(set_id),
-                set_id,
-                species,
-                field,
-            )
-            item = self._table.item(row, column)
-            if item is not None and key in self._invalid_raw:
-                item.setText(self._invalid_raw[key])
-                item.setBackground(_INVALID_BG)
-                item.setForeground(_INVALID_FG)
-
-    def _update_unresolved_global_draft(
-        self,
-        item: QtWidgets.QTableWidgetItem,
-        species: str,
-    ) -> None:
-        field = self._initial_field(item.column())
-        if field is None:
-            return
-        if field in {"fit", "log10"}:
-            self._global_draft_checks[(species, field)] = item.checkState()
-        else:
-            self._global_draft_raw[(species, field)] = item.text()
-        try:
-            values = {
-                field_name: float(self._global_draft_raw[(species, field_name)])
-                for field_name in ("initial", "minimum", "maximum")
-            }
-            if not all(math.isfinite(value) for value in values.values()):
-                raise ValueError
-            fit_state = self._global_draft_checks.get(
-                (species, "fit"),
-                Qt.CheckState.PartiallyChecked,
-            )
-            log_state = self._global_draft_checks.get(
-                (species, "log10"),
-                Qt.CheckState.PartiallyChecked,
-            )
-            if fit_state == Qt.CheckState.PartiallyChecked:
-                return
-            fit = fit_state == Qt.CheckState.Checked
-            if not fit:
-                log10 = False
-            elif log_state == Qt.CheckState.PartiallyChecked:
-                return
-            else:
-                log10 = log_state == Qt.CheckState.Checked
-            active = self._active_initials(species)
-            replacements = tuple(
-                replace(
-                    initial,
-                    initial=values["initial"],
-                    minimum=values["minimum"],
-                    maximum=values["maximum"],
-                    fit=fit,
-                    log10=log10,
-                    scope="global",
-                )
-                for initial in active
-            )
-        except (KeyError, TypeError, ValueError, OverflowError):
-            self._refresh_footer_validity()
-            return
-        for replacement in replacements:
-            self._set_pending_initial(replacement)
-        self._clear_unresolved_global(species)
-        self._refresh_visible_presentation()
-        self.set_status(
-            f"Complete Global {species} initial staged for all included datasets."
-        )
-
     def _ordered_pending_initials(self) -> tuple[FitInitialVariable, ...]:
         setup = self._current_setup()
         if setup is None:
@@ -1513,109 +1154,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     (intent.initial.set_id, intent.initial.species),
                     None,
                 )
-        for species in tuple(self._pre_global_local_backups):
-            active = self._active_initials(species)
-            if active and {item.scope for item in active} == {"global"}:
-                self._pre_global_local_backups.pop(species, None)
         return True
-
-    def _global_inclusion_transition_edits(
-        self,
-        previous: FitSetupSnapshot | None,
-        current: FitSetupSnapshot,
-    ) -> tuple[FitInitialSetupEdit, ...]:
-        if previous is None:
-            return ()
-        old_included = {
-            item.dataset_id for item in previous.datasets if item.included
-        }
-        newly_included = tuple(
-            item.dataset_id
-            for item in current.datasets
-            if item.included and item.dataset_id not in old_included
-        )
-        if not newly_included:
-            return ()
-        old_set_ids = {
-            mapped.set_id
-            for mapped in self._origin.mapped_datasets
-            if mapped.dataset_id in old_included
-        }
-        new_set_ids = {
-            mapped.dataset_id: mapped.set_id
-            for mapped in self._origin.mapped_datasets
-            if mapped.dataset_id in newly_included
-        }
-        old_by_species: dict[str, list[FitInitialVariable]] = {}
-        for initial in previous.initials:
-            if (
-                initial.set_id in old_set_ids
-                or not old_set_ids and initial.scope == "global"
-            ):
-                old_by_species.setdefault(initial.species, []).append(initial)
-        current_by_key = {
-            (item.set_id, item.species): item for item in current.initials
-        }
-        edits: list[FitInitialSetupEdit] = []
-        for species, old_rows in old_by_species.items():
-            if (
-                {item.scope for item in old_rows} != {"global"}
-                or len({self._initial_signature(item) for item in old_rows}) != 1
-            ):
-                continue
-            template = old_rows[0]
-            for dataset_id in newly_included:
-                set_id = new_set_ids.get(dataset_id)
-                row = current_by_key.get((str(set_id or ""), species))
-                if row is None:
-                    continue
-                replacement = replace(
-                    row,
-                    initial=template.initial,
-                    minimum=template.minimum,
-                    maximum=template.maximum,
-                    fit=template.fit,
-                    log10=template.log10,
-                    scope="global",
-                )
-                if replacement == row:
-                    continue
-                edits.append(
-                    FitInitialSetupEdit(
-                        origin_tab_id=self._origin.tab_id,
-                        origin_capture_id=self._origin.capture_id,
-                        initial=replacement,
-                    )
-                )
-        return tuple(edits)
-
-    def _resolve_unresolved_globals_if_identical(self) -> None:
-        included = set(self._included_set_ids())
-        for species in tuple(self._unresolved_global_species):
-            backup = self._pre_global_local_backups.get(species, {})
-            remaining = tuple(
-                initial
-                for (set_id, _species), initial in backup.items()
-                if set_id in included
-            )
-            if not remaining or len(
-                {self._initial_signature(item) for item in remaining}
-            ) != 1:
-                continue
-            template = remaining[0]
-            for initial in remaining:
-                self._set_pending_initial(
-                    replace(
-                        initial,
-                        initial=template.initial,
-                        minimum=template.minimum,
-                        maximum=template.maximum,
-                        fit=template.fit,
-                        log10=template.log10,
-                        scope="global",
-                    )
-                )
-            self._clear_unresolved_global(species)
 
     # ------------------------------------------------------------------
     # Weight-mode and validation presentation

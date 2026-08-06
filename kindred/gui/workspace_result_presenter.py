@@ -838,8 +838,9 @@ class WorkspaceResultProjection:
     selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
     selected_y_series: tuple[AxisSeriesSelection, ...] = ()
     selected_y_uses_default_all: bool = True
+    x_label: str = "Time (s)"
+    y_label: str = "Value"
     axis_candidates: tuple[AxisSelectionCandidate, ...] = ()
-    parametric_mode: bool = False
     reference_lines_visible: bool = True
     intervention_annotations: tuple[Mapping[str, object], ...] = ()
     intervention_annotations_visible: bool = True
@@ -967,6 +968,10 @@ class WorkspaceResultProjection:
         )
         if len(selected_y) != len(set(selected_y)):
             raise ValueError("selected_y_series must be unique.")
+        if type(self.x_label) is not str:
+            raise TypeError("x_label must be an exact string.")
+        if type(self.y_label) is not str:
+            raise TypeError("y_label must be an exact string.")
         candidates = tuple(self.axis_candidates)
         if any(not isinstance(item, AxisSelectionCandidate) for item in candidates):
             raise TypeError(
@@ -1008,12 +1013,13 @@ class WorkspaceResultProjection:
             "selected_y_uses_default_all",
             bool(self.selected_y_uses_default_all),
         )
+        object.__setattr__(self, "x_label", self.x_label)
+        object.__setattr__(self, "y_label", self.y_label)
         object.__setattr__(
             self,
             "axis_candidates",
             candidates,
         )
-        object.__setattr__(self, "parametric_mode", bool(self.parametric_mode))
         object.__setattr__(
             self,
             "reference_lines_visible",
@@ -1113,6 +1119,7 @@ def _data_block(
     *,
     x_axis: AxisSeriesSelection,
     y_axes: set[AxisSeriesSelection] | None = None,
+    excluded_y_axes: set[AxisSeriesSelection] | None = None,
 ) -> ResultDataBlock | None:
     series_map = dict(layer.series)
     series_axis_map = dict(layer.series_axes)
@@ -1145,6 +1152,10 @@ def _data_block(
         (name, values)
         for name, values in layer.series
         if series_axis_map[name] != x_axis
+        and (
+            excluded_y_axes is None
+            or series_axis_map[name] not in excluded_y_axes
+        )
         and (y_axes is None or series_axis_map[name] in y_axes)
     )
     if not selected:
@@ -1181,6 +1192,7 @@ def _statistics_block(
     layer: WorkspacePlotLayer,
     *,
     y_axes: set[AxisSeriesSelection] | None,
+    excluded_y_axes: set[AxisSeriesSelection] | None = None,
 ) -> ResultDataBlock | None:
     """Build selected-Y statistics against canonical simulation time."""
 
@@ -1197,6 +1209,10 @@ def _statistics_block(
         for name, values in result.series.items()
         if (
             name not in succeeded_algebra_outputs
+            and (
+                excluded_y_axes is None
+                or series_axis_map[name] not in excluded_y_axes
+            )
             and (y_axes is None or series_axis_map[name] in y_axes)
         )
     )
@@ -1367,7 +1383,6 @@ class WorkspaceResultPresenter:
         ),
         selected_y_series: Sequence[AxisSeriesSelection] = (),
         selected_y_uses_default_all: bool = True,
-        parametric_mode: bool = False,
     ) -> WorkspaceResultProjection:
         tab_id = _required_id(tab_id, "tab_id")
         if not isinstance(repository, ResultRepository):
@@ -1386,11 +1401,7 @@ class WorkspaceResultPresenter:
             selected_x_series,
             field="selected_x_series",
         )
-        x_axis = (
-            selected_x
-            if bool(parametric_mode)
-            else SimulationSeriesAxisSelection("t")
-        )
+        x_axis = selected_x
         selected_y_ordered = tuple(
             _axis_selection(selection, field="selected_y_series")
             for selection in selected_y_series
@@ -1403,6 +1414,57 @@ class WorkspaceResultPresenter:
             if bool(selected_y_uses_default_all)
             else selected_y
         )
+
+        point_size = float(experimental_point_size)
+        point_opacity = float(experimental_point_opacity)
+        if not np.isfinite(point_size) or point_size <= 0.0:
+            raise ValueError("experimental_point_size must be positive.")
+        if not np.isfinite(point_opacity) or not 0.0 <= point_opacity <= 1.0:
+            raise ValueError(
+                "experimental_point_opacity must be between zero and one."
+            )
+        experimental_inputs = tuple(experimental_layers)
+        if any(
+            not isinstance(candidate, ExperimentalLayerInput)
+            for candidate in experimental_inputs
+        ):
+            raise TypeError(
+                "experimental_layers must contain ExperimentalLayerInput values."
+            )
+        experimental_by_axis = {
+            ExperimentalAxisSelection(
+                candidate.dataset_id,
+                candidate.raw_observation_id,
+            ): candidate
+            for candidate in experimental_inputs
+        }
+        if len(experimental_by_axis) != len(experimental_inputs):
+            raise ValueError(
+                "Experimental layers duplicate a dataset/raw-observation "
+                "identity."
+            )
+        excluded_simulation_y: set[AxisSeriesSelection] = set()
+        excluded_experimental_y: set[AxisSeriesSelection] = set()
+        selected_x_source: ExperimentalLayerInput | None = None
+        if isinstance(selected_x, SimulationSeriesAxisSelection):
+            excluded_simulation_y.add(selected_x)
+            excluded_experimental_y.update(
+                ExperimentalAxisSelection(
+                    candidate.dataset_id,
+                    candidate.raw_observation_id,
+                )
+                for candidate in experimental_inputs
+                if candidate.model_species == selected_x.series_name
+            )
+        elif isinstance(selected_x, ExperimentalAxisSelection):
+            selected_x_source = experimental_by_axis.get(selected_x)
+            excluded_experimental_y.add(selected_x)
+            if selected_x_source is not None and selected_x_source.model_species:
+                excluded_simulation_y.add(
+                    SimulationSeriesAxisSelection(
+                        selected_x_source.model_species
+                    )
+                )
 
         layers: list[WorkspacePlotLayer] = []
         blocks: list[ResultDataBlock] = []
@@ -1458,6 +1520,7 @@ class WorkspaceResultPresenter:
                     foreground,
                     x_axis=x_axis,
                     y_axes=wanted_y,
+                    excluded_y_axes=excluded_simulation_y,
                 )
                 if block is not None:
                     blocks.append(block)
@@ -1481,6 +1544,7 @@ class WorkspaceResultPresenter:
                         reference_layer,
                         x_axis=x_axis,
                         y_axes=wanted_y,
+                        excluded_y_axes=excluded_simulation_y,
                     )
                     if block is not None:
                         blocks.append(block)
@@ -1500,36 +1564,8 @@ class WorkspaceResultPresenter:
                 primary_block = _statistics_block(
                     foreground,
                     y_axes=wanted_y,
+                    excluded_y_axes=excluded_simulation_y,
                 )
-
-        point_size = float(experimental_point_size)
-        point_opacity = float(experimental_point_opacity)
-        if not np.isfinite(point_size) or point_size <= 0.0:
-            raise ValueError("experimental_point_size must be positive.")
-        if not np.isfinite(point_opacity) or not 0.0 <= point_opacity <= 1.0:
-            raise ValueError(
-                "experimental_point_opacity must be between zero and one."
-            )
-        experimental_inputs = tuple(experimental_layers)
-        if any(
-            not isinstance(candidate, ExperimentalLayerInput)
-            for candidate in experimental_inputs
-        ):
-            raise TypeError(
-                "experimental_layers must contain ExperimentalLayerInput values."
-            )
-        experimental_by_axis = {
-            ExperimentalAxisSelection(
-                candidate.dataset_id,
-                candidate.raw_observation_id,
-            ): candidate
-            for candidate in experimental_inputs
-        }
-        if len(experimental_by_axis) != len(experimental_inputs):
-            raise ValueError(
-                "Experimental layers duplicate a dataset/raw-observation "
-                "identity."
-            )
 
         for experimental in experimental_inputs:
             y_axis = ExperimentalAxisSelection(
@@ -1554,15 +1590,23 @@ class WorkspaceResultPresenter:
                 MappingProxyType({})
             )
             selected_source_rows = tuple(experimental.source_rows)
-            if bool(parametric_mode) and not _is_time_selection(selected_x):
-                if not isinstance(selected_x, ExperimentalAxisSelection):
-                    # Simulation-owned X has no raw-observation pairing.
-                    continue
-                x_source = experimental_by_axis.get(selected_x)
+            if not _is_time_selection(selected_x):
+                if isinstance(selected_x, SimulationSeriesAxisSelection):
+                    x_source = next(
+                        (
+                            candidate
+                            for candidate in experimental_inputs
+                            if candidate.dataset_id == experimental.dataset_id
+                            and candidate.model_species == selected_x.series_name
+                        ),
+                        None,
+                    )
+                else:
+                    x_source = selected_x_source
                 if (
                     x_source is None
                     or x_source.dataset_id != experimental.dataset_id
-                    or x_source.layer_id == experimental.layer_id
+                    or y_axis in excluded_experimental_y
                 ):
                     continue
                 paired = _same_source_row_values(x_source, experimental)
@@ -1640,8 +1684,47 @@ class WorkspaceResultPresenter:
                 continue
             annotation_signatures.add(signature)
             unique_annotations.append(annotation)
-        if bool(parametric_mode) and not _is_time_selection(selected_x):
+        if not _is_time_selection(selected_x):
             unique_annotations.clear()
+
+        if _is_time_selection(selected_x):
+            x_label = "Time (s)"
+        elif isinstance(selected_x, SimulationSeriesAxisSelection):
+            x_label = selected_x.series_name
+        elif selected_x_source is None:
+            x_label = ""
+        else:
+            x_label = selected_x_source.model_species or selected_x_source.raw_column
+
+        effective_y_axes = tuple(
+            selection
+            for block in blocks
+            for _name, selection in block.series_axes
+        )
+
+        def is_concentration(selection: AxisSeriesSelection) -> bool:
+            if isinstance(selection, ExperimentalAxisSelection):
+                source = experimental_by_axis.get(selection)
+                return source is not None and source.model_species is not None
+            for layer in layers:
+                if layer.kind is ResultLayerKind.EXPERIMENTAL:
+                    continue
+                if selection not in dict(layer.series_axes).values():
+                    continue
+                if layer.result_entry is None:
+                    continue
+                return (
+                    selection.series_name
+                    not in layer.result_entry.result.provenance.requested_algebra_outputs
+                )
+            return False
+
+        y_label = (
+            "Concentration (M)"
+            if effective_y_axes
+            and all(is_concentration(selection) for selection in effective_y_axes)
+            else "Value"
+        )
 
         return WorkspaceResultProjection(
             tab_id=tab_id,
@@ -1665,16 +1748,14 @@ class WorkspaceResultPresenter:
             selected_y_uses_default_all=bool(
                 selected_y_uses_default_all
             ),
+            x_label=x_label,
+            y_label=y_label,
             axis_candidates=tuple(axis_candidates),
-            parametric_mode=bool(parametric_mode),
             reference_lines_visible=bool(reference_lines_visible),
             intervention_annotations=tuple(unique_annotations),
             intervention_annotations_visible=bool(
                 intervention_annotations_visible
-                and not (
-                    bool(parametric_mode)
-                    and not _is_time_selection(selected_x)
-                )
+                and _is_time_selection(selected_x)
             ),
         )
 

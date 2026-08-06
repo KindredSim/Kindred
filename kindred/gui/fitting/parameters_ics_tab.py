@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -27,6 +28,8 @@ from kindred.gui.fitting.constants import (
 )
 from kindred.gui.fitting.launch import (
     FitDefaultsSetupEdit,
+    FitInitialSetupEdit,
+    FitInitialVariable,
     FitOriginSnapshot,
     FitParameterSetupEdit,
     FitParameterVariable,
@@ -258,7 +261,7 @@ class _FitLocalObservableDialog(QtWidgets.QDialog):
 
 
 class ParametersIcsTab(QtWidgets.QWidget):
-    """Presentation-only parameter, optimizer, and execution panel."""
+    """Presentation-only parameter, IC-scope, and optimizer panel."""
 
     setupEditsRequested = QtCore.Signal(object)
     addObservableRequested = QtCore.Signal(object)
@@ -281,13 +284,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._projected_setup: FitSetupSnapshot | None = None
         self._initial_snapshot: FitSetupSnapshot | None = None
         self._last_fit_snapshot: FitSetupSnapshot | None = None
-        self._execution_presentation_widget: QtWidgets.QWidget | None = None
         self._selected_dataset_ids: tuple[str, ...] = ()
         self._selected_dataset_ids_explicit = False
         self._parameter_choices: dict[str, object] = {}
         self._invalid_numeric_text: dict[tuple[str, ...], str] = {}
         self._invalid_numeric_messages: dict[tuple[str, ...], str] = {}
         self._projecting = False
+        self._numeric_transaction_active = False
         self._running = False
         self._set_parameter_choices(parameter_choices or {})
         self._build_ui()
@@ -355,6 +358,36 @@ class ParametersIcsTab(QtWidgets.QWidget):
         )
         params_layout.addWidget(self._parameter_local_table)
 
+        ic_scope_group = QtWidgets.QGroupBox("Initial-condition scope", params_group)
+        ic_scope_layout = QtWidgets.QVBoxLayout(ic_scope_group)
+        ic_scope_form = QtWidgets.QFormLayout()
+        self._ic_scope_species = QtWidgets.QComboBox(ic_scope_group)
+        self._ic_scope_species.setObjectName("global_fit_ic_scope_species")
+        ic_scope_form.addRow("Species:", self._ic_scope_species)
+        ic_scope_layout.addLayout(ic_scope_form)
+        self._ic_scope_local_radio = QtWidgets.QRadioButton(
+            "A separate fitted value for each dataset", ic_scope_group
+        )
+        self._ic_scope_global_radio = QtWidgets.QRadioButton(
+            "One fitted value across all included datasets", ic_scope_group
+        )
+        self._ic_scope_local_radio.setChecked(True)
+        self._ic_scope_group = QtWidgets.QButtonGroup(ic_scope_group)
+        self._ic_scope_group.addButton(self._ic_scope_local_radio)
+        self._ic_scope_group.addButton(self._ic_scope_global_radio)
+        ic_scope_layout.addWidget(self._ic_scope_local_radio)
+        ic_scope_layout.addWidget(self._ic_scope_global_radio)
+        self._ic_scope_status = QtWidgets.QLabel(ic_scope_group)
+        self._ic_scope_status.setWordWrap(True)
+        self._ic_scope_status.setObjectName("global_fit_ic_scope_status")
+        ic_scope_layout.addWidget(self._ic_scope_status)
+        self._ic_scope_species.currentTextChanged.connect(
+            self._on_ic_scope_species_changed
+        )
+        self._ic_scope_local_radio.toggled.connect(self._on_ic_scope_toggled)
+        self._ic_scope_global_radio.toggled.connect(self._on_ic_scope_toggled)
+        params_layout.addWidget(ic_scope_group)
+
         action_row = QtWidgets.QHBoxLayout()
         self._add_observable_button = QtWidgets.QPushButton(
             "Define New Fit-local Observable…"
@@ -412,16 +445,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         algo_form.addRow(self._seed_check, self._seed_spin)
         params_layout.addLayout(algo_form)
 
-        # The current execution contract is per dataset.  This host preserves
-        # the historical placement while allowing FittingWindow to insert its
-        # current execution presentation without this tab owning that policy.
-        self._execution_presentation_host = QtWidgets.QWidget(params_group)
-        self._execution_presentation_layout = QtWidgets.QVBoxLayout(
-            self._execution_presentation_host
-        )
-        self._execution_presentation_layout.setContentsMargins(0, 0, 0, 0)
-        params_layout.addWidget(self._execution_presentation_host)
-
         layout.addWidget(params_group, stretch=1)
 
         self._method_combo.currentTextChanged.connect(self._emit_defaults_edit)
@@ -460,6 +483,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 self._xtol_edit,
                 self._seed_check,
                 self._seed_spin,
+                self._ic_scope_species,
+                self._ic_scope_local_radio,
+                self._ic_scope_global_radio,
             )
         ]
         try:
@@ -483,6 +509,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 parameters,
                 self._parameter_dataset_ids(snapshot, parameters),
             )
+            self._project_ic_scope_controls(snapshot)
             self._project_defaults(snapshot.defaults)
         finally:
             del projection_blockers
@@ -536,21 +563,118 @@ class ParametersIcsTab(QtWidgets.QWidget):
         # rows always retain every captured dataset value, including excluded
         # datasets.
 
-    def set_execution_presentation_widget(
-        self,
-        widget: QtWidgets.QWidget | None,
-    ) -> None:
-        """Install a parent-owned per-dataset execution view in the reserved host."""
-
-        if self._execution_presentation_widget is not None:
-            self._execution_presentation_widget.setParent(None)
-        self._execution_presentation_widget = widget
-        if widget is not None:
-            self._execution_presentation_layout.addWidget(widget)
-
     def set_running_state(self, running: bool) -> None:
         self._running = bool(running)
         self._add_observable_button.setEnabled(not self._running)
+        self._ic_scope_species.setEnabled(not self._running)
+        self._ic_scope_local_radio.setEnabled(not self._running)
+        self._ic_scope_global_radio.setEnabled(not self._running)
+
+    def _project_ic_scope_controls(self, snapshot: FitSetupSnapshot) -> None:
+        species = tuple(
+            dict.fromkeys(item.species for item in snapshot.initials)
+        )
+        current = str(self._ic_scope_species.currentText() or "")
+        self._ic_scope_species.clear()
+        self._ic_scope_species.addItems(list(species))
+        if current in species:
+            self._ic_scope_species.setCurrentText(current)
+        elif species:
+            self._ic_scope_species.setCurrentIndex(0)
+        active = self._active_ic_rows(
+            str(self._ic_scope_species.currentText() or "")
+        )
+        explicit_global = bool(active) and {item.scope for item in active} == {"global"}
+        self._ic_scope_local_radio.setChecked(not explicit_global)
+        self._ic_scope_global_radio.setChecked(explicit_global)
+        self._ic_scope_status.setText(
+            "Local is the default; choose Global explicitly."
+            if not explicit_global
+            else "Global is explicitly accepted for the selected species."
+        )
+        self._ic_scope_species.setEnabled(not self._running)
+        self._ic_scope_local_radio.setEnabled(bool(active) and not self._running)
+        self._ic_scope_global_radio.setEnabled(bool(active) and not self._running)
+
+    def _active_ic_rows(self, species: str) -> tuple[FitInitialVariable, ...]:
+        setup = self._projected_setup
+        if setup is None or not species:
+            return ()
+        included = {
+            item.dataset_id for item in setup.datasets if item.included
+        }
+        included_sets = {
+            mapped.set_id
+            for mapped in (self._origin.mapped_datasets if self._origin else ())
+            if mapped.dataset_id in included
+        }
+        return tuple(
+            item
+            for item in setup.initials
+            if item.species == species and item.set_id in included_sets
+        )
+
+    def _on_ic_scope_species_changed(self, _species: str) -> None:
+        if self._projecting:
+            return
+        active = self._active_ic_rows(
+            str(self._ic_scope_species.currentText() or "")
+        )
+        explicit_global = bool(active) and {item.scope for item in active} == {"global"}
+        for control, checked in (
+            (self._ic_scope_local_radio, not explicit_global),
+            (self._ic_scope_global_radio, explicit_global),
+        ):
+            blocker = QtCore.QSignalBlocker(control)
+            control.setChecked(checked)
+            del blocker
+        self._ic_scope_status.setText(
+            "Global is explicitly accepted for the selected species."
+            if explicit_global
+            else "Local is the default; choose Global explicitly."
+        )
+
+    def _on_ic_scope_toggled(self, checked: bool) -> None:
+        if self._projecting or self._running or not checked:
+            return
+        species = str(self._ic_scope_species.currentText() or "").strip()
+        active = self._active_ic_rows(species)
+        if not active:
+            return
+        desired = "global" if self._ic_scope_global_radio.isChecked() else "local"
+        if desired == "global":
+            signatures = {
+                (
+                    item.initial,
+                    item.minimum,
+                    item.maximum,
+                    item.fit,
+                    item.log10,
+                )
+                for item in active
+            }
+            if len(signatures) != 1:
+                self._ic_scope_status.setText(
+                    "Multiple values: make the included rows identical before "
+                    "choosing Global."
+                )
+                return
+        intents = tuple(
+            FitInitialSetupEdit(
+                origin_tab_id=self._projected_setup.origin_tab_id,
+                origin_capture_id=self._projected_setup.origin_capture_id,
+                initial=replace(item, scope=desired),
+            )
+            for item in active
+            if item.scope != desired
+        )
+        if intents:
+            self.setupEditsRequested.emit(intents)
+        self._ic_scope_status.setText(
+            "Global is explicitly accepted for the selected species."
+            if desired == "global"
+            else "Local keeps a separate fitted value for each dataset."
+        )
 
     # ------------------------------------------------------------------
     # Parameter presentation and intents
@@ -826,14 +950,20 @@ class ParametersIcsTab(QtWidgets.QWidget):
         item: QtWidgets.QTableWidgetItem,
         key: tuple[str, ...],
     ) -> None:
-        if key in self._invalid_numeric_text:
-            item.setBackground(QtGui.QColor(255, 200, 200))
-            item.setForeground(QtGui.QColor(80, 0, 0))
-            item.setToolTip(self._invalid_numeric_messages.get(key, "Invalid value"))
-            return
-        item.setBackground(QtGui.QBrush())
-        item.setForeground(QtGui.QBrush())
-        item.setToolTip("")
+        param_blocked = self._param_table.blockSignals(True)
+        local_blocked = self._parameter_local_table.blockSignals(True)
+        try:
+            if key in self._invalid_numeric_text:
+                item.setBackground(QtGui.QColor(255, 200, 200))
+                item.setForeground(QtGui.QColor(80, 0, 0))
+                item.setToolTip(self._invalid_numeric_messages.get(key, "Invalid value"))
+                return
+            item.setBackground(QtGui.QBrush())
+            item.setForeground(QtGui.QBrush())
+            item.setToolTip("")
+        finally:
+            self._param_table.blockSignals(param_blocked)
+            self._parameter_local_table.blockSignals(local_blocked)
 
     def _set_invalid_numeric(
         self,
@@ -1063,8 +1193,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         changed_key: tuple[str, ...] | None = None,
         changed_item: QtWidgets.QTableWidgetItem | None = None,
     ) -> bool:
-        if self._projecting or self._projected_setup is None:
+        if (
+            self._projecting
+            or self._numeric_transaction_active
+            or self._projected_setup is None
+        ):
             return False
+        self._numeric_transaction_active = True
         try:
             edited = self._parameter_projection(name)
             intent = FitParameterSetupEdit(
@@ -1088,6 +1223,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 )
             self.statusMessage.emit(f"Fit parameter edit is invalid: {exc}")
             return False
+        finally:
+            self._numeric_transaction_active = False
         self.setupEditsRequested.emit((intent,))
         return True
 

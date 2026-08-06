@@ -22,18 +22,14 @@ from kindred.core.project_document import (
     FitDefaults,
     MechanismTabDocument,
     ProjectDocument,
-    SimulationExecutionSettings,
     TabScientificSettings,
+    canonical_initial_values,
+    canonical_species_names,
     default_project_document,
-    validate_simulation_execution_settings,
 )
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.fitting.contracts import FitParametricSettings, FitRunIdentity
-from kindred.gui.widgets.batch_initial_conditions_table import (
-    projected_initial_values,
-    projected_species_names,
-)
 
 __all__ = [
     "FitDatasetLocalSettings",
@@ -135,7 +131,7 @@ class FitMappedDatasetSnapshot:
     initial_values: tuple[tuple[str, float], ...]
     observations: tuple[FitObservationSnapshot, ...]
     included_at_launch: bool
-    execution: SimulationExecutionSettings
+    resolved_t_start: float
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dataset_id", _required(self.dataset_id, "dataset ID"))
@@ -170,7 +166,11 @@ class FitMappedDatasetSnapshot:
                 "Mapped Fit dataset-local raw observation IDs must be unique."
             )
         object.__setattr__(self, "observations", observations)
-        validate_simulation_execution_settings(self.execution)
+        object.__setattr__(
+            self,
+            "resolved_t_start",
+            _finite(self.resolved_t_start, "resolved mapped start"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,10 +268,11 @@ class FitInitialVariable:
 class FitDatasetLocalSettings:
     dataset_id: str
     included: bool
-    sample_t_min: float
-    sample_t_max: float
-    sample_points: int | None
-    execution: SimulationExecutionSettings
+    t_start: float
+    solver: str = "BDF"
+    data_range_min: float = 0.0
+    data_range_max: float = 0.0
+    maximum_observations_per_target: int | None = None
     weight: float = 1.0
     target_species: tuple[str, ...] = ()
     target_weights: tuple[tuple[str, float], ...] = ()
@@ -280,17 +281,28 @@ class FitDatasetLocalSettings:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dataset_id", _required(self.dataset_id, "dataset ID"))
-        low = _finite(self.sample_t_min, "sampling t min")
-        high = _finite(self.sample_t_max, "sampling t max")
+        t_start = _finite(self.t_start, "Fit simulation start")
+        if t_start < 0.0:
+            raise ValueError("Fit simulation start must be nonnegative.")
+        low = _finite(self.data_range_min, "Data Range minimum")
+        high = _finite(self.data_range_max, "Data Range maximum")
         if high < low:
-            raise ValueError("Sampling t max must be >= t min.")
-        points = None if self.sample_points in (None, 0) else int(self.sample_points)
-        if points is not None and points < 2:
-            raise ValueError("Sampling Points must be All or at least 2.")
+            raise ValueError("Data Range maximum must be >= minimum.")
+        solver = str(self.solver or "").strip()
+        if solver not in {"BDF", "Radau"}:
+            raise ValueError("Fit solver must be BDF or Radau.")
+        maximum = (
+            None
+            if self.maximum_observations_per_target in (None, 0)
+            else int(self.maximum_observations_per_target)
+        )
+        if maximum is not None and maximum < 2:
+            raise ValueError(
+                "Maximum observations per target must be All or at least 2."
+            )
         weight = _finite(self.weight, "dataset weight")
         if weight <= 0.0:
             raise ValueError("Dataset weight must be positive.")
-        validate_simulation_execution_settings(self.execution)
         targets = tuple(_required(item, "target series") for item in self.target_species)
         if len(targets) != len(set(targets)):
             raise ValueError("Fit target series must be unique.")
@@ -329,9 +341,11 @@ class FitDatasetLocalSettings:
                 "Observation target overrides must exactly match selected "
                 "Fit targets."
             )
-        object.__setattr__(self, "sample_t_min", low)
-        object.__setattr__(self, "sample_t_max", high)
-        object.__setattr__(self, "sample_points", points)
+        object.__setattr__(self, "t_start", t_start)
+        object.__setattr__(self, "solver", solver)
+        object.__setattr__(self, "data_range_min", low)
+        object.__setattr__(self, "data_range_max", high)
+        object.__setattr__(self, "maximum_observations_per_target", maximum)
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "target_species", targets)
         object.__setattr__(self, "target_weights", target_weights)
@@ -435,14 +449,7 @@ class FitOriginSnapshot:
                         "set_id": item.set_id,
                         "initial_values": dict(item.initial_values),
                         "included_at_launch": item.included_at_launch,
-                        "execution": {
-                            "solver": item.execution.solver,
-                            "t_start": item.execution.t_start,
-                            "t_end": item.execution.t_end,
-                            "integration_points": (
-                                item.execution.integration_points
-                            ),
-                        },
+                        "resolved_t_start": item.resolved_t_start,
                         "observations": [
                             {
                                 "raw_observation_id": obs.raw_observation_id,
@@ -843,24 +850,25 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
         FitDatasetLocalSettings(
             dataset_id=mapped.dataset_id,
             included=mapped.included_at_launch,
-            sample_t_min=min(
+            t_start=mapped.resolved_t_start,
+            solver="BDF",
+            data_range_min=min(
                 (
                     value
                     for observation in mapped.observations
                     for value in observation.t
                 ),
-                default=mapped.execution.t_start,
+                default=mapped.resolved_t_start,
             ),
-            sample_t_max=max(
+            data_range_max=max(
                 (
                     value
                     for observation in mapped.observations
                     for value in observation.t
                 ),
-                default=mapped.execution.t_end,
+                default=mapped.resolved_t_start,
             ),
-            sample_points=None,
-            execution=mapped.execution,
+            maximum_observations_per_target=None,
             weight=1.0,
             target_species=tuple(
                 observation.model_species
@@ -880,11 +888,6 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
         )
         for mapped in origin.mapped_datasets
     )
-    included_set_ids = {
-        mapped.set_id
-        for mapped in origin.mapped_datasets
-        if mapped.included_at_launch
-    }
     values_by_key: dict[tuple[str, str], float] = {}
     for mapped in origin.mapped_datasets:
         for species, value in mapped.initial_values:
@@ -896,16 +899,6 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
                     "with conflicting values."
                 )
             values_by_key[key] = value
-    scope_by_species: dict[str, str] = {}
-    for species in {species for _set_id, species in values_by_key}:
-        active_values = {
-            value
-            for (set_id, row_species), value in values_by_key.items()
-            if row_species == species and set_id in included_set_ids
-        }
-        scope_by_species[species] = (
-            "global" if active_values and len(active_values) == 1 else "local"
-        )
     initials = tuple(
         FitInitialVariable(
             set_id=set_id,
@@ -915,7 +908,7 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
             maximum=_initial_bounds(value)[1],
             fit=False,
             log10=False,
-            scope=scope_by_species[species],
+            scope="local",
         )
         for (set_id, species), value in values_by_key.items()
     )
@@ -964,7 +957,7 @@ def fit_origin_science_matches(
             item.set_id,
             item.initial_values,
             item.included_at_launch,
-            item.execution,
+            item.resolved_t_start,
             tuple(
                 (
                     observation.raw_observation_id,
@@ -995,7 +988,7 @@ def capture_fit_origin(document: ProjectDocument, tab_id: str) -> FitOriginSnaps
     tab = document.tab(tab_id)
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
         raise ValueError("Fit requires an accepted visible mechanism.")
-    mechanism_species = projected_species_names(tab)
+    mechanism_species = canonical_species_names(tab)
     mapped: list[FitMappedDatasetSnapshot] = []
     for dataset_id, link in tab.dataset_links:
         if link.set_id is None:
@@ -1048,13 +1041,13 @@ def capture_fit_origin(document: ProjectDocument, tab_id: str) -> FitOriginSnaps
                 display_name=dataset.display_name,
                 set_id=initial_set.set_id,
                 set_name=initial_set.name,
-                initial_values=projected_initial_values(tab, initial_set.set_id),
+                initial_values=canonical_initial_values(tab, initial_set.set_id),
                 observations=tuple(observations),
                 included_at_launch=bool(link.include_in_fit),
-                execution=(
-                    validated.execution
+                resolved_t_start=(
+                    validated.execution.t_start
                     if validated is not None
-                    else tab.resolved_execution_settings(initial_set.set_id)
+                    else tab.resolved_execution_settings(initial_set.set_id).t_start
                 ),
             )
         )
@@ -1074,60 +1067,93 @@ def selected_observations(
     mapped: FitMappedDatasetSnapshot,
     local: FitDatasetLocalSettings,
 ) -> tuple[FitSelectedObservation, ...]:
-    """Materialize only selected existing rows for one dataset."""
+    """Materialize the retained observation projection for one dataset."""
     target_by_raw_id = {
         raw_id: model_target
         for raw_id, model_target in local.observation_targets
     }
     wanted = set(local.target_species)
-    selected: list[FitSelectedObservation] = []
-    seen_targets: set[str] = set()
+    observations_by_target: dict[str, FitObservationSnapshot] = {}
     for observation in mapped.observations:
-        if observation.raw_observation_id not in target_by_raw_id:
+        target = target_by_raw_id.get(observation.raw_observation_id)
+        if target is None or target not in wanted:
             continue
-        target = target_by_raw_id[observation.raw_observation_id]
-        if target not in wanted:
-            continue
-        if target in seen_targets:
+        if target in observations_by_target:
             raise ValueError(
-                f"Dataset {mapped.display_name!r} maps multiple selected columns "
-                f"to target {target!r}."
+                f"Dataset {mapped.display_name!r} maps multiple selected "
+                f"columns to target {target!r}."
             )
-        indices = compute_sampled_indices(
-            t=np.asarray(observation.t, dtype=float),
-            t_min=local.sample_t_min,
-            t_max=local.sample_t_max,
-            n_points=local.sample_points,
+        observations_by_target[target] = observation
+    missing = wanted - set(observations_by_target)
+    if missing:
+        raise ValueError(
+            f"Dataset {mapped.display_name!r} has no selected observation "
+            f"rows for: {', '.join(sorted(missing))}."
         )
-        times = tuple(float(observation.t[index]) for index in indices)
-        values = tuple(float(observation.y[index]) for index in indices)
-        if any(
-            time < local.execution.t_start or time > local.execution.t_end
-            for time in times
-        ):
+
+    x_rows: set[int] | None = None
+    if local.parametric is not None:
+        x_observations = tuple(
+            observation
+            for observation in mapped.observations
+            if observation.model_species == local.parametric.x_name
+        )
+        if len(x_observations) != 1:
             raise ValueError(
-                f"Dataset {mapped.display_name!r} has selected observation times "
-                f"outside [{local.execution.t_start:g}, {local.execution.t_end:g}]."
+                f"Dataset {mapped.display_name!r} Parametric-X series "
+                f"{local.parametric.x_name!r} must map to exactly one "
+                "observation."
+            )
+        x_rows = set(x_observations[0].source_rows)
+
+    selected: list[FitSelectedObservation] = []
+    for target in local.target_species:
+        observation = observations_by_target[target]
+        usable = tuple(
+            index
+            for index, (time_value, source_row) in enumerate(
+                zip(observation.t, observation.source_rows)
+            )
+            if (
+                time_value >= local.t_start
+                and local.data_range_min <= time_value <= local.data_range_max
+                and (x_rows is None or source_row in x_rows)
+            )
+        )
+        if not usable:
+            pairing = (
+                " and Parametric-X physical-row pairing"
+                if x_rows is not None
+                else ""
+            )
+            raise ValueError(
+                f"Dataset {mapped.display_name!r} target {target!r} has "
+                "zero usable observations after Data Range, Simulation "
+                f"start{pairing}."
+            )
+        maximum = local.maximum_observations_per_target
+        indices = usable
+        if maximum is not None:
+            indices = tuple(
+                usable[index]
+                for index in compute_sampled_indices(
+                    t=np.asarray([observation.t[index] for index in usable]),
+                    t_min=-math.inf,
+                    t_max=math.inf,
+                    n_points=maximum,
+                )
             )
         selected.append(
             FitSelectedObservation(
                 raw_observation_id=observation.raw_observation_id,
                 raw_column=observation.raw_column,
                 model_species=target,
-                t=times,
-                y=values,
+                t=tuple(float(observation.t[index]) for index in indices),
+                y=tuple(float(observation.y[index]) for index in indices),
                 source_rows=tuple(
-                    int(observation.source_rows[index])
-                    for index in indices
+                    int(observation.source_rows[index]) for index in indices
                 ),
             )
-        )
-        seen_targets.add(target)
-    missing = wanted - seen_targets
-    if missing:
-        raise ValueError(
-            f"Dataset {mapped.display_name!r} has no selected observation rows "
-            f"for: {', '.join(sorted(missing))}."
         )
     return tuple(selected)
 
@@ -1144,7 +1170,7 @@ def revalidate_fit_request_inclusions(
     if not isinstance(request, FitExecutionRequest):
         raise TypeError("request must be FitExecutionRequest.")
     tab = document.tab(request.origin.tab_id)
-    species = projected_species_names(tab)
+    species = canonical_species_names(tab)
     mapped_by_id = {
         item.dataset_id: item for item in request.origin.mapped_datasets
     }
@@ -1315,6 +1341,12 @@ def build_fit_execution_request(
                 raise ValueError(
                     f"Dataset {mapped_by_id[local.dataset_id].display_name!r} "
                     "has no selected observations."
+                )
+            if local.data_range_max <= local.t_start:
+                raise ValueError(
+                    f"Dataset {mapped_by_id[local.dataset_id].display_name!r} "
+                    "Fit interval requires Data Range maximum to be greater "
+                    "than Simulation start."
                 )
     if not any(item.fit for item in request.parameters) and not any(
         item.fit

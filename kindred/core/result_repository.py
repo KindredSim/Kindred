@@ -20,8 +20,11 @@ from kindred.core.intervention_schedule_compiler import InterventionExecutionCon
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
+    MechanismTabDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
+    canonical_analysis_identity,
+    canonical_initial_values,
     validate_simulation_execution_settings,
     validate_tab_scientific_settings,
 )
@@ -29,7 +32,10 @@ from kindred.core.project_document import (
 __all__ = [
     "ExplicitResultEntry",
     "ExplicitResultKey",
+    "explicit_result_key_for_tab",
+    "explicit_result_key_from_values",
     "PreviewResultIdentity",
+    "preview_result_identity_for_tab",
     "PreviewResultEntry",
     "PreviewResultKey",
     "ResultEntry",
@@ -269,6 +275,90 @@ def scientific_identity(prepared_dsl: object) -> str:
     )
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return f"science:{digest}"
+
+
+def explicit_result_key_from_values(
+    *,
+    tab_id: str,
+    set_id: str,
+    mechanism_source: MechanismAuthoringSource,
+    prepared_dsl: object,
+    analysis_identity: str,
+    initial_values: Iterable[tuple[str, float]],
+    execution_settings: SimulationExecutionSettings,
+    scientific_settings: TabScientificSettings,
+) -> "ExplicitResultKey":
+    """Construct one explicit key from one retained typed source identity."""
+
+    return ExplicitResultKey(
+        tab_id=tab_id,
+        set_id=set_id,
+        mechanism_source=mechanism_source,
+        analysis_identity=analysis_identity,
+        standard_concentration_identity=standard_concentration_identity(
+            prepared_dsl
+        ),
+        scientific_identity=scientific_identity(prepared_dsl),
+        initial_values=tuple(initial_values),
+        execution_settings=execution_settings,
+        scientific_settings=scientific_settings,
+    )
+
+
+def explicit_result_key_for_tab(
+    tab: MechanismTabDocument,
+    set_id: str,
+) -> "ExplicitResultKey":
+    """Construct the canonical key for one accepted document tab/set."""
+
+    if not isinstance(tab, MechanismTabDocument):
+        raise TypeError("tab must be a MechanismTabDocument.")
+    prepared_dsl = tab.prepared_dsl
+    if prepared_dsl is None:
+        raise ValueError(f"Mechanism tab {tab.tab_id!r} has no accepted DSL.")
+    return explicit_result_key_from_values(
+        tab_id=tab.tab_id,
+        set_id=set_id,
+        mechanism_source=tab.mechanism_source,
+        prepared_dsl=prepared_dsl,
+        analysis_identity=canonical_analysis_identity(tab),
+        initial_values=canonical_initial_values(tab, set_id),
+        execution_settings=tab.resolved_execution_settings(set_id),
+        scientific_settings=tab.scientific_settings,
+    )
+
+
+def preview_result_identity_for_tab(
+    tab: MechanismTabDocument,
+    set_id: str,
+    *,
+    parameter_values: Iterable[tuple[str, float]],
+    initial_values: Iterable[tuple[str, float]] | None = None,
+) -> "PreviewResultIdentity":
+    """Construct Preview identity from the same accepted tab projection."""
+
+    if not isinstance(tab, MechanismTabDocument):
+        raise TypeError("tab must be a MechanismTabDocument.")
+    prepared_dsl = tab.prepared_dsl
+    if prepared_dsl is None:
+        raise ValueError(f"Mechanism tab {tab.tab_id!r} has no accepted DSL.")
+    return PreviewResultIdentity(
+        tab_id=tab.tab_id,
+        set_id=set_id,
+        mechanism_source=tab.mechanism_source,
+        analysis_identity=canonical_analysis_identity(tab),
+        standard_concentration_identity=standard_concentration_identity(
+            prepared_dsl
+        ),
+        parameter_values=tuple(parameter_values),
+        initial_values=(
+            canonical_initial_values(tab, set_id)
+            if initial_values is None
+            else tuple(initial_values)
+        ),
+        execution_settings=tab.resolved_execution_settings(set_id),
+        scientific_settings=tab.scientific_settings,
+    )
 
 
 def _finite_pairs(

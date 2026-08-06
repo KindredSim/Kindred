@@ -129,6 +129,7 @@ class AuthoringDiscardMode(Enum):
 @dataclass(frozen=True, slots=True)
 class _DispositionResult:
     content_token: ProjectContentToken
+    clean_idle: bool = False
     saved: bool = False
     discard_all_authoring: bool = False
     discard_slider_drafts: bool = False
@@ -321,7 +322,10 @@ class ProjectController(QtCore.QObject):
             application_close=bool(application_close),
         )
         if not request.archive_dirty and not request.transient.has_any:
-            return _DispositionResult(content_token=expected_token)
+            return _DispositionResult(
+                content_token=expected_token,
+                clean_idle=True,
+            )
         choice = self._prompt_disposition(request)
         if not self._content_token_is_current(
             expected_token,
@@ -1029,6 +1033,8 @@ class ProjectController(QtCore.QObject):
     def request_close(self) -> bool:
         """Start application Close once; subsequent requests only advance it."""
 
+        if self._close_authorization is not None:
+            return True
         if self._close_started:
             self.notify_close_progress()
             return self._close_authorization is not None
@@ -1047,6 +1053,10 @@ class ProjectController(QtCore.QObject):
         ):
             return False
         self._apply_discard(disposition)
+        if disposition.clean_idle:
+            self._close_authorization = "native"
+            self.nativeCloseAuthorized.emit()
+            return True
         self._close_started = True
         self._close_pending = True
         self._close_deadline = (

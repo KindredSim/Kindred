@@ -13,11 +13,11 @@ __all__ = ["RightPanelTabbed"]
 
 class RightPanelTabbed(QtWidgets.QWidget):
     """
-    Right panel with the fixed Data and Overlays tabs.
+    Right panel with the fixed Data and Plot Overlays tabs.
 
     Contains exactly two tabs:
     - Data: DataManagerPanel for loading CSV files
-    - Overlays: DatasetOverlayPanel for experimental plot membership
+    - Plot Overlays: DatasetOverlayPanel for experimental plot membership
     """
 
     def __init__(
@@ -54,4 +54,9 @@ class RightPanelTabbed(QtWidgets.QWidget):
         self._tabs.addTab(self._data_manager, "Data")
         self._overlay_panel = overlay_panel
         self._overlay_panel.setObjectName("datasetOverlayPanel")
-        self._tabs.addTab(self._overlay_panel, "Overlays")
+        self._tabs.addTab(self._overlay_panel, "Plot Overlays")
+
+    def select_plot_overlays_page(self) -> None:
+        """Show the existing Plot Overlays page without changing its state."""
+
+        self._tabs.setCurrentWidget(self._overlay_panel)

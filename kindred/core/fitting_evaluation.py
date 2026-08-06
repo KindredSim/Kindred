@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
@@ -53,8 +53,8 @@ from kindred.core.simulation_preparation import (
     SimulationPreparationError,
 )
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulation_result_finalization import finalize_simulation_result
-from kindred.core.simulation_series_payload import SimulationSeriesPayload
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, solve_ode
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
@@ -67,7 +67,6 @@ __all__ = [
     "FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR",
     "FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET",
     "FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED",
-    "FittingSeriesEvaluation",
     "PreparedFittingExecutionContext",
     "SerialFittingEvaluator",
     "evaluate_fitting_series",
@@ -167,75 +166,7 @@ class FittingSeriesEvaluator(Protocol):
         origins: Optional[Mapping[str, str]] = None,
         *,
         failed_params: Optional[Dict[str, float]] = None,
-    ) -> "FittingSeriesEvaluation": ...
-
-
-@dataclass(frozen=True, slots=True)
-class FittingSeriesEvaluation:
-    """Simulation series plus the exact Run-owned intervention execution."""
-
-    series: SimulationSeriesPayload
-    segment_ids: np.ndarray
-    segment_keys: tuple[str, ...]
-    discontinuity_ids: np.ndarray
-    intervention_execution: InterventionExecutionContract
-    solver_provenance: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.series, SimulationSeriesPayload):
-            raise TypeError(
-                "Fit series must be the final SimulationSeriesPayload type."
-            )
-        if not isinstance(
-            self.intervention_execution, InterventionExecutionContract
-        ):
-            raise TypeError(
-                "Fit intervention execution must be an "
-                "InterventionExecutionContract."
-            )
-        if not isinstance(self.solver_provenance, Mapping):
-            raise TypeError("Fit solver provenance must be a mapping.")
-        segment_ids = np.asarray(self.segment_ids, dtype=np.int64).reshape(-1).copy()
-        times = np.asarray(self.series.t, dtype=float).reshape(-1)
-        if segment_ids.size != times.size:
-            raise ValueError("Fit segment identity must align with simulation time.")
-        if (
-            np.any(segment_ids < 0)
-            or np.any(np.diff(segment_ids) < 0)
-        ):
-            raise ValueError(
-                "Fit segment identity must be ordered and nonnegative."
-            )
-        if np.any(np.diff(times) <= 0.0):
-            raise ValueError("Fit simulation time must be strictly increasing.")
-        segment_keys = tuple(str(value or "").strip() for value in self.segment_keys)
-        if (
-            len(segment_keys) != times.size
-            or any(not value for value in segment_keys)
-        ):
-            raise ValueError(
-                "Fit segment keys must align with simulation time and be nonblank."
-            )
-        discontinuity_ids = np.asarray(
-            self.discontinuity_ids,
-            dtype=np.int64,
-        ).reshape(-1).copy()
-        if (
-            discontinuity_ids.size != times.size
-            or np.any(discontinuity_ids < 0)
-            or np.any(np.diff(discontinuity_ids) < 0)
-        ):
-            raise ValueError("Fit discontinuity identity must align with simulation time.")
-        segment_ids.setflags(write=False)
-        discontinuity_ids.setflags(write=False)
-        object.__setattr__(self, "segment_ids", segment_ids)
-        object.__setattr__(self, "segment_keys", segment_keys)
-        object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
-        object.__setattr__(
-            self,
-            "solver_provenance",
-            copy.deepcopy(dict(self.solver_provenance)),
-        )
+    ) -> SimulationResultValue: ...
 
 
 def evaluate_fitting_series(
@@ -244,7 +175,7 @@ def evaluate_fitting_series(
     *,
     origins: Optional[Mapping[str, str]] = None,
     failed_params: Optional[Dict[str, float]] = None,
-) -> FittingSeriesEvaluation:
+) -> SimulationResultValue:
     if not callable(
         getattr(evaluator, "evaluate_series_with_parameter_origins", None)
     ):
@@ -257,14 +188,8 @@ def evaluate_fitting_series(
         dict(origins or {}),
         failed_params=failed_params,
     )
-    if (
-        not isinstance(value, FittingSeriesEvaluation)
-        or not isinstance(value.series, SimulationSeriesPayload)
-    ):
-        raise TypeError(
-            "Fit evaluator must return FittingSeriesEvaluation with a "
-            "SimulationSeriesPayload and segment identity."
-        )
+    if not isinstance(value, SimulationResultValue):
+        raise TypeError("Fit evaluator must return a SimulationResultValue.")
     return value
 
 
@@ -302,6 +227,8 @@ class PreparedFittingExecutionContext:
     temperature_K: float
     initial_prefix: str
     requested_sample_times: tuple[float, ...]
+    fit_sampling_policy: str = "fit_internal_regular_grid"
+    fit_sampling_identity: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         plan = _coerce_fitting_simulation_plan(self.simulation_plan)
@@ -342,6 +269,16 @@ class PreparedFittingExecutionContext:
                 "increasing, and inside the execution span."
             )
         object.__setattr__(self, "requested_sample_times", sample_times)
+        object.__setattr__(
+            self,
+            "fit_sampling_policy",
+            str(self.fit_sampling_policy or "fit_internal_regular_grid"),
+        )
+        object.__setattr__(
+            self,
+            "fit_sampling_identity",
+            dict(self.fit_sampling_identity or {}),
+        )
 
     def clone(
         self,
@@ -355,6 +292,8 @@ class PreparedFittingExecutionContext:
             temperature_K=float(self.temperature_K),
             initial_prefix=str(self.initial_prefix),
             requested_sample_times=self.requested_sample_times,
+            fit_sampling_policy=self.fit_sampling_policy,
+            fit_sampling_identity=dict(self.fit_sampling_identity),
         )
 
 
@@ -372,6 +311,8 @@ def prepare_fitting_execution_context(
     use_sparse_jacobian: bool = USE_SPARSE_JACOBIAN_DEFAULT,
     wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
     initial_prefix: str = "init:",
+    fit_sampling_policy: str = "fit_internal_regular_grid",
+    fit_sampling_identity: Mapping[str, object] | None = None,
 ) -> PreparedFittingExecutionContext:
     """Prepare structured execution data for serial fitting evaluation."""
 
@@ -519,6 +460,8 @@ def prepare_fitting_execution_context(
         temperature_K=float(temperature_K),
         initial_prefix=str(initial_prefix),
         requested_sample_times=requested_sample_times,
+        fit_sampling_policy=str(fit_sampling_policy or "fit_internal_regular_grid"),
+        fit_sampling_identity=dict(fit_sampling_identity or {}),
     )
 
 
@@ -614,10 +557,10 @@ class SerialFittingEvaluator:
                     details={"fatal": True, "stage": "parameter_binding"},
                 )
 
-    def __call__(self, params: Dict[str, float]) -> FittingSeriesEvaluation:
+    def __call__(self, params: Dict[str, float]) -> SimulationResultValue:
         return self.evaluate_series(params)
 
-    def evaluate_series(self, params: Mapping[str, float]) -> FittingSeriesEvaluation:
+    def evaluate_series(self, params: Mapping[str, float]) -> SimulationResultValue:
         configured_origins = {
             str(name): FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
             for name in dict(params or {})
@@ -635,7 +578,7 @@ class SerialFittingEvaluator:
         origins: Optional[Mapping[str, str]] = None,
         *,
         failed_params: Optional[Dict[str, float]] = None,
-    ) -> FittingSeriesEvaluation:
+    ) -> SimulationResultValue:
         self._raise_if_cancel_requested()
         self._ensure_prepared()
         # Every candidate starts from the retained immutable execution request.
@@ -891,10 +834,24 @@ class SerialFittingEvaluator:
                 f"Fitting result finalization failed: {exc}",
                 details={"fatal": True, "stage": "result_finalization"},
             ) from exc
-        series = SimulationSeriesPayload(
-            t=admitted.t,
-            species=dict(admitted.series),
-            algebra_scalars=dict(admitted.scalars),
+        final_solver_provenance = dict(admitted.provenance.solver)
+        final_solver_provenance.update(
+            {
+                "fit_sampling_policy": self._context.fit_sampling_policy,
+                "fit_sampling_identity": dict(
+                    self._context.fit_sampling_identity
+                ),
+                "fit_final_sampling_times": tuple(
+                    float(value) for value in np.asarray(admitted.t, dtype=float)
+                ),
+            }
+        )
+        admitted = replace(
+            admitted,
+            provenance=replace(
+                admitted.provenance,
+                solver=final_solver_provenance,
+            ),
         )
         segment_ids = np.asarray(admitted.segment_ids, dtype=np.int64)
         segment_keys = tuple(admitted.segment_keys)
@@ -954,14 +911,7 @@ class SerialFittingEvaluator:
                     },
                 )
         self._raise_if_cancel_requested()
-        return FittingSeriesEvaluation(
-            series=series,
-            segment_ids=segment_ids,
-            segment_keys=segment_keys,
-            discontinuity_ids=discontinuity_ids,
-            intervention_execution=result_execution,
-            solver_provenance=admitted.provenance.solver,
-        )
+        return admitted
 
     def _ensure_prepared(self) -> None:
         """Prepare the evaluator's simulation state exactly once for the current owner.

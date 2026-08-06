@@ -1,4 +1,4 @@
-"""Strict codec for the sole current ``kindred-kin-3`` archive."""
+"""Strict codec for the sole current ``kindred-kin-4`` archive."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ __all__ = [
     "KinArchiveStore",
 ]
 
-CURRENT_PROJECT_FORMAT = "kindred-kin-3"
+CURRENT_PROJECT_FORMAT = "kindred-kin-4"
 _PROJECT_MEMBER = "project.json"
 _SOURCE_MEMBER_PREFIX = "sources/"
 _MAX_ARCHIVE_MEMBERS = 257
@@ -760,7 +760,6 @@ def _encode_presentation(
             for selection in state.selected_y_series
         ],
         "selected_y_uses_default_all": state.selected_y_uses_default_all,
-        "parametric_mode": state.parametric_mode,
         "reference_lines_visible": state.reference_lines_visible,
         "intervention_annotations_visible": (
             state.intervention_annotations_visible
@@ -856,7 +855,6 @@ def _decode_presentation(
             "selected_x_series",
             "selected_y_series",
             "selected_y_uses_default_all",
-            "parametric_mode",
             "reference_lines_visible",
             "intervention_annotations_visible",
             "log_x",
@@ -955,10 +953,6 @@ def _decode_presentation(
         selected_y_uses_default_all=_boolean(
             data["selected_y_uses_default_all"],
             f"{label}.selected_y_uses_default_all",
-        ),
-        parametric_mode=_boolean(
-            data["parametric_mode"],
-            f"{label}.parametric_mode",
         ),
         reference_lines_visible=_boolean(
             data["reference_lines_visible"],

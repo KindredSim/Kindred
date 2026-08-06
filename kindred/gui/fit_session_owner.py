@@ -18,6 +18,7 @@ from kindred.core.project_document import (
     FitDefaults,
     InitialConditionSet,
     MechanismTabDocument,
+    canonical_species_names,
 )
 from kindred.core.project_session import ProjectSession
 from kindred.core.simulator.dsl_parse import (
@@ -56,9 +57,6 @@ from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.widgets.mechanism_editor import (
     DetailedBalanceCorrectionOutcome,
     DetailedBalanceCorrectionRequest,
-)
-from kindred.gui.widgets.batch_initial_conditions_table import (
-    projected_species_names,
 )
 from kindred.gui.workspace_tab_registry import WorkspaceTabRegistry
 
@@ -198,7 +196,7 @@ class FitSessionOwner(QtCore.QObject):
         try:
             origin = capture_fit_origin(self._session.document, requested_id)
             modeled_species = tuple(
-                projected_species_names(
+                canonical_species_names(
                     self._session.document.tab(requested_id)
                 )
             )
@@ -1196,8 +1194,7 @@ class FitSessionOwner(QtCore.QObject):
             self._set_status("There is no completed Fit candidate to Apply.")
             return False
         selected = frozenset(str(item) for item in self._scope_items(scopes))
-        available = self._candidate_available_scopes
-        if not selected or not selected.issubset(available):
+        if not selected:
             self._set_status("Apply contains an unavailable or empty scope selection.")
             return False
         if not self._origin_is_current():
@@ -1205,6 +1202,26 @@ class FitSessionOwner(QtCore.QObject):
             return False
         origin = self._origin
         if origin is None:
+            return False
+        (
+            self._candidate_available_scopes,
+            self._candidate_unavailable_reasons,
+        ) = self._candidate_apply_feasibility(candidate)
+        window.update_candidate_apply_feasibility(
+            self._candidate_available_scopes,
+            self._candidate_unavailable_reasons,
+        )
+        available = self._candidate_available_scopes
+        if not selected.issubset(available):
+            unavailable_selected = sorted(selected.difference(available))
+            reason = "; ".join(
+                self._candidate_unavailable_reasons.get(scope, "")
+                for scope in unavailable_selected
+            )
+            self._set_status(
+                "Apply rejected: "
+                + (reason or "the selected Apply scope is unavailable.")
+            )
             return False
         if window.has_pending_target_changes:
             self._set_status(
@@ -1927,10 +1944,10 @@ class FitSessionOwner(QtCore.QObject):
         datasets = tuple(
             replace(
                 prior,
-                execution=(
-                    fresh.execution
-                    if "simulation_setup" in canonicalized_scopes
-                    else prior.execution
+                t_start=(
+                    fresh.t_start
+                    if "initial_concentrations" in canonicalized_scopes
+                    else prior.t_start
                 ),
             )
             if (prior := prior_datasets.get(fresh.dataset_id)) is not None
@@ -2054,10 +2071,10 @@ class FitSessionOwner(QtCore.QObject):
                 if "initial_concentrations" in scopes
                 else candidate.initial_values_by_set
             ),
-            execution_by_set=(
+            start_by_set=(
                 ()
-                if "simulation_setup" in scopes
-                else candidate.execution_by_set
+                if "initial_concentrations" in scopes
+                else candidate.start_by_set
             ),
             local_observables=(
                 ()
@@ -2070,20 +2087,19 @@ class FitSessionOwner(QtCore.QObject):
             if (
                 remaining.parameters
                 or remaining.initial_values_by_set
-                or remaining.execution_by_set
+                or remaining.start_by_set
                 or remaining.local_observables
             )
             else None
         )
 
-    @classmethod
     def _candidate_apply_feasibility(
-        cls,
+        self,
         candidate: FitCandidate,
     ) -> tuple[frozenset[str], dict[str, str]]:
         """Decide terminal Apply feasibility once in the sole Fit owner."""
 
-        local_scalar_names = cls._candidate_local_scalar_names(candidate)
+        local_scalar_names = self._candidate_local_scalar_names(candidate)
         available: set[str] = set()
         unavailable: dict[str, str] = {}
         if any(
@@ -2096,23 +2112,47 @@ class FitSessionOwner(QtCore.QObject):
                 "Parameters Apply is unavailable because the candidate "
                 "contains no fitted project parameters."
             )
-        if candidate.initial_values_by_set:
-            available.add("initial_concentrations")
+        mapped_by_set = {
+            item.set_id: item
+            for item in (self._origin.mapped_datasets if self._origin else ())
+        }
+        start_deltas: list[tuple[str, float, float]] = []
+        for set_id, proposed in candidate.start_by_set:
+            mapped = mapped_by_set.get(set_id)
+            if mapped is None:
+                unavailable["initial_concentrations"] = (
+                    f"Initial Conditions Apply is unavailable: mapped set "
+                    f"{set_id!r} is no longer present."
+                )
+                break
+            current = self._session.document.tab(
+                candidate.origin_tab_id
+            ).resolved_execution_settings(set_id)
+            if not math.isfinite(float(proposed)) or proposed >= current.t_end:
+                unavailable["initial_concentrations"] = (
+                    "Initial Conditions Apply is unavailable because mapped "
+                    f"set {mapped.set_name!r} proposes start {proposed:g}, "
+                    f"which is not before the current Run end "
+                    f"{current.t_end:g}; Fit remains valid and Apply never "
+                    "writes the Run end."
+                )
+                break
+            if float(proposed) != float(current.t_start):
+                start_deltas.append(
+                    (set_id, float(proposed), float(current.t_start))
+                )
         else:
-            unavailable["initial_concentrations"] = (
-                "Initial Concentrations Apply is unavailable because the "
-                "candidate contains no fitted initial-concentration results."
-            )
-        if candidate.execution_by_set:
-            available.add("simulation_setup")
-        else:
-            unavailable["simulation_setup"] = (
-                "Simulation Setup Apply is unavailable because the candidate "
-                "contains no execution-setup results."
-            )
+            if candidate.initial_values_by_set or start_deltas:
+                available.add("initial_concentrations")
+            else:
+                unavailable["initial_concentrations"] = (
+                    "Initial Conditions Apply is unavailable because the "
+                    "candidate contains no fitted initial values and no "
+                    "changed Fit-local start."
+                )
         if candidate.local_observables:
             try:
-                cls._validate_terminal_observable_definitions(candidate)
+                self._validate_terminal_observable_definitions(candidate)
             except ValueError as exc:
                 unavailable["observable_definitions"] = (
                     "Observable Definitions Apply is unavailable because "
@@ -2450,14 +2490,22 @@ class FitSessionOwner(QtCore.QObject):
                     initial_set.with_values(merged)
                 )
             next_tab = next_tab.with_initial_condition_sets(updated)
-        if "simulation_setup" in scopes:
-            for set_id, execution in candidate.execution_by_set:
-                if (
-                    set_id not in dict(next_tab.run_overrides_by_set_id)
-                    and execution == next_tab.resolved_execution_settings(set_id)
-                ):
+        if "initial_concentrations" in scopes:
+            for set_id, proposed_start in candidate.start_by_set:
+                current = next_tab.resolved_execution_settings(set_id)
+                if float(proposed_start) == float(current.t_start):
                     continue
-                next_tab = next_tab.with_run_override(set_id, execution)
+                if float(proposed_start) >= float(current.t_end):
+                    raise ValueError(
+                        "Initial Conditions Apply cannot write a Fit start "
+                        f"{proposed_start:g} at mapped set {set_id!r}: it "
+                        f"must remain before the current Run end "
+                        f"{current.t_end:g}; Run end is never written by Fit."
+                    )
+                next_tab = next_tab.with_run_override(
+                    set_id,
+                    replace(current, t_start=float(proposed_start)),
+                )
         return next_tab
 
     def _set_status(self, text: str) -> None:

@@ -10,26 +10,25 @@ from typing import Callable
 from PySide6 import QtCore
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
-from kindred.core.project_document import MechanismTabDocument
+from kindred.core.project_document import (
+    MechanismSourceReconciliation,
+    MechanismTabDocument,
+    canonical_initial_values,
+    canonical_species_names,
+)
 from kindred.core.result_repository import (
     ExplicitResultKey,
     PreviewResultIdentity,
     PreviewResultKey,
-    scientific_identity,
-    standard_concentration_identity,
+    explicit_result_key_for_tab,
+    preview_result_identity_for_tab,
 )
 from kindred.core.simulator.dsl_parse import (
     DslParameterCoordinateUpdate,
     PreparedDslRequestSet,
     derive_prepared_dsl_with_parameter_updates,
-    prepare_dsl_request_set,
 )
-from kindred.core.simulator.errors import DSLError
-from kindred.core.units import UnitsModel
-from kindred.core.simulator.wegscheider_symbolic import (
-    UnresolvedWegscheiderCyclicityError,
-    WegscheiderCyclicityReport,
-)
+from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
 from kindred.gui.parameter_enumeration import (
     GuiParameterCoordinate,
     enumerate_parameter_coordinates,
@@ -37,9 +36,6 @@ from kindred.gui.parameter_enumeration import (
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
     BatchInitialConditionsTableView,
-    projected_analysis_identity,
-    projected_initial_values,
-    projected_species_names,
     resolve_live_slider_target_set_ids,
 )
 from kindred.gui.widgets.mechanism_editor import (
@@ -168,7 +164,7 @@ class TabSliderBinding(QtCore.QObject):
         species_sliders,
         slider_workspace_owner: MechanismEditorTabbed,
         simulation_jobs,
-        preview_preflight: Callable[[tuple[str, ...]], bool] | None = None,
+        preview_preflight: Callable[[tuple[str, ...]], object] | None = None,
         parameter_preview_debounce_ms: int = 80,
         equilibrium_preview_debounce_ms: int = 150,
         parent: QtCore.QObject | None = None,
@@ -381,12 +377,21 @@ class TabSliderBinding(QtCore.QObject):
             )
         except (TypeError, ValueError) as exc:
             self.errorRaised.emit(
-                "Slider projection failed; the previous coherent Slider "
-                f"view was kept: {exc}"
+                "Slider projection failed; stale controls were cleared while "
+                f"draft and semantic state were retained: {exc}"
             )
+            self.clear_projection()
             return False
-        self.apply_render_projection(prepared)
-        self.settle_render_projection(prepared)
+        try:
+            self.apply_render_projection(prepared)
+            self.settle_render_projection(prepared)
+        except Exception as exc:
+            self.errorRaised.emit(
+                "Slider render failed; stale controls were cleared while "
+                f"draft and semantic state were retained: {exc}"
+            )
+            self.clear_projection()
+            return False
         return True
 
     def clear_projection(self) -> None:
@@ -394,8 +399,8 @@ class TabSliderBinding(QtCore.QObject):
         variable_blocker = QtCore.QSignalBlocker(self._variable_sliders)
         species_blocker = QtCore.QSignalBlocker(self._species_sliders)
         try:
-            self._variable_sliders.clear()
-            self._species_sliders.clear()
+            self._variable_sliders.clear(preserve_visibility=True)
+            self._species_sliders.clear(preserve_visibility=True)
         finally:
             del species_blocker
             del variable_blocker
@@ -462,13 +467,13 @@ class TabSliderBinding(QtCore.QObject):
         tab: MechanismTabDocument,
         targets: tuple[str, ...],
     ) -> tuple[dict[str, float], frozenset[str]]:
-        species_names = tuple(projected_species_names(tab))
+        species_names = tuple(canonical_species_names(tab))
         if not targets:
             return ({name: 0.0 for name in species_names}, frozenset())
         runtime = self._registry.tab_runtime(tab.tab_id)
         target_values: list[dict[str, float]] = []
         for set_id in targets:
-            values = dict(projected_initial_values(tab, set_id))
+            values = dict(canonical_initial_values(tab, set_id))
             values.update(
                 runtime.slider_species_drafts_by_set_id.get(set_id, {})
             )
@@ -626,7 +631,7 @@ class TabSliderBinding(QtCore.QObject):
             return self._restore_rejected_slider_action()
         tab, projection = prepared
         species_name = str(species)
-        if species_name not in projected_species_names(tab):
+        if species_name not in canonical_species_names(tab):
             return self._reject_slider_action(
                 f"Species {species_name!r} is absent."
             )
@@ -671,53 +676,33 @@ class TabSliderBinding(QtCore.QObject):
         self,
         targets: tuple[str, ...],
     ) -> tuple[MechanismTabDocument, ParameterSliderProjection] | None:
-        """Settle visible science before any Slider draft/currentness mutation."""
+        """Use one canonical source result before any Slider mutation."""
 
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
         visible_source = runtime.reactions_draft or tab.mechanism_source
-        visible_projection: ParameterSliderProjection | None = None
-        visible_prepared: PreparedDslRequestSet | None = None
-        try:
-            visible_prepared = (
-                tab.prepared_dsl
-                if runtime.reactions_draft is None
-                else prepare_dsl_request_set(
-                    visible_source.reactions_text,
-                    initials={},
-                    units=UnitsModel(
-                        temperature_K=tab.scientific_settings.temperature
-                    ),
-                )
-            )
-            if visible_prepared is None:
-                raise ValueError("Preview requires nonempty Reactions.")
-            visible_projection = build_parameter_slider_projection(
-                visible_prepared,
-                wegscheider_cyclicity_enabled=(
-                    tab.scientific_settings.wegscheider_policy
-                ),
-            )
-        except UnresolvedWegscheiderCyclicityError as exc:
-            request = self._preview_detailed_balance_request(
-                tab,
-                exc,
-                reactions_text=visible_source.reactions_text,
-                source_energy_unit=(
-                    str(visible_prepared.analysis.structure.get("energy_unit", "kJ/mol"))
-                    if visible_prepared is not None
-                    else "kJ/mol"
-                ),
-            )
-            self._pending_detailed_balance_request = request
-            self.previewDetailedBalanceCorrectionRequired.emit(request)
-            return None
-        except (DSLError, TypeError, ValueError):
-            # The application settlement callback presents source diagnostics.
-            visible_projection = None
-
+        visible_prepared: PreparedDslRequestSet | None = tab.prepared_dsl
+        callback_result: object = True
         callback = self._preview_preflight
-        if callback is None:
+        if callback is not None:
+            callback_result = callback(targets)
+            if isinstance(callback_result, MechanismSourceReconciliation):
+                tab = self._registry.tab(self._tab_id)
+                visible_source = tab.mechanism_source
+                visible_prepared = callback_result.prepared_dsl
+                if callback_result.detailed_balance.requires_correction:
+                    request = self._preview_detailed_balance_request(
+                        tab,
+                        callback_result.detailed_balance.report,
+                        prepared_dsl=visible_prepared,
+                        reactions_text=visible_source.reactions_text,
+                    )
+                    self._pending_detailed_balance_request = request
+                    self.previewDetailedBalanceCorrectionRequired.emit(request)
+                    return None
+            elif not bool(callback_result):
+                return None
+        else:
             if runtime.reactions_draft is not None:
                 self.errorRaised.emit(
                     "Preview requires visible Reactions to be accepted first."
@@ -725,41 +710,19 @@ class TabSliderBinding(QtCore.QObject):
                 return None
             if not self._preview_inputs_valid(targets):
                 return None
-        elif not bool(callback(targets)):
-            return None
-
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
         try:
-            if tab.prepared_dsl is None:
+            if visible_prepared is None:
                 raise ValueError(
                     "Preview requires accepted Reactions with retained DSL analysis."
                 )
-            projection = (
-                visible_projection
-                if visible_prepared is tab.prepared_dsl
-                and visible_projection is not None
-                else build_parameter_slider_projection(
-                    tab.prepared_dsl,
-                    wegscheider_cyclicity_enabled=(
-                        tab.scientific_settings.wegscheider_policy
-                    ),
-                )
-            )
-        except UnresolvedWegscheiderCyclicityError as exc:
-            request = self._preview_detailed_balance_request(
-                tab,
-                exc,
-                reactions_text=tab.mechanism_source.reactions_text,
-                source_energy_unit=(
-                    str(tab.prepared_dsl.analysis.structure.get("energy_unit", "kJ/mol"))
-                    if tab.prepared_dsl is not None
-                    else "kJ/mol"
+            projection = build_parameter_slider_projection(
+                visible_prepared,
+                wegscheider_cyclicity_enabled=(
+                    tab.scientific_settings.wegscheider_policy
                 ),
             )
-            self._pending_detailed_balance_request = request
-            self.previewDetailedBalanceCorrectionRequired.emit(request)
-            return None
         except (TypeError, ValueError) as exc:
             self.errorRaised.emit(f"Preview parameter projection failed: {exc}")
             return None
@@ -849,12 +812,25 @@ class TabSliderBinding(QtCore.QObject):
     @staticmethod
     def _preview_detailed_balance_request(
         tab: MechanismTabDocument,
-        error: UnresolvedWegscheiderCyclicityError,
+        report: WegscheiderCyclicityReport,
         *,
+        prepared_dsl: PreparedDslRequestSet,
         reactions_text: str,
-        source_energy_unit: str,
     ) -> DetailedBalanceCorrectionRequest:
         source = str(reactions_text)
+        unresolved = report.unresolved_cycles
+        if not unresolved:
+            raise ValueError("Preview detailed-balance admission is already resolved.")
+        issue = "Unresolved detailed-balance cycle"
+        if len(unresolved) != 1:
+            issue += "s"
+        issue += ": " + "; ".join(
+            f"{cycle.cycle_id} ({', '.join(cycle.parameter_names)})"
+            for cycle in unresolved
+        )
+        source_energy_unit = str(
+            prepared_dsl.analysis.structure.get("energy_unit", "kJ/mol")
+        )
         identity = hashlib.sha256(
             (
                 f"Preview\0{tab.tab_id}\0"
@@ -866,9 +842,9 @@ class TabSliderBinding(QtCore.QObject):
             origin="Preview",
             tab_id=tab.tab_id,
             source=source,
-            issue=str(error),
+            issue=issue,
             temperature_K=float(tab.scientific_settings.temperature),
-            report=WegscheiderCyclicityReport(cycles=tuple(error.cycles)),
+            report=report,
             source_energy_unit=str(source_energy_unit),
         )
 
@@ -923,10 +899,6 @@ class TabSliderBinding(QtCore.QObject):
                 "Preview detailed-balance source is no longer current."
             )
             return False
-        self._verify_preview_detailed_balance_source(
-            corrected,
-            temperature_K=pending.temperature_K,
-        )
         self._pending_detailed_balance_request = None
         # Integration commits this exact typed outcome. No Preview request is
         # scheduled here or by the editor modal.
@@ -940,34 +912,6 @@ class TabSliderBinding(QtCore.QObject):
         self._pending_detailed_balance_request = None
         self.previewDetailedBalanceBlockCleared.emit(pending.tab_id)
         return True
-
-    @staticmethod
-    def _verify_preview_detailed_balance_source(
-        reactions_text: str,
-        *,
-        temperature_K: float,
-    ) -> None:
-        from kindred.core.simulator.parameter_algebra import (
-            apply_parameter_algebra_spec_to_mechanism,
-        )
-        from kindred.core.simulator.wegscheider_symbolic import (
-            validate_wegscheider_cyclicity_resolved,
-        )
-        from kindred.core.units import UnitsModel
-
-        source = str(reactions_text or "")
-        prepared_dsl = prepare_dsl_request_set(
-            source,
-            initials={},
-            units=UnitsModel(temperature_K=float(temperature_K)),
-        )
-        mechanism = prepared_dsl.mechanism_for_execution()
-        apply_parameter_algebra_spec_to_mechanism(
-            prepared_dsl.parameter_algebra_spec_for_execution(),
-            mechanism=mechanism,
-            require_mutable=False,
-        )
-        validate_wegscheider_cyclicity_resolved(mechanism)
 
     def _preview_inputs_valid(self, targets: tuple[str, ...]) -> bool:
         runtime = self._registry.tab_runtime(self._tab_id)
@@ -1243,22 +1187,15 @@ class TabSliderBinding(QtCore.QObject):
         runtime = self._registry.tab_runtime(tab.tab_id)
         parameter_values = projection.values_dict()
         parameter_values.update(runtime.slider_parameter_draft)
-        initial_values = dict(projected_initial_values(tab, set_id))
+        initial_values = dict(canonical_initial_values(tab, set_id))
         initial_values.update(
             runtime.slider_species_drafts_by_set_id.get(set_id, {})
         )
-        return PreviewResultIdentity(
-            tab_id=tab.tab_id,
-            set_id=set_id,
-            mechanism_source=tab.mechanism_source,
-            analysis_identity=projected_analysis_identity(tab),
-            standard_concentration_identity=standard_concentration_identity(
-                tab.prepared_dsl
-            ),
+        return preview_result_identity_for_tab(
+            tab,
+            set_id,
             parameter_values=tuple(parameter_values.items()),
             initial_values=tuple(initial_values.items()),
-            execution_settings=tab.resolved_execution_settings(set_id),
-            scientific_settings=tab.scientific_settings,
         )
 
     @staticmethod
@@ -1266,19 +1203,7 @@ class TabSliderBinding(QtCore.QObject):
         tab: MechanismTabDocument,
         set_id: str,
     ) -> ExplicitResultKey:
-        return ExplicitResultKey(
-            tab_id=tab.tab_id,
-            set_id=set_id,
-            mechanism_source=tab.mechanism_source,
-            analysis_identity=projected_analysis_identity(tab),
-            standard_concentration_identity=standard_concentration_identity(
-                tab.prepared_dsl
-            ),
-            scientific_identity=scientific_identity(tab.prepared_dsl),
-            initial_values=projected_initial_values(tab, set_id),
-            execution_settings=tab.resolved_execution_settings(set_id),
-            scientific_settings=tab.scientific_settings,
-        )
+        return explicit_result_key_for_tab(tab, set_id)
 
     def _emit_draft_state(self) -> None:
         slider_dirty = self.has_slider_draft()

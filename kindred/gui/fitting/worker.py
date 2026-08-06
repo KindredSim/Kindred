@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from threading import Condition, Event
 
@@ -35,7 +35,7 @@ from kindred.core.fitting_evaluation import (
     prepare_fitting_execution_context,
 )
 from kindred.core.mechanism_source import MechanismAuthoringSource
-from kindred.core.project_document import SimulationExecutionSettings
+from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.wegscheider_symbolic import (
     UnresolvedWegscheiderCyclicityError,
@@ -400,7 +400,7 @@ class FitCandidate:
     initial_values_by_set: tuple[
         tuple[str, tuple[tuple[str, float], ...]], ...
     ]
-    execution_by_set: tuple[tuple[str, SimulationExecutionSettings], ...]
+    start_by_set: tuple[tuple[str, float], ...]
     local_observables: tuple[FitLocalObservable, ...]
     result: GlobalFitResult
     curves: tuple[FitCurveDataset, ...]
@@ -452,6 +452,16 @@ class FitCandidate:
             "resolved_auto_modes",
             resolved_auto_modes,
         )
+        starts = tuple(
+            (str(set_id or "").strip(), float(value))
+            for set_id, value in self.start_by_set
+        )
+        if (
+            any(not set_id or not math.isfinite(value) for set_id, value in starts)
+            or len({set_id for set_id, _value in starts}) != len(starts)
+        ):
+            raise ValueError("Fit candidate start map must have unique finite set IDs.")
+        object.__setattr__(self, "start_by_set", starts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -856,6 +866,74 @@ def _terminal_setup_snapshot(
     )
 
 
+def _canonical_curve_projection(
+    result: SimulationResultValue,
+    selected: Sequence[FitSelectedObservation],
+    *,
+    x_name: str,
+) -> tuple[
+    tuple[str, ...],
+    np.ndarray,
+    dict[str, np.ndarray],
+    tuple[int, ...],
+    tuple[str, ...],
+    tuple[int, ...],
+]:
+    """Project one canonical result for display without copying its authority."""
+
+    names = tuple(dict.fromkeys(item.model_species for item in selected))
+    time = np.asarray(result.t, dtype=float).reshape(-1)
+    segment_ids = np.asarray(result.segment_ids, dtype=np.int64).reshape(-1)
+    segment_keys = tuple(result.segment_keys)
+    discontinuity_ids = np.asarray(
+        result.discontinuity_ids,
+        dtype=np.int64,
+    ).reshape(-1)
+    mask: np.ndarray | None = None
+    if x_name != "t":
+        observed_times = np.concatenate(
+            [np.asarray(item.t, dtype=float).reshape(-1) for item in selected]
+        )
+        t0 = float(np.min(observed_times))
+        t1 = float(np.max(observed_times))
+        if t0 > t1:
+            t0, t1 = t1, t0
+        t_scale = max(1.0, abs(t0), abs(t1))
+        t_pad = 1e-12 * t_scale
+        mask = (time >= (t0 - t_pad)) & (time <= (t1 + t_pad))
+        if not np.any(mask):
+            mask = None
+
+    if mask is None:
+        axis = time if x_name == "t" else np.asarray(result.series[x_name], dtype=float)
+        values = {
+            name: np.asarray(result.series[name], dtype=float).reshape(-1)
+            for name in names
+        }
+        projected_ids = segment_ids
+        projected_keys = segment_keys
+        projected_discontinuities = discontinuity_ids
+    else:
+        axis = np.asarray(result.series[x_name], dtype=float).reshape(-1)[mask]
+        values = {
+            name: np.asarray(result.series[name], dtype=float).reshape(-1)[mask]
+            for name in names
+        }
+        projected_ids = segment_ids[mask]
+        projected_keys = tuple(
+            key for key, included in zip(segment_keys, mask, strict=True) if included
+        )
+        projected_discontinuities = discontinuity_ids[mask]
+    return (
+        names,
+        axis,
+        values,
+        tuple(int(value) for value in projected_ids),
+        tuple(projected_keys),
+        tuple(int(value) for value in projected_discontinuities),
+    )
+
+
 def _curves_from_result(
     request: FitExecutionRequest,
     result: GlobalFitResult,
@@ -863,174 +941,140 @@ def _curves_from_result(
     mapped_by_id = {item.dataset_id: item for item in request.origin.mapped_datasets}
     local_by_id = {item.dataset_id: item for item in request.datasets}
     curves: list[FitCurveDataset] = []
-    for dataset_id, model_series in result.plot_model_series.items():
+    for dataset_id, simulation in result.simulation_results_by_dataset.items():
+        if not isinstance(simulation, SimulationResultValue):
+            raise TypeError("Terminal Fit result lost its canonical simulation result.")
         mapped = mapped_by_id[dataset_id]
         local = local_by_id[dataset_id]
         selected = selected_observations(mapped, local)
+        observed_axes = _observed_x_by_target(mapped, selected, local)
         observed_x, observed_y = _observed_curve_parts(
             selected,
-            x_by_target=result.plot_observed_x.get(dataset_id),
+            x_by_target=observed_axes,
         )
-        axes = result.plot_model_x_by_species.get(dataset_id, {})
+        x_name = local.parametric.x_name if local.parametric is not None else "t"
+        (
+            model_names,
+            model_axis,
+            model_values,
+            model_segment_ids,
+            model_segment_keys,
+            model_discontinuity_ids,
+        ) = _canonical_curve_projection(
+            simulation,
+            selected,
+            x_name=x_name,
+        )
+        objective_model_series = result.model_series[dataset_id]
         curves.append(
             FitCurveDataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
                 model_x=tuple(
-                    (
-                        species,
-                        tuple(float(value) for value in np.asarray(axes[species])),
-                    )
-                    for species in model_series
-                    if species in axes
+                    (name, tuple(float(value) for value in model_axis))
+                    for name in model_names
                 ),
                 model_y=tuple(
-                    (
-                        species,
-                        tuple(float(value) for value in np.asarray(values)),
-                    )
-                    for species, values in model_series.items()
-                    if species in axes
+                    (name, tuple(float(value) for value in model_values[name]))
+                    for name in model_names
                 ),
                 observed_x=observed_x,
                 observed_y=observed_y,
                 model_segment_ids=tuple(
-                    (
-                        species,
-                        tuple(
-                            int(value)
-                            for value in np.asarray(
-                                result.plot_model_segment_ids[
-                                    dataset_id
-                                ][species],
-                                dtype=np.int64,
-                            )
-                        ),
-                    )
-                    for species in model_series
-                    if species in axes
+                    (name, model_segment_ids) for name in model_names
                 ),
                 model_segment_keys=tuple(
-                    (
-                        species,
-                        tuple(
-                            result.plot_model_segment_keys[
-                                dataset_id
-                            ][species]
-                        ),
-                    )
-                    for species in model_series
-                    if species in axes
+                    (name, model_segment_keys) for name in model_names
                 ),
                 model_discontinuity_ids=tuple(
-                    (
-                        species,
-                        tuple(
-                            int(value)
-                            for value in np.asarray(
-                                result.plot_model_discontinuity_ids[
-                                    dataset_id
-                                ][species],
-                                dtype=np.int64,
-                            )
-                        ),
-                    )
-                    for species in model_series
-                    if species in axes
+                    (name, model_discontinuity_ids) for name in model_names
                 ),
                 observed_source_rows=tuple(
-                    (
-                        species,
-                        tuple(
-                            result.plot_observed_source_rows[
-                                dataset_id
-                            ][species]
-                        ),
-                    )
-                    for species in model_series
-                    if species in axes
+                    (item.model_species, item.source_rows) for item in selected
                 ),
                 observed_raw_ids=tuple(
-                    (
-                        species,
-                        result.plot_observed_raw_ids[
-                            dataset_id
-                        ][species],
-                    )
-                    for species in model_series
-                    if species in axes
+                    (item.model_species, item.raw_observation_id)
+                    for item in selected
                 ),
                 observed_raw_columns=tuple(
-                    (item.model_species, item.raw_column)
-                    for item in selected
-                    if item.model_species in model_series
-                    and item.model_species in axes
+                    (item.model_species, item.raw_column) for item in selected
                 ),
                 objective_model_x=tuple(
                     (
-                        species,
+                        name,
                         tuple(
                             float(value)
-                            for value in result.model_x_by_species[dataset_id][species]
+                            for value in result.model_x_by_species[dataset_id][name]
                         ),
                     )
-                    for species in model_series
-                    if species in axes
+                    for name in objective_model_series
                 ),
                 objective_model_y=tuple(
                     (
-                        species,
-                        tuple(float(value) for value in result.model_series[dataset_id][species]),
+                        name,
+                        tuple(
+                            float(value)
+                            for value in objective_model_series[name]
+                        ),
                     )
-                    for species in model_series
-                    if species in axes
+                    for name in objective_model_series
                 ),
                 objective_model_segment_ids=tuple(
                     (
-                        species,
-                        tuple(int(value) for value in result.model_segment_ids[dataset_id][species]),
+                        name,
+                        tuple(
+                            int(value)
+                            for value in result.model_segment_ids[dataset_id][name]
+                        ),
                     )
-                    for species in model_series
-                    if species in axes
+                    for name in objective_model_series
                 ),
                 objective_model_segment_keys=tuple(
-                    (species, tuple(result.model_segment_keys[dataset_id][species]))
-                    for species in model_series
-                    if species in axes
+                    (
+                        name,
+                        tuple(result.model_segment_keys[dataset_id][name]),
+                    )
+                    for name in objective_model_series
                 ),
                 objective_model_discontinuity_ids=tuple(
                     (
-                        species,
-                        tuple(int(value) for value in result.model_discontinuity_ids[dataset_id][species]),
+                        name,
+                        tuple(
+                            int(value)
+                            for value in result.model_discontinuity_ids[dataset_id][name]
+                        ),
                     )
-                    for species in model_series
-                    if species in axes
+                    for name in objective_model_series
                 ),
                 objective_selection_provenance=tuple(
-                    (species, tuple(result.model_selection_provenance[dataset_id][species]))
-                    for species in model_series
-                    if species in axes
+                    (
+                        name,
+                        tuple(result.model_selection_provenance[dataset_id][name]),
+                    )
+                    for name in objective_model_series
                 ),
                 objective_observation_ids=tuple(
-                    (species, tuple(result.model_observation_ids[dataset_id][species]))
-                    for species in model_series
-                    if species in axes
+                    (
+                        name,
+                        tuple(result.model_observation_ids[dataset_id][name]),
+                    )
+                    for name in objective_model_series
                 ),
                 objective_raw_columns=tuple(
-                    (species, tuple(result.model_raw_columns[dataset_id][species]))
-                    for species in model_series
-                    if species in axes
+                    (
+                        name,
+                        tuple(result.model_raw_columns[dataset_id][name]),
+                    )
+                    for name in objective_model_series
                 ),
                 objective_source_rows=tuple(
-                    (species, tuple(result.model_source_rows[dataset_id][species]))
-                    for species in model_series
-                    if species in axes
+                    (
+                        name,
+                        tuple(result.model_source_rows[dataset_id][name]),
+                    )
+                    for name in objective_model_series
                 ),
-                x_name=(
-                    local.parametric.x_name
-                    if local.parametric is not None
-                    else "t"
-                ),
+                x_name=x_name,
             )
         )
     return tuple(curves)
@@ -1048,11 +1092,8 @@ def _curves_from_evaluations(
     }
     curves: list[FitCurveDataset] = []
     for dataset_id, raw_evaluation in evaluations.items():
-        if not hasattr(raw_evaluation, "series") or not hasattr(
-            raw_evaluation,
-            "segment_ids",
-        ):
-            raise TypeError("Live Fit evaluation lost its typed series payload.")
+        if not isinstance(raw_evaluation, SimulationResultValue):
+            raise TypeError("Live Fit evaluation lost its canonical result.")
         evaluation = raw_evaluation
         local = effective_local[dataset_id]
         mapped = mapped_by_id[dataset_id]
@@ -1062,7 +1103,7 @@ def _curves_from_evaluations(
             selected,
             x_by_target=observed_axes,
         )
-        series = evaluation.series
+        result_series = evaluation.series
         segment_ids = tuple(
             int(value)
             for value in np.asarray(
@@ -1087,17 +1128,20 @@ def _curves_from_evaluations(
             else "t"
         )
         model_axis = (
-            np.asarray(series.t, dtype=float)
+            np.asarray(evaluation.t, dtype=float)
             if x_name == "t"
-            else np.asarray(series.species[x_name], dtype=float)
+            else np.asarray(result_series[x_name], dtype=float)
         )
         objective_rows = {
             item.model_species: select_fit_rows(
-                model_y=np.asarray(series.species[item.model_species], dtype=float),
+                model_y=np.asarray(
+                    result_series[item.model_species],
+                    dtype=float,
+                ),
                 model_x=(
                     None
                     if x_name == "t"
-                    else np.asarray(series.species[x_name], dtype=float)
+                    else np.asarray(result_series[x_name], dtype=float)
                 ),
                 x_name=x_name,
                 x_mode=(
@@ -1105,7 +1149,7 @@ def _curves_from_evaluations(
                     if local.parametric is not None
                     else "monotone"
                 ),
-                sim_time=np.asarray(series.t, dtype=float),
+                sim_time=np.asarray(evaluation.t, dtype=float),
                 observation_time=np.asarray(item.t, dtype=float),
                 observation_x=np.asarray(
                     item.t
@@ -1144,7 +1188,7 @@ def _curves_from_evaluations(
                         tuple(
                             float(value)
                             for value in np.asarray(
-                                series.species[item.model_species],
+                                result_series[item.model_species],
                                 dtype=float,
                             )
                         ),
@@ -1581,27 +1625,42 @@ class GlobalFitWorker(QtCore.QThread):
             if self._checkpoint():
                 raise FittingCancelled()
             science = request.origin.scientific_settings
-            execution = local.execution
+            retained = selected_observations(
+                mapped_by_id[local.dataset_id],
+                local,
+            )
+            retained_times = tuple(
+                sorted({float(time_value) for item in retained for time_value in item.t})
+            )
+            grid_points = max(
+                100,
+                len(retained_times),
+            ) if local.parametric is not None else 100
             try:
                 context = prepare_fitting_execution_context(
                     prepared_dsl=request.prepared_dsl,
                     param_names=candidate_names,
-                    t_start=float(execution.t_start),
-                    t_end=float(execution.t_end),
-                    num_points=int(execution.integration_points),
-                    objective_sample_times=tuple(
-                        sorted(
-                            {
-                                float(time_value)
-                                for observation in selected_observations(
-                                    mapped_by_id[local.dataset_id],
-                                    local,
-                                )
-                                for time_value in observation.t
-                            }
-                        )
+                    t_start=float(local.t_start),
+                    t_end=float(local.data_range_max),
+                    num_points=grid_points,
+                    objective_sample_times=retained_times,
+                    solver=local.solver,
+                    fit_sampling_policy=(
+                        "parametric_regular_grid_union_retained_endpoints"
+                        if local.parametric is not None
+                        else "fit_internal_regular_grid_union_retained_endpoints"
                     ),
-                    solver=execution.solver,
+                    fit_sampling_identity={
+                        "solver": local.solver,
+                        "t_start": float(local.t_start),
+                        "t_end": float(local.data_range_max),
+                        "regular_grid_count": int(grid_points),
+                        "retained_observation_times": retained_times,
+                        "union_endpoints": (
+                            float(local.t_start),
+                            float(local.data_range_max),
+                        ),
+                    },
                     rtol=float(science.rtol),
                     atol=float(science.atol),
                     use_sparse_jacobian=bool(science.sparse_jacobian_policy),
@@ -1673,12 +1732,13 @@ class GlobalFitWorker(QtCore.QThread):
                 "declarative_analysis_identity": (
                     request.prepared_dsl.analysis.identity
                 ),
-                "execution": {
-                    "solver": execution.solver,
-                    "t_start": float(execution.t_start),
-                    "t_end": float(execution.t_end),
-                    "integration_points": int(execution.integration_points),
+                "fit_solver": local.solver,
+                "fit_interval": {
+                    "t_start": float(local.t_start),
+                    "data_range_max": float(local.data_range_max),
                 },
+                "fit_sampling_policy": context.fit_sampling_policy,
+                "fit_sampling_identity": context.fit_sampling_identity,
             }
 
         effective_local: dict[str, FitDatasetLocalSettings] = {}
@@ -1712,6 +1772,8 @@ class GlobalFitWorker(QtCore.QThread):
                     for name in starting_values
                 },
             )
+            if not isinstance(evaluation, SimulationResultValue):
+                raise TypeError("Fit evaluator did not return its canonical result.")
             starting_evaluations[dataset_id] = evaluation
             prepared_ids[dataset_id]["validated_executable_schedule"] = (
                 evaluation.intervention_execution.provenance_projection()
@@ -1730,7 +1792,7 @@ class GlobalFitWorker(QtCore.QThread):
                         ),
                     ),
                 )
-                series = evaluation.series
+                series = evaluation
                 try:
                     for target_name, observation in provisional.observations.items():
                         align_y_on_x_obs(
@@ -1743,11 +1805,11 @@ class GlobalFitWorker(QtCore.QThread):
                                 dtype=float,
                             ),
                             t_sim=series.t,
-                            x_model=series.species[provisional.x_name],
-                            y_model=series.species[target_name],
-                            segment_ids=evaluation.segment_ids,
-                            segment_keys=evaluation.segment_keys,
-                            discontinuity_ids=evaluation.discontinuity_ids,
+                            x_model=series.series[provisional.x_name],
+                            y_model=series.series[target_name],
+                            segment_ids=series.segment_ids,
+                            segment_keys=series.segment_keys,
+                            discontinuity_ids=series.discontinuity_ids,
                             dataset_label=dataset_id,
                             x_name=provisional.x_name,
                             y_name=target_name,
@@ -1923,16 +1985,16 @@ class GlobalFitWorker(QtCore.QThread):
                         "targets": item.species_list,
                         "target_weights": dict(item.target_weights),
                         "sampling": {
-                            "t_min": float(
-                                effective_local[item.dataset_id].sample_t_min
+                            "data_range_min": float(
+                                effective_local[item.dataset_id].data_range_min
                             ),
-                            "t_max": float(
-                                effective_local[item.dataset_id].sample_t_max
+                            "data_range_max": float(
+                                effective_local[item.dataset_id].data_range_max
                             ),
-                            "points": (
+                            "maximum_observations_per_target": (
                                 effective_local[
                                     item.dataset_id
-                                ].sample_points
+                                ].maximum_observations_per_target
                             ),
                         },
                         **(
@@ -1944,24 +2006,49 @@ class GlobalFitWorker(QtCore.QThread):
                             if request.dataset_weight_mode == "user"
                             else {}
                         ),
-                        "execution": {
-                            "solver": effective_local[
-                                item.dataset_id
-                            ].execution.solver,
+                        "fit_solver": effective_local[item.dataset_id].solver,
+                        "fit_interval": {
                             "t_start": float(
-                                effective_local[
-                                    item.dataset_id
-                                ].execution.t_start
+                                effective_local[item.dataset_id].t_start
                             ),
-                            "t_end": float(
-                                effective_local[
-                                    item.dataset_id
-                                ].execution.t_end
+                            "data_range_max": float(
+                                effective_local[item.dataset_id].data_range_max
                             ),
-                            "integration_points": int(
-                                effective_local[
-                                    item.dataset_id
-                                ].execution.integration_points
+                        },
+                        "fit_sampling_policy": (
+                            "parametric_regular_grid_union_retained_endpoints"
+                            if effective_local[item.dataset_id].parametric is not None
+                            else "fit_internal_regular_grid_union_retained_endpoints"
+                        ),
+                        "fit_sampling_identity": {
+                            "retained_observation_times": tuple(
+                                sorted(
+                                    {
+                                        float(time_value)
+                                        for observation in selected_observations(
+                                            mapped_by_id[item.dataset_id],
+                                            effective_local[item.dataset_id],
+                                        )
+                                        for time_value in observation.t
+                                    }
+                                )
+                            ),
+                            "regular_grid_count": int(
+                                max(
+                                    100,
+                                    len(
+                                        {
+                                            float(time_value)
+                                            for observation in selected_observations(
+                                                mapped_by_id[item.dataset_id],
+                                                effective_local[item.dataset_id],
+                                            )
+                                            for time_value in observation.t
+                                        }
+                                    ),
+                                )
+                                if effective_local[item.dataset_id].parametric is not None
+                                else 100
                             ),
                         },
                         "x_name": item.x_name,
@@ -2063,7 +2150,7 @@ class GlobalFitWorker(QtCore.QThread):
                     values[variable.parameter_name] = float(
                         params.get(variable.variable_id, variable.initial)
                     )
-                evaluations[dataset_id] = evaluators[
+                evaluation = evaluators[
                     dataset_id
                 ].evaluate_series_with_parameter_origins(
                     values,
@@ -2072,6 +2159,11 @@ class GlobalFitWorker(QtCore.QThread):
                         for name in values
                     },
                 )
+                if not isinstance(evaluation, SimulationResultValue):
+                    raise TypeError(
+                        "Live Fit evaluator did not return its canonical result."
+                    )
+                evaluations[dataset_id] = evaluation
             return evaluations
 
         def progress(iteration: int, cost: float, params: dict[str, float]) -> None:
@@ -2161,10 +2253,8 @@ class GlobalFitWorker(QtCore.QThread):
                 "included datasets."
             )
         solver_provenance_by_dataset = {
-            str(dataset_id or "").strip(): provenance
-            for dataset_id, provenance in (
-                result.solver_provenance_by_dataset.items()
-            )
+            str(dataset_id or "").strip(): simulation.provenance.solver
+            for dataset_id, simulation in result.simulation_results_by_dataset.items()
         }
         if (
             any(not dataset_id for dataset_id in solver_provenance_by_dataset)
@@ -2189,22 +2279,17 @@ class GlobalFitWorker(QtCore.QThread):
             )
             for dataset_id, values in sorted(result.dataset_params.items())
         )
-        execution_by_set_map: dict[
-            str,
-            SimulationExecutionSettings,
-        ] = {}
-        execution_conflict = False
+        start_by_set_map: dict[str, float] = {}
         for item in included:
             set_id = mapped_by_id[item.dataset_id].set_id
-            previous = execution_by_set_map.get(set_id)
-            if previous is not None and previous != item.execution:
-                execution_conflict = True
-            execution_by_set_map[set_id] = item.execution
-        execution_by_set = (
-            ()
-            if execution_conflict
-            else tuple(execution_by_set_map.items())
-        )
+            if set_id in start_by_set_map:
+                raise ValueError(
+                    f"Fit candidate repeats mapped set {set_id!r}."
+                )
+            start_by_set_map[set_id] = float(
+                effective_local[item.dataset_id].t_start
+            )
+        start_by_set = tuple(start_by_set_map.items())
         curves = _curves_from_result(request, result)
         initial_values_by_set = _initial_values_from_result(
             request,
@@ -2340,7 +2425,7 @@ class GlobalFitWorker(QtCore.QThread):
             parameters=_finite_items(result.shared_params, field="Fit parameters"),
             scalar_values_by_dataset=scalar_values,
             initial_values_by_set=initial_values_by_set,
-            execution_by_set=execution_by_set,
+            start_by_set=start_by_set,
             local_observables=terminal_snapshot.local_observables,
             result=result,
             curves=curves,

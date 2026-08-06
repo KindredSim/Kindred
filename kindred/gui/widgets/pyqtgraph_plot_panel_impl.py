@@ -59,7 +59,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     interventionAnnotationsVisibilityRequested = QtCore.Signal(bool)
     xSeriesRequested = QtCore.Signal(object)
     ySeriesRequested = QtCore.Signal(object)
-    parametricModeRequested = QtCore.Signal(bool)
     plotPresentationIntentRequested = QtCore.Signal(object)
     renderFailed = QtCore.Signal(str)
 
@@ -119,9 +118,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar = AxisToolbar(self)
         self._axis_toolbar.xChanged.connect(self.xSeriesRequested.emit)
         self._axis_toolbar.ySelectionChanged.connect(self.ySeriesRequested.emit)
-        self._axis_toolbar.parametricToggled.connect(
-            self.parametricModeRequested.emit
-        )
         self._axis_toolbar.optionsRequested.connect(self._on_axis_option)
         self._axis_toolbar.axisRangeChanged.connect(self._apply_axis_range)
         self._axis_toolbar.addGuideRequested.connect(self._add_scalar_guide)
@@ -322,6 +318,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         projection: WorkspaceResultProjection,
     ) -> tuple[ResultDataBlock, ...]:
         self._clear_plot_items()
+        self._plot_widget.setLabel("bottom", projection.x_label)
+        self._plot_widget.setLabel("left", projection.y_label)
         block_by_id = {
             block.block_id: block
             for block in projection.copy_all_blocks
@@ -366,7 +364,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 for candidate in y_candidates
             ]
         )
-        self._axis_toolbar.set_parametric(projection.parametric_mode)
         self._axis_toolbar.set_coarse_sampling(
             self._sampling_limit_by_tab.get(projection.tab_id) is not None
         )
@@ -538,19 +535,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._completion_warning_badge.setVisible(visible)
 
     def _render_annotations(self, projection: WorkspaceResultProjection) -> None:
-        if (
-            not projection.intervention_annotations_visible
-            or (
-                projection.parametric_mode
-                and not (
-                    isinstance(
-                        projection.selected_x_series,
-                        SimulationSeriesAxisSelection,
-                    )
-                    and projection.selected_x_series.series_name == "t"
-                )
-            )
-        ):
+        if not projection.intervention_annotations_visible:
             return
         for annotation in projection.intervention_annotations:
             if "start" in annotation and "end" in annotation:

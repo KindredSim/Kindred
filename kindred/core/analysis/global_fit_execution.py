@@ -8,7 +8,6 @@ diagnostics, and result/completion assembly. Public API composition remains in
 
 from __future__ import annotations
 
-import copy
 import logging
 import math
 from dataclasses import dataclass, field
@@ -32,10 +31,10 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
-    FittingSeriesEvaluation,
     evaluate_fitting_series,
 )
 from kindred.core.objective import ObjectiveContext
+from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulation_failure import (
     SimulationFailure,
     build_simulation_failure,
@@ -165,7 +164,7 @@ class GlobalFitResult:
     model_observation_ids: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
     model_raw_columns: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
     model_source_rows: Dict[str, Dict[str, tuple[int, ...]]] = field(default_factory=dict)
-    solver_provenance_by_dataset: Dict[str, Dict[str, Any]] = field(
+    simulation_results_by_dataset: Dict[str, SimulationResultValue] = field(
         default_factory=dict
     )
     plot_observed_x: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
@@ -191,20 +190,22 @@ class GlobalFitResult:
     def __post_init__(self) -> None:
         if not isinstance(self.completion, GlobalFitCompletion):
             raise TypeError("GlobalFitResult.completion must be a GlobalFitCompletion")
-        solver_provenance: Dict[str, Dict[str, Any]] = {}
-        for raw_dataset_id, provenance in self.solver_provenance_by_dataset.items():
+        simulation_results: Dict[str, SimulationResultValue] = {}
+        for raw_dataset_id, simulation in self.simulation_results_by_dataset.items():
             dataset_id = str(raw_dataset_id or "").strip()
-            if not dataset_id or dataset_id in solver_provenance:
+            if not dataset_id or dataset_id in simulation_results:
                 raise ValueError(
-                    "Fit solver provenance requires distinct stable dataset IDs."
+                    "Fit simulation results require distinct stable dataset IDs."
                 )
-            if not isinstance(provenance, Mapping):
-                raise TypeError("Fit solver provenance entries must be mappings.")
-            solver_provenance[dataset_id] = copy.deepcopy(dict(provenance))
+            if not isinstance(simulation, SimulationResultValue):
+                raise TypeError(
+                    "Fit simulation result entries must be SimulationResultValue values."
+                )
+            simulation_results[dataset_id] = simulation
         object.__setattr__(
             self,
-            "solver_provenance_by_dataset",
-            solver_provenance,
+            "simulation_results_by_dataset",
+            simulation_results,
         )
         identity_maps = (
             self.model_x_by_species,
@@ -552,29 +553,6 @@ def _robust_span(values: np.ndarray) -> float:
     if not np.isfinite(span) or span < 0.0:
         return 0.0
     return span
-
-
-def _extract_simulation_payload(
-    simulation: FittingSeriesEvaluation,
-) -> Tuple[
-    np.ndarray,
-    Dict[str, np.ndarray],
-    np.ndarray,
-    tuple[str, ...],
-    np.ndarray,
-    Dict[str, Any],
-]:
-    """Return time, series, and direct canonical row identity."""
-    payload = simulation.series
-    t_sim = np.asarray(payload.t, dtype=float).reshape(-1)
-    return (
-        t_sim,
-        dict(payload.species),
-        np.asarray(simulation.segment_ids, dtype=np.int64).reshape(-1),
-        tuple(simulation.segment_keys),
-        np.asarray(simulation.discontinuity_ids, dtype=np.int64).reshape(-1),
-        dict(simulation.solver_provenance),
-    )
 
 
 def _align_series(
@@ -1155,122 +1133,27 @@ class ObjectiveDatasetInput:
 @dataclass(frozen=True)
 class DatasetSimulationEvaluation:
     index: int
-    sim_time: Optional[np.ndarray]
-    sim_species: Dict[str, np.ndarray]
-    segment_ids: Optional[np.ndarray] = None
-    segment_keys: tuple[str, ...] | None = None
-    discontinuity_ids: Optional[np.ndarray] = None
-    solver_provenance: Optional[Dict[str, Any]] = None
+    result: Optional[SimulationResultValue] = None
     error: Optional[BaseException] = None
     error_provenance: Optional[Dict[str, Any]] = None
     final_error_message: Optional[str] = None
 
     def __post_init__(self) -> None:
-        species = dict(self.sim_species)
-        object.__setattr__(self, "sim_species", species)
         if self.error is not None:
-            if (
-                self.sim_time is not None
-                or species
-                or self.segment_ids is not None
-                or self.segment_keys is not None
-                or self.discontinuity_ids is not None
-                or self.solver_provenance is not None
-            ):
+            if self.result is not None:
                 raise ValueError(
                     "Failed Fit evaluations cannot publish a partial result."
                 )
-        elif self.segment_ids is None or self.sim_time is None:
+        elif self.result is None:
             raise ValueError(
-                "Successful Fit simulation results require complete row identity."
+                "Successful Fit evaluations require a canonical simulation result."
             )
-        else:
-            times = np.asarray(self.sim_time, dtype=float).reshape(-1).copy()
-            if (
-                times.size == 0
-                or np.any(~np.isfinite(times))
-                or np.any(np.diff(times) <= 0.0)
-                or not species
-            ):
-                raise ValueError(
-                    "Successful Fit simulation results require finite ordered rows."
-                )
-            normalized_species: Dict[str, np.ndarray] = {}
-            for raw_name, raw_values in species.items():
-                name = str(raw_name or "").strip()
-                values = np.asarray(raw_values, dtype=float).reshape(-1).copy()
-                if (
-                    not name
-                    or values.size != times.size
-                    or np.any(~np.isfinite(values))
-                ):
-                    raise ValueError(
-                        "Fit simulation species must align with finite row time."
-                    )
-                values.setflags(write=False)
-                normalized_species[name] = values
-            times.setflags(write=False)
-            object.__setattr__(self, "sim_time", times)
-            object.__setattr__(self, "sim_species", normalized_species)
-        if self.segment_ids is not None:
-            segments = np.asarray(
-                self.segment_ids,
-                dtype=np.int64,
-            ).reshape(-1).copy()
-            keys = tuple(
-                str(value or "").strip()
-                for value in (self.segment_keys or ())
-            )
-            expected_size = (
-                0
-                if self.sim_time is None
-                else np.asarray(self.sim_time).reshape(-1).size
-            )
-            if (
-                segments.size != expected_size
-                or len(keys) != expected_size
-                or any(not value for value in keys)
-                or np.any(segments < 0)
-                or np.any(np.diff(segments) < 0)
-            ):
-                raise ValueError(
-                    "Fit simulation segment identity must align with time."
-                )
-            discontinuities = np.asarray(
-                self.discontinuity_ids,
-                dtype=np.int64,
-            ).reshape(-1).copy()
-            if (
-                discontinuities.size != expected_size
-                or np.any(discontinuities < 0)
-                or np.any(np.diff(discontinuities) < 0)
-            ):
-                raise ValueError(
-                    "Fit direct row identity must align with time."
-                )
-            object.__setattr__(self, "segment_ids", segments)
-            object.__setattr__(self, "segment_keys", keys)
-            segments.setflags(write=False)
-            discontinuities.setflags(write=False)
-            object.__setattr__(self, "discontinuity_ids", discontinuities)
-        elif (
-            self.segment_keys is not None
-            or self.discontinuity_ids is not None
-        ):
-            raise ValueError(
-                "Fit simulation row identity requires "
-                "discontinuity identity."
+        elif not isinstance(self.result, SimulationResultValue):
+            raise TypeError(
+                "Successful Fit evaluations require a SimulationResultValue."
             )
         if self.error_provenance is not None:
             object.__setattr__(self, "error_provenance", dict(self.error_provenance))
-        if self.solver_provenance is not None:
-            if not isinstance(self.solver_provenance, Mapping):
-                raise TypeError("Fit solver provenance must be a mapping.")
-            object.__setattr__(
-                self,
-                "solver_provenance",
-                copy.deepcopy(dict(self.solver_provenance)),
-            )
 
 
 def dataset_evaluation_is_fatal(result: DatasetSimulationEvaluation) -> bool:
@@ -1283,7 +1166,6 @@ def evaluate_dataset_simulation(
     item: ObjectiveDatasetInput,
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
-    retain_solver_provenance: bool = False,
 ) -> DatasetSimulationEvaluation:
     ds_id = item.payload.dataset_id
     try:
@@ -1300,31 +1182,14 @@ def evaluate_dataset_simulation(
             origins=item.parameter_origins,
             failed_params=item.failed_param_snapshot,
         )
-        (
-            sim_time,
-            sim_species,
-            segment_ids,
-            segment_keys,
-            discontinuity_ids,
-            solver_provenance,
-        ) = _extract_simulation_payload(sim_result)
         _raise_if_fitting_cancel_requested(cancellation_check)
         return DatasetSimulationEvaluation(
             index=int(item.index),
-            sim_time=sim_time,
-            sim_species=sim_species,
-            segment_ids=segment_ids,
-            segment_keys=segment_keys,
-            discontinuity_ids=discontinuity_ids,
-            solver_provenance=(
-                solver_provenance if retain_solver_provenance else None
-            ),
+            result=sim_result,
         )
     except FitSimulationError as exc:
         return DatasetSimulationEvaluation(
             index=int(item.index),
-            sim_time=None,
-            sim_species={},
             error=exc,
             error_provenance={"dataset": ds_id, "provenance": getattr(exc, "provenance", None)},
             final_error_message=str(exc),
@@ -1340,8 +1205,6 @@ def evaluate_dataset_simulation(
             error_details.pop("parameters", None)
         return DatasetSimulationEvaluation(
             index=int(item.index),
-            sim_time=None,
-            sim_species={},
             error=FitSimulationError(
                 f"Simulation failed for dataset '{ds_id}': {exc}",
                 failed_params=preferred_failed_params,
@@ -1358,7 +1221,6 @@ def evaluate_dataset_simulations(
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
     stop_on_fatal: bool = True,
-    retain_solver_provenance: bool = False,
 ) -> List[DatasetSimulationEvaluation]:
     if not items:
         return []
@@ -1367,7 +1229,6 @@ def evaluate_dataset_simulations(
         items,
         cancellation_check=cancellation_check,
         stop_on_fatal=stop_on_fatal,
-        retain_solver_provenance=retain_solver_provenance,
     )
 
 
@@ -1377,7 +1238,6 @@ def evaluate_dataset_simulations_serial(
     *,
     cancellation_check: Optional[Callable[[], bool]],
     stop_on_fatal: bool,
-    retain_solver_provenance: bool,
 ) -> List[DatasetSimulationEvaluation]:
     results = []
     for item in items:
@@ -1386,7 +1246,6 @@ def evaluate_dataset_simulations_serial(
             fit_evaluators,
             item,
             cancellation_check=cancellation_check,
-            retain_solver_provenance=retain_solver_provenance,
         )
         results.append(result)
         if stop_on_fatal and dataset_evaluation_is_fatal(result):
@@ -1579,21 +1438,17 @@ class GlobalFitObjective:
                     )
                 continue
 
-            sim_time = evaluation.sim_time
-            sim_species = evaluation.sim_species
-            segment_ids = evaluation.segment_ids
-            segment_keys = evaluation.segment_keys
-            discontinuity_ids = evaluation.discontinuity_ids
-            if (
-                segment_ids is None
-                or segment_keys is None
-                or discontinuity_ids is None
-            ):
+            simulation = evaluation.result
+            if simulation is None:
                 raise FitSimulationError(
-                    f"Dataset {ds_id!r}: Fit simulation lost exact segment "
-                    "identity.",
+                    f"Dataset {ds_id!r}: Fit simulation lost its canonical result.",
                     failed_params=failed_param_snapshot,
                 )
+            sim_time = simulation.t
+            sim_species = simulation.series
+            segment_ids = simulation.segment_ids
+            segment_keys = simulation.segment_keys
+            discontinuity_ids = simulation.discontinuity_ids
 
             for species_name in species_list:
                 _raise_if_fitting_cancelled(self._cancellation_check)
@@ -1760,7 +1615,7 @@ def assemble_global_fit_result(
     model_observation_ids_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
     model_raw_columns_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
     model_source_rows_map: Dict[str, Dict[str, tuple[int, ...]]] = {}
-    solver_provenance_by_dataset: Dict[str, Dict[str, Any]] = {}
+    simulation_results_by_dataset: Dict[str, SimulationResultValue] = {}
     plot_observed_x_map: Dict[str, Dict[str, np.ndarray]] = {}
     plot_observed_source_rows_map: Dict[
         str, Dict[str, tuple[int, ...]]
@@ -1823,7 +1678,6 @@ def assemble_global_fit_result(
             dataset_inputs,
             cancellation_check=cancellation_check,
             stop_on_fatal=False,
-            retain_solver_provenance=True,
         )
     }
 
@@ -1845,7 +1699,10 @@ def assemble_global_fit_result(
         _raise_if_fitting_cancelled(cancellation_check)
 
         sim_time: Optional[np.ndarray] = None
-        sim_species: Dict[str, np.ndarray] = {}
+        sim_species: Mapping[str, np.ndarray] = {}
+        segment_ids: Optional[np.ndarray] = None
+        segment_keys: tuple[str, ...] | None = None
+        discontinuity_ids: Optional[np.ndarray] = None
         evaluation = simulation_evaluations.get(int(item.index))
         if evaluation is None:
             raise RuntimeError(f"Missing fitting simulation result for dataset '{ds_id}'.")
@@ -1877,22 +1734,21 @@ def assemble_global_fit_result(
                     )
                 final_dataset_failures[ds_id] = diagnostic
         else:
-            sim_time = evaluation.sim_time
-            sim_species = evaluation.sim_species
-            if evaluation.solver_provenance is None:
+            simulation = evaluation.result
+            if simulation is None:
                 raise RuntimeError(
-                    f"Final Fit replay omitted solver provenance for dataset {ds_id!r}."
+                    f"Final Fit replay omitted the canonical result for dataset {ds_id!r}."
                 )
-            solver_provenance_by_dataset[ds_id] = dict(
-                evaluation.solver_provenance
-            )
-        segment_ids = evaluation.segment_ids
-        segment_keys = evaluation.segment_keys
-        discontinuity_ids = evaluation.discontinuity_ids
+            simulation_results_by_dataset[ds_id] = simulation
+            sim_time = simulation.t
+            sim_species = simulation.series
+            segment_ids = simulation.segment_ids
+            segment_keys = simulation.segment_keys
+            discontinuity_ids = simulation.discontinuity_ids
 
         plot_mask: Optional[np.ndarray] = None
         plot_x = np.asarray([], dtype=float)
-        if x_name != "t" and sim_time is not None and isinstance(sim_species, dict) and x_name in sim_species:
+        if x_name != "t" and sim_time is not None and x_name in sim_species:
             t0 = float(np.min(observed_times))
             t1 = float(np.max(observed_times))
             if t0 > t1:
@@ -1932,7 +1788,7 @@ def assemble_global_fit_result(
             ] = captured_observation.raw_observation_id
             penalty_block = np.full_like(y_exp, penalty_value, dtype=float)
 
-            if not (isinstance(sim_species, dict) and species_name in sim_species):
+            if species_name not in sim_species:
                 if ds_id not in final_dataset_failures:
                     final_dataset_failures[ds_id] = build_fit_diagnostic_from_failure(
                         build_simulation_failure(
@@ -2073,7 +1929,7 @@ def assemble_global_fit_result(
                 ] = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1).copy()
             else:
                 sliced = None
-                if plot_mask is not None and isinstance(sim_species, dict) and species_name in sim_species:
+                if plot_mask is not None and species_name in sim_species:
                     values = np.asarray(sim_species[species_name], dtype=float).reshape(-1)
                     try:
                         sliced = np.asarray(values[plot_mask], dtype=float).reshape(-1)
@@ -2287,7 +2143,7 @@ def assemble_global_fit_result(
         model_observation_ids=model_observation_ids_map,
         model_raw_columns=model_raw_columns_map,
         model_source_rows=model_source_rows_map,
-        solver_provenance_by_dataset=solver_provenance_by_dataset,
+        simulation_results_by_dataset=simulation_results_by_dataset,
         plot_observed_x=plot_observed_x_map,
         plot_observed_source_rows=plot_observed_source_rows_map,
         plot_observed_raw_ids=plot_observed_raw_ids_map,
