@@ -9,29 +9,9 @@ from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, 
 from kindred.core.simulator.parameter_namespace import is_protected_indexed_identifier
 
 from .errors import UnsupportedSymbolicExpressionError
-from .identity import symbolic_fingerprint
 
 
 _PROTECTED_RUNTIME_SYMBOLS = {"T"}
-
-
-@dataclass(frozen=True, slots=True)
-class SymbolicStateVectorContext:
-    species_names: tuple[str, ...]
-    symbol_names: tuple[str, ...]
-    display_symbols: tuple[str, ...]
-
-    @property
-    def kind(self) -> str:
-        return "state-vector"
-
-    def to_payload(self) -> dict[str, object]:
-        return {
-            "kind": self.kind,
-            "species_names": list(self.species_names),
-            "symbol_names": list(self.symbol_names),
-            "display_symbols": list(self.display_symbols),
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,32 +121,6 @@ class SymbolicProductIdentityProofContext:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class SymbolicEvaluationSnapshotContext:
-    parameter_values: tuple[tuple[str, float], ...]
-    fingerprint: str
-
-    @property
-    def kind(self) -> str:
-        return "evaluation-snapshot"
-
-    def to_payload(self) -> dict[str, object]:
-        return {
-            "kind": self.kind,
-            "parameter_values": [[name, f"{value:.17g}"] for name, value in self.parameter_values],
-            "fingerprint": self.fingerprint,
-        }
-
-
-def make_state_symbol_context(species_names: Sequence[object]) -> SymbolicStateVectorContext:
-    names = tuple(str(name) for name in species_names)
-    return SymbolicStateVectorContext(
-        species_names=names,
-        symbol_names=tuple(f"y_{idx}" for idx, _name in enumerate(names)),
-        display_symbols=tuple(f"[{name}]" for name in names),
-    )
-
-
 def make_parameter_expression_context(
     canonical_identifiers: Sequence[object] = (),
 ) -> SymbolicParameterExpressionContext:
@@ -187,19 +141,6 @@ def make_product_identity_proof_context(
     return SymbolicProductIdentityProofContext.from_spec(target_factors=target_factors, spec=spec)
 
 
-def make_evaluation_snapshot_context(
-    parameter_values: Sequence[tuple[str, float]],
-) -> SymbolicEvaluationSnapshotContext:
-    snapshot = tuple((str(name), float(value)) for name, value in parameter_values)
-    fingerprint = symbolic_fingerprint(
-        {
-            "kind": "evaluation-snapshot",
-            "parameter_values": [[name, f"{value:.17g}"] for name, value in snapshot],
-        }
-    )
-    return SymbolicEvaluationSnapshotContext(parameter_values=snapshot, fingerprint=fingerprint)
-
-
 def reject_unsupported_parameter_symbol_source(source: str) -> None:
     source_s = str(source or "").strip()
     if not source_s:
@@ -210,10 +151,6 @@ def reject_unsupported_parameter_symbol_source(source: str) -> None:
         )
     if re.search(r"\b(if|else|and|or|not)\b", source_s):
         raise UnsupportedSymbolicExpressionError("Dynamic or logical expressions are not supported in symbolic proof.")
-
-
-def canonical_parameter_identifier(name: str, spec: ParameterAlgebraSpec) -> str:
-    return SymbolicParameterNamespaceContext.from_spec(spec).resolve_identifier(name)
 
 
 def symbolic_status_payload(

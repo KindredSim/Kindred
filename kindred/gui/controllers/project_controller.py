@@ -6,17 +6,14 @@ import logging
 import math
 import os
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import ProjectDocument
-from kindred.core.project_presentation_state import (
-    default_workspace_presentation_state,
-    reconcile_workspace_presentation_state,
-)
+from kindred.core.project_presentation_state import default_workspace_presentation_state
 from kindred.core.project_session import (
     PreparedProjectInstall,
     ProjectContentToken,
@@ -160,7 +157,10 @@ class ProjectController(QtCore.QObject):
         fit_session: FitSessionOwner,
         xlsx_exports: object,
         set_status_text: Callable[[str], None],
-        settle_execution_candidate: Callable[[], bool],
+        settle_execution_candidate: Callable[
+            [ProjectContentToken],
+            ProjectContentToken | None,
+        ],
         prepare_before_save: Callable[[bool], ProjectDocument | None],
         commit_saved_document: Callable[
             [ProjectDocument, ProjectContentToken],
@@ -275,6 +275,21 @@ class ProjectController(QtCore.QObject):
 
     def _set_status(self, text: str) -> None:
         self._set_status_text(str(text))
+
+    @property
+    def mutation_admitted(self) -> bool:
+        """Whether a new user mutation may enter the project lifecycle."""
+
+        # Close is a one-way lifecycle.  Keep the admission latched even
+        # after early native authorization has cleared ``_close_pending`` so
+        # the event loop cannot reopen a writable window before closeEvent.
+        return not (self._close_started or self._close_pending)
+
+    def _reject_mutation_during_close(self, action: str) -> bool:
+        if self.mutation_admitted:
+            return False
+        self._set_status(f"{action} rejected: application Close is in progress.")
+        return True
 
     def _show_error(self, title: str, message: str) -> None:
         logger.error("%s: %s", title, message)
@@ -637,9 +652,12 @@ class ProjectController(QtCore.QObject):
                 )
 
     def new_project(self) -> bool:
-        if not self._settle_execution_candidate():
+        if self._reject_mutation_during_close("New Project"):
             return False
-        expected_token = self._session.capture_content_token()
+        entry_token = self._session.capture_content_token()
+        operative_token = self._settle_execution_candidate(entry_token)
+        if operative_token is None:
+            return False
         candidate = self._config.default_project_document()
         if not isinstance(candidate, ProjectDocument):
             raise TypeError(
@@ -655,7 +673,7 @@ class ProjectController(QtCore.QObject):
         )
         disposition = self._resolve_disposition(
             "starting a new project",
-            expected_token=expected_token,
+            expected_token=operative_token,
         )
         if disposition is None:
             return False
@@ -669,7 +687,9 @@ class ProjectController(QtCore.QObject):
         return True
 
     def load_project(self) -> bool:
-        chooser_token = self._session.capture_content_token()
+        if self._reject_mutation_during_close("Open Project"):
+            return False
+        entry_token = self._session.capture_content_token()
         path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
             self._parent_widget,
             "Open Project",
@@ -679,34 +699,43 @@ class ProjectController(QtCore.QObject):
         if not path:
             return False
         if not self._content_token_is_current(
-            chooser_token,
+            entry_token,
             action="Open Project",
         ):
             return False
-        if not self._settle_execution_candidate():
+        operative_token = self._settle_execution_candidate(entry_token)
+        if operative_token is None:
             return False
         return self._open_project_candidate(
             path,
             remove_missing_recent=False,
-            expected_token=self._session.capture_content_token(),
+            expected_token=operative_token,
         )
 
     def load_recent_project(self, path: str) -> bool:
-        if not self._settle_execution_candidate():
+        if self._reject_mutation_during_close("Open Recent Project"):
+            return False
+        entry_token = self._session.capture_content_token()
+        operative_token = self._settle_execution_candidate(entry_token)
+        if operative_token is None:
             return False
         return self._open_project_candidate(
             path,
             remove_missing_recent=True,
-            expected_token=self._session.capture_content_token(),
+            expected_token=operative_token,
         )
 
     def open_project_path(self, path: str) -> bool:
-        if not self._settle_execution_candidate():
+        if self._reject_mutation_during_close("Open Project"):
+            return False
+        entry_token = self._session.capture_content_token()
+        operative_token = self._settle_execution_candidate(entry_token)
+        if operative_token is None:
             return False
         return self._open_project_candidate(
             path,
             remove_missing_recent=False,
-            expected_token=self._session.capture_content_token(),
+            expected_token=operative_token,
         )
 
     def _open_project_candidate(
@@ -716,6 +745,8 @@ class ProjectController(QtCore.QObject):
         remove_missing_recent: bool,
         expected_token: ProjectContentToken,
     ) -> bool:
+        if self._reject_mutation_during_close("Open Project"):
+            return False
         absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
         if remove_missing_recent and not os.path.isfile(absolute_path):
             try:
@@ -774,27 +805,6 @@ class ProjectController(QtCore.QObject):
             except Exception:
                 logger.warning("Recent-project promotion failed", exc_info=True)
             return True
-        if disposition.saved:
-            if not self._content_token_is_current(
-                disposition.content_token,
-                action="Open Project",
-            ):
-                return False
-            try:
-                decoded = self._archive_store.load(absolute_path)
-                prepared_session, prepared_workspace = (
-                    self._prepare_project_install(
-                        decoded,
-                        path=absolute_path,
-                    )
-                )
-            except Exception as exc:
-                self._show_error(
-                    "Open Error",
-                    "Failed to reload the project after saving the current "
-                    f"project:\n\n{exc}",
-                )
-                return False
         if not self._commit_project_install(
             prepared_session,
             prepared_workspace,
@@ -824,9 +834,12 @@ class ProjectController(QtCore.QObject):
         return first_path == second_path
 
     def save_project(self) -> bool:
-        if not self._settle_execution_candidate():
+        if self._reject_mutation_during_close("Save Project"):
             return False
-        expected_token = self._session.capture_content_token()
+        entry_token = self._session.capture_content_token()
+        operative_token = self._settle_execution_candidate(entry_token)
+        if operative_token is None:
+            return False
         candidate = self._prepared_save_document(
             discard_invalid_authoring=False,
         )
@@ -835,16 +848,19 @@ class ProjectController(QtCore.QObject):
         return (
             self._save_prepared_document(
                 candidate,
-                expected_token=expected_token,
+                expected_token=operative_token,
                 choose_destination=self._session.current_path is None,
             )
             is not None
         )
 
     def save_project_as(self) -> bool:
-        if not self._settle_execution_candidate():
+        if self._reject_mutation_during_close("Save Project As"):
             return False
-        expected_token = self._session.capture_content_token()
+        entry_token = self._session.capture_content_token()
+        operative_token = self._settle_execution_candidate(entry_token)
+        if operative_token is None:
+            return False
         candidate = self._prepared_save_document(
             discard_invalid_authoring=False,
         )
@@ -853,7 +869,7 @@ class ProjectController(QtCore.QObject):
         return (
             self._save_prepared_document(
                 candidate,
-                expected_token=expected_token,
+                expected_token=operative_token,
                 choose_destination=True,
             )
             is not None
@@ -872,9 +888,9 @@ class ProjectController(QtCore.QObject):
             action="Save Project",
         ):
             return None
-        if not self._settle_execution_candidate():
+        operative_token = self._settle_execution_candidate(expected_token)
+        if operative_token is None:
             return None
-        operative_token = self._session.capture_content_token()
         candidate = self._prepared_save_document(
             discard_invalid_authoring=discard_invalid_authoring,
         )
@@ -907,6 +923,11 @@ class ProjectController(QtCore.QObject):
         expected_token: ProjectContentToken,
         choose_destination: bool,
     ) -> ProjectContentToken | None:
+        if not self._content_token_is_current(
+            expected_token,
+            action="Save Project",
+        ):
+            return None
         if not choose_destination:
             current_path = self._session.current_path
             if current_path is None:
@@ -929,21 +950,37 @@ class ProjectController(QtCore.QObject):
             action="Save Project",
         ):
             return None
+        destination = self._save_as_path(path)
+        if os.path.exists(destination) and not self._confirm_overwrite(
+            destination
+        ):
+            return None
         return self._write_project(
-            path,
+            destination,
             candidate,
             expected_token=expected_token,
         )
 
     @staticmethod
-    def _canonical_save_path(path: str | os.PathLike[str]) -> str:
+    def _save_as_path(path: str | os.PathLike[str]) -> str:
         absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
-        directory, filename = os.path.split(absolute_path)
-        while filename.casefold().endswith(".kin"):
-            filename = filename[:-4]
+        _directory, filename = os.path.split(absolute_path)
         if not filename:
             raise ValueError("Project save destination requires a file name.")
-        return os.path.join(directory, f"{filename}.kin")
+        if filename.casefold().endswith(".kin"):
+            return absolute_path
+        return f"{absolute_path}.kin"
+
+    def _confirm_overwrite(self, path: str) -> bool:
+        choice = QtWidgets.QMessageBox.question(
+            self._parent_widget,
+            "Replace Existing Project",
+            f"A project already exists at:\n{path}\n\nReplace it?",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return choice == QtWidgets.QMessageBox.StandardButton.Yes
 
     def _write_project(
         self,
@@ -958,33 +995,11 @@ class ProjectController(QtCore.QObject):
         ):
             return None
         try:
-            absolute_path = self._canonical_save_path(path)
+            absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
         except (TypeError, ValueError, OSError) as exc:
             self._show_error(
                 "Save Error",
                 f"Invalid project destination:\n\n{exc}",
-            )
-            return None
-        try:
-            presentation = reconcile_workspace_presentation_state(
-                candidate,
-                self._tabs.workspace_presentation(),
-            )
-            self._archive_store.save(
-                absolute_path,
-                candidate,
-                presentation,
-            )
-        except Exception as exc:
-            self._show_error("Save Error", f"Failed to save project:\n\n{exc}")
-            return None
-        if not self._content_token_is_current(
-            expected_token,
-            action="Save Project",
-        ):
-            self._set_status(
-                "The selected snapshot was written, but the current project "
-                "changed and remains unsaved."
             )
             return None
         committed_token = self._commit_saved_document(
@@ -993,8 +1008,7 @@ class ProjectController(QtCore.QObject):
         )
         if committed_token is None:
             self._set_status(
-                "The selected snapshot was written, but its stale document "
-                "was not published."
+                "The selected save candidate was superseded before publication."
             )
             return None
         if not isinstance(committed_token, ProjectContentToken):
@@ -1006,8 +1020,26 @@ class ProjectController(QtCore.QObject):
             or self._session.document != candidate
         ):
             self._set_status(
+                "The selected save candidate changed before archive publication."
+            )
+            return None
+        try:
+            presentation = self._tabs.workspace_presentation()
+            self._archive_store.save(
+                absolute_path,
+                candidate,
+                presentation,
+            )
+        except Exception as exc:
+            self._show_error("Save Error", f"Failed to save project:\n\n{exc}")
+            return None
+        if not self._content_token_is_current(
+            committed_token,
+            action="Save Project",
+        ):
+            self._set_status(
                 "The selected snapshot was written, but the current project "
-                "changed before save publication."
+                "changed and remains unsaved."
             )
             return None
         if not self._session.mark_saved(
@@ -1038,11 +1070,13 @@ class ProjectController(QtCore.QObject):
         if self._close_started:
             self.notify_close_progress()
             return self._close_authorization is not None
-        if not self._settle_execution_candidate():
+        entry_token = self._session.capture_content_token()
+        operative_token = self._settle_execution_candidate(entry_token)
+        if operative_token is None:
             return False
         disposition = self._resolve_disposition(
             "closing Kindred",
-            expected_token=self._session.capture_content_token(),
+            expected_token=operative_token,
             application_close=True,
         )
         if disposition is None:
@@ -1053,7 +1087,34 @@ class ProjectController(QtCore.QObject):
         ):
             return False
         self._apply_discard(disposition)
-        if disposition.clean_idle:
+        if not self._session.is_content_token_current(
+            disposition.content_token
+        ):
+            return False
+        if disposition.clean_idle and self._owned_qthreads_are_settled():
+            try:
+                fit_idle_closed = bool(
+                    self._fit_session.close_idle_for_application_close()
+                )
+            except Exception:
+                logger.exception(
+                    "Idle Fit cleanup failed during application Close"
+                )
+                fit_idle_closed = False
+            if not fit_idle_closed:
+                self._set_status(
+                    "Close was not completed because the idle Fit window "
+                    "could not be destroyed safely."
+                )
+                return False
+            if not self._session.is_content_token_current(
+                disposition.content_token
+            ):
+                self._set_status(
+                    "Close was not completed because the current project changed."
+                )
+                return False
+            self._close_started = True
             self._close_authorization = "native"
             self.nativeCloseAuthorized.emit()
             return True
@@ -1106,15 +1167,14 @@ class ProjectController(QtCore.QObject):
     def notify_close_progress(self) -> None:
         if not self._close_pending:
             return
-        running, enumeration_complete = self._running_owned_qthreads()
-        if not enumeration_complete:
-            return
-        if not running:
-            self._authorize_application_close(hard_exit=False)
-            return
         deadline = self._close_deadline
-        if deadline is not None and time.monotonic() >= deadline:
+        if deadline is None:
+            return
+        if time.monotonic() >= deadline:
             self._authorize_application_close(hard_exit=True)
+            return
+        if self._owned_qthreads_are_settled():
+            self._authorize_application_close(hard_exit=False)
 
     @QtCore.Slot()
     def _on_application_close_deadline(self) -> None:
@@ -1123,147 +1183,70 @@ class ProjectController(QtCore.QObject):
         deadline = self._close_deadline
         if deadline is None:
             return
-        remaining = deadline - time.monotonic()
-        if remaining > 0.0:
-            self._close_timer.start(max(1, math.ceil(remaining * 1000.0)))
-            return
-        running, enumeration_complete = self._running_owned_qthreads()
-        if running:
-            self._authorize_application_close(hard_exit=True)
-            return
-        if not enumeration_complete:
-            self._set_status(
-                "Close is waiting because owned QThread status could not be "
-                "determined safely."
+        if time.monotonic() < deadline:
+            self._close_timer.start(
+                max(
+                    1,
+                    math.ceil(
+                        (float(deadline) - time.monotonic()) * 1000.0
+                    ),
+                )
             )
-            self._close_timer.start(100)
             return
-        self._authorize_application_close(hard_exit=False)
+        self._authorize_application_close(hard_exit=True)
 
-    def _running_owned_qthreads(
-        self,
-    ) -> tuple[tuple[QtCore.QThread, ...], bool]:
-        running: list[QtCore.QThread] = []
-        seen: set[int] = set()
-        complete = True
-        try:
-            simulation_threads = self._simulation_jobs.owned_qthreads()
-        except Exception:
-            logger.exception(
-                "Simulation QThread enumeration failed during Close"
-            )
-            complete = False
-        else:
-            complete = (
-                self._append_running_qthreads(
-                    simulation_threads,
-                    owner_label="Simulation",
-                    running=running,
-                    seen=seen,
-                )
-                and complete
-            )
-        try:
-            import_threads = self._dataset_imports.owned_qthreads()
-        except Exception:
-            logger.exception(
-                "Dataset-import QThread enumeration failed during Close"
-            )
-            complete = False
-        else:
-            complete = (
-                self._append_running_qthreads(
-                    import_threads,
-                    owner_label="Dataset import",
-                    running=running,
-                    seen=seen,
-                )
-                and complete
-            )
-        try:
-            fit_threads = self._fit_session.owned_qthreads()
-        except Exception:
-            logger.exception("Fit QThread enumeration failed during Close")
-            complete = False
-        else:
-            complete = (
-                self._append_running_qthreads(
-                    fit_threads,
-                    owner_label="Fit",
-                    running=running,
-                    seen=seen,
-                )
-                and complete
-            )
-        try:
-            xlsx_threads = self._xlsx_exports.owned_qthreads()
-        except Exception:
-            logger.exception(
-                "XLSX export QThread enumeration failed during Close"
-            )
-            complete = False
-        else:
-            complete = (
-                self._append_running_qthreads(
-                    xlsx_threads,
-                    owner_label="XLSX export",
-                    running=running,
-                    seen=seen,
-                )
-                and complete
-            )
-        return tuple(running), complete
+    def _owned_qthreads_are_settled(self) -> bool:
+        """Use owner-retained thread receipts, never native thread status."""
 
-    @staticmethod
-    def _append_running_qthreads(
-        candidates: Iterable[object],
-        *,
-        owner_label: str,
-        running: list[QtCore.QThread],
-        seen: set[int],
-    ) -> bool:
-        complete = True
-        try:
-            owned_threads = tuple(candidates)
-        except (TypeError, RuntimeError):
-            logger.exception(
-                "%s returned an unreadable owned-QThread collection",
-                owner_label,
-            )
-            return False
-        for candidate in owned_threads:
-            if not isinstance(candidate, QtCore.QThread):
-                logger.error(
-                    "%s returned a non-QThread owned worker during Close",
-                    owner_label,
-                )
-                complete = False
-                continue
-            identity = id(candidate)
-            if identity in seen:
-                continue
-            seen.add(identity)
+        settled = True
+        for owner_label, owner in (
+            ("Simulation", self._simulation_jobs),
+            ("Dataset import", self._dataset_imports),
+            ("Fit", self._fit_session),
+            ("XLSX export", self._xlsx_exports),
+        ):
             try:
-                is_running = bool(candidate.isRunning())
-            except RuntimeError:
+                collection = owner.owned_qthreads()
+                if isinstance(collection, (str, bytes, bytearray, Mapping)):
+                    raise TypeError("owned-QThread collection has invalid type")
+                retained = tuple(collection)
+            except Exception:
                 logger.exception(
-                    "%s QThread status could not be read during Close",
+                    "%s owned-QThread collection could not be read during Close",
                     owner_label,
                 )
-                complete = False
+                settled = False
                 continue
-            if is_running:
-                running.append(candidate)
-        return complete
+            if any(not isinstance(thread, QtCore.QThread) for thread in retained):
+                logger.error(
+                    "%s returned a malformed owned-QThread collection during Close",
+                    owner_label,
+                )
+                settled = False
+            elif retained:
+                settled = False
+        return settled
 
     def _authorize_application_close(self, *, hard_exit: bool) -> None:
         if not self._close_pending or self._close_authorization is not None:
             return
+        if hard_exit:
+            self._close_pending = False
+            self._close_timer.stop()
+            self.closePendingChanged.emit(False)
+            self._close_authorization = "hard_exit"
+            self.hardExitAuthorized.emit()
+            return
         self._close_pending = False
         self._close_timer.stop()
-        self._close_authorization = "hard_exit" if hard_exit else "native"
         self.closePendingChanged.emit(False)
-        if hard_exit:
-            self.hardExitAuthorized.emit()
-        else:
-            self.nativeCloseAuthorized.emit()
+        self._close_authorization = "native"
+        self.nativeCloseAuthorized.emit()
+
+    def consume_native_close_authorization(self) -> bool:
+        """Consume the one native-close authorization at the physical boundary."""
+
+        if self._close_authorization != "native":
+            return False
+        self._close_authorization = None
+        return True

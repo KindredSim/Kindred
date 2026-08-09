@@ -36,7 +36,6 @@ _NON_ALGEBRA_ASSIGNMENT_PREFIXES = {
     "equilibrium",
     "init",
     "initial",
-    "kappa",
     "reaction",
     "t",
     "temp_response",
@@ -1156,17 +1155,6 @@ def extract_parameter_assignments_from_algebra_lines(
             )
 
     return assignments
-
-
-def extract_parameter_assignments_from_dsl_text(
-    dsl_text: str,
-    *,
-    mechanism_namespace: MechanismParameterNamespace,
-) -> List[ParameterAssignment]:
-    return extract_parameter_assignments_from_algebra_lines(
-        collect_algebra_section_lines(dsl_text),
-        mechanism_namespace=mechanism_namespace,
-    )
 
 
 def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[int, str]]) -> Set[str]:

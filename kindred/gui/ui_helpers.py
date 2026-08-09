@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from typing import Optional
 
 from PySide6 import QtCore, QtWidgets
@@ -160,8 +161,19 @@ def safe_float_parse(val_str: str, default: float) -> float:
     return float(parsed)
 
 
-def setup_scientific_validator(line_edit: QtWidgets.QLineEdit) -> QDoubleValidator:
-    validator = QDoubleValidator(0.0, 1e300, 323, line_edit)
+def setup_scientific_validator(
+    line_edit: QtWidgets.QLineEdit,
+    *,
+    minimum: float = 0.0,
+    maximum: float = sys.float_info.max,
+) -> QDoubleValidator:
+    """Install the full binary64 scientific-text admission range.
+
+    The validator only governs text admission. Callers still perform the
+    semantic positive/finite check when constructing their typed value.
+    """
+
+    validator = QDoubleValidator(float(minimum), float(maximum), 323, line_edit)
     validator.setNotation(QDoubleValidator.Notation.ScientificNotation)
     line_edit.setValidator(validator)
     return validator

@@ -26,12 +26,14 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         self.setHorizontalHeaderLabels(["Name", "Value", "Unit"])
         header = self.horizontalHeader()
         header.setStretchLastSection(False)
-        for col in range(self.columnCount()):
-            header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)  # Unit
-        self.setColumnWidth(2, 140)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
         self.setAlternatingRowColors(True)
-        self.setMaximumHeight(130)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
 
     def update_parameters(self, parameters: Dict[str, Tuple[float, str]]) -> None:
         """
@@ -42,20 +44,29 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         parameters : dict
             Mapping name -> (value, unit)
         """
-        self.setRowCount(0)
-        for row, name in enumerate(sorted(parameters.keys(), key=_param_sort_key)):
+        names = tuple(sorted(parameters.keys(), key=_param_sort_key))
+        current_names = tuple(
+            str(self.item(row, 0).data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            if self.item(row, 0) is not None
+            else ""
+            for row in range(self.rowCount())
+        )
+        if current_names != names:
+            self.setRowCount(len(names))
+            for row, name in enumerate(names):
+                name_item = QtWidgets.QTableWidgetItem()
+                name_item.setData(QtCore.Qt.ItemDataRole.UserRole, str(name))
+                name_item.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.setItem(row, 0, name_item)
+                for column in (1, 2):
+                    item = QtWidgets.QTableWidgetItem()
+                    item.setTextAlignment(QtCore.Qt.AlignCenter)
+                    self.setItem(row, column, item)
+        for row, name in enumerate(names):
             value, unit = parameters[name]
-            self.insertRow(row)
-            _name_item = QtWidgets.QTableWidgetItem(str(name))
-            _name_item.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(row, 0, _name_item)
-            _val_item = QtWidgets.QTableWidgetItem(f"{float(value):.6g}")
-            _val_item.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(row, 1, _val_item)
-            _unit_item = QtWidgets.QTableWidgetItem(str(unit))
-            _unit_item.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(row, 2, _unit_item)
-        self.viewport().repaint()
+            self.item(row, 0).setText(str(name))
+            self.item(row, 1).setText(f"{float(value):.6g}")
+            self.item(row, 2).setText(str(unit))
 
 
 def _param_sort_key(name: str):

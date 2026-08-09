@@ -10,7 +10,6 @@ from kindred.core.temperature import (
     coerce_temperature_kelvin,
     coerce_temperature_schedule,
 )
-from kindred.core.intervention_schedule import InterventionSchedule, coerce_intervention_schedule
 
 __all__ = [
     "MechanismMetadataKeys",
@@ -23,12 +22,9 @@ __all__ = [
 class MechanismMetadataKeys:
     TEMPERATURE_K = "temperature_K"
     STANDARD_CONC_M = "standard_conc_M"
-    KAPPA_GLOBAL = "kappa_global"
     ENERGY_UNIT = "energy_unit"
     STEP_INDEX_POLICY = "step_index_policy"
-    ALGEBRA_TEXT = "algebra_text"
     TEMPERATURE_SCHEDULE = "temperature_schedule"
-    INTERVENTION_SCHEDULE = "intervention_schedule"
     WEGSCHEIDER_CYCLICITY_ENABLED = "wegscheider_cyclicity_enabled"
 
 
@@ -37,7 +33,6 @@ class EquilibriumMetadataKeys:
     USER_PROVIDED_KF = "user_provided_kf"
     USER_PROVIDED_KR = "user_provided_kr"
     DG_EQ_J_PER_MOL = "dG_eq_J_per_mol"
-    SOURCE_ENERGY_UNIT = "source_energy_unit"
     KEQ_INPUT = "Keq_input"
     EXPLICIT_RATES = "explicit_rates"
     FORWARD_MODEL = "forward_model"
@@ -85,12 +80,9 @@ def _optional_finite_float(value: object) -> Optional[float]:
 class MechanismMetadataView:
     temperature_K: float = 298.15
     standard_conc_M: float = 1.0
-    kappa_global: float = 1.0
     energy_unit: str = "kJ/mol"
     step_index_policy: str = "dsl_only"
-    algebra_text: Optional[str] = None
     temperature_schedule: Optional[TemperatureScheduleProtocol] = None
-    intervention_schedule: Optional[InterventionSchedule] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -124,10 +116,6 @@ class MechanismMetadataView:
                 field=MechanismMetadataKeys.TEMPERATURE_K,
             ),
             standard_conc_M=meta.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0),
-            kappa_global=_as_float(
-                meta.get(MechanismMetadataKeys.KAPPA_GLOBAL, 1.0),
-                default=1.0,
-            ),
             energy_unit=normalize_energy_unit(
                 meta.get(MechanismMetadataKeys.ENERGY_UNIT, "kJ/mol"),
                 default="kJ/mol",
@@ -135,31 +123,18 @@ class MechanismMetadataView:
             step_index_policy=str(
                 meta.get(MechanismMetadataKeys.STEP_INDEX_POLICY, "dsl_only")
             ),
-            algebra_text=(
-                str(meta.get(MechanismMetadataKeys.ALGEBRA_TEXT))
-                if meta.get(MechanismMetadataKeys.ALGEBRA_TEXT) is not None
-                else None
-            ),
             temperature_schedule=coerce_temperature_schedule(
                 meta.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE)
-            ),
-            intervention_schedule=coerce_intervention_schedule(
-                meta.get(MechanismMetadataKeys.INTERVENTION_SCHEDULE)
             ),
         )
 
     def apply_to_metadata(self, meta: MutableMapping[str, Any]) -> None:
         meta[MechanismMetadataKeys.TEMPERATURE_K] = float(self.temperature_K)
         meta[MechanismMetadataKeys.STANDARD_CONC_M] = float(self.standard_conc_M)
-        meta[MechanismMetadataKeys.KAPPA_GLOBAL] = float(self.kappa_global)
         meta[MechanismMetadataKeys.ENERGY_UNIT] = str(self.energy_unit)
         meta[MechanismMetadataKeys.STEP_INDEX_POLICY] = str(self.step_index_policy)
-        if self.algebra_text is not None:
-            meta[MechanismMetadataKeys.ALGEBRA_TEXT] = str(self.algebra_text)
         if self.temperature_schedule is not None:
             meta[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = self.temperature_schedule
-        if self.intervention_schedule is not None:
-            meta[MechanismMetadataKeys.INTERVENTION_SCHEDULE] = self.intervention_schedule
 
 
 @dataclass(frozen=True)

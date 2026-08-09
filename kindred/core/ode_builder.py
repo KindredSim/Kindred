@@ -24,7 +24,7 @@ from .equilibrium_rate_authority import (
     normalize_existing_equilibrium_rate_authority,
 )
 from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
-from .rate_binding import ForwardRateBinding, RateBinding
+from .rate_binding import ForwardRateBinding, RateBinding as _RateBinding
 from .kinetics import (
     ArrheniusRateModel,
     ConstantRateModel,
@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "EffectiveRateCoefficients",
     "EffectiveRateCoefficientEvaluator",
-    "RateBinding",
     "build_effective_rate_coefficient_evaluator",
     "build_ode_rhs_from_mechanism",
 ]
@@ -69,7 +68,7 @@ def _stoichiometric_flux_product(
     return out.copy()
 
 
-def _evaluate_rate_binding(binding: RateBinding, temperature_K: float) -> float:
+def _evaluate_rate_binding(binding: _RateBinding, temperature_K: float) -> float:
     if bool(getattr(binding, "accepts_runtime_temperature", False)):
         return float(binding(float(temperature_K)))  # type: ignore[call-arg]
     return float(binding())
@@ -90,6 +89,7 @@ def _forward_rate_model_payload(model: ForwardRateModel) -> dict[str, object]:
             "kappa": float(model.kappa),
             "standard_conc_M": float(model.standard_conc_M),
             "molecularity": float(model.molecularity),
+            "degeneracy": int(model.degeneracy),
         }
     else:
         raise TypeError("Unsupported typed forward-rate model.")
@@ -189,7 +189,6 @@ def build_effective_rate_coefficient_evaluator(
     )
     nominal_temperature = float(mech_meta.temperature_K)
     default_standard_conc = float(mech_meta.standard_conc_M)
-    default_kappa = float(mech_meta.kappa_global)
     evaluators: list[Callable[[float], tuple[float, float]]] = []
     step_kinds: list[str] = []
     snapshots: list[Mapping[str, object]] = []
@@ -197,12 +196,11 @@ def build_effective_rate_coefficient_evaluator(
     for reaction in mechanism.reactions:
         model = forward_rate_model_for_reaction(
             reaction,
-            default_kappa=default_kappa,
             default_standard_conc_M=default_standard_conc,
         )
         binding = (
             reaction.rate
-            if isinstance(reaction.rate, RateBinding)
+            if isinstance(reaction.rate, _RateBinding)
             else None
         )
         if binding is not None:
@@ -231,7 +229,7 @@ def build_effective_rate_coefficient_evaluator(
             def reaction_coefficients(
                 temperature_K: float,
                 *,
-                _binding: RateBinding = binding,
+                _binding: _RateBinding = binding,
             ) -> tuple[float, float]:
                 return (
                     _evaluate_rate_binding(_binding, temperature_K),
@@ -264,7 +262,7 @@ def build_effective_rate_coefficient_evaluator(
         )
         forward_binding = (
             equilibrium.kf
-            if isinstance(equilibrium.kf, RateBinding)
+            if isinstance(equilibrium.kf, _RateBinding)
             else None
         )
         if isinstance(forward_binding, ForwardRateBinding):
@@ -273,7 +271,6 @@ def build_effective_rate_coefficient_evaluator(
             forward_model = forward_rate_model_for_equilibrium(
                 equilibrium,
                 temperature_K=nominal_temperature,
-                default_kappa=default_kappa,
                 default_standard_conc_M=default_standard_conc,
             )
             if forward_binding is not None and not isinstance(
@@ -288,7 +285,7 @@ def build_effective_rate_coefficient_evaluator(
             "forward_model": _forward_rate_model_payload(forward_model),
             "forward_binding_name": (
                 str(forward_binding.name)
-                if isinstance(forward_binding, RateBinding)
+                if isinstance(forward_binding, _RateBinding)
                 else None
             ),
             "authority": json_safe_equilibrium_authority_payload(
@@ -296,7 +293,7 @@ def build_effective_rate_coefficient_evaluator(
             ),
             "reverse_binding_name": (
                 str(authority.kr.name)
-                if isinstance(authority.kr, RateBinding)
+            if isinstance(authority.kr, _RateBinding)
                 else None
             ),
             "reverse_model": (
@@ -311,7 +308,7 @@ def build_effective_rate_coefficient_evaluator(
             *,
             _equilibrium: Equilibrium = equilibrium,
             _authority=authority,
-            _forward_binding: RateBinding | None = forward_binding,
+            _forward_binding: _RateBinding | None = forward_binding,
             _forward_model: ForwardRateModel = forward_model,
         ) -> tuple[float, float]:
             forward = (
@@ -327,7 +324,7 @@ def build_effective_rate_coefficient_evaluator(
             )
             if _authority.kind == EquilibriumRateAuthorityKind.KR:
                 reverse = _authority.effective_reverse_rate()
-                if isinstance(reverse, RateBinding):
+                if isinstance(reverse, _RateBinding):
                     reverse = _evaluate_rate_binding(
                         reverse,
                         temperature_K,

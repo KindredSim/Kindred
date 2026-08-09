@@ -33,7 +33,7 @@ def main() -> int:
         )
         return 1
 
-    gui_startup.apply_pre_qapplication_startup(qt_core=QtCore)
+    gui_startup.apply_qt_startup_workarounds(qt_core=QtCore)
 
     from kindred.gui.main_window import MainWindow
 

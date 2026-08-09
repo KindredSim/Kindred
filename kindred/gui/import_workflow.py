@@ -13,12 +13,11 @@ from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path
+from types import MappingProxyType
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+import uuid
 
-from kindred.core.datasets.csv_import import (
-    PhysicalColumn,
-    validate_tabular_source_bytes,
-)
+from kindred.core.datasets.source_rules import PhysicalColumn, validate_tabular_source_bytes
 from kindred.core.datasets.units import (
     looks_like_unit_row,
     parse_concentration_unit,
@@ -39,33 +38,27 @@ __all__ = [
     "resolve_import_plans",
 ]
 
-_MAX_SOURCE_BYTES = 32 * 1024 * 1024
-
-
 @dataclass(frozen=True, slots=True)
 class ImportSourceSnapshot:
     """One immutable source-byte snapshot captured before any preview read."""
 
-    filepath: str
     file_type: str
     original_filename: str
     exact_source_bytes: bytes
+    source_id: str = field(default_factory=lambda: f"source-{uuid.uuid4().hex}")
 
     def __post_init__(self) -> None:
-        filepath = os.fspath(self.filepath)
         filename = str(self.original_filename)
         source_type = str(self.file_type)
         source_bytes = self.exact_source_bytes
-        if not filepath:
-            raise ValueError("Dataset import source path must be nonblank.")
+        source_id = str(self.source_id)
         if (
             not filename
             or filename != filename.strip()
-            or os.path.basename(filepath) != filename
             or os.path.basename(filename) != filename
         ):
             raise ValueError(
-                "Dataset import source filename must be the source-path basename."
+                "Dataset import source filename must be a nonblank basename."
             )
         suffix = Path(filename).suffix.lower()
         expected_type = "excel" if suffix == ".xlsx" else "csv" if suffix == ".csv" else ""
@@ -74,22 +67,16 @@ class ImportSourceSnapshot:
                 "Dataset import source type must exactly match its .csv or "
                 ".xlsx filename."
             )
-        if type(source_bytes) is not bytes:
-            raise TypeError("Dataset import source content must be exact bytes.")
-        if not source_bytes:
-            raise ValueError("Dataset import source content must be nonempty.")
-        if len(source_bytes) > _MAX_SOURCE_BYTES:
-            raise ValueError(
-                "Dataset import source exceeds the 32 MiB supported-size limit."
-            )
+        if not source_id or source_id != source_id.strip():
+            raise ValueError("Dataset import source ID must be nonblank and edge-normalized.")
         validate_tabular_source_bytes(
             source_bytes,
             source_format="xlsx" if source_type == "excel" else "csv",
             source_label=filename,
         )
-        object.__setattr__(self, "filepath", filepath)
         object.__setattr__(self, "file_type", source_type)
         object.__setattr__(self, "original_filename", filename)
+        object.__setattr__(self, "source_id", source_id)
 
     @property
     def archive_format(self) -> str:
@@ -115,21 +102,11 @@ def capture_import_source(
     if not path.is_file():
         raise ValueError(f"Dataset source does not exist: {path}.")
     try:
-        source_size = path.stat().st_size
-        if source_size > _MAX_SOURCE_BYTES:
-            raise ValueError(
-                "Dataset import source exceeds the 32 MiB supported-size limit."
-            )
         with path.open("rb") as source:
-            source_bytes = source.read(_MAX_SOURCE_BYTES + 1)
+            source_bytes = source.read()
     except OSError as exc:
         raise ValueError(f"Cannot read dataset source {path!s}: {exc}") from exc
-    if len(source_bytes) > _MAX_SOURCE_BYTES:
-        raise ValueError(
-            "Dataset import source exceeds the 32 MiB supported-size limit."
-        )
     return ImportSourceSnapshot(
-        filepath=os.fspath(path),
         file_type="excel" if suffix == ".xlsx" else "csv",
         original_filename=path.name,
         exact_source_bytes=source_bytes,
@@ -289,9 +266,9 @@ class ResolvedSheetPlan:
     species_columns: Tuple[PhysicalColumn, ...]
     skip_unit_row: bool
     time_factor: float
-    conc_factors: Dict[str, float]
+    conc_factors: Mapping[str, float]
     original_time_unit: str
-    original_conc_units: Dict[str, str]
+    original_conc_units: Mapping[str, str]
 
     def __post_init__(self) -> None:
         species_columns = tuple(self.species_columns)
@@ -357,8 +334,15 @@ class ResolvedSheetPlan:
             )
         object.__setattr__(self, "species_columns", species_columns)
         object.__setattr__(self, "time_factor", float(self.time_factor))
-        object.__setattr__(self, "conc_factors", conc_factors)
-        object.__setattr__(self, "original_conc_units", original_conc_units)
+        # The worker retains this plan after GUI admission.  Copy caller
+        # mappings once, then expose read-only views so later caller edits
+        # cannot change worker normalization.
+        object.__setattr__(self, "conc_factors", MappingProxyType(conc_factors))
+        object.__setattr__(
+            self,
+            "original_conc_units",
+            MappingProxyType(original_conc_units),
+        )
 
 
 @dataclass(frozen=True)

@@ -14,13 +14,11 @@ class ObservationMappingError(ValueError):
 @dataclass(frozen=True)
 class ObservationMappingSuggestion:
     raw_observation_id: str
-    raw_column: str
     model_species: str
 
     def __post_init__(self) -> None:
         for value, label in (
             (self.raw_observation_id, "raw observation ID"),
-            (self.raw_column, "raw observation label"),
             (self.model_species, "model species"),
         ):
             if (
@@ -131,7 +129,7 @@ def suggest_observation_mapping(
     suggestions: list[ObservationMappingSuggestion] = []
     claimed_ids: set[str] = set()
     claimed_species: set[str] = set()
-    candidates: list[tuple[str, str, str]] = []
+    candidates: list[tuple[str, str]] = []
     for species_value in model_species:
         species = _canonical_text(species_value, "Model species name")
         exact = [
@@ -140,8 +138,8 @@ def suggest_observation_mapping(
             if raw_column == species
         ]
         if len(exact) == 1:
-            candidates.append((*exact[0], species))
-    for raw_id, raw_column, species in candidates:
+            candidates.append((exact[0][0], species))
+    for raw_id, species in candidates:
         if raw_id in claimed_ids or species in claimed_species:
             continue
         claimed_ids.add(raw_id)
@@ -149,7 +147,6 @@ def suggest_observation_mapping(
         suggestions.append(
             ObservationMappingSuggestion(
                 raw_observation_id=raw_id,
-                raw_column=raw_column,
                 model_species=species,
             )
         )

@@ -2,24 +2,26 @@
 
 from __future__ import annotations
 
-import time
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.gui.fitting.contracts import FitRunIdentity
+from kindred.gui.fitting.contracts import FitParametricSettings, FitRunIdentity
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.launch import (
-    FitDatasetLocalSettings,
     FitDatasetSetupEdit,
     FitDatasetWeightModeSetupEdit,
     FitDefaultsSetupEdit,
     FitInitialSetupEdit,
+    FitInitialScopeSetupEdit,
     FitOriginSnapshot,
     FitParameterSetupEdit,
+    FitParameterScopeSetupEdit,
     FitSetupSnapshot,
+    FitSolverSetupEdit,
     selected_observations,
 )
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
@@ -28,6 +30,8 @@ from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 from kindred.gui.fitting.worker import FitCandidate, FitCurveDataset, FitLiveUpdate
 
 __all__ = ["FittingWindow"]
+
+logger = logging.getLogger(__name__)
 
 
 class FittingWindow(QtWidgets.QDialog):
@@ -46,14 +50,14 @@ class FittingWindow(QtWidgets.QDialog):
     applyRequested = QtCore.Signal(object)
     addObservableRequested = QtCore.Signal(str, str, str, str, str)
     setupEditsRequested = QtCore.Signal(object)
-    restoreSetupRequested = QtCore.Signal(object)
+    resetRequested = QtCore.Signal(str)
     projectDefaultsRequested = QtCore.Signal(object)
 
     def __init__(
         self,
         origin: FitOriginSnapshot,
         *,
-        close_handler: Callable[[float], bool],
+        close_handler: Callable[[], bool],
         color_resolver: Callable[[str], object] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -68,15 +72,11 @@ class FittingWindow(QtWidgets.QDialog):
         self._origin = origin
         self._close_handler = close_handler
         self._color_resolver = color_resolver
+        self._closing = False
         self._closing_after_cleanup = False
         self._paused = False
-        self._initial_setup: FitSetupSnapshot | None = None
-        self._last_fit_setup: FitSetupSnapshot | None = None
-        self._snapshot_capture_id: str | None = None
         self._projected_setup: FitSetupSnapshot | None = None
         self._invalid_setup_edits: set[tuple[str, ...]] = set()
-        self._pending_target_changes = False
-        self._resolved_auto_modes: tuple[tuple[str, str], ...] = ()
         self._run_identity: FitRunIdentity | None = None
         self._executing = False
         self._setup_projecting = False
@@ -251,7 +251,7 @@ class FittingWindow(QtWidgets.QDialog):
         actions.addWidget(self._apply_button)
 
         self._project_defaults_button = QtWidgets.QPushButton(
-            "Use as Project Defaults", footer
+            "Save Optimizer Settings as Project Defaults", footer
         )
         self._project_defaults_button.clicked.connect(
             self._emit_project_defaults
@@ -267,15 +267,14 @@ class FittingWindow(QtWidgets.QDialog):
     def _connect_leaf_signals(self) -> None:
         self._connect_origin_dependent_leaf_signals()
 
-        self._data_tab.fitSettingsApplied.connect(self._on_fit_settings_applied)
+        self._data_tab.fitSettingsApplied.connect(self._on_data_settings_applied)
         self._data_tab.statusMessage.connect(self.set_status)
         self._data_tab.validityChanged.connect(self._refresh_setup_validity)
-
         self._params_ics_tab.setupEditsRequested.connect(
             self._on_leaf_setup_edits
         )
-        self._params_ics_tab.restoreSetupRequested.connect(
-            self.restoreSetupRequested
+        self._params_ics_tab.resetRequested.connect(
+            self.resetRequested
         )
         self._params_ics_tab.addObservableRequested.connect(
             self._on_add_observable_requested
@@ -302,16 +301,9 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._species_table.statusMessage.connect(self.set_status)
         dataset_list = self._data_targets_tab.unified_list
-        dataset_list.currentDatasetChanged.connect(
-            self._on_dataset_selected
-        )
         dataset_list.datasetIncludeChanged.connect(
             self._on_dataset_include_changed
         )
-        self._species_table.targetsApplied.connect(
-            self.commit_current_target_selection
-        )
-
     def _project_result_identity_labels(self) -> None:
         self._run_results_tab.set_identity_labels(
             dataset_labels={
@@ -330,9 +322,6 @@ class FittingWindow(QtWidgets.QDialog):
                 item.dataset_id for item in self._origin.mapped_datasets
             ),
             "available_species": self._mechanism_species(),
-            "available_rates": (),
-            "available_scalars": (),
-            "available_observables": {},
         }
 
     def _open_mechanism_inspector(self) -> None:
@@ -383,85 +372,80 @@ class FittingWindow(QtWidgets.QDialog):
         origin: FitOriginSnapshot,
         *,
         setup: FitSetupSnapshot,
-        preserve_snapshots: bool = False,
     ) -> None:
         if not isinstance(origin, FitOriginSnapshot):
             raise TypeError("origin must be FitOriginSnapshot.")
         self._check_snapshot_origin(setup, origin)
-        capture_changed = self._snapshot_capture_id != origin.capture_id
-        if origin is not self._origin and not preserve_snapshots:
+        if origin is not self._origin:
             self._replace_origin_dependent_presentation(origin)
-        elif origin is not self._origin:
-            # A preserving rebase retains widget-local pending/raw state.  The
-            # species view's origin is presentation identity only; accepted
-            # setup and mutation authority remain with FitSessionOwner.
-            self._species_table._origin = origin  # noqa: SLF001
-        if capture_changed:
-            if not preserve_snapshots:
-                self._initial_setup = None
-                self._last_fit_setup = None
-                self._invalid_setup_edits.clear()
-                self._pending_target_changes = False
-                self._clear_resolved_auto_modes()
-            else:
-                self._initial_setup = self._rebase_retained_snapshot(
-                    self._initial_setup,
-                    origin,
-                )
-                self._last_fit_setup = self._rebase_retained_snapshot(
-                    self._last_fit_setup,
-                    origin,
-                )
-            self._snapshot_capture_id = origin.capture_id
+            self._invalid_setup_edits.clear()
+            self._clear_resolved_auto_modes()
         self._origin = origin
-        if preserve_snapshots and capture_changed:
-            self._params_ics_tab._origin = origin  # noqa: SLF001
-        else:
-            self._params_ics_tab.set_origin(origin)
+        self._params_ics_tab.set_origin(origin)
         self._params_ics_tab.set_parameter_choices(
             **self._parameter_choices_for_origin()
         )
         self._project_result_identity_labels()
         self.project_setup_snapshot(setup)
 
-    def install_initial_snapshot(self, snapshot: FitSetupSnapshot) -> None:
+    def set_initial_reset_available(self, snapshot: FitSetupSnapshot) -> None:
         self._check_snapshot(snapshot)
-        self._initial_setup = snapshot
-        self._snapshot_capture_id = snapshot.origin_capture_id
-        self._params_ics_tab.install_initial_snapshot(snapshot)
+        self._params_ics_tab.set_initial_reset_available(snapshot)
 
-    def restore_snapshot(self, snapshot: FitSetupSnapshot) -> FitSetupSnapshot:
-        self._check_snapshot(snapshot)
-        # Initial/Last Fit are whole-setup replacements.  Rebuild the first
-        # presentation page so every target, data-range, weight, IC, and raw
-        # validation overlay is cleared without altering the retained reset
-        # snapshots themselves.
-        self._replace_origin_dependent_presentation(self._origin)
-        self._invalid_setup_edits.clear()
-        self._pending_target_changes = False
-        self._clear_resolved_auto_modes()
-        self._params_ics_tab._clear_invalid_numeric_state()  # noqa: SLF001
-        self.project_setup_snapshot(snapshot)
-        return snapshot
+    def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot | None) -> None:
+        """Project Last Fit reset availability without retaining the snapshot."""
+
+        if snapshot is not None:
+            self._check_snapshot(snapshot)
+        self._params_ics_tab.set_last_fit_reset_available(snapshot)
+
+    def clear_parameters_pending_edits(self) -> None:
+        """Clear Parameters-owned drafts and their window validity markers."""
+
+        self._params_ics_tab.clear_pending_setup_edits()
+        self._invalid_setup_edits.difference_update(
+            key
+            for key in tuple(self._invalid_setup_edits)
+            if key[0]
+            in {
+                "parameter",
+                "parameter_scope",
+                "initial",
+                "initial_global",
+                "initial_scope",
+                "defaults",
+                "solver",
+            }
+        )
+        self._species_table.refresh_validity_ui()
+        self._refresh_setup_validity()
 
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         """Project accepted baselines while retaining unrelated local edits."""
 
         self._check_snapshot(snapshot)
         self._projected_setup = snapshot
+        self._populate_dataset_list(snapshot)
+        selected_dataset_id = (
+            self._data_targets_tab.unified_list.selected_dataset_id()
+        )
         self._setup_projecting = True
         try:
-            self._species_table.project_setup_snapshot(snapshot)
             self._params_ics_tab.project_setup_snapshot(snapshot)
-            if self._initial_setup is not None:
-                self._params_ics_tab.install_initial_snapshot(
-                    self._initial_setup
-                )
-            self._params_ics_tab.set_last_fit_snapshot(self._last_fit_setup)
             self._params_ics_tab.set_selected_dataset_ids(
                 self._included_dataset_ids(snapshot)
             )
-            self._populate_dataset_list(snapshot)
+            self._species_table.project_setup_snapshot(
+                snapshot,
+                dataset_id=selected_dataset_id,
+            )
+            if selected_dataset_id:
+                self._data_tab.select_dataset(
+                    selected_dataset_id,
+                    self._data_targets_tab.unified_list.dataset_display_name(
+                        selected_dataset_id
+                    ),
+                )
         finally:
             self._setup_projecting = False
         self._species_table.refresh_validity_ui()
@@ -481,9 +465,72 @@ class FittingWindow(QtWidgets.QDialog):
         # Leaf projections update accepted baselines.  Their keyed pending/raw
         # overlays survive, and synchronous Apply handlers acknowledge only
         # the represented fields after this owner callback returns.
-        self.project_setup_snapshot(snapshot)
-        if self._pending_target_changes:
-            self._set_species_footer_dirty(True)
+        self._project_accepted_setup(snapshot, intents)
+
+    def _project_accepted_setup(
+        self,
+        snapshot: FitSetupSnapshot,
+        intents: tuple[object, ...],
+    ) -> None:
+        """Dispatch an acknowledgement to only the affected presentation rows."""
+
+        self._check_snapshot(snapshot)
+        self._projected_setup = snapshot
+        parameter_intents = tuple(
+            intent
+            for intent in intents
+            if isinstance(
+                intent,
+                (
+                    FitParameterSetupEdit,
+                    FitParameterScopeSetupEdit,
+                    FitDefaultsSetupEdit,
+                    FitSolverSetupEdit,
+                ),
+            )
+        )
+        dataset_projection = any(
+            isinstance(
+                intent,
+                (
+                    FitDatasetSetupEdit,
+                    FitDatasetWeightModeSetupEdit,
+                    FitInitialSetupEdit,
+                    FitInitialScopeSetupEdit,
+                ),
+            )
+            for intent in intents
+        )
+        self._setup_projecting = True
+        try:
+            self._params_ics_tab.project_setup_delta(
+                snapshot,
+                parameter_intents,
+            )
+            self._params_ics_tab.set_selected_dataset_ids(
+                self._included_dataset_ids(snapshot)
+            )
+            if dataset_projection:
+                self._populate_dataset_list(snapshot)
+                selected_dataset_id = (
+                    self._data_targets_tab.unified_list.selected_dataset_id()
+                )
+                self._species_table.project_setup_snapshot(
+                    snapshot,
+                    dataset_id=selected_dataset_id,
+                )
+                if selected_dataset_id:
+                    self._data_tab.select_dataset(
+                        selected_dataset_id,
+                        self._data_targets_tab.unified_list.dataset_display_name(
+                            selected_dataset_id
+                        ),
+                    )
+        finally:
+            self._setup_projecting = False
+        if dataset_projection:
+            self._species_table.refresh_validity_ui()
+        self._refresh_setup_validity()
 
     def reject_setup_edits(
         self,
@@ -506,6 +553,7 @@ class FittingWindow(QtWidgets.QDialog):
             or self._data_tab.invalid_editor_keys
             or self._data_range_validation_errors()
             or self._species_table.invalid_editor_keys
+            or self._species_table.has_pending_initial_changes
             or self._params_ics_tab.has_invalid_edits
         )
 
@@ -517,27 +565,20 @@ class FittingWindow(QtWidgets.QDialog):
             return ("dataset_weight_mode",)
         if isinstance(intent, FitParameterSetupEdit):
             return ("parameter", intent.parameter.name)
+        if isinstance(intent, FitParameterScopeSetupEdit):
+            return ("parameter_scope", intent.parameter_name)
         if isinstance(intent, FitInitialSetupEdit):
             return ("initial", intent.initial.set_id, intent.initial.species)
+        if isinstance(intent, FitInitialScopeSetupEdit):
+            return ("initial_scope", intent.species)
         if isinstance(intent, FitDefaultsSetupEdit):
             return ("defaults",)
+        if isinstance(intent, FitSolverSetupEdit):
+            return ("solver",)
         return ("unknown", type(intent).__name__)
 
     def _check_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         self._check_snapshot_origin(snapshot, self._origin)
-
-    @staticmethod
-    def _rebase_retained_snapshot(
-        snapshot: FitSetupSnapshot | None,
-        origin: FitOriginSnapshot,
-    ) -> FitSetupSnapshot | None:
-        if snapshot is None:
-            return None
-        return replace(
-            snapshot,
-            origin_tab_id=origin.tab_id,
-            origin_capture_id=origin.capture_id,
-        )
 
     @staticmethod
     def _check_snapshot_origin(
@@ -552,60 +593,15 @@ class FittingWindow(QtWidgets.QDialog):
         ):
             raise ValueError("Fit snapshot does not match this origin.")
 
-    @staticmethod
-    def _target_signature(
-        snapshot: FitSetupSnapshot,
-    ) -> tuple[tuple[object, ...], ...]:
-        return tuple(
-            (
-                item.dataset_id,
-                item.weight,
-                item.target_species,
-                item.target_weights,
-                item.observation_targets,
-            )
-            for item in snapshot.datasets
-        )
-
     def _on_leaf_setup_edits(self, intents: object) -> None:
+        if self._closing:
+            return
         if self._setup_projecting:
             return
         if not isinstance(intents, tuple) or not intents:
             self.set_status("Fit setup edits must be a nonempty tuple.")
             return
-        setup = self._projected_setup
-        target_change_requested = False
-        if setup is not None:
-            for intent in intents:
-                if isinstance(intent, FitDatasetSetupEdit):
-                    current = next(
-                        (
-                            item
-                            for item in setup.datasets
-                            if item.dataset_id == intent.dataset.dataset_id
-                        ),
-                        None,
-                    )
-                    if current is not None and (
-                        self._target_signature_for_dataset(current)
-                        != self._target_signature_for_dataset(intent.dataset)
-                    ):
-                        self._pending_target_changes = True
-                        target_change_requested = True
-        if target_change_requested:
-            self._refresh_setup_validity()
         self.setupEditsRequested.emit(intents)
-
-    @staticmethod
-    def _target_signature_for_dataset(
-        dataset: FitDatasetLocalSettings,
-    ) -> tuple[object, ...]:
-        return (
-            dataset.weight,
-            dataset.target_species,
-            dataset.target_weights,
-            dataset.observation_targets,
-        )
 
     def _refresh_setup_validity(self) -> None:
         invalid = self.has_invalid_setup_edits
@@ -647,11 +643,6 @@ class FittingWindow(QtWidgets.QDialog):
             if error
         )
 
-    def _set_species_footer_dirty(self, dirty: bool) -> None:
-        footer = getattr(self._species_table, "_footer", None)
-        if footer is not None:
-            footer.set_dirty(bool(dirty))
-
     def _populate_dataset_list(self, snapshot: FitSetupSnapshot) -> None:
         by_id = {item.dataset_id: item for item in self._origin.mapped_datasets}
         entries = [
@@ -665,11 +656,10 @@ class FittingWindow(QtWidgets.QDialog):
             }
             for dataset in snapshot.datasets
         ]
-        self._data_targets_tab.unified_list.populate(entries)
-        selected = self._data_targets_tab.unified_list.selected_dataset_id()
-        if selected:
-            self._species_table.load_for_dataset(selected)
-            self._data_tab.select_dataset(selected)
+        self._data_targets_tab.unified_list.populate(
+            entries,
+            emit_selection=False,
+        )
 
     # ------------------------------------------------------------------
     # Fit-local data and setup presentation adapters
@@ -716,29 +706,78 @@ class FittingWindow(QtWidgets.QDialog):
             return self._fit_default_settings_for_dataset(dataset_id)
         return {
             "t_start": dataset.t_start,
-            "solver": dataset.solver,
             "data_range_min": dataset.data_range_min,
             "data_range_max": dataset.data_range_max,
             "maximum_observations_per_target": dataset.maximum_observations_per_target,
+            "parametric_x": (
+                dataset.parametric.x_name if dataset.parametric is not None else "t"
+            ),
+            "parametric_mode": (
+                dataset.parametric.requested_mode
+                if dataset.parametric is not None
+                else "auto"
+            ),
+            "eligible_parametric_x": self._eligible_parametric_x(dataset_id),
         }
+
+    def _eligible_parametric_x(self, dataset_id: str) -> tuple[str, ...]:
+        setup = self._projected_setup
+        mapped = self._mapped_dataset(dataset_id)
+        if setup is None or mapped is None:
+            return ()
+        dataset = next(
+            item for item in setup.datasets if item.dataset_id == dataset_id
+        )
+        target_by_raw_id = dict(dataset.observation_targets)
+        resolved_observations = tuple(
+            (
+                observation,
+                target_by_raw_id.get(observation.raw_observation_id),
+            )
+            for observation in mapped.observations
+            if observation.raw_observation_id in target_by_raw_id
+        )
+        counts: dict[str, int] = {}
+        selected_raw_ids = {
+            observation.raw_observation_id
+            for observation, target in resolved_observations
+            if target in dataset.target_species
+        }
+        for _observation, target in resolved_observations:
+            if target is not None:
+                counts[target] = counts.get(target, 0) + 1
+        return tuple(
+            dict.fromkeys(
+                target
+                for observation, target in resolved_observations
+                if target is not None
+                and counts[target] == 1
+                and target not in dataset.target_species
+                and observation.raw_observation_id not in selected_raw_ids
+            )
+        )
 
     def _fit_default_settings_for_dataset(self, dataset_id: str) -> dict[str, object]:
         mapped = self._mapped_dataset(dataset_id)
         if mapped is None:
             return {
                 "t_start": 0.0,
-                "solver": "BDF",
                 "data_range_min": 0.0,
                 "data_range_max": 0.0,
                 "maximum_observations_per_target": None,
+                "parametric_x": "t",
+                "parametric_mode": "auto",
+                "eligible_parametric_x": (),
             }
         times = [float(value) for item in mapped.observations for value in item.t]
         return {
             "t_start": mapped.resolved_t_start,
-            "solver": "BDF",
             "data_range_min": min(times, default=mapped.resolved_t_start),
             "data_range_max": max(times, default=mapped.resolved_t_start),
             "maximum_observations_per_target": None,
+            "parametric_x": "t",
+            "parametric_mode": "auto",
+            "eligible_parametric_x": self._eligible_parametric_x(dataset_id),
         }
 
     def _retained_observations_for_dataset(
@@ -756,7 +795,6 @@ class FittingWindow(QtWidgets.QDialog):
         edited = replace(
             current,
             t_start=float(config.get("t_start", current.t_start)),
-            solver=str(config.get("solver", current.solver)),
             data_range_min=float(
                 config.get("data_range_min", current.data_range_min)
             ),
@@ -767,14 +805,9 @@ class FittingWindow(QtWidgets.QDialog):
                 "maximum_observations_per_target",
                 current.maximum_observations_per_target,
             ),
+            parametric=self._parametric_from_config(dataset_id, config),
         )
         return selected_observations(mapped, edited)
-
-    def _on_dataset_selected(self, dataset_id: str) -> None:
-        if not dataset_id:
-            return
-        self._species_table.load_for_dataset(dataset_id)
-        self._data_tab.select_dataset(dataset_id)
 
     def _on_dataset_include_changed(
         self,
@@ -801,7 +834,7 @@ class FittingWindow(QtWidgets.QDialog):
             )
         )
 
-    def _on_fit_settings_applied(self, dataset_id: str, config: dict) -> None:
+    def _on_data_settings_applied(self, dataset_id: str, config: dict) -> None:
         setup = self._projected_setup
         if setup is None:
             return
@@ -811,21 +844,46 @@ class FittingWindow(QtWidgets.QDialog):
         )
         if current is None:
             return
+        expected_fields = {
+            "t_start",
+            "data_range_min",
+            "data_range_max",
+            "maximum_observations_per_target",
+            "parametric_x",
+            "parametric_mode",
+        }
+        if set(config) != expected_fields:
+            self.set_status("Data settings edit carried invalid fields.")
+            return
         try:
+            parametric = self._parametric_from_config(dataset_id, config)
+            observation_targets = current.observation_targets
+            if parametric is not None:
+                current_targets = tuple(
+                    target
+                    for target in current.target_species
+                    if target != parametric.x_name
+                )
+                target_weights = tuple(
+                    (target, weight)
+                    for target, weight in current.target_weights
+                    if target in current_targets
+                )
+            else:
+                current_targets = current.target_species
+                target_weights = current.target_weights
             edited = replace(
                 current,
-                t_start=float(config.get("t_start", current.t_start)),
-                solver=str(config.get("solver", current.solver)),
-                data_range_min=float(
-                    config.get("data_range_min", current.data_range_min)
-                ),
-                data_range_max=float(
-                    config.get("data_range_max", current.data_range_max)
-                ),
-                maximum_observations_per_target=config.get(
-                    "maximum_observations_per_target",
-                    current.maximum_observations_per_target,
-                ),
+                t_start=float(config["t_start"]),
+                data_range_min=float(config["data_range_min"]),
+                data_range_max=float(config["data_range_max"]),
+                maximum_observations_per_target=config[
+                    "maximum_observations_per_target"
+                ],
+                parametric=parametric,
+                target_species=current_targets,
+                target_weights=target_weights,
+                observation_targets=observation_targets,
             )
             intent = FitDatasetSetupEdit(
                 origin_tab_id=self._origin.tab_id,
@@ -833,9 +891,25 @@ class FittingWindow(QtWidgets.QDialog):
                 dataset=edited,
             )
         except (TypeError, ValueError, OverflowError) as exc:
-            self.set_status(f"Sampling edit is invalid: {exc}")
+            self.set_status(f"Data settings edit is invalid: {exc}")
             return
         self._on_leaf_setup_edits((intent,))
+
+    @staticmethod
+    def _parametric_from_config(
+        dataset_id: str,
+        config: Mapping[str, object],
+    ) -> FitParametricSettings | None:
+        x_name = str(config.get("parametric_x", "t") or "t")
+        if x_name == "t":
+            return None
+        mode = str(config.get("parametric_mode", "auto") or "auto")
+        return FitParametricSettings(
+            dataset_id=dataset_id,
+            x_name=x_name,
+            requested_mode=mode,
+            resolved_mode=None if mode == "auto" else mode,
+        )
 
     def _on_add_observable_requested(self, selection: object) -> None:
         if not isinstance(selection, Mapping):
@@ -875,20 +949,19 @@ class FittingWindow(QtWidgets.QDialog):
 
     @property
     def has_pending_target_changes(self) -> bool:
-        return bool(
-            self._pending_target_changes
-            or self._species_table.has_pending_target_changes
-        )
+        return self._species_table.has_pending_target_changes
 
-    def commit_current_target_selection(self) -> None:
-        self._pending_target_changes = False
-        self._set_species_footer_dirty(False)
-        self._refresh_setup_validity()
+    def add_observable_conflict(self, dataset_id: str) -> str | None:
+        """Expose the target leaf's same-dataset Add Observable guard."""
+
+        return self._species_table.add_observable_conflict(dataset_id)
 
     def _is_executing(self) -> bool:
         return bool(self._executing)
 
     def _request_execute(self) -> None:
+        if self._closing:
+            return
         if self.has_invalid_setup_edits:
             self.set_status(
                 "Fit setup contains an invalid edit; correct it before running."
@@ -902,7 +975,7 @@ class FittingWindow(QtWidgets.QDialog):
         self.executeRequested.emit()
 
     def _toggle_pause(self) -> None:
-        if not self._executing:
+        if self._closing or not self._executing:
             return
         if self._paused:
             self._resume_from_button()
@@ -913,7 +986,7 @@ class FittingWindow(QtWidgets.QDialog):
         self.pauseRequested.emit()
 
     def _resume_from_button(self) -> None:
-        if not self._executing:
+        if self._closing or not self._executing:
             return
         self._paused = False
         self._pause_button.setEnabled(True)
@@ -952,6 +1025,9 @@ class FittingWindow(QtWidgets.QDialog):
         self.set_status(text)
 
     def set_status(self, text: str) -> None:
+        if self._closing and not self._closing_after_cleanup:
+            self._status.setText("Stopping…")
+            return
         self._status.setText(self._display_text(text))
 
     def _display_text(self, text: object) -> str:
@@ -994,10 +1070,10 @@ class FittingWindow(QtWidgets.QDialog):
         normalized = tuple((str(dataset_id), str(mode)) for dataset_id, mode in modes)
         if len(normalized) != len({dataset_id for dataset_id, _mode in normalized}):
             raise ValueError("Resolved Auto modes repeat a dataset ID.")
-        self._resolved_auto_modes = normalized
+        self._data_tab.set_resolved_auto_modes(normalized)
 
     def _clear_resolved_auto_modes(self) -> None:
-        self._resolved_auto_modes = ()
+        self._data_tab.set_resolved_auto_modes(())
 
     def set_run_identity(self, identity: FitRunIdentity) -> None:
         if not isinstance(identity, FitRunIdentity):
@@ -1016,23 +1092,10 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> bool:
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be FitCandidate.")
-        known = {
-            "parameters",
-            "initial_concentrations",
-            "observable_definitions",
-        }
         available = frozenset(str(scope) for scope in available_scopes)
         reasons = {
             str(scope): str(reason or "") for scope, reason in unavailable_reasons.items()
         }
-        if (
-            not available.issubset(known)
-            or set(reasons) != known - available
-            or any(not reason for reason in reasons.values())
-        ):
-            raise ValueError("Fit Apply feasibility is invalid.")
-        self._last_fit_setup = candidate.setup_snapshot
-        self._params_ics_tab.set_last_fit_snapshot(self._last_fit_setup)
         self._run_identity = candidate.run_identity
         self.set_resolved_auto_modes(candidate.resolved_auto_modes)
         self._copy_run_json.setEnabled(True)
@@ -1064,34 +1127,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._copy_run_json.setEnabled(False)
         self._results_summary_button.setEnabled(False)
 
-    def update_candidate_apply_feasibility(
-        self,
-        available_scopes: frozenset[str],
-        unavailable_reasons: Mapping[str, str],
-    ) -> None:
-        known = {
-            "parameters",
-            "initial_concentrations",
-            "observable_definitions",
-        }
-        available = frozenset(str(scope) for scope in available_scopes)
-        reasons = {
-            str(scope): str(reason or "")
-            for scope, reason in unavailable_reasons.items()
-        }
-        if (
-            not available.issubset(known)
-            or set(reasons) != known - available
-            or any(not reason for reason in reasons.values())
-        ):
-            raise ValueError("Fit Apply feasibility is invalid.")
-        for checkbox, scope in self._apply_controls():
-            checkbox.setEnabled(scope in available)
-            if scope not in available:
-                checkbox.setChecked(False)
-            checkbox.setToolTip(reasons.get(scope, ""))
-        self._refresh_apply_button()
-
     def _apply_controls(self):
         return (
             (self._apply_parameters, "parameters"),
@@ -1100,6 +1135,8 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _emit_apply(self) -> None:
+        if self._closing:
+            return
         scopes = frozenset(
             scope
             for checkbox, scope in self._apply_controls()
@@ -1122,6 +1159,8 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _emit_project_defaults(self) -> None:
+        if self._closing:
+            return
         setup = self._projected_setup
         if setup is not None:
             self.projectDefaultsRequested.emit(setup.defaults)
@@ -1130,8 +1169,16 @@ class FittingWindow(QtWidgets.QDialog):
         if self._run_identity is None:
             self.set_status("No completed Fit run is available to copy.")
             return
-        clipboard = QtWidgets.QApplication.clipboard()
-        clipboard.setText(self._run_identity.readable_json())
+        try:
+            self._run_results_tab.copy_run_identity_json()
+        except Exception as exc:
+            logger.exception(
+                "Failed to copy Fit run JSON (%s): %s",
+                type(exc).__name__,
+                exc,
+            )
+            self.set_status("Failed to copy Fit run JSON.")
+            return
         self.set_status("Copied the complete Fit run JSON.")
 
     def _set_copy_available(self, available: bool) -> None:
@@ -1165,13 +1212,47 @@ class FittingWindow(QtWidgets.QDialog):
         self._closing_after_cleanup = True
         self.close()
 
+    def reject(self) -> None:
+        """Route QDialog dismissal through the owner-controlled close fence."""
+
+        if self._closing:
+            return
+        self.close()
+
+    def enter_stopping(self) -> None:
+        """Make the presentation inert until owner-authorized cleanup closes it."""
+
+        if self._closing_after_cleanup:
+            return
+        self._closing = True
+        self._status.setText("Stopping…")
+        self._tabs.setEnabled(False)
+        self._current_tab_stack.setEnabled(False)
+        self._data_targets_tab.setEnabled(False)
+        self._params_ics_tab.setEnabled(False)
+        self._run_button.setEnabled(False)
+        self._cancel_button.setEnabled(False)
+        self._pause_button.setEnabled(False)
+        self._resume_button.setEnabled(False)
+        self._results_summary_button.setEnabled(False)
+        self._copy_button.setEnabled(False)
+        self._copy_run_json.setEnabled(False)
+        for checkbox, _scope in self._apply_controls():
+            checkbox.setEnabled(False)
+        self._apply_button.setEnabled(False)
+        self._project_defaults_button.setEnabled(False)
+        self._close_button.setEnabled(False)
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if self._closing_after_cleanup:
             event.accept()
             return
-        if self._close_handler(time.monotonic() + 2.0):
+        if self._closing:
+            event.ignore()
+            return
+        self.enter_stopping()
+        if self._close_handler():
             self._closing_after_cleanup = True
             event.accept()
         else:
-            self.set_status("Fit is still stopping; close was deferred.")
             event.ignore()

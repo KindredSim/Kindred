@@ -177,10 +177,14 @@ def _plain_json(value: object) -> object:
 
 @dataclass(frozen=True, slots=True)
 class FitRunIdentity:
-    """Deeply immutable canonical run object and its exact JSON projections."""
+    """Deeply immutable compact scientific run identity.
+
+    The identity retains only scalar metadata and digest descriptors.  The
+    canonical bytes used to derive ``short_hash`` are intentionally transient;
+    verbose export is a presentation concern and is assembled on demand.
+    """
 
     payload: Mapping[str, object]
-    canonical_bytes: bytes
     short_hash: str
 
     @classmethod
@@ -197,7 +201,6 @@ class FitRunIdentity:
         ).encode("ascii")
         return cls(
             payload=_freeze_json(normalized),
-            canonical_bytes=encoded,
             short_hash=hashlib.sha256(encoded).hexdigest()[:12],
         )
 

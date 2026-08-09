@@ -18,14 +18,16 @@ from kindred.core.project_document import (
     FitDefaults,
     InitialConditionSet,
     MechanismTabDocument,
-    ObservationSeries,
     ProjectDocument,
-    RawDatasetRecord,
     SimulationExecutionSettings,
     TabScientificSettings,
+)
+from kindred.core.datasets.foundation import (
+    ImportedSource,
+    ObservationSeries,
+    RawDatasetRecord,
     freeze_json_value,
     thaw_json_value,
-    validate_project_document,
 )
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
@@ -45,11 +47,6 @@ __all__ = [
 CURRENT_PROJECT_FORMAT = "kindred-kin-4"
 _PROJECT_MEMBER = "project.json"
 _SOURCE_MEMBER_PREFIX = "sources/"
-_MAX_ARCHIVE_MEMBERS = 257
-_MAX_SOURCE_MEMBER_BYTES = 32 * 1024 * 1024
-_MAX_PROJECT_MEMBER_BYTES = 128 * 1024 * 1024
-_MAX_ARCHIVE_MEMBER_BYTES = 512 * 1024 * 1024
-_MAX_ARCHIVE_FILE_BYTES = 513 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +200,7 @@ def _encode_science(
         "temperature": settings.temperature,
         "rtol": settings.rtol,
         "atol": settings.atol,
-        "sparse_jacobian_policy": settings.sparse_jacobian_policy,
+        "analytic_jacobian_policy": settings.analytic_jacobian_policy,
         "wegscheider_policy": settings.wegscheider_policy,
     }
 
@@ -219,7 +216,7 @@ def _decode_science(
             "temperature",
             "rtol",
             "atol",
-            "sparse_jacobian_policy",
+            "analytic_jacobian_policy",
             "wegscheider_policy",
         },
     )
@@ -230,9 +227,9 @@ def _decode_science(
         ),
         rtol=_finite(data["rtol"], f"{label}.rtol"),
         atol=_finite(data["atol"], f"{label}.atol"),
-        sparse_jacobian_policy=_boolean(
-            data["sparse_jacobian_policy"],
-            f"{label}.sparse_jacobian_policy",
+        analytic_jacobian_policy=_boolean(
+            data["analytic_jacobian_policy"],
+            f"{label}.analytic_jacobian_policy",
         ),
         wegscheider_policy=_boolean(
             data["wegscheider_policy"],
@@ -282,17 +279,25 @@ def _encode_document(
     document: ProjectDocument,
 ) -> tuple[dict[str, object], tuple[tuple[str, bytes], ...]]:
     source_members: list[tuple[str, bytes]] = []
-    datasets: list[dict[str, object]] = []
-    for index, dataset in enumerate(document.datasets):
+    source_payloads: list[dict[str, object]] = []
+    for index, source in enumerate(document.imported_sources):
         source_member = f"{_SOURCE_MEMBER_PREFIX}{index:08d}.bin"
-        source_members.append((source_member, dataset.exact_source_bytes))
+        source_members.append((source_member, source.exact_source_bytes))
+        source_payloads.append(
+            {
+                "source_id": source.source_id,
+                "original_filename": source.original_filename,
+                "original_format": source.original_format,
+                "source_member": source_member,
+            }
+        )
+    datasets: list[dict[str, object]] = []
+    for dataset in document.datasets:
         datasets.append(
             {
                 "dataset_id": dataset.dataset_id,
                 "display_name": dataset.display_name,
-                "original_filename": dataset.original_filename,
-                "original_format": dataset.original_format,
-                "source_member": source_member,
+                "source_id": dataset.source_id,
                 "source_metadata": thaw_json_value(
                     dataset.source_metadata
                 ),
@@ -310,6 +315,7 @@ def _encode_document(
         )
     payload = {
         "project_id": document.project_id,
+        "sources": source_payloads,
         "datasets": datasets,
         "tabs": [
             {
@@ -396,10 +402,39 @@ def _decode_document(
     data = _exact_fields(
         value,
         "document",
-        {"project_id", "datasets", "tabs", "fit_defaults"},
+        {"project_id", "sources", "datasets", "tabs", "fit_defaults"},
     )
+    sources: list[ImportedSource] = []
+    source_ids: set[str] = set()
+    source_members: set[str] = set()
+    for index, raw_source in enumerate(_array(data["sources"], "document.sources")):
+        label = f"document.sources[{index}]"
+        item = _exact_fields(
+            raw_source,
+            label,
+            {"source_id", "original_filename", "original_format", "source_member"},
+        )
+        source_member = _string(item["source_member"], f"{label}.source_member", nonblank=True)
+        expected_member = f"{_SOURCE_MEMBER_PREFIX}{index:08d}.bin"
+        if source_member != expected_member:
+            raise ValueError(f"{label}.source_member must be {expected_member!r}.")
+        if source_member not in source_bytes_by_member:
+            raise ValueError(f"Archive is missing source member {source_member!r}.")
+        source_id = _string(item["source_id"], f"{label}.source_id", nonblank=True)
+        if source_id in source_ids:
+            raise ValueError(f"Duplicate imported source ID {source_id!r}.")
+        source_ids.add(source_id)
+        source_members.add(source_member)
+        sources.append(
+            ImportedSource(
+                source_id=source_id,
+                original_filename=_string(item["original_filename"], f"{label}.original_filename", nonblank=True),
+                original_format=_string(item["original_format"], f"{label}.original_format", nonblank=True),
+                exact_source_bytes=source_bytes_by_member[source_member],
+            )
+        )
     datasets: list[RawDatasetRecord] = []
-    referenced_members: list[str] = []
+    referenced_source_ids: set[str] = set()
     for index, raw_dataset in enumerate(
         _array(data["datasets"], "document.datasets")
     ):
@@ -410,33 +445,15 @@ def _decode_document(
             {
                 "dataset_id",
                 "display_name",
-                "original_filename",
-                "original_format",
-                "source_member",
+                "source_id",
                 "source_metadata",
                 "observations",
             },
         )
-        source_member = _string(
-            item["source_member"],
-            f"{label}.source_member",
-            nonblank=True,
-        )
-        expected_member = f"{_SOURCE_MEMBER_PREFIX}{index:08d}.bin"
-        if source_member != expected_member:
-            raise ValueError(
-                f"{label}.source_member must be {expected_member!r}."
-            )
-        if source_member not in source_bytes_by_member:
-            raise ValueError(
-                f"Archive is missing source member {source_member!r}."
-            )
-        if not source_bytes_by_member[source_member]:
-            raise ValueError(
-                f"{label} exact source member {source_member!r} "
-                "must be nonempty."
-            )
-        referenced_members.append(source_member)
+        source_id = _string(item["source_id"], f"{label}.source_id", nonblank=True)
+        if source_id not in source_ids:
+            raise ValueError(f"{label}.source_id references an unknown imported source.")
+        referenced_source_ids.add(source_id)
         observations: list[ObservationSeries] = []
         for series_index, raw_series in enumerate(
             _array(item["observations"], f"{label}.observations")
@@ -509,23 +526,15 @@ def _decode_document(
                     f"{label}.display_name",
                     nonblank=True,
                 ),
-                original_filename=_string(
-                    item["original_filename"],
-                    f"{label}.original_filename",
-                    nonblank=True,
-                ),
-                original_format=_string(
-                    item["original_format"],
-                    f"{label}.original_format",
-                    nonblank=True,
-                ),
-                exact_source_bytes=source_bytes_by_member[source_member],
+                source_id=source_id,
                 source_metadata=freeze_json_value(item["source_metadata"]),
                 observations=tuple(observations),
             )
         )
-    if set(referenced_members) != set(source_bytes_by_member):
-        raise ValueError("Archive contains an unreferenced source member.")
+    if referenced_source_ids != source_ids:
+        raise ValueError("Archive contains an unreferenced imported source.")
+    if source_members != set(source_bytes_by_member):
+        raise ValueError("Archive contains an unreferenced or unknown source member.")
 
     tabs: list[MechanismTabDocument] = []
     for index, raw_tab in enumerate(
@@ -722,20 +731,19 @@ def _decode_document(
                 dataset_links=tuple(links),
             )
         )
-    return validate_project_document(
-        ProjectDocument(
-            project_id=_string(
-                data["project_id"],
-                "document.project_id",
-                nonblank=True,
-            ),
-            datasets=tuple(datasets),
-            tabs=tuple(tabs),
-            fit_defaults=_decode_fit(
-                data["fit_defaults"],
-                "document.fit_defaults",
-            ),
-        )
+    return ProjectDocument(
+        project_id=_string(
+            data["project_id"],
+            "document.project_id",
+            nonblank=True,
+        ),
+        imported_sources=tuple(sources),
+        datasets=tuple(datasets),
+        tabs=tuple(tabs),
+        fit_defaults=_decode_fit(
+            data["fit_defaults"],
+            "document.fit_defaults",
+        ),
     )
 
 
@@ -983,12 +991,13 @@ def _encode_project(
     document: ProjectDocument,
     presentation: WorkspacePresentationState,
 ) -> tuple[dict[str, object], tuple[tuple[str, bytes], ...]]:
-    validated = validate_project_document(document)
+    if not isinstance(document, ProjectDocument):
+        raise TypeError("document must be ProjectDocument.")
     workspace_presentation = validate_workspace_presentation_state(
-        validated,
+        document,
         presentation,
     )
-    encoded_document, source_members = _encode_document(validated)
+    encoded_document, source_members = _encode_document(document)
     return (
         {
             "format": CURRENT_PROJECT_FORMAT,
@@ -1065,16 +1074,13 @@ def _decode_project(
                 ),
             )
         )
-    workspace_presentation = validate_workspace_presentation_state(
-        document,
-        WorkspacePresentationState(
-            active_tab_id=_string(
-                workspace["active_tab_id"],
-                "workspace.active_tab_id",
-                nonblank=True,
-            ),
-            presentation_by_tab_id=tuple(presentations),
+    workspace_presentation = WorkspacePresentationState(
+        active_tab_id=_string(
+            workspace["active_tab_id"],
+            "workspace.active_tab_id",
+            nonblank=True,
         ),
+        presentation_by_tab_id=tuple(presentations),
     )
     return ArchiveProject(
         document=document,
@@ -1087,19 +1093,9 @@ class KinArchiveStore:
 
     def load(self, path: str | os.PathLike[str]) -> ArchiveProject:
         archive_path = os.path.abspath(os.fspath(path))
-        if os.stat(archive_path).st_size > _MAX_ARCHIVE_FILE_BYTES:
-            raise ValueError(
-                "Current project archive exceeds the 513 MiB "
-                "supported-size limit."
-            )
         try:
             with zipfile.ZipFile(archive_path, mode="r") as archive:
                 members = archive.infolist()
-                if len(members) > _MAX_ARCHIVE_MEMBERS:
-                    raise ValueError(
-                        "Current project archive exceeds the 257-member "
-                        "supported-size limit."
-                    )
                 names = [member.filename for member in members]
                 if len(names) != len(set(names)):
                     raise ValueError(
@@ -1122,27 +1118,6 @@ class KinArchiveStore:
                         "Current project archive members must be stored "
                         "without compression."
                     )
-                aggregate_member_bytes = 0
-                for member in members:
-                    member_bytes = int(member.file_size)
-                    aggregate_member_bytes += member_bytes
-                    if aggregate_member_bytes > _MAX_ARCHIVE_MEMBER_BYTES:
-                        raise ValueError(
-                            "Current project archive exceeds the 512 MiB "
-                            "aggregate-member supported-size limit."
-                        )
-                    member_limit = (
-                        _MAX_PROJECT_MEMBER_BYTES
-                        if member.filename == _PROJECT_MEMBER
-                        else _MAX_SOURCE_MEMBER_BYTES
-                    )
-                    if member_bytes > member_limit:
-                        raise ValueError(
-                            f"Current project archive member "
-                            f"{member.filename!r} exceeds the "
-                            f"{member_limit // (1024 * 1024)} MiB "
-                            "supported-size limit."
-                        )
                 project_bytes = archive.read(_PROJECT_MEMBER)
                 source_bytes = {
                     name: archive.read(name)
@@ -1183,30 +1158,6 @@ class KinArchiveStore:
             )
             + "\n"
         ).encode("utf-8")
-        if len(source_members) + 1 > _MAX_ARCHIVE_MEMBERS:
-            raise ValueError(
-                "Current project archive exceeds the 257-member "
-                "supported-size limit."
-            )
-        if len(encoded) > _MAX_PROJECT_MEMBER_BYTES:
-            raise ValueError(
-                "Current project archive project.json exceeds the 128 MiB "
-                "supported-size limit."
-            )
-        aggregate_member_bytes = len(encoded)
-        for member_name, source_bytes in source_members:
-            source_size = len(source_bytes)
-            if source_size > _MAX_SOURCE_MEMBER_BYTES:
-                raise ValueError(
-                    f"Current project archive member {member_name!r} "
-                    "exceeds the 32 MiB supported-size limit."
-                )
-            aggregate_member_bytes += source_size
-        if aggregate_member_bytes > _MAX_ARCHIVE_MEMBER_BYTES:
-            raise ValueError(
-                "Current project archive exceeds the 512 MiB "
-                "aggregate-member supported-size limit."
-            )
 
         descriptor: int | None = None
         temporary_path = ""
@@ -1239,11 +1190,6 @@ class KinArchiveStore:
                     for member_name, source_bytes in source_members:
                         archive.writestr(member_name, source_bytes)
                 handle.flush()
-                if os.fstat(handle.fileno()).st_size > _MAX_ARCHIVE_FILE_BYTES:
-                    raise ValueError(
-                        "Current project archive exceeds the 513 MiB "
-                        "supported-size limit."
-                    )
             try:
                 existing_mode = stat.S_IMODE(os.stat(archive_path).st_mode)
             except FileNotFoundError:

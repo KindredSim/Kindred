@@ -9,7 +9,6 @@ from kindred.core.equilibrium_rate_authority import (
 )
 from kindred.core.validation import try_parse_int
 
-_CANONICAL_NAME_RE = re.compile(r"^(k|kf|kr|Keq)([1-9]\d*)$")
 _PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:K|k|kf|kr|Keq)([1-9]\d*)$", re.IGNORECASE)
 
 
@@ -129,10 +128,6 @@ class _StepNamespacePolicy:
 
 def is_protected_indexed_identifier(raw_name: str) -> bool:
     return bool(_PROTECTED_INDEXED_IDENTIFIER_RE.fullmatch(str(raw_name or "")))
-
-
-def is_canonical_indexed_identifier(raw_name: str) -> bool:
-    return bool(_CANONICAL_NAME_RE.fullmatch(str(raw_name or "")))
 
 
 def protected_indexed_identifier_step_index(raw_name: str) -> int | None:
@@ -343,64 +338,4 @@ def canonical_name_for_mechanism_step_parameter(
     raise ValueError(
         f"Cannot resolve authoritative mechanism parameter name {expected_name!r}: "
         f"{candidate!r} is not a canonical parameter in the mechanism namespace."
-    )
-
-
-def build_namespace_from_ir_steps(steps: Sequence[object]) -> MechanismParameterNamespace:
-    descriptors: list[_NamespaceStepDescriptor] = []
-    authored_step_index = 0
-    for source_index, step in enumerate(steps):
-        policy = _namespace_policy_from_step(step)
-        authored_step_index += 1
-        descriptors.append(
-            _NamespaceStepDescriptor(
-                step_index=authored_step_index,
-                step_kind=policy.step_kind,
-                has_explicit_keq=policy.has_explicit_keq,
-                source_index=source_index,
-            )
-        )
-    return _build_namespace(descriptors)
-
-
-def build_namespace_from_canonical_names(canonical_names: Iterable[str]) -> MechanismParameterNamespace:
-    """
-    Build a namespace from already-canonical parameter names.
-
-    This is for test/support contexts that already own canonical names. Production
-    mechanism behavior should prefer mechanism-backed namespace construction.
-    """
-    ordered_names: list[str] = []
-    seen: set[str] = set()
-    for raw_name in canonical_names:
-        name = str(raw_name)
-        match = _CANONICAL_NAME_RE.match(name)
-        if match is None:
-            raise ValueError(
-                f"Canonical-name namespace requires already-canonical names; got {name!r}."
-            )
-        if name in seen:
-            continue
-        seen.add(name)
-        ordered_names.append(name)
-    canonical_by_lower = _canonical_lookup(ordered_names)
-    ordered_items = tuple(
-        MechanismParameterNamespaceItem(
-            canonical_name=name,
-            info=MechanismParameterInfo(
-                canonical_name=name,
-                step_index=None,
-                step_kind=None,
-                role=None,
-                has_explicit_keq=None,
-            ),
-            source_index=None,
-        )
-        for name in ordered_names
-    )
-    return MechanismParameterNamespace(
-        canonical_names=frozenset(ordered_names),
-        canonical_by_lower=canonical_by_lower,
-        info_by_name={item.canonical_name: item.info for item in ordered_items},
-        ordered_items=ordered_items,
     )

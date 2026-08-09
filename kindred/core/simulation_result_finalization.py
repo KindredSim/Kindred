@@ -10,7 +10,7 @@ from kindred.core import simulation_algebra_policy
 from kindred.core.equilibrium_rate_authority import effective_equilibrium_keq
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
-from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
 from kindred.core.result_repository import (
     SimulationResultProvenance,
     SimulationResultValue,
@@ -64,23 +64,33 @@ def _initials_for_algebra(
     }
 
 
-def _prepared_static_scalar_snapshot(mechanism: object) -> dict[str, float]:
+def _prepared_static_scalar_snapshot(
+    mechanism: object,
+    parameter_algebra_spec: object,
+) -> dict[str, float]:
     """Read the complete static scalar map already bound during preparation."""
 
     metadata = getattr(mechanism, "metadata", {}) or {}
     if not isinstance(metadata, Mapping):
         raise TypeError("prepared mechanism metadata must be a mapping.")
-    parameter_spec = metadata.get("parameter_algebra_spec")
-    if parameter_spec is None:
-        return {}
-    assignment_names = getattr(parameter_spec, "param_assignment_names", None)
+    if parameter_algebra_spec is None:
+        raise TypeError(
+            "prepared scalar snapshot requires its retained parameter algebra spec."
+        )
+    assignment_names = getattr(
+        parameter_algebra_spec,
+        "param_assignment_names",
+        None,
+    )
     if not callable(assignment_names):
         raise TypeError(
             "prepared parameter Algebra spec must expose assignment names."
         )
     mechanism_names = {
         str(name)
-        for name in getattr(parameter_spec, "mechanism_param_names", ()) or ()
+        for name in (
+            getattr(parameter_algebra_spec, "mechanism_param_names", ()) or ()
+        )
     }
     scalar_names = tuple(
         sorted(
@@ -126,6 +136,7 @@ def build_simulation_row_algebra_context(
     mechanism: object,
     times: np.ndarray,
     *,
+    parameter_algebra_spec: object,
     temperature_schedule: TemperatureScheduleProtocol | Mapping[str, object] | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Build the sole row-local temperature/coefficient/static context.
@@ -204,7 +215,10 @@ def build_simulation_row_algebra_context(
             if len(values) == temperatures.size
         }
     )
-    return symbol_series, _prepared_static_scalar_snapshot(mechanism)
+    return symbol_series, _prepared_static_scalar_snapshot(
+        mechanism,
+        parameter_algebra_spec,
+    )
 
 
 def evaluate_simulation_result_algebra(
@@ -214,7 +228,8 @@ def evaluate_simulation_result_algebra(
     species_names: list[str],
     initials_for_algebra: Mapping[str, Any] | None,
     temperature_schedule: TemperatureScheduleProtocol | Mapping[str, object] | None,
-    simulation_plan: SimulationPlan | Mapping[str, Any] | None,
+    parameter_algebra_spec: object,
+    algebra_policy: SimulationAlgebraPolicy | str,
 ) -> FinalizedSimulationResult:
     base_species_names = [str(name) for name in species_names]
     if (
@@ -262,8 +277,8 @@ def evaluate_simulation_result_algebra(
             algebra_scalars=algebra_scalars,
             algebra_errors=algebra_errors,
         )
-    policy = simulation_algebra_policy.algebra_policy_from_simulation_plan(
-        simulation_plan,
+    policy = simulation_algebra_policy.coerce_simulation_algebra_policy(
+        algebra_policy,
         default=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
     )
     authority_error: Exception | None = None
@@ -272,6 +287,7 @@ def evaluate_simulation_result_algebra(
             mechanism,
             result_t,
             temperature_schedule=temperature_schedule,
+            parameter_algebra_spec=parameter_algebra_spec,
         )
     except Exception as exc:
         # Keep authority/schedule failures inside the existing policy boundary:
@@ -343,7 +359,6 @@ def evaluate_simulation_result_algebra(
             species_series=species_series,
             initials=initials,
             gui_evaluator=_best_effort_evaluator,
-            batch_evaluator=_strict_evaluator,
         )
     algebra_scalars = dict(evaluation.scalars)
     algebra_errors = list(evaluation.errors)
@@ -415,7 +430,8 @@ def finalize_simulation_result(
     species_names: list[str],
     initials_for_algebra: Mapping[str, Any] | None,
     temperature_schedule: TemperatureScheduleProtocol | Mapping[str, object] | None,
-    simulation_plan: SimulationPlan | Mapping[str, Any] | None,
+    parameter_algebra_spec: object,
+    algebra_policy: SimulationAlgebraPolicy | str,
     parameters: tuple[tuple[str, float, str], ...] = (),
     preparation_warnings: list[str] | tuple[str, ...] = (),
 ) -> SimulationResultValue:
@@ -454,7 +470,8 @@ def finalize_simulation_result(
         species_names=species_names,
         initials_for_algebra=initials_for_algebra,
         temperature_schedule=temperature_schedule,
-        simulation_plan=simulation_plan,
+        parameter_algebra_spec=parameter_algebra_spec,
+        algebra_policy=algebra_policy,
     )
     solver_provenance = getattr(result, "provenance", None)
     if not isinstance(solver_provenance, Mapping):
@@ -510,4 +527,5 @@ def finalize_simulation_result(
             algebra_errors=tuple(finalized.algebra_errors),
         ),
         intervention_execution=getattr(result, "intervention_execution"),
+        presentation_boundaries=result.presentation_boundaries,
     )

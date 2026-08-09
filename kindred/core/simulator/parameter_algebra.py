@@ -39,7 +39,6 @@ from kindred.core.mechanism_metadata import (
 from kindred.core.rate_binding import ForwardRateBinding, RateBinding
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import (
-    MechanismParameterNamespace,
     build_namespace_from_mechanism,
 )
 from kindred.core.simulator.parameter_algebra_eval import (
@@ -48,13 +47,8 @@ from kindred.core.simulator.parameter_algebra_eval import (
 )
 from kindred.core.simulator.parameter_algebra_spec import (
     ParameterAlgebraSpec,
-    ParameterAssignment,
     ParameterOverrideWarning,
-    extract_parameter_assignments_from_algebra_lines,
-    extract_parameter_assignments_from_dsl_text,
-    extract_observable_names_from_algebra_lines,
     mechanism_parameter_name_pattern,
-    parse_parameter_algebra_spec_from_dsl_text,
 )
 from kindred.core.simulator.step_indexing import (
     get_step_index_map,
@@ -67,24 +61,8 @@ _MECH_PARAM_RE = mechanism_parameter_name_pattern()
 _WEGSCHEIDER_META_KEY = "wegscheider_cyclicity_enabled"
 _PARAMETER_ALGEBRA_SPEC_META_KEY = "parameter_algebra_spec"
 
-_PUBLIC_REEXPORTS = (
-    ParameterAssignment,
-    ParameterAlgebraSpec,
-    ParameterOverrideWarning,
-    extract_parameter_assignments_from_algebra_lines,
-    extract_parameter_assignments_from_dsl_text,
-    extract_observable_names_from_algebra_lines,
-    parse_parameter_algebra_spec_from_dsl_text,
-    evaluate_parameter_algebra,
-)
-
-
-def mechanism_parameter_namespace(mechanism: object) -> MechanismParameterNamespace:
-    return build_namespace_from_mechanism(mechanism)
-
-
 def mechanism_parameter_names(mechanism: object) -> Set[str]:
-    return mechanism_parameter_namespace(mechanism).flat_names()
+    return build_namespace_from_mechanism(mechanism).flat_names()
 
 
 def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[str]] = None) -> Dict[str, float]:
@@ -233,7 +211,6 @@ def _set_mechanism_param(
         )
         model = forward_rate_model_for_reaction(
             rxn,
-            default_kappa=float(metadata.kappa_global),
             default_standard_conc_M=float(metadata.standard_conc_M),
         )
         rxns[idx] = replace(
@@ -264,7 +241,6 @@ def _set_mechanism_param(
                 model = forward_rate_model_for_equilibrium(
                     eq,
                     temperature_K=float(metadata.temperature_K),
-                    default_kappa=float(metadata.kappa_global),
                     default_standard_conc_M=float(metadata.standard_conc_M),
                 )
                 eqs[idx] = replace(

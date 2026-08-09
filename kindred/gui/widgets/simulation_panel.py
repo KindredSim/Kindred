@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from PySide6 import QtCore, QtGui, QtWidgets
+import math
+from collections.abc import Callable
+
+from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import (
     SimulationExecutionSettings,
+    SUPPORTED_SOLVERS,
     validate_simulation_execution_settings,
 )
+from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
     BatchInitialConditionsTableView,
@@ -35,6 +40,14 @@ class SimulationPanel(QtWidgets.QWidget):
     ) -> None:
         super().__init__(parent)
         self._canonical_settings = SimulationExecutionSettings()
+        self._candidate_values: dict[str, object] = {
+            "solver": self._canonical_settings.solver,
+            "t_start": self._canonical_settings.t_start,
+            "t_end": self._canonical_settings.t_end,
+            "integration_points": self._canonical_settings.integration_points,
+        }
+        self._candidate_changed_fields: set[str] = set()
+        self._candidate_invalid_raw: dict[str, str] = {}
         self._rendering = False
         self._candidate_dirty = False
         self._run_admitted = True
@@ -47,7 +60,7 @@ class SimulationPanel(QtWidgets.QWidget):
 
         controls = QtWidgets.QHBoxLayout()
         self.solver_method_combo = QtWidgets.QComboBox(self)
-        self.solver_method_combo.addItems(["Radau", "BDF"])
+        self.solver_method_combo.addItems(list(SUPPORTED_SOLVERS))
         self.t_start_edit = self._number_edit("0", "Absolute Run start time")
         self.t_end_edit = self._number_edit("10", "Absolute Run end time")
         self.num_points_spinbox = QtWidgets.QSpinBox(self)
@@ -128,9 +141,7 @@ class SimulationPanel(QtWidgets.QWidget):
         edit = QtWidgets.QLineEdit(value, self)
         edit.setMaximumWidth(120)
         edit.setToolTip(tooltip)
-        validator = QtGui.QDoubleValidator(0.0, 1e300, 12, edit)
-        validator.setNotation(QtGui.QDoubleValidator.Notation.ScientificNotation)
-        edit.setValidator(validator)
+        setup_scientific_validator(edit)
         return edit
 
     def render_run_defaults(
@@ -162,6 +173,14 @@ class SimulationPanel(QtWidgets.QWidget):
             self._canonical_settings = settings
             if not preserve_candidate:
                 self._candidate_dirty = False
+                self._candidate_values = {
+                    "solver": settings.solver,
+                    "t_start": settings.t_start,
+                    "t_end": settings.t_end,
+                    "integration_points": settings.integration_points,
+                }
+                self._candidate_changed_fields.clear()
+                self._candidate_invalid_raw.clear()
             self._run_admitted = bool(run_admitted)
             self._simulation_job_kind = kind
             if not preserve_candidate:
@@ -192,7 +211,12 @@ class SimulationPanel(QtWidgets.QWidget):
         """Shared local truth for every Run entry point."""
         return bool(self.run_btn.isEnabled())
 
-    def settle_run_defaults(self) -> bool:
+    def settle_run_defaults(
+        self,
+        publish_candidate: (
+            Callable[[SimulationExecutionSettings], bool] | None
+        ) = None,
+    ) -> bool:
         """Commit one complete candidate or reproject canonical and abort once."""
         self.batch_table.settle_active_editor()
         if not self._candidate_dirty:
@@ -206,19 +230,43 @@ class SimulationPanel(QtWidgets.QWidget):
             return False
         self._candidate_dirty = False
         if candidate != self._canonical_settings:
-            self.workspaceRunDefaultsRequested.emit(candidate)
+            if publish_candidate is None:
+                self.workspaceRunDefaultsRequested.emit(candidate)
+            elif not publish_candidate(candidate):
+                self._reproject_canonical()
+                return False
         return True
 
     def current_settings_candidate(self) -> SimulationExecutionSettings:
-        try:
-            t_start = float(self.t_start_edit.text())
-            t_end = float(self.t_end_edit.text())
-        except ValueError as exc:
-            raise ValueError("Run start and end times must be numeric.") from exc
+        values = dict(self._candidate_values)
+        changed = set(self._candidate_changed_fields)
+        # Direct callers may set a field without the user-edit signal. Detect
+        # only text that differs from the exact projection; untouched fields
+        # continue to come from the accepted backing object.
+        for field, edit in (
+            ("t_start", self.t_start_edit),
+            ("t_end", self.t_end_edit),
+        ):
+            projected = repr(float(values[field]))
+            if edit.text() != projected:
+                changed.add(field)
+        for field, edit in (
+            ("t_start", self.t_start_edit),
+            ("t_end", self.t_end_edit),
+        ):
+            if field not in changed:
+                continue
+            try:
+                parsed = float(edit.text())
+                if not math.isfinite(parsed):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Run start and end times must be numeric.") from exc
+            values[field] = parsed
         candidate = SimulationExecutionSettings(
             solver=str(self.solver_method_combo.currentText()),
-            t_start=t_start,
-            t_end=t_end,
+            t_start=float(values["t_start"]),
+            t_end=float(values["t_end"]),
             integration_points=int(self.num_points_spinbox.value()),
         )
         validate_simulation_execution_settings(candidate)
@@ -226,12 +274,20 @@ class SimulationPanel(QtWidgets.QWidget):
 
     def _reproject_canonical(self) -> None:
         settings = self._canonical_settings
+        self._candidate_values = {
+            "solver": settings.solver,
+            "t_start": settings.t_start,
+            "t_end": settings.t_end,
+            "integration_points": settings.integration_points,
+        }
+        self._candidate_changed_fields.clear()
+        self._candidate_invalid_raw.clear()
         previous_rendering = self._rendering
         self._rendering = True
         try:
             self.solver_method_combo.setCurrentText(settings.solver)
-            self.t_start_edit.setText(f"{settings.t_start:.12g}")
-            self.t_end_edit.setText(f"{settings.t_end:.12g}")
+            self.t_start_edit.setText(repr(float(settings.t_start)))
+            self.t_end_edit.setText(repr(float(settings.t_end)))
             self.num_points_spinbox.setValue(settings.integration_points)
         finally:
             self._rendering = previous_rendering
@@ -242,6 +298,18 @@ class SimulationPanel(QtWidgets.QWidget):
             return
         first_edit = not self._candidate_dirty
         self._candidate_dirty = True
+        sender = self.sender()
+        if sender is self.solver_method_combo:
+            self._candidate_changed_fields.add("solver")
+            self._candidate_values["solver"] = str(
+                self.solver_method_combo.currentText()
+            )
+        elif sender is self.t_start_edit:
+            self._candidate_changed_fields.add("t_start")
+        elif sender is self.t_end_edit:
+            self._candidate_changed_fields.add("t_end")
+        elif sender is self.num_points_spinbox:
+            self._candidate_changed_fields.add("integration_points")
         if first_edit:
             self.defaultsEditStarted.emit()
 

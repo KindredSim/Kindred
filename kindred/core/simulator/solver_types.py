@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 import numpy as np
 
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
+from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.temperature import TemperatureScheduleProtocol
 
 DEFAULT_SOLVER_NAME = "BDF"
@@ -25,12 +27,111 @@ ODERhs = ODERhsNoTemp | ODERhsWithTemp
 Rhs2 = Callable[[float, np.ndarray], np.ndarray]
 
 
+@dataclass(frozen=True, slots=True)
+class SimulationCancellationControl:
+    """Typed, nonblocking cancellation poll owned by one simulation request."""
+
+    poll: Callable[[], bool]
+
+    def __post_init__(self) -> None:
+        if not callable(self.poll):
+            raise TypeError("Simulation cancellation control requires a callable poll.")
+
+    def cancel_requested(self) -> bool:
+        """Return cancellation state without waiting on pause or worker state."""
+
+        return bool(self.poll())
+
+
+def _freeze_solver_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_solver_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_solver_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_solver_value(item) for item in value)
+    if isinstance(value, np.ndarray):
+        array = np.asarray(value).copy()
+        array.setflags(write=False)
+        return array
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class SimulationPresentationBoundary:
+    """Exact public pre/post state for one intervention boundary.
+
+    This is a presentation-only carrier.  The executor retains raw trigger
+    roots locally for action ordering and continuation; only detached public
+    endpoint values cross the solver/output boundary.
+    """
+
+    time: float
+    pre_state: tuple[tuple[str, float], ...]
+    post_state: tuple[tuple[str, float], ...]
+
+    def __post_init__(self) -> None:
+        time = float(self.time)
+        if not np.isfinite(time):
+            raise ValueError("Presentation boundary time must be finite.")
+        pre = _finite_state_pairs(self.pre_state, field="pre_state")
+        post = _finite_state_pairs(self.post_state, field="post_state")
+        if tuple(name for name, _value in pre) != tuple(
+            name for name, _value in post
+        ):
+            raise ValueError(
+                "Presentation boundary pre/post states must align exactly."
+            )
+        if not any(
+            pre_value != post_value
+            for (_pre_name, pre_value), (_post_name, post_value) in zip(
+                pre,
+                post,
+                strict=True,
+            )
+        ):
+            raise ValueError(
+                "Presentation boundary must contain an exact changed state."
+            )
+        object.__setattr__(self, "time", time)
+        object.__setattr__(self, "pre_state", pre)
+        object.__setattr__(self, "post_state", post)
+
+
+def _finite_state_pairs(
+    values: Iterable[tuple[str, object]],
+    *,
+    field: str,
+) -> tuple[tuple[str, float], ...]:
+    normalized: list[tuple[str, float]] = []
+    names: set[str] = set()
+    for raw_name, raw_value in values:
+        name = str(raw_name).strip()
+        if not name:
+            raise ValueError(f"{field} species names must be nonblank.")
+        if name in names:
+            raise ValueError(f"{field} contains duplicate species {name!r}.")
+        value = float(raw_value)
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"{field} values must be finite and nonnegative."
+            )
+        names.add(name)
+        normalized.append((name, value))
+    if not normalized:
+        raise ValueError(f"{field} must not be empty.")
+    return tuple(normalized)
+
+
 @dataclass(frozen=True)
 class SimulationRequest:
     rhs: ODERhs
     t_span: Tuple[float, float]
     y0: np.ndarray
     intervention_execution: InterventionExecutionContract
+    symbolic_jacobian: SymbolicJacobianExecution
     solver: str = DEFAULT_SOLVER_NAME
     rtol: float = 1e-6
     atol: float = 1e-12
@@ -38,16 +139,12 @@ class SimulationRequest:
     first_step: Optional[float] = None
     t_eval: Optional[np.ndarray] = None
     grid: Optional[Mapping[str, float | int]] = None
-    jacobian_func: Optional[Callable[[float, np.ndarray], np.ndarray]] = None
-    jac_sparsity: Optional[Any] = None
-    events: Optional[Iterable[Callable[[float, np.ndarray], float]]] = None
-    event_terminal: Optional[Iterable[bool]] = None
 
     progress_callback: Optional[Callable[[float, float, float], None]] = None
     temperature_schedule: TemperatureScheduleProtocol | None = None
     species_names: Optional[Tuple[str, ...]] = None
     symbolic_wegscheider_identity: Optional[Mapping[str, Any]] = None
-    symbolic_jacobian_status: Optional[Mapping[str, Any]] = None
+    cancellation_control: SimulationCancellationControl | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -56,11 +153,95 @@ class SimulationRequest:
             raise TypeError(
                 "intervention_execution must be an InterventionExecutionContract."
             )
+        if not isinstance(self.symbolic_jacobian, SymbolicJacobianExecution):
+            raise TypeError(
+                "symbolic_jacobian must be a SymbolicJacobianExecution."
+            )
+        if self.cancellation_control is not None and not isinstance(
+            self.cancellation_control,
+            SimulationCancellationControl,
+        ):
+            raise TypeError(
+                "cancellation_control must be a SimulationCancellationControl."
+            )
+        object.__setattr__(
+            self,
+            "t_span",
+            (float(self.t_span[0]), float(self.t_span[1])),
+        )
+        y0 = np.asarray(self.y0, dtype=float).reshape(-1).copy()
+        y0.setflags(write=False)
+        object.__setattr__(self, "y0", y0)
+        if self.t_eval is not None:
+            t_eval = np.asarray(self.t_eval, dtype=float).copy()
+            t_eval.setflags(write=False)
+            object.__setattr__(self, "t_eval", t_eval)
+        if self.grid is not None:
+            if not isinstance(self.grid, Mapping):
+                raise TypeError("grid must be a mapping or None.")
+            object.__setattr__(self, "grid", _freeze_solver_value(self.grid))
+        if self.species_names is not None:
+            object.__setattr__(
+                self,
+                "species_names",
+                tuple(str(name) for name in self.species_names),
+            )
+        for name in ("symbolic_wegscheider_identity",):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, Mapping):
+                raise TypeError(f"{name} must be a mapping or None.")
+            object.__setattr__(self, name, _freeze_solver_value(value))
 
 
 @dataclass(frozen=True)
 class SimulationOutput:
     t: np.ndarray
     Y: np.ndarray
-    provenance: dict[str, object]
+    provenance: Mapping[str, object]
     intervention_execution: InterventionExecutionContract
+    presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intervention_execution, InterventionExecutionContract):
+            raise TypeError(
+                "intervention_execution must be an InterventionExecutionContract."
+            )
+        t = np.asarray(self.t, dtype=float).copy()
+        Y = np.asarray(self.Y, dtype=float).copy()
+        t.setflags(write=False)
+        Y.setflags(write=False)
+        object.__setattr__(self, "t", t)
+        object.__setattr__(self, "Y", Y)
+        if not isinstance(self.provenance, Mapping):
+            raise TypeError("provenance must be a mapping.")
+        boundaries = tuple(self.presentation_boundaries)
+        if any(
+            not isinstance(boundary, SimulationPresentationBoundary)
+            for boundary in boundaries
+        ):
+            raise TypeError(
+                "presentation_boundaries must contain only "
+                "SimulationPresentationBoundary values."
+            )
+        if any(
+            current.time <= previous.time
+            for previous, current in zip(boundaries, boundaries[1:])
+        ):
+            raise ValueError(
+                "presentation boundaries must be strictly ordered by time."
+            )
+        if any(
+            not bool(np.any(t == boundary.time))
+            for boundary in boundaries
+        ):
+            raise ValueError(
+                "presentation boundaries must align with canonical output times."
+            )
+        object.__setattr__(
+            self,
+            "provenance",
+            _freeze_solver_value(self.provenance),
+        )
+        object.__setattr__(self, "presentation_boundaries", boundaries)

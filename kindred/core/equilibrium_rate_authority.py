@@ -7,7 +7,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from kindred.core.constants import R
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
-from kindred.core.kinetics import K_from_deltaG_eq
+from kindred.core.thermodynamics import K_from_deltaG_eq
 from kindred.core.simulator.errors import DSLError
 
 AUTHORITY_ERROR = "equilibrium requires kf and exactly one of kr or Keq/dG_eq"
@@ -191,23 +191,6 @@ class EquilibriumRateAuthority:
             items.append(("Keq", self.Keq))
             items.append(("dG_eq_J_per_mol", self.dG_eq_J_per_mol))
         return tuple(items)
-
-    def authored_symbolic_roles(self) -> tuple[str, ...]:
-        roles = ["kf"]
-        if self.kind == EquilibriumRateAuthorityKind.KR:
-            roles.append("kr")
-        elif self.has_explicit_keq_param:
-            roles.append("Keq")
-        return tuple(roles)
-
-
-@dataclass(frozen=True, slots=True)
-class EquilibriumAuthorityReadoutUpdate:
-    name: str
-    value: float
-    editable: bool = False
-    derived: bool = True
-
 
 @dataclass(frozen=True, slots=True)
 class EquilibriumRateSymbolicRelations:
@@ -421,18 +404,6 @@ def _finite_float_or_none(value: object, *, temperature_K: float | None = None) 
     return float(out)
 
 
-def _metadata_bool(value: object) -> bool:
-    if isinstance(value, bool):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"", "0", "false", "no", "off", "none", "null"}:
-            return False
-        if normalized in {"1", "true", "yes", "on"}:
-            return True
-    return bool(value)
-
-
 def plain_finite_float_or_none(value: object) -> float | None:
     """Return a finite float only for already-scalar values.
 
@@ -486,8 +457,6 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
         ):
             dg_value = _finite_float_or_none(authority.dG_eq_J_per_mol, temperature_K=temperature)
             if dg_value is not None:
-                from kindred.core.kinetics import K_from_deltaG_eq
-
                 return float(K_from_deltaG_eq(dg_value, temperature))
         metadata_keq_source = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
         if callable(metadata_keq_source):
@@ -496,8 +465,6 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
                 return float(metadata_keq)
         dg_value = _finite_float_or_none(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL), temperature_K=temperature)
         if dg_value is not None:
-            from kindred.core.kinetics import K_from_deltaG_eq
-
             return float(K_from_deltaG_eq(dg_value, temperature))
         metadata_keq = _finite_float_or_none(metadata_keq_source, temperature_K=temperature)
         if metadata_keq is not None:
@@ -516,7 +483,6 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
             return derived
     return None
 
-
 def effective_equilibrium_reverse_rate(eq: object, *, temperature_K: float = 298.15) -> float | None:
     authority = normalize_existing_equilibrium_rate_authority(eq)
     temperature = float(temperature_K)
@@ -528,87 +494,6 @@ def effective_equilibrium_reverse_rate(eq: object, *, temperature_K: float = 298
         return None
     value = authority.effective_reverse_rate(Keq=keq, kf=kf)
     return _finite_float_or_none(value, temperature_K=temperature)
-
-
-def authority_readout_updates_from_step_entry(
-    entry: Mapping[str, Any],
-    current_values: Mapping[str, object],
-) -> tuple[EquilibriumAuthorityReadoutUpdate, ...]:
-    if str(entry.get("kind") or "") != "equilibrium":
-        return ()
-    try:
-        step_index = int(entry.get("step_index"))
-    except (TypeError, ValueError):
-        return ()
-    authority = authority_fields_from_step_entry(entry)
-    if not authority:
-        return ()
-    editable = authority.get("editable")
-    if not isinstance(editable, Mapping):
-        editable = {}
-    derived_role = str(authority.get("derived_role") or "")
-    try:
-        reverse_std_ratio = float(authority.get("reverse_std_ratio") or 1.0)
-    except (TypeError, ValueError, OverflowError):
-        reverse_std_ratio = 1.0
-    if not math.isfinite(reverse_std_ratio) or reverse_std_ratio <= 0.0:
-        reverse_std_ratio = 1.0
-
-    kf_key = f"kf{step_index}"
-    kr_key = f"kr{step_index}"
-    keq_key = f"Keq{step_index}"
-
-    def _current(name: str) -> float | None:
-        return _finite_float_or_none(current_values.get(name))
-
-    def _readout(name: str, value: float) -> EquilibriumAuthorityReadoutUpdate:
-        return EquilibriumAuthorityReadoutUpdate(
-            name=name,
-            value=float(value),
-            editable=False,
-            derived=True,
-        )
-
-    updates: list[EquilibriumAuthorityReadoutUpdate] = []
-    if authority.get("kind") == EquilibriumRateAuthorityKind.KR:
-        # Explicit kf+kr: Keq is a derived display value only.  Never apply
-        # reverse_std_ratio or expose it as an editable coordinate.
-        kf_val = _current(kf_key)
-        kr_val = _current(kr_key)
-        if kf_val is None or kr_val is None or kf_val <= 0.0 or kr_val <= 0.0:
-            return ()
-        try:
-            derived_keq = float(kf_val) / float(kr_val)
-        except (OverflowError, ZeroDivisionError):
-            return ()
-        if not math.isfinite(derived_keq) or derived_keq <= 0.0:
-            return ()
-        return (_readout(keq_key, derived_keq),)
-    keq_editable = bool(editable.get("Keq"))
-    k_val = _current(keq_key) if (keq_editable or bool(authority.get("has_thermo_param"))) else None
-    if derived_role == "Keq" or (k_val is None and not keq_editable):
-        kf_val = _current(kf_key)
-        kr_val = _current(kr_key)
-        if kf_val is None or kr_val is None or kf_val <= 0.0 or kr_val <= 0.0:
-            return ()
-        k_val = float(kf_val) / (float(kr_val) * reverse_std_ratio)
-        updates.append(_readout(keq_key, k_val))
-        return tuple(updates)
-    if k_val is None or k_val <= 0.0:
-        return tuple(updates)
-    if not keq_editable:
-        updates.append(_readout(keq_key, k_val))
-
-    if derived_role == "kf":
-        kr_val = _current(kr_key)
-        if kr_val is not None:
-            updates.append(_readout(kf_key, float(kr_val) * float(k_val) * reverse_std_ratio))
-    elif derived_role == "kr":
-        kf_val = _current(kf_key)
-        if kf_val is not None:
-            updates.append(_readout(kr_key, effective_reverse_rate_from_keq(kf_val, k_val, reverse_std_ratio)))
-
-    return tuple(updates)
 
 
 def _metadata_has_thermo_authority(metadata: Mapping[str, Any] | None) -> bool:
@@ -663,17 +548,6 @@ def validate_equilibrium_rate_authority_flags(
     reverse_authority_count = int(bool(has_kr)) + int(bool(has_Keq)) + int(bool(has_dG_eq))
     if not bool(has_kf) or reverse_authority_count != 1:
         raise ValueError(AUTHORITY_ERROR)
-
-
-def validate_equilibrium_rate_authority_values(
-    *,
-    kf: object | None,
-    kr: object | None,
-    Keq: object | None,
-    metadata: Mapping[str, Any] | None = None,
-    context: EquilibriumRateInputContext | str | None = None,
-) -> None:
-    normalize_equilibrium_rate_authority(kf=kf, kr=kr, Keq=Keq, metadata=metadata, context=context)
 
 
 def _validate_concrete_positive_coefficient(value: object | None, *, label: str) -> None:
@@ -843,24 +717,3 @@ def step_entry_authored_role_is_derived(entry: Mapping[str, Any] | None, role: s
     if isinstance(derived, Mapping) and role in derived:
         return bool(derived[role])
     return None
-
-
-def public_text_equilibrium_role_editable(
-    *,
-    has_kr: bool,
-    has_Keq: bool,
-    has_dG_eq: bool,
-    role: str,
-) -> bool:
-    """Return editability for a public DSL equilibrium line already parsed as text tokens."""
-    role = str(role)
-    has_thermo = bool(has_Keq or has_dG_eq)
-    if role == "kf":
-        return True
-    if role == "kr":
-        return bool(has_kr and not has_thermo)
-    if role == "Keq":
-        return bool(has_Keq)
-    if role == "dG_eq":
-        return bool(has_dG_eq)
-    return False

@@ -1,13 +1,12 @@
 """
-Mechanism construction from the simulator DSL intermediate representation (IR).
+Mechanism construction from one admitted ``DslMechanismBuildInput``.
 
-This module is intentionally separate from `dsl.py` so that importing the DSL parsing
-utilities does not eagerly import Mechanism/kinetics construction code.
+``dsl_parse`` owns source parsing and analysis; this module only consumes the
+exact immutable builder input and constructs the typed mechanism authority.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 from typing import Dict, List, Optional
@@ -16,8 +15,8 @@ from ..equilibrium_rate_authority import (
     normalize_equilibrium_rate_authority,
 )
 from ..mechanism import Mechanism
-from ..mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
-from ..kinetics import K_from_deltaG_eq
+from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
+from ..thermodynamics import K_from_deltaG_eq
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .dsl_build_input import DslMechanismBuildInput
 from .parameter_namespace import _namespace_policy_from_step
@@ -30,7 +29,7 @@ __all__ = ["build_mechanism_from_ir"]
 def build_mechanism_from_ir(
     build_input: DslMechanismBuildInput,
 ) -> Mechanism:
-    """Build a mechanism from the sole exact immutable builder input."""
+    """Build a mechanism from the exact admitted immutable builder input."""
 
     if type(build_input) is not DslMechanismBuildInput:
         raise TypeError(
@@ -41,23 +40,13 @@ def build_mechanism_from_ir(
     energy_unit = build_input.energy_unit
     T = build_input.temperature_K
     C0 = build_input.standard_conc_M
-    kappa_global = build_input.kappa_global
     steps = build_input.steps
-    algebra_lines = build_input.algebra_lines
-    intervention_schedule = build_input.intervention_schedule
-    temperature_schedule = None
-    if build_input.temperature_schedule_json is not None:
-        from kindred.core.temperature import TemperatureSchedule
-
-        temperature_schedule = TemperatureSchedule.from_dict(
-            json.loads(build_input.temperature_schedule_json)
-        )
+    temperature_schedule = build_input.temperature_schedule
 
     mechanism = Mechanism()
     MechanismMetadataView(
         temperature_K=float(T),
         standard_conc_M=float(C0),
-        kappa_global=float(kappa_global),
         energy_unit=str(energy_unit),
         step_index_policy="dsl_only",
     ).apply_to_metadata(mechanism.metadata)
@@ -96,12 +85,12 @@ def build_mechanism_from_ir(
                 rxn_overrides["Ea_J_per_mol"] = float(EaJ)
         elif model == "Eyring":
             rxn_overrides["model"] = "Eyring"
+            rxn_overrides["degeneracy"] = int(step.degeneracy)
             dGJ = step.eyring_dG_act_J_per_mol
             if dGJ is not None:
                 rxn_overrides["dG_act_J_per_mol"] = float(dGJ)
             kappa = step.kappa
-            if kappa is not None:
-                rxn_overrides["kappa"] = float(kappa)
+            rxn_overrides["kappa"] = float(kappa)
             sc = step.standard_conc_M
             if sc is not None:
                 rxn_overrides["standard_conc_M"] = float(sc)
@@ -146,11 +135,8 @@ def build_mechanism_from_ir(
                 forward_model = {
                     "type": "Eyring",
                     "dG_act_J_per_mol": step.eyring_dG_act_J_per_mol,
-                    "kappa": (
-                        step.kappa
-                        if step.kappa is not None
-                        else kappa_global
-                    ),
+                    "degeneracy": int(step.degeneracy),
+                    "kappa": float(step.kappa),
                     "standard_conc_M": (
                         step.standard_conc_M
                         if step.standard_conc_M is not None
@@ -177,9 +163,6 @@ def build_mechanism_from_ir(
                 if step.standard_conc_M is not None
                 else None,
             ).to_metadata()
-            source_energy_unit = str(step.source_energy_unit or "").strip()
-            if source_energy_unit:
-                eq_metadata[EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT] = source_energy_unit
             if Keq_input is not None or dG_eq_J is not None:
                 nf = math.fsum(float(value) for value in reactants.values())
                 nr = math.fsum(float(value) for value in products.values())
@@ -240,18 +223,6 @@ def build_mechanism_from_ir(
         len(mechanism.equilibria),
     )
 
-    if algebra_lines:
-        # Algebra admission is owned by ``prepare_dsl_request_set`` after the
-        # mechanism namespace exists.  The builder preserves source provenance
-        # only; parsing or compiling here would create a duplicate raw-text
-        # admission path before the retained AST is installed.
-        mechanism.metadata[MechanismMetadataKeys.ALGEBRA_TEXT] = "\n".join(
-            algebra_lines
-        )
-
     if temperature_schedule is not None:
         mechanism.metadata[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = temperature_schedule
-    if intervention_schedule is not None:
-        mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE] = intervention_schedule
-
     return mechanism

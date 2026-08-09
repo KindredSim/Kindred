@@ -8,24 +8,10 @@ from typing import Callable, Iterable
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
-from kindred.core.project_document import RawDatasetRecord
+from kindred.core.datasets.foundation import RawDatasetRecord
 from kindred.gui.dataset_payload_snapshot import ActiveDatasetLinkSnapshot
 
-__all__ = ["DatasetOverlayPanel", "DatasetStyle", "OverlaySelectionIntent"]
-
-
-@dataclass(frozen=True)
-class DatasetStyle:
-    size: int = 6
-    opacity: int = 180
-
-    def __post_init__(self) -> None:
-        if not 1 <= int(self.size) <= 20:
-            raise ValueError("Experimental point size must be between 1 and 20.")
-        if not 0 <= int(self.opacity) <= 255:
-            raise ValueError("Experimental point opacity must be between 0 and 255.")
-        object.__setattr__(self, "size", int(self.size))
-        object.__setattr__(self, "opacity", int(self.opacity))
+__all__ = ["DatasetOverlayPanel", "OverlaySelectionIntent"]
 
 
 @dataclass(frozen=True)
@@ -68,31 +54,32 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
     """Render global records with persisted active-tab overlay membership."""
 
     overlaySelectionRequested = QtCore.Signal(object)
+    speciesColorRequested = QtCore.Signal(str, object, object)
+    experimentalPointSizeRequested = QtCore.Signal(int)
+    experimentalPointOpacityRequested = QtCore.Signal(float)
 
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
         *,
         color_for_species: Callable[[str, tuple[str, ...]], QtGui.QColor],
-        set_species_color: Callable[
-            [str, QtGui.QColor, tuple[str, ...]],
-            None,
-        ],
-        experimental_style: Callable[[], DatasetStyle],
-        set_experimental_style: Callable[[DatasetStyle], None],
+        experimental_point_size: Callable[[], int],
+        experimental_point_opacity: Callable[[], float],
     ) -> None:
         super().__init__(parent)
-        if not callable(color_for_species) or not callable(set_species_color):
-            raise TypeError("DatasetOverlayPanel requires injected species-color callbacks.")
-        if not callable(experimental_style) or not callable(set_experimental_style):
-            raise TypeError("DatasetOverlayPanel requires injected experimental-style callbacks.")
+        if not callable(color_for_species):
+            raise TypeError("DatasetOverlayPanel requires a species-color callback.")
+        if not callable(experimental_point_size) or not callable(
+            experimental_point_opacity
+        ):
+            raise TypeError(
+                "DatasetOverlayPanel requires field-specific style callbacks."
+            )
         self._color_for_species = color_for_species
-        self._set_species_color = set_species_color
-        self._experimental_style = experimental_style
-        self._set_experimental_style = set_experimental_style
+        self._experimental_point_size = experimental_point_size
+        self._experimental_point_opacity = experimental_point_opacity
         self._links_by_dataset_id: dict[str, ActiveDatasetLinkSnapshot] = {}
         self._known_species: tuple[str, ...] = ()
-        self._style = DatasetStyle()
         self._preferences_loaded = False
         self._color_buttons: dict[tuple[str, str], QtWidgets.QPushButton] = {}
         self._raw_columns_by_key: dict[tuple[str, str], str] = {}
@@ -132,15 +119,15 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         style_row.addWidget(QtWidgets.QLabel("Point style"))
         self._size_spin = QtWidgets.QSpinBox()
         self._size_spin.setRange(1, 20)
-        self._size_spin.setValue(self._style.size)
-        self._size_spin.valueChanged.connect(self._on_style_changed)
+        self._size_spin.setValue(6)
+        self._size_spin.valueChanged.connect(self._on_size_changed)
         style_row.addWidget(QtWidgets.QLabel("Size"))
         style_row.addWidget(self._size_spin)
         self._opacity_spin = QtWidgets.QSpinBox()
         self._opacity_spin.setRange(0, 100)
         self._opacity_spin.setSuffix("%")
-        self._opacity_spin.setValue(round(self._style.opacity * 100 / 255))
-        self._opacity_spin.valueChanged.connect(self._on_style_changed)
+        self._opacity_spin.setValue(71)
+        self._opacity_spin.valueChanged.connect(self._on_opacity_changed)
         style_row.addWidget(QtWidgets.QLabel("Opacity"))
         style_row.addWidget(self._opacity_spin)
         style_row.addStretch(1)
@@ -360,12 +347,11 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         color = QtWidgets.QColorDialog.getColor(current, self, "Choose Species Color")
         if not color.isValid():
             return
-        self._set_species_color(
+        self.speciesColorRequested.emit(
             species_name,
             color,
             self._known_species,
         )
-        self.refresh_color_swatches()
 
     def _color_species_name(
         self,
@@ -456,31 +442,25 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         finally:
             self._tree.blockSignals(False)
 
-    def _on_style_changed(self) -> None:
+    def _on_size_changed(self, value: int) -> None:
         if not self._preferences_loaded:
             return
-        requested = DatasetStyle(
-            size=self._size_spin.value(),
-            opacity=round(self._opacity_spin.value() * 255 / 100),
-        )
-        self._set_experimental_style(requested)
-        self._style = self._read_application_style()
-        self._render_application_style()
+        self.experimentalPointSizeRequested.emit(int(value))
 
-    def _read_application_style(self) -> DatasetStyle:
-        style = self._experimental_style()
-        if not isinstance(style, DatasetStyle):
-            raise TypeError("experimental_style() must return DatasetStyle.")
-        return style
+    def _on_opacity_changed(self, value: int) -> None:
+        if not self._preferences_loaded:
+            return
+        self.experimentalPointOpacityRequested.emit(float(value) / 100.0)
 
     def _render_application_style(self) -> None:
-        self._style = self._read_application_style()
+        size = int(self._experimental_point_size())
+        opacity = float(self._experimental_point_opacity())
         self._preferences_loaded = True
         self._size_spin.blockSignals(True)
         self._opacity_spin.blockSignals(True)
         try:
-            self._size_spin.setValue(self._style.size)
-            self._opacity_spin.setValue(round(self._style.opacity * 100 / 255))
+            self._size_spin.setValue(size)
+            self._opacity_spin.setValue(round(opacity * 100))
         finally:
             self._opacity_spin.blockSignals(False)
             self._size_spin.blockSignals(False)

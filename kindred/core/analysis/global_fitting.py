@@ -14,40 +14,21 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     FitSharedVariableParamSpec,
 )
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
-from kindred.core.analysis.global_fit_execution import (
-    DatasetFitInfo,
-    GlobalFitObjective,
-    GlobalFitResult,
-    assemble_global_fit_result,
-    build_completion_detail_sections,
-    build_fit_diagnostic_from_exception,
-    build_fit_diagnostic_from_failure,
-    build_parameter_layout,
-    ensure_failure_diagnostic,
-    normalize_weights,
-)
+from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.exceptions import (
     FitSimulationError,
     FittingCancelled,
     SimulationCancelled,
 )
-from kindred.core.fitting_completion import (
-    FitDetailSection,
-    FitDiagnostic,
-    GlobalFitCompletion,
-)
+from kindred.core import fitting_completion as _fitting_completion
 from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.objective import ObjectiveContext
 from kindred.core.simulation_failure import build_simulation_failure
+from kindred.core.simulator.solver_types import SimulationCancellationControl
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "DatasetFitInfo",
-    "FitDetailSection",
-    "FitDiagnostic",
-    "GlobalFitCompletion",
-    "GlobalFitResult",
     "fit_global",
 ]
 
@@ -115,16 +96,17 @@ def fit_global(
     dataset_overrides: Sequence[FitDatasetParameterOverrides] = (),
     coupled_variables: Sequence[FitCoupledVariableParamSpec] = (),
     weights: Optional[Mapping[str, float]] = None,
-    method: str = "trf",
+    method: str,
     max_nfev: int = 1000,
     ftol: float = 1e-10,
     xtol: float = 1e-10,
     seed: Optional[int] = None,
     progress_callback: Optional[
-        Callable[[int, float, dict[str, float]], None]
+        Callable[[_fit_execution.FitProgress], None]
     ] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
-) -> GlobalFitResult:
+    cancellation_control: SimulationCancellationControl | None = None,
+) -> _fit_execution.GlobalFitResult:
     """Fit immutable dataset captures through one evaluator per dataset."""
 
     payloads, evaluators, shared, overrides = _validate_run_inputs(
@@ -144,11 +126,11 @@ def fit_global(
         item.dataset_id: dict(item.fixed_params)
         for item in overrides
     }
-    weights_norm = normalize_weights(
+    weights_norm = _fit_execution.normalize_weights(
         payloads,
         None if weights is None else dict(weights),
     )
-    layout = build_parameter_layout(
+    layout = _fit_execution.build_parameter_layout(
         payloads=payloads,
         shared_params=shared_params,
         dataset_overrides=overrides,
@@ -156,12 +138,6 @@ def fit_global(
         bounds=shared_bounds,
         log10_params=shared_log10,
     )
-
-    method_key = str(method or "trf").strip().lower()
-    if method_key in {"differential_evolution", "de"}:
-        method_key = "de"
-    elif method_key not in {"lm", "trf", "dogbox"}:
-        raise ValueError(f"Unknown optimization method: {method}")
 
     logger.info(
         "Global fitting: %d datasets, %d optimizer coordinates",
@@ -171,49 +147,42 @@ def fit_global(
     penalty_value = 1e6
     objective_total_points = int(sum(item.point_count for item in payloads))
     context = ObjectiveContext()
-    objective: Optional[GlobalFitObjective] = None
+    objective: Optional[_fit_execution.GlobalFitObjective] = None
     optimizer_completed = False
     de_optimizer_nfev: Optional[int] = None
 
     def failed_result(
         message: str,
         *,
-        diagnostic: Optional[FitDiagnostic] = None,
-    ) -> GlobalFitResult:
-        chosen = ensure_failure_diagnostic(
+        diagnostic: Optional[_fitting_completion.FitDiagnostic] = None,
+    ) -> _fit_execution.GlobalFitResult:
+        chosen = _fit_execution.ensure_failure_diagnostic(
             diagnostic,
             message=str(message or "Global fit failed before replay completed."),
         )
-        return GlobalFitResult(
+        return _fit_execution.GlobalFitResult(
             shared_params=dict(shared_params),
             dataset_params={item.dataset_id: {} for item in payloads},
-            uncertainties=None,
             weighted_residual_sse=np.inf,
             weighted_residual_mse=np.inf,
             dataset_info=[],
             nfev=(
                 de_optimizer_nfev
                 if de_optimizer_nfev is not None
-                else int(getattr(objective, "_iteration", 0))
+                else int(getattr(objective, "_objective_calls", 0))
             ),
             message=str(message),
-            completion=GlobalFitCompletion(
+            completion=_fitting_completion.GlobalFitCompletion(
                 status="fail",
                 optimizer_converged=False,
                 nonfinite_metrics=False,
                 optimizer_diagnostic=chosen,
                 dataset_failures={},
-                dataset_warnings={},
-                detail_sections=build_completion_detail_sections(
-                    status="fail",
-                    optimizer_diagnostic=chosen,
-                    dataset_failures={},
-                ),
             ),
         )
 
     try:
-        objective = GlobalFitObjective(
+        objective = _fit_execution.GlobalFitObjective(
             fit_evaluators=evaluators,
             payloads=payloads,
             shared_params=shared_params,
@@ -224,18 +193,18 @@ def fit_global(
             ctx=context,
             progress_callback=progress_callback,
             cancellation_check=cancellation_check,
+            cancellation_control=cancellation_control,
         )
         de_penalty = (
             float((penalty_value**2) * max(1, objective_total_points))
-            if method_key == "de"
+            if method == "differential_evolution"
             else None
         )
         optimizer_result = fit_parameters(
             objective,
             layout.initial_params(),
             bounds=layout.bounds_dict(),
-            method=method_key,
-            progress_callback=None,
+            method=method,
             max_nfev=max_nfev,
             seed=seed,
             ftol=ftol,
@@ -243,17 +212,17 @@ def fit_global(
             cancellation_check=cancellation_check,
             de_penalty=de_penalty,
         )
-        if method_key == "de":
+        if method == "differential_evolution":
             de_optimizer_nfev = int(optimizer_result.nfev)
         optimizer_completed = True
         success = bool(optimizer_result.success)
         message = str(optimizer_result.message)
-        diagnostic: Optional[FitDiagnostic] = None
+        diagnostic: Optional[_fitting_completion.FitDiagnostic] = None
         identifiability = str(
             optimizer_result.identifiability_warning or ""
         ).strip()
         if identifiability:
-            diagnostic = build_fit_diagnostic_from_failure(
+            diagnostic = _fit_execution.build_fit_diagnostic_from_failure(
                 build_simulation_failure(
                     kind="fitting_identifiability",
                     message=identifiability,
@@ -268,7 +237,7 @@ def fit_global(
                 if isinstance(provenance, dict) and provenance.get("dataset") is not None
                 else None
             )
-            diagnostic = build_fit_diagnostic_from_exception(
+            diagnostic = _fit_execution.build_fit_diagnostic_from_exception(
                 context.last_error,
                 phase="optimizer",
                 dataset_id=dataset_id,
@@ -299,26 +268,7 @@ def fit_global(
                     layout.coupled_params_for_dataset(dataset_id, vector)
                 )
 
-        covariance = optimizer_result.covariance
-        uncertainties = None
-        if covariance is not None:
-            try:
-                deviations = np.sqrt(np.diag(covariance))
-                uncertainties = {}
-                for index, name in enumerate(layout.param_names):
-                    if index >= deviations.size:
-                        break
-                    deviation = float(deviations[index])
-                    if layout.shared_log10.get(name):
-                        uncertainties[name] = float(
-                            np.log(10.0) * fitted_shared[name] * deviation
-                        )
-                    else:
-                        uncertainties[name] = deviation
-            except (IndexError, TypeError, ValueError):
-                logger.debug("Shared uncertainty projection failed.", exc_info=True)
-
-        return assemble_global_fit_result(
+        return _fit_execution.assemble_global_fit_result(
             fit_evaluators=evaluators,
             payloads=payloads,
             layout=layout,
@@ -328,15 +278,14 @@ def fit_global(
             weights=weights_norm,
             penalty_value=penalty_value,
             cancellation_check=cancellation_check,
+            cancellation_control=cancellation_control,
             success=success,
             message=message,
             nfev=int(optimizer_result.nfev),
-            covariance=covariance,
             objective_residuals=np.asarray(
                 optimizer_result.residuals,
                 dtype=float,
             ).reshape(-1),
-            uncertainties=uncertainties,
             optimizer_diagnostic=diagnostic,
         )
     except FittingCancelled:
@@ -347,10 +296,9 @@ def fit_global(
         logger.error("Global fitting failed: %s", exc, exc_info=False)
         return failed_result(
             str(exc),
-            diagnostic=build_fit_diagnostic_from_exception(
+            diagnostic=_fit_execution.build_fit_diagnostic_from_exception(
                 exc,
                 phase="fatal",
-                parameter_snapshot=exc.failed_params,
             ),
         )
     except Exception as exc:
@@ -361,5 +309,5 @@ def fit_global(
         logger.error("Global fitting failed: %s", exc, exc_info=True)
         return failed_result(
             f"Fitting failed: {exc}",
-            diagnostic=build_fit_diagnostic_from_exception(exc, phase="fatal"),
+            diagnostic=_fit_execution.build_fit_diagnostic_from_exception(exc, phase="fatal"),
         )

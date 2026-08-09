@@ -89,7 +89,7 @@ def enumerate_parameter_coordinates(
 
     if not isinstance(prepared_dsl, PreparedDslRequestSet):
         raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-    temperature = float(prepared_dsl.analysis.structure["temperature_K"])
+    temperature = float(prepared_dsl.analysis.temperature_K)
     if not math.isfinite(temperature) or temperature <= 0.0:
         raise ValueError(
             "Prepared DSL nominal temperature must be positive and finite."
@@ -147,7 +147,6 @@ def enumerate_parameter_coordinates(
                 continue
             model = forward_rate_model_for_reaction(
                 reactions[int(raw_index)],
-                default_kappa=metadata_view.kappa_global,
                 default_standard_conc_M=metadata_view.standard_conc_M,
             )
             family = forward_rate_family(model)
@@ -174,7 +173,6 @@ def enumerate_parameter_coordinates(
                 model = forward_rate_model_for_equilibrium(
                     equilibrium,
                     temperature_K=temperature,
-                    default_kappa=metadata_view.kappa_global,
                     default_standard_conc_M=metadata_view.standard_conc_M,
                 )
                 family = forward_rate_family(model)

@@ -1,13 +1,15 @@
 """
-Parameter-scan helpers for the simulator DSL.
+Parameter-analysis projection helpers for the simulator DSL.
 
-This module keeps reaction/algebra parameter name extraction out of the public
-`dsl.py` entrypoint so the core parser facade stays smaller and import-thin.
+This module owns the ``DslParameterAnalysis`` value type and projects parameter
+analyses from an already admitted mechanism.  The parser consumes that typed
+value directly; it does not own or lazily import the scanner's DTO.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Mapping
 
 from kindred.core.equilibrium_rate_authority import (
@@ -26,32 +28,9 @@ from .parameter_namespace import (
 from .step_indexing import get_step_index_map
 
 
-@dataclass(frozen=True)
-class ParameterDefinition:
-    """
-    Structured parameter entry extracted from the DSL.
-
-    Attributes
-    ----------
-    name : str
-        Canonical indexed mechanism parameter identifier (k1, kf2, kr2, Keq2).
-    value : float
-        Numeric value parsed from the DSL (unit-neutral).
-    context : str
-        Human-readable reaction context, e.g. "A + B -> C".
-    source : str
-        Additional source metadata (Arrhenius, Eyring, etc.).
-    step_index : int | None
-        1-based index of the reaction/equilibrium line in the DSL.
-    editable : bool
-        Whether the parameter is a writable public/fitting endpoint.
-    unit : str | None
-        Unit owned by the source endpoint, when the value is unitful.
-    role : str | None
-        Source role for a structured parameter endpoint.
-    min/max : float | None
-        Optional source-owned default scan range.
-    """
+@dataclass(frozen=True, slots=True)
+class DslParameterAnalysis:
+    """One immutable parameter projection produced by the DSL scanner."""
 
     name: str
     value: float
@@ -61,8 +40,51 @@ class ParameterDefinition:
     editable: bool = True
     unit: str | None = None
     role: str | None = None
-    min: float | None = None
-    max: float | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.name) is not str
+            or not self.name
+            or self.name != self.name.strip()
+        ):
+            raise ValueError("DSL parameter name must be nonempty text.")
+        if type(self.value) not in {int, float}:
+            raise TypeError("DSL parameter values must be exact numbers.")
+        value = float(self.value)
+        if not math.isfinite(value):
+            raise ValueError("DSL parameter values must be finite.")
+        object.__setattr__(self, "value", value)
+        for attr in ("context", "source"):
+            if type(getattr(self, attr)) is not str:
+                raise TypeError(
+                    f"DSL parameter {attr} must be an exact string."
+                )
+        if self.step_index is not None and type(self.step_index) is not int:
+            raise TypeError(
+                "DSL parameter step index must be an exact int or None."
+            )
+        if type(self.editable) is not bool:
+            raise TypeError("DSL parameter editable must be bool.")
+        for attr in ("unit", "role"):
+            raw = getattr(self, attr)
+            if raw is not None and type(raw) is not str:
+                raise TypeError(
+                    f"DSL parameter {attr} must be a string or None."
+                )
+        for attr in ("minimum", "maximum"):
+            raw = getattr(self, attr)
+            if raw is None:
+                continue
+            if type(raw) not in {int, float}:
+                raise TypeError(
+                    f"DSL parameter {attr} must be an exact number."
+                )
+            numeric = float(raw)
+            if not math.isfinite(numeric):
+                raise ValueError(f"DSL parameter {attr} must be finite.")
+            object.__setattr__(self, attr, numeric)
 
 
 def _finite_value(value: object) -> float | None:
@@ -76,16 +98,18 @@ def _mechanism_temperature(mechanism: object) -> float:
         value = _finite_value(meta.get(MechanismMetadataKeys.TEMPERATURE_K))
         if value is not None:
             return float(value)
-    return 298.15
+    raise ValueError(
+        "Admitted mechanism is missing its validated temperature_K authority."
+    )
 
 
 def extract_parameters_from_mechanism(
     mechanism: object,
-) -> list[ParameterDefinition]:
-    """Project parameters from one already admitted mechanism."""
+) -> list[DslParameterAnalysis]:
+    """Project scanner-owned parameter analyses from one admitted mechanism."""
 
     namespace = build_namespace_from_mechanism(mechanism)
-    parameters: list[ParameterDefinition] = []
+    parameters: list[DslParameterAnalysis] = []
     rxns = list(getattr(mechanism, "reactions", []) or [])
     eqs = list(getattr(mechanism, "equilibria", []) or [])
     temperature_K = _mechanism_temperature(mechanism)
@@ -112,7 +136,7 @@ def extract_parameters_from_mechanism(
             if value is None:
                 continue
             parameters.append(
-                ParameterDefinition(
+                DslParameterAnalysis(
                     name=item.canonical_name,
                     value=float(value),
                     context=context,
@@ -138,7 +162,7 @@ def extract_parameters_from_mechanism(
         if value is None:
             continue
         parameters.append(
-            ParameterDefinition(
+            DslParameterAnalysis(
                 name=item.canonical_name,
                 value=float(value),
                 context=context,
@@ -155,4 +179,4 @@ def extract_parameters_from_mechanism(
     return parameters
 
 
-__all__ = ["ParameterDefinition", "extract_parameters_from_mechanism"]
+__all__ = ["DslParameterAnalysis", "extract_parameters_from_mechanism"]

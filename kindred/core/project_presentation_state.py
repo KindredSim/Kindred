@@ -8,8 +8,8 @@ from typing import TypeAlias
 from kindred.core.project_document import (
     MechanismTabDocument,
     ProjectDocument,
-    validate_raw_observation_id,
 )
+from kindred.core.datasets.foundation import validate_raw_observation_id
 
 __all__ = [
     "AxisSeriesSelection",

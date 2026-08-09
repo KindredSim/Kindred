@@ -121,9 +121,6 @@ class SymbolicCalculatorResult:
             MappingProxyType({str(name): str(expr) for name, expr in dict(self.let_definitions).items()}),
         )
 
-    def compact_copy_text(self) -> str:
-        return str(self.result_text)
-
     def full_context_copy_text(self) -> str:
         parameters = ", ".join(str(name) for name in self.symbol_legend.get("parameters", ())) or "none"
         species = ", ".join(str(name) for name in self.symbol_legend.get("species", ())) or "none"
@@ -164,7 +161,6 @@ class _CalculatorContext:
     jacobian_by_species: Mapping[tuple[str, str], Any]
     expression_symbols: Mapping[str, Any]
     parameter_namespace: MechanismParameterNamespace
-    internal_to_display: Mapping[Any, Any]
     chemistry_relations: Mapping[str, Any]
     rendered_parameter_definitions: Mapping[str, str]
     let_sources: Mapping[str, str]
@@ -189,7 +185,6 @@ class _CalculatorContext:
             ),
         )
         object.__setattr__(self, "expression_symbols", MappingProxyType(dict(self.expression_symbols)))
-        object.__setattr__(self, "internal_to_display", MappingProxyType(dict(self.internal_to_display)))
         object.__setattr__(
             self,
             "chemistry_relations",
@@ -225,7 +220,7 @@ def evaluate_symbolic_query(
     query_s = str(query or "").strip()
     if not query_s:
         raise SymbolicCalculatorError("Symbolic calculator query is empty.")
-    expr_or_lines = _evaluate_query(context, query_s)
+    expr_or_lines = _parse_calculator_expression(context, query_s)
     if isinstance(expr_or_lines, tuple):
         result_text = "\n".join(str(line) for line in expr_or_lines)
     else:
@@ -265,11 +260,7 @@ def _check_available(mechanism: Any) -> None:
         raise SymbolicCalculatorUnavailable(
             "Symbolic calculator is unavailable for mechanisms with scheduled temperature."
         )
-    schedule = metadata.intervention_schedule
-    if schedule is not None and not bool(schedule.is_empty()):
-        raise SymbolicCalculatorUnavailable(
-            "Symbolic calculator is unavailable for mechanisms with scheduled interventions."
-        )
+
 def _build_context(mechanism: Any, *, mechanism_source: str) -> _CalculatorContext:
     _check_available(mechanism)
     parameter_namespace = build_namespace_from_mechanism(mechanism)
@@ -322,7 +313,6 @@ def _build_context(mechanism: Any, *, mechanism_source: str) -> _CalculatorConte
         jacobian_by_species=jacobian_by_species,
         expression_symbols=expression_symbols,
         parameter_namespace=parameter_namespace,
-        internal_to_display={},
         chemistry_relations=projection.chemistry_relations,
         rendered_parameter_definitions=rendered_definitions,
         let_sources=let_sources,
@@ -368,10 +358,6 @@ def _mechanism_species_names(mechanism: Any) -> tuple[str, ...]:
             "Symbolic calculator requires a Kindred mechanism with species_names()."
         )
     return tuple(str(name) for name in species_names())
-
-
-def _evaluate_query(context: _CalculatorContext, query: str) -> Any:
-    return _parse_calculator_expression(context, query)
 
 
 def _evaluate_zero_arg_query(context: _CalculatorContext, name: str) -> tuple[str, ...]:
@@ -647,7 +633,7 @@ class _CalculatorExpressionParser:
         den = _require_species(self._context, denominator[1:])
         return require_sympy().diff(
             self._context.rhs_by_species[num],
-            _display_symbol_for_species(self._context, den),
+            self._context.expression_symbols[den],
         )
 
     def _is_unambiguous_derivative_symbol(self, name: str) -> bool:
@@ -1119,13 +1105,8 @@ def _translate_let_node(node: Any, *, context: _CalculatorContext, stack: Sequen
     raise SymbolicCalculatorError(f"Unsupported let expression node {type(node).__name__}.")
 
 
-def _display_expr(context: _CalculatorContext, expr: Any) -> Any:
-    return expr.xreplace(dict(context.internal_to_display))
-
-
 def _render_expr(context: _CalculatorContext, expr: Any) -> str:
-    displayed = _display_expr(context, expr)
-    return str(displayed)
+    return str(expr)
 
 
 def _require_species(context: _CalculatorContext, name: str) -> str:
@@ -1133,7 +1114,3 @@ def _require_species(context: _CalculatorContext, name: str) -> str:
     if name_s not in context.species_names:
         raise SymbolicCalculatorError(f"Unknown species {name_s!r}.")
     return name_s
-
-
-def _display_symbol_for_species(context: _CalculatorContext, name: str) -> Any:
-    return context.expression_symbols[_require_species(context, name)]

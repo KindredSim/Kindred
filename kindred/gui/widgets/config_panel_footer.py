@@ -38,7 +38,6 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         hint_text: str = "Changes take effect after Apply.",
         show_hint: bool = True,
         show_dirty: bool = False,
-        show_secondary_error: bool = False,
         messages_position: str = "before_body",
         show_divider: bool = False,
         show_reset: bool = False,
@@ -47,7 +46,6 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         hint_object_name: Optional[str] = None,
         dirty_object_name: Optional[str] = None,
         error_object_name: Optional[str] = None,
-        secondary_error_object_name: Optional[str] = None,
         apply_object_name: Optional[str] = None,
         revert_object_name: Optional[str] = None,
         reset_object_name: Optional[str] = None,
@@ -58,8 +56,6 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         self._show_dirty = bool(show_dirty)
         self._dirty = False
         self._error_text = ""
-        self._apply_enabled_override: Optional[bool] = None
-        self._revert_enabled_override: Optional[bool] = None
 
         messages_position_norm = str(messages_position or "before_body").strip().lower()
         if messages_position_norm not in ("before_body", "after_body"):
@@ -109,19 +105,6 @@ class ConfigPanelFooter(QtWidgets.QWidget):
             self.error_label.setObjectName(str(error_object_name))
         self.error_label.setVisible(False)
         messages_layout.addWidget(self.error_label)
-
-        self.secondary_error_label: Optional[QtWidgets.QLabel]
-        if show_secondary_error:
-            secondary = QtWidgets.QLabel("")
-            secondary.setWordWrap(False)
-            secondary.setStyleSheet("font-weight: bold; font-size: 11px;")
-            if secondary_error_object_name:
-                secondary.setObjectName(str(secondary_error_object_name))
-            secondary.setVisible(False)
-            messages_layout.addWidget(secondary)
-            self.secondary_error_label = secondary
-        else:
-            self.secondary_error_label = None
 
         if self._messages_position == "before_body":
             layout.addWidget(self._messages)
@@ -202,9 +185,6 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         if (not show_reset) and "reset" in normalized:
             raise ValueError("ConfigPanelFooter button_order must not include 'reset' when show_reset=False.")
 
-    def set_hint(self, text: str) -> None:
-        self.hint_label.setText(str(text))
-
     def set_dirty(self, dirty: bool) -> None:
         self._dirty = bool(dirty)
         if self._show_dirty:
@@ -229,37 +209,6 @@ class ConfigPanelFooter(QtWidgets.QWidget):
             self.error_label.setVisible(False)
         self._refresh_buttons_enabled_state()
 
-    def set_secondary_error(self, message: Optional[str], *, tooltip_text: Optional[str] = None) -> None:
-        if self.secondary_error_label is None:
-            return
-        text = str(message or "")
-        if text:
-            set_compact_label_text(
-                self.secondary_error_label,
-                text,
-                max_chars=INLINE_ERROR_MAX_CHARS,
-                max_width=520,
-                diagnostic=True,
-                tooltip_text=tooltip_text,
-            )
-            self.secondary_error_label.setVisible(True)
-        else:
-            self.secondary_error_label.clear()
-            self.secondary_error_label.setVisible(False)
-
-    def set_apply_enabled_override(self, enabled: Optional[bool]) -> None:
-        """
-        Optional escape hatch: allow callers to fully control Apply enabled state.
-
-        When enabled is None, the button state is driven by dirty/error state.
-        """
-        self._apply_enabled_override = enabled
-        self._refresh_buttons_enabled_state()
-
-    def set_revert_enabled_override(self, enabled: Optional[bool]) -> None:
-        self._revert_enabled_override = enabled
-        self._refresh_buttons_enabled_state()
-
     def _refresh_buttons_enabled_state(self) -> None:
         computed_revert_enabled = bool(self._dirty)
         if self._apply_requires_no_error:
@@ -267,9 +216,5 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         else:
             computed_apply_enabled = bool(self._dirty)
 
-        self.revert_button.setEnabled(
-            computed_revert_enabled if self._revert_enabled_override is None else bool(self._revert_enabled_override)
-        )
-        self.apply_button.setEnabled(
-            computed_apply_enabled if self._apply_enabled_override is None else bool(self._apply_enabled_override)
-        )
+        self.revert_button.setEnabled(computed_revert_enabled)
+        self.apply_button.setEnabled(computed_apply_enabled)

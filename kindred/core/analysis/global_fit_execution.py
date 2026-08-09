@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -26,7 +27,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
 )
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.exceptions import FittingCancelled, FitSimulationError, SimulationCancelled
-from kindred.core.fitting_completion import FitDiagnostic, FitDetailSection, GlobalFitCompletion
+from kindred.core.fitting_completion import FitDiagnostic, GlobalFitCompletion
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
@@ -35,11 +36,11 @@ from kindred.core.fitting_evaluation import (
 )
 from kindred.core.objective import ObjectiveContext
 from kindred.core.result_repository import SimulationResultValue
+from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.simulation_failure import (
     SimulationFailure,
     build_simulation_failure,
     coerce_simulation_failure,
-    simulation_failure_detail_text,
     simulation_failure_from_exception,
     simulation_failure_user_message,
 )
@@ -47,6 +48,7 @@ from kindred.core.simulation_failure import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "FitProgress",
     "DatasetFitInfo",
     "GlobalFitResult",
     "FitParameterLayout",
@@ -67,11 +69,12 @@ def _raise_if_fitting_cancelled(cancellation_check: Optional[Callable[[], bool]]
         raise FittingCancelled()
 
 
-def _raise_if_fitting_cancel_requested(cancellation_check: Optional[Callable[[], bool]]) -> None:
-    if cancellation_check is None:
+def _raise_if_fitting_cancel_requested(
+    cancellation_control: SimulationCancellationControl | None,
+) -> None:
+    if cancellation_control is None:
         return
-    cancel_requested = getattr(cancellation_check, "_kindred_nonblocking_cancelled", cancellation_check)
-    if bool(cancel_requested()):
+    if cancellation_control.cancel_requested():
         raise FittingCancelled()
 
 
@@ -104,6 +107,47 @@ def _candidate_trajectory_failure(
         context=exc.context,
     )
 
+@dataclass(frozen=True, slots=True)
+class FitProgress:
+    """Immutable Global Fit progress with its complete best-result payload."""
+
+    objective_calls: int
+    cost: float
+    parameters: Mapping[str, float]
+    improved: bool = False
+    best_simulation_results_by_dataset: Mapping[str, SimulationResultValue] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "objective_calls", int(self.objective_calls))
+        object.__setattr__(self, "cost", float(self.cost))
+        object.__setattr__(
+            self,
+            "parameters",
+            MappingProxyType(
+                {str(name): float(value) for name, value in self.parameters.items()}
+            ),
+        )
+        object.__setattr__(self, "improved", bool(self.improved))
+        best_results = {
+            str(dataset_id): value
+            for dataset_id, value in self.best_simulation_results_by_dataset.items()
+        }
+        if any(
+            not isinstance(value, SimulationResultValue)
+            for value in best_results.values()
+        ):
+            raise TypeError(
+                "Fit progress best simulations require SimulationResultValue values."
+            )
+        object.__setattr__(
+            self,
+            "best_simulation_results_by_dataset",
+            MappingProxyType(best_results),
+        )
+
+
 @dataclass
 class DatasetFitInfo:
     """Fit statistics for a single dataset within global fit."""
@@ -113,7 +157,6 @@ class DatasetFitInfo:
     weighted_residual_mse: float  # Exact objective contribution per observation
     weighted_rmse: float
     weighted_mae: float
-    residuals: np.ndarray  # Residuals for this dataset
     n_points: int  # Number of data points
     weight: float  # Weight used in global objective
 
@@ -129,8 +172,6 @@ class GlobalFitResult:
         Optimized shared parameters {name: value}
     dataset_params : dict
         Dataset-specific parameters {dataset_id: {name: value}}
-    uncertainties : dict, optional
-        Parameter uncertainties {name: std_dev}
     weighted_residual_sse : float
         Exact sum of squares minimized by the weighted objective
     weighted_residual_mse : float
@@ -141,19 +182,15 @@ class GlobalFitResult:
         Total number of function evaluations
     message : str
         Optimization termination message
-    covariance : np.ndarray, optional
-        Covariance matrix of all parameters
     """
     shared_params: Dict[str, float]
     dataset_params: Dict[str, Dict[str, float]]
-    uncertainties: Optional[Dict[str, float]]
     weighted_residual_sse: float
     weighted_residual_mse: float
     dataset_info: List[DatasetFitInfo]
     nfev: int
     message: str
     completion: GlobalFitCompletion
-    covariance: Optional[np.ndarray] = None
     objective_residuals: Optional[np.ndarray] = None
     model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     model_x_by_species: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
@@ -165,25 +202,6 @@ class GlobalFitResult:
     model_raw_columns: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
     model_source_rows: Dict[str, Dict[str, tuple[int, ...]]] = field(default_factory=dict)
     simulation_results_by_dataset: Dict[str, SimulationResultValue] = field(
-        default_factory=dict
-    )
-    plot_observed_x: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
-    plot_observed_source_rows: Dict[str, Dict[str, tuple[int, ...]]] = field(
-        default_factory=dict
-    )
-    plot_observed_raw_ids: Dict[str, Dict[str, str]] = field(
-        default_factory=dict
-    )
-    plot_model_x_by_species: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
-    plot_model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
-    plot_model_segment_ids: Dict[str, Dict[str, np.ndarray]] = field(
-        default_factory=dict
-    )
-    plot_model_segment_keys: Dict[
-        str,
-        Dict[str, tuple[str, ...]],
-    ] = field(default_factory=dict)
-    plot_model_discontinuity_ids: Dict[str, Dict[str, np.ndarray]] = field(
         default_factory=dict
     )
 
@@ -317,12 +335,6 @@ def _coerce_fit_failure_payload(value: object) -> SimulationFailure:
     return payload
 
 
-def _coerce_parameter_snapshot(snapshot: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
-    if not snapshot:
-        return None
-    return {str(name): float(value) for name, value in dict(snapshot).items()}
-
-
 def _compact_failure_message(failure: SimulationFailure) -> str:
     raw_message = simulation_failure_user_message(failure)
     return " ".join(part.strip() for part in str(raw_message).splitlines() if part.strip())
@@ -333,14 +345,12 @@ def build_fit_diagnostic_from_failure(
     *,
     phase: str,
     dataset_id: Optional[str] = None,
-    parameter_snapshot: Optional[Dict[str, float]] = None,
 ) -> FitDiagnostic:
     coerced_failure = _coerce_fit_failure_payload(failure)
     return FitDiagnostic(
         phase=phase,
         dataset_id=dataset_id,
         failure=coerced_failure,
-        parameter_snapshot=_coerce_parameter_snapshot(parameter_snapshot),
     )
 
 
@@ -357,12 +367,8 @@ def build_fit_diagnostic_from_exception(
     *,
     phase: str,
     dataset_id: Optional[str] = None,
-    parameter_snapshot: Optional[Dict[str, float]] = None,
     message_override: Optional[str] = None,
 ) -> FitDiagnostic:
-    chosen_snapshot = getattr(exc, "failed_params", None)
-    if not chosen_snapshot:
-        chosen_snapshot = parameter_snapshot
     failure = _embedded_fit_failure_payload(exc)
     if failure is None:
         failure = _coerce_fit_failure_payload(simulation_failure_from_exception(exc))
@@ -372,49 +378,7 @@ def build_fit_diagnostic_from_exception(
         phase=phase,
         dataset_id=dataset_id,
         failure=failure,
-        parameter_snapshot=_coerce_parameter_snapshot(chosen_snapshot),
     )
-
-
-def build_completion_detail_sections(
-    *,
-    status: str,
-    optimizer_diagnostic: Optional[FitDiagnostic],
-    dataset_failures: Dict[str, FitDiagnostic],
-) -> List[FitDetailSection]:
-    if status == "ok":
-        return []
-
-    sections: List[FitDetailSection] = []
-    if optimizer_diagnostic is not None:
-        optimizer_detail = simulation_failure_detail_text(optimizer_diagnostic.failure)
-        optimizer_summary = _compact_failure_message(optimizer_diagnostic.failure)
-        matching_detail = ""
-        matching_summary = ""
-        if optimizer_diagnostic.dataset_id is not None:
-            matching = dataset_failures.get(str(optimizer_diagnostic.dataset_id))
-            if matching is not None:
-                matching_detail = simulation_failure_detail_text(matching.failure)
-                matching_summary = _compact_failure_message(matching.failure)
-        if (optimizer_detail and optimizer_detail != matching_detail) or (
-            (not optimizer_detail) and optimizer_summary and optimizer_summary != matching_summary
-        ):
-            sections.append(
-                FitDetailSection(
-                    dataset_id=optimizer_diagnostic.dataset_id,
-                    failure=optimizer_diagnostic.failure,
-                )
-            )
-
-    for ds_id, diagnostic in sorted(dataset_failures.items(), key=lambda kv: str(kv[0])):
-        if simulation_failure_detail_text(diagnostic.failure) or _compact_failure_message(diagnostic.failure):
-            sections.append(
-                FitDetailSection(
-                    dataset_id=str(ds_id),
-                    failure=diagnostic.failure,
-                )
-            )
-    return sections
 
 
 def completion_result_message(
@@ -423,7 +387,6 @@ def completion_result_message(
     completion: GlobalFitCompletion,
     optimizer_diagnostic: Optional[FitDiagnostic],
     dataset_failures: Dict[str, FitDiagnostic],
-    dataset_warnings: Dict[str, str],
 ) -> str:
     if completion.status == "ok":
         return str(base_message)
@@ -439,10 +402,6 @@ def completion_result_message(
             detail = _compact_failure_message(optimizer_diagnostic.failure)
             if detail:
                 warning_parts.append(detail)
-        for ds_id, message in sorted(dataset_warnings.items(), key=lambda kv: str(kv[0])):
-            compact_message = " ".join(part.strip() for part in str(message).splitlines() if part.strip())
-            if compact_message:
-                warning_parts.append(f"dataset '{ds_id}': {compact_message}")
         if warning_parts:
             return "Global fit completed with warnings: " + "; ".join(warning_parts)
         fallback = str(base_message or "").strip()
@@ -540,19 +499,6 @@ def _normalized_target_weight_multipliers(
         name: float(np.sqrt(count * float(value) / total_weight))
         for name, value in cleaned
     }
-
-
-def _robust_span(values: np.ndarray) -> float:
-    arr = np.asarray(values, dtype=float).reshape(-1)
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return 0.0
-    lo = float(np.percentile(arr, 5))
-    hi = float(np.percentile(arr, 95))
-    span = hi - lo
-    if not np.isfinite(span) or span < 0.0:
-        return 0.0
-    return span
 
 
 def _align_series(
@@ -829,16 +775,75 @@ def _payload_x_obs_by_species(payload: FitDatasetSpec) -> Dict[str, np.ndarray]:
 
 @dataclass(frozen=True)
 class FitParameterLayout:
-    param_names: List[str]
-    shared_log10: Dict[str, bool]
-    dataset_var_order: List[Tuple[str, str]]
-    dataset_var_index: Dict[str, Dict[str, int]]
-    dataset_var_log10: Dict[Tuple[str, str], bool]
-    coupled_var_order: List[FitCoupledVariableParamSpec]
-    coupled_var_index: Dict[str, int]
+    param_names: tuple[str, ...]
+    shared_log10: Mapping[str, bool]
+    dataset_var_order: tuple[tuple[str, str], ...]
+    dataset_var_index: Mapping[str, Mapping[str, int]]
+    dataset_var_log10: Mapping[Tuple[str, str], bool]
+    coupled_var_order: tuple[FitCoupledVariableParamSpec, ...]
+    coupled_var_index: Mapping[str, int]
     x0: np.ndarray
     lower: np.ndarray
     upper: np.ndarray
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "param_names",
+            tuple(str(name) for name in self.param_names),
+        )
+        object.__setattr__(
+            self,
+            "shared_log10",
+            MappingProxyType(
+                {str(name): bool(value) for name, value in self.shared_log10.items()}
+            ),
+        )
+        object.__setattr__(
+            self,
+            "dataset_var_order",
+            tuple(
+                (str(dataset_id), str(parameter_name))
+                for dataset_id, parameter_name in self.dataset_var_order
+            ),
+        )
+        object.__setattr__(
+            self,
+            "dataset_var_index",
+            MappingProxyType(
+                {
+                    str(dataset_id): MappingProxyType(
+                        {
+                            str(parameter_name): int(index)
+                            for parameter_name, index in values.items()
+                        }
+                    )
+                    for dataset_id, values in self.dataset_var_index.items()
+                }
+            ),
+        )
+        object.__setattr__(
+            self,
+            "dataset_var_log10",
+            MappingProxyType(
+                {
+                    (str(dataset_id), str(parameter_name)): bool(value)
+                    for (dataset_id, parameter_name), value in self.dataset_var_log10.items()
+                }
+            ),
+        )
+        object.__setattr__(self, "coupled_var_order", tuple(self.coupled_var_order))
+        object.__setattr__(
+            self,
+            "coupled_var_index",
+            MappingProxyType(
+                {str(variable_id): int(index) for variable_id, index in self.coupled_var_index.items()}
+            ),
+        )
+        for name in ("x0", "lower", "upper"):
+            values = np.asarray(getattr(self, name), dtype=float).reshape(-1).copy()
+            values.setflags(write=False)
+            object.__setattr__(self, name, values)
 
     def opt_param_keys(self) -> List[str]:
         keys: List[str] = list(self.param_names)
@@ -1165,11 +1170,11 @@ def evaluate_dataset_simulation(
     fit_evaluators: Mapping[str, object],
     item: ObjectiveDatasetInput,
     *,
-    cancellation_check: Optional[Callable[[], bool]] = None,
+    cancellation_control: SimulationCancellationControl | None = None,
 ) -> DatasetSimulationEvaluation:
     ds_id = item.payload.dataset_id
     try:
-        _raise_if_fitting_cancel_requested(cancellation_check)
+        _raise_if_fitting_cancel_requested(cancellation_control)
         evaluator = fit_evaluators.get(ds_id)
         if evaluator is None:
             raise FitSimulationError(
@@ -1182,7 +1187,7 @@ def evaluate_dataset_simulation(
             origins=item.parameter_origins,
             failed_params=item.failed_param_snapshot,
         )
-        _raise_if_fitting_cancel_requested(cancellation_check)
+        _raise_if_fitting_cancel_requested(cancellation_control)
         return DatasetSimulationEvaluation(
             index=int(item.index),
             result=sim_result,
@@ -1220,32 +1225,19 @@ def evaluate_dataset_simulations(
     items: Sequence[ObjectiveDatasetInput],
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
+    cancellation_control: SimulationCancellationControl | None = None,
     stop_on_fatal: bool = True,
 ) -> List[DatasetSimulationEvaluation]:
     if not items:
         return []
-    return evaluate_dataset_simulations_serial(
-        fit_evaluators,
-        items,
-        cancellation_check=cancellation_check,
-        stop_on_fatal=stop_on_fatal,
-    )
-
-
-def evaluate_dataset_simulations_serial(
-    fit_evaluators: Mapping[str, object],
-    items: Sequence[ObjectiveDatasetInput],
-    *,
-    cancellation_check: Optional[Callable[[], bool]],
-    stop_on_fatal: bool,
-) -> List[DatasetSimulationEvaluation]:
     results = []
     for item in items:
         _raise_if_fitting_cancelled(cancellation_check)
+        _raise_if_fitting_cancel_requested(cancellation_control)
         result = evaluate_dataset_simulation(
             fit_evaluators,
             item,
-            cancellation_check=cancellation_check,
+            cancellation_control=cancellation_control,
         )
         results.append(result)
         if stop_on_fatal and dataset_evaluation_is_fatal(result):
@@ -1265,12 +1257,12 @@ class GlobalFitObjective:
         layout: FitParameterLayout,
         penalty_value: float,
         ctx: ObjectiveContext,
-        progress_callback: Optional[Callable[[int, float, Dict[str, float]], None]],
+        progress_callback: Optional[Callable[[FitProgress], None]],
         cancellation_check: Optional[Callable[[], bool]],
+        cancellation_control: SimulationCancellationControl | None = None,
     ) -> None:
         self._fit_evaluators = dict(fit_evaluators)
         self._payloads = payloads
-        self._shared_params = shared_params
         self._dataset_params = dataset_params
         self._weights = weights
         self._layout = layout
@@ -1278,8 +1270,9 @@ class GlobalFitObjective:
         self._ctx = ctx
         self._progress_callback = progress_callback
         self._cancellation_check = cancellation_check
+        self._cancellation_control = cancellation_control
 
-        self._iteration = 0
+        self._objective_calls = 0
         self._best_cost = float("inf")
         self._warned_objective_keys: set[tuple[str, str, str]] = set()
 
@@ -1326,7 +1319,7 @@ class GlobalFitObjective:
         dataset_inputs: List[ObjectiveDatasetInput] = []
 
         for index, payload in enumerate(self._payloads):
-            _raise_if_fitting_cancel_requested(self._cancellation_check)
+            _raise_if_fitting_cancel_requested(self._cancellation_control)
 
             ds_id = payload.dataset_id
             optimizer_dataset_params = self._layout.dataset_var_params_for_dataset(ds_id, params)
@@ -1378,6 +1371,7 @@ class GlobalFitObjective:
                 self._fit_evaluators,
                 dataset_inputs,
                 cancellation_check=self._cancellation_check,
+                cancellation_control=self._cancellation_control,
             )
         }
 
@@ -1390,7 +1384,7 @@ class GlobalFitObjective:
                 raise exc
 
         for item in dataset_inputs:
-            _raise_if_fitting_cancel_requested(self._cancellation_check)
+            _raise_if_fitting_cancel_requested(self._cancellation_control)
 
             payload = item.payload
             ds_id = payload.dataset_id
@@ -1557,13 +1551,27 @@ class GlobalFitObjective:
 
         residuals = np.asarray(all_residuals, dtype=float).ravel()
 
-        self._iteration += 1
+        self._objective_calls += 1
         if self._progress_callback is not None:
             cost = float(np.sum(residuals**2))
-            improved = cost < self._best_cost
+            candidate_evaluations = {
+                item.payload.dataset_id: evaluation.result
+                for item in dataset_inputs
+                if (
+                    (evaluation := simulation_evaluations.get(int(item.index)))
+                    is not None
+                    and evaluation.error is None
+                    and evaluation.result is not None
+                )
+            }
+            complete_evaluations = len(candidate_evaluations) == len(dataset_inputs)
+            improved = complete_evaluations and cost < self._best_cost
             if improved:
                 self._best_cost = cost
-            if improved or self._iteration % 10 == 0:
+            best_evaluations: Mapping[str, SimulationResultValue] = (
+                candidate_evaluations if improved else {}
+            )
+            if improved or self._objective_calls % 10 == 0:
                 callback_params = dict(param_dict)
                 if self._layout.dataset_var_index:
                     for ds_id, var_map in self._layout.dataset_var_index.items():
@@ -1578,7 +1586,15 @@ class GlobalFitObjective:
                     callback_params[spec.variable_id] = (
                         float(10.0**raw_val) if spec.log10 else raw_val
                     )
-                self._progress_callback(self._iteration, cost, callback_params)
+                self._progress_callback(
+                    FitProgress(
+                        objective_calls=self._objective_calls,
+                        cost=cost,
+                        parameters=callback_params,
+                        improved=improved,
+                        best_simulation_results_by_dataset=best_evaluations,
+                    )
+                )
         _raise_if_fitting_cancelled(self._cancellation_check)
 
         return residuals
@@ -1598,10 +1614,9 @@ def assemble_global_fit_result(
     success: bool,
     message: str,
     nfev: int,
-    covariance: Optional[np.ndarray],
     objective_residuals: Optional[np.ndarray],
-    uncertainties: Optional[Dict[str, float]],
     optimizer_diagnostic: Optional[FitDiagnostic] = None,
+    cancellation_control: SimulationCancellationControl | None = None,
 ) -> GlobalFitResult:
     dataset_info = []
     total_weighted_sse = 0.0
@@ -1616,26 +1631,13 @@ def assemble_global_fit_result(
     model_raw_columns_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
     model_source_rows_map: Dict[str, Dict[str, tuple[int, ...]]] = {}
     simulation_results_by_dataset: Dict[str, SimulationResultValue] = {}
-    plot_observed_x_map: Dict[str, Dict[str, np.ndarray]] = {}
-    plot_observed_source_rows_map: Dict[
-        str, Dict[str, tuple[int, ...]]
-    ] = {}
-    plot_observed_raw_ids_map: Dict[str, Dict[str, str]] = {}
-    plot_model_x_by_species_map: Dict[str, Dict[str, np.ndarray]] = {}
-    plot_model_series_map: Dict[str, Dict[str, np.ndarray]] = {}
-    plot_model_segment_ids_map: Dict[str, Dict[str, np.ndarray]] = {}
-    plot_model_segment_keys_map: Dict[
-        str,
-        Dict[str, tuple[str, ...]],
-    ] = {}
-    plot_model_discontinuity_ids_map: Dict[str, Dict[str, np.ndarray]] = {}
     final_dataset_failures: Dict[str, FitDiagnostic] = {}
-    final_dataset_warnings: Dict[str, str] = {}
 
     dataset_inputs: List[ObjectiveDatasetInput] = []
     for index, payload in enumerate(payloads):
         ds_id = payload.dataset_id
         _raise_if_fitting_cancelled(cancellation_check)
+        _raise_if_fitting_cancel_requested(cancellation_control)
 
         full_params = dict(fitted_params)
         full_params.update(fixed_dataset_params.get(ds_id, {}))
@@ -1677,6 +1679,7 @@ def assemble_global_fit_result(
             fit_evaluators,
             dataset_inputs,
             cancellation_check=cancellation_check,
+            cancellation_control=cancellation_control,
             stop_on_fatal=False,
         )
     }
@@ -1686,17 +1689,12 @@ def assemble_global_fit_result(
         ds_id = payload.dataset_id
         species_list = payload.species_list
         observations = _payload_observations(payload)
-        observed_times = np.concatenate(
-            [
-                np.asarray(observations[name]["t"], dtype=float).reshape(-1)
-                for name in species_list
-            ]
-        )
         x_name = payload.x_name
         x_obs_by_species = _payload_x_obs_by_species(payload) if x_name != "t" else {}
         x_mode = payload.x_mode
         failed_param_snapshot = item.failed_param_snapshot
         _raise_if_fitting_cancelled(cancellation_check)
+        _raise_if_fitting_cancel_requested(cancellation_control)
 
         sim_time: Optional[np.ndarray] = None
         sim_species: Mapping[str, np.ndarray] = {}
@@ -1715,7 +1713,6 @@ def assemble_global_fit_result(
                         evaluation.error,
                         phase="final_replay",
                         dataset_id=ds_id,
-                        parameter_snapshot=failed_param_snapshot,
                         message_override=(
                             final_error_message
                             if final_error_message.strip() and final_error_message != str(exc)
@@ -1730,7 +1727,6 @@ def assemble_global_fit_result(
                         ),
                         phase="final_replay",
                         dataset_id=ds_id,
-                        parameter_snapshot=failed_param_snapshot,
                     )
                 final_dataset_failures[ds_id] = diagnostic
         else:
@@ -1746,22 +1742,6 @@ def assemble_global_fit_result(
             segment_keys = simulation.segment_keys
             discontinuity_ids = simulation.discontinuity_ids
 
-        plot_mask: Optional[np.ndarray] = None
-        plot_x = np.asarray([], dtype=float)
-        if x_name != "t" and sim_time is not None and x_name in sim_species:
-            t0 = float(np.min(observed_times))
-            t1 = float(np.max(observed_times))
-            if t0 > t1:
-                t0, t1 = t1, t0
-            t_scale = max(1.0, abs(t0), abs(t1))
-            t_pad = 1e-12 * t_scale
-            plot_mask = (sim_time >= (t0 - t_pad)) & (sim_time <= (t1 + t_pad))
-            if np.any(plot_mask):
-                plot_x = np.asarray(
-                    sim_species[x_name],
-                    dtype=float,
-                ).reshape(-1)[plot_mask]
-
         residual_blocks: List[np.ndarray] = []
         weighted_residual_blocks: List[np.ndarray] = []
         r_squared_by_series: Dict[str, float] = {}
@@ -1774,18 +1754,6 @@ def assemble_global_fit_result(
                 if species_name in x_obs_by_species
                 else None
             )
-            plot_observed_x_map.setdefault(ds_id, {})[species_name] = (
-                obs_t.copy()
-                if x_name == "t"
-                else np.asarray(species_x_obs, dtype=float).reshape(-1).copy()
-            )
-            captured_observation = payload.observations[species_name]
-            plot_observed_source_rows_map.setdefault(ds_id, {})[
-                species_name
-            ] = tuple(captured_observation.source_rows)
-            plot_observed_raw_ids_map.setdefault(ds_id, {})[
-                species_name
-            ] = captured_observation.raw_observation_id
             penalty_block = np.full_like(y_exp, penalty_value, dtype=float)
 
             if species_name not in sim_species:
@@ -1797,7 +1765,6 @@ def assemble_global_fit_result(
                         ),
                         phase="final_replay",
                         dataset_id=ds_id,
-                        parameter_snapshot=failed_param_snapshot,
                     )
                 residual_blocks.append(penalty_block)
                 continue
@@ -1868,7 +1835,6 @@ def assemble_global_fit_result(
                         exc,
                         phase="final_replay",
                         dataset_id=ds_id,
-                        parameter_snapshot=failed_param_snapshot,
                     )
                 residual_blocks.append(penalty_block)
                 continue
@@ -1882,7 +1848,6 @@ def assemble_global_fit_result(
                         ),
                         phase="final_replay",
                         dataset_id=ds_id,
-                        parameter_snapshot=failed_param_snapshot,
                     )
                 residual_blocks.append(penalty_block)
             else:
@@ -1908,93 +1873,6 @@ def assemble_global_fit_result(
                     * target_multiplier
                     * raw_residual
                 )
-
-            if x_name == "t":
-                plot_model_series_map.setdefault(ds_id, {})[species_name] = np.asarray(
-                    sim_species[species_name],
-                    dtype=float,
-                ).reshape(-1).copy()
-                plot_model_x_by_species_map.setdefault(ds_id, {})[species_name] = np.asarray(
-                    sim_time,
-                    dtype=float,
-                ).reshape(-1).copy()
-                plot_model_segment_ids_map.setdefault(ds_id, {})[
-                    species_name
-                ] = np.asarray(segment_ids, dtype=np.int64).reshape(-1).copy()
-                plot_model_segment_keys_map.setdefault(ds_id, {})[
-                    species_name
-                ] = tuple(segment_keys or ())
-                plot_model_discontinuity_ids_map.setdefault(ds_id, {})[
-                    species_name
-                ] = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1).copy()
-            else:
-                sliced = None
-                if plot_mask is not None and species_name in sim_species:
-                    values = np.asarray(sim_species[species_name], dtype=float).reshape(-1)
-                    try:
-                        sliced = np.asarray(values[plot_mask], dtype=float).reshape(-1)
-                    except (IndexError, TypeError, ValueError):
-                        sliced = None
-                if sliced is not None and plot_x.size == sliced.size:
-                    plot_model_series_map.setdefault(ds_id, {})[species_name] = sliced
-                    plot_model_x_by_species_map.setdefault(ds_id, {})[species_name] = plot_x.copy()
-                    plot_model_segment_ids_map.setdefault(ds_id, {})[
-                        species_name
-                    ] = np.asarray(
-                        segment_ids,
-                        dtype=np.int64,
-                    ).reshape(-1)[plot_mask].copy()
-                    plot_model_segment_keys_map.setdefault(ds_id, {})[
-                        species_name
-                    ] = tuple(
-                        key
-                        for key, selected in zip(
-                            tuple(segment_keys or ()),
-                            np.asarray(plot_mask, dtype=bool),
-                            strict=True,
-                        )
-                        if selected
-                    )
-                    plot_model_discontinuity_ids_map.setdefault(ds_id, {})[
-                        species_name
-                    ] = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1)[plot_mask].copy()
-                else:
-                    full_model_y = np.asarray(
-                        sim_species[species_name],
-                        dtype=float,
-                    ).reshape(-1)
-                    full_model_x = np.asarray(
-                        sim_species[x_name],
-                        dtype=float,
-                    ).reshape(-1)
-                    full_segments = np.asarray(
-                        segment_ids,
-                        dtype=np.int64,
-                    ).reshape(-1)
-                    if not (
-                        full_model_x.size
-                        == full_model_y.size
-                        == full_segments.size
-                    ):
-                        raise FitSimulationError(
-                            f"Dataset {ds_id!r}: terminal Parametric model "
-                            "axes lost segment-aligned identity."
-                        )
-                    plot_model_series_map.setdefault(ds_id, {})[
-                        species_name
-                    ] = full_model_y.copy()
-                    plot_model_x_by_species_map.setdefault(ds_id, {})[
-                        species_name
-                    ] = full_model_x.copy()
-                    plot_model_segment_ids_map.setdefault(ds_id, {})[
-                        species_name
-                    ] = full_segments.copy()
-                    plot_model_segment_keys_map.setdefault(ds_id, {})[
-                        species_name
-                    ] = tuple(segment_keys or ())
-                    plot_model_discontinuity_ids_map.setdefault(ds_id, {})[
-                        species_name
-                    ] = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1).copy()
 
         residuals = np.concatenate(residual_blocks) if residual_blocks else np.asarray([], dtype=float)
         weighted_residuals = (
@@ -2026,7 +1904,6 @@ def assemble_global_fit_result(
                 weighted_residual_mse=weighted_mse,
                 weighted_rmse=weighted_rmse,
                 weighted_mae=weighted_mae,
-                residuals=residuals,
                 n_points=int(residuals.size),
                 weight=weights.get(ds_id, 1.0),
             )
@@ -2063,25 +1940,19 @@ def assemble_global_fit_result(
         completion_optimizer_diagnostic = None
     if final_dataset_failures or not metrics_finite:
         completion_status = "fail"
-    elif (not optimizer_converged) or final_dataset_warnings or completion_optimizer_diagnostic is not None:
+    elif (not optimizer_converged) or completion_optimizer_diagnostic is not None:
         completion_status = "warn"
     else:
         completion_status = "ok"
 
     if completion_status == "ok":
         completion_optimizer_diagnostic = None
-        completion_detail_sections: List[FitDetailSection] = []
     else:
         if completion_status == "fail" and (not metrics_finite) and not final_dataset_failures:
             completion_optimizer_diagnostic = ensure_failure_diagnostic(
                 completion_optimizer_diagnostic,
                 message="Final weighted residual MSE is non-finite; results are invalid.",
             )
-        completion_detail_sections = build_completion_detail_sections(
-            status=completion_status,
-            optimizer_diagnostic=completion_optimizer_diagnostic,
-            dataset_failures=dict(final_dataset_failures),
-        )
 
     completion = GlobalFitCompletion(
         status=completion_status,
@@ -2089,15 +1960,12 @@ def assemble_global_fit_result(
         nonfinite_metrics=not metrics_finite,
         optimizer_diagnostic=completion_optimizer_diagnostic,
         dataset_failures=dict(final_dataset_failures),
-        dataset_warnings=dict(final_dataset_warnings),
-        detail_sections=completion_detail_sections,
     )
     completion_message = completion_result_message(
         base_message=message,
         completion=completion,
         optimizer_diagnostic=completion_optimizer_diagnostic,
         dataset_failures=dict(final_dataset_failures),
-        dataset_warnings=dict(final_dataset_warnings),
     )
 
     if completion.status == "ok":
@@ -2125,14 +1993,12 @@ def assemble_global_fit_result(
     return GlobalFitResult(
         shared_params=fitted_params,
         dataset_params=combined_dataset_params,
-        uncertainties=uncertainties,
         weighted_residual_sse=total_weighted_sse,
         weighted_residual_mse=weighted_residual_mse,
         dataset_info=dataset_info,
         nfev=nfev,
         message=completion_message,
         completion=completion,
-        covariance=covariance,
         objective_residuals=objective_residuals.copy() if objective_residuals is not None else None,
         model_series=model_series_map,
         model_x_by_species=model_x_by_species_map,
@@ -2144,12 +2010,4 @@ def assemble_global_fit_result(
         model_raw_columns=model_raw_columns_map,
         model_source_rows=model_source_rows_map,
         simulation_results_by_dataset=simulation_results_by_dataset,
-        plot_observed_x=plot_observed_x_map,
-        plot_observed_source_rows=plot_observed_source_rows_map,
-        plot_observed_raw_ids=plot_observed_raw_ids_map,
-        plot_model_x_by_species=plot_model_x_by_species_map,
-        plot_model_series=plot_model_series_map,
-        plot_model_segment_ids=plot_model_segment_ids_map,
-        plot_model_segment_keys=plot_model_segment_keys_map,
-        plot_model_discontinuity_ids=plot_model_discontinuity_ids_map,
     )

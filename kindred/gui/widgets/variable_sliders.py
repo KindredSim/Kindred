@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 __all__ = ["VariableSliders"]
 
 _LOG_SLIDER_VALUE_MIN = 1e-12
-_LOG_SLIDER_VALUE_MAX = 1e12
 _LOG_SLIDER_EXP_MIN = -12.0
 _LOG_SLIDER_EXP_MAX = 12.0
 _LOG_DOMAIN_MIN = math.log10(float.fromhex("0x0.0000000000001p-1022"))
@@ -57,27 +56,59 @@ class _NumericValueEdit(QtWidgets.QLineEdit):
 class _GrooveJumpSlider(QtWidgets.QSlider):
     """Horizontal slider with native click-anywhere groove behavior."""
 
+    def __init__(
+        self,
+        orientation: QtCore.Qt.Orientation | QtWidgets.QWidget = (
+            QtCore.Qt.Orientation.Horizontal
+        ),
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        if isinstance(orientation, QtWidgets.QWidget) and parent is None:
+            parent = orientation
+            orientation = QtCore.Qt.Orientation.Horizontal
+        super().__init__(orientation, parent)
+        self._fine_drag_mode = False
+        self._fine_drag_origin: tuple[float, int, int, int, int] | None = None
+
+    def set_fine_drag_mode(self, enabled: bool) -> None:
+        """Reduce handle-drag sensitivity without changing slider semantics."""
+        self._fine_drag_mode = bool(enabled)
+
+    def _slider_geometry(
+        self,
+    ) -> tuple[QtWidgets.QStyleOptionSlider, QtCore.QRect, QtCore.QRect, int]:
+        option = QtWidgets.QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_Slider,
+            option,
+            QtWidgets.QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        handle = self.style().subControlRect(
+            QtWidgets.QStyle.ComplexControl.CC_Slider,
+            option,
+            QtWidgets.QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+        return option, groove, handle, max(1, groove.width() - handle.width())
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._fine_drag_origin = None
         if (
             event.button() == QtCore.Qt.MouseButton.LeftButton
             and self.orientation() == QtCore.Qt.Orientation.Horizontal
         ):
-            option = QtWidgets.QStyleOptionSlider()
-            self.initStyleOption(option)
-            groove = self.style().subControlRect(
-                QtWidgets.QStyle.ComplexControl.CC_Slider,
-                option,
-                QtWidgets.QStyle.SubControl.SC_SliderGroove,
-                self,
-            )
-            handle = self.style().subControlRect(
-                QtWidgets.QStyle.ComplexControl.CC_Slider,
-                option,
-                QtWidgets.QStyle.SubControl.SC_SliderHandle,
-                self,
-            )
-            if not handle.contains(event.position().toPoint()):
-                span = max(1, groove.width() - handle.width())
+            option, groove, handle, span = self._slider_geometry()
+            if handle.contains(event.position().toPoint()):
+                self._fine_drag_origin = (
+                    float(event.position().x()),
+                    int(self.sliderPosition()),
+                    span,
+                    int(self.minimum()),
+                    int(self.maximum()),
+                )
+            else:
                 position = int(
                     round(event.position().x() - groove.x() - handle.width() / 2)
                 )
@@ -93,6 +124,31 @@ class _GrooveJumpSlider(QtWidgets.QSlider):
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        origin = self._fine_drag_origin
+        if (
+            self._fine_drag_mode
+            and origin is not None
+            and self.isSliderDown()
+            and event.buttons() & QtCore.Qt.MouseButton.LeftButton
+        ):
+            origin_x, origin_value, span, minimum, maximum = origin
+            option, _, _, _ = self._slider_geometry()
+            pointer_delta = float(event.position().x()) - origin_x
+            value_delta = pointer_delta * (maximum - minimum) / (span * 10.0)
+            slider_position = origin_value + int(
+                round(-value_delta if option.upsideDown else value_delta)
+            )
+            slider_position = max(minimum, min(maximum, slider_position))
+            self.setSliderPosition(slider_position)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._fine_drag_origin = None
+        super().mouseReleaseEvent(event)
 
 
 class VariableSliders(QtWidgets.QWidget):
@@ -116,6 +172,7 @@ class VariableSliders(QtWidgets.QWidget):
     variableChanged = Signal(str, float)  # (variable_name, new_value)
     sliderDragStarted = Signal(str)  # name
     sliderDragFinished = Signal(str)  # name
+    fineModeReset = Signal(bool)
 
     def __init__(
         self, parent: Optional[QtWidgets.QWidget] = None, *, embedded: bool = False
@@ -210,13 +267,18 @@ class VariableSliders(QtWidgets.QWidget):
 
         logger.debug("VariableSliders initialized")
 
+    @property
+    def fine_mode_enabled(self) -> bool:
+        """Return the current mechanism-slider Fine projection state."""
+        return bool(self._fine_mode)
+
     def set_variables(
         self,
         variables: Dict[str, float],
         *,
         metadata: Optional[Dict[str, Dict[str, object]]] = None,
         preserve_visibility: bool = False,
-        visibility_scope_signature: object | None = None,
+        visibility_scope_signature: object,
     ) -> None:
         """
         Set variables and create sliders.
@@ -227,22 +289,28 @@ class VariableSliders(QtWidgets.QWidget):
             Dictionary of {variable_name: value}
             Examples: {'k1': 0.5, 'k2': 1.0, 'Keq1': 10.0, 'kf1': 2.0, 'kr1': 0.2}
         """
-        logger.info(f"Setting {len(variables)} variables")
+        normalized_variables, normalized_metadata = (
+            self._normalize_slider_snapshot(variables, metadata)
+        )
+        logger.info(f"Setting {len(normalized_variables)} variables")
 
-        current_names = {str(name) for name in variables}
+        current_names = set(normalized_variables)
         self._reconcile_visibility_scope(
             current_names,
             visibility_scope_signature,
+            metadata=normalized_metadata,
             preserve_visibility=preserve_visibility,
         )
+
+        self._reset_fine_mode_quietly()
 
         # Clear existing sliders
         self._clear_sliders()
 
-        self._variables = variables.copy()
-        self._metadata = dict(metadata or {})
+        self._variables = normalized_variables
+        self._metadata = normalized_metadata
 
-        if not variables:
+        if not normalized_variables:
             if self._placeholder is not None:
                 self._placeholder.show()
             logger.debug("No variables to display")
@@ -251,7 +319,7 @@ class VariableSliders(QtWidgets.QWidget):
         if self._placeholder is not None:
             self._placeholder.hide()
 
-        for name, value in variables.items():
+        for name, value in normalized_variables.items():
             self._create_slider(name, value)
 
         self._sync_visibility_state()
@@ -302,7 +370,7 @@ class VariableSliders(QtWidgets.QWidget):
         layout.setSpacing(2)
 
         meta = self._metadata.get(name) or {}
-        scale = str(meta.get("scale") or "log").strip().lower()
+        scale = meta["scale"]
 
         # Top row: name label and writable/read-only value projection.
         top_row = QtWidgets.QHBoxLayout()
@@ -369,12 +437,6 @@ class VariableSliders(QtWidgets.QWidget):
                 )
             except (ArithmeticError, TypeError, ValueError):
                 hi = float(value) + 10.0
-            if not math.isfinite(lo):
-                lo = float(value) - 10.0
-            if not math.isfinite(hi):
-                hi = float(value) + 10.0
-            if hi <= lo:
-                hi = lo + 1.0
             self._slider_ranges[name] = (lo, hi)
             self._slider_signs[name] = 1.0
         else:
@@ -385,11 +447,11 @@ class VariableSliders(QtWidgets.QWidget):
         # Store slider reference early so _value_to_slider_pos can access it
         self._sliders[name] = slider
 
-        if self._slider_scales.get(name) == "log":
-            self._ensure_range_covers(name, float(value))
-        slider_pos = self._value_to_slider_pos(name, float(value))
+        value_f = float(value)
+        self._ensure_range_covers(name, value_f, project_slider=False)
+        slider_pos = self._value_to_slider_pos(name, value_f)
         slider.setValue(slider_pos)
-        self._last_valid_values[name] = self._slider_pos_to_value(name, slider_pos)
+        self._last_valid_values[name] = value_f
 
         # Connect slider to update handler
         callbacks = self._slider_callbacks.setdefault(str(name), {})
@@ -578,16 +640,12 @@ class VariableSliders(QtWidgets.QWidget):
         *,
         metadata: Optional[Dict[str, Dict[str, object]]] = None,
         preserve_visibility: bool = True,
-        visibility_scope_signature: object | None = None,
+        visibility_scope_signature: object,
     ) -> None:
         """Render a tab snapshot without treating widget values as canonical."""
-        normalized_variables = {
-            str(name): float(value) for name, value in variables.items()
-        }
-        normalized_metadata = {
-            str(name): dict(value)
-            for name, value in dict(metadata or {}).items()
-        }
+        normalized_variables, normalized_metadata = (
+            self._normalize_slider_snapshot(variables, metadata)
+        )
         same_coordinates = (
             tuple(normalized_variables) == tuple(self._variables)
             and normalized_metadata == self._metadata
@@ -597,6 +655,7 @@ class VariableSliders(QtWidgets.QWidget):
             self._reconcile_visibility_scope(
                 set(normalized_variables),
                 visibility_scope_signature,
+                metadata=normalized_metadata,
                 preserve_visibility=preserve_visibility,
             )
             for name, value in normalized_variables.items():
@@ -663,7 +722,7 @@ class VariableSliders(QtWidgets.QWidget):
             self._last_valid_values.pop(name, None)
         if self._slider_scales.get(name, "log") == "log":
             self._slider_signs[name] = 1.0 if value_f >= 0 else -1.0
-            self._ensure_range_covers(name, value_f, project_slider=False)
+        self._ensure_range_covers(name, value_f, project_slider=False)
 
         value_label = self._value_labels.get(name)
         if isinstance(value_label, QtWidgets.QLabel):
@@ -673,6 +732,7 @@ class VariableSliders(QtWidgets.QWidget):
 
     def clear(self, *, preserve_visibility: bool = True) -> None:
         """Clear physical controls, optionally retaining visibility preference."""
+        self._reset_fine_mode_quietly()
         self._clear_sliders()
         self._variables.clear()
         self._slider_ranges.clear()
@@ -763,23 +823,17 @@ class VariableSliders(QtWidgets.QWidget):
         enabled : bool
             True to enable fine mode, False for normal mode
         """
+        enabled = bool(enabled)
         if self._fine_mode == enabled:
             return
         self._fine_mode = enabled
 
         for name, slider in self._sliders.items():
-            # Capture current numeric value
-            current_pos = slider.value()
-            current_max = max(1, slider.maximum())
-            if self._slider_scales.get(name, "log") == "linear":
-                lo, hi = self._slider_ranges[name]
-                frac = current_pos / current_max
-                val = float(lo) + float(frac) * (float(hi) - float(lo))
-            else:
-                sign = self._slider_signs.get(name, 1.0)
-                log_min, log_max = self._slider_ranges[name]
-                log_value = log_min + (current_pos / current_max) * (log_max - log_min)
-                val = sign * (10**log_value)
+            # Preserve the authoritative scientific value rather than
+            # reconstructing it from the quantized slider position.
+            val = float(
+                self._variables.get(name, self._last_valid_values.get(name, 0.0))
+            )
 
             # Switch resolution without emitting valueChanged (Fine must not trigger simulations).
             new_max = 10000 if enabled else 1000
@@ -788,11 +842,26 @@ class VariableSliders(QtWidgets.QWidget):
                 slider.setMaximum(new_max)
                 slider.setSingleStep(1 if enabled else 5)
                 slider.setPageStep(50 if enabled else 100)
+                slider.set_fine_drag_mode(enabled)
 
                 # Restore position for the same numeric value
                 slider.setValue(self._value_to_slider_pos(name, float(val)))
 
         logger.info(f"Fine mode {'enabled' if enabled else 'disabled'}")
+
+    def _reset_fine_mode_quietly(self) -> None:
+        """Return child sliders to quiet Normal state before a rebuild/clear."""
+        was_fine = bool(self._fine_mode)
+        self._fine_mode = False
+        for slider in self._sliders.values():
+            with QtCore.QSignalBlocker(slider):
+                slider.setMinimum(0)
+                slider.setMaximum(1000)
+                slider.setSingleStep(5)
+                slider.setPageStep(100)
+                slider.set_fine_drag_mode(False)
+        if was_fine:
+            self.fineModeReset.emit(False)
 
     def _apply_variable_visibility(self, name: str) -> None:
         container = self._containers.get(str(name))
@@ -818,28 +887,161 @@ class VariableSliders(QtWidgets.QWidget):
     def _reconcile_visibility_scope(
         self,
         names: set[str],
-        supplied_signature: object | None,
+        supplied_signature: object,
         *,
+        metadata: Dict[str, Dict[str, object]],
         preserve_visibility: bool,
     ) -> None:
-        """Reconcile visibility once for a structural scope transition."""
-        signature = (
-            tuple(sorted(names))
-            if supplied_signature is None
-            else supplied_signature
-        )
-        same_scope = bool(
-            preserve_visibility
-            and self._visibility_scope_signature == signature
-        )
-        if names:
-            if same_scope:
-                self._hidden_names.intersection_update(names)
-            else:
-                self._hidden_names = set(names)
-        elif not preserve_visibility:
-            self._hidden_names.clear()
+        """Reconcile choices by stable parameter identity, not roster order."""
+        if set(metadata) != names:
+            raise ValueError(
+                "Parameter slider metadata names must match slider values."
+            )
+
+        metadata_identities: Dict[str, tuple[str, str, str]] = {}
+        for name in names:
+            meta = metadata[name]
+            try:
+                family = meta["family"]
+                role = meta["role"]
+                scale = meta["scale"]
+            except KeyError as exc:
+                raise ValueError(
+                    "Parameter slider metadata requires family, role, and scale."
+                ) from exc
+            if not all(
+                isinstance(field, str) for field in (family, role, scale)
+            ) or scale not in {"log", "linear"}:
+                raise ValueError(
+                    "Parameter slider metadata requires string family, role, "
+                    "and scale, with scale equal to log or linear."
+                )
+            metadata_identities[name] = (family, role, scale)
+
+        if supplied_signature is None:
+            raise ValueError(
+                "Parameter visibility scope requires structural identities."
+            )
+        try:
+            raw_signature = tuple(supplied_signature)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Parameter visibility scope must contain structural identities."
+            ) from exc
+
+        identities: list[tuple[str, str, str, str]] = []
+        seen_names: set[str] = set()
+        for identity in raw_signature:
+            if not isinstance(identity, (tuple, list)) or len(identity) != 4:
+                raise ValueError(
+                    "Parameter visibility scope identities must be "
+                    "(name, family, role, scale)."
+                )
+            canonical_name, family, role, scale = identity
+            if not all(
+                isinstance(field, str)
+                for field in (canonical_name, family, role, scale)
+            ) or scale not in {"log", "linear"}:
+                raise ValueError(
+                    "Parameter visibility scope identities must be "
+                    "(name, family, role, scale)."
+                )
+            if canonical_name in seen_names:
+                raise ValueError(
+                    "Parameter visibility scope requires one identity per name."
+                )
+            if canonical_name not in metadata_identities:
+                raise ValueError(
+                    "Parameter visibility scope names must match slider metadata."
+                )
+            if (family, role, scale) != metadata_identities[canonical_name]:
+                raise ValueError(
+                    "Parameter visibility scope identities must match slider "
+                    "metadata."
+                )
+            seen_names.add(canonical_name)
+            identities.append((canonical_name, family, role, scale))
+
+        if seen_names != names:
+            raise ValueError(
+                "Parameter visibility scope names must match slider values."
+            )
+
+        # Identity names are unique by the validation above, so name-keyed
+        # lookup below cannot collapse an ambiguous supplied signature.
+        signature = tuple(identities)
+
+        previous = self._visibility_scope_signature
+        if not preserve_visibility or previous is None:
+            self._hidden_names = set(names)
+        else:
+            previous_by_name = {
+                identity[0]: identity
+                for identity in previous
+            }
+            current_by_name = {
+                identity[0]: identity
+                for identity in signature
+            }
+            preserved = {
+                name
+                for name in names
+                if previous_by_name.get(name) == current_by_name.get(name)
+            }
+            self._hidden_names = (
+                self._hidden_names.intersection(preserved)
+                | (names - preserved)
+            )
         self._visibility_scope_signature = signature
+
+    @staticmethod
+    def _normalize_slider_snapshot(
+        variables: Dict[str, float],
+        metadata: Optional[Dict[str, Dict[str, object]]],
+    ) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
+        """Normalize one render call without changing widget state."""
+        try:
+            variable_items = variables.items()
+        except AttributeError as exc:
+            raise ValueError("Slider variables must be a mapping.") from exc
+
+        normalized_variables: Dict[str, float] = {}
+        for raw_name, value in variable_items:
+            name = str(raw_name)
+            if name in normalized_variables:
+                raise ValueError(
+                    "Slider variables must have unique canonical names."
+                )
+            try:
+                normalized_variables[name] = float(value)
+            except (ArithmeticError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Slider variable values must be numeric."
+                ) from exc
+
+        if metadata is None:
+            metadata_items = ()
+        else:
+            try:
+                metadata_items = metadata.items()
+            except AttributeError as exc:
+                raise ValueError("Slider metadata must be a mapping.") from exc
+
+        normalized_metadata: Dict[str, Dict[str, object]] = {}
+        for raw_name, raw_meta in metadata_items:
+            name = str(raw_name)
+            if name in normalized_metadata:
+                raise ValueError(
+                    "Slider metadata must have unique canonical names."
+                )
+            try:
+                normalized_metadata[name] = dict(raw_meta)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Slider metadata entries must be mappings."
+                ) from exc
+
+        return normalized_variables, normalized_metadata
 
     def _editor_has_focus(self, name: str) -> bool:
         editor = self._value_labels.get(str(name))
@@ -923,7 +1125,7 @@ class VariableSliders(QtWidgets.QWidget):
             return
         if self._slider_scales.get(name_s, "log") == "log":
             self._slider_signs[name_s] = 1.0 if value_f >= 0 else -1.0
-            self._ensure_range_covers(name_s, value_f)
+        self._ensure_range_covers(name_s, value_f)
         self._variables[name_s] = value_f
         self._last_valid_values[name_s] = value_f
         slider = self._sliders[name_s]
@@ -1023,6 +1225,89 @@ class VariableSliders(QtWidgets.QWidget):
             log_min, log_max = _LOG_DOMAIN_MIN, _LOG_DOMAIN_MAX
         return log_min, log_max
 
+    @staticmethod
+    def _representable_linear_range(value: float) -> Tuple[float, float]:
+        """Return finite ordered neighbors containing one finite value."""
+        value_f = float(value)
+        if not math.isfinite(value_f):
+            raise ValueError("Linear slider values must be finite.")
+
+        lower = math.nextafter(value_f, -math.inf)
+        upper = math.nextafter(value_f, math.inf)
+        if not math.isfinite(lower):
+            lower = value_f
+        if not math.isfinite(upper):
+            upper = value_f
+        if lower < value_f < upper:
+            return lower, upper
+        if lower < value_f:
+            return lower, value_f
+        if value_f < upper:
+            return value_f, upper
+        raise ValueError("Could not construct an ordered linear slider range.")
+
+    @staticmethod
+    def _linear_fraction(value: float, lower: float, upper: float) -> float:
+        """Map a bounded linear value to a fraction without overflow."""
+        value_f = float(value)
+        lower_f = float(lower)
+        upper_f = float(upper)
+        if value_f <= lower_f:
+            return 0.0
+        if value_f >= upper_f:
+            return 1.0
+
+        span = upper_f - lower_f
+        if math.isfinite(span):
+            fraction = (value_f - lower_f) / span
+        else:
+            exponent = max(
+                math.frexp(abs(endpoint))[1]
+                for endpoint in (lower_f, value_f, upper_f)
+                if endpoint != 0.0
+            )
+            scaled_lower = math.ldexp(lower_f, -exponent)
+            scaled_value = math.ldexp(value_f, -exponent)
+            scaled_upper = math.ldexp(upper_f, -exponent)
+            fraction = (scaled_value - scaled_lower) / (
+                scaled_upper - scaled_lower
+            )
+        return min(max(fraction, 0.0), 1.0)
+
+    @staticmethod
+    def _linear_value_at_fraction(
+        fraction: float,
+        lower: float,
+        upper: float,
+    ) -> float:
+        """Map a slider fraction to a bounded linear value without overflow."""
+        fraction_f = min(max(float(fraction), 0.0), 1.0)
+        if fraction_f <= 0.0:
+            return float(lower)
+        if fraction_f >= 1.0:
+            return float(upper)
+
+        lower_f = float(lower)
+        upper_f = float(upper)
+        span = upper_f - lower_f
+        if math.isfinite(span):
+            value = lower_f + fraction_f * span
+        else:
+            exponent = max(
+                math.frexp(abs(endpoint))[1]
+                for endpoint in (lower_f, upper_f)
+                if endpoint != 0.0
+            )
+            scaled_lower = math.ldexp(lower_f, -exponent)
+            scaled_upper = math.ldexp(upper_f, -exponent)
+            value = math.ldexp(
+                scaled_lower + fraction_f * (scaled_upper - scaled_lower),
+                exponent,
+            )
+        if not math.isfinite(value):
+            return upper_f if fraction_f >= 0.5 else lower_f
+        return min(max(value, lower_f), upper_f)
+
     def _slider_pos_to_value(self, name: str, slider_pos: int) -> float:
         """Convert a slider position to a concrete variable value."""
         scale = self._slider_scales.get(name, "log")
@@ -1035,13 +1320,18 @@ class VariableSliders(QtWidgets.QWidget):
             lo, hi = self._slider_ranges.get(name, (0.0, 1.0))
             lo = float(lo)
             hi = float(hi)
-            if not math.isfinite(lo):
-                lo = 0.0
-            if not math.isfinite(hi):
-                hi = 1.0
-            if hi <= lo:
-                hi = lo + 1.0
-            return lo + frac * (hi - lo)
+            if not (
+                math.isfinite(lo)
+                and math.isfinite(hi)
+                and hi > lo
+            ):
+                reference = self._last_valid_values.get(
+                    name,
+                    self._variables.get(name, 0.0),
+                )
+                lo, hi = self._representable_linear_range(float(reference))
+                self._slider_ranges[name] = (lo, hi)
+            return self._linear_value_at_fraction(frac, lo, hi)
 
         log_min, log_max = self._validated_log_range(name)
         log_value = log_min + frac * (log_max - log_min)
@@ -1060,11 +1350,16 @@ class VariableSliders(QtWidgets.QWidget):
         steps = max(1, self._sliders[name].maximum())
         if scale == "linear":
             lo, hi = self._slider_ranges.get(name, (0.0, 1.0))
-            span = float(hi) - float(lo)
-            if span <= 0:
-                span = 1.0
-            frac = (float(value_abs) - float(lo)) / span
-            frac = min(max(frac, 0.0), 1.0)
+            lo = float(lo)
+            hi = float(hi)
+            if not (
+                math.isfinite(lo)
+                and math.isfinite(hi)
+                and hi > lo
+            ):
+                lo, hi = self._representable_linear_range(float(value_abs))
+                self._slider_ranges[name] = (lo, hi)
+            frac = self._linear_fraction(float(value_abs), lo, hi)
             return max(0, min(int(round(frac * steps)), int(steps)))
 
         log_min, log_max = self._validated_log_range(name)
@@ -1089,12 +1384,39 @@ class VariableSliders(QtWidgets.QWidget):
         *,
         project_slider: bool = True,
     ) -> None:
-        """Expand the slider range if needed to include the given value."""
-        if self._slider_scales.get(name, "log") != "log":
-            return
-        if self._freeze_ranges:
+        """Expand the GUI-only range if needed to include the given value."""
+        if self._freeze_ranges and self._slider_scales.get(name, "log") == "log":
             return
         if name not in self._slider_ranges:
+            return
+
+        if self._slider_scales.get(name, "log") == "linear":
+            value_f = float(value)
+            raw_min, raw_max = self._slider_ranges[name]
+            try:
+                linear_min = float(raw_min)
+                linear_max = float(raw_max)
+            except (ArithmeticError, TypeError, ValueError):
+                linear_min, linear_max = math.nan, math.nan
+
+            if (
+                math.isfinite(linear_min)
+                and math.isfinite(linear_max)
+                and linear_max > linear_min
+            ):
+                if value_f < linear_min:
+                    linear_min = value_f
+                elif value_f > linear_max:
+                    linear_max = value_f
+            else:
+                linear_min, linear_max = self._representable_linear_range(value_f)
+
+            self._slider_ranges[name] = (linear_min, linear_max)
+            self._update_range_labels(name)
+            if project_slider and name in self._sliders:
+                slider = self._sliders[name]
+                with QtCore.QSignalBlocker(slider):
+                    slider.setValue(self._value_to_slider_pos(name, value_f))
             return
 
         log_min, log_max = self._validated_log_range(name)
@@ -1121,9 +1443,14 @@ class VariableSliders(QtWidgets.QWidget):
         """Refresh the displayed min/max labels for a slider."""
         if name not in self._range_labels or name not in self._slider_ranges:
             return
+        min_label, max_label = self._range_labels[name]
+        if self._slider_scales.get(name, "log") == "linear":
+            linear_min, linear_max = self._slider_ranges[name]
+            min_label.setText(self._format_value(float(linear_min)))
+            max_label.setText(self._format_value(float(linear_max)))
+            return
         log_min, log_max = self._validated_log_range(name)
         self._slider_ranges[name] = (log_min, log_max)
-        min_label, max_label = self._range_labels[name]
         min_label.setText(self._format_power_of_ten(log_min))
         max_label.setText(self._format_power_of_ten(log_max))
 

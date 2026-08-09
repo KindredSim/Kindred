@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.core.datasets.csv_import import (
+from kindred.core.datasets.source_rules import (
     PhysicalColumn,
     identify_physical_columns,
 )
@@ -29,8 +29,8 @@ from kindred.core.datasets.units import (
     TIME_UNIT_DISPLAY,
     parse_concentration_unit,
 )
-from kindred.gui.widgets.import_config import (
-    ImportConfig,
+from kindred.gui.import_workflow import (
+    ImportConfig as _ImportConfig,
     ImportSourceSnapshot,
     SheetImportIntent,
     UnitDetection,
@@ -39,7 +39,7 @@ from kindred.gui.widgets.import_config import (
     resolve_import_plans,
 )
 
-__all__ = ["ImportConfig", "ImportConfigDialog", "ImportDialogResult"]
+__all__ = ["ImportConfigDialog", "ImportDialogResult"]
 
 _TIME_CANDIDATES = ["time", "time_s", "t", "Time", "T", "x"]
 _MAX_PREVIEW_ROWS = 20
@@ -48,12 +48,12 @@ _UNIT_ROW_BG = QtGui.QColor(80, 65, 20)  # dark muted amber for dark-theme reada
 
 @dataclass
 class ImportDialogResult:
-    config: Optional[ImportConfig] = None
+    config: Optional[_ImportConfig] = None
     action: str = "cancel"
 
 
 class ImportConfigDialog(QtWidgets.QDialog):
-    """Modal dialog that previews a data file and returns an ImportConfig."""
+    """Modal dialog that previews a data file and returns an import config."""
 
     def __init__(
         self,
@@ -534,36 +534,6 @@ class ImportConfigDialog(QtWidgets.QDialog):
             for col, unit in det.detected_conc_unit_by_column.items()
         }
 
-    def _detect_units_for_sheet(
-        self,
-        sheet_name: str,
-        relevant_columns: list[PhysicalColumn],
-    ) -> tuple[UnitDetection, list[PhysicalColumn]]:
-        """Return (UnitDetection, column_names) for a specific sheet."""
-        if sheet_name == self._previewed_sheet_name:
-            row_mapping = dict(zip(self._columns, self._preview_rows[0])) if self._preview_rows else {}
-            det = detect_units_from_physical_row(
-                row_mapping,
-                relevant_columns,
-            )
-            return det, list(self._columns)
-        with closing(
-            read_excel_sheet_rows_from_bytes(
-                self._source.exact_source_bytes,
-                sheet_name,
-                source_label=self._source.original_filename,
-            )
-        ) as rows:
-            first_row = next(iter(rows), None)
-        if first_row is None:
-            return UnitDetection.empty(), []
-        columns = list(first_row.keys())
-        det = detect_units_from_physical_row(
-            dict(first_row),
-            relevant_columns,
-        )
-        return det, columns
-
     def _restore_sheet_state(self, sheet_name: Optional[str], state: dict) -> None:
         self._previewed_sheet_name = sheet_name
         self._time_combo.blockSignals(True)
@@ -954,7 +924,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     @staticmethod
     def _build_intent_from_state(
-        state: dict, sheet_key: Optional[str],
+        state: dict,
     ) -> tuple[
         SheetImportIntent,
         UnitDetection,
@@ -1032,7 +1002,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
             )
 
         intent, _detection, _columns = self._build_intent_from_state(
-            previewed_state, previewed_key,
+            previewed_state,
         )
         return intent
 
@@ -1056,7 +1026,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
         for key in checked_keys:
             intent, detection, columns = self._build_intent_from_state(
-                self._sheet_states[key], key,
+                self._sheet_states[key],
             )
             per_sheet_intents[key] = intent
             per_sheet_detections[key] = detection
@@ -1075,7 +1045,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
         remaining_template = self._build_remaining_template()
 
-        config = ImportConfig(
+        config = _ImportConfig(
             source=self._source,
             file_intent=file_intent,
             plans=tuple(plans),

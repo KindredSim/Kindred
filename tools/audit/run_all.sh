@@ -107,6 +107,53 @@ summary="${report_dir}/SUMMARY.txt"
 
 hard_fail=0
 
+severity_pattern() {
+  local severity
+  severity="$1"
+  printf '%s' "(\\|[[:space:]]*${severity}[[:space:]]*\\|)|(\\(${severity}\\)(:|[[:space:]]|$))|((^|\\|)status=${severity}($|\\|))|(^${severity}($|[[:space:]:|]))"
+}
+
+report_severity() {
+  local stage report_file severity summary_status_pattern
+  stage="$1"
+  severity=""
+
+  for report_file in "${report_dir}/${stage}_"*; do
+    [[ -f "${report_file}" ]] || continue
+    if grep -Eq "$(severity_pattern FAIL)" "${report_file}"; then
+      severity="FAIL"
+      break
+    fi
+    if grep -Eq "$(severity_pattern TIMEOUT)" "${report_file}"; then
+      severity="TIMEOUT"
+      continue
+    fi
+    if [[ -z "${severity}" ]] && grep -Eq "$(severity_pattern WARN)" "${report_file}"; then
+      severity="WARN"
+    fi
+  done
+
+  [[ -n "${severity}" ]] || return 0
+
+  case "${severity}" in
+    FAIL)
+      summary_status_pattern="FAIL"
+      ;;
+    TIMEOUT)
+      summary_status_pattern="FAIL|TIMEOUT"
+      ;;
+    WARN)
+      summary_status_pattern="WARN|FAIL|TIMEOUT"
+      ;;
+  esac
+  if grep -Eq "^Audit ${stage}([^:]*)?: (${summary_status_pattern})($|[ (])" "${summary}"; then
+    return 0
+  fi
+
+  sed -i -E "/^Audit ${stage}: PASS($|[ (])/d" "${summary}"
+  echo "Audit ${stage}: ${severity} (stage report contains ${severity})" >> "${summary}"
+}
+
 run_stage() {
   local stage
   stage="$1"
@@ -230,6 +277,7 @@ run_stage() {
 
 for stage in "${stages[@]}"; do
   run_stage "${stage}"
+  report_severity "${stage}"
   echo >> "${summary}"
 done
 

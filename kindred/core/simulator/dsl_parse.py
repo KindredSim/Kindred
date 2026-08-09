@@ -5,8 +5,9 @@ Current contract
 ----------------
 - Entries: `reaction:` and `equilibrium:`.
 - Accepted keys with normalization:
-  T, degeneracy, κ, C°|C0, dG_act|ΔG‡, Ea, dG_eq|ΔG°, k|kf|kr, A, k_fast,
+  degeneracy, κ, C°|C0, dG_act|ΔG‡, Ea, dG_eq|ΔG°, k|kf|kr, A, k_fast,
   energy=kcal/mol|kJ/mol|J/mol
+- Source-level `T=` is rejected; set nominal temperature in the mechanism tab.
 - If dG_eq/ΔG° is provided and Keq is omitted, compute Keq = exp(-ΔG°/(R*T)).
 - Default per step is Eyring; Arrhenius override via A/Ea.
 - Units inferred from molecularity (1/(M^(n−1)*s)); bimolecular Eyring divides by C°.
@@ -25,17 +26,15 @@ Non-goals
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping as MappingABC, Sequence as SequenceABC
+from collections.abc import Iterator, Mapping as MappingABC
 import copy
 import hashlib
 import json
 import logging
 import math
-import pickle
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, Optional, Tuple, cast, TYPE_CHECKING
 
-import numpy as np
 import re
 
 from ..equilibrium_rate_authority import (
@@ -50,12 +49,23 @@ from .errors import (
     invalid_species_term_error,
     empty_stoichiometry_error,
     invalid_keyvalue_pair_error,
-    invalid_boolean_error,
 )
 from .parameter_algebra_spec import classify_parameter_algebra_declaration
+from .parameter_namespace import build_namespace_from_mechanism
+from .dsl_build_input import DslBuildStep
+from .dsl_parameter_scan import DslParameterAnalysis
+from .dsl_derivation import (
+    authored_step_origin,
+    coordinate_source_line,
+    coordinate_source_parts,
+    origin_line_positions,
+    scalar_origin,
+    set_coordinate_source_token,
+)
 
 if TYPE_CHECKING:
     from ..intervention_schedule import InterventionSchedule
+    from ..intervention_schedule_compiler import InterventionExecutionContract
     from ..temperature import TemperatureScheduleProtocol
 
 logger = logging.getLogger(__name__)
@@ -69,7 +79,6 @@ __all__ = [
     "DslInitialConditionAdmission",
     "DslInitialConditionAssignment",
     "DslInitialConditionDeclaration",
-    "DslParameterAnalysis",
     "DslParameterCoordinateUpdate",
     "DslSourceOrigin",
     "FrozenDslMapping",
@@ -83,7 +92,7 @@ __all__ = [
 # ------------------------------ normalized keys ------------------------------
 
 _KEY_ALIASES: Dict[str, str] = {
-    # temperature / states
+    # temperature / states (keys are casefold-normalized)
     "t": "T",
     "degeneracy": "degeneracy",
     "kappa": "κ",
@@ -92,18 +101,12 @@ _KEY_ALIASES: Dict[str, str] = {
     "c0": "C0",
     # energies / model params
     "dg_act": "dG_act",
-    "Δg‡": "dG_act",
-    "Δg^‡": "dG_act",
-    "dG_act": "dG_act",
-    "ΔG‡": "dG_act",
+    "δg‡": "dG_act",
+    "δg^‡": "dG_act",
     "ea": "Ea",
-    "Ea": "Ea",
     "dg_eq": "dG_eq",
-    "Δg°": "dG_eq",
-    "dG_eq": "dG_eq",
-    "ΔG°": "dG_eq",
+    "δg°": "dG_eq",
     "a": "A",
-    "A": "A",
     "k": "k",
     "keq": "Keq",
     "kf": "kf",
@@ -123,7 +126,9 @@ _STOICH_TERM_SPLIT_RE = re.compile(r"(?<![eE])\+")
 _COMMA_SEMI_SPLIT_RE = re.compile(r"[,;]")
 _SEMI_SPLIT_RE = re.compile(r"[;]")
 
-_REACTION_KNOWN_KEYS = frozenset({"κ", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"})
+_REACTION_KNOWN_KEYS = frozenset(
+    {"κ", "degeneracy", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"}
+)
 _EQUILIBRIUM_KNOWN_KEYS = frozenset({"Keq", "kf", "kr", "dG_eq", "dg_eq"})
 
 
@@ -142,11 +147,9 @@ class DSLIR:
     energy_unit: str
     temperature_K: float
     standard_conc_M: float
-    kappa_global: float
     temperature_schedule: Optional["TemperatureScheduleProtocol"]
     intervention_schedule: Optional["InterventionSchedule"]
-    steps: List["ParsedStep"]
-    algebra_lines: List[str]
+    steps: List[DslBuildStep]
     inline_initial_conditions: "DslInitialConditionAdmission"
     notes: List[str] = field(default_factory=list)
 
@@ -192,118 +195,6 @@ class FrozenDslMapping(MappingABC[str, object]):
         return (type(self), (self.__items,))
 
 
-def _canonical_dsl_value(
-    value: object,
-    *,
-    active_ids: set[int] | None = None,
-) -> object:
-    from kindred.core.intervention_schedule import InterventionSchedule
-    from kindred.core.temperature import TemperatureSchedule
-
-    if value is None or type(value) in {str, bool, int, bytes}:
-        return value
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise ValueError("DSL analysis values must be finite.")
-        return value
-    if type(value) is TemperatureSchedule:
-        return _canonical_dsl_value(value.to_dict(), active_ids=active_ids)
-    if type(value) is InterventionSchedule:
-        return _canonical_dsl_value(value.to_payload(), active_ids=active_ids)
-    if isinstance(value, np.generic):
-        return _canonical_dsl_value(value.item(), active_ids=active_ids)
-    if type(value) is np.ndarray:
-        if value.dtype.hasobject:
-            raise TypeError("DSL analysis arrays cannot contain objects.")
-        return _canonical_dsl_value(value.tolist(), active_ids=active_ids)
-    if active_ids is None:
-        active_ids = set()
-    if isinstance(value, MappingABC):
-        identity = id(value)
-        if identity in active_ids:
-            raise TypeError("DSL analysis values cannot contain cycles.")
-        active_ids.add(identity)
-        try:
-            result: dict[str, object] = {}
-            for key, item in value.items():
-                if type(key) is not str:
-                    raise TypeError(
-                        "DSL analysis mapping keys must be exact strings."
-                    )
-                result[key] = _canonical_dsl_value(
-                    item,
-                    active_ids=active_ids,
-                )
-            return result
-        finally:
-            active_ids.remove(identity)
-    if isinstance(value, SequenceABC) and not isinstance(
-        value,
-        (str, bytes, bytearray),
-    ):
-        identity = id(value)
-        if identity in active_ids:
-            raise TypeError("DSL analysis values cannot contain cycles.")
-        active_ids.add(identity)
-        try:
-            return [
-                _canonical_dsl_value(item, active_ids=active_ids)
-                for item in value
-            ]
-        finally:
-            active_ids.remove(identity)
-    raise TypeError(
-        "DSL analysis accepts only explicit code-owned schedules and exact "
-        "JSON-safe values."
-    )
-
-
-def _freeze_dsl_value(
-    value: object,
-    *,
-    active_ids: set[int] | None = None,
-) -> object:
-    if value is None or type(value) in {str, bool, int, float, bytes}:
-        return value
-    if isinstance(value, (DslAnalysis, DslParameterAnalysis, DslSourceOrigin)):
-        return value
-    if active_ids is None:
-        active_ids = set()
-    if isinstance(value, MappingABC):
-        identity = id(value)
-        if identity in active_ids:
-            raise TypeError("DSL immutable values cannot contain cycles.")
-        active_ids.add(identity)
-        try:
-            return FrozenDslMapping(
-                tuple(
-                    (
-                        str(key),
-                        _freeze_dsl_value(item, active_ids=active_ids),
-                    )
-                    for key, item in value.items()
-                )
-            )
-        finally:
-            active_ids.remove(identity)
-    if isinstance(value, SequenceABC) and not isinstance(
-        value,
-        (str, bytes, bytearray),
-    ):
-        identity = id(value)
-        if identity in active_ids:
-            raise TypeError("DSL immutable values cannot contain cycles.")
-        active_ids.add(identity)
-        try:
-            return tuple(
-                _freeze_dsl_value(item, active_ids=active_ids)
-                for item in value
-            )
-        finally:
-            active_ids.remove(identity)
-    raise TypeError(f"Unsupported DSL immutable value: {type(value).__name__}.")
-
-
 def _dsl_identity_payload(
     text: str,
     units: UnitsModel | None,
@@ -340,63 +231,6 @@ class DslSourceOrigin:
             raise ValueError("DSL origin kind must be nonempty text.")
         if type(self.source_text) is not str:
             raise TypeError("DSL origin source text must be an exact string.")
-
-
-@dataclass(frozen=True, slots=True)
-class DslParameterAnalysis:
-    name: str
-    value: float
-    context: str
-    source: str
-    step_index: int | None = None
-    editable: bool = True
-    unit: str | None = None
-    role: str | None = None
-    minimum: float | None = None
-    maximum: float | None = None
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.name) is not str
-            or not self.name
-            or self.name != self.name.strip()
-        ):
-            raise ValueError("DSL parameter name must be nonempty text.")
-        if type(self.value) not in {int, float}:
-            raise TypeError("DSL parameter values must be exact numbers.")
-        value = float(self.value)
-        if not math.isfinite(value):
-            raise ValueError("DSL parameter values must be finite.")
-        object.__setattr__(self, "value", value)
-        for attr in ("context", "source"):
-            if type(getattr(self, attr)) is not str:
-                raise TypeError(
-                    f"DSL parameter {attr} must be an exact string."
-                )
-        if self.step_index is not None and type(self.step_index) is not int:
-            raise TypeError(
-                "DSL parameter step index must be an exact int or None."
-            )
-        if type(self.editable) is not bool:
-            raise TypeError("DSL parameter editable must be bool.")
-        for attr in ("unit", "role"):
-            raw = getattr(self, attr)
-            if raw is not None and type(raw) is not str:
-                raise TypeError(
-                    f"DSL parameter {attr} must be a string or None."
-                )
-        for attr in ("minimum", "maximum"):
-            raw = getattr(self, attr)
-            if raw is None:
-                continue
-            if type(raw) not in {int, float}:
-                raise TypeError(
-                    f"DSL parameter {attr} must be an exact number."
-                )
-            numeric = float(raw)
-            if not math.isfinite(numeric):
-                raise ValueError(f"DSL parameter {attr} must be finite.")
-            object.__setattr__(self, attr, numeric)
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,18 +409,6 @@ class DslInitialConditionAdmission:
             item for item in self.declarations if item.source_kind == "named"
         )
 
-    @property
-    def anonymous_assignments(
-        self,
-    ) -> tuple[DslInitialConditionAssignment, ...]:
-        return tuple(
-            assignment
-            for item in self.declarations
-            if item.source_kind == "anonymous"
-            for assignment in item.assignments
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class DslDerivedScalarDefinition:
     name: str
@@ -674,11 +496,8 @@ class DslAnalysis:
     observable_names: tuple[str, ...]
     parameters: tuple[DslParameterAnalysis, ...]
     inline_initial_conditions: DslInitialConditionAdmission
-    temperature_schedule: object
-    intervention_schedule: object
-    structure: Mapping[str, object] = field(
-        default_factory=FrozenDslMapping
-    )
+    temperature_K: float
+    energy_unit: str
 
     def __post_init__(self) -> None:
         if (
@@ -735,15 +554,27 @@ class DslAnalysis:
             raise TypeError(
                 "DSL inline initial conditions must be one typed admission."
             )
-        for attr in ("temperature_schedule", "intervention_schedule"):
-            canonical = _canonical_dsl_value(getattr(self, attr))
-            object.__setattr__(self, attr, _freeze_dsl_value(canonical))
-        canonical_structure = _canonical_dsl_value(self.structure)
-        frozen_structure = _freeze_dsl_value(canonical_structure)
-        if not isinstance(frozen_structure, FrozenDslMapping):
-            raise TypeError("DSL structure must be a mapping.")
-        object.__setattr__(self, "structure", frozen_structure)
+        if type(self.temperature_K) not in {int, float} or isinstance(
+            self.temperature_K, bool
+        ):
+            raise TypeError("DSL analysis temperature_K must be numeric.")
+        temperature_K = float(self.temperature_K)
+        if not math.isfinite(temperature_K) or temperature_K <= 0.0:
+            raise ValueError(
+                "DSL analysis temperature_K must be positive and finite."
+            )
+        object.__setattr__(self, "temperature_K", temperature_K)
+        if type(self.energy_unit) is not str:
+            raise TypeError("DSL analysis energy_unit must be an exact string.")
+        from .common import normalize_energy_unit
 
+        try:
+            energy_unit = normalize_energy_unit(self.energy_unit)
+        except ValueError as exc:
+            raise ValueError(
+                f"DSL analysis energy_unit is invalid: {self.energy_unit!r}."
+            ) from exc
+        object.__setattr__(self, "energy_unit", energy_unit)
     @property
     def parameter_values(self) -> Mapping[str, float]:
         return cast(
@@ -761,6 +592,7 @@ class PreparedDslRequestSet:
         "analysis",
         "__mechanism",
         "__intervention_schedule",
+        "__intervention_execution",
         "__parameter_algebra_spec",
     )
 
@@ -769,87 +601,83 @@ class PreparedDslRequestSet:
         *,
         analysis: DslAnalysis,
         mechanism: object,
-        intervention_schedule: object,
+        intervention_schedule: InterventionSchedule | None,
+        intervention_execution: InterventionExecutionContract | None,
         parameter_algebra_spec: object,
     ) -> None:
+        from kindred.core.intervention_schedule import InterventionSchedule
+        from kindred.core.intervention_schedule_compiler import (
+            InterventionExecutionContract,
+        )
+
         if type(analysis) is not DslAnalysis:
             raise TypeError("analysis must be DslAnalysis.")
+        if intervention_schedule is not None and type(
+            intervention_schedule
+        ) is not InterventionSchedule:
+            raise TypeError(
+                "Parameterized intervention authority must be an exact "
+                "InterventionSchedule."
+            )
+        if intervention_execution is not None and not isinstance(
+            intervention_execution,
+            InterventionExecutionContract,
+        ):
+            raise TypeError(
+                "Literal intervention authority must be an "
+                "InterventionExecutionContract."
+            )
+        if intervention_schedule is not None:
+            if not intervention_schedule.is_parameterized:
+                raise ValueError(
+                    "Only a parameterized intervention schedule may remain "
+                    "declarative on prepared DSL state."
+                )
+            if intervention_execution is not None:
+                raise ValueError(
+                    "Prepared DSL intervention authority cannot be both "
+                    "declarative and compiled."
+                )
+        elif intervention_execution is None:
+            raise ValueError(
+                "Literal prepared DSL state requires its compiled intervention "
+                "contract."
+            )
         self.analysis = analysis
         self.__mechanism = mechanism
         self.__intervention_schedule = intervention_schedule
+        self.__intervention_execution = intervention_execution
         self.__parameter_algebra_spec = parameter_algebra_spec
 
     def mechanism_for_execution(self) -> object:
         return copy.deepcopy(self.__mechanism)
 
-    def intervention_schedule_for_execution(self) -> object:
+    def parameterized_intervention_schedule_for_binding(
+        self,
+    ) -> InterventionSchedule | None:
         return copy.deepcopy(self.__intervention_schedule)
+
+    def intervention_execution_contract(
+        self,
+    ) -> InterventionExecutionContract | None:
+        return self.__intervention_execution
 
     def parameter_algebra_spec_for_execution(self) -> object:
         return copy.deepcopy(self.__parameter_algebra_spec)
-
-    def process_execution_payload(
-        self,
-        *,
-        wegscheider_cyclicity_enabled: bool,
-    ) -> Mapping[str, object]:
-        from kindred.core.mechanism_metadata import MechanismMetadataKeys
-
-        mechanism = self.mechanism_for_execution()
-        metadata = getattr(mechanism, "metadata", None)
-        if not isinstance(metadata, dict):
-            raise TypeError("Prepared DSL mechanism metadata must be mutable.")
-        metadata[
-            MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED
-        ] = bool(wegscheider_cyclicity_enabled)
-        # Static parameter evaluation belongs to execution preparation.  This
-        # boundary only transports the admitted retained AST so ordinary runs
-        # evaluate it exactly once after execution bindings are ready.
-
-        species_names = tuple(str(name) for name in mechanism.species_names())
-        schedule = self.intervention_schedule_for_execution()
-        schedule_payload = (
-            schedule.to_payload()
-            if callable(getattr(schedule, "to_payload", None))
-            else schedule
-        )
-        payload = _freeze_dsl_value(
-            {
-                "version": 4,
-                "dsl_analysis": self.analysis,
-                "mechanism_blob": pickle.dumps(
-                    mechanism,
-                    protocol=pickle.HIGHEST_PROTOCOL,
-                ),
-                "species_names": species_names,
-                "y0": tuple(
-                    float(mechanism.species[name].initial_conc)
-                    for name in species_names
-                ),
-                "temperature_schedule": self.analysis.temperature_schedule,
-                "intervention_schedule": schedule_payload,
-                "unresolved_intervention_schedule": schedule_payload,
-                "jacobian_func": None,
-            }
-        )
-        if not isinstance(payload, FrozenDslMapping):
-            raise TypeError(
-                "Prepared DSL execution payload must be a mapping."
-            )
-        return payload
-
 
 # ------------------------------ helpers --------------------------------------
 
 def _norm_key(k: str) -> str:
     key = k.strip()
-    if key.lower() == "keq":
+    normalized = key.casefold()
+    if normalized == "keq":
         return "Keq"
     # Bare uppercase K is not lowercase k and is not accepted as a Keq alias.
     if key == "K":
         return "K"
-    # Otherwise normalize to lowercase and look up
-    return _KEY_ALIASES.get(key.lower(), key)
+    # Otherwise normalize to casefolded Unicode before lookup.  The table is
+    # stored in the same normalized form, including Greek Delta aliases.
+    return _KEY_ALIASES.get(normalized, key)
 
 
 def _parse_keyvals(
@@ -948,6 +776,46 @@ def _float_or_none(s: Optional[str]) -> Optional[float]:
     return v
 
 
+_DEGENERACY_LITERAL_RE = re.compile(r"\+?\d+")
+
+
+def _parse_degeneracy(
+    raw: object,
+    *,
+    line_number: int | None,
+    line_content: str | None,
+) -> int:
+    """Admit only a positive integer literal for an Eyring degeneracy."""
+
+    if type(raw) is bool:
+        raise DSLError(
+            "degeneracy must be a positive integer literal, not a boolean",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    if type(raw) is not str:
+        raise DSLError(
+            "degeneracy must be a positive integer literal",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    literal = raw.strip()
+    if not _DEGENERACY_LITERAL_RE.fullmatch(literal):
+        raise DSLError(
+            "degeneracy must be a positive integer literal",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    value = int(literal)
+    if value <= 0:
+        raise DSLError(
+            "degeneracy must be a positive integer",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    return value
+
+
 def _validate_rate_or_K(
     value: Optional[float],
     name: str,
@@ -1013,15 +881,6 @@ def _reverse_rate_for_dsl(
             line_content=line_content,
         )
     return result
-
-
-def _bool_from_str(s: str) -> bool:
-    v = s.strip().lower()
-    if v in ("1", "true", "yes", "on"):
-        return True
-    if v in ("0", "false", "no", "off"):
-        return False
-    raise invalid_boolean_error(s, "boolean")
 
 
 def _derive_fast_equilibrium_rates_with_context(
@@ -1460,11 +1319,9 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     energy_unit = u.energy_unit
     temperature_K = float(u.temperature_K)
     standard_conc_M = float(u.standard_conc_M)
-    kappa_global = 1.0
 
     temperature_directive = _admit_temperature_directive(text)
-    steps: List[ParsedStep] = []
-    algebra_lines: List[str] = []
+    steps: List[DslBuildStep] = []
     inline_initial_conditions, inline_initial_line_indexes = (
         _admit_inline_initial_conditions(text)
     )
@@ -1488,6 +1345,66 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     if not any(line.strip() and not line.strip().startswith("#") for line in raw_lines):
         raise DSLError("DSL text is empty. Provide at least one reaction or directive.")
     lines = [ln.rstrip() for ln in raw_lines]
+
+    # Resolve source-wide settings before lowering any reaction.  A directive
+    # may appear anywhere in the source, but each global setting has exactly
+    # one source owner and duplicate definitions fail before chemistry is
+    # constructed.
+    global_directive_lines: set[int] = set()
+    global_directives: dict[str, tuple[int, str]] = {}
+    for line_no, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        lower = line.lower()
+        if not line or line.startswith("#"):
+            continue
+        key: str | None = None
+        if lower.startswith("energy="):
+            key = "energy"
+        elif lower.startswith("c0=") or lower.startswith("c°="):
+            key = "C0"
+        if key is None:
+            continue
+        if key in global_directives:
+            raise DSLError(
+                f"Duplicate global {key} directive.",
+                suggestion=f"Keep exactly one source-wide {key}= definition.",
+                line_number=line_no,
+                line_content=raw,
+            )
+        global_directives[key] = (line_no, raw)
+        global_directive_lines.add(line_no)
+
+    if "energy" in global_directives:
+        line_no, raw = global_directives["energy"]
+        try:
+            energy_unit = _parse_energy_unit_directive(raw.strip())
+        except DSLError as exc:
+            if exc.line_number is None:
+                raise DSLError(
+                    str(exc.message),
+                    suggestion=exc.suggestion,
+                    examples=exc.examples,
+                    line_number=line_no,
+                    line_content=raw,
+                ) from exc
+            raise
+        notes.append(f"energy unit set to {energy_unit}")
+    if "C0" in global_directives:
+        line_no, raw = global_directives["C0"]
+        try:
+            standard_conc_M = _parse_standard_conc_directive(raw.strip())
+        except DSLError as exc:
+            if exc.line_number is None:
+                raise DSLError(
+                    str(exc.message),
+                    suggestion=exc.suggestion,
+                    examples=exc.examples,
+                    line_number=line_no,
+                    line_content=raw,
+                ) from exc
+            raise
+        notes.append(f"C° set to {standard_conc_M:g} M")
+
     for line_no, raw in enumerate(lines, start=1):
         line = raw.strip()
         lower = line.lower()
@@ -1501,16 +1418,8 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         if lower.startswith("intervention:"):
             continue
 
-        # Header-like switches
-        if lower.startswith("energy="):
-            try:
-                energy_unit = _parse_energy_unit_directive(line)
-            except DSLError as exc:
-                if exc.line_number is None:
-                    raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                                   line_number=line_no, line_content=raw) from exc
-                raise
-            notes.append(f"energy unit set to {energy_unit}")
+        # Source-wide settings were resolved before lowering.
+        if line_no in global_directive_lines:
             continue
 
         if lower.startswith("t="):
@@ -1521,38 +1430,14 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                 line_content=raw,
             )
 
-        if lower.startswith("c0=") or lower.startswith("c°="):
-            try:
-                standard_conc_M = _parse_standard_conc_directive(line)
-            except DSLError as exc:
-                if exc.line_number is None:
-                    raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                                   line_number=line_no, line_content=raw) from exc
-                raise
-            notes.append(f"C° set to {standard_conc_M:g} M")
-            continue
-
-        if lower.startswith("κ=") or lower.startswith("kappa="):
-            try:
-                kappa_global = _parse_kappa_directive(line)
-            except DSLError as exc:
-                if exc.line_number is None:
-                    raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                                   line_number=line_no, line_content=raw) from exc
-                raise
-            notes.append(f"κ set to {kappa_global:g}")
-            continue
-
         if line_no - 1 in inline_initial_line_indexes:
             continue
 
         classification = classify_parameter_algebra_declaration(raw, line_number=line_no)
         if classification.kind == "let":
-            algebra_lines.append(raw)
             continue
 
         if classification.kind == "param":
-            algebra_lines.append(raw)
             continue
 
         if classification.kind == "invalid_step_key_identifier":
@@ -1585,7 +1470,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                     energy_unit=energy_unit,
                     T=temperature_K,
                     C0=standard_conc_M,
-                    kappa_global=kappa_global,
                     line_number=line_no,
                     line_content=raw,
                 )
@@ -1600,7 +1484,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                 energy_unit=energy_unit,
                 T=temperature_K,
                 C0=standard_conc_M,
-                kappa_global=kappa_global,
                 line_number=line_no,
                 line_content=raw,
             )
@@ -1615,7 +1498,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                     energy_unit=energy_unit,
                     T=temperature_K,
                     C0=standard_conc_M,
-                    kappa_global=kappa_global,
                     line_number=line_no,
                     line_content=raw,
                 )
@@ -1634,11 +1516,9 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         energy_unit=str(energy_unit),
         temperature_K=float(temperature_K),
         standard_conc_M=float(standard_conc_M),
-        kappa_global=float(kappa_global),
         temperature_schedule=temperature_schedule,
         intervention_schedule=intervention_schedule,
         steps=steps,
-        algebra_lines=algebra_lines,
         inline_initial_conditions=inline_initial_conditions,
         notes=notes,
     )
@@ -1646,33 +1526,11 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
 # ------------------------------ Mechanism building ---------------------------
 
-@dataclass
-class ParsedStep:
-    """Internal representation of a parsed reaction step."""
-    reactants: Dict[str, float]
-    products: Dict[str, float]
-    reversible: bool
-    kf: float
-    kr: Optional[float]
-    model: str  # "Constant", "Arrhenius", or "Eyring"
-    is_equilibrium: bool  # True if from "equilibrium:" line
-    arrhenius_A: Optional[float] = None
-    arrhenius_Ea_J_per_mol: Optional[float] = None
-    eyring_dG_act_J_per_mol: Optional[float] = None
-    kappa: Optional[float] = None
-    standard_conc_M: Optional[float] = None
-    dG_eq_J_per_mol: Optional[float] = None
-    Keq_input: Optional[float] = None
-    explicit_rates: List[float] = field(default_factory=list)
-    user_kf_explicit: bool = False
-    user_kr_explicit: bool = False
-    source_energy_unit: Optional[str] = None
-
 
 def _parse_energy_unit_directive(line: str) -> str:
     from .common import normalize_energy_unit
 
-    kv = _parse_keyvals(line)
+    kv = _parse_keyvals(line, reject_duplicate_canonical_keys=True)
     raw = kv.get("energy")
     if not raw:
         raise DSLError("energy= directive requires a value (kJ/mol, kcal/mol, or J/mol)")
@@ -1686,7 +1544,7 @@ def _parse_energy_unit_directive(line: str) -> str:
 
 
 def _parse_standard_conc_directive(line: str) -> float:
-    kv = _parse_keyvals(line)
+    kv = _parse_keyvals(line, reject_duplicate_canonical_keys=True)
     raw = kv.get("C0")
     if not raw:
         raise DSLError("C0= directive requires a numeric value")
@@ -1694,17 +1552,6 @@ def _parse_standard_conc_directive(line: str) -> float:
     if C0 is None or C0 <= 0:
         raise DSLError("C0 must be positive")
     return float(C0)
-
-
-def _parse_kappa_directive(line: str) -> float:
-    kv = _parse_keyvals(line)
-    raw = kv.get("κ")
-    if not raw:
-        raise DSLError("κ= directive requires a numeric value")
-    kappa = _float_or_none(raw)
-    if kappa is None or kappa <= 0:
-        raise DSLError("κ must be positive")
-    return float(kappa)
 
 
 def _split_stoich_and_params(
@@ -1780,7 +1627,7 @@ def _resolve_Keq_from_params(
     Precondition: at least one of "Keq" or "dG_eq" must be present in params.
     Returns (Keq, dG_eqJ_or_None). Raises DSLError on numeric/overflow/underflow issues.
     """
-    from ..kinetics import K_from_deltaG_eq
+    from ..thermodynamics import K_from_deltaG_eq
     from .kinetics import normalize_energy_to_J_per_mol
 
     Keq = _float_or_none(params.get("Keq"))
@@ -1813,11 +1660,10 @@ def _parse_reaction_like_step(
     energy_unit: str,
     T: float,
     C0: float,
-    kappa_global: float,
     missing_eyring_message: str,
     line_number: int | None,
     line_content: str | None,
-) -> ParsedStep:
+) -> DslBuildStep:
     from ..kinetics import arrhenius_rate, eyring_rate
     from .common import molecularity
     from .kinetics import normalize_energy_to_J_per_mol
@@ -1840,11 +1686,24 @@ def _parse_reaction_like_step(
         line_number=line_number,
         line_content=line_content,
     )
+    degeneracy = 1
+    if "degeneracy" in params:
+        if model != "Eyring" or "dG_act" not in params:
+            raise DSLError(
+                "degeneracy is valid only with an Eyring dG_act forward rate",
+                line_number=line_number,
+                line_content=line_content,
+            )
+        degeneracy = _parse_degeneracy(
+            params["degeneracy"],
+            line_number=line_number,
+            line_content=line_content,
+        )
     kappa_raw = _float_or_none(params.get("κ"))
     if kappa_raw is not None:
         kappa = kappa_raw
     else:
-        kappa = kappa_global
+        kappa = 1.0
     n = molecularity(react)
 
     forward_rate_raw = params.get("kf") if "kf" in params else params.get("k")
@@ -1948,7 +1807,14 @@ def _parse_reaction_like_step(
                     line_number=line_number, line_content=line_content,
                 )
             try:
-                kf = eyring_rate(dGJ, T, kappa=kappa, molecularity=n, standard_conc_M=C0)
+                kf = eyring_rate(
+                    dGJ,
+                    T,
+                    kappa=kappa,
+                    molecularity=n,
+                    standard_conc_M=C0,
+                    degeneracy=degeneracy,
+                )
             except (ValueError, OverflowError) as exc:
                 raise DSLError(
                     "Eyring rate computation overflowed (dG_act too large for given T)",
@@ -1997,12 +1863,16 @@ def _parse_reaction_like_step(
     if kr is not None:
         explicit_rates.append(kr)
 
-    return ParsedStep(
-        reactants=react,
-        products=prod,
+    return DslBuildStep(
+        reactants=tuple(
+            (str(name), float(value)) for name, value in react.items()
+        ),
+        products=tuple(
+            (str(name), float(value)) for name, value in prod.items()
+        ),
         reversible=reversible,
-        kf=kf,
-        kr=kr,
+        kf=float(kf),
+        kr=float(kr) if kr is not None else None,
         model=model,
         is_equilibrium=False,
         arrhenius_A=arrhenius_A,
@@ -2012,11 +1882,12 @@ def _parse_reaction_like_step(
         standard_conc_M=C0,
         dG_eq_J_per_mol=dG_eqJ_for_step,
         Keq_input=Keq_input,
-        explicit_rates=explicit_rates,
+        explicit_rates=tuple(float(value) for value in explicit_rates),
         user_kf_explicit=any(
             key in params for key in ("kf", "k", "A", "Ea", "dG_act")
         ),
         user_kr_explicit=bool(params.get("kr")),
+        degeneracy=degeneracy,
     )
 
 
@@ -2026,10 +1897,9 @@ def _parse_reaction_step(
     energy_unit: str,
     T: float,
     C0: float,
-    kappa_global: float,
     line_number: int,
     line_content: str,
-) -> ParsedStep:
+) -> DslBuildStep:
     stoich_part, params = _split_stoich_and_params(
         rest,
         reject_duplicate_canonical_keys=True,
@@ -2042,7 +1912,6 @@ def _parse_reaction_step(
         energy_unit=energy_unit,
         T=T,
         C0=C0,
-        kappa_global=kappa_global,
         missing_eyring_message="Eyring step requires dG_act or explicit k",
         line_number=line_number,
         line_content=line_content,
@@ -2055,10 +1924,9 @@ def _parse_bare_arrow_step(
     energy_unit: str,
     T: float,
     C0: float,
-    kappa_global: float,
     line_number: int,
     line_content: str,
-) -> ParsedStep:
+) -> DslBuildStep:
     stoich_part, params = _split_stoich_and_params(
         line,
         reject_duplicate_canonical_keys=True,
@@ -2071,7 +1939,6 @@ def _parse_bare_arrow_step(
         energy_unit=energy_unit,
         T=T,
         C0=C0,
-        kappa_global=kappa_global,
         missing_eyring_message="Bare arrow syntax requires k (or kf), or dG_act for Eyring",
         line_number=line_number,
         line_content=line_content,
@@ -2084,10 +1951,9 @@ def _parse_equilibrium_step(
     energy_unit: str,
     T: float,
     C0: float,
-    kappa_global: float,
     line_number: int,
     line_content: str,
-) -> ParsedStep:
+) -> DslBuildStep:
     from .common import molecularity
     from .kinetics import normalize_energy_to_J_per_mol
 
@@ -2195,23 +2061,27 @@ def _parse_equilibrium_step(
             line_content=line_content,
         )
 
-    return ParsedStep(
-        reactants=react,
-        products=prod,
+    return DslBuildStep(
+        reactants=tuple(
+            (str(name), float(value)) for name, value in react.items()
+        ),
+        products=tuple(
+            (str(name), float(value)) for name, value in prod.items()
+        ),
         reversible=True,
-        kf=kf,
-        kr=kr,
+        kf=float(kf),
+        kr=float(kr) if kr is not None else None,
         model="Eyring",
         is_equilibrium=True,
         eyring_dG_act_J_per_mol=None,
-        kappa=kappa_global,
+        kappa=1.0,
         standard_conc_M=C0,
         dG_eq_J_per_mol=dG_eqJ,
         Keq_input=(Keq if has_explicit_Keq else None),
-        explicit_rates=exp_rates,
+        explicit_rates=tuple(float(value) for value in exp_rates),
         user_kf_explicit=("kf" in params),
         user_kr_explicit=("kr" in params),
-        source_energy_unit=str(energy_unit),
+        degeneracy=1,
     )
 
 
@@ -2242,118 +2112,33 @@ def _mechanism_build_input(
     ir: DSLIR,
     *,
     initials: Mapping[str, float] | None,
-    intervention_schedule: object,
 ):
     """Freeze the private parse accumulator into the sole builder input."""
 
-    from kindred.core.intervention_schedule import InterventionSchedule
-    from kindred.core.simulator.dsl_build_input import (
-        DslBuildStep,
-        DslMechanismBuildInput,
-    )
+    from kindred.core.simulator.dsl_build_input import DslMechanismBuildInput
     from kindred.core.temperature import TemperatureSchedule
 
     if type(ir) is not DSLIR:
         raise TypeError("DSL builder freeze requires the exact private DSLIR.")
-    if (
-        intervention_schedule is not None
-        and type(intervention_schedule) is not InterventionSchedule
-    ):
-        raise TypeError(
-            "DSL builder freeze requires exact InterventionSchedule."
-        )
-
     canonical_initials = {
         str(name): float(value)
         for name, value in dict(initials or {}).items()
     }
 
-    schedule_json: str | None = None
+    temperature_schedule = ir.temperature_schedule
     if ir.temperature_schedule is not None:
         if type(ir.temperature_schedule) is not TemperatureSchedule:
             raise TypeError(
                 "DSL builder freeze requires exact TemperatureSchedule."
             )
-        schedule_json = json.dumps(
-            ir.temperature_schedule.to_dict(),
-            allow_nan=False,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
 
     return DslMechanismBuildInput(
         version=1,
         energy_unit=str(ir.energy_unit),
         temperature_K=float(ir.temperature_K),
         standard_conc_M=float(ir.standard_conc_M),
-        kappa_global=float(ir.kappa_global),
-        temperature_schedule_json=schedule_json,
-        intervention_schedule=intervention_schedule,
-        steps=tuple(
-            DslBuildStep(
-                reactants=tuple(
-                    (str(name), float(value))
-                    for name, value in step.reactants.items()
-                ),
-                products=tuple(
-                    (str(name), float(value))
-                    for name, value in step.products.items()
-                ),
-                reversible=bool(step.reversible),
-                kf=float(step.kf),
-                kr=float(step.kr) if step.kr is not None else None,
-                model=str(step.model),
-                is_equilibrium=bool(step.is_equilibrium),
-                arrhenius_A=(
-                    float(step.arrhenius_A)
-                    if step.arrhenius_A is not None
-                    else None
-                ),
-                arrhenius_Ea_J_per_mol=(
-                    float(step.arrhenius_Ea_J_per_mol)
-                    if step.arrhenius_Ea_J_per_mol is not None
-                    else None
-                ),
-                eyring_dG_act_J_per_mol=(
-                    float(step.eyring_dG_act_J_per_mol)
-                    if step.eyring_dG_act_J_per_mol is not None
-                    else None
-                ),
-                kappa=(
-                    float(step.kappa)
-                    if step.kappa is not None
-                    else None
-                ),
-                standard_conc_M=(
-                    float(step.standard_conc_M)
-                    if step.standard_conc_M is not None
-                    else None
-                ),
-                dG_eq_J_per_mol=(
-                    float(step.dG_eq_J_per_mol)
-                    if step.dG_eq_J_per_mol is not None
-                    else None
-                ),
-                Keq_input=(
-                    float(step.Keq_input)
-                    if step.Keq_input is not None
-                    else None
-                ),
-                explicit_rates=tuple(
-                    float(value) for value in step.explicit_rates
-                ),
-                user_kf_explicit=bool(step.user_kf_explicit),
-                user_kr_explicit=bool(step.user_kr_explicit),
-                source_energy_unit=(
-                    str(step.source_energy_unit)
-                    if step.source_energy_unit is not None
-                    else None
-                ),
-            )
-            for step in ir.steps
-        ),
-        algebra_lines=tuple(str(line) for line in ir.algebra_lines),
+        temperature_schedule=temperature_schedule,
+        steps=tuple(ir.steps),
         initials=tuple(canonical_initials.items()),
     )
 
@@ -2425,13 +2210,14 @@ def prepare_dsl_request_set(
     from kindred.core.intervention_schedule import (
         coerce_intervention_schedule,
     )
-    from kindred.core.mechanism_metadata import MechanismMetadataKeys
+    from kindred.core.intervention_schedule_compiler import (
+        compile_intervention_schedule,
+    )
     from kindred.core.simulator.dsl_build import build_mechanism_from_ir
     from kindred.core.simulator.dsl_parameter_scan import (
         extract_parameters_from_mechanism,
     )
-    from kindred.core.simulator.parameter_algebra import (
-        mechanism_parameter_namespace,
+    from kindred.core.simulator.parameter_algebra_spec import (
         parse_parameter_algebra_spec_from_dsl_text,
     )
     from kindred.core.algebra.simulation_series import (
@@ -2448,10 +2234,9 @@ def prepare_dsl_request_set(
         _mechanism_build_input(
             ir,
             initials=initials,
-            intervention_schedule=intervention_schedule,
         )
     )
-    mechanism_namespace = mechanism_parameter_namespace(mechanism)
+    mechanism_namespace = build_namespace_from_mechanism(mechanism)
     parameter_algebra_spec = parse_parameter_algebra_spec_from_dsl_text(
         text,
         mechanism_namespace=mechanism_namespace,
@@ -2468,22 +2253,21 @@ def prepare_dsl_request_set(
     except ValueError as exc:
         raise DSLError(str(exc)) from exc
     setattr(mechanism, "_compiled_algebra_series", compiled_algebra_series)
-    definitions = tuple(
-        DslParameterAnalysis(
-            name=str(item.name),
-            value=float(item.value),
-            context=str(item.context),
-            source=str(item.source),
-            step_index=item.step_index,
-            editable=bool(item.editable),
-            unit=item.unit,
-            role=item.role,
-            minimum=item.min,
-            maximum=item.max,
-        )
-        for item in extract_parameters_from_mechanism(mechanism)
-    )
+    definitions = tuple(extract_parameters_from_mechanism(mechanism))
     species_names = tuple(str(item) for item in mechanism.species_names())
+    if intervention_schedule is not None:
+        intervention_schedule.validate_species(species_names)
+    parameterized_intervention_schedule = (
+        intervention_schedule
+        if intervention_schedule is not None
+        and intervention_schedule.is_parameterized
+        else None
+    )
+    intervention_execution = (
+        None
+        if parameterized_intervention_schedule is not None
+        else compile_intervention_schedule(intervention_schedule)
+    )
     identity = hashlib.sha256(
         json.dumps(
             payload,
@@ -2507,26 +2291,8 @@ def prepare_dsl_request_set(
         ),
         parameters=definitions,
         inline_initial_conditions=ir.inline_initial_conditions,
-        temperature_schedule=getattr(ir, "temperature_schedule", None),
-        intervention_schedule=getattr(ir, "intervention_schedule", None),
-        structure={
-            "energy_unit": getattr(ir, "energy_unit", ""),
-            "temperature_K": getattr(ir, "temperature_K", None),
-            "standard_conc_M": getattr(ir, "standard_conc_M", None),
-            "kappa_global": getattr(ir, "kappa_global", None),
-            "step_count": len(tuple(getattr(ir, "steps", ()) or ())),
-            "algebra_lines": tuple(
-                getattr(ir, "algebra_lines", ()) or ()
-            ),
-            "mechanism_metadata": _canonical_dsl_value(
-                dict(getattr(mechanism, "metadata", {}) or {})
-            ),
-            "intervention_declarative_fingerprint": (
-                intervention_schedule.fingerprint
-                if intervention_schedule is not None
-                else ""
-            ),
-        },
+        temperature_K=float(ir.temperature_K),
+        energy_unit=str(ir.energy_unit),
     )
     metadata = getattr(mechanism, "metadata", None)
     if isinstance(metadata, dict):
@@ -2539,160 +2305,14 @@ def prepare_dsl_request_set(
             }
             for origin in analysis.origins
         )
-        metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE] = (
-            intervention_schedule
-        )
         metadata["parameter_algebra_spec"] = parameter_algebra_spec
     return PreparedDslRequestSet(
         analysis=analysis,
         mechanism=mechanism,
-        intervention_schedule=intervention_schedule,
+        intervention_schedule=parameterized_intervention_schedule,
+        intervention_execution=intervention_execution,
         parameter_algebra_spec=parameter_algebra_spec,
     )
-
-
-def _coordinate_source_parts(
-    source_line: str,
-) -> tuple[str, list[list[str]], str]:
-    before_comment, marker, comment = source_line.partition("#")
-    prefix, separator, parameter_text = before_comment.partition(";")
-    tokens: list[list[str]] = []
-    if separator:
-        for raw_token in re.split(r"[;,]", parameter_text):
-            token = raw_token.strip()
-            if not token:
-                continue
-            key, equals, value = token.partition("=")
-            tokens.append(
-                [key.strip(), value.strip() if equals else ""]
-            )
-    return prefix.rstrip(), tokens, f"{marker}{comment}" if marker else ""
-
-
-def _coordinate_source_line(
-    prefix: str,
-    tokens: list[list[str]],
-    comment: str,
-) -> str:
-    body = prefix.rstrip()
-    if tokens:
-        body += " ; " + ", ".join(
-            f"{key}={value}" if value else f"{key}="
-            for key, value in tokens
-        )
-    if comment:
-        body += f" {comment.strip()}"
-    return body
-
-
-def _coordinate_token_matches(candidate: str, target: str) -> bool:
-    candidate_name = str(candidate).strip()
-    target_name = str(target).strip()
-    if target_name == "Keq":
-        return candidate_name.casefold() == "keq"
-    if candidate_name == "K":
-        return False
-    return candidate_name.casefold() == target_name.casefold()
-
-
-def _set_coordinate_source_token(
-    tokens: list[list[str]],
-    *,
-    token: str,
-    value: float,
-) -> None:
-    rendered = f"{float(value):.15g}"
-    matches = [
-        index
-        for index, pair in enumerate(tokens)
-        if _coordinate_token_matches(pair[0], token)
-    ]
-    if matches:
-        target = matches[0]
-        tokens[target] = [token, rendered]
-        for duplicate in reversed(matches[1:]):
-            tokens.pop(duplicate)
-        return
-    tokens.append([token, rendered])
-
-
-def _origin_line_positions(
-    analysis: DslAnalysis,
-) -> dict[int, int]:
-    """Resolve immutable origin ordinals onto canonical source line indexes."""
-
-    lines = analysis.normalized_text.splitlines()
-    positions: dict[int, int] = {}
-    cursor = 0
-    for origin in analysis.origins:
-        position = next(
-            (
-                index
-                for index in range(cursor, len(lines))
-                if lines[index] == origin.source_text
-            ),
-            None,
-        )
-        if position is None:
-            raise ValueError(
-                "Prepared DSL origin no longer matches canonical source."
-            )
-        positions[origin.authored_ordinal] = position
-        cursor = position + 1
-    return positions
-
-
-def _authored_step_origin(
-    analysis: DslAnalysis,
-    *,
-    step_index: int,
-) -> DslSourceOrigin:
-    authored_steps: list[DslSourceOrigin] = []
-    for line in analysis.normalized_text.splitlines():
-        origin = next(
-            (
-                item
-                for item in analysis.origins
-                if item.source_text == line
-                and item.authored_ordinal
-                not in {
-                    candidate.authored_ordinal
-                    for candidate in authored_steps
-                }
-            ),
-            None,
-        )
-        if origin is None:
-            continue
-        code = line.split("#", 1)[0].strip()
-        if any(arrow in code for arrow in ("->", "=>", "<=>")):
-            authored_steps.append(origin)
-    if not 1 <= step_index <= len(authored_steps):
-        raise LookupError(
-            f"Mechanism step {step_index} has no exact source origin."
-        )
-    return authored_steps[step_index - 1]
-
-
-def _scalar_origin(
-    analysis: DslAnalysis,
-    *,
-    name: str,
-) -> DslSourceOrigin:
-    pattern = re.compile(
-        rf"^\s*param\s+{re.escape(name)}\s*=",
-        re.IGNORECASE,
-    )
-    matches = [
-        origin
-        for origin in analysis.origins
-        if pattern.match(origin.source_text.split("#", 1)[0])
-    ]
-    if len(matches) != 1:
-        raise LookupError(
-            f"Scalar parameter {name!r} has no unique source origin."
-        )
-    return matches[0]
 
 
 def _forward_model_payload(model: object) -> dict[str, object]:
@@ -2714,6 +2334,7 @@ def _forward_model_payload(model: object) -> dict[str, object]:
         return {
             "type": "Eyring",
             "dG_act_J_per_mol": float(model.dG_act_J_per_mol),
+            "degeneracy": int(model.degeneracy),
             "kappa": float(model.kappa),
             "standard_conc_M": float(model.standard_conc_M),
         }
@@ -2754,12 +2375,6 @@ def derive_prepared_dsl_with_parameter_updates(
         MechanismMetadataKeys,
         MechanismMetadataView,
     )
-    from kindred.core.simulator.dsl_parameter_scan import (
-        extract_parameters_from_mechanism,
-    )
-    from kindred.core.simulator.parameter_algebra import (
-        apply_parameter_algebra_spec_to_mechanism,
-    )
     from kindred.core.simulator.step_indexing import (
         lookup_step_param_target,
     )
@@ -2790,6 +2405,10 @@ def derive_prepared_dsl_with_parameter_updates(
         raise ValueError("DSL parameter update names must be unique.")
 
     mechanism = base.mechanism_for_execution()
+    initials = {
+        str(name): float(species.initial_conc)
+        for name, species in getattr(mechanism, "species", {}).items()
+    }
     spec = base.parameter_algebra_spec_for_execution()
     metadata = getattr(mechanism, "metadata", None)
     if not isinstance(metadata, dict):
@@ -2798,7 +2417,7 @@ def derive_prepared_dsl_with_parameter_updates(
         MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED
     ] = wegscheider_cyclicity_enabled
     metadata_view = MechanismMetadataView.from_metadata(metadata)
-    temperature = float(base.analysis.structure["temperature_K"])
+    temperature = float(base.analysis.temperature_K)
     if temperature != metadata_view.temperature_K:
         raise ValueError(
             "Prepared DSL nominal temperature metadata is inconsistent."
@@ -2814,7 +2433,7 @@ def derive_prepared_dsl_with_parameter_updates(
         if lookup_step_param_target(mechanism, str(statement.name)) is not None
     }
     source_lines = base.analysis.normalized_text.splitlines()
-    origin_positions = _origin_line_positions(base.analysis)
+    origin_positions = origin_line_positions(base.analysis)
     updated_origin_lines: dict[int, str] = {}
     scalar_values = metadata.get("scalar_params")
     if not isinstance(scalar_values, dict):
@@ -2869,7 +2488,7 @@ def derive_prepared_dsl_with_parameter_updates(
                 raise LookupError(
                     f"Scalar parameter {update.name!r} has no typed declaration."
                 )
-            origin = _scalar_origin(
+            origin = scalar_origin(
                 base.analysis,
                 name=update.name,
             )
@@ -2887,7 +2506,7 @@ def derive_prepared_dsl_with_parameter_updates(
                     f"Scalar parameter {update.name!r} origin is invalid."
                 )
             new_line = (
-                f"{match.group(1)}{update.value:.15g}"
+                f"{match.group(1)}{repr(float(update.value))}"
                 + (f" {marker}{comment}".rstrip() if marker else "")
             )
             updated_origin_lines[origin.authored_ordinal] = new_line
@@ -2897,7 +2516,7 @@ def derive_prepared_dsl_with_parameter_updates(
             replacement_expr = NumberNode(float(update.value))
             statements[statement_index] = replace(
                 statement,
-                expr_src=f"{update.value:.15g}",
+                expr_src=repr(float(update.value)),
                 line_content=new_line,
                 expr_ast=replacement_expr,
             )
@@ -2933,14 +2552,14 @@ def derive_prepared_dsl_with_parameter_updates(
             continue
 
         kind, index, role, entry = target
-        origin = _authored_step_origin(
+        origin = authored_step_origin(
             base.analysis,
             step_index=int(entry["step_index"]),
         )
         old_line = source_lines[
             origin_positions[origin.authored_ordinal]
         ]
-        prefix, tokens, comment = _coordinate_source_parts(old_line)
+        prefix, tokens, comment = coordinate_source_parts(old_line)
         source_token = role
         source_value = update.value
 
@@ -2948,7 +2567,6 @@ def derive_prepared_dsl_with_parameter_updates(
             reaction = mechanism.reactions[index]
             model = forward_rate_model_for_reaction(
                 reaction,
-                default_kappa=metadata_view.kappa_global,
                 default_standard_conc_M=metadata_view.standard_conc_M,
             )
             rewritten = write_reference_rate(
@@ -2984,7 +2602,6 @@ def derive_prepared_dsl_with_parameter_updates(
                 model = forward_rate_model_for_equilibrium(
                     equilibrium,
                     temperature_K=temperature,
-                    default_kappa=metadata_view.kappa_global,
                     default_standard_conc_M=metadata_view.standard_conc_M,
                 )
                 rewritten = write_reference_rate(
@@ -3017,12 +2634,7 @@ def derive_prepared_dsl_with_parameter_updates(
                     kr=kr,
                     metadata=equilibrium_metadata,
                 )
-                source_energy_unit = str(
-                    equilibrium_metadata.get(
-                        EquilibriumMetadataKeys.SOURCE_ENERGY_UNIT
-                    )
-                    or metadata_view.energy_unit
-                )
+                source_energy_unit = metadata_view.energy_unit
                 if isinstance(rewritten, ArrheniusRateModel):
                     source_token = "Ea"
                     source_value = UnitsModel(
@@ -3079,151 +2691,44 @@ def derive_prepared_dsl_with_parameter_updates(
                 f"Unsupported mechanism coordinate kind {kind!r}."
             )
 
-        _set_coordinate_source_token(
+        set_coordinate_source_token(
             tokens,
             token=source_token,
             value=float(source_value),
         )
         updated_origin_lines[origin.authored_ordinal] = (
-            _coordinate_source_line(prefix, tokens, comment)
+            coordinate_source_line(prefix, tokens, comment)
         )
 
     for ordinal, line in updated_origin_lines.items():
         source_lines[origin_positions[ordinal]] = line
     updated_text = "\n".join(source_lines)
-    updated_origins = tuple(
-        DslSourceOrigin(
-            authored_ordinal=origin.authored_ordinal,
-            line_number=origin.line_number,
-            kind=origin.kind,
-            source_text=updated_origin_lines.get(
-                origin.authored_ordinal,
-                origin.source_text,
-            ),
-        )
-        for origin in base.analysis.origins
-    )
-
-    algebra_lines = tuple(
-        origin.source_text
-        for origin in updated_origins
-        if re.match(
-            r"^\s*(?:param|let)\s+",
-            origin.source_text.split("#", 1)[0],
-            flags=re.IGNORECASE,
-        )
-    )
-    metadata[MechanismMetadataKeys.ALGEBRA_TEXT] = "\n".join(algebra_lines)
-    apply_parameter_algebra_spec_to_mechanism(
-        spec,
-        mechanism=mechanism,
-        require_mutable=False,
-    )
-    derived_parameter_values = [
-        DslParameterAnalysis(
-            name=str(item.name),
-            value=float(item.value),
-            context=str(item.context),
-            source=str(item.source),
-            step_index=item.step_index,
-            editable=bool(item.editable),
-            unit=item.unit,
-            role=item.role,
-            minimum=item.min,
-            maximum=item.max,
-        )
-        for item in extract_parameters_from_mechanism(mechanism)
-    ]
-    derived_scalar_info = dict(metadata.get("scalar_param_info") or {})
-    for raw_name, raw_value in dict(
-        metadata.get("scalar_params") or {}
-    ).items():
-        name = str(raw_name)
-        if any(item.name == name for item in derived_parameter_values):
-            continue
-        info = dict(derived_scalar_info.get(name) or {})
-        derived_parameter_values.append(
-            DslParameterAnalysis(
-                name=name,
-                value=float(raw_value),
-                context="Algebra scalar",
-                source="Algebra parameter",
-                step_index=None,
-                editable=not bool(info.get("derived")),
-                unit=str(info.get("unit") or "1"),
-                role="scalar",
-            )
-        )
-    definitions = tuple(derived_parameter_values)
-    identity_hash = hashlib.sha256(
-        json.dumps(
-            {
-                "base_analysis_identity": base.analysis.identity,
-                "updates": tuple(
-                    {"name": item.name, "value": item.value}
-                    for item in updates
-                ),
-                "normalized_text": updated_text,
-                "wegscheider_cyclicity_enabled": (
-                    wegscheider_cyclicity_enabled
-                ),
-            },
-            allow_nan=False,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    identity = f"dsl-analysis-parameter-derived:{identity_hash}"
-    structure = dict(
-        cast(
-            Mapping[str, object],
-            _canonical_dsl_value(base.analysis.structure),
-        )
-    )
-    structure["algebra_lines"] = algebra_lines
-    analysis_metadata = dict(metadata)
-    analysis_metadata.pop("parameter_algebra_spec", None)
-    structure["mechanism_metadata"] = _canonical_dsl_value(
-        analysis_metadata
-    )
-    structure["derived_from_analysis_identity"] = (
-        base.analysis.identity
-    )
-    structure["parameter_updates"] = tuple(
-        {"name": item.name, "value": item.value}
-        for item in updates
-    )
-    analysis = DslAnalysis(
-        identity=identity,
-        normalized_text=updated_text,
-        origins=updated_origins,
-        species_names=base.analysis.species_names,
-        observable_names=base.analysis.observable_names,
-        parameters=definitions,
-        inline_initial_conditions=DslInitialConditionAdmission(
-            materialized_source=updated_text
+    # Publish only the typed state admitted from the exact rendered source.
+    # The in-loop mechanism is deliberately not returned: its calculated
+    # values may retain precision that the source token cannot represent.
+    prepared = prepare_dsl_request_set(
+        updated_text,
+        initials=initials,
+        units=UnitsModel(
+            energy_unit=base.analysis.energy_unit,
+            temperature_K=base.analysis.temperature_K,
+            standard_conc_M=metadata_view.standard_conc_M,
         ),
-        temperature_schedule=base.analysis.temperature_schedule,
-        intervention_schedule=base.analysis.intervention_schedule,
-        structure=structure,
     )
-    metadata["dsl_analysis_identity"] = identity
-    metadata["dsl_source_origins"] = tuple(
-        {
-            "authored_ordinal": origin.authored_ordinal,
-            "line_number": origin.line_number,
-            "kind": origin.kind,
-        }
-        for origin in updated_origins
-    )
+    admitted_mechanism = prepared.mechanism_for_execution()
+    admitted_metadata = getattr(admitted_mechanism, "metadata", None)
+    if isinstance(admitted_metadata, dict):
+        admitted_metadata[
+            MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED
+        ] = wegscheider_cyclicity_enabled
     return PreparedDslRequestSet(
-        analysis=analysis,
-        mechanism=mechanism,
+        analysis=prepared.analysis,
+        mechanism=admitted_mechanism,
         intervention_schedule=(
-            base.intervention_schedule_for_execution()
+            prepared.parameterized_intervention_schedule_for_binding()
         ),
-        parameter_algebra_spec=spec,
+        intervention_execution=prepared.intervention_execution_contract(),
+        parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
     )
 
 
@@ -3232,8 +2737,6 @@ def derive_prepared_dsl_with_observables(
     definitions: tuple[DslDerivedObservableDefinition, ...],
 ) -> PreparedDslRequestSet:
     """Derive one typed Fit-local observable authority from a retained base."""
-
-    from kindred.core.mechanism_metadata import MechanismMetadataKeys
 
     if not isinstance(base, PreparedDslRequestSet):
         raise TypeError("base must be a PreparedDslRequestSet.")
@@ -3310,13 +2813,12 @@ def derive_prepared_dsl_with_observables(
     from kindred.core.algebra.simulation_series import (
         compile_algebra_observables,
     )
-    from kindred.core.simulator.parameter_algebra import (
-        mechanism_parameter_namespace,
+    from kindred.core.simulator.parameter_algebra_spec import (
         parse_parameter_algebra_spec_from_dsl_text,
     )
 
     mechanism = base.mechanism_for_execution()
-    mechanism_namespace = mechanism_parameter_namespace(mechanism)
+    mechanism_namespace = build_namespace_from_mechanism(mechanism)
     base_spec = base.parameter_algebra_spec_for_execution()
     derived_spec = parse_parameter_algebra_spec_from_dsl_text(
         "\n".join(derived_lines),
@@ -3438,15 +2940,6 @@ def derive_prepared_dsl_with_observables(
         )
         for index, line in enumerate(derived_lines)
     )
-    structure = dict(
-        cast(Mapping[str, object], _canonical_dsl_value(base.analysis.structure))
-    )
-    structure["algebra_lines"] = tuple(
-        tuple(base.analysis.structure.get("algebra_lines", ()))
-        + derived_lines
-    )
-    structure["derived_from_analysis_identity"] = base.analysis.identity
-    structure["derived_observable_definitions"] = definition_payload
     analysis = DslAnalysis(
         identity=derived_identity,
         normalized_text="\n".join((base_text, *derived_lines)),
@@ -3457,15 +2950,11 @@ def derive_prepared_dsl_with_observables(
         ),
         parameters=base.analysis.parameters,
         inline_initial_conditions=base.analysis.inline_initial_conditions,
-        temperature_schedule=base.analysis.temperature_schedule,
-        intervention_schedule=base.analysis.intervention_schedule,
-        structure=structure,
+        temperature_K=base.analysis.temperature_K,
+        energy_unit=base.analysis.energy_unit,
     )
     metadata = getattr(mechanism, "metadata", None)
     if isinstance(metadata, dict):
-        metadata[MechanismMetadataKeys.ALGEBRA_TEXT] = "\n".join(
-            (base_text, *derived_lines)
-        )
         metadata["dsl_analysis_identity"] = analysis.identity
         metadata["dsl_source_origins"] = tuple(
             {
@@ -3475,12 +2964,12 @@ def derive_prepared_dsl_with_observables(
             }
             for origin in analysis.origins
         )
-        metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE] = (
-            base.intervention_schedule_for_execution()
-        )
     return PreparedDslRequestSet(
         analysis=analysis,
         mechanism=mechanism,
-        intervention_schedule=base.intervention_schedule_for_execution(),
+        intervention_schedule=(
+            base.parameterized_intervention_schedule_for_binding()
+        ),
+        intervention_execution=base.intervention_execution_contract(),
         parameter_algebra_spec=retained_spec,
     )

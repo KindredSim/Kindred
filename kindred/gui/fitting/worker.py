@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum
 from threading import Condition, Event
 
 import numpy as np
@@ -22,8 +25,12 @@ from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetSpec,
     FitObservationSeries,
 )
-from kindred.core.analysis.global_fitting import GlobalFitResult, fit_global
-from kindred.core.analysis.global_fit_execution import select_fit_rows
+from kindred.core.analysis.global_fitting import fit_global
+from kindred.core.analysis.global_fit_execution import (
+    FitProgress,
+    GlobalFitResult,
+    select_fit_rows,
+)
 from kindred.core.analysis.parametric_alignment import (
     DeterministicParametricResolutionError,
     align_y_on_x_obs,
@@ -34,8 +41,8 @@ from kindred.core.fitting_evaluation import (
     SerialFittingEvaluator,
     prepare_fitting_execution_context,
 )
-from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.result_repository import SimulationResultValue
+from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.wegscheider_symbolic import (
     UnresolvedWegscheiderCyclicityError,
@@ -49,20 +56,25 @@ from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
     FitExecutionRequest,
     FitMappedDatasetSnapshot,
+    FitOriginSnapshot,
     FitSelectedObservation,
     FitSetupSnapshot,
+    _replace_fit_parameter,
+    fit_local_observable_definitions,
     selected_observations,
 )
-from kindred.gui.widgets.mechanism_editor import (
+from kindred.gui.workflow_contracts import (
     DetailedBalanceCorrectionRequest,
 )
 
 __all__ = [
     "FitCandidate",
     "FitCurveDataset",
+    "FitCurveYSemantic",
     "FitLiveUpdate",
     "FitWorkerTerminal",
     "GlobalFitWorker",
+    "project_fit_candidate_curves",
 ]
 
 _BEST_INTERVAL_SECONDS = 0.25
@@ -73,6 +85,13 @@ class _DetailedBalanceCorrectionRequired(RuntimeError):
     def __init__(self, request: DetailedBalanceCorrectionRequest) -> None:
         super().__init__(request.issue)
         self.request = request
+
+
+class FitCurveYSemantic(str, Enum):
+    """Typed physical meaning of one projected Fit Y series."""
+
+    CONCENTRATION = "concentration"
+    VALUE = "value"
 
 
 def _unresolved_detailed_balance_error(
@@ -143,6 +162,7 @@ def _curve_items(
 class FitCurveDataset:
     dataset_id: str
     display_name: str
+    y_semantics: tuple[tuple[str, FitCurveYSemantic], ...]
     model_x: tuple[tuple[str, tuple[float, ...]], ...]
     model_y: tuple[tuple[str, tuple[float, ...]], ...]
     observed_x: tuple[tuple[str, tuple[float, ...]], ...]
@@ -238,6 +258,28 @@ class FitCurveDataset:
             for name, values in self.objective_source_rows
         )
         names = tuple(name for name, _values in model_y)
+        if type(self.y_semantics) is not tuple or any(
+            type(item) is not tuple or len(item) != 2
+            for item in self.y_semantics
+        ):
+            raise ValueError(
+                "Fit curves require immutable typed Y semantic entries."
+            )
+        y_semantics = self.y_semantics
+        if (
+            any(
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(semantic, FitCurveYSemantic)
+                for name, semantic in y_semantics
+            )
+            or len(y_semantics) != len(names)
+            or tuple(name for name, _semantic in y_semantics) != names
+        ):
+            raise ValueError(
+                "Fit curves require one ordered typed Y semantic for every "
+                "projected series."
+            )
         segment_names = tuple(name for name, _values in model_segment_ids)
         segment_key_names = tuple(
             name for name, _values in model_segment_keys
@@ -342,6 +384,7 @@ class FitCurveDataset:
             )
         object.__setattr__(self, "dataset_id", dataset_id)
         object.__setattr__(self, "display_name", display_name)
+        object.__setattr__(self, "y_semantics", y_semantics)
         object.__setattr__(self, "x_name", x_name)
         object.__setattr__(self, "model_x", model_x)
         object.__setattr__(self, "model_y", model_y)
@@ -389,10 +432,7 @@ class FitLiveUpdate:
 class FitCandidate:
     """Scientifically valid terminal result, still local to the Fit window."""
 
-    origin_tab_id: str
-    origin_capture_id: str
-    mechanism_source: MechanismAuthoringSource
-    prepared_dsl: PreparedDslRequestSet
+    origin: FitOriginSnapshot
     parameters: tuple[tuple[str, float], ...]
     scalar_values_by_dataset: tuple[
         tuple[str, tuple[tuple[str, float], ...]], ...
@@ -400,23 +440,23 @@ class FitCandidate:
     initial_values_by_set: tuple[
         tuple[str, tuple[tuple[str, float], ...]], ...
     ]
-    start_by_set: tuple[tuple[str, float], ...]
     local_observables: tuple[FitLocalObservable, ...]
     result: GlobalFitResult
-    curves: tuple[FitCurveDataset, ...]
     run_identity: FitRunIdentity
     setup_snapshot: FitSetupSnapshot
     resolved_auto_modes: tuple[tuple[str, str], ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
-            raise TypeError("Fit candidate prepared_dsl must be retained.")
+        if not isinstance(self.origin, FitOriginSnapshot):
+            raise TypeError("Fit candidate origin must be retained.")
+        if not isinstance(self.result, GlobalFitResult):
+            raise TypeError("Fit candidate result must be canonical.")
         if (
-            self.prepared_dsl.analysis.normalized_text
-            != self.mechanism_source.reactions_text.strip()
+            self.setup_snapshot.origin_tab_id != self.origin.tab_id
+            or self.setup_snapshot.origin_capture_id != self.origin.capture_id
         ):
             raise ValueError(
-                "Fit candidate prepared DSL must exactly match its source."
+                "Fit candidate origin and terminal setup identities must match."
             )
         resolved_auto_modes = tuple(
             (str(dataset_id or "").strip(), str(mode or "").strip())
@@ -452,18 +492,6 @@ class FitCandidate:
             "resolved_auto_modes",
             resolved_auto_modes,
         )
-        starts = tuple(
-            (str(set_id or "").strip(), float(value))
-            for set_id, value in self.start_by_set
-        )
-        if (
-            any(not set_id or not math.isfinite(value) for set_id, value in starts)
-            or len({set_id for set_id, _value in starts}) != len(starts)
-        ):
-            raise ValueError("Fit candidate start map must have unique finite set IDs.")
-        object.__setattr__(self, "start_by_set", starts)
-
-
 @dataclass(frozen=True, slots=True)
 class FitWorkerTerminal:
     """The one result retained by a worker until native ``finished``."""
@@ -521,21 +549,41 @@ def _observed_x_by_target(
     parametric = local.parametric
     if parametric is None:
         return {}
-    if any(item.model_species == parametric.x_name for item in observations):
-        raise ValueError(
-            f"Dataset {mapped.display_name!r}: selected X={parametric.x_name!r} "
-            "cannot also be a fitted Y target."
-        )
-    sources = [
-        item for item in mapped.observations
-        if item.model_species == parametric.x_name
-    ]
-    if len(sources) != 1:
+    raw_id_by_target = {
+        model_target: raw_id
+        for raw_id, model_target in local.observation_targets
+    }
+    target_by_raw_id = {
+        raw_id: model_target
+        for raw_id, model_target in local.observation_targets
+    }
+    x_raw_id = raw_id_by_target.get(parametric.x_name)
+    if x_raw_id is None:
         raise ValueError(
             f"Dataset {mapped.display_name!r} requires exactly one observed "
             f"source for X={parametric.x_name!r}."
         )
-    source = sources[0]
+    active_y_raw_ids = {
+        item.raw_observation_id for item in observations
+    }
+    if x_raw_id in active_y_raw_ids:
+        raise ValueError(
+            f"Dataset {mapped.display_name!r}: selected X={parametric.x_name!r} "
+            "cannot reuse a selected Y observation column."
+        )
+    source = next(
+        (
+            item
+            for item in mapped.observations
+            if item.raw_observation_id == x_raw_id
+        ),
+        None,
+    )
+    if source is None:
+        raise ValueError(
+            f"Dataset {mapped.display_name!r} requires exactly one observed "
+            f"source for X={parametric.x_name!r}."
+        )
     x_by_row = {
         int(row): float(value)
         for row, value in zip(source.source_rows, source.y, strict=True)
@@ -546,19 +594,26 @@ def _observed_x_by_target(
             row for row in observation.source_rows if int(row) not in x_by_row
         ]
         if missing:
+            target = target_by_raw_id.get(observation.raw_observation_id, "")
             raise ValueError(
                 f"Dataset {mapped.display_name!r}: X={parametric.x_name!r} "
                 f"is missing {len(missing)} physical source rows for "
-                f"Y={observation.model_species!r}."
+                f"Y={target!r}."
             )
-        aligned[observation.model_species] = np.asarray(
+        target = target_by_raw_id.get(observation.raw_observation_id)
+        if target is None:
+            raise ValueError(
+                f"Dataset {mapped.display_name!r}: active Y observation "
+                f"{observation.raw_observation_id!r} has no current mapping."
+            )
+        aligned[target] = np.asarray(
             [x_by_row[int(row)] for row in observation.source_rows],
             dtype=float,
         )
     return aligned
 
 
-def _dataset_spec(
+def _compile_dataset_spec(
     mapped: FitMappedDatasetSnapshot,
     local: FitDatasetLocalSettings,
 ) -> FitDatasetSpec:
@@ -595,19 +650,237 @@ def _dataset_spec(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _FitOptimizerCompilation:
+    """Immutable optimizer coordinates lowered from one Fit capture.
+
+    This carrier deliberately contains only evaluator inputs.  It has no Qt
+    state and no worker callbacks, so the coordinate authority can be checked
+    independently of thread custody.
+    """
+
+    included_ids: tuple[str, ...]
+    shared_variables: tuple[FitSharedVariableParamSpec, ...]
+    coupled_variables: tuple[FitCoupledVariableParamSpec, ...]
+    variable_by_dataset: tuple[
+        tuple[str, tuple[FitDatasetVariableParamSpec, ...]], ...
+    ]
+    fixed_by_dataset: tuple[
+        tuple[str, tuple[tuple[str, float], ...]], ...
+    ]
+    overrides: tuple[FitDatasetParameterOverrides, ...]
+    candidate_names: tuple[str, ...]
+
+
+def _compile_optimizer_coordinates(
+    request: FitExecutionRequest,
+) -> _FitOptimizerCompilation:
+    """Compile Shared, Per-dataset, Local, and Global coordinates once."""
+
+    included = tuple(item for item in request.datasets if item.included)
+    if not included:
+        raise ValueError("Select at least one mapped dataset for fitting.")
+    included_ids = tuple(item.dataset_id for item in included)
+    shared_variables: list[FitSharedVariableParamSpec] = []
+    coupled_variables: list[FitCoupledVariableParamSpec] = []
+    variable_by_dataset: dict[str, list[FitDatasetVariableParamSpec]] = {
+        dataset_id: [] for dataset_id in included_ids
+    }
+    fixed_by_dataset: dict[str, dict[str, float]] = {
+        dataset_id: {} for dataset_id in included_ids
+    }
+
+    for parameter in request.parameters:
+        config = parameter.selected_config
+        dataset_values = dict(config.dataset_values)
+        if config.fit and parameter.scope == "shared":
+            shared_variables.append(
+                FitSharedVariableParamSpec(
+                    name=parameter.name,
+                    initial=config.value,
+                    minimum=config.minimum,
+                    maximum=config.maximum,
+                    log10=config.log10,
+                )
+            )
+        elif config.fit:
+            for dataset_id in included_ids:
+                variable_by_dataset[dataset_id].append(
+                    FitDatasetVariableParamSpec(
+                        name=parameter.name,
+                        initial=dataset_values[dataset_id],
+                        minimum=config.minimum,
+                        maximum=config.maximum,
+                        log10=config.log10,
+                    )
+                )
+        elif parameter.scope == "per_dataset":
+            for dataset_id in included_ids:
+                fixed_by_dataset[dataset_id][parameter.name] = float(
+                    dataset_values[dataset_id]
+                )
+        else:
+            for dataset_id in included_ids:
+                fixed_by_dataset[dataset_id][parameter.name] = float(
+                    config.value
+                )
+
+    datasets_for_set: dict[str, tuple[str, ...]] = {}
+    applicable_dataset_ids: dict[str, set[str]] = {}
+    for mapped in request.origin.mapped_datasets:
+        if mapped.dataset_id not in included_ids:
+            continue
+        datasets_for_set.setdefault(mapped.set_id, ())
+        datasets_for_set[mapped.set_id] = (
+            *datasets_for_set[mapped.set_id],
+            mapped.dataset_id,
+        )
+        for species, _value in mapped.initial_values:
+            applicable_dataset_ids.setdefault(species, set()).add(
+                mapped.dataset_id
+            )
+
+    scopes = dict(request.initial_scopes)
+    global_by_species = {item.species: item for item in request.global_initials}
+    for species, config in global_by_species.items():
+        if scopes.get(species) != "global":
+            continue
+        applicable_ids = tuple(sorted(applicable_dataset_ids.get(species, ())))
+        if not applicable_ids:
+            continue
+        if config.fit:
+            coupled_variables.append(
+                FitCoupledVariableParamSpec(
+                    variable_id=f"initial:global:{species}",
+                    parameter_name=f"{INITIAL_PREFIX}{species}",
+                    dataset_ids=applicable_ids,
+                    initial=config.initial,
+                    minimum=config.minimum,
+                    maximum=config.maximum,
+                    log10=config.log10,
+                )
+            )
+        else:
+            for dataset_id in applicable_ids:
+                fixed_by_dataset[dataset_id][
+                    f"{INITIAL_PREFIX}{species}"
+                ] = config.initial
+    for initial in request.initials:
+        if scopes.get(initial.species) != "local":
+            continue
+        target_datasets = datasets_for_set.get(initial.set_id, ())
+        if not target_datasets:
+            continue
+        species = initial.species
+        if initial.fit:
+            coupled_variables.append(
+                FitCoupledVariableParamSpec(
+                    variable_id=f"initial:{initial.set_id}:{species}",
+                    parameter_name=f"{INITIAL_PREFIX}{species}",
+                    dataset_ids=target_datasets,
+                    initial=initial.initial,
+                    minimum=initial.minimum,
+                    maximum=initial.maximum,
+                    log10=initial.log10,
+                )
+            )
+        else:
+            for dataset_id in target_datasets:
+                fixed_by_dataset[dataset_id][
+                    f"{INITIAL_PREFIX}{species}"
+                ] = initial.initial
+
+    fixed_items = tuple(
+        (dataset_id, tuple(values.items()))
+        for dataset_id, values in fixed_by_dataset.items()
+    )
+    variable_items = tuple(
+        (dataset_id, tuple(values))
+        for dataset_id, values in variable_by_dataset.items()
+    )
+    overrides = tuple(
+        FitDatasetParameterOverrides(
+            dataset_id=dataset_id,
+            fixed_params=tuple(sorted(fixed_by_dataset[dataset_id].items())),
+            variable_params=tuple(variable_by_dataset[dataset_id]),
+        )
+        for dataset_id in included_ids
+    )
+    candidate_names = tuple(
+        sorted(
+            parameter.name
+            for parameter in request.parameters
+            if not parameter.name.startswith(INITIAL_PREFIX)
+        )
+    )
+    return _FitOptimizerCompilation(
+        included_ids=included_ids,
+        shared_variables=tuple(shared_variables),
+        coupled_variables=tuple(coupled_variables),
+        variable_by_dataset=variable_items,
+        fixed_by_dataset=fixed_items,
+        overrides=overrides,
+        candidate_names=candidate_names,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _FitDatasetContextCompilation:
+    """Stable dataset sampling inputs used to build one evaluator context."""
+
+    selected: tuple[FitSelectedObservation, ...]
+    retained_times: tuple[float, ...]
+    grid_points: int
+    fit_sampling_policy: str
+    fit_sampling_identity: Mapping[str, object]
+
+
+def _compile_dataset_context(
+    mapped: FitMappedDatasetSnapshot,
+    local: FitDatasetLocalSettings,
+    *,
+    solver: str,
+) -> _FitDatasetContextCompilation:
+    selected = selected_observations(mapped, local)
+    retained_times = tuple(
+        sorted({float(time_value) for item in selected for time_value in item.t})
+    )
+    is_parametric = local.parametric is not None
+    grid_points = max(100, len(retained_times)) if is_parametric else 100
+    policy = (
+        "parametric_regular_grid_union_retained_endpoints"
+        if is_parametric
+        else "fit_internal_regular_grid_union_retained_endpoints"
+    )
+    return _FitDatasetContextCompilation(
+        selected=selected,
+        retained_times=retained_times,
+        grid_points=grid_points,
+        fit_sampling_policy=policy,
+        fit_sampling_identity={
+            "solver": solver,
+            "t_start": float(local.t_start),
+            "t_end": float(local.data_range_max),
+            "regular_grid_count": int(grid_points),
+            "retained_observation_times": retained_times,
+            "union_endpoints": (
+                float(local.t_start),
+                float(local.data_range_max),
+            ),
+        },
+    )
+
+
 def _initial_values_from_result(
     request: FitExecutionRequest,
     result: GlobalFitResult,
 ) -> tuple[tuple[str, tuple[tuple[str, float], ...]], ...]:
-    fitted_by_key: dict[tuple[str, str], object] = {}
-    for initial in request.initials:
-        if initial.fit:
-            key = (initial.set_id, initial.species)
-            if key in fitted_by_key:
-                raise ValueError(
-                    "Fit result projection repeats a fitted initial row."
-                )
-            fitted_by_key[key] = initial
+    scopes = dict(request.initial_scopes)
+    fitted_by_key: dict[tuple[str, str], object] = {
+        (initial.set_id, initial.species): initial
+        for initial in request.initials
+        if initial.fit and scopes.get(initial.species) == "local"
+    }
     included_ids = {
         item.dataset_id for item in request.datasets if item.included
     }
@@ -645,8 +918,43 @@ def _initial_values_from_result(
             )
         value = coupled_values.pop()
         values_by_set.setdefault(set_id, {})[species] = value
-        if getattr(initial, "scope", "") == "global":
-            global_values.setdefault(species, set()).add(value)
+    for global_initial in request.global_initials:
+        if not global_initial.fit or scopes.get(global_initial.species) != "global":
+            continue
+        parameter_name = f"{INITIAL_PREFIX}{global_initial.species}"
+        values: set[float] = set()
+        applicable_ids = sorted(
+            mapped.dataset_id
+            for mapped in request.origin.mapped_datasets
+            if mapped.dataset_id in included_ids
+            and any(
+                species == global_initial.species
+                for species, _value in mapped.initial_values
+            )
+        )
+        for dataset_id in applicable_ids:
+            dataset_result = result.dataset_params.get(dataset_id)
+            if dataset_result is None or parameter_name not in dataset_result:
+                raise ValueError(
+                    f"Fit result omitted Global initial {global_initial.species!r} "
+                    f"for included dataset {dataset_id!r}."
+                )
+            value = float(dataset_result[parameter_name])
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Fit result contains a non-finite Global initial "
+                    f"{global_initial.species!r}."
+                )
+            values.add(value)
+            set_ids = {
+                mapped.set_id
+                for mapped in request.origin.mapped_datasets
+                if mapped.dataset_id == dataset_id
+            }
+            for set_id in set_ids:
+                values_by_set.setdefault(set_id, {})[global_initial.species] = value
+        if values:
+            global_values[global_initial.species] = values
     inconsistent_global = sorted(
         species
         for species, values in global_values.items()
@@ -710,10 +1018,11 @@ def _terminal_setup_snapshot(
                 f"Terminal Fit setup contains unknown parameter "
                 f"{parameter.name!r}."
             )
-        dataset_values = tuple(parameter.dataset_values)
-        if not requested.fit:
+        dataset_values = tuple(parameter.selected_config.dataset_values)
+        requested_config = requested.selected_config
+        if not requested_config.fit:
             parameters.append(
-                replace(parameter, dataset_values=dataset_values)
+                _replace_fit_parameter(parameter, dataset_values=dataset_values)
             )
             continue
         if requested.scope == "shared":
@@ -728,7 +1037,7 @@ def _terminal_setup_snapshot(
                     f"{parameter.name!r}."
                 )
             parameters.append(
-                replace(
+                _replace_fit_parameter(
                     parameter,
                     initial=value,
                     dataset_values=dataset_values,
@@ -737,15 +1046,15 @@ def _terminal_setup_snapshot(
             continue
         expected_ids = {
             dataset_id
-            for dataset_id, _value in requested.dataset_values
+            for dataset_id, _value in requested_config.dataset_values
         }
         if not included_ids.issubset(expected_ids):
             raise ValueError(
                 f"Per-dataset parameter {parameter.name!r} no longer "
                 "matches the included dataset identities."
             )
-        fitted_by_id = dict(requested.dataset_values)
-        for dataset_id, _launch_value in requested.dataset_values:
+        fitted_by_id = dict(requested_config.dataset_values)
+        for dataset_id, _launch_value in requested_config.dataset_values:
             if dataset_id not in included_ids:
                 continue
             values = dataset_results.get(dataset_id)
@@ -763,18 +1072,18 @@ def _terminal_setup_snapshot(
             fitted_by_id[dataset_id] = value
         fitted_values = [
             (dataset_id, fitted_by_id[dataset_id])
-            for dataset_id, _value in requested.dataset_values
+            for dataset_id, _value in requested_config.dataset_values
         ]
         fitted_unique_values = {
             value for _dataset_id, value in fitted_values
         }
         parameters.append(
-            replace(
+            _replace_fit_parameter(
                 parameter,
                 initial=(
                     fitted_unique_values.pop()
                     if len(fitted_unique_values) == 1
-                    else parameter.initial
+                    else parameter.selected_config.value
                 ),
                 dataset_values=tuple(fitted_values),
             )
@@ -785,74 +1094,49 @@ def _terminal_setup_snapshot(
         for set_id, values in initial_values_by_set
         for species, value in values
     }
+    scopes = dict(request.initial_scopes)
     global_initial_results: dict[str, float] = {}
-    for initial in request.initials:
-        if not initial.fit or initial.scope != "global":
+    for global_initial in request.global_initials:
+        if not global_initial.fit or scopes.get(global_initial.species) != "global":
             continue
         values = {
             value
             for (set_id, species), value in initial_results.items()
-            if species == initial.species
+            if species == global_initial.species and set_id in included_set_ids
         }
         if len(values) != 1:
             raise ValueError(
                 f"Fit result did not resolve one global value for initial "
-                f"{initial.species!r}."
+                f"{global_initial.species!r}."
             )
-        global_initial_results[initial.species] = values.pop()
+        global_initial_results[global_initial.species] = values.pop()
     initials = tuple(
         replace(
             initial,
             initial=(
-                global_initial_results[initial.species]
-                if (
-                    initial.scope == "global"
-                    and initial.set_id in included_set_ids
-                )
-                else initial_results[(initial.set_id, initial.species)]
+                initial_results[(initial.set_id, initial.species)]
             ),
         )
         if (
             initial.fit
             and initial.set_id in included_set_ids
-            and (
-                initial.species in global_initial_results
-                or (initial.set_id, initial.species) in initial_results
-            )
+            and scopes.get(initial.species) == "local"
+            and (initial.set_id, initial.species) in initial_results
         )
         else initial
         for initial in setup_snapshot.initials
     )
-    parameter_by_name = {
-        parameter.name: parameter
-        for parameter in parameters
-    }
-    terminal_scalar_values: dict[str, float] = {}
-    for name, parameter in parameter_by_name.items():
-        if parameter.fit and parameter.scope == "per_dataset":
-            values = {
-                float(value)
-                for _dataset_id, value in parameter.dataset_values
-            }
-            if len(values) == 1:
-                terminal_scalar_values[name] = values.pop()
-                continue
-        terminal_scalar_values[name] = parameter.initial
-    local_observables = tuple(
+    global_initials = tuple(
         replace(
-            observable,
-            scalar_parameters=tuple(
-                replace(
-                    scalar,
-                    value=terminal_scalar_values[scalar.name],
-                    minimum=parameter_by_name[scalar.name].minimum,
-                    maximum=parameter_by_name[scalar.name].maximum,
-                    scope=parameter_by_name[scalar.name].scope,
-                )
-                for scalar in observable.scalar_parameters
-            ),
+            initial,
+            initial=global_initial_results[initial.species],
         )
-        for observable in setup_snapshot.local_observables
+        if (
+            initial.species in global_initial_results
+            and scopes.get(initial.species) == "global"
+        )
+        else initial
+        for initial in setup_snapshot.global_initials
     )
     return replace(
         setup_snapshot,
@@ -862,7 +1146,9 @@ def _terminal_setup_snapshot(
         ),
         parameters=tuple(parameters),
         initials=initials,
-        local_observables=local_observables,
+        global_initials=global_initials,
+        initial_scopes=setup_snapshot.initial_scopes,
+        local_observables=setup_snapshot.local_observables,
     )
 
 
@@ -889,57 +1175,52 @@ def _canonical_curve_projection(
         result.discontinuity_ids,
         dtype=np.int64,
     ).reshape(-1)
-    mask: np.ndarray | None = None
-    if x_name != "t":
-        observed_times = np.concatenate(
-            [np.asarray(item.t, dtype=float).reshape(-1) for item in selected]
-        )
-        t0 = float(np.min(observed_times))
-        t1 = float(np.max(observed_times))
-        if t0 > t1:
-            t0, t1 = t1, t0
-        t_scale = max(1.0, abs(t0), abs(t1))
-        t_pad = 1e-12 * t_scale
-        mask = (time >= (t0 - t_pad)) & (time <= (t1 + t_pad))
-        if not np.any(mask):
-            mask = None
-
-    if mask is None:
-        axis = time if x_name == "t" else np.asarray(result.series[x_name], dtype=float)
-        values = {
-            name: np.asarray(result.series[name], dtype=float).reshape(-1)
-            for name in names
-        }
-        projected_ids = segment_ids
-        projected_keys = segment_keys
-        projected_discontinuities = discontinuity_ids
-    else:
-        axis = np.asarray(result.series[x_name], dtype=float).reshape(-1)[mask]
-        values = {
-            name: np.asarray(result.series[name], dtype=float).reshape(-1)[mask]
-            for name in names
-        }
-        projected_ids = segment_ids[mask]
-        projected_keys = tuple(
-            key for key, included in zip(segment_keys, mask, strict=True) if included
-        )
-        projected_discontinuities = discontinuity_ids[mask]
+    axis = (
+        time
+        if x_name == "t"
+        else np.asarray(result.series[x_name], dtype=float).reshape(-1)
+    )
+    values = {
+        name: np.asarray(result.series[name], dtype=float).reshape(-1)
+        for name in names
+    }
     return (
         names,
         axis,
         values,
-        tuple(int(value) for value in projected_ids),
-        tuple(projected_keys),
-        tuple(int(value) for value in projected_discontinuities),
+        tuple(int(value) for value in segment_ids),
+        segment_keys,
+        tuple(int(value) for value in discontinuity_ids),
+    )
+
+
+def _fit_curve_y_semantics(
+    prepared_dsl: PreparedDslRequestSet,
+    names: Sequence[str],
+) -> tuple[tuple[str, FitCurveYSemantic], ...]:
+    """Project Y meaning only from the prepared DSL typed species roster."""
+
+    concentration_names = {
+        str(name) for name in prepared_dsl.analysis.species_names
+    }
+    return tuple(
+        (
+            str(name),
+            FitCurveYSemantic.CONCENTRATION
+            if str(name) in concentration_names
+            else FitCurveYSemantic.VALUE,
+        )
+        for name in names
     )
 
 
 def _curves_from_result(
-    request: FitExecutionRequest,
+    origin: FitOriginSnapshot,
+    setup_snapshot: FitSetupSnapshot,
     result: GlobalFitResult,
 ) -> tuple[FitCurveDataset, ...]:
-    mapped_by_id = {item.dataset_id: item for item in request.origin.mapped_datasets}
-    local_by_id = {item.dataset_id: item for item in request.datasets}
+    mapped_by_id = {item.dataset_id: item for item in origin.mapped_datasets}
+    local_by_id = {item.dataset_id: item for item in setup_snapshot.datasets}
     curves: list[FitCurveDataset] = []
     for dataset_id, simulation in result.simulation_results_by_dataset.items():
         if not isinstance(simulation, SimulationResultValue):
@@ -970,6 +1251,10 @@ def _curves_from_result(
             FitCurveDataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
+                y_semantics=_fit_curve_y_semantics(
+                    setup_snapshot.prepared_dsl,
+                    model_names,
+                ),
                 model_x=tuple(
                     (name, tuple(float(value) for value in model_axis))
                     for name in model_names
@@ -1080,6 +1365,20 @@ def _curves_from_result(
     return tuple(curves)
 
 
+def project_fit_candidate_curves(
+    candidate: FitCandidate,
+) -> tuple[FitCurveDataset, ...]:
+    """Lazily project terminal curves from the candidate's canonical truth."""
+
+    if not isinstance(candidate, FitCandidate):
+        raise TypeError("candidate must be FitCandidate.")
+    return _curves_from_result(
+        candidate.origin,
+        candidate.setup_snapshot,
+        candidate.result,
+    )
+
+
 def _curves_from_evaluations(
     request: FitExecutionRequest,
     evaluations: Mapping[str, object],
@@ -1175,6 +1474,10 @@ def _curves_from_evaluations(
             FitCurveDataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
+                y_semantics=_fit_curve_y_semantics(
+                    request.prepared_dsl,
+                    tuple(item.model_species for item in selected),
+                ),
                 model_x=tuple(
                     (
                         item.model_species,
@@ -1266,6 +1569,454 @@ def _curves_from_evaluations(
     return tuple(curves)
 
 
+def _array_identity(value: object) -> dict[str, object]:
+    """Describe an array without retaining its scientific contents."""
+
+    array = np.asarray(value)
+    if array.dtype.kind in {"O", "U", "S"}:
+        content = json.dumps(
+            array.reshape(-1).tolist(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    else:
+        content = np.ascontiguousarray(array).tobytes(order="C")
+    hasher = hashlib.sha256()
+    hasher.update(str(array.dtype).encode("ascii", "replace"))
+    hasher.update(json.dumps(tuple(int(item) for item in array.shape)).encode("ascii"))
+    hasher.update(content)
+    return {
+        "dtype": str(array.dtype),
+        "shape": tuple(int(item) for item in array.shape),
+        "sha256": hasher.hexdigest(),
+    }
+
+
+def _compact_metadata(value: object) -> object:
+    """Normalize preparation metadata while replacing arrays with digests."""
+
+    if isinstance(value, np.ndarray):
+        return _array_identity(value)
+    if isinstance(value, np.generic):
+        return _compact_metadata(value.item())
+    if isinstance(value, Mapping):
+        return {
+            str(key): _compact_metadata(item)
+            for key, item in sorted(value.items(), key=lambda entry: str(entry[0]))
+        }
+    if isinstance(value, (tuple, list)):
+        return [_compact_metadata(item) for item in value]
+    return value
+
+
+def _metadata_digest(value: object) -> str:
+    normalized = _compact_metadata(value)
+    encoded = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _simulation_result_array_identity(
+    result: GlobalFitResult,
+) -> list[dict[str, object]]:
+    """Hash canonical terminal simulations without building curve mirrors."""
+
+    return [
+        {
+            "dataset_id": dataset_id,
+            "time": _array_identity(simulation.t),
+            "series": {
+                name: _array_identity(values)
+                for name, values in sorted(simulation.series.items())
+            },
+            "segment_ids": _array_identity(simulation.segment_ids),
+            "segment_keys": _array_identity(simulation.segment_keys),
+            "discontinuity_ids": _array_identity(
+                simulation.discontinuity_ids
+            ),
+        }
+        for dataset_id, simulation in sorted(
+            result.simulation_results_by_dataset.items()
+        )
+    ]
+
+
+def _result_array_identity(result: GlobalFitResult) -> list[dict[str, object]]:
+    """Retain dtype-sensitive digests before presentation casts occur."""
+
+    rows: list[dict[str, object]] = []
+    for dataset_id in sorted(result.model_series):
+        rows.append(
+            {
+                "dataset_id": dataset_id,
+                "series": {
+                    series_name: {
+                        "model_x": _array_identity(
+                            result.model_x_by_species[dataset_id][series_name]
+                        ),
+                        "model_y": _array_identity(
+                            result.model_series[dataset_id][series_name]
+                        ),
+                        "segment_ids": _array_identity(
+                            result.model_segment_ids[dataset_id][series_name]
+                        ),
+                        "segment_keys": _array_identity(
+                            result.model_segment_keys[dataset_id][series_name]
+                        ),
+                        "discontinuity_ids": _array_identity(
+                            result.model_discontinuity_ids[dataset_id][series_name]
+                        ),
+                        "selection_provenance": _array_identity(
+                            result.model_selection_provenance[dataset_id][series_name]
+                        ),
+                        "observation_ids": _array_identity(
+                            result.model_observation_ids[dataset_id][series_name]
+                        ),
+                        "raw_columns": _array_identity(
+                            result.model_raw_columns[dataset_id][series_name]
+                        ),
+                        "source_rows": _array_identity(
+                            result.model_source_rows[dataset_id][series_name]
+                        ),
+                    }
+                    for series_name in sorted(result.model_series[dataset_id])
+                },
+            }
+        )
+    return rows
+
+
+def _compile_fit_run_identity_payload(
+    *,
+    request: FitExecutionRequest,
+    datasets: Sequence[FitDatasetSpec],
+    included: tuple[FitDatasetLocalSettings, ...],
+    mapped_by_id: Mapping[str, FitMappedDatasetSnapshot],
+    effective_local: Mapping[str, FitDatasetLocalSettings],
+    prepared_ids: Mapping[str, Mapping[str, object]],
+    resolved_modes: tuple[tuple[str, str], ...],
+) -> dict[str, object]:
+    """Build a compact identity; scientific arrays are represented by digests."""
+
+    dataset_payloads: list[dict[str, object]] = []
+    for item in datasets:
+        mapped = mapped_by_id[item.dataset_id]
+        local = effective_local[item.dataset_id]
+        launch_local = next(
+            value for value in included if value.dataset_id == item.dataset_id
+        )
+        raw_columns = {
+            observation.raw_observation_id: observation.raw_column
+            for observation in mapped.observations
+        }
+        observations = {
+            name: {
+                "raw_observation_id": series.raw_observation_id,
+                "t": _array_identity(series.t),
+                "y": _array_identity(series.y),
+                "source_rows": _array_identity(series.source_rows),
+                "raw_column": raw_columns[series.raw_observation_id],
+                "observed_x": _array_identity(
+                    item.x_obs_by_species[name] if item.x_name != "t" else series.t
+                ),
+            }
+            for name, series in item.observations.items()
+        }
+        retained_times = tuple(
+            sorted(
+                {
+                    float(time_value)
+                    for observation in selected_observations(mapped, local)
+                    for time_value in observation.t
+                }
+            )
+        )
+        dataset_payloads.append(
+            {
+                "dataset_id": item.dataset_id,
+                "set_id": mapped.set_id,
+                "observations": observations,
+                "mappings": [
+                    {
+                        "raw_observation_id": raw_id,
+                        "raw_column": raw_columns[raw_id],
+                        "model_target": model_target,
+                    }
+                    for raw_id, model_target in launch_local.observation_targets
+                ],
+                "targets": item.species_list,
+                "target_weights": dict(item.target_weights),
+                "sampling": {
+                    "data_range_min": float(local.data_range_min),
+                    "data_range_max": float(local.data_range_max),
+                    "maximum_observations_per_target": local.maximum_observations_per_target,
+                },
+                **(
+                    {"dataset_weight": float(local.weight)}
+                    if request.dataset_weight_mode == "user"
+                    else {}
+                ),
+                "fit_solver": request.solver,
+                "fit_interval": {
+                    "t_start": float(local.t_start),
+                    "data_range_max": float(local.data_range_max),
+                },
+                "fit_sampling_policy": (
+                    "parametric_regular_grid_union_retained_endpoints"
+                    if local.parametric is not None
+                    else "fit_internal_regular_grid_union_retained_endpoints"
+                ),
+                "fit_sampling_identity": {
+                    "retained_observation_times": _array_identity(retained_times),
+                    "retained_observation_count": len(retained_times),
+                    "regular_grid_count": max(100, len(retained_times))
+                    if local.parametric is not None
+                    else 100,
+                },
+                "x_name": item.x_name,
+                "x_mapping_requested": (
+                    local.parametric.requested_mode if local.parametric is not None else "time"
+                ),
+                "x_mapping_resolved": (
+                    local.parametric.resolved_mode if local.parametric is not None else "time"
+                ),
+            }
+        )
+    return {
+        "kind": "global_fit_run",
+        "schema_version": 2,
+        "origin_tab_id": request.origin.tab_id,
+        "origin_capture_id": request.origin.capture_id,
+        "mechanism_text": request.mechanism_source.reactions_text,
+        "fit_solver": request.solver,
+        "dataset_weight_mode": request.dataset_weight_mode,
+        "local_observables": [
+            {
+                "name": definition.name,
+                "expression": definition.expression,
+                "scalars": [
+                    {
+                        "name": scalar.name,
+                        "value": float(scalar.value),
+                        "minimum": _stamp_bound(scalar.minimum),
+                        "maximum": _stamp_bound(scalar.maximum),
+                        "scope": scalar.scope,
+                    }
+                    for scalar in definition.scalar_parameters
+                ],
+            }
+            for definition in fit_local_observable_definitions(
+                request.local_observables,
+                request.parameters,
+            )
+        ],
+        "datasets": dataset_payloads,
+        "parameters": [
+            {
+                "name": item.name,
+                "display_name": item.display_name,
+                "fit": item.selected_config.fit,
+                "initial": item.selected_config.value,
+                "minimum": _stamp_bound(item.selected_config.minimum),
+                "maximum": _stamp_bound(item.selected_config.maximum),
+                "log10": item.selected_config.log10,
+                "scope": item.scope,
+                "dataset_values": dict(item.selected_config.dataset_values),
+                "family": item.family,
+                "role": item.role,
+                "unit": item.unit,
+            }
+            for item in request.parameters
+        ],
+        "initials": [
+            {
+                "set_id": item.set_id,
+                "species": item.species,
+                "fit": item.fit,
+                "initial": item.initial,
+                "minimum": _stamp_bound(item.minimum),
+                "maximum": _stamp_bound(item.maximum),
+                "log10": item.log10,
+                "scope": "local",
+            }
+            for item in request.initials
+        ],
+        "global_initials": [
+            {
+                "species": item.species,
+                "fit": item.fit,
+                "initial": item.initial,
+                "minimum": _stamp_bound(item.minimum),
+                "maximum": _stamp_bound(item.maximum),
+                "log10": item.log10,
+                "scope": dict(request.initial_scopes).get(item.species),
+            }
+            for item in request.global_initials
+        ],
+        "settings": {
+            "method": request.defaults.method,
+            "max_nfev": request.defaults.max_nfev,
+            "ftol": request.defaults.ftol,
+            "xtol": request.defaults.xtol,
+            "use_seed": request.defaults.use_seed,
+            "seed": request.defaults.seed if request.defaults.use_seed else None,
+        },
+        "scientific_settings": {
+            "temperature": float(request.origin.scientific_settings.temperature),
+            "rtol": float(request.origin.scientific_settings.rtol),
+            "atol": float(request.origin.scientific_settings.atol),
+            "analytic_jacobian_policy": bool(request.origin.scientific_settings.analytic_jacobian_policy),
+            "wegscheider_policy": bool(request.origin.scientific_settings.wegscheider_policy),
+        },
+        "prepared_identities": {
+            dataset_id: {"sha256": _metadata_digest(metadata)}
+            for dataset_id, metadata in sorted(prepared_ids.items())
+        },
+        "resolved_auto_modes": dict(resolved_modes),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _FitTerminalAssembly:
+    """Deterministic successful terminal projection owned by no Qt object."""
+
+    candidate: FitCandidate
+    run_identity: FitRunIdentity
+
+
+def _assemble_fit_terminal(
+    *,
+    request: FitExecutionRequest,
+    result: GlobalFitResult,
+    included: tuple[FitDatasetLocalSettings, ...],
+    included_ids: tuple[str, ...],
+    mapped_by_id: Mapping[str, FitMappedDatasetSnapshot],
+    effective_local: Mapping[str, FitDatasetLocalSettings],
+    setup_snapshot: FitSetupSnapshot,
+    resolved_modes: tuple[tuple[str, str], ...],
+    evaluators: Mapping[str, SerialFittingEvaluator],
+    prepared_ids: dict[str, dict[str, object]],
+    run_identity_payload: dict[str, object],
+) -> _FitTerminalAssembly:
+    """Validate provenance and build candidate/curves without worker custody."""
+
+    effective_dataset_weights: dict[str, float] = {}
+    for info in result.dataset_info:
+        dataset_id = str(info.dataset_id or "").strip()
+        weight = float(info.weight)
+        if (
+            not dataset_id
+            or dataset_id in effective_dataset_weights
+            or not math.isfinite(weight)
+            or weight <= 0.0
+        ):
+            raise ValueError(
+                "Fit terminal contains invalid effective dataset weights."
+            )
+        effective_dataset_weights[dataset_id] = weight
+    if set(effective_dataset_weights) != set(included_ids):
+        raise ValueError(
+            "Fit terminal effective weights do not exactly match the "
+            "included datasets."
+        )
+    solver_provenance_by_dataset = {
+        str(dataset_id or "").strip(): simulation.provenance.solver
+        for dataset_id, simulation in result.simulation_results_by_dataset.items()
+    }
+    if (
+        any(not dataset_id for dataset_id in solver_provenance_by_dataset)
+        or set(solver_provenance_by_dataset) != set(included_ids)
+    ):
+        raise ValueError(
+            "Fit terminal solver provenance does not exactly match the "
+            "included datasets."
+        )
+    scalar_values = tuple(
+        (
+            dataset_id,
+            _finite_items(
+                {
+                    name: value
+                    for name, value in values.items()
+                    if not name.startswith(INITIAL_PREFIX)
+                },
+                field=f"Fit scalar values {dataset_id}",
+            ),
+        )
+        for dataset_id, values in sorted(result.dataset_params.items())
+    )
+    initial_values_by_set = _initial_values_from_result(request, result)
+    terminal_snapshot = _terminal_setup_snapshot(
+        setup_snapshot,
+        request=request,
+        result=result,
+        effective_datasets=effective_local,
+        initial_values_by_set=initial_values_by_set,
+    )
+    for dataset_id, evaluator in evaluators.items():
+        prepared_ids[dataset_id]["prepared_simulation"] = (
+            evaluator.prepared_metadata.to_serializable_dict()
+        )
+    run_identity_payload["prepared_identities"] = {
+        dataset_id: {"sha256": _metadata_digest(metadata)}
+        for dataset_id, metadata in sorted(prepared_ids.items())
+    }
+    run_identity_payload["terminal"] = {
+        "fit_solver": request.solver,
+        "status": result.completion.status,
+        "optimizer_converged": bool(result.completion.optimizer_converged),
+        "message": str(result.message),
+        "nfev": int(result.nfev),
+        "weighted_residual_sse": float(result.weighted_residual_sse),
+        "weighted_residual_mse": float(result.weighted_residual_mse),
+        "effective_dataset_weights": {
+            dataset_id: effective_dataset_weights[dataset_id]
+            for dataset_id in sorted(effective_dataset_weights)
+        },
+        "solver_provenance_identity_by_dataset": {
+            dataset_id: {
+                "sha256": _metadata_digest(
+                    solver_provenance_by_dataset[dataset_id]
+                )
+            }
+            for dataset_id in sorted(solver_provenance_by_dataset)
+        },
+        "shared_parameters": {
+            str(name): float(value)
+            for name, value in sorted(result.shared_params.items())
+        },
+        "dataset_parameters": {
+            str(dataset_id): {
+                str(name): float(value)
+                for name, value in sorted(values.items())
+            }
+            for dataset_id, values in sorted(result.dataset_params.items())
+        },
+        "result_array_identity": _result_array_identity(result),
+        "simulation_result_array_identity": (
+            _simulation_result_array_identity(result)
+        ),
+    }
+    run_identity = FitRunIdentity.build(run_identity_payload)
+    candidate = FitCandidate(
+        origin=request.origin,
+        parameters=_finite_items(result.shared_params, field="Fit parameters"),
+        scalar_values_by_dataset=scalar_values,
+        initial_values_by_set=initial_values_by_set,
+        local_observables=terminal_snapshot.local_observables,
+        result=result,
+        run_identity=run_identity,
+        setup_snapshot=terminal_snapshot,
+        resolved_auto_modes=resolved_modes,
+    )
+    return _FitTerminalAssembly(candidate=candidate, run_identity=run_identity)
+
+
 class GlobalFitWorker(QtCore.QThread):
     """Run one immutable request and retain every evaluator until terminal."""
 
@@ -1279,24 +2030,22 @@ class GlobalFitWorker(QtCore.QThread):
         self,
         request: FitExecutionRequest,
         *,
-        setup_snapshot: FitSetupSnapshot | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
         if not isinstance(request, FitExecutionRequest):
             raise TypeError("request must be FitExecutionRequest.")
         self._request = request
-        self._setup_snapshot = (
-            setup_snapshot or FitSetupSnapshot.from_request(request)
-        )
+        self._setup_snapshot = FitSetupSnapshot.from_request(request)
         self._cancelled = Event()
+        self._cancellation_control = SimulationCancellationControl(
+            self._cancelled.is_set
+        )
         self._pause_condition = Condition()
         self._paused = False
         self._last_best_emit = 0.0
         self._last_curve_emit = 0.0
-        self._best_cost = math.inf
-        self._best_iteration = 0
-        self._best_params: dict[str, float] = {}
+        self._best_progress: FitProgress | None = None
         self._resolved_auto_modes: tuple[tuple[str, str], ...] = ()
         self._detailed_balance_condition = Condition()
         self._detailed_balance_response: tuple[
@@ -1346,7 +2095,6 @@ class GlobalFitWorker(QtCore.QThread):
         self,
         request_id: str,
         corrected_request: FitExecutionRequest | None,
-        corrected_snapshot: FitSetupSnapshot | None = None,
         *,
         rejection_message: str | None = None,
     ) -> None:
@@ -1364,8 +2112,6 @@ class GlobalFitWorker(QtCore.QThread):
                     or "Detailed-balance correction was not accepted; Fit aborted."
                 )
             else:
-                if corrected_snapshot is None:
-                    raise TypeError("A corrected Fit setup snapshot is required.")
                 if rejection_message is not None:
                     raise ValueError(
                         "An accepted detailed-balance correction cannot carry "
@@ -1373,7 +2119,7 @@ class GlobalFitWorker(QtCore.QThread):
                     )
                 self._detailed_balance_response = (
                     corrected_request,
-                    corrected_snapshot,
+                    FitSetupSnapshot.from_request(corrected_request),
                 )
                 self._detailed_balance_rejection_message = None
             self._detailed_balance_answered = True
@@ -1427,9 +2173,7 @@ class GlobalFitWorker(QtCore.QThread):
                         "Fit aborted."
                     )
                 self._request, self._setup_snapshot = response
-                self._best_cost = math.inf
-                self._best_iteration = 0
-                self._best_params = {}
+                self._best_progress = None
                 self._resolved_auto_modes = ()
                 candidate = self._execute(
                     allow_detailed_balance_correction=False
@@ -1466,207 +2210,46 @@ class GlobalFitWorker(QtCore.QThread):
     ) -> FitCandidate:
         def fitting_checkpoint() -> bool:
             return self._checkpoint()
-
-        fitting_checkpoint._kindred_nonblocking_cancelled = (  # type: ignore[attr-defined]
-            lambda: self._cancelled.is_set() or self.isInterruptionRequested()
-        )
         request = self._request
-        included = [item for item in request.datasets if item.included]
+        included = tuple(item for item in request.datasets if item.included)
         mapped_by_id = {item.dataset_id: item for item in request.origin.mapped_datasets}
-        if not included:
-            raise ValueError("Select at least one mapped dataset for fitting.")
-        included_ids = tuple(item.dataset_id for item in included)
-
-        shared_variables: list[FitSharedVariableParamSpec] = []
-        coupled_variables: list[FitCoupledVariableParamSpec] = []
-        variable_by_dataset: dict[str, list[FitDatasetVariableParamSpec]] = {
-            dataset_id: [] for dataset_id in included_ids
+        coordinates = _compile_optimizer_coordinates(request)
+        included_ids = coordinates.included_ids
+        shared_variables = list(coordinates.shared_variables)
+        coupled_variables = list(coordinates.coupled_variables)
+        fixed_by_dataset = {
+            dataset_id: dict(values)
+            for dataset_id, values in coordinates.fixed_by_dataset
         }
-        fixed_by_dataset: dict[str, dict[str, float]] = {
-            dataset_id: {} for dataset_id in included_ids
-        }
-
-        for parameter in request.parameters:
-            dataset_values = dict(parameter.dataset_values)
-            if parameter.fit and parameter.scope == "shared":
-                shared_variables.append(
-                    FitSharedVariableParamSpec(
-                        name=parameter.name,
-                        initial=parameter.initial,
-                        minimum=parameter.minimum,
-                        maximum=parameter.maximum,
-                        log10=parameter.log10,
-                    )
-                )
-            elif parameter.fit:
-                for dataset_id in included_ids:
-                    variable_by_dataset[dataset_id].append(
-                        FitDatasetVariableParamSpec(
-                            name=parameter.name,
-                            initial=dataset_values[dataset_id],
-                            minimum=parameter.minimum,
-                            maximum=parameter.maximum,
-                            log10=parameter.log10,
-                        )
-                    )
-            elif parameter.scope == "per_dataset":
-                for dataset_id in included_ids:
-                    fixed_by_dataset[dataset_id][parameter.name] = float(
-                        dataset_values[dataset_id]
-                    )
-            else:
-                for dataset_id in included_ids:
-                    fixed_by_dataset[dataset_id][parameter.name] = float(
-                        parameter.initial
-                    )
-
-        datasets_for_set: dict[str, tuple[str, ...]] = {}
-        for mapped in request.origin.mapped_datasets:
-            if mapped.dataset_id in included_ids:
-                datasets_for_set.setdefault(mapped.set_id, ())
-                datasets_for_set[mapped.set_id] = (
-                    *datasets_for_set[mapped.set_id],
-                    mapped.dataset_id,
-                )
-        initials_by_species: dict[str, list[object]] = {}
-        for initial in request.initials:
-            initials_by_species.setdefault(initial.species, []).append(initial)
-        for species, rows in initials_by_species.items():
-            active_rows = [
-                item
-                for item in rows
-                if datasets_for_set.get(item.set_id)
-            ]
-            global_rows = [
-                item for item in active_rows if item.scope == "global"
-            ]
-            if global_rows:
-                if len(global_rows) != len(active_rows):
-                    raise ValueError(
-                        f"Initial {species!r} mixes Global and Local scope."
-                    )
-                signatures = {
-                    (
-                        item.initial,
-                        item.minimum,
-                        item.maximum,
-                        item.fit,
-                        item.log10,
-                    )
-                    for item in global_rows
-                }
-                if len(signatures) != 1:
-                    raise ValueError(
-                        f"Global initial {species!r} has inconsistent "
-                        "coupled setup rows."
-                    )
-                (
-                    initial_value,
-                    minimum,
-                    maximum,
-                    fitted,
-                    log10,
-                ) = signatures.pop()
-                if fitted:
-                    coupled_variables.append(
-                        FitCoupledVariableParamSpec(
-                            variable_id=f"initial:global:{species}",
-                            parameter_name=f"{INITIAL_PREFIX}{species}",
-                            dataset_ids=included_ids,
-                            initial=initial_value,
-                            minimum=minimum,
-                            maximum=maximum,
-                            log10=log10,
-                        )
-                    )
-                else:
-                    for dataset_id in included_ids:
-                        fixed_by_dataset[dataset_id][f"{INITIAL_PREFIX}{species}"] = (
-                            initial_value
-                        )
-                continue
-            for initial in active_rows:
-                target_datasets = datasets_for_set.get(initial.set_id, ())
-                if not target_datasets:
-                    continue
-                value = initial.initial
-                if initial.fit:
-                    coupled_variables.append(
-                        FitCoupledVariableParamSpec(
-                            variable_id=f"initial:{initial.set_id}:{species}",
-                            parameter_name=f"{INITIAL_PREFIX}{species}",
-                            dataset_ids=target_datasets,
-                            initial=value,
-                            minimum=initial.minimum,
-                            maximum=initial.maximum,
-                            log10=initial.log10,
-                        )
-                    )
-                else:
-                    for dataset_id in target_datasets:
-                        fixed_by_dataset[dataset_id][f"{INITIAL_PREFIX}{species}"] = value
-
-        overrides = tuple(
-            FitDatasetParameterOverrides(
-                dataset_id=dataset_id,
-                fixed_params=tuple(sorted(fixed_by_dataset[dataset_id].items())),
-                variable_params=tuple(variable_by_dataset[dataset_id]),
-            )
-            for dataset_id in included_ids
-        )
-        candidate_names = sorted(
-            parameter.name
-            for parameter in request.parameters
-            if not parameter.name.startswith(INITIAL_PREFIX)
-        )
+        overrides = coordinates.overrides
+        candidate_names = list(coordinates.candidate_names)
         evaluators: dict[str, SerialFittingEvaluator] = {}
         prepared_ids: dict[str, dict[str, object]] = {}
         for local in included:
             if self._checkpoint():
                 raise FittingCancelled()
             science = request.origin.scientific_settings
-            retained = selected_observations(
+            dataset_context = _compile_dataset_context(
                 mapped_by_id[local.dataset_id],
                 local,
+                solver=request.solver,
             )
-            retained_times = tuple(
-                sorted({float(time_value) for item in retained for time_value in item.t})
-            )
-            grid_points = max(
-                100,
-                len(retained_times),
-            ) if local.parametric is not None else 100
             try:
                 context = prepare_fitting_execution_context(
                     prepared_dsl=request.prepared_dsl,
                     param_names=candidate_names,
                     t_start=float(local.t_start),
                     t_end=float(local.data_range_max),
-                    num_points=grid_points,
-                    objective_sample_times=retained_times,
-                    solver=local.solver,
-                    fit_sampling_policy=(
-                        "parametric_regular_grid_union_retained_endpoints"
-                        if local.parametric is not None
-                        else "fit_internal_regular_grid_union_retained_endpoints"
-                    ),
-                    fit_sampling_identity={
-                        "solver": local.solver,
-                        "t_start": float(local.t_start),
-                        "t_end": float(local.data_range_max),
-                        "regular_grid_count": int(grid_points),
-                        "retained_observation_times": retained_times,
-                        "union_endpoints": (
-                            float(local.t_start),
-                            float(local.data_range_max),
-                        ),
-                    },
-                    rtol=float(science.rtol),
-                    atol=float(science.atol),
-                    use_sparse_jacobian=bool(science.sparse_jacobian_policy),
-                    wegscheider_cyclicity_enabled=bool(
-                        science.wegscheider_policy
-                    ),
+                    num_points=dataset_context.grid_points,
+                    objective_sample_times=dataset_context.retained_times,
+                    solver=request.solver,
+                    fit_sampling_policy=dataset_context.fit_sampling_policy,
+                    fit_sampling_identity=dataset_context.fit_sampling_identity,
+                    cancellation_control=self._cancellation_control,
+                    rtol=science.rtol,
+                    atol=science.atol,
+                    use_analytic_jacobian=science.analytic_jacobian_policy,
+                    wegscheider_cyclicity_enabled=science.wegscheider_policy,
                     initial_prefix=INITIAL_PREFIX,
                 )
             except BaseException as exc:
@@ -1686,6 +2269,7 @@ class GlobalFitWorker(QtCore.QThread):
                                 request.origin.mechanism_source.reactions_text
                             ),
                             "temperature_K": float(science.temperature),
+                            "fit_solver": request.solver,
                             "wegscheider_cyclicity_enabled": bool(
                                 science.wegscheider_policy
                             ),
@@ -1704,18 +2288,12 @@ class GlobalFitWorker(QtCore.QThread):
                             temperature_K=float(science.temperature),
                             report=WegscheiderCyclicityReport(tuple(unresolved.cycles)),
                             source_energy_unit=str(
-                                getattr(request.prepared_dsl.analysis, "structure", {})
-                                .get(
-                                    "source_energy_unit",
-                                    getattr(
-                                        request.prepared_dsl.analysis,
-                                        "structure",
-                                        {},
-                                    ).get("energy_unit", "kJ/mol"),
-                                )
+                                request.prepared_dsl.analysis.energy_unit
                             ),
-                        )
+                    )
                     ) from exc
+                if isinstance(exc, FitSimulationError):
+                    exc.details.setdefault("fit_solver", request.solver)
                 raise
             evaluator = SerialFittingEvaluator(
                 context,
@@ -1724,7 +2302,7 @@ class GlobalFitWorker(QtCore.QThread):
                     for name in fixed_by_dataset[local.dataset_id]
                 },
             )
-            evaluator.set_cancellation_check(fitting_checkpoint)
+            evaluator.set_cancellation_control(self._cancellation_control)
             evaluators[local.dataset_id] = evaluator
             metadata = evaluator.prepared_metadata
             prepared_ids[local.dataset_id] = {
@@ -1732,7 +2310,7 @@ class GlobalFitWorker(QtCore.QThread):
                 "declarative_analysis_identity": (
                     request.prepared_dsl.analysis.identity
                 ),
-                "fit_solver": local.solver,
+                "fit_solver": request.solver,
                 "fit_interval": {
                     "t_start": float(local.t_start),
                     "data_range_max": float(local.data_range_max),
@@ -1750,19 +2328,32 @@ class GlobalFitWorker(QtCore.QThread):
             mapped = mapped_by_id[dataset_id]
             starting_values = {
                 parameter.name: (
-                    dict(parameter.dataset_values)[dataset_id]
+                    dict(parameter.selected_config.dataset_values)[dataset_id]
                     if parameter.scope == "per_dataset"
-                    else parameter.initial
+                    else parameter.selected_config.value
                 )
                 for parameter in request.parameters
             }
             starting_values.update(fixed_by_dataset[dataset_id])
             for initial in request.initials:
-                if initial.set_id != mapped.set_id:
+                if (
+                    initial.set_id != mapped.set_id
+                    or dict(request.initial_scopes).get(initial.species) != "local"
+                ):
                     continue
                 starting_values[
                     f"{INITIAL_PREFIX}{initial.species}"
                 ] = initial.initial
+            for initial in request.global_initials:
+                if (
+                    dict(request.initial_scopes).get(initial.species) == "global"
+                    and mapped.set_id in {
+                        item.set_id
+                        for item in request.initials
+                        if item.species == initial.species
+                    }
+                ):
+                    starting_values[f"{INITIAL_PREFIX}{initial.species}"] = initial.initial
             evaluation = evaluators[
                 dataset_id
             ].evaluate_series_with_parameter_origins(
@@ -1782,7 +2373,7 @@ class GlobalFitWorker(QtCore.QThread):
                 local.parametric is not None
                 and local.parametric.requested_mode == "auto"
             ):
-                provisional = _dataset_spec(
+                provisional = _compile_dataset_spec(
                     mapped,
                     replace(
                         local,
@@ -1843,7 +2434,9 @@ class GlobalFitWorker(QtCore.QThread):
                 )
             effective_local[local.dataset_id] = chosen
         datasets = [
-            _dataset_spec(mapped_by_id[item.dataset_id], effective_local[item.dataset_id])
+            _compile_dataset_spec(
+                mapped_by_id[item.dataset_id], effective_local[item.dataset_id]
+            )
             for item in included
         ]
         resolved_modes = tuple(
@@ -1868,317 +2461,41 @@ class GlobalFitWorker(QtCore.QThread):
         if self._checkpoint():
             raise FittingCancelled()
         self._last_curve_emit = time.monotonic()
-        run_identity_payload = {
-            "kind": "global_fit_run",
-            "schema_version": 1,
-            "origin_tab_id": request.origin.tab_id,
-            "origin_capture_id": request.origin.capture_id,
-            "mechanism_text": request.mechanism_source.reactions_text,
-            "dataset_weight_mode": request.dataset_weight_mode,
-            "local_observables": [
-                    {
-                        "name": item.name,
-                        "expression": item.expression,
-                        "scalars": [
-                            {
-                                "name": scalar.name,
-                                "value": float(scalar.value),
-                                "minimum": _stamp_bound(scalar.minimum),
-                                "maximum": _stamp_bound(scalar.maximum),
-                                "scope": scalar.scope,
-                            }
-                            for scalar in item.scalar_parameters
-                        ],
-                    }
-                    for item in request.local_observables
-                ],
-            "datasets": [
-                    {
-                        "dataset_id": item.dataset_id,
-                        "set_id": mapped_by_id[item.dataset_id].set_id,
-                        "observations": {
-                            name: {
-                                "raw_observation_id": (
-                                    series.raw_observation_id
-                                ),
-                                "t": [
-                                    float(value)
-                                    for value in np.asarray(
-                                        series.t,
-                                        dtype=float,
-                                    ).reshape(-1)
-                                ],
-                                "y": [
-                                    float(value)
-                                    for value in np.asarray(
-                                        series.y,
-                                        dtype=float,
-                                    ).reshape(-1)
-                                ],
-                                "source_rows": list(
-                                    series.source_rows
-                                ),
-                                "observed_x": {
-                                    "identity": (
-                                        (
-                                            next(
-                                                observation.raw_observation_id
-                                                for observation in mapped_by_id[
-                                                    item.dataset_id
-                                                ].observations
-                                                if observation.model_species
-                                                == item.x_name
-                                            )
-                                        )
-                                        if item.x_name != "t"
-                                        else series.raw_observation_id
-                                    ),
-                                    "kind": (
-                                        "raw_observation"
-                                        if item.x_name != "t"
-                                        else "observation_time"
-                                    ),
-                                    "name": item.x_name,
-                                    "values": [
-                                        float(value)
-                                        for value in np.asarray(
-                                            (
-                                                item.x_obs_by_species[name]
-                                                if item.x_name != "t"
-                                                else series.t
-                                            ),
-                                            dtype=float,
-                                        ).reshape(-1)
-                                    ],
-                                    "paired_y_raw_observation_id": (
-                                        series.raw_observation_id
-                                    ),
-                                    "paired_source_rows": list(
-                                        series.source_rows
-                                    ),
-                                },
-                            }
-                            for name, series in item.observations.items()
-                        },
-                        "mappings": [
-                            {
-                                "raw_observation_id": raw_id,
-                                "raw_column": raw_column,
-                                "model_target": model_target,
-                            }
-                            for raw_id, model_target in next(
-                                local.observation_targets
-                                for local in included
-                                if local.dataset_id == item.dataset_id
-                            )
-                            for raw_column in (
-                                next(
-                                    observation.raw_column
-                                    for observation in mapped_by_id[
-                                        item.dataset_id
-                                    ].observations
-                                    if observation.raw_observation_id
-                                    == raw_id
-                                ),
-                            )
-                        ],
-                        "targets": item.species_list,
-                        "target_weights": dict(item.target_weights),
-                        "sampling": {
-                            "data_range_min": float(
-                                effective_local[item.dataset_id].data_range_min
-                            ),
-                            "data_range_max": float(
-                                effective_local[item.dataset_id].data_range_max
-                            ),
-                            "maximum_observations_per_target": (
-                                effective_local[
-                                    item.dataset_id
-                                ].maximum_observations_per_target
-                            ),
-                        },
-                        **(
-                            {
-                                "dataset_weight": float(
-                                    effective_local[item.dataset_id].weight
-                                )
-                            }
-                            if request.dataset_weight_mode == "user"
-                            else {}
-                        ),
-                        "fit_solver": effective_local[item.dataset_id].solver,
-                        "fit_interval": {
-                            "t_start": float(
-                                effective_local[item.dataset_id].t_start
-                            ),
-                            "data_range_max": float(
-                                effective_local[item.dataset_id].data_range_max
-                            ),
-                        },
-                        "fit_sampling_policy": (
-                            "parametric_regular_grid_union_retained_endpoints"
-                            if effective_local[item.dataset_id].parametric is not None
-                            else "fit_internal_regular_grid_union_retained_endpoints"
-                        ),
-                        "fit_sampling_identity": {
-                            "retained_observation_times": tuple(
-                                sorted(
-                                    {
-                                        float(time_value)
-                                        for observation in selected_observations(
-                                            mapped_by_id[item.dataset_id],
-                                            effective_local[item.dataset_id],
-                                        )
-                                        for time_value in observation.t
-                                    }
-                                )
-                            ),
-                            "regular_grid_count": int(
-                                max(
-                                    100,
-                                    len(
-                                        {
-                                            float(time_value)
-                                            for observation in selected_observations(
-                                                mapped_by_id[item.dataset_id],
-                                                effective_local[item.dataset_id],
-                                            )
-                                            for time_value in observation.t
-                                        }
-                                    ),
-                                )
-                                if effective_local[item.dataset_id].parametric is not None
-                                else 100
-                            ),
-                        },
-                        "x_name": item.x_name,
-                        "x_mapping_requested": (
-                            effective_local[
-                                item.dataset_id
-                            ].parametric.requested_mode
-                            if effective_local[
-                                item.dataset_id
-                            ].parametric is not None
-                            else "time"
-                        ),
-                        "x_mapping_resolved": (
-                            effective_local[
-                                item.dataset_id
-                            ].parametric.resolved_mode
-                            if effective_local[
-                                item.dataset_id
-                            ].parametric is not None
-                            else "time"
-                        ),
-                    }
-                    for item in datasets
-                ],
-            "parameters": [
-                    {
-                        "name": item.name,
-                        "display_name": item.display_name,
-                        "fit": item.fit,
-                        "initial": item.initial,
-                        "minimum": _stamp_bound(item.minimum),
-                        "maximum": _stamp_bound(item.maximum),
-                        "log10": item.log10,
-                        "scope": item.scope,
-                        "dataset_values": dict(item.dataset_values),
-                        "family": item.family,
-                        "role": item.role,
-                        "unit": item.unit,
-                    }
-                    for item in request.parameters
-                ],
-            "initials": [
-                    {
-                        "set_id": item.set_id,
-                        "species": item.species,
-                        "fit": item.fit,
-                        "initial": item.initial,
-                        "minimum": _stamp_bound(item.minimum),
-                        "maximum": _stamp_bound(item.maximum),
-                        "log10": item.log10,
-                        "scope": item.scope,
-                    }
-                    for item in request.initials
-                ],
-            "settings": {
-                    "method": request.defaults.method,
-                    "max_nfev": request.defaults.max_nfev,
-                    "ftol": request.defaults.ftol,
-                    "xtol": request.defaults.xtol,
-                    "use_seed": request.defaults.use_seed,
-                    "seed": request.defaults.seed if request.defaults.use_seed else None,
-                },
-            "scientific_settings": {
-                    "temperature": float(
-                        request.origin.scientific_settings.temperature
-                    ),
-                    "rtol": float(request.origin.scientific_settings.rtol),
-                    "atol": float(request.origin.scientific_settings.atol),
-                    "sparse_jacobian_policy": bool(
-                        request.origin.scientific_settings.sparse_jacobian_policy
-                    ),
-                    "wegscheider_policy": bool(
-                        request.origin.scientific_settings.wegscheider_policy
-                    ),
-                },
-            "prepared_identities": prepared_ids,
-            "resolved_auto_modes": dict(resolved_modes),
-        }
+        run_identity_payload = _compile_fit_run_identity_payload(
+            request=request,
+            datasets=datasets,
+            included=included,
+            mapped_by_id=mapped_by_id,
+            effective_local=effective_local,
+            prepared_ids=prepared_ids,
+            resolved_modes=resolved_modes,
+        )
 
-        def live_evaluations(
-            params: Mapping[str, float],
-        ) -> dict[str, object]:
-            evaluations: dict[str, object] = {}
-            for local in included:
-                dataset_id = local.dataset_id
-                values = dict(fixed_by_dataset[dataset_id])
-                for variable in shared_variables:
-                    values[variable.name] = float(
-                        params.get(variable.name, variable.initial)
-                    )
-                for variable in variable_by_dataset[dataset_id]:
-                    key = f"{dataset_id}::{variable.name}"
-                    values[variable.name] = float(
-                        params.get(key, variable.initial)
-                    )
-                for variable in coupled_variables:
-                    if dataset_id not in variable.dataset_ids:
-                        continue
-                    values[variable.parameter_name] = float(
-                        params.get(variable.variable_id, variable.initial)
-                    )
-                evaluation = evaluators[
-                    dataset_id
-                ].evaluate_series_with_parameter_origins(
-                    values,
-                    {
-                        name: FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
-                        for name in values
-                    },
-                )
-                if not isinstance(evaluation, SimulationResultValue):
-                    raise TypeError(
-                        "Live Fit evaluator did not return its canonical result."
-                    )
-                evaluations[dataset_id] = evaluation
-            return evaluations
-
-        def progress(iteration: int, cost: float, params: dict[str, float]) -> None:
+        def progress(update: FitProgress) -> None:
             if self._checkpoint():
                 raise FittingCancelled()
+            if not isinstance(update, FitProgress):
+                raise TypeError("Fit progress callback requires FitProgress.")
+            objective_calls = update.objective_calls
+            cost = update.cost
             self.progress.emit(
-                min(95, max(1, int(100 * iteration / max(1, request.defaults.max_nfev)))),
-                f"Iteration {iteration}: objective SSQ={cost:.4g}",
+                min(
+                    95,
+                    max(
+                        1,
+                        int(
+                            100
+                            * objective_calls
+                            / max(1, request.defaults.max_nfev)
+                        ),
+                    ),
+                ),
+                f"Objective calls {objective_calls}: objective SSQ={cost:.4g}",
             )
             if self._checkpoint():
                 raise FittingCancelled()
-            if math.isfinite(cost) and cost < self._best_cost:
-                self._best_cost = float(cost)
-                self._best_iteration = int(iteration)
-                self._best_params = dict(params)
+            if update.improved:
+                self._best_progress = update
                 now = time.monotonic()
                 if now - self._last_best_emit >= _BEST_INTERVAL_SECONDS:
                     if self._checkpoint():
@@ -2189,10 +2506,14 @@ class GlobalFitWorker(QtCore.QThread):
                     self._last_best_emit = now
                 if now - self._last_curve_emit >= _CURVE_INTERVAL_SECONDS:
                     try:
-                        live_curves = _curves_from_evaluations(
-                            request,
-                            live_evaluations(self._best_params),
-                            effective_local,
+                        live_curves = (
+                            _curves_from_evaluations(
+                                request,
+                                update.best_simulation_results_by_dataset,
+                                effective_local,
+                            )
+                            if update.best_simulation_results_by_dataset
+                            else ()
                         )
                     except (FitSimulationError, KeyError, TypeError, ValueError):
                         live_curves = ()
@@ -2204,7 +2525,7 @@ class GlobalFitWorker(QtCore.QThread):
                             raise FittingCancelled()
                     self._last_curve_emit = now
 
-        method = str(request.defaults.method).strip().lower()
+        method = request.defaults.method
         result = fit_global(
             fit_evaluators=evaluators,
             datasets=datasets,
@@ -2219,13 +2540,14 @@ class GlobalFitWorker(QtCore.QThread):
                 if request.dataset_weight_mode == "user"
                 else None
             ),
-            method="de" if method == "differential_evolution" else method,
+            method=method,
             max_nfev=int(request.defaults.max_nfev),
             ftol=float(request.defaults.ftol),
             xtol=float(request.defaults.xtol),
             seed=int(request.defaults.seed) if request.defaults.use_seed else None,
             progress_callback=progress,
             cancellation_check=fitting_checkpoint,
+            cancellation_control=self._cancellation_control,
         )
         if self._checkpoint():
             raise FittingCancelled()
@@ -2233,208 +2555,34 @@ class GlobalFitWorker(QtCore.QThread):
             message = result.message or "Fit did not produce a candidate."
             raise RuntimeError(message)
 
-        effective_dataset_weights: dict[str, float] = {}
-        for info in result.dataset_info:
-            dataset_id = str(info.dataset_id or "").strip()
-            weight = float(info.weight)
-            if (
-                not dataset_id
-                or dataset_id in effective_dataset_weights
-                or not math.isfinite(weight)
-                or weight <= 0.0
-            ):
-                raise ValueError(
-                    "Fit terminal contains invalid effective dataset weights."
-                )
-            effective_dataset_weights[dataset_id] = weight
-        if set(effective_dataset_weights) != set(included_ids):
-            raise ValueError(
-                "Fit terminal effective weights do not exactly match the "
-                "included datasets."
-            )
-        solver_provenance_by_dataset = {
-            str(dataset_id or "").strip(): simulation.provenance.solver
-            for dataset_id, simulation in result.simulation_results_by_dataset.items()
-        }
-        if (
-            any(not dataset_id for dataset_id in solver_provenance_by_dataset)
-            or set(solver_provenance_by_dataset) != set(included_ids)
-        ):
-            raise ValueError(
-                "Fit terminal solver provenance does not exactly match the "
-                "included datasets."
-            )
-
-        scalar_values = tuple(
-            (
-                dataset_id,
-                _finite_items(
-                    {
-                        name: value
-                        for name, value in values.items()
-                        if not name.startswith(INITIAL_PREFIX)
-                    },
-                    field=f"Fit scalar values {dataset_id}",
-                ),
-            )
-            for dataset_id, values in sorted(result.dataset_params.items())
-        )
-        start_by_set_map: dict[str, float] = {}
-        for item in included:
-            set_id = mapped_by_id[item.dataset_id].set_id
-            if set_id in start_by_set_map:
-                raise ValueError(
-                    f"Fit candidate repeats mapped set {set_id!r}."
-                )
-            start_by_set_map[set_id] = float(
-                effective_local[item.dataset_id].t_start
-            )
-        start_by_set = tuple(start_by_set_map.items())
-        curves = _curves_from_result(request, result)
-        initial_values_by_set = _initial_values_from_result(
-            request,
-            result,
-        )
-        terminal_snapshot = _terminal_setup_snapshot(
-            self._setup_snapshot,
-            request=request,
-            result=result,
-            effective_datasets=effective_local,
-            initial_values_by_set=initial_values_by_set,
-        )
         if self._checkpoint():
             raise FittingCancelled()
-        for dataset_id, evaluator in evaluators.items():
-            prepared_ids[dataset_id]["prepared_simulation"] = (
-                evaluator.prepared_metadata.to_serializable_dict()
-            )
-        run_identity_payload["terminal_replay"] = {
-            "status": result.completion.status,
-            "optimizer_converged": bool(
-                result.completion.optimizer_converged
-            ),
-            "message": str(result.message),
-            "nfev": int(result.nfev),
-            "weighted_residual_sse": float(result.weighted_residual_sse),
-            "weighted_residual_mse": float(result.weighted_residual_mse),
-            "effective_dataset_weights": {
-                dataset_id: effective_dataset_weights[dataset_id]
-                for dataset_id in sorted(effective_dataset_weights)
-            },
-            "solver_provenance_by_dataset": {
-                dataset_id: solver_provenance_by_dataset[dataset_id]
-                for dataset_id in sorted(solver_provenance_by_dataset)
-            },
-            "shared_parameters": {
-                str(name): float(value)
-                for name, value in sorted(result.shared_params.items())
-            },
-            "dataset_parameters": {
-                str(dataset_id): {
-                    str(name): float(value)
-                    for name, value in sorted(values.items())
-                }
-                for dataset_id, values in sorted(
-                    result.dataset_params.items()
-                )
-            },
-            "objective_rows": [
-                {
-                    "dataset_id": dataset_id,
-                    "series": [
-                        {
-                            "model_target": series_name,
-                            "model_x": [
-                                float(value)
-                                for value in np.asarray(
-                                    result.model_x_by_species[dataset_id][
-                                        series_name
-                                    ],
-                                    dtype=float,
-                                ).reshape(-1)
-                            ],
-                            "model_y": [
-                                float(value)
-                                for value in np.asarray(
-                                    result.model_series[dataset_id][series_name],
-                                    dtype=float,
-                                ).reshape(-1)
-                            ],
-                            "segment_ids": [
-                                int(value)
-                                for value in np.asarray(
-                                    result.model_segment_ids[dataset_id][
-                                        series_name
-                                    ],
-                                    dtype=np.int64,
-                                ).reshape(-1)
-                            ],
-                            "segment_keys": list(
-                                result.model_segment_keys[dataset_id][
-                                    series_name
-                                ]
-                            ),
-                            "discontinuity_ids": [
-                                int(value)
-                                for value in np.asarray(
-                                    result.model_discontinuity_ids[dataset_id][
-                                        series_name
-                                    ],
-                                    dtype=np.int64,
-                                ).reshape(-1)
-                            ],
-                            "selection_provenance": list(
-                                result.model_selection_provenance[dataset_id][
-                                    series_name
-                                ]
-                            ),
-                            "raw_observation_ids": list(
-                                result.model_observation_ids[dataset_id][
-                                    series_name
-                                ]
-                            ),
-                            "raw_columns": list(
-                                result.model_raw_columns[dataset_id][series_name]
-                            ),
-                            "source_rows": [
-                                int(value)
-                                for value in result.model_source_rows[dataset_id][
-                                    series_name
-                                ]
-                            ],
-                        }
-                        for series_name in sorted(
-                            result.model_series[dataset_id]
-                        )
-                    ],
-                }
-                for dataset_id in sorted(result.model_series)
-            ],
-        }
-        run_identity = FitRunIdentity.build(run_identity_payload)
+        terminal_assembly = _assemble_fit_terminal(
+            request=request,
+            result=result,
+            included=included,
+            included_ids=included_ids,
+            mapped_by_id=mapped_by_id,
+            effective_local=effective_local,
+            setup_snapshot=self._setup_snapshot,
+            resolved_modes=resolved_modes,
+            evaluators=evaluators,
+            prepared_ids=prepared_ids,
+            run_identity_payload=run_identity_payload,
+        )
+        run_identity = terminal_assembly.run_identity
         if self._checkpoint():
             raise FittingCancelled()
         self.progress.emit(100, f"Fit complete · {run_identity.short_hash}")
         if self._checkpoint():
             raise FittingCancelled()
-        return FitCandidate(
-            origin_tab_id=request.origin.tab_id,
-            origin_capture_id=request.origin.capture_id,
-            mechanism_source=request.mechanism_source,
-            prepared_dsl=request.prepared_dsl,
-            parameters=_finite_items(result.shared_params, field="Fit parameters"),
-            scalar_values_by_dataset=scalar_values,
-            initial_values_by_set=initial_values_by_set,
-            start_by_set=start_by_set,
-            local_observables=terminal_snapshot.local_observables,
-            result=result,
-            curves=curves,
-            run_identity=run_identity,
-            setup_snapshot=terminal_snapshot,
-            resolved_auto_modes=resolved_modes,
-        )
+        return terminal_assembly.candidate
 
     def _live_update(self) -> FitLiveUpdate:
+        best_progress = self._best_progress
+        if best_progress is None:
+            raise RuntimeError("Live Fit update requested before a best candidate.")
+        best_params = best_progress.parameters
         included_dataset_ids = {
             item.dataset_id for item in self._request.datasets if item.included
         }
@@ -2444,26 +2592,44 @@ class GlobalFitWorker(QtCore.QThread):
             if mapped.dataset_id in included_dataset_ids
         }
         initials_by_set: dict[str, dict[str, float]] = {}
+        scopes = dict(self._request.initial_scopes)
         for initial in self._request.initials:
-            if not initial.fit or initial.set_id not in included_set_ids:
+            if (
+                not initial.fit
+                or initial.set_id not in included_set_ids
+                or scopes.get(initial.species) != "local"
+            ):
                 continue
-            variable_id = (
-                f"initial:global:{initial.species}"
-                if initial.scope == "global"
-                else f"initial:{initial.set_id}:{initial.species}"
-            )
-            value = self._best_params.get(variable_id)
+            variable_id = f"initial:{initial.set_id}:{initial.species}"
+            value = best_params.get(variable_id)
             if value is not None and math.isfinite(float(value)):
                 initials_by_set.setdefault(initial.set_id, {})[
                     initial.species
                 ] = float(value)
+        for initial in self._request.global_initials:
+            if not initial.fit or scopes.get(initial.species) != "global":
+                continue
+            value = best_params.get(f"initial:global:{initial.species}")
+            if value is None or not math.isfinite(float(value)):
+                continue
+            applicable_set_ids = {
+                mapped.set_id
+                for mapped in self._request.origin.mapped_datasets
+                if mapped.dataset_id in included_dataset_ids
+                and any(
+                    species == initial.species
+                    for species, _value in mapped.initial_values
+                )
+            }
+            for set_id in applicable_set_ids:
+                initials_by_set.setdefault(set_id, {})[initial.species] = float(value)
         return FitLiveUpdate(
-            iteration=self._best_iteration,
-            cost=self._best_cost,
+            iteration=best_progress.objective_calls,
+            cost=best_progress.cost,
             parameters=_finite_items(
                 {
                     name: value
-                    for name, value in self._best_params.items()
+                    for name, value in best_params.items()
                     if "::" not in name and not name.startswith("initial:")
                 },
                 field="live Fit parameters",
@@ -2473,16 +2639,16 @@ class GlobalFitWorker(QtCore.QThread):
                     dataset_id,
                     _finite_items(
                         {
-                            parameter.name: self._best_params.get(
+                            parameter.name: best_params.get(
                                 f"{dataset_id}::{parameter.name}",
-                                dict(parameter.dataset_values)[dataset_id],
+                                dict(parameter.selected_config.dataset_values)[dataset_id],
                             )
                             for parameter in self._request.parameters
                             if (
-                                parameter.fit
+                                parameter.selected_config.fit
                                 and parameter.scope == "per_dataset"
                                 and dataset_id
-                                in dict(parameter.dataset_values)
+                                in dict(parameter.selected_config.dataset_values)
                             )
                         },
                         field=f"live Fit scalars {dataset_id}",

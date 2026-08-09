@@ -78,11 +78,25 @@ if [[ -n "${offending_lines}" ]]; then
   exit 2
 fi
 
+severity_pattern='(\|[[:space:]]*(WARN|FAIL|TIMEOUT)[[:space:]]*\|)|(\((WARN|FAIL|TIMEOUT)\)(:|[[:space:]]|$))|((^|\|)status=(WARN|FAIL|TIMEOUT)($|\|))|(^((WARN|FAIL|TIMEOUT))($|[[:space:]:|]))'
+report_offending_lines="$(
+  find "${report_dir}" -maxdepth 1 -type f ! -name 'SUMMARY.txt' -print0 \
+    | xargs -0 -r grep -nHE "${severity_pattern}" \
+    || true
+)"
+if [[ -n "${report_offending_lines}" ]]; then
+  echo "STRICT GATE FAILED: stage report contains WARN/FAIL/TIMEOUT."
+  echo "Report dir: ${report_dir}"
+  echo "Offending report lines:"
+  printf '%s\n' "${report_offending_lines}" | head -n 50 | sed 's/^/  /'
+  exit 2
+fi
+
 if [[ "${run_all_rc}" != "0" ]]; then
   echo "STRICT GATE FAILED: run_all.sh exited non-zero (${run_all_rc})."
   echo "Report dir: ${report_dir}"
   exit "${run_all_rc}"
 fi
 
-echo "STRICT GATE PASS: no WARN/FAIL/TIMEOUT in SUMMARY.txt."
+echo "STRICT GATE PASS: no WARN/FAIL/TIMEOUT in SUMMARY.txt or stage reports."
 echo "Report dir: ${report_dir}"

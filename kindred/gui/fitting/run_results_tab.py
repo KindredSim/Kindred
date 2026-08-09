@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 import numpy as np
 from PySide6 import QtWidgets
@@ -23,13 +26,20 @@ from kindred.gui.display_name_policy import (
     dataset_alias,
 )
 from kindred.gui.fitting.contracts import FitRunIdentity
-from kindred.gui.fitting.worker import FitCandidate, FitCurveDataset, FitLiveUpdate
+from kindred.gui.fitting.worker import (
+    FitCandidate,
+    FitCurveDataset,
+    FitLiveUpdate,
+    project_fit_candidate_curves,
+)
 from kindred.gui.widgets.grid_plot_view import (
     DatasetPlotPresentation,
     GridPlotView,
 )
 
 __all__ = ["FitTrackerPanel", "ResultsSummaryDialog", "RunResultsTab"]
+
+logger = logging.getLogger(__name__)
 
 ColorResolver = Callable[[str], object]
 DatasetParameterPresentation: TypeAlias = tuple[str, str, Mapping[str, float]]
@@ -49,6 +59,29 @@ _APPLY_SCOPE_LABELS = {
     "initial_concentrations": "Initial Conditions",
     "observable_definitions": "Observable Definitions",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _FitResultViewIdentity:
+    """Tagged Fit view identity kept outside opaque dataset-ID strings."""
+
+    kind: Literal["dataset", "aggregate"]
+    dataset_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"dataset", "aggregate"}:
+            raise ValueError("Fit result view kind must be dataset or aggregate.")
+        if self.kind == "aggregate":
+            if self.dataset_id is not None:
+                raise ValueError("Aggregate Fit view cannot carry a dataset ID.")
+            return
+        dataset_id = str(self.dataset_id or "").strip()
+        if not dataset_id:
+            raise ValueError("Dataset Fit view requires an opaque dataset ID.")
+        object.__setattr__(self, "dataset_id", dataset_id)
+
+
+_FIT_AGGREGATE_VIEW = _FitResultViewIdentity("aggregate")
 
 
 def _get_clipboard():
@@ -93,6 +126,208 @@ def _parameter_pairs(values: object) -> tuple[tuple[str, float], ...]:
     return tuple(normalized)
 
 
+def _plain_json_data(value: object) -> object:
+    """Normalize one export payload into strict JSON-compatible plain data."""
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Fit run export contains a non-finite number.")
+        return value
+    if isinstance(value, np.generic):
+        return _plain_json_data(value.item())
+    if isinstance(value, np.ndarray):
+        return _plain_json_data(value.tolist())
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_json_data(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [_plain_json_data(item) for item in value]
+    raise TypeError(
+        "Fit run export contains unsupported value "
+        f"{type(value).__name__}."
+    )
+
+
+def _export_array(value: object) -> list[object]:
+    """Materialize one result array only for an explicit verbose export."""
+
+    return np.asarray(value).reshape(-1).tolist()
+
+
+def _fit_run_identity_export_payload(candidate: FitCandidate) -> dict[str, object]:
+    """Build the complete Copy Run JSON view without retaining it."""
+
+    if not isinstance(candidate, FitCandidate):
+        raise TypeError("candidate must be FitCandidate.")
+    identity_payload = candidate.run_identity.payload
+    if not isinstance(identity_payload, Mapping):
+        raise TypeError("Fit run identity payload must be a JSON object.")
+    result = candidate.result
+    curves = project_fit_candidate_curves(candidate)
+    terminal_replay: dict[str, object] = {
+        "fit_solver": identity_payload.get("fit_solver"),
+        "status": result.completion.status,
+        "optimizer_converged": bool(result.completion.optimizer_converged),
+        "message": str(result.message),
+        "nfev": int(result.nfev),
+        "weighted_residual_sse": float(result.weighted_residual_sse),
+        "weighted_residual_mse": float(result.weighted_residual_mse),
+        "shared_parameters": {
+            str(name): float(value)
+            for name, value in sorted(result.shared_params.items())
+        },
+        "dataset_parameters": {
+            str(dataset_id): {
+                str(name): float(value)
+                for name, value in sorted(values.items())
+            }
+            for dataset_id, values in sorted(result.dataset_params.items())
+        },
+        "objective_rows": [],
+    }
+    dataset_info = {str(info.dataset_id): info for info in result.dataset_info}
+    terminal_replay["effective_dataset_weights"] = {
+        dataset_id: float(info.weight)
+        for dataset_id, info in dataset_info.items()
+    }
+    terminal_replay["solver_provenance_by_dataset"] = {
+        str(dataset_id): simulation.provenance.solver
+        for dataset_id, simulation in result.simulation_results_by_dataset.items()
+    }
+    for curve in sorted(curves, key=lambda item: item.dataset_id):
+        objective_model_x = dict(curve.objective_model_x)
+        objective_model_y = dict(curve.objective_model_y)
+        objective_segment_ids = dict(curve.objective_model_segment_ids)
+        objective_segment_keys = dict(curve.objective_model_segment_keys)
+        objective_discontinuities = dict(curve.objective_model_discontinuity_ids)
+        objective_rows = []
+        for series_name, _values in curve.objective_model_y:
+            objective_rows.append(
+                {
+                    "model_target": series_name,
+                    "model_x": _export_array(objective_model_x[series_name]),
+                    "model_y": _export_array(objective_model_y[series_name]),
+                    "segment_ids": _export_array(
+                        objective_segment_ids[series_name]
+                    ),
+                    "segment_keys": _export_array(
+                        objective_segment_keys[series_name]
+                    ),
+                    "discontinuity_ids": _export_array(
+                        objective_discontinuities[series_name]
+                    ),
+                    "selection_provenance": _export_array(
+                        dict(curve.objective_selection_provenance)[series_name]
+                    ),
+                    "raw_observation_ids": _export_array(
+                        dict(curve.objective_observation_ids)[series_name]
+                    ),
+                    "raw_columns": _export_array(
+                        dict(curve.objective_raw_columns)[series_name]
+                    ),
+                    "source_rows": _export_array(
+                        dict(curve.objective_source_rows)[series_name]
+                    ),
+                }
+            )
+        terminal_replay["objective_rows"].append(
+            {"dataset_id": curve.dataset_id, "series": objective_rows}
+        )
+    export = dict(identity_payload)
+    export["schema_version"] = 2
+    export["export_kind"] = "verbose_fit_run"
+    export["candidate"] = {
+        "origin_tab_id": candidate.origin.tab_id,
+        "origin_capture_id": candidate.origin.capture_id,
+        "parameters": dict(candidate.parameters),
+        "scalar_values_by_dataset": {
+            dataset_id: dict(values)
+            for dataset_id, values in candidate.scalar_values_by_dataset
+        },
+        "initial_values_by_set": {
+            set_id: dict(values)
+            for set_id, values in candidate.initial_values_by_set
+        },
+        "mechanism_text": candidate.setup_snapshot.mechanism_source.reactions_text,
+        "prepared_analysis_identity": candidate.setup_snapshot.prepared_dsl.analysis.identity,
+    }
+    export["terminal_replay"] = terminal_replay
+    export["curves"] = [
+        {
+            "dataset_id": curve.dataset_id,
+            "display_name": curve.display_name,
+            "x_name": curve.x_name,
+            "y_semantics": [
+                (name, semantic.value) for name, semantic in curve.y_semantics
+            ],
+            "model": {
+                name: {
+                    "x": _export_array(dict(curve.model_x)[name]),
+                    "y": _export_array(dict(curve.model_y)[name]),
+                    "segment_ids": _export_array(dict(curve.model_segment_ids)[name]),
+                    "segment_keys": _export_array(dict(curve.model_segment_keys)[name]),
+                    "discontinuity_ids": _export_array(
+                        dict(curve.model_discontinuity_ids)[name]
+                    ),
+                }
+                for name, _values in curve.model_y
+            },
+            "observed": {
+                name: {
+                    "x": _export_array(dict(curve.observed_x)[name]),
+                    "y": _export_array(dict(curve.observed_y)[name]),
+                    "source_rows": _export_array(dict(curve.observed_source_rows)[name]),
+                    "raw_observation_id": dict(curve.observed_raw_ids)[name],
+                    "raw_column": dict(curve.observed_raw_columns)[name],
+                }
+                for name, _values in curve.observed_y
+            },
+            "objective": {
+                name: {
+                    "x": _export_array(dict(curve.objective_model_x)[name]),
+                    "y": _export_array(dict(curve.objective_model_y)[name]),
+                    "segment_ids": _export_array(
+                        dict(curve.objective_model_segment_ids)[name]
+                    ),
+                    "segment_keys": _export_array(
+                        dict(curve.objective_model_segment_keys)[name]
+                    ),
+                    "discontinuity_ids": _export_array(
+                        dict(curve.objective_model_discontinuity_ids)[name]
+                    ),
+                    "selection_provenance": _export_array(
+                        dict(curve.objective_selection_provenance)[name]
+                    ),
+                    "observation_ids": _export_array(
+                        dict(curve.objective_observation_ids)[name]
+                    ),
+                    "raw_columns": _export_array(dict(curve.objective_raw_columns)[name]),
+                    "source_rows": _export_array(dict(curve.objective_source_rows)[name]),
+                }
+                for name, _values in curve.objective_model_y
+            },
+        }
+        for curve in sorted(curves, key=lambda item: item.dataset_id)
+    ]
+    return export
+
+
+def _fit_run_identity_export_json(candidate: FitCandidate) -> str:
+    """Serialize the complete Fit export at its single final plain-data boundary."""
+
+    return json.dumps(
+        _plain_json_data(_fit_run_identity_export_payload(candidate)),
+        sort_keys=True,
+        indent=2,
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
 class ResultsSummaryDialog(QtWidgets.QDialog):
     """Non-modal popup displaying the current Fit run identity and statistics."""
 
@@ -101,6 +336,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
     def __init__(
         self,
         identity: FitRunIdentity,
+        candidate: FitCandidate | None = None,
         stats: Mapping[str, object] | None = None,
         fitted_params: Sequence[tuple[str, float]] | Mapping[str, float] | None = None,
         dataset_fitted_params: Sequence[DatasetParameterPresentation] | None = None,
@@ -110,12 +346,15 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
     ) -> None:
         if not isinstance(identity, FitRunIdentity):
             raise TypeError("Results summary requires a FitRunIdentity.")
+        if candidate is not None and not isinstance(candidate, FitCandidate):
+            raise TypeError("candidate must be FitCandidate.")
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("Results Summary")
         self.resize(480, 360)
 
         self._identity = identity
+        self._candidate = candidate
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -160,7 +399,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             "Optimizer diagnostic",
             "Weighted SSE",
             "Weighted MSE",
-            "Evaluations",
+            "Optimizer evaluations",
             "Message",
             "Objective SSQ",
         ):
@@ -318,6 +557,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         self,
         identity: FitRunIdentity,
         *,
+        candidate: FitCandidate | None = None,
         stats: Mapping[str, object] | None = None,
         fitted_params: Sequence[tuple[str, float]] | Mapping[str, float] | None = None,
         dataset_fitted_params: Sequence[DatasetParameterPresentation] | None = None,
@@ -327,6 +567,10 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         if not isinstance(identity, FitRunIdentity):
             raise TypeError("Results summary requires a FitRunIdentity.")
         self._identity = identity
+        if candidate is not None:
+            if not isinstance(candidate, FitCandidate):
+                raise TypeError("candidate must be FitCandidate.")
+            self._candidate = candidate
         self._run_identity_label.setText(f"Run: {identity.short_hash}")
         self._update_stats(stats)
         self._update_fitted_params(
@@ -354,8 +598,16 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             self.statusMessage.emit("Clipboard unavailable")
             return
         try:
-            clipboard.setText(self._identity.readable_json())
-        except Exception:
+            if self._candidate is None:
+                clipboard.setText(self._identity.readable_json())
+            else:
+                clipboard.setText(_fit_run_identity_export_json(self._candidate))
+        except Exception as exc:
+            logger.exception(
+                "Failed to copy run identity JSON (%s): %s",
+                type(exc).__name__,
+                exc,
+            )
             self.statusMessage.emit("Failed to copy run identity")
             return
         self.statusMessage.emit("Copied run identity JSON")
@@ -427,7 +679,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
             set_labels=set_labels,
         )
         self._set_live_text(
-            f"Iter {int(update.iteration)} | Objective SSQ "
+            f"Objective calls {int(update.iteration)} | Objective SSQ "
             f"{_format_metric(cost)}{delta_text}",
             lines,
             tooltips,
@@ -449,7 +701,8 @@ class FitTrackerPanel(QtWidgets.QWidget):
             set_labels=set_labels,
         )
         self._set_live_text(
-            f"Iter {int(candidate.result.nfev)} | Objective SSQ {_format_metric(cost)}",
+            "Optimizer evaluations "
+            f"{int(candidate.result.nfev)} | Objective SSQ {_format_metric(cost)}",
             lines,
             tooltips,
         )
@@ -514,7 +767,8 @@ class FitTrackerPanel(QtWidgets.QWidget):
             for parameter in candidate.setup_snapshot.parameters
         }
         dataset_labels = {
-            curve.dataset_id: curve.display_name for curve in candidate.curves
+            mapped.dataset_id: mapped.display_name
+            for mapped in candidate.origin.mapped_datasets
         }
         initial_labels = dict(set_labels or {})
         lines = [
@@ -586,8 +840,6 @@ class RunResultsTab(QtWidgets.QWidget):
 
     statusMessage = Signal(str)
     copyAvailableChanged = Signal(bool)
-    _ALL_DATASETS_TAB_KEY = "__all_datasets__"
-
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
@@ -599,6 +851,7 @@ class RunResultsTab(QtWidgets.QWidget):
             raise TypeError("color_resolver must be callable.")
         self._color_resolver = color_resolver
         self._run_identity: FitRunIdentity | None = None
+        self._candidate: FitCandidate | None = None
         self._last_stats: dict[str, object] = {}
         self._last_fitted_params: tuple[tuple[str, float], ...] = ()
         self._last_dataset_fitted_params: tuple[DatasetParameterPresentation, ...] = ()
@@ -613,11 +866,12 @@ class RunResultsTab(QtWidgets.QWidget):
         self._dataset_presentation: Mapping[str, DatasetPlotPresentation] = (
             MappingProxyType({})
         )
-        self._dataset_tab_ids: list[str] = []
+        self._dataset_tab_ids: list[_FitResultViewIdentity] = []
         self._dataset_labels: dict[str, str] = {}
         self._set_labels: dict[str, str] = {}
-        self._dataset_plot_views: dict[str, GridPlotView] = {}
+        self._dataset_plot_views: dict[_FitResultViewIdentity, GridPlotView] = {}
         self._all_datasets_plot_view: GridPlotView | None = None
+        self._stale_plot_view_ids: set[_FitResultViewIdentity] = set()
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -660,7 +914,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._subtab_stack.setObjectName("global_fit_results_subtab_stack")
         layout.addWidget(self._subtab_stack, stretch=1)
 
-        self._subtabs.currentChanged.connect(self._subtab_stack.setCurrentIndex)
+        self._subtabs.currentChanged.connect(self._on_subtab_changed)
 
     def set_identity_labels(
         self,
@@ -687,17 +941,7 @@ class RunResultsTab(QtWidgets.QWidget):
     def set_live_curves(self, curves: Sequence[FitCurveDataset]) -> None:
         """Render immutable live curves in per-dataset and combined subtabs."""
 
-        values = tuple(curves)
-        if any(not isinstance(item, FitCurveDataset) for item in values):
-            raise TypeError("curves must contain FitCurveDataset values.")
-        ids = [item.dataset_id for item in values]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Fit curve datasets must have unique dataset IDs.")
-        self._dataset_presentation = MappingProxyType({})
-        self._curves = values
-        if values:
-            self._ensure_subtabs(values)
-        self._refresh_plot_views()
+        self._install_plot_projection(curves, {})
 
     def set_run_identity(self, identity: FitRunIdentity) -> None:
         """Present the immutable terminal identity used by the copy dialog."""
@@ -729,6 +973,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._unavailable_apply_reasons = MappingProxyType(reasons)
         self._project_apply_availability()
         self.set_run_identity(candidate.run_identity)
+        self._candidate = candidate
         self._last_fitted_params = tuple(candidate.parameters)
         self._last_dataset_fitted_params = self._dataset_parameter_entries(candidate)
         self._last_set_initial_values = self._set_initial_entries(candidate)
@@ -736,16 +981,16 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_stats = self._candidate_stats(candidate)
         self._tracker_panel.update_final(candidate, set_labels=self._set_labels)
         self._refresh_summary_dialog()
-        presentation = self._candidate_plot_presentation(candidate)
-        self.set_live_curves(candidate.curves)
-        self._dataset_presentation = presentation
-        self._apply_dataset_presentation()
-        return self.copy_eligible()
+        curves = project_fit_candidate_curves(candidate)
+        presentation = self._candidate_plot_presentation(candidate, curves)
+        self._install_plot_projection(curves, presentation)
+        return bool(self._curves)
 
     def clear_candidate(self) -> None:
         """Clear all terminal/live result presentation without touching ownership."""
 
         self._run_identity = None
+        self._candidate = None
         self._last_stats = {}
         self._last_fitted_params = ()
         self._last_dataset_fitted_params = ()
@@ -758,9 +1003,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._run_identity_label.setToolTip("")
         self._copy_run_hash_button.setEnabled(False)
         self._tracker_panel.clear()
-        self._curves = ()
-        self._dataset_presentation = MappingProxyType({})
-        self._clear_plot_views()
+        self._install_plot_projection((), {})
         self.copyAvailableChanged.emit(False)
         if self._summary_dialog is not None and self._summary_dialog.isVisible():
             self._summary_dialog.close()
@@ -787,6 +1030,7 @@ class RunResultsTab(QtWidgets.QWidget):
             return
         dialog = ResultsSummaryDialog(
             identity,
+            candidate=self._candidate,
             stats=self._last_stats or None,
             fitted_params=self._last_fitted_params or None,
             dataset_fitted_params=self._last_dataset_fitted_params or None,
@@ -798,6 +1042,18 @@ class RunResultsTab(QtWidgets.QWidget):
         dialog.destroyed.connect(lambda: setattr(self, "_summary_dialog", None))
         self._summary_dialog = dialog
         dialog.show()
+
+    def copy_run_identity_json(self) -> None:
+        """Generate and copy verbose Run JSON only for an explicit request."""
+
+        identity = self._run_identity
+        clipboard = _get_clipboard()
+        if identity is None or clipboard is None:
+            raise ValueError("Fit run JSON is unavailable.")
+        if self._candidate is None:
+            clipboard.setText(identity.readable_json())
+        else:
+            clipboard.setText(_fit_run_identity_export_json(self._candidate))
 
     def _copy_short_hash(self) -> None:
         identity = self._run_identity
@@ -824,16 +1080,6 @@ class RunResultsTab(QtWidgets.QWidget):
             str(scope): str(reason or "").strip()
             for scope, reason in (unavailable_reasons or {}).items()
         }
-        known = frozenset(_APPLY_SCOPE_LABELS)
-        if (
-            not available.issubset(known)
-            or set(reasons) != set(known - available)
-            or any(not reason for reason in reasons.values())
-        ):
-            raise ValueError(
-                "Every Fit Apply scope must be independently available or "
-                "carry one owner-computed unavailable reason."
-            )
         return available, reasons
 
     def _project_apply_availability(self) -> None:
@@ -856,15 +1102,24 @@ class RunResultsTab(QtWidgets.QWidget):
 
     def copy_eligible(self) -> bool:
         return bool(
-            self._all_datasets_plot_view is not None
-            and self._all_datasets_plot_view.copy_eligible()
+            self._curves
+            and self._all_datasets_plot_view is not None
+            and (
+                _FIT_AGGREGATE_VIEW in self._stale_plot_view_ids
+                or self._all_datasets_plot_view.copy_eligible()
+            )
         )
 
     def copy_all_to_clipboard(self) -> None:
         view = self._all_datasets_plot_view
-        if view is None:
+        candidate = self._candidate
+        if view is None or candidate is None:
             raise ValueError("No rendered Fit curves are available to copy.")
-        view.copy_all_to_clipboard()
+        if _FIT_AGGREGATE_VIEW in self._stale_plot_view_ids:
+            self._refresh_plot_view(_FIT_AGGREGATE_VIEW)
+        view.copy_projection_to_clipboard(
+            project_fit_candidate_curves(candidate)
+        )
 
     def set_view_autorange_locked(self, running: bool) -> None:
         """Retain the historical presentation state at this composition boundary."""
@@ -887,7 +1142,10 @@ class RunResultsTab(QtWidgets.QWidget):
             self._all_datasets_plot_view.set_dark_mode(self._dark_mode)
 
     def _ensure_subtabs(self, curves: Sequence[FitCurveDataset]) -> None:
-        ids = [curve.dataset_id for curve in curves]
+        ids = [
+            _FitResultViewIdentity("dataset", curve.dataset_id)
+            for curve in curves
+        ]
         labels = {curve.dataset_id: curve.display_name for curve in curves}
         if ids == self._dataset_tab_ids and labels == self._dataset_labels:
             return
@@ -901,7 +1159,7 @@ class RunResultsTab(QtWidgets.QWidget):
         for label in labels.values():
             label_counts[label] = label_counts.get(label, 0) + 1
 
-        for index, curve in enumerate(curves):
+        for index, (curve, view_identity) in enumerate(zip(curves, ids, strict=True)):
             full_label = curve.display_name
             if label_counts[full_label] > 1:
                 full_label = f"{full_label} ({curve.dataset_id})"
@@ -912,7 +1170,7 @@ class RunResultsTab(QtWidgets.QWidget):
             plot_view = self._create_plot_view(
                 f"global_fit_results_plot_{curve.dataset_id}"
             )
-            self._dataset_plot_views[curve.dataset_id] = plot_view
+            self._dataset_plot_views[view_identity] = plot_view
             self._subtab_stack.addWidget(plot_view)
             tab_index = self._subtabs.addTab(compact_label.display)
             self._subtabs.setTabToolTip(
@@ -922,7 +1180,7 @@ class RunResultsTab(QtWidgets.QWidget):
             self._subtabs.setTabData(
                 tab_index,
                 {
-                    "dataset_id": curve.dataset_id,
+                    "view_identity": view_identity,
                     "alias": dataset_alias(index),
                     "full_label": compact_label.full,
                 },
@@ -940,6 +1198,7 @@ class RunResultsTab(QtWidgets.QWidget):
     def _create_plot_view(self, object_name: str) -> GridPlotView:
         plot_view = GridPlotView(
             color_resolver=self._color_resolver,
+            show_generic_controls=False,
             parent=self,
         )
         plot_view.setObjectName(object_name)
@@ -951,34 +1210,74 @@ class RunResultsTab(QtWidgets.QWidget):
         )
         return plot_view
 
-    def _refresh_plot_views(self) -> None:
-        curves_by_id = {curve.dataset_id: curve for curve in self._curves}
-        for dataset_id, plot_view in self._dataset_plot_views.items():
-            curve = curves_by_id.get(dataset_id)
-            plot_view.clear() if curve is None else plot_view.set_curves((curve,))
+    def _install_plot_projection(
+        self,
+        curves: Sequence[FitCurveDataset],
+        presentation: Mapping[str, DatasetPlotPresentation],
+    ) -> None:
+        """Install one Fit payload and project only the active Results view."""
+
+        values = tuple(curves)
+        if any(not isinstance(item, FitCurveDataset) for item in values):
+            raise TypeError("Fit curves must contain FitCurveDataset values.")
+        ids = [item.dataset_id for item in values]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Fit curve datasets must have unique dataset IDs.")
+        if not isinstance(presentation, Mapping):
+            raise TypeError("Fit plot presentation must be a mapping.")
+        self._curves = values
+        self._dataset_presentation = MappingProxyType(dict(presentation))
+        if values:
+            self._ensure_subtabs(values)
+        self._stale_plot_view_ids.update(self._dataset_plot_views)
         if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.set_curves(self._curves)
-        self._apply_dataset_presentation()
+            self._stale_plot_view_ids.add(_FIT_AGGREGATE_VIEW)
+        self._refresh_active_plot_view()
         self.copyAvailableChanged.emit(self.copy_eligible())
 
-    def _clear_plot_views(self) -> None:
-        for plot_view in self._dataset_plot_views.values():
-            plot_view.clear()
-        if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.clear()
-        self.copyAvailableChanged.emit(False)
+    def _active_plot_view_id(self) -> _FitResultViewIdentity | None:
+        index = self._subtabs.currentIndex()
+        if index < 0:
+            return None
+        if index == len(self._dataset_tab_ids):
+            return _FIT_AGGREGATE_VIEW
+        if 0 <= index < len(self._dataset_tab_ids):
+            return self._dataset_tab_ids[index]
+        return None
 
-    def _apply_dataset_presentation(self) -> None:
-        for plot_view in self._dataset_plot_views.values():
-            plot_view.set_dataset_presentation(self._dataset_presentation)
-        if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.set_dataset_presentation(
-                self._dataset_presentation
+    def _refresh_active_plot_view(self) -> None:
+        view_id = self._active_plot_view_id()
+        if view_id is not None:
+            self._refresh_plot_view(view_id)
+
+    def _refresh_plot_view(self, view_id: _FitResultViewIdentity) -> None:
+        if view_id not in self._stale_plot_view_ids:
+            return
+        if view_id.kind == "aggregate":
+            plot_view = self._all_datasets_plot_view
+            curves = self._curves
+        else:
+            plot_view = self._dataset_plot_views.get(view_id)
+            curves = tuple(
+                curve
+                for curve in self._curves
+                if curve.dataset_id == view_id.dataset_id
             )
+        if plot_view is None:
+            return
+        plot_view.set_projection(curves, self._dataset_presentation)
+        self._stale_plot_view_ids.discard(view_id)
+
+    def _on_subtab_changed(self, index: int) -> None:
+        if 0 <= int(index) < self._subtab_stack.count():
+            self._subtab_stack.setCurrentIndex(int(index))
+        self._refresh_active_plot_view()
+        self.copyAvailableChanged.emit(self.copy_eligible())
 
     def _candidate_plot_presentation(
         self,
         candidate: FitCandidate,
+        curves: Sequence[FitCurveDataset],
     ) -> Mapping[str, DatasetPlotPresentation]:
         """Freeze terminal plot text directly from the result's dataset info."""
 
@@ -988,7 +1287,7 @@ class RunResultsTab(QtWidgets.QWidget):
             if str(getattr(info, "dataset_id", ""))
         }
         presentation: dict[str, DatasetPlotPresentation] = {}
-        for curve in candidate.curves:
+        for curve in curves:
             info = infos_by_id.get(curve.dataset_id)
             if info is None:
                 continue
@@ -1020,6 +1319,7 @@ class RunResultsTab(QtWidgets.QWidget):
         return MappingProxyType(presentation)
 
     def _clear_subtabs(self) -> None:
+        self._stale_plot_view_ids.clear()
         while self._subtabs.count():
             self._subtabs.removeTab(self._subtabs.count() - 1)
         while self._subtab_stack.count():
@@ -1036,7 +1336,10 @@ class RunResultsTab(QtWidgets.QWidget):
             dataset_id: dict(values)
             for dataset_id, values in candidate.scalar_values_by_dataset
         }
-        labels = {curve.dataset_id: curve.display_name for curve in candidate.curves}
+        labels = {
+            mapped.dataset_id: mapped.display_name
+            for mapped in candidate.origin.mapped_datasets
+        }
         counts: dict[str, int] = {}
         for label in labels.values():
             counts[label] = counts.get(label, 0) + 1
@@ -1060,7 +1363,10 @@ class RunResultsTab(QtWidgets.QWidget):
         self,
         candidate: FitCandidate,
     ) -> tuple[DatasetMetricPresentation, ...]:
-        labels = {curve.dataset_id: curve.display_name for curve in candidate.curves}
+        labels = {
+            mapped.dataset_id: mapped.display_name
+            for mapped in candidate.origin.mapped_datasets
+        }
         counts: dict[str, int] = {}
         for label in labels.values():
             counts[label] = counts.get(label, 0) + 1
@@ -1120,20 +1426,24 @@ class RunResultsTab(QtWidgets.QWidget):
         parameter_coordinates = sum(
             1 if parameter.scope == "shared" else included_dataset_count
             for parameter in setup.parameters
-            if parameter.fit
+            if parameter.selected_config.fit
         )
         fitted_initial_keys = {
             (set_id, species)
             for set_id, values in candidate.initial_values_by_set
             for species, _value in values
         }
+        initial_scopes = dict(setup.initial_scopes)
         global_initial_species = {
             initial.species
-            for initial in setup.initials
+            for initial in setup.global_initials
             if (
                 initial.fit
-                and initial.scope == "global"
-                and (initial.set_id, initial.species) in fitted_initial_keys
+                and initial_scopes.get(initial.species) == "global"
+                and any(
+                    (set_id, initial.species) in fitted_initial_keys
+                    for set_id, _value in candidate.initial_values_by_set
+                )
             )
         }
         local_initial_coordinates = sum(
@@ -1141,7 +1451,7 @@ class RunResultsTab(QtWidgets.QWidget):
             for initial in setup.initials
             if (
                 initial.fit
-                and initial.scope == "local"
+                and initial_scopes.get(initial.species) == "local"
                 and (initial.set_id, initial.species) in fitted_initial_keys
             )
         )
@@ -1165,11 +1475,11 @@ class RunResultsTab(QtWidgets.QWidget):
         result = candidate.result
         infos = tuple(result.dataset_info)
         points = sum(int(info.n_points) for info in infos)
-        series = sum(len(curve.objective_model_y) for curve in candidate.curves)
+        series = sum(len(values) for values in result.model_series.values())
         coordinate_count = self._optimizer_coordinate_count(candidate)
         completion = result.completion
         return {
-            "Datasets": len(candidate.curves),
+            "Datasets": len(result.simulation_results_by_dataset),
             "Series": series,
             "Points": points,
             "Parameters": coordinate_count,
@@ -1179,7 +1489,7 @@ class RunResultsTab(QtWidgets.QWidget):
             "Optimizer diagnostic": self._optimizer_diagnostic_text(candidate),
             "Weighted SSE": float(result.weighted_residual_sse),
             "Weighted MSE": float(result.weighted_residual_mse),
-            "Evaluations": int(result.nfev),
+            "Optimizer evaluations": int(result.nfev),
             "Message": str(result.message),
             "Objective SSQ": _objective_cost(result),
         }
@@ -1193,6 +1503,7 @@ class RunResultsTab(QtWidgets.QWidget):
             return
         self._summary_dialog.refresh(
             identity,
+            candidate=self._candidate,
             stats=self._last_stats or None,
             fitted_params=self._last_fitted_params or None,
             dataset_fitted_params=self._last_dataset_fitted_params or None,

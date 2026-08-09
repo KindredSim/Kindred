@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import logging
 from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 
-from kindred.core.exceptions import ErrorContext, FitSimulationError
 from kindred.core.simulation_failure import serialize_algebra_error, simulation_failure_from_exception
-from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 
 logger = logging.getLogger(__name__)
+
+
+class SimulationAlgebraPolicy(str, Enum):
+    """Caller-owned algebra handling policy for simulation finalization."""
+
+    GUI_BEST_EFFORT = "gui_best_effort"
+    FITTING_STRICT = "fitting_strict"
 
 
 def _copy_evaluation_value(value: Any) -> Any:
@@ -67,17 +73,6 @@ def coerce_simulation_algebra_policy(
     return SimulationAlgebraPolicy(str(value))
 
 
-def algebra_policy_from_simulation_plan(
-    value: SimulationPlan | Mapping[str, Any] | None,
-    *,
-    default: SimulationAlgebraPolicy,
-) -> SimulationAlgebraPolicy:
-    if value is None:
-        return default
-    plan = value if isinstance(value, SimulationPlan) else SimulationPlan.from_payload(value)
-    return coerce_simulation_algebra_policy(plan.algebra_policy, default=default)
-
-
 def evaluate_simulation_algebra(
     policy: SimulationAlgebraPolicy | str,
     mechanism: object,
@@ -86,7 +81,6 @@ def evaluate_simulation_algebra(
     species_series: Mapping[str, np.ndarray],
     initials: Mapping[str, float],
     gui_evaluator: Optional[Any] = None,
-    batch_evaluator: Optional[Any] = None,
 ) -> SimulationAlgebraEvaluation:
     algebra_policy = coerce_simulation_algebra_policy(
         policy,
@@ -101,14 +95,6 @@ def evaluate_simulation_algebra(
             species_series=species_series,
             initials=initials,
             evaluator=gui_evaluator,
-        )
-    if algebra_policy is SimulationAlgebraPolicy.BATCH_BEST_EFFORT:
-        return _evaluate_batch_best_effort_algebra(
-            mechanism,
-            t=t,
-            species_series=species_series,
-            initials=initials,
-            evaluator=batch_evaluator,
         )
     raise ValueError(f"Unsupported simulation algebra policy: {algebra_policy!r}")
 
@@ -162,42 +148,6 @@ def _evaluate_gui_best_effort_algebra(
     )
 
 
-def _evaluate_batch_best_effort_algebra(
-    mechanism: object,
-    *,
-    t: np.ndarray,
-    species_series: Mapping[str, np.ndarray],
-    initials: Mapping[str, float],
-    evaluator: Optional[Any],
-) -> SimulationAlgebraEvaluation:
-    if evaluator is None:
-        from kindred.core.algebra.simulation_series import evaluate_algebra_series_for_simulation
-
-        evaluator = evaluate_algebra_series_for_simulation
-
-    try:
-        algebra_series, algebra_scalars = evaluator(
-            mechanism,
-            t=np.asarray(t, dtype=float).reshape(-1),
-            species_series={str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in species_series.items()},
-            initials={str(name): float(value) for name, value in dict(initials or {}).items()},
-        )
-    except Exception as exc:
-        logger.warning("Algebra evaluation failed in batch worker: %s", exc)
-        return SimulationAlgebraEvaluation(
-            series={},
-            scalars={},
-            errors=[serialize_algebra_error(exc, name="__algebra__")],
-            warning=None,
-        )
-    return SimulationAlgebraEvaluation(
-        series={str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in (algebra_series or {}).items()},
-        scalars={str(name): float(value) for name, value in dict(algebra_scalars or {}).items()},
-        errors=[],
-        warning=None,
-    )
-
-
 def ensure_fitting_strict_algebra_policy(policy: SimulationAlgebraPolicy | str) -> SimulationAlgebraPolicy:
     algebra_policy = coerce_simulation_algebra_policy(
         policy,
@@ -206,42 +156,3 @@ def ensure_fitting_strict_algebra_policy(policy: SimulationAlgebraPolicy | str) 
     if algebra_policy is not SimulationAlgebraPolicy.FITTING_STRICT:
         raise ValueError("Fitting algebra handling requires a fitting_strict algebra policy.")
     return algebra_policy
-
-
-def fitting_algebra_error_is_fatal(exc: BaseException) -> bool:
-    from kindred.core.algebra.errors import (
-        AlgebraNameError,
-        AlgebraShadowError,
-        AlgebraSyntaxError,
-    )
-
-    return isinstance(exc, (AlgebraNameError, AlgebraShadowError, AlgebraSyntaxError))
-
-
-def fitting_strict_parse_error(exc: BaseException, *, message_prefix: str) -> FitSimulationError:
-    return FitSimulationError(
-        f"{message_prefix}: {exc}",
-        details={"fatal": True},
-    )
-
-
-def fitting_strict_evaluation_error(
-    exc: BaseException,
-    *,
-    message_prefix: str,
-    failed_params: Optional[Dict[str, float]] = None,
-) -> FitSimulationError:
-    from kindred.core.algebra.errors import AlgebraError
-
-    if isinstance(exc, AlgebraError):
-        return FitSimulationError(
-            f"{message_prefix}: {exc}",
-            failed_params=failed_params,
-            details={"fatal": bool(fitting_algebra_error_is_fatal(exc))},
-            context=ErrorContext(line=exc.line, col=exc.col, line_text=exc.line_text),
-        )
-    return FitSimulationError(
-        f"{message_prefix}: {exc}",
-        failed_params=failed_params,
-        details={"fatal": False},
-    )

@@ -14,14 +14,13 @@ __all__ = ["SpeciesStatisticsTable"]
 
 class SpeciesStatisticsTable(QtWidgets.QTableWidget):
     """
-    Bottom panel showing final concentrations, max values, equilibrium times, and fit stats.
+    Bottom panel showing simulation-owned species statistics.
 
     Displays per-species statistics including:
     - Species name
     - Final concentration at t_end
     - Maximum concentration reached
     - Time at which maximum occurs
-    - Result-level residual mean square from fitting
     - CTC (Concentration-Time Curve) - baseline-corrected integral
 
     The CTC calculation uses smart logic:
@@ -42,10 +41,16 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         """
         super().__init__(parent)
 
+        self._statistics_cache: tuple[
+            object,
+            tuple[str, ...],
+            tuple[tuple[str, ...], ...],
+        ] | None = None
+
         # Configure table
-        self.setColumnCount(6)
+        self.setColumnCount(5)
         self.setHorizontalHeaderLabels([
-            "Species", "Final", "Max", "t@Max", "Result MSE", "CTC"
+            "Species", "Final", "Max", "t@Max", "CTC"
         ])
 
         # Add tooltips to explain each column
@@ -55,8 +60,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         self.horizontalHeaderItem(1).setToolTip("Final concentration at t_end")
         self.horizontalHeaderItem(2).setToolTip("Maximum concentration reached")
         self.horizontalHeaderItem(3).setToolTip("Time at which maximum concentration occurs")
-        self.horizontalHeaderItem(4).setToolTip("Result-level raw residual mean square from fitting")
-        self.horizontalHeaderItem(5).setToolTip(
+        self.horizontalHeaderItem(4).setToolTip(
             "Concentration-Time Curve (baseline-corrected):\n"
             "• Species → 0: ∫C dt (area under curve)\n"
             "• Species → C_final: ∫|C - C_final| dt (deviation from equilibrium)"
@@ -77,7 +81,8 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         self,
         canonical_time: np.ndarray,
         species_data: Mapping[str, np.ndarray],
-        residual_mse: Optional[float] = None,
+        *,
+        accepted_result_key: object | None = None,
     ) -> None:
         """
         Update table with simulation results.
@@ -89,8 +94,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             at this scientific-statistics boundary.
         species_data : dict
             Dictionary of {species_name: concentration_array}
-        residual_mse : float, optional
-            Result-level raw residual mean square for fitting results
+        accepted_result_key : object, optional
+            Accepted-result identity used with the projected species roster
+            for the single-entry statistics cache.
         """
         time = np.asarray(canonical_time, dtype=float)
         if (
@@ -117,75 +123,74 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                     "Scientific statistics series must be named, finite, and "
                     "aligned with canonical simulation time."
                 )
+            if name in normalized:
+                raise ValueError(
+                    "Scientific statistics series names must be unique after "
+                    "normalization."
+                )
             normalized[name] = values
-        if residual_mse is not None and not np.isfinite(float(residual_mse)):
-            raise ValueError("Result MSE must be finite when provided.")
-
-        # Clear existing rows
-        self.setRowCount(0)
-
-        # Add row for each species
-        for i, (species_name, concentrations) in enumerate(
-            sorted(normalized.items())
+        projected_roster = tuple(sorted(normalized))
+        cached = self._statistics_cache
+        if (
+            cached is not None
+            and accepted_result_key is not None
+            and cached[0] == accepted_result_key
+            and cached[1] == projected_roster
         ):
-            self.insertRow(i)
-
-            # Column 0: Species name
-            _item0 = QtWidgets.QTableWidgetItem(species_name)
-            _item0.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 0, _item0)
-
-            # Column 1: Final concentration
-            final_conc = concentrations[-1]
-            _item1 = QtWidgets.QTableWidgetItem(f"{final_conc:.6g}")
-            _item1.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 1, _item1)
-
-            # Column 2: Maximum concentration
-            max_conc = np.max(concentrations)
-            _item2 = QtWidgets.QTableWidgetItem(f"{max_conc:.6g}")
-            _item2.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 2, _item2)
-
-            # Column 3: Time at maximum (t@Max)
-            idx_max = np.argmax(concentrations)
-            t_at_max = time[idx_max]
-            _item3 = QtWidgets.QTableWidgetItem(f"{t_at_max:.6g}")
-            _item3.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 3, _item3)
-
-            # Column 4: result-level residual MSE (only if provided, from fitting)
-            if residual_mse is not None:
-                _item4 = QtWidgets.QTableWidgetItem(f"{residual_mse:.6g}")
+            rows = cached[2]
+        else:
+            calculated: list[tuple[str, ...]] = []
+            for species_name in projected_roster:
+                concentrations = normalized[species_name]
+                final_conc = concentrations[-1]
+                max_conc = np.max(concentrations)
+                idx_max = np.argmax(concentrations)
+                threshold = max(
+                    1e-10,
+                    0.01 * float(np.max(np.abs(concentrations))),
+                )
+                integrand = (
+                    concentrations
+                    if abs(float(final_conc)) < threshold
+                    else np.abs(concentrations - final_conc)
+                )
+                ctc, _method, _uniform, _eps, _tail = integrate_ctc(
+                    time,
+                    integrand,
+                    uniformity_eps=1e-6,
+                    tail_strategy="38",
+                )
+                calculated.append(
+                    (
+                        species_name,
+                        f"{final_conc:.6g}",
+                        f"{max_conc:.6g}",
+                        f"{time[idx_max]:.6g}",
+                        f"{ctc:.6g}",
+                    )
+                )
+            rows = tuple(calculated)
+            if accepted_result_key is not None:
+                self._statistics_cache = (
+                    accepted_result_key,
+                    projected_roster,
+                    rows,
+                )
             else:
-                _item4 = QtWidgets.QTableWidgetItem("—")
-            _item4.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 4, _item4)
+                self._statistics_cache = None
 
-            # Column 5: CTC (Concentration-Time Curve)
-            # Baseline-corrected integral measuring deviation from equilibrium:
-            # - Species → 0: ∫C dt (area under curve)
-            # - Species → C_final ≠ 0: ∫|C - C_final| dt (deviation from baseline)
-
-            threshold = max(
-                1e-10,
-                0.01 * float(np.max(np.abs(concentrations))),
-            )
-            integrand = (
-                concentrations
-                if abs(float(final_conc)) < threshold
-                else np.abs(concentrations - final_conc)
-            )
-            ctc, _method, _uniform, _eps, _tail = integrate_ctc(
-                time,
-                integrand,
-                uniformity_eps=1e-6,
-                tail_strategy="38",
-            )
-
-            _item5 = QtWidgets.QTableWidgetItem(f"{ctc:.6g}")
-            _item5.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.setItem(i, 5, _item5)
-
-        # Force immediate visual update for WSL/X11 environments
-        self.viewport().repaint()
+        names = tuple(row[0] for row in rows)
+        current_names = tuple(
+            self.item(row, 0).text() if self.item(row, 0) is not None else ""
+            for row in range(self.rowCount())
+        )
+        if current_names != names:
+            self.setRowCount(len(rows))
+            for row in range(len(rows)):
+                for column in range(self.columnCount()):
+                    item = QtWidgets.QTableWidgetItem()
+                    item.setTextAlignment(QtCore.Qt.AlignCenter)
+                    self.setItem(row, column, item)
+        for row, values in enumerate(rows):
+            for column, value in enumerate(values):
+                self.item(row, column).setText(value)

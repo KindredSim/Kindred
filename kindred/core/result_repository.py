@@ -13,10 +13,8 @@ from typing import Any, Iterable, Mapping, TypeAlias
 
 import numpy as np
 
-from kindred.core.intervention_schedule import (
-    intervention_schedule_identity_fingerprints,
-)
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
+from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
@@ -32,8 +30,10 @@ from kindred.core.project_document import (
 __all__ = [
     "ExplicitResultEntry",
     "ExplicitResultKey",
-    "explicit_result_key_for_tab",
+    "ExplicitResultCurrentFacts",
     "explicit_result_key_from_values",
+    "explicit_result_key_from_current_facts",
+    "explicit_result_key_is_current",
     "PreviewResultIdentity",
     "preview_result_identity_for_tab",
     "PreviewResultEntry",
@@ -87,7 +87,6 @@ def standard_concentration_identity(prepared_dsl: object) -> str:
     for reaction in tuple(getattr(mechanism, "reactions", ()) or ()):
         model = forward_rate_model_for_reaction(
             reaction,
-            default_kappa=view.kappa_global,
             default_standard_conc_M=view.standard_conc_M,
         )
         if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
@@ -98,7 +97,6 @@ def standard_concentration_identity(prepared_dsl: object) -> str:
             model = forward_rate_model_for_equilibrium(
                 equilibrium,
                 temperature_K=view.temperature_K,
-                default_kappa=view.kappa_global,
                 default_standard_conc_M=view.standard_conc_M,
             )
             if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
@@ -127,7 +125,11 @@ def standard_concentration_identity(prepared_dsl: object) -> str:
     return f"C0:consumed:{float(view.standard_conc_M).hex()}"
 
 
-def scientific_identity(prepared_dsl: object) -> str:
+def scientific_identity(
+    prepared_dsl: object,
+    *,
+    intervention_execution: InterventionExecutionContract,
+) -> str:
     """Return a deterministic identity for accepted executable science.
 
     Authoring text and provenance remain on the result key, but comments and
@@ -201,20 +203,19 @@ def scientific_identity(prepared_dsl: object) -> str:
                 "stoich_back": canonical(getattr(equilibrium, "stoich_back", {})),
             }
         )
-    intervention_for_execution = getattr(
-        prepared_dsl,
-        "intervention_schedule_for_execution",
-        None,
-    )
-    if not callable(intervention_for_execution):
+    if not isinstance(
+        intervention_execution,
+        InterventionExecutionContract,
+    ):
         raise TypeError(
-            "prepared_dsl must provide intervention_schedule_for_execution()."
+            "scientific identity requires an InterventionExecutionContract."
         )
-    intervention = intervention_for_execution()
-    (
-        intervention_declarative_fingerprint,
-        intervention_executable_fingerprint,
-    ) = intervention_schedule_identity_fingerprints(intervention)
+    intervention_declarative_fingerprint = (
+        intervention_execution.declarative_fingerprint
+    )
+    intervention_executable_fingerprint = (
+        intervention_execution.executable_fingerprint
+    )
     payload: dict[str, object] = {
         "species": tuple(str(name) for name in getattr(mechanism, "species_names", lambda: ())()),
         "reactions": reactions,
@@ -287,6 +288,7 @@ def explicit_result_key_from_values(
     initial_values: Iterable[tuple[str, float]],
     execution_settings: SimulationExecutionSettings,
     scientific_settings: TabScientificSettings,
+    intervention_execution: InterventionExecutionContract,
 ) -> "ExplicitResultKey":
     """Construct one explicit key from one retained typed source identity."""
 
@@ -298,33 +300,13 @@ def explicit_result_key_from_values(
         standard_concentration_identity=standard_concentration_identity(
             prepared_dsl
         ),
-        scientific_identity=scientific_identity(prepared_dsl),
+        scientific_identity=scientific_identity(
+            prepared_dsl,
+            intervention_execution=intervention_execution,
+        ),
         initial_values=tuple(initial_values),
         execution_settings=execution_settings,
         scientific_settings=scientific_settings,
-    )
-
-
-def explicit_result_key_for_tab(
-    tab: MechanismTabDocument,
-    set_id: str,
-) -> "ExplicitResultKey":
-    """Construct the canonical key for one accepted document tab/set."""
-
-    if not isinstance(tab, MechanismTabDocument):
-        raise TypeError("tab must be a MechanismTabDocument.")
-    prepared_dsl = tab.prepared_dsl
-    if prepared_dsl is None:
-        raise ValueError(f"Mechanism tab {tab.tab_id!r} has no accepted DSL.")
-    return explicit_result_key_from_values(
-        tab_id=tab.tab_id,
-        set_id=set_id,
-        mechanism_source=tab.mechanism_source,
-        prepared_dsl=prepared_dsl,
-        analysis_identity=canonical_analysis_identity(tab),
-        initial_values=canonical_initial_values(tab, set_id),
-        execution_settings=tab.resolved_execution_settings(set_id),
-        scientific_settings=tab.scientific_settings,
     )
 
 
@@ -334,6 +316,7 @@ def preview_result_identity_for_tab(
     *,
     parameter_values: Iterable[tuple[str, float]],
     initial_values: Iterable[tuple[str, float]] | None = None,
+    intervention_execution: InterventionExecutionContract,
 ) -> "PreviewResultIdentity":
     """Construct Preview identity from the same accepted tab projection."""
 
@@ -342,6 +325,13 @@ def preview_result_identity_for_tab(
     prepared_dsl = tab.prepared_dsl
     if prepared_dsl is None:
         raise ValueError(f"Mechanism tab {tab.tab_id!r} has no accepted DSL.")
+    if not isinstance(
+        intervention_execution,
+        InterventionExecutionContract,
+    ):
+        raise TypeError(
+            "Preview identity requires an InterventionExecutionContract."
+        )
     return PreviewResultIdentity(
         tab_id=tab.tab_id,
         set_id=set_id,
@@ -358,6 +348,12 @@ def preview_result_identity_for_tab(
         ),
         execution_settings=tab.resolved_execution_settings(set_id),
         scientific_settings=tab.scientific_settings,
+        intervention_declarative_fingerprint=(
+            intervention_execution.declarative_fingerprint
+        ),
+        intervention_executable_fingerprint=(
+            intervention_execution.executable_fingerprint
+        ),
     )
 
 
@@ -763,6 +759,100 @@ class ExplicitResultKey:
 
 
 @dataclass(frozen=True, slots=True)
+class ExplicitResultCurrentFacts:
+    """Typed live facts captured for one current explicit-result target.
+
+    The GUI captures these values from its current immutable document and
+    passes them across this boundary.  Identity construction and exact-key
+    comparison remain pure operations here, alongside :class:`ExplicitResultKey`.
+    """
+
+    tab_id: str
+    set_id: str
+    mechanism_source: MechanismAuthoringSource
+    prepared_dsl: object
+    analysis_identity: str
+    initial_values: tuple[tuple[str, float], ...]
+    execution_settings: SimulationExecutionSettings
+    scientific_settings: TabScientificSettings
+    intervention_execution: InterventionExecutionContract
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
+        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
+        if not isinstance(self.mechanism_source, MechanismAuthoringSource):
+            raise TypeError(
+                "mechanism_source must be a MechanismAuthoringSource."
+            )
+        object.__setattr__(
+            self,
+            "analysis_identity",
+            _required_id(self.analysis_identity, "analysis_identity"),
+        )
+        object.__setattr__(
+            self,
+            "initial_values",
+            _finite_pairs(
+                self.initial_values,
+                field="initial_values",
+                nonnegative=True,
+            ),
+        )
+        if not isinstance(
+            self.execution_settings,
+            SimulationExecutionSettings,
+        ):
+            raise TypeError(
+                "execution_settings must be a SimulationExecutionSettings value."
+            )
+        validate_simulation_execution_settings(self.execution_settings)
+        validate_tab_scientific_settings(self.scientific_settings)
+        if not isinstance(
+            self.intervention_execution,
+            InterventionExecutionContract,
+        ):
+            raise TypeError(
+                "intervention_execution must be an "
+                "InterventionExecutionContract."
+            )
+
+
+def explicit_result_key_from_current_facts(
+    facts: ExplicitResultCurrentFacts,
+) -> ExplicitResultKey:
+    """Construct the one exact key for captured current typed facts."""
+
+    if not isinstance(facts, ExplicitResultCurrentFacts):
+        raise TypeError(
+            "facts must be an ExplicitResultCurrentFacts value."
+        )
+    return explicit_result_key_from_values(
+        tab_id=facts.tab_id,
+        set_id=facts.set_id,
+        mechanism_source=facts.mechanism_source,
+        prepared_dsl=facts.prepared_dsl,
+        analysis_identity=facts.analysis_identity,
+        initial_values=facts.initial_values,
+        execution_settings=facts.execution_settings,
+        scientific_settings=facts.scientific_settings,
+        intervention_execution=facts.intervention_execution,
+    )
+
+
+def explicit_result_key_is_current(
+    key: ExplicitResultKey,
+    current_key: ExplicitResultKey | None,
+) -> bool:
+    """Return whether ``key`` is exactly the captured current result key."""
+
+    return (
+        isinstance(key, ExplicitResultKey)
+        and isinstance(current_key, ExplicitResultKey)
+        and key == current_key
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class PreviewResultIdentity:
     """Generation-free scientific identity captured by the Slider owner."""
 
@@ -775,6 +865,8 @@ class PreviewResultIdentity:
     initial_values: tuple[tuple[str, float], ...]
     execution_settings: SimulationExecutionSettings
     scientific_settings: TabScientificSettings
+    intervention_declarative_fingerprint: str
+    intervention_executable_fingerprint: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
@@ -814,6 +906,15 @@ class PreviewResultIdentity:
             )
         validate_simulation_execution_settings(self.execution_settings)
         validate_tab_scientific_settings(self.scientific_settings)
+        for field_name in (
+            "intervention_declarative_fingerprint",
+            "intervention_executable_fingerprint",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not str or value != value.strip():
+                raise ValueError(
+                    f"{field_name} must be an edge-normalized string."
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,6 +931,8 @@ class PreviewResultKey:
     execution_settings: SimulationExecutionSettings
     scientific_settings: TabScientificSettings
     generation: int
+    intervention_declarative_fingerprint: str
+    intervention_executable_fingerprint: str
     kind: str = "preview"
 
     def __post_init__(self) -> None:
@@ -843,6 +946,12 @@ class PreviewResultKey:
             initial_values=self.initial_values,
             execution_settings=self.execution_settings,
             scientific_settings=self.scientific_settings,
+            intervention_declarative_fingerprint=(
+                self.intervention_declarative_fingerprint
+            ),
+            intervention_executable_fingerprint=(
+                self.intervention_executable_fingerprint
+            ),
         )
         object.__setattr__(self, "tab_id", identity.tab_id)
         object.__setattr__(self, "set_id", identity.set_id)
@@ -864,6 +973,16 @@ class PreviewResultKey:
             self,
             "scientific_settings",
             identity.scientific_settings,
+        )
+        object.__setattr__(
+            self,
+            "intervention_declarative_fingerprint",
+            identity.intervention_declarative_fingerprint,
+        )
+        object.__setattr__(
+            self,
+            "intervention_executable_fingerprint",
+            identity.intervention_executable_fingerprint,
         )
         if self.kind != "preview":
             raise ValueError("PreviewResultKey kind must be exactly 'preview'.")
@@ -893,6 +1012,12 @@ class PreviewResultKey:
             initial_values=identity.initial_values,
             execution_settings=identity.execution_settings,
             scientific_settings=identity.scientific_settings,
+            intervention_declarative_fingerprint=(
+                identity.intervention_declarative_fingerprint
+            ),
+            intervention_executable_fingerprint=(
+                identity.intervention_executable_fingerprint
+            ),
             generation=generation,
         )
 
@@ -908,6 +1033,12 @@ class PreviewResultKey:
             initial_values=self.initial_values,
             execution_settings=self.execution_settings,
             scientific_settings=self.scientific_settings,
+            intervention_declarative_fingerprint=(
+                self.intervention_declarative_fingerprint
+            ),
+            intervention_executable_fingerprint=(
+                self.intervention_executable_fingerprint
+            ),
         )
 
 
@@ -1038,6 +1169,7 @@ class SimulationResultValue:
     provenance: SimulationResultProvenance
     scalars: Mapping[str, float] = MappingProxyType({})
     parameters: tuple[tuple[str, float, str], ...] = ()
+    presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.provenance, SimulationResultProvenance):
@@ -1050,9 +1182,42 @@ class SimulationResultValue:
             raise TypeError(
                 "intervention_execution must be an InterventionExecutionContract."
             )
+        presentation_boundaries = tuple(self.presentation_boundaries)
+        if any(
+            not isinstance(boundary, SimulationPresentationBoundary)
+            for boundary in presentation_boundaries
+        ):
+            raise TypeError(
+                "presentation_boundaries must contain only "
+                "SimulationPresentationBoundary values."
+            )
+        if any(
+            current.time <= previous.time
+            for previous, current in zip(
+                presentation_boundaries,
+                presentation_boundaries[1:],
+            )
+        ):
+            raise ValueError(
+                "presentation boundaries must be strictly ordered by time."
+            )
         time = _frozen_vector(self.t, field="result time")
         if time.size > 1 and np.any(np.diff(time) <= 0.0):
             raise ValueError("result time must be strictly increasing.")
+        if presentation_boundaries and (
+            presentation_boundaries[0].time < float(time[0])
+            or presentation_boundaries[-1].time > float(time[-1])
+        ):
+            raise ValueError(
+                "presentation boundaries must lie within the result time span."
+            )
+        if any(
+            not bool(np.any(time == boundary.time))
+            for boundary in presentation_boundaries
+        ):
+            raise ValueError(
+                "presentation boundaries must align with canonical result times."
+            )
         segment_ids = _frozen_identity_vector(
             self.segment_ids,
             field="result segment identity",
@@ -1130,6 +1295,11 @@ class SimulationResultValue:
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
         object.__setattr__(self, "scalars", MappingProxyType(scalars))
         object.__setattr__(self, "parameters", tuple(parameters))
+        object.__setattr__(
+            self,
+            "presentation_boundaries",
+            presentation_boundaries,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1171,7 +1341,7 @@ class ResultRepository:
         self._reference_by_set_id: dict[str, ExplicitResultEntry] = {}
         self._explicit_cache: OrderedDict[
             tuple[object, ...],
-            SimulationResultValue,
+            ExplicitResultEntry,
         ] = OrderedDict()
 
     @property
@@ -1195,9 +1365,6 @@ class ResultRepository:
     def explicit_entry(self, set_id: str) -> ExplicitResultEntry | None:
         return self._explicit_by_set_id.get(str(set_id or ""))
 
-    def explicit_entries(self) -> tuple[ExplicitResultEntry, ...]:
-        return tuple(self._explicit_by_set_id.values())
-
     def preview_entry(self, set_id: str) -> PreviewResultEntry | None:
         sid = str(set_id or "")
         entry = self._preview_by_set_id.get(sid)
@@ -1207,13 +1374,6 @@ class ResultRepository:
         ):
             return None
         return entry
-
-    def preview_entries(self) -> tuple[PreviewResultEntry, ...]:
-        return tuple(
-            entry
-            for set_id, entry in self._preview_by_set_id.items()
-            if self._preview_display_key_by_set_id.get(set_id) == entry.key
-        )
 
     def reference_entry(self, set_id: str) -> ExplicitResultEntry | None:
         return self._reference_by_set_id.get(str(set_id or ""))
@@ -1270,7 +1430,7 @@ class ResultRepository:
         self._preview_display_key_by_set_id.pop(key.set_id, None)
         self._reference_by_set_id.pop(key.set_id, None)
         cache_identity = key.cache_identity
-        self._explicit_cache[cache_identity] = result
+        self._explicit_cache[cache_identity] = entry
         self._explicit_cache.move_to_end(cache_identity)
         self._trim_explicit_cache()
         return entry
@@ -1278,10 +1438,11 @@ class ResultRepository:
     def cached_result(self, key: ExplicitResultKey) -> SimulationResultValue | None:
         self._require_explicit_key(key)
         cache_identity = key.cache_identity
-        result = self._explicit_cache.get(cache_identity)
-        if result is not None:
+        entry = self._explicit_cache.get(cache_identity)
+        if entry is not None:
             self._explicit_cache.move_to_end(cache_identity)
-        return result
+            return entry.result
+        return None
 
     def hydrate_cached(self, key: ExplicitResultKey) -> ExplicitResultEntry | None:
         """Hydrate one owner-authorized exact cache hit; a miss changes nothing."""
@@ -1309,25 +1470,35 @@ class ResultRepository:
         self._preview_display_key_by_set_id.pop(sid, None)
         self._reference_by_set_id.pop(sid, None)
 
-    def clear_semantic_sets(self, set_ids: Iterable[str]) -> None:
-        seen: set[str] = set()
-        for set_id in set_ids:
-            sid = _required_id(set_id, "set_id")
-            if sid not in seen:
-                seen.add(sid)
-                self.clear_semantic_set(sid)
-
     def deauthorize_sets(
         self,
         set_ids: Iterable[str],
+        *,
+        preserve_reference: bool = False,
     ) -> None:
-        """Clear display authorization while retaining exact reusable values."""
+        """Clear display authorization while retaining exact reusable values.
+
+        Slider Preview uses the same canonical deauthorization boundary as
+        every other scientific edit, but its established Run-to-Reference
+        behavior moves the prior explicit entry to comparison-only storage
+        before the new request is constructed.  The reference is never an
+        eligible foreground entry and remains absent for ordinary invalidation.
+        """
 
         targets = {
             _required_id(set_id, "set_id")
             for set_id in set_ids
         }
-        self.clear_semantic_sets(targets)
+        if not targets:
+            return
+        for set_id in targets:
+            explicit = self._explicit_by_set_id.pop(set_id, None)
+            if preserve_reference and explicit is not None:
+                self._reference_by_set_id[set_id] = explicit
+            elif not preserve_reference:
+                self._reference_by_set_id.pop(set_id, None)
+            self._preview_by_set_id.pop(set_id, None)
+            self._preview_display_key_by_set_id.pop(set_id, None)
 
     def clear_all_semantic_entries(self) -> None:
         self._explicit_by_set_id.clear()

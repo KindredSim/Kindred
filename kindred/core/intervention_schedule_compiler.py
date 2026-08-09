@@ -324,56 +324,6 @@ class InterventionExecutionContract:
     ) -> "InterventionExecutionContract":
         return replace(self, trigger_firings=tuple(firings))
 
-    def discontinuities_for_span(
-        self, start_time: float, end_time: float
-    ) -> tuple[float, ...]:
-        start = _finite_derived(start_time, context="Segment start")
-        end = _finite_derived(end_time, context="Segment end")
-        if end <= start:
-            raise InterventionScheduleError(
-                "Segment end must be greater than segment start."
-            )
-        return tuple(
-            value for value in self.discontinuities if start < value < end
-        )
-
-    def segments_for_span(
-        self, start_time: float, end_time: float
-    ) -> tuple[tuple[float, float], ...]:
-        start = _finite_derived(start_time, context="Segment start")
-        end = _finite_derived(end_time, context="Segment end")
-        boundaries = (
-            start,
-            *self.discontinuities_for_span(start, end),
-            end,
-        )
-        return tuple(zip(boundaries, boundaries[1:]))
-
-    def runtime_discontinuities_for_span(
-        self, start_time: float, end_time: float
-    ) -> tuple[float, ...]:
-        start = _finite_derived(start_time, context="Segment start")
-        end = _finite_derived(end_time, context="Segment end")
-        static = self.discontinuities_for_span(start, end)
-        firing_times = tuple(
-            firing.root_time
-            for firing in self.trigger_firings
-            if start < firing.root_time < end
-        )
-        return tuple(sorted(set(static + firing_times)))
-
-    def runtime_segments_for_span(
-        self, start_time: float, end_time: float
-    ) -> tuple[tuple[float, float], ...]:
-        start = _finite_derived(start_time, context="Segment start")
-        end = _finite_derived(end_time, context="Segment end")
-        boundaries = (
-            start,
-            *self.runtime_discontinuities_for_span(start, end),
-            end,
-        )
-        return tuple(zip(boundaries, boundaries[1:]))
-
     def provenance_projection(self) -> dict[str, Any]:
         return {
             "declarative_fingerprint": self.declarative_fingerprint,

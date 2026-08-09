@@ -27,7 +27,6 @@ class ThemeManager:
             raise TypeError("application must be a QApplication.")
         if not callable(getattr(plot_container, "set_theme", None)):
             raise TypeError("plot_container must provide set_theme(dark_mode=...).")
-        self._application = application
         self._plot_container = plot_container
         self._report_failure = report_failure
         self._applied_dark_mode: bool | None = None

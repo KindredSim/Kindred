@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Iterable
 
 
+FORBIDDEN_FAST_EQ_MODULE = "kindred.core.simulator.fast_eq"
+
+
 @dataclass(frozen=True)
 class ModuleInfo:
     module: str
@@ -29,7 +32,7 @@ class ImportOccurrence:
 def _should_skip_dir(dirname: str) -> bool:
     if dirname in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}:
         return True
-    if dirname == "_audit_reports":
+    if dirname == "_audit_reports" or dirname.startswith("_backup_before_"):
         return True
     return False
 
@@ -101,6 +104,65 @@ def _read_line_text(path: Path, lineno: int) -> str:
     return ""
 
 
+def _is_type_checking_guard(test: ast.expr) -> bool:
+    """Return whether *test* is a guard that is false at runtime.
+
+    ``TYPE_CHECKING`` imports are useful to static type checkers but do not
+    participate in Python's runtime import graph.  The graph audit must not
+    report a cycle solely because one side is protected by that guard.
+    """
+
+    if isinstance(test, ast.Name):
+        return test.id == "TYPE_CHECKING"
+    if isinstance(test, ast.Attribute):
+        return (
+            test.attr == "TYPE_CHECKING"
+            and isinstance(test.value, ast.Name)
+            and test.value.id == "typing"
+        )
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_is_type_checking_guard(value) for value in test.values)
+    return False
+
+
+def _iter_runtime_import_nodes(tree: ast.AST) -> Iterable[ast.Import | ast.ImportFrom]:
+    """Yield import nodes that execute on the runtime path.
+
+    Imports nested below ``if TYPE_CHECKING:`` (including the equivalent
+    ``if typing.TYPE_CHECKING:`` spelling) are intentionally excluded.  The
+    visitor keeps the guard state for nested blocks while preserving imports
+    in an ``else`` branch as runtime imports.
+    """
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self._type_checking_depth = 0
+            self.nodes: list[ast.Import | ast.ImportFrom] = []
+
+        def visit_If(self, node: ast.If) -> None:
+            guarded = _is_type_checking_guard(node.test)
+            if guarded:
+                self._type_checking_depth += 1
+            for child in node.body:
+                self.visit(child)
+            if guarded:
+                self._type_checking_depth -= 1
+            for child in node.orelse:
+                self.visit(child)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            if self._type_checking_depth == 0:
+                self.nodes.append(node)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            if self._type_checking_depth == 0:
+                self.nodes.append(node)
+
+    visitor = _Visitor()
+    visitor.visit(tree)
+    return visitor.nodes
+
+
 def iter_internal_imports(
     *, repo_root: Path, module_index: dict[str, ModuleInfo], package: str
 ) -> tuple[list[ImportOccurrence], list[tuple[str, str]]]:
@@ -127,7 +189,7 @@ def iter_internal_imports(
             parse_warnings.append((info.relpath, msg))
             continue
 
-        for node in ast.walk(tree):
+        for node in _iter_runtime_import_nodes(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     name = alias.name
@@ -186,6 +248,59 @@ def iter_internal_imports(
 
     occurrences.sort(key=lambda o: (o.src_relpath, o.lineno, o.dst_module))
     return occurrences, parse_warnings
+
+
+def iter_forbidden_imports(
+    *, repo_root: Path, module_index: dict[str, ModuleInfo]
+) -> list[ImportOccurrence]:
+    """Find exact production imports of the deleted fast_eq facade.
+
+    This source check deliberately does not depend on the target module being
+    present in ``module_index``.  It is kept separate from the internal graph so
+    the general cycle/orphan analysis remains a graph of existing modules only.
+    """
+    occurrences: list[ImportOccurrence] = []
+    for src_module, info in sorted(module_index.items(), key=lambda kv: kv[0]):
+        src_path = repo_root / info.relpath
+        try:
+            tree = ast.parse(src_path.read_text(encoding="utf-8"), filename=info.relpath)
+        except (OSError, SyntaxError):
+            # iter_internal_imports already reports read/parse diagnostics.
+            continue
+
+        for node in ast.walk(tree):
+            is_forbidden = False
+            if isinstance(node, ast.Import):
+                is_forbidden = any(
+                    alias.name == FORBIDDEN_FAST_EQ_MODULE for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                base = _resolve_importfrom_base(
+                    src_module=src_module,
+                    src_is_init=info.is_init,
+                    level=node.level or 0,
+                    module=node.module,
+                )
+                is_forbidden = base == FORBIDDEN_FAST_EQ_MODULE or any(
+                    f"{base}.{alias.name}" == FORBIDDEN_FAST_EQ_MODULE
+                    for alias in node.names
+                    if alias.name != "*"
+                )
+
+            if is_forbidden:
+                lineno = getattr(node, "lineno", 0) or 0
+                occurrences.append(
+                    ImportOccurrence(
+                        src_module=src_module,
+                        src_relpath=info.relpath,
+                        lineno=lineno,
+                        line_text=_read_line_text(src_path, lineno).strip() if lineno else "",
+                        dst_module=FORBIDDEN_FAST_EQ_MODULE,
+                    )
+                )
+
+    occurrences.sort(key=lambda o: (o.src_relpath, o.lineno, o.dst_module))
+    return occurrences
 
 
 def build_graph(occurrences: Iterable[ImportOccurrence]) -> dict[str, set[str]]:
@@ -294,24 +409,26 @@ def main() -> int:
     else:
         print("A1 CoreGUIImport | INFO | - | No kindred.core.* -> kindred.gui.* imports detected | -")
 
-    # A2 ForbiddenDslFastEqCycle (FAIL)
-    dsl = "kindred.core.simulator.dsl"
-    fast_eq = "kindred.core.simulator.fast_eq"
-    forbidden: list[ImportOccurrence] = []
-    for occ in occurrences:
-        if (occ.src_module == dsl and occ.dst_module == fast_eq) or (occ.src_module == fast_eq and occ.dst_module == dsl):
-            forbidden.append(occ)
+    # A2 ObsoleteFastEqFacadeImport (FAIL)
+    # Keep this independent of module existence: the check protects the deleted
+    # facade boundary itself, so a source import must fail the audit even when
+    # the target file is no longer present in the graph.
+    forbidden = iter_forbidden_imports(
+        repo_root=repo_root,
+        module_index=module_index,
+    )
     if forbidden:
         hard_fail = 1
         for occ in forbidden:
             loc = f"{occ.src_relpath}:{occ.lineno}" if occ.lineno else occ.src_relpath
-            direction = f"{occ.src_module} -> {occ.dst_module}"
             evidence = occ.line_text or "-"
             print(
-                f"A2 ForbiddenDslFastEqCycle | FAIL | {loc} | Forbidden import edge {direction} (evidence: {evidence}) | Move shared logic to kindred.core.simulator.common"
+                f"A2 ObsoleteFastEqFacadeImport | FAIL | {loc} | Production import of deleted compatibility facade {FORBIDDEN_FAST_EQ_MODULE!r} (evidence: {evidence}) | Import shared simulator helpers from kindred.core.simulator.common"
             )
     else:
-        print("A2 ForbiddenDslFastEqCycle | INFO | - | No dsl<->fast_eq import edges detected | -")
+        print(
+            "A2 ObsoleteFastEqFacadeImport | INFO | - | No production imports of deleted compatibility facade kindred.core.simulator.fast_eq detected | -"
+        )
 
     # A4 ImportCycles (WARN)
     sccs = [c for c in strongly_connected_components(graph, nodes) if len(c) > 1]
@@ -342,4 +459,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

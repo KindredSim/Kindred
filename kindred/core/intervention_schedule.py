@@ -17,12 +17,8 @@ __all__ = [
     "InterventionSet",
     "InterventionTrigger",
     "InterventionTriggerAction",
-    "active_interval_boundaries",
     "coerce_intervention_schedule",
-    "intervention_schedule_identity_fingerprints",
     "intervention_schedule_parameter_names",
-    "normalized_intervention_schedule_identity_fingerprints",
-    "normalized_intervention_schedule_payload",
 ]
 
 
@@ -1411,103 +1407,3 @@ def coerce_intervention_schedule(value: object) -> InterventionSchedule | None:
     raise InterventionScheduleError(
         "Intervention schedule must be a final typed schedule or final payload."
     )
-
-
-def intervention_schedule_identity_fingerprints(
-    schedule: InterventionSchedule | Mapping[str, Any] | None,
-) -> tuple[str, str]:
-    schedule_obj = coerce_intervention_schedule(schedule)
-    if schedule_obj is None:
-        return "", ""
-    executable = ""
-    if not schedule_obj.is_parameterized:
-        from kindred.core.intervention_schedule_compiler import (
-            compile_intervention_schedule,
-        )
-
-        executable = compile_intervention_schedule(schedule_obj).executable_fingerprint
-    return schedule_obj.fingerprint, executable
-
-
-def _canonicalize_parameter_names(
-    value: object, *, mechanism_namespace: object
-) -> object:
-    if isinstance(value, Mapping):
-        output: dict[str, object] = {}
-        for key, item in value.items():
-            key_string = str(key)
-            if key_string in _PARAM_FIELDS and str(item or "").strip():
-                raw_name = str(item)
-                resolution = mechanism_namespace.resolve(raw_name)  # type: ignore[attr-defined]
-                if resolution.canonical_name is not None:
-                    output[key_string] = str(resolution.canonical_name)
-                    continue
-                invalid = mechanism_namespace.invalid_protected_indexed_identifier_message(raw_name)  # type: ignore[attr-defined]
-                if invalid is not None:
-                    raise InterventionScheduleError(invalid)
-                output[key_string] = raw_name
-            else:
-                output[key_string] = _canonicalize_parameter_names(
-                    item, mechanism_namespace=mechanism_namespace
-                )
-        return output
-    if isinstance(value, list):
-        return [
-            _canonicalize_parameter_names(item, mechanism_namespace=mechanism_namespace)
-            for item in value
-        ]
-    return value
-
-
-def normalized_intervention_schedule_payload(
-    schedule: InterventionSchedule | Mapping[str, Any] | None,
-    *,
-    mechanism_namespace: object,
-) -> dict[str, Any] | None:
-    schedule_obj = coerce_intervention_schedule(schedule)
-    if schedule_obj is None:
-        return None
-    payload = _canonicalize_parameter_names(
-        schedule_obj.to_payload(), mechanism_namespace=mechanism_namespace
-    )
-    if not isinstance(payload, Mapping):
-        raise InterventionScheduleError("Normalized schedule payload is invalid.")
-    return InterventionSchedule.from_payload(payload).to_payload()
-
-
-def normalized_intervention_schedule_identity_fingerprints(
-    schedule: InterventionSchedule | Mapping[str, Any] | None,
-    *,
-    mechanism_namespace: object,
-) -> tuple[str, str]:
-    payload = normalized_intervention_schedule_payload(
-        schedule, mechanism_namespace=mechanism_namespace
-    )
-    return intervention_schedule_identity_fingerprints(payload)
-
-
-def active_interval_boundaries(
-    schedule: InterventionSchedule, *, t0: float, t1: float
-) -> list[float]:
-    if schedule.is_parameterized:
-        raise InterventionScheduleError(
-            "Parameterized intervention schedule must be resolved before solving."
-        )
-    if schedule.protocols:
-        raise InterventionScheduleError(
-            "Protocol schedules must be compiled before execution."
-        )
-    boundaries = {float(t0), float(t1)}
-    for operation in schedule.operations:
-        if isinstance(operation, (InterventionSet, InterventionJump)):
-            if t0 <= float(operation.time) <= t1:
-                boundaries.add(float(operation.time))
-        elif isinstance(operation, (InterventionFlux, InterventionHold)):
-            for value in (operation.start_time, operation.end_time):
-                if t0 <= float(value) <= t1:
-                    boundaries.add(float(value))
-    if any(not math.isfinite(value) for value in boundaries):
-        raise InterventionScheduleError(
-            "Derived intervention boundary must be finite."
-        )
-    return sorted(boundaries)

@@ -18,7 +18,6 @@ __all__ = [
     "arrhenius_rate",
     "eyring_prefactor",
     "eyring_rate",
-    "K_from_deltaG_eq",
     "ConstantRateModel",
     "ArrheniusRateModel",
     "EyringRateModel",
@@ -49,6 +48,14 @@ class EyringRateModel:
     kappa: float
     standard_conc_M: float
     molecularity: float
+    degeneracy: int = 1
+
+    def __post_init__(self) -> None:
+        kappa = _numeric_float(self.kappa, field="Eyring kappa")
+        if not math.isfinite(kappa) or kappa <= 0.0:
+            raise ValueError("Eyring kappa must be positive and finite.")
+        object.__setattr__(self, "kappa", kappa)
+        _positive_integer(self.degeneracy, field="Eyring degeneracy")
 
 
 ForwardRateModel: TypeAlias = (
@@ -63,6 +70,15 @@ def _numeric_float(value: object, *, field: str) -> float:
         return float(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{field} must be numeric.") from exc
+
+
+def _positive_integer(value: object, *, field: str) -> int:
+    """Admit only a positive, non-boolean builtin integer coordinate."""
+    if type(value) is not int:
+        raise TypeError(f"{field} must be a positive integer.")
+    if value <= 0:
+        raise ValueError(f"{field} must be a positive integer.")
+    return value
 
 
 def _directional_order(value: object, *, field: str = "molecularity") -> float:
@@ -95,7 +111,6 @@ def _decode_forward_rate_model(
     family: str,
     constant_rate: object | None,
     molecularity: float,
-    default_kappa: float = 1.0,
     default_standard_conc_M: float = 1.0,
 ) -> ForwardRateModel:
     """Decode one final Constant/Arrhenius/Eyring authority.
@@ -115,6 +130,7 @@ def _decode_forward_rate_model(
                 "dG_act_J_per_mol",
                 "kappa",
                 "standard_conc_M",
+                "degeneracy",
             }
         ),
     }
@@ -163,7 +179,7 @@ def _decode_forward_rate_model(
                 field="Eyring dG_act_J_per_mol",
             ),
             kappa=_numeric_float(
-                fields.get("kappa", default_kappa),
+                fields.get("kappa", 1.0),
                 field="Eyring kappa",
             ),
             standard_conc_M=_numeric_float(
@@ -174,6 +190,10 @@ def _decode_forward_rate_model(
                 field="Eyring standard_conc_M",
             ),
             molecularity=order,
+            degeneracy=_positive_integer(
+                fields.get("degeneracy", 1),
+                field="Eyring degeneracy",
+            ),
         )
     # Validate authored coordinates without evaluating at an arbitrary
     # temperature (extreme, otherwise-valid barriers can be temperature-safe
@@ -204,7 +224,6 @@ def _decode_forward_rate_model(
 def forward_rate_model_for_reaction(
     reaction: object,
     *,
-    default_kappa: float = 1.0,
     default_standard_conc_M: float = 1.0,
 ) -> ForwardRateModel:
     """Project one mechanism reaction onto the final typed rate model."""
@@ -246,7 +265,6 @@ def forward_rate_model_for_reaction(
         family=family,
         constant_rate=constant_rate,
         molecularity=getattr(reaction, "order", 1),
-        default_kappa=default_kappa,
         default_standard_conc_M=default_standard_conc_M,
     )
 
@@ -255,7 +273,6 @@ def forward_rate_model_for_equilibrium(
     equilibrium: object,
     *,
     temperature_K: float | None,
-    default_kappa: float = 1.0,
     default_standard_conc_M: float = 1.0,
 ) -> ForwardRateModel:
     """Project one equilibrium's forward side onto the same typed model."""
@@ -326,7 +343,6 @@ def forward_rate_model_for_equilibrium(
         family=family,
         constant_rate=constant_rate,
         molecularity=molecularity,
-        default_kappa=default_kappa,
         default_standard_conc_M=default_standard_conc_M,
     )
 
@@ -350,6 +366,10 @@ def forward_rate_at_temperature(
             kappa=model.kappa,
             standard_conc_M=model.standard_conc_M,
             molecularity=model.molecularity,
+            degeneracy=_positive_integer(
+                model.degeneracy,
+                field="Eyring degeneracy",
+            ),
         )
     raise TypeError("model must be one typed forward-rate model.")
 
@@ -412,6 +432,10 @@ def forward_rate_symbolic_relation(
             model.molecularity,
             field="Eyring molecularity",
         )
+        degeneracy = _positive_integer(
+            model.degeneracy,
+            field="Eyring degeneracy",
+        )
         if not math.isfinite(barrier):
             raise ValueError("Eyring dG_act_J_per_mol must be finite.")
         if not math.isfinite(transmission) or transmission <= 0.0:
@@ -421,7 +445,8 @@ def forward_rate_symbolic_relation(
                 "Eyring standard concentration must be positive and finite."
             )
         relation = (
-            literal(float(transmission))
+            literal(float(degeneracy))
+            * literal(float(transmission))
             * exact(k_B, field="k_B")
             * temperature
             / exact(h, field="h")
@@ -477,6 +502,10 @@ def write_reference_rate(
             model.molecularity,
             field="Eyring molecularity",
         )
+        degeneracy = _positive_integer(
+            model.degeneracy,
+            field="Eyring degeneracy",
+        )
         if kappa <= 0.0 or not math.isfinite(kappa):
             raise ValueError("Eyring kappa must be positive and finite.")
         if standard <= 0.0 or not math.isfinite(standard):
@@ -485,6 +514,7 @@ def write_reference_rate(
             )
         log_ratio = (
             math.log(rate)
+            - math.log(degeneracy)
             - (1.0 - molecularity) * math.log(standard)
             - math.log(kappa)
             - math.log(eyring_prefactor(temperature))
@@ -497,6 +527,7 @@ def write_reference_rate(
             kappa=kappa,
             standard_conc_M=standard,
             molecularity=molecularity,
+            degeneracy=degeneracy,
         )
     raise TypeError("model must be one typed forward-rate model.")
 
@@ -516,11 +547,12 @@ def eyring_rate(
     kappa: float = 1.0,
     molecularity: float = 1.0,
     standard_conc_M: float = 1.0,
+    degeneracy: int = 1,
 ) -> float:
     """
     Compute Eyring rate constant.
 
-    - Unimolecular: κ * (k_B T / h) * exp(-ΔG‡/(R T))      [1/s]
+    - Unimolecular: g * κ * (k_B T / h) * exp(-ΔG‡/(R T))  [1/s]
     - n-molecular (n >= 2): multiply by 1/(C°^(n-1))        [1/(M^(n-1)*s)]
     """
     T = _numeric_float(T, field="T")
@@ -533,6 +565,7 @@ def eyring_rate(
     if standard <= 0.0 or not math.isfinite(standard):
         raise ValueError("standard_conc_M must be positive and finite")
     n = _directional_order(molecularity)
+    degeneracy = _positive_integer(degeneracy, field="Eyring degeneracy")
 
     transmission = _numeric_float(kappa, field="kappa")
     if not math.isfinite(transmission) or transmission <= 0.0:
@@ -547,7 +580,8 @@ def eyring_rate(
     exponent = -dG / (R * T)
     try:
         k = (
-            transmission
+            degeneracy
+            * transmission
             * eyring_prefactor(T)
             * math.exp(exponent)
             * math.pow(standard, 1.0 - n)
@@ -583,22 +617,3 @@ def arrhenius_rate(A: float, Ea_J_per_mol: float, T: float) -> float:
     except OverflowError as exc:
         raise ValueError("Arrhenius rate overflows the finite real domain") from exc
     return _finite_result(rate, field="Arrhenius rate")
-
-
-def K_from_deltaG_eq(dG_eq_J_per_mol: float, T: float) -> float:
-    """
-    Equilibrium constant from standard Gibbs free energy change:
-
-        K = exp(-ΔG° / (R T))
-    """
-    T = _numeric_float(T, field="T")
-    if T <= 0.0 or not math.isfinite(T):
-        raise ValueError("T must be positive and finite")
-    dG = _numeric_float(dG_eq_J_per_mol, field="dG_eq_J_per_mol")
-    if not math.isfinite(dG):
-        raise ValueError("dG_eq_J_per_mol must be finite")
-    try:
-        value = math.exp(-dG / (R * T))
-    except OverflowError as exc:
-        raise ValueError("equilibrium constant overflows the finite real domain") from exc
-    return _finite_result(value, field="equilibrium constant")

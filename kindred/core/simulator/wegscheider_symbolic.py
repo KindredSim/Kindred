@@ -491,7 +491,10 @@ def apply_wegscheider_resolution_to_reactions_text(
         if re.fullmatch(r"dg_eq\d+", key, flags=re.IGNORECASE)
     }
     if dg_updates:
-        _materialize_dG_source_updates(lines, dg_updates)
+        lines = _materialize_admitted_dG_source_updates(
+            str(dsl_text or ""),
+            dg_updates,
+        )
         pending = {
             key: update
             for key, update in pending.items()
@@ -528,63 +531,86 @@ def apply_wegscheider_resolution_to_reactions_text(
     return upsert_lines_into_algebra_section(rewritten_text, missing)
 
 
-_SOURCE_ARROW_RE = re.compile(r"(?:<=>|<->|->)")
-_SOURCE_DG_RE = re.compile(
-    r"(?P<key>dg_eq)\s*=\s*(?P<value>[^\s;#]+)",
-    re.IGNORECASE,
-)
-
-
-def _source_step_line_indices(lines: Sequence[str]) -> tuple[int, ...]:
-    """Return source line indices for canonical authored reaction steps."""
-
-    indices: list[int] = []
-    for index, raw_line in enumerate(lines):
-        code = strip_inline_comment(str(raw_line)).strip()
-        if not code:
-            continue
-        lower = code.casefold()
-        if (
-            lower.startswith("reaction:")
-            or lower.startswith("equilibrium:")
-            or _SOURCE_ARROW_RE.search(code) is not None
-        ):
-            indices.append(index)
-    return tuple(indices)
-
-
-def _materialize_dG_source_updates(
-    lines: list[str],
+def _materialize_admitted_dG_source_updates(
+    dsl_text: str,
     updates: Mapping[str, WegscheiderResolutionUpdate],
-) -> None:
-    """Rewrite source-owned dG_eq values from retained cycle coordinates."""
+) -> list[str]:
+    """Materialize dG corrections through admitted origins and coordinates."""
 
-    source_steps = _source_step_line_indices(lines)
-    values: dict[str, float] = {}
-    matches: dict[str, tuple[int, re.Match[str]]] = {}
-    for step_number, line_index in enumerate(source_steps, start=1):
-        match = _SOURCE_DG_RE.search(strip_inline_comment(lines[line_index]))
+    # This is intentionally a call-local admission.  The source parser owns
+    # arrow recognition (including bare ``=>``), coordinate aliases, and the
+    # source-wide energy directive; this writer consumes only that typed
+    # admission and never scans reaction syntax itself.
+    from kindred.core.simulator.dsl_derivation import (
+        authored_step_origin,
+        coordinate_source_line,
+        coordinate_source_parts,
+        coordinate_token_matches,
+        origin_line_positions,
+        set_coordinate_source_token,
+    )
+    from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
+
+    prepared = prepare_dsl_request_set(dsl_text)
+    analysis = prepared.analysis
+    lines = analysis.normalized_text.splitlines()
+    positions = origin_line_positions(analysis)
+    coordinate_names: set[str] = {
+        str(key).casefold()
+        for key in updates
+    }
+    for update in updates.values():
+        coordinate_names.update(
+            str(name).casefold()
+            for name, _factor in update.source_terms
+        )
+
+    admitted_coordinates: dict[str, tuple[int, list[list[str]], str, float]] = {}
+    for coordinate_name in sorted(coordinate_names):
+        match = re.fullmatch(r"dg_eq(\d+)", coordinate_name)
         if match is None:
-            continue
-        key = f"dg_eq{step_number}"
+            raise ValueError(
+                f"Unsupported native detailed-balance coordinate {coordinate_name!r}."
+            )
+        step_index = int(match.group(1))
+        origin = authored_step_origin(analysis, step_index=step_index)
+        line_index = positions[origin.authored_ordinal]
+        prefix, tokens, comment = coordinate_source_parts(lines[line_index])
+        matches = [
+            pair
+            for pair in tokens
+            if coordinate_token_matches(pair[0], "dG_eq")
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Source does not contain exactly one authored coordinate "
+                f"{coordinate_name!r}."
+            )
         try:
-            value = float(match.group("value"))
+            value = float(matches[0][1])
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
-                f"Source {key} value is not a finite numeric dG_eq coordinate."
+                f"Source {coordinate_name} value is not numeric."
             ) from exc
         if not isfinite(value):
-            raise ValueError(f"Source {key} value is not finite.")
-        values[key] = float(value)
-        matches[key] = (line_index, match)
+            raise ValueError(f"Source {coordinate_name} value is not finite.")
+        admitted_coordinates[coordinate_name] = (
+            line_index,
+            tokens,
+            comment,
+            value,
+        )
 
-    replacements: dict[int, tuple[int, int, str]] = {}
+    # All values are retained in the one admitted source energy unit.  Do not
+    # convert through J/mol here: the canonical source directive remains in
+    # ``analysis.energy_unit`` and the rendered coordinate must stay in it.
+    _source_energy_unit = analysis.energy_unit
+    if not _source_energy_unit:
+        raise ValueError("Admitted DSL source has no energy render unit.")
     for key, update in updates.items():
         target = str(key).casefold()
-        target_match = re.fullmatch(r"dg_eq(\d+)", target)
-        if target_match is None:
-            raise ValueError(f"Unsupported native detailed-balance target {key!r}.")
-        if target not in matches:
+        coordinate = admitted_coordinates.get(target)
+        if coordinate is None:
             raise ValueError(
                 f"Source does not contain authored coordinate {update.parameter_name!r}."
             )
@@ -596,25 +622,25 @@ def _materialize_dG_source_updates(
         materialized = 0.0
         for source_name, factor in update.source_terms:
             source_key = str(source_name).casefold()
-            if source_key not in values:
+            source = admitted_coordinates.get(source_key)
+            if source is None:
                 raise ValueError(
                     f"Source does not contain authored coordinate {source_name!r}."
                 )
-            materialized += float(factor) * values[source_key]
+            materialized += float(factor) * source[3]
         if not isfinite(materialized):
             raise ValueError(
                 f"Detailed-balance correction for {update.parameter_name!r} is not finite."
             )
-        line_index, match = matches[target]
-        replacements[line_index] = (
-            match.start("value"),
-            match.end("value"),
-            repr(float(materialized)),
+        line_index, tokens, comment, _value = coordinate
+        prefix = coordinate_source_parts(lines[line_index])[0]
+        set_coordinate_source_token(
+            tokens,
+            token="dG_eq",
+            value=float(materialized),
         )
-
-    for line_index, (start, end, replacement) in replacements.items():
-        raw = lines[line_index]
-        lines[line_index] = raw[:start] + replacement + raw[end:]
+        lines[line_index] = coordinate_source_line(prefix, tokens, comment)
+    return lines
 
 
 def _assignment_by_name(spec: ParameterAlgebraSpec | None) -> dict[str, ParameterAssignment]:
@@ -812,9 +838,6 @@ def _step_log_temperature_relation(
                 forward_model = forward_rate_model_for_equilibrium(
                     equilibrium,
                     temperature_K=nominal_temperature_K,
-                    default_kappa=MechanismMetadataView.from_metadata(
-                        getattr(mechanism, "metadata", {}) or {}
-                    ).kappa_global,
                     default_standard_conc_M=MechanismMetadataView.from_metadata(
                         getattr(mechanism, "metadata", {}) or {}
                     ).standard_conc_M,

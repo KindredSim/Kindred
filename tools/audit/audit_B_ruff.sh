@@ -41,6 +41,8 @@ RUFF_CMD=(
   --force-exclude
   --extend-exclude
   _audit_reports
+  --extend-exclude
+  "_backup_before_*"
 )
 
 {

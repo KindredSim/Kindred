@@ -49,16 +49,6 @@ class UnitsModel:
     standard_conc_M: float = 1.0
     standard_pressure_Pa: float = 1.0e5
 
-    def to_jmol(self, value: float) -> float:
-        """Convert from current energy_unit to canonical J/mol."""
-        if self.energy_unit == "kJ/mol":
-            return kjmol_to_jmol(value)
-        if self.energy_unit == "kcal/mol":
-            return kcalmol_to_jmol(value)
-        if self.energy_unit == "J/mol":
-            return float(value)
-        raise ValueError(f"Unsupported energy_unit: {self.energy_unit!r}")
-
     def from_jmol(self, value: float) -> float:
         """Convert from canonical J/mol to current energy_unit."""
         if self.energy_unit == "kJ/mol":

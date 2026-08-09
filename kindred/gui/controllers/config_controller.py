@@ -22,6 +22,7 @@ from kindred.core.project_document import (
     default_project_document,
     default_simulation_execution_settings,
     default_tab_scientific_settings,
+    validate_fit_defaults,
     validate_simulation_execution_settings,
     validate_tab_scientific_settings,
 )
@@ -48,7 +49,7 @@ _SCIENTIFIC_SETTINGS_KEYS = {
     "temperature": "simulation/temperature",
     "rtol": "simulation/rtol",
     "atol": "simulation/atol",
-    "sparse_jacobian_policy": "simulation/use_sparse_jacobian",
+    "analytic_jacobian_policy": "simulation/use_analytic_jacobian",
     "wegscheider_policy": "simulation/wegscheider_cyclicity_enabled",
 }
 _FIT_SETTINGS_KEYS = {
@@ -166,7 +167,11 @@ class ConfigController(QtCore.QObject):
         previous = self.run_user_maximum_preference()
         settings = self._settings()
         settings.setValue(_RUN_USER_MAXIMUM_KEY, accepted)
-        self._sync_or_raise(settings, "Run user maximum")
+        self._sync_or_report(
+            settings,
+            "Run user maximum",
+            success_message=f"Run parallel maximum set to {accepted}.",
+        )
         if previous != accepted:
             self.runUserMaximumChanged.emit(accepted)
         return accepted
@@ -205,7 +210,13 @@ class ConfigController(QtCore.QObject):
         previous = self.result_cache_capacity()
         settings = self._settings()
         settings.setValue(_RESULT_CACHE_CAPACITY_KEY, value)
-        self._sync_or_raise(settings, "result cache capacity")
+        self._sync_or_report(
+            settings,
+            "result cache capacity",
+            success_message=(
+                f"Result cache capacity set to {value} per mechanism tab."
+            ),
+        )
         if previous != value:
             self.resultCacheCapacityChanged.emit(value)
         return value
@@ -228,19 +239,7 @@ class ConfigController(QtCore.QObject):
         )
         if not accepted:
             return
-        try:
-            saved = self.set_result_cache_capacity(int(value))
-        except Exception as exc:
-            logger.exception("Result cache capacity could not be persisted")
-            QtWidgets.QMessageBox.critical(
-                parent,
-                "Result Cache Capacity",
-                f"Could not save the result cache capacity:\n\n{exc}",
-            )
-            return
-        self._ui.set_status_text(
-            f"Result cache capacity set to {saved} per mechanism tab."
-        )
+        self.set_result_cache_capacity(int(value))
 
     def mechanism_parameter_debounce_ms(self) -> int:
         return self._debounce_setting(
@@ -254,6 +253,7 @@ class ConfigController(QtCore.QObject):
             _MECHANISM_PARAMETER_DEBOUNCE_KEY,
             value,
             label="mechanism parameter debounce",
+            success_message="Parameter preview debounce set to {value} ms.",
         )
         if previous != accepted:
             self.mechanismParameterDebounceChanged.emit(accepted)
@@ -271,6 +271,7 @@ class ConfigController(QtCore.QObject):
             _EQUILIBRIUM_K_DEBOUNCE_KEY,
             value,
             label="equilibrium-K debounce",
+            success_message="Equilibrium preview debounce set to {value} ms.",
         )
         if previous != accepted:
             self.equilibriumKDebounceChanged.emit(accepted)
@@ -288,13 +289,18 @@ class ConfigController(QtCore.QObject):
         value: int,
         *,
         label: str,
+        success_message: str,
     ) -> int:
         if type(value) is not int:
             raise TypeError(f"{label} must be an integer.")
         accepted = min(1000, max(0, value))
         settings = self._settings()
         settings.setValue(key, accepted)
-        self._sync_or_raise(settings, label)
+        self._sync_or_report(
+            settings,
+            label,
+            success_message=success_message.format(value=accepted),
+        )
         return accepted
 
     @staticmethod
@@ -386,11 +392,11 @@ class ConfigController(QtCore.QObject):
                         float,
                     )
                 ),
-                sparse_jacobian_policy=bool(
+                analytic_jacobian_policy=bool(
                     self._setting(
                         settings,
-                        _SCIENTIFIC_SETTINGS_KEYS["sparse_jacobian_policy"],
-                        factory.sparse_jacobian_policy,
+                        _SCIENTIFIC_SETTINGS_KEYS["analytic_jacobian_policy"],
+                        factory.analytic_jacobian_policy,
                         bool,
                     )
                 ),
@@ -508,10 +514,7 @@ class ConfigController(QtCore.QObject):
 
     @staticmethod
     def validate_fit_defaults_candidate(candidate: FitDefaults) -> FitDefaults:
-        if not isinstance(candidate, FitDefaults):
-            raise TypeError("candidate must be FitDefaults.")
-        probe = default_project_document(fit_defaults=candidate)
-        return probe.fit_defaults
+        return validate_fit_defaults(candidate)
 
     def persist_run_defaults(
         self,
@@ -521,7 +524,7 @@ class ConfigController(QtCore.QObject):
         settings = self._settings()
         for field_name, key in _RUN_SETTINGS_KEYS.items():
             settings.setValue(key, getattr(accepted, field_name))
-        self._sync_or_raise(settings, "Run defaults")
+        self._sync_or_report(settings, "Run defaults")
         return accepted
 
     def persist_scientific_defaults(
@@ -532,7 +535,7 @@ class ConfigController(QtCore.QObject):
         settings = self._settings()
         for field_name, key in _SCIENTIFIC_SETTINGS_KEYS.items():
             settings.setValue(key, getattr(accepted, field_name))
-        self._sync_or_raise(settings, "tab-scientific defaults")
+        self._sync_or_report(settings, "tab-scientific defaults")
         return accepted
 
     def persist_fit_defaults(self, candidate: FitDefaults) -> FitDefaults:
@@ -540,7 +543,13 @@ class ConfigController(QtCore.QObject):
         settings = self._settings()
         for field_name, key in _FIT_SETTINGS_KEYS.items():
             settings.setValue(key, getattr(accepted, field_name))
-        self._sync_or_raise(settings, "Fit defaults")
+        self._sync_or_report(
+            settings,
+            "Fit defaults",
+            success_message=(
+                "Application Fit defaults updated for newly created projects."
+            ),
+        )
         return accepted
 
     def load_settings(self) -> None:
@@ -593,7 +602,8 @@ class ConfigController(QtCore.QObject):
                 save_splitter = getattr(splitter, "saveState", None)
                 if callable(save_splitter):
                     settings.setValue("window/splitter_state", save_splitter())
-            self._sync_or_raise(settings, "layout preferences")
+            if not self._sync_or_report(settings, "layout preferences"):
+                return False
         except Exception as exc:
             logger.warning("Could not save layout preferences: %s", exc)
             return False
@@ -602,7 +612,7 @@ class ConfigController(QtCore.QObject):
     def persist_theme(self, dark_mode: bool) -> None:
         settings = self._settings()
         settings.setValue(_THEME_KEY, bool(dark_mode))
-        self._sync_or_raise(settings, "theme")
+        self._sync_or_report(settings, "theme")
 
     def toggle_theme(self) -> bool:
         action = self._ui.dark_mode_action()
@@ -623,11 +633,27 @@ class ConfigController(QtCore.QObject):
             )
         return actual
 
-    @staticmethod
-    def _sync_or_raise(settings: QtCore.QSettings, label: str) -> None:
-        settings.sync()
-        if settings.status() != QtCore.QSettings.Status.NoError:
-            raise RuntimeError(f"Could not persist {label}.")
+    def _sync_or_report(
+        self,
+        settings: QtCore.QSettings,
+        label: str,
+        *,
+        success_message: str | None = None,
+    ) -> bool:
+        try:
+            settings.sync()
+            if settings.status() != QtCore.QSettings.Status.NoError:
+                raise RuntimeError(f"Could not persist {label}.")
+        except Exception as exc:
+            logger.warning("Could not persist %s: %s", label, exc)
+            self._ui.set_status_text(
+                f"Could not save {label}; the new value remains active "
+                "for this session."
+            )
+            return False
+        if success_message is not None:
+            self._ui.set_status_text(success_message)
+        return True
 
     @staticmethod
     def _discard_invalid_state(settings: QtCore.QSettings, key: str) -> None:
@@ -709,7 +735,7 @@ class ConfigController(QtCore.QObject):
     def _persist_recent_projects(self, projects: Sequence[str]) -> None:
         settings = self._settings()
         settings.setValue(_RECENT_PROJECTS_KEY, list(projects))
-        self._sync_or_raise(settings, "recent projects")
+        self._sync_or_report(settings, "recent projects")
         self.update_recent_files_menu()
 
     def populate_recent_menu(self, menu: QtWidgets.QMenu) -> None:
@@ -788,7 +814,7 @@ class ConfigController(QtCore.QObject):
         overrides[canonical] = QtGui.QColor(color).name(QtGui.QColor.NameFormat.HexRgb)
         settings = self._settings()
         settings.setValue(_SPECIES_COLORS_KEY, overrides)
-        self._sync_or_raise(settings, "species colors")
+        self._sync_or_report(settings, "species colors")
         self.applicationPlotPreferencesChanged.emit()
 
     def species_color_strings(
@@ -822,7 +848,7 @@ class ConfigController(QtCore.QObject):
         accepted = self._validate_experimental_point_size(size)
         settings = self._settings()
         settings.setValue(_EXPERIMENTAL_POINT_SIZE_KEY, accepted)
-        self._sync_or_raise(settings, "experimental point size")
+        self._sync_or_report(settings, "experimental point size")
         self.applicationPlotPreferencesChanged.emit()
         return accepted
 
@@ -842,7 +868,7 @@ class ConfigController(QtCore.QObject):
         accepted = self._validate_experimental_point_opacity(opacity)
         settings = self._settings()
         settings.setValue(_EXPERIMENTAL_POINT_OPACITY_KEY, accepted)
-        self._sync_or_raise(settings, "experimental point opacity")
+        self._sync_or_report(settings, "experimental point opacity")
         self.applicationPlotPreferencesChanged.emit()
         return accepted
 

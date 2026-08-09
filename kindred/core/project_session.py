@@ -19,6 +19,7 @@ from kindred.core.project_presentation_state import (
 
 __all__ = [
     "ProjectContentToken",
+    "PreparedDocumentMutation",
     "PreparedProjectInstall",
     "ProjectSession",
     "SavedArchiveBaseline",
@@ -38,6 +39,13 @@ class PreparedProjectInstall:
     document: ProjectDocument
     path: str | None
     saved_baseline: SavedArchiveBaseline
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedDocumentMutation:
+    """A fully validated canonical document ready for non-fallible commit."""
+
+    document: ProjectDocument
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,9 +148,19 @@ class ProjectSession:
             presentation
         )
 
-    def replace_document(
+    def prepare_document_mutation(
         self,
         document: ProjectDocument,
+    ) -> PreparedDocumentMutation:
+        """Validate one proposed canonical document without publishing it."""
+
+        return PreparedDocumentMutation(
+            document=validate_project_document(document),
+        )
+
+    def commit_document_mutation(
+        self,
+        prepared: PreparedDocumentMutation,
         *,
         expected_token: ProjectContentToken,
         fence_deletions: Callable[
@@ -150,18 +168,20 @@ class ProjectSession:
             None,
         ],
     ) -> ProjectContentToken | None:
-        """Conditionally validate, fence, and publish one document value.
+        """Conditionally fence and publish one prepared document value.
 
         ``None`` means a newer canonical document or presentation superseded
         the caller.  An unchanged document is an accepted no-op and returns
         the still-current token.
         """
 
+        if not isinstance(prepared, PreparedDocumentMutation):
+            raise TypeError("prepared must be PreparedDocumentMutation.")
         if not callable(fence_deletions):
             raise TypeError("fence_deletions must be callable.")
         if not self.is_content_token_current(expected_token):
             return None
-        candidate = validate_project_document(document)
+        candidate = prepared.document
         if candidate == self.document:
             return self.capture_content_token()
         fence_deletions(self.document, candidate)

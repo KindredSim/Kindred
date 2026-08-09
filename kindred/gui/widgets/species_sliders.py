@@ -8,7 +8,10 @@ from typing import Mapping, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.gui.species_sliders_logic import compute_slider_max_option_c
+from kindred.gui.species_sliders_logic import (
+    compute_slider_max_option_c,
+    _scale_finite_gui_range,
+)
 
 __all__ = ["BatchSpeciesSliders", "format_slider_value"]
 
@@ -161,13 +164,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 )
             normalized[name] = value
             normalized_display_names[name] = display
-        logical_scope_signature = self._logical_visibility_scope(
-            visibility_scope_signature,
-            tuple(normalized),
-        )
         self._reconcile_visibility_scope(
             set(normalized),
-            logical_scope_signature,
+            visibility_scope_signature,
             preserve_visibility=preserve_visibility,
         )
         self._target_set_ids = tuple(str(item) for item in target_set_ids)
@@ -384,21 +383,25 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def _reconcile_visibility_scope(
         self,
         names: set[str],
-        signature: object,
+        supplied_signature: object | None,
         *,
         preserve_visibility: bool,
     ) -> None:
-        """Reconcile visibility once for a structural scope transition."""
-        same_scope = bool(
-            preserve_visibility and self._scope_signature == signature
+        """Reconcile choices by stable canonical species identity."""
+        signature = frozenset(
+            str(name)
+            for name in (names if supplied_signature is None else supplied_signature)
         )
-        if names:
-            if same_scope:
-                self._hidden_species.intersection_update(names)
-            else:
-                self._hidden_species = set(names)
-        elif not preserve_visibility:
-            self._hidden_species.clear()
+        if signature != names:
+            raise ValueError(
+                "Species visibility scope names must match slider values."
+            )
+        previous = self._scope_signature
+        if not preserve_visibility or previous is None:
+            self._hidden_species = set(names)
+        else:
+            preserved = names.intersection(self._hidden_species)
+            self._hidden_species = preserved | (names - set(previous))
         self._scope_signature = signature
 
     def _update_row_projection(
@@ -437,7 +440,11 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         if not math.isfinite(value_f) or value_f < 0.0:
             return
         if value_f > row.maximum:
-            row.maximum = max(value_f, row.maximum * 2.0, 1e-12)
+            row.maximum = max(
+                value_f,
+                _scale_finite_gui_range(row.maximum, 2.0),
+                1e-12,
+            )
             row.maximum_label.setText(format_slider_value(row.maximum))
         self._values[species_s] = value_f
         if species_s not in self._active_drag_species:
@@ -550,24 +557,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             editor.setText(str(text))
         finally:
             del blocker
-
-    @staticmethod
-    def _logical_visibility_scope(
-        supplied: object,
-        species_names: tuple[str, ...],
-    ) -> object:
-        """Discard volatile values from a name/value scope projection."""
-
-        if isinstance(supplied, tuple) and len(supplied) == len(species_names):
-            projected_names: list[str] = []
-            for item in supplied:
-                if not isinstance(item, tuple) or len(item) != 2:
-                    break
-                projected_names.append(str(item[0]))
-            else:
-                if tuple(projected_names) == species_names:
-                    return species_names
-        return species_names if supplied is None else supplied
 
     @staticmethod
     def _value_to_position(value: float, maximum: float) -> int:

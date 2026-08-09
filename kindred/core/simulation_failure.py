@@ -105,11 +105,6 @@ def coerce_simulation_failure(value: object) -> SimulationFailure:
     )
 
 
-def is_cancelled_failure(value: object) -> bool:
-    payload = coerce_simulation_failure(value)
-    return str(payload.get("kind") or "") == "cancelled"
-
-
 def simulation_failure_user_message(value: object) -> str:
     payload = coerce_simulation_failure(value)
     kind = str(payload.get("kind") or "")
@@ -121,7 +116,6 @@ def simulation_failure_user_message(value: object) -> str:
     if kind == "preparation_error":
         prefixes = {
             "parse": "Failed to parse mechanism",
-            "prepared_payload": "Prepared simulation payload invalid",
             "solver_config": "Invalid solver configuration",
             "parameter_algebra": "Parameter algebra failed",
             "ode_build": "Failed to build ODE system",

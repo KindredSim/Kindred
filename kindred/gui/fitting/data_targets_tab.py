@@ -11,7 +11,7 @@ from kindred.gui.fitting.unified_dataset_list import UnifiedDatasetList
 
 
 class DataTargetsTab(QtWidgets.QWidget):
-    """Unified master/detail container: dataset list left, stacked panels right."""
+    """Unified master/detail container: dataset list left, one table right."""
 
     def __init__(
         self,
@@ -52,23 +52,8 @@ class DataTargetsTab(QtWidgets.QWidget):
         left_scroll.setWidget(left_panel)
         splitter.addWidget(left_scroll)
 
-        # RIGHT: scroll area with species table only
-        scroll = QtWidgets.QScrollArea(splitter)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-
-        container = QtWidgets.QWidget()
-        container.setSizePolicy(
-            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred
-        )
-        detail_layout = QtWidgets.QVBoxLayout(container)
-        detail_layout.setContentsMargins(0, 0, 0, 0)
-        detail_layout.setSpacing(10)
-
-        detail_layout.addWidget(self.species_table)
-
-        scroll.setWidget(container)
-        splitter.addWidget(scroll)
+        # RIGHT: one screenshot-authoritative unified species/IC presenter.
+        splitter.addWidget(self.species_table)
 
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
@@ -78,13 +63,13 @@ class DataTargetsTab(QtWidgets.QWidget):
 
         layout.addWidget(splitter)
 
-        # Override MinimumExpanding policies so the scroll area can scroll.
+        # Keep the unified presenter visible as one physical table.
         sp = self.species_table.sizePolicy()
         if sp.verticalPolicy() == QtWidgets.QSizePolicy.MinimumExpanding:
             sp.setVerticalPolicy(QtWidgets.QSizePolicy.Preferred)
             self.species_table.setSizePolicy(sp)
 
-        # Ensure species table doesn't collapse inside scroll area.
+        # Ensure the unified table does not collapse inside the splitter.
         self.species_table.setMinimumHeight(300)
 
         # Wire unified list selection to both panels.

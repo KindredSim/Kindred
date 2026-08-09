@@ -11,7 +11,7 @@ import math
 from dataclasses import replace
 from typing import Sequence
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
 
@@ -35,17 +35,16 @@ from kindred.gui.ui_helpers import setup_scientific_validator
 
 
 class _Col:
-    """Column indices for the historical unified species table."""
+    """Data-and-Targets column indices."""
 
     INCLUDE = 0
     WEIGHT = 1
     SPECIES = 2
     INITIAL = 3
-    FIT_IC = 4
+    FIT = 4
     LOG10 = 5
-    MIN = 6
-    MAX = 7
-
+    MINIMUM = 6
+    MAXIMUM = 7
     COUNT = 8
     HEADERS = [
         "Include in Fit",
@@ -70,6 +69,7 @@ _RAW_ID_ROLE = Qt.ItemDataRole.UserRole + 2
 _RAW_COLUMN_ROLE = Qt.ItemDataRole.UserRole + 3
 _MODEL_TARGET_ROLE = Qt.ItemDataRole.UserRole + 4
 _SPECIES_ROLE = Qt.ItemDataRole.UserRole + 5
+_EXACT_VALUE_ROLE = Qt.ItemDataRole.UserRole + 6
 
 
 class _ValidationCellDelegate(QtWidgets.QStyledItemDelegate):
@@ -121,11 +121,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     """Historical target/weight/initial presentation with typed edit hooks."""
 
     # The payload is the tuple already consumed by FittingWindow's
-    # setupEditsRequested signal.  targetsApplied only acknowledges the
-    # presentation route after that synchronous owner-facing emission; it
-    # does not accept or retain Fit state.
+    # setupEditsRequested signal. The table owns pending target/weight drafts
+    # locally; accepted-state acknowledgement comes only from the owner.
     setupEditsRequested = Signal(object)
-    targetsApplied = Signal()
     validityChanged = Signal()
     statusMessage = Signal(str)
 
@@ -161,8 +159,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._pending_target_selections: dict[str, tuple[str, ...]] = {}
         self._pending_target_weights: dict[tuple[str, str], float] = {}
         self._pending_dataset_weights: dict[str, float] = {}
-        self._pending_initials: dict[tuple[str, str], FitInitialVariable] = {}
+        self._pending_initial_rows: dict[tuple[str, str], dict[str, object]] = {}
+        self._pending_initial_values: dict[
+            tuple[str, str], dict[str, object]
+        ] = {}
+        self._initial_changed_fields: dict[tuple[str, str], set[str]] = {}
         self._invalid_raw: dict[tuple[str, ...], str] = {}
+        self._invalid_initial_raw: dict[tuple[str, str, str], str] = {}
         self._refreshing = False
         self._running = False
 
@@ -185,12 +188,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._footer = ConfigPanelFooter(
             group,
             show_dirty=True,
-            show_secondary_error=True,
             show_divider=True,
             apply_requires_no_error=False,
             button_order=("apply", "revert"),
             error_object_name="global_fit_species_table_error",
-            secondary_error_object_name="global_fit_species_table_run_blocked",
             apply_object_name="global_fit_species_table_apply",
             revert_object_name="global_fit_species_table_revert",
         )
@@ -289,6 +290,40 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         layout.addWidget(group, stretch=1)
 
+    def set_origin(
+        self,
+        origin: FitOriginSnapshot,
+        *,
+        preserve_drafts: bool = False,
+    ) -> None:
+        """Install a new captured origin without introducing a second store."""
+
+        if not isinstance(origin, FitOriginSnapshot):
+            raise TypeError("origin must be FitOriginSnapshot.")
+        if origin.capture_id != self._origin.capture_id and not preserve_drafts:
+            self._pending_target_selections.clear()
+            self._pending_target_weights.clear()
+            self._pending_dataset_weights.clear()
+            self._pending_initial_rows.clear()
+            self._pending_initial_values.clear()
+            self._initial_changed_fields.clear()
+            self._invalid_raw.clear()
+            self._invalid_initial_raw.clear()
+        self._origin = origin
+
+    def clear_pending_edits(self) -> None:
+        """Discard this presenter's raw drafts and validation state."""
+
+        self._pending_target_selections.clear()
+        self._pending_target_weights.clear()
+        self._pending_dataset_weights.clear()
+        self._pending_initial_rows.clear()
+        self._pending_initial_values.clear()
+        self._initial_changed_fields.clear()
+        self._invalid_raw.clear()
+        self._invalid_initial_raw.clear()
+        self._refresh_visible_presentation()
+
     # ------------------------------------------------------------------
     # Typed snapshot projection
     # ------------------------------------------------------------------
@@ -314,6 +349,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             raise ValueError("Fit snapshot does not contain the selected dataset.")
 
         self._projected_setup = snapshot
+        for dataset in snapshot.datasets:
+            self._purge_parametric_x_pending(dataset)
         self._current_dataset_id = requested_id or (
             available_ids[0] if available_ids else None
         )
@@ -397,10 +434,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             None,
         )
 
-    def _pending_dataset(self, dataset_id: str) -> FitDatasetLocalSettings | None:
-        del dataset_id
-        return None
-
     def _current_dataset(self) -> FitDatasetLocalSettings | None:
         if self._projected_setup is None or not self._current_dataset_id:
             return None
@@ -416,39 +449,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             None,
         )
 
-    def _dataset_id_for_set(self, set_id: str) -> str:
-        return next(
-            (
-                item.dataset_id
-                for item in self._origin.mapped_datasets
-                if item.set_id == set_id
-            ),
-            "",
-        )
-
-    def _initial_variable(
-        self,
-        set_id: str,
-        species: str,
-    ) -> FitInitialVariable | None:
-        pending = self._pending_initials.get((set_id, species))
-        if pending is not None:
-            return pending
-        setup = self._current_setup()
-        if setup is None:
-            return None
-        return next(
-            (
-                item
-                for item in setup.initials
-                if item.set_id == set_id and item.species == species
-            ),
-            None,
-        )
-
     @staticmethod
     def _float_text(value: float) -> str:
-        return f"{float(value):.6g}"
+        # ``repr`` is the display projection of the accepted binary64 value;
+        # it round-trips without silently changing scientific state.
+        return repr(float(value))
 
     @staticmethod
     def _set_editable(item: QtWidgets.QTableWidgetItem, enabled: bool) -> None:
@@ -504,6 +509,36 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             )
         )
 
+    def _local_initial(
+        self,
+        dataset: FitDatasetLocalSettings,
+        species: str,
+    ) -> FitInitialVariable | None:
+        setup = self._current_setup()
+        if setup is None:
+            return None
+        mapped = self._mapped_dataset(dataset.dataset_id)
+        if mapped is None:
+            return None
+        return next(
+            (
+                item
+                for item in setup.initials
+                if item.set_id == mapped.set_id and item.species == species
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _initial_raw(initial: FitInitialVariable) -> dict[str, object]:
+        return {
+            "initial": UnifiedSpeciesTable._float_text(initial.initial),
+            "minimum": UnifiedSpeciesTable._float_text(initial.minimum),
+            "maximum": UnifiedSpeciesTable._float_text(initial.maximum),
+            "fit": bool(initial.fit),
+            "log10": bool(initial.log10),
+        }
+
     def _observations_for_target(
         self,
         dataset: FitDatasetLocalSettings,
@@ -544,20 +579,17 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         mapped = self._mapped_dataset(dataset.dataset_id)
         if mapped is None:
             return
+        self._purge_parametric_x_pending(dataset)
+        x_name = dataset.parametric.x_name if dataset.parametric is not None else None
         selected = set(
             self._pending_target_selections.get(
                 dataset.dataset_id,
                 dataset.target_species,
             )
         )
+        if x_name is not None:
+            selected.discard(x_name)
         weights = dict(dataset.target_weights)
-        set_id = mapped.set_id
-        initial_rows = {
-            item.species: item
-            for item in self._current_setup().initials
-            if item.set_id == set_id
-        } if self._current_setup() is not None else {}
-
         compact = compact_dataset_label(
             mapped.display_name,
             max_chars=DATASET_LIST_LABEL_MAX_CHARS,
@@ -571,8 +603,18 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         for row, species in enumerate(row_species):
             observations = self._observations_for_target(dataset, species)
             has_data = bool(observations)
+            local = self._local_initial(dataset, species)
+            local_key = (
+                mapped.set_id if mapped is not None else "",
+                species,
+            )
+            raw_initial = self._pending_initial_rows.get(
+                local_key,
+                self._initial_raw(local) if local is not None else {},
+            )
             target_item = QtWidgets.QTableWidgetItem()
-            self._set_checkable(target_item, species in selected, has_data)
+            eligible = has_data and species != x_name
+            self._set_checkable(target_item, species in selected, eligible)
             target_item.setData(_DATASET_ROLE, dataset.dataset_id)
             target_item.setData(_RAW_ID_ROLE, tuple(item.raw_observation_id for item in observations))
             target_item.setData(_RAW_COLUMN_ROLE, tuple(item.raw_column for item in observations))
@@ -597,10 +639,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 )
             )
             weight_item = QtWidgets.QTableWidgetItem(
-                weight_text if has_data else ""
+                weight_text if eligible else ""
             )
             weight_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._set_editable(weight_item, has_data)
+            self._set_editable(weight_item, eligible)
             weight_item.setData(_DATASET_ROLE, dataset.dataset_id)
             weight_item.setData(
                 _RAW_ID_ROLE,
@@ -630,85 +672,48 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 species_item.setToolTip(tooltip)
             self._table.setItem(row, _Col.SPECIES, species_item)
 
-            initial = self._pending_initials.get(
-                (set_id, species),
-                initial_rows.get(species),
-            )
-            mapped_value = dict(mapped.initial_values).get(species)
-            if initial is None and mapped_value is None:
-                for column in (
-                    _Col.INITIAL,
-                    _Col.FIT_IC,
-                    _Col.LOG10,
-                    _Col.MIN,
-                    _Col.MAX,
-                ):
-                    disabled = QtWidgets.QTableWidgetItem("")
-                    disabled.setFlags(Qt.ItemFlag.ItemIsSelectable)
-                    self._table.setItem(row, column, disabled)
-                continue
-
-            initial_item = QtWidgets.QTableWidgetItem(
-                self._float_text(initial.initial if initial else mapped_value)
-            )
-            initial_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._set_editable(initial_item, initial is not None)
-            initial_item.setData(_DATASET_ROLE, dataset.dataset_id)
-            initial_item.setData(_SET_ROLE, set_id)
-            initial_item.setData(_SPECIES_ROLE, species)
-            initial_item.setToolTip(f"Set ID: {set_id}\nSpecies ID: {species}")
-            self._table.setItem(row, _Col.INITIAL, initial_item)
-
-            fit_item = QtWidgets.QTableWidgetItem()
-            self._set_checkable(fit_item, bool(initial and initial.fit), initial is not None)
-            fit_item.setData(_DATASET_ROLE, dataset.dataset_id)
-            fit_item.setData(_SET_ROLE, set_id)
-            fit_item.setData(_SPECIES_ROLE, species)
-            self._table.setItem(row, _Col.FIT_IC, fit_item)
-
-            log_item = QtWidgets.QTableWidgetItem()
-            self._set_checkable(
-                log_item,
-                bool(initial and initial.log10),
-                bool(initial and initial.fit),
-            )
-            log_item.setData(_DATASET_ROLE, dataset.dataset_id)
-            log_item.setData(_SET_ROLE, set_id)
-            log_item.setData(_SPECIES_ROLE, species)
-            self._table.setItem(row, _Col.LOG10, log_item)
-
-            for column, value in (
-                (_Col.MIN, initial.minimum if initial else ""),
-                (_Col.MAX, initial.maximum if initial else ""),
-            ):
-                bound_item = QtWidgets.QTableWidgetItem(
-                    self._float_text(value) if initial else ""
-                )
-                bound_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self._set_editable(bound_item, initial is not None)
-                bound_item.setData(_DATASET_ROLE, dataset.dataset_id)
-                bound_item.setData(_SET_ROLE, set_id)
-                bound_item.setData(_SPECIES_ROLE, species)
-                bound_item.setToolTip(f"Set ID: {set_id}\nSpecies ID: {species}")
-                self._table.setItem(row, column, bound_item)
-
             for column, field in (
                 (_Col.INITIAL, "initial"),
-                (_Col.MIN, "minimum"),
-                (_Col.MAX, "maximum"),
+                (_Col.MINIMUM, "minimum"),
+                (_Col.MAXIMUM, "maximum"),
             ):
-                key = (
-                    "initial",
-                    dataset.dataset_id,
-                    set_id,
-                    species,
-                    field,
+                invalid_key = (mapped.set_id, species, field)
+                initial_item = QtWidgets.QTableWidgetItem(
+                    self._invalid_initial_raw.get(
+                        invalid_key,
+                        str(raw_initial.get(field, "")),
+                    )
                 )
-                item = self._table.item(row, column)
-                if item is not None and key in self._invalid_raw:
-                    item.setText(self._invalid_raw[key])
-                    item.setBackground(_INVALID_BG)
-                    item.setForeground(_INVALID_FG)
+                self._set_editable(initial_item, local is not None)
+                initial_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                initial_item.setData(_DATASET_ROLE, dataset.dataset_id)
+                initial_item.setData(_SET_ROLE, mapped.set_id)
+                initial_item.setData(_SPECIES_ROLE, species)
+                if local is not None:
+                    initial_item.setData(_EXACT_VALUE_ROLE, getattr(local, field))
+                if invalid_key in self._invalid_initial_raw:
+                    initial_item.setBackground(_INVALID_BG)
+                    initial_item.setForeground(_INVALID_FG)
+                    initial_item.setToolTip(self._invalid_initial_raw[invalid_key])
+                self._table.setItem(row, column, initial_item)
+
+            for column, field in ((_Col.FIT, "fit"), (_Col.LOG10, "log10")):
+                check_item = QtWidgets.QTableWidgetItem()
+                self._set_checkable(
+                    check_item,
+                    bool(raw_initial.get(field, False)),
+                    local is not None and (field == "fit" or bool(raw_initial.get("fit", False))),
+                )
+                check_item.setData(_DATASET_ROLE, dataset.dataset_id)
+                check_item.setData(_SET_ROLE, mapped.set_id)
+                check_item.setData(_SPECIES_ROLE, species)
+                if local is not None:
+                    check_item.setData(
+                        _EXACT_VALUE_ROLE,
+                        getattr(local, field),
+                    )
+                self._table.setItem(row, column, check_item)
+
 
     def _refresh_visible_presentation(self) -> None:
         self._refreshing = True
@@ -728,6 +733,27 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._refresh_footer_dirty()
         self._refresh_footer_validity()
 
+    def _purge_parametric_x_pending(
+        self,
+        dataset: FitDatasetLocalSettings,
+    ) -> None:
+        """Drop target drafts that are invalid for this dataset's current X."""
+
+        parametric = dataset.parametric
+        if parametric is None:
+            return
+        dataset_id = dataset.dataset_id
+        x_name = parametric.x_name
+        pending = self._pending_target_selections.get(dataset_id)
+        if pending is not None:
+            filtered = tuple(target for target in pending if target != x_name)
+            if filtered == dataset.target_species:
+                self._pending_target_selections.pop(dataset_id, None)
+            else:
+                self._pending_target_selections[dataset_id] = filtered
+        self._pending_target_weights.pop((dataset_id, x_name), None)
+        self._invalid_raw.pop(("target_weight", dataset_id, x_name), None)
+
     # ------------------------------------------------------------------
     # Presentation edits
     # ------------------------------------------------------------------
@@ -737,6 +763,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         dataset_id = str(item.data(_DATASET_ROLE) or "")
         species = str(item.data(_SPECIES_ROLE) or item.data(_MODEL_TARGET_ROLE) or "")
         if not dataset_id or not species:
+            return
+        if item.column() in {
+            _Col.INITIAL,
+            _Col.FIT,
+            _Col.LOG10,
+            _Col.MINIMUM,
+            _Col.MAXIMUM,
+        }:
+            self._stage_initial_row(item)
             return
         if item.column() == _Col.WEIGHT:
             key = ("target_weight", dataset_id, species)
@@ -769,29 +804,135 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if item.column() == _Col.INCLUDE:
             self._stage_visible_target_selection(dataset_id)
             return
-        if item.column() in (
-            _Col.INITIAL,
-            _Col.FIT_IC,
-            _Col.LOG10,
-            _Col.MIN,
-            _Col.MAX,
-        ):
-            if item.column() == _Col.FIT_IC:
-                log_item = self._table.item(item.row(), _Col.LOG10)
-                if log_item is not None and item.checkState() != Qt.CheckState.PartiallyChecked:
-                    fit_checked = item.checkState() == Qt.CheckState.Checked
-                    self._table.blockSignals(True)
-                    try:
-                        self._set_checkable(
-                            log_item,
-                            log_item.checkState() == Qt.CheckState.Checked,
-                            fit_checked,
-                        )
-                        if not fit_checked:
-                            log_item.setCheckState(Qt.CheckState.Unchecked)
-                    finally:
-                        self._table.blockSignals(False)
-            self._stage_initial_item_edit(item)
+
+    def _stage_initial_row(self, item: QtWidgets.QTableWidgetItem) -> None:
+        """Retain one Local IC draft while parsing only the edited field."""
+
+        set_id = str(item.data(_SET_ROLE) or "").strip()
+        species = str(item.data(_SPECIES_ROLE) or "").strip()
+        if not set_id or not species:
+            return
+        fit_item = self._table.item(item.row(), _Col.FIT)
+        log_item = self._table.item(item.row(), _Col.LOG10)
+        if fit_item is None or log_item is None:
+            return
+        setup = self._current_setup()
+        accepted = next(
+            (
+                row
+                for row in (setup.initials if setup is not None else ())
+                if row.set_id == set_id and row.species == species
+            ),
+            None,
+        )
+        if accepted is None:
+            return
+        key = (set_id, species)
+        typed = dict(
+            self._pending_initial_values.get(
+                key,
+                {
+                    "initial": accepted.initial,
+                    "minimum": accepted.minimum,
+                    "maximum": accepted.maximum,
+                    "fit": accepted.fit,
+                    "log10": accepted.log10,
+                },
+            )
+        )
+        raw = dict(
+            self._pending_initial_rows.get(key, self._initial_raw(accepted))
+        )
+        changed = self._initial_changed_fields.setdefault(key, set())
+        field_by_column = {
+            _Col.INITIAL: "initial",
+            _Col.MINIMUM: "minimum",
+            _Col.MAXIMUM: "maximum",
+            _Col.FIT: "fit",
+            _Col.LOG10: "log10",
+        }
+        changed_field = field_by_column.get(item.column())
+        if changed_field in {"initial", "minimum", "maximum"}:
+            try:
+                parsed = float(item.text())
+                if not math.isfinite(parsed):
+                    raise ValueError("value must be finite")
+            except (TypeError, ValueError, OverflowError) as exc:
+                self._pending_initial_rows[key] = raw
+                self._pending_initial_values[key] = typed
+                field_key = (set_id, species, changed_field)
+                self._invalid_initial_raw[field_key] = item.text()
+                self._decorate_initial_field(item.row(), item.column(), str(exc))
+                self._refresh_footer_dirty()
+                self._refresh_footer_validity()
+                return
+            typed[changed_field] = parsed
+            raw[changed_field] = item.text()
+            changed.add(changed_field)
+        elif changed_field in {"fit", "log10"}:
+            fit = fit_item.checkState() == Qt.CheckState.Checked
+            log10 = log_item.checkState() == Qt.CheckState.Checked
+            if not fit and log10:
+                blocker = QtCore.QSignalBlocker(self._table)
+                log_item.setCheckState(Qt.CheckState.Unchecked)
+                del blocker
+                log10 = False
+            typed["fit"] = fit
+            typed["log10"] = log10
+            raw["fit"] = fit
+            raw["log10"] = log10
+            changed.update({"fit", "log10"})
+        self._pending_initial_rows[key] = raw
+        try:
+            initial = FitInitialVariable(
+                set_id=set_id,
+                species=species,
+                initial=float(typed["initial"]),
+                minimum=float(typed["minimum"]),
+                maximum=float(typed["maximum"]),
+                fit=bool(typed["fit"]),
+                log10=bool(typed["log10"]),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            self._pending_initial_values[key] = typed
+            if changed_field in {"initial", "minimum", "maximum"}:
+                field_key = (set_id, species, changed_field)
+                self._invalid_initial_raw[field_key] = raw.get(
+                    changed_field,
+                    item.text(),
+                )
+            self._decorate_initial_field(item.row(), item.column(), str(exc))
+        else:
+            if changed_field in {"initial", "minimum", "maximum"}:
+                self._invalid_initial_raw.pop((set_id, species, changed_field), None)
+            self._decorate_initial_field(item.row(), item.column(), None)
+            self._pending_initial_values[key] = {
+                "initial": initial.initial,
+                "minimum": initial.minimum,
+                "maximum": initial.maximum,
+                "fit": initial.fit,
+                "log10": initial.log10,
+            }
+            if accepted is not None and initial == accepted:
+                self._pending_initial_rows.pop(key, None)
+                self._pending_initial_values.pop(key, None)
+                self._initial_changed_fields.pop(key, None)
+        self._refresh_footer_dirty()
+        self._refresh_footer_validity()
+
+    def _decorate_initial_field(
+        self,
+        row: int,
+        column: int,
+        message: str | None,
+    ) -> None:
+        blocker = QtCore.QSignalBlocker(self._table)
+        item = self._table.item(row, column)
+        if item is not None:
+            item.setBackground(_INVALID_BG if message else _DEFAULT_BG)
+            item.setForeground(_INVALID_FG if message else _DEFAULT_FG)
+            item.setToolTip(message or "")
+        del blocker
 
     def _stage_visible_target_selection(self, dataset_id: str) -> None:
         projected = self._projected_dataset(dataset_id)
@@ -843,22 +984,30 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._refresh_footer_validity()
 
     def _selected_targets(self, dataset: FitDatasetLocalSettings) -> tuple[str, ...]:
-        return self._pending_target_selections.get(
+        selected = self._pending_target_selections.get(
             dataset.dataset_id,
             dataset.target_species,
         )
+        if dataset.parametric is not None:
+            selected = tuple(
+                target
+                for target in selected
+                if target != dataset.parametric.x_name
+            )
+        return selected
 
     def _eligible_targets(self, dataset_id: str) -> tuple[str, ...]:
         dataset = self._projected_dataset(dataset_id)
         mapped = self._mapped_dataset(dataset_id)
         if dataset is None or mapped is None:
             return ()
+        x_name = dataset.parametric.x_name if dataset.parametric is not None else None
         return tuple(
             dict.fromkeys(
                 target
                 for observation in mapped.observations
                 for target in (self._observation_target(dataset, observation),)
-                if target
+                if target and target != x_name
             )
         )
 
@@ -872,7 +1021,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         mapped = self._mapped_dataset(dataset_id)
         if current is None or mapped is None:
             return None
-        selected = self._selected_targets(current)
+        self._purge_parametric_x_pending(current)
+        x_name = current.parametric.x_name if current.parametric is not None else None
+        selected = tuple(
+            target
+            for target in self._selected_targets(current)
+            if target != x_name
+        )
         invalid_selected = [
             target
             for target in selected
@@ -891,25 +1046,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             )
             for target in selected
         )
-        current_raw_by_target = {
-            target: raw_id for raw_id, target in current.observation_targets
-        }
-        eligible_raw_by_target: dict[str, str] = {}
-        for observation in mapped.observations:
-            target = self._observation_target(current, observation)
-            eligible_raw_by_target.setdefault(
-                target,
-                observation.raw_observation_id,
-            )
         try:
-            observation_targets = tuple(
-                (
-                    current_raw_by_target.get(target)
-                    or eligible_raw_by_target[target],
-                    target,
-                )
-                for target in selected
-            )
             return replace(
                 current,
                 weight=self._pending_dataset_weights.get(
@@ -918,7 +1055,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 ),
                 target_species=selected,
                 target_weights=target_weights,
-                observation_targets=observation_targets,
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -926,81 +1062,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def _refresh_footer_dirty(self) -> None:
         self._footer.set_dirty(
             self.has_pending_target_changes
-            or bool(self._pending_initials)
+            or self.has_pending_initial_changes
             or bool(self._invalid_raw)
+            or bool(self._invalid_initial_raw)
         )
-
-    @staticmethod
-    def _initial_field(column: int) -> str | None:
-        return {
-            _Col.INITIAL: "initial",
-            _Col.FIT_IC: "fit",
-            _Col.LOG10: "log10",
-            _Col.MIN: "minimum",
-            _Col.MAX: "maximum",
-        }.get(column)
-
-    def _stage_initial_item_edit(self, item: QtWidgets.QTableWidgetItem) -> None:
-        dataset_id = str(item.data(_DATASET_ROLE) or "")
-        set_id = str(item.data(_SET_ROLE) or "")
-        species = str(item.data(_SPECIES_ROLE) or "")
-        current = self._initial_variable(set_id, species)
-        field = self._initial_field(item.column())
-        if current is None or field is None:
-            return
-        raw_key = (
-            "initial",
-            dataset_id,
-            set_id,
-            species,
-            field,
-        )
-        try:
-            if field in {"fit", "log10"}:
-                state = item.checkState()
-                if state == Qt.CheckState.PartiallyChecked:
-                    raise ValueError("Choose an explicit checked or unchecked state.")
-                value: object = state == Qt.CheckState.Checked
-            else:
-                value = float(item.text())
-                if not math.isfinite(value):
-                    raise ValueError("Initial-condition values must be finite.")
-            replacement = replace(current, **{field: value})
-            if field == "fit" and not bool(value):
-                replacement = replace(replacement, log10=False)
-        except (TypeError, ValueError, OverflowError) as exc:
-            self._invalid_raw[raw_key] = (
-                item.text()
-                if field not in {"fit", "log10"}
-                else str(int(item.checkState()))
-            )
-            self._mark_invalid(item, str(exc))
-            return
-        self._invalid_raw.pop(raw_key, None)
-        self._clear_invalid(item)
-        self._set_pending_initial(replacement)
-        self._refresh_footer_dirty()
-        self._refresh_footer_validity()
-
-    def _set_pending_initial(self, initial: FitInitialVariable) -> None:
-        projected = next(
-            (
-                item
-                for item in (self._current_setup().initials if self._current_setup() else ())
-                if item.set_id == initial.set_id and item.species == initial.species
-            ),
-            None,
-        )
-        key = (initial.set_id, initial.species)
-        if projected == initial:
-            self._pending_initials.pop(key, None)
-        else:
-            self._pending_initials[key] = initial
 
     def _apply_presentation_edits(self) -> None:
         """Overlay owned fields on latest rows and emit one atomic edit tuple."""
 
-        if self._invalid_raw:
+        if self._invalid_raw or self._invalid_initial_raw:
             self._refresh_footer_validity()
             return
         dataset_ids = {
@@ -1023,32 +1093,47 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             )
             for overlay in overlays
         )
+        setup = self._current_setup()
+        current_initials = {
+            (item.set_id, item.species): item
+            for item in (setup.initials if setup is not None else ())
+        }
         initial_intents = tuple(
             FitInitialSetupEdit(
                 origin_tab_id=self._origin.tab_id,
                 origin_capture_id=self._origin.capture_id,
-                initial=initial,
+                initial=replace(
+                    current_initials[key],
+                    initial=float(self._pending_initial_values[key]["initial"]),
+                    minimum=float(self._pending_initial_values[key]["minimum"]),
+                    maximum=float(self._pending_initial_values[key]["maximum"]),
+                    fit=bool(self._pending_initial_values[key]["fit"]),
+                    log10=bool(self._pending_initial_values[key]["log10"]),
+                ),
             )
-            for initial in self._ordered_pending_initials()
+            for key, raw in self._pending_initial_rows.items()
+            if key in current_initials and key in self._pending_initial_values
         )
         intents = (*dataset_intents, *initial_intents)
         if not intents:
-            self.set_status("No pending Fit target or initial-condition changes.")
+            self.set_status("No pending Fit target, weight, or IC changes.")
             return
         self.setupEditsRequested.emit(intents)
         if self._acknowledge_applied_intents(intents):
-            self.targetsApplied.emit()
-            self.set_status("Fit target and initial-condition edits applied.")
+            self.set_status("Fit target, weight, and IC edits applied.")
         self._refresh_visible_presentation()
 
     def _revert_presentation_edits(self) -> None:
         self._pending_target_selections.clear()
         self._pending_target_weights.clear()
         self._pending_dataset_weights.clear()
-        self._pending_initials.clear()
+        self._pending_initial_rows.clear()
+        self._pending_initial_values.clear()
+        self._initial_changed_fields.clear()
         self._invalid_raw.clear()
+        self._invalid_initial_raw.clear()
         self._refresh_visible_presentation()
-        self.set_status("Pending Fit target and initial-condition edits reverted.")
+        self.set_status("Pending Fit target, weight, and IC edits reverted.")
 
     def _apply_bulk_action(self, action: str) -> None:
         if self._current_dataset() is None:
@@ -1115,29 +1200,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._refresh_visible_presentation()
         self.set_status(f"Copy Targets: {copied} copied, {skipped} skipped.")
 
-    def _ordered_pending_initials(self) -> tuple[FitInitialVariable, ...]:
-        setup = self._current_setup()
-        if setup is None:
-            return ()
-        return tuple(
-            self._pending_initials[key]
-            for item in setup.initials
-            for key in ((item.set_id, item.species),)
-            if key in self._pending_initials
-        )
-
     def _acknowledge_applied_intents(self, intents: tuple[object, ...]) -> bool:
         setup = self._current_setup()
         if setup is None:
             return False
         datasets = {item.dataset_id: item for item in setup.datasets}
-        initials = {(item.set_id, item.species): item for item in setup.initials}
         if any(
             isinstance(intent, FitDatasetSetupEdit)
             and datasets.get(intent.dataset.dataset_id) != intent.dataset
-            or isinstance(intent, FitInitialSetupEdit)
-            and initials.get((intent.initial.set_id, intent.initial.species))
-            != intent.initial
             for intent in intents
         ):
             return False
@@ -1150,10 +1220,22 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     if key[0] == dataset_id:
                         self._pending_target_weights.pop(key, None)
             elif isinstance(intent, FitInitialSetupEdit):
-                self._pending_initials.pop(
-                    (intent.initial.set_id, intent.initial.species),
+                key = (intent.initial.set_id, intent.initial.species)
+                current = next(
+                    (
+                        item
+                        for item in (self._current_setup().initials if self._current_setup() else ())
+                        if (item.set_id, item.species) == key
+                    ),
                     None,
                 )
+                if current == intent.initial:
+                    self._pending_initial_rows.pop(key, None)
+                    self._pending_initial_values.pop(key, None)
+                    self._initial_changed_fields.pop(key, None)
+                    for invalid_key in tuple(self._invalid_initial_raw):
+                        if invalid_key[:2] == key:
+                            self._invalid_initial_raw.pop(invalid_key, None)
         return True
 
     # ------------------------------------------------------------------
@@ -1247,8 +1329,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
     def _refresh_footer_validity(self) -> None:
         message = (
-            "Correct invalid target or initial-condition values before running."
-            if self._invalid_raw
+            "Correct invalid target, weight, or IC values before running."
+            if self._invalid_raw or self._invalid_initial_raw
             else None
         )
         self._set_footer_error(message)
@@ -1263,16 +1345,54 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         )
 
     @property
+    def has_pending_initial_changes(self) -> bool:
+        return bool(self._pending_initial_rows)
+
+    def add_observable_conflict(self, dataset_id: str) -> str | None:
+        """Return a same-dataset leaf draft that blocks Add Observable.
+
+        Add Observable replaces a raw observation's accepted target identity.
+        Target-selection and per-target-weight drafts for that same dataset
+        must be settled first so no pending dictionary can retain a retired
+        target key. Dataset-weight drafts and drafts for other datasets are
+        independent and do not block this action.
+        """
+
+        dataset_id = str(dataset_id or "").strip()
+        if not dataset_id:
+            return None
+        if dataset_id in self._pending_target_selections:
+            return (
+                "Apply or Revert the pending target selection for this dataset "
+                "before adding an observable."
+            )
+        if any(
+            pending_dataset_id == dataset_id
+            for pending_dataset_id, _target in self._pending_target_weights
+        ):
+            return (
+                "Apply or Revert the pending per-target weight edits for this "
+                "dataset before adding an observable."
+            )
+        if any(
+            len(key) >= 2
+            and key[0] == "target_weight"
+            and key[1] == dataset_id
+            for key in self._invalid_raw
+        ):
+            return (
+                "Apply or Revert the invalid per-target weight edits for this "
+                "dataset before adding an observable."
+            )
+        return None
+
+    @property
     def invalid_editor_keys(self) -> tuple[tuple[str, ...], ...]:
-        return tuple(sorted(self._invalid_raw))
+        return tuple(sorted((*self._invalid_raw, *self._invalid_initial_raw)))
 
     @property
     def invalid_raw_values(self) -> dict[tuple[str, ...], str]:
         return dict(self._invalid_raw)
-
-    @property
-    def has_pending_initial_changes(self) -> bool:
-        return bool(self._pending_initials)
 
 
 __all__ = ["UnifiedSpeciesTable"]

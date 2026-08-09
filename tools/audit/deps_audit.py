@@ -96,8 +96,6 @@ def _safe_relpath(path: Path, *, root: Path) -> str:
 def _is_excluded_relpath(rel: Path) -> bool:
     if "_audit_reports" in rel.parts:
         return True
-    if len(rel.parts) >= 2 and rel.parts[0] == "tools" and rel.parts[1] == "audit":
-        return True
     if any(p in EXCLUDE_DIR_NAMES for p in rel.parts):
         return True
     return False
@@ -146,7 +144,7 @@ def _iter_py_files(repo_root: Path) -> list[Path]:
 
 
 def _discover_local_roots(repo_root: Path) -> set[str]:
-    roots = {"kindred"}
+    roots = {"kindred", "tests", "tools"}
     for child in sorted(repo_root.iterdir(), key=lambda p: p.name):
         if not child.is_dir():
             continue
@@ -287,6 +285,7 @@ class ImportSite:
 class ScanResult:
     files_scanned: int
     parse_failures: int
+    parse_failure_paths: list[str]
     import_sites: list[ImportSite]
 
 
@@ -295,7 +294,7 @@ def _scan_imports(*, repo_root: Path, py_files: list[Path]) -> ScanResult:
     stdlib, used_fallback = _stdlib_names()
 
     import_sites: list[ImportSite] = []
-    parse_failures = 0
+    parse_failure_paths: list[str] = []
 
     def record_site(*, root: str, full: str, relpath: str, lineno: int, unguarded: bool) -> None:
         if not root:
@@ -325,13 +324,13 @@ def _scan_imports(*, repo_root: Path, py_files: list[Path]) -> ScanResult:
             with tokenize.open(path) as f:
                 src = f.read()
         except Exception:
-            parse_failures += 1
+            parse_failure_paths.append(relpath)
             continue
 
         try:
             tree = ast.parse(src, filename=relpath)
         except Exception:
-            parse_failures += 1
+            parse_failure_paths.append(relpath)
             continue
 
         def walk(node: ast.AST, *, nest: int, in_import_try: bool, in_type_checking: bool) -> None:
@@ -402,7 +401,12 @@ def _scan_imports(*, repo_root: Path, py_files: list[Path]) -> ScanResult:
         walk(tree, nest=0, in_import_try=False, in_type_checking=False)
 
     import_sites = sorted(import_sites, key=lambda s: (s.module_root.lower(), s.relpath, s.lineno, s.module_full))
-    return ScanResult(files_scanned=len(py_files), parse_failures=parse_failures, import_sites=import_sites)
+    return ScanResult(
+        files_scanned=len(py_files),
+        parse_failures=len(parse_failure_paths),
+        parse_failure_paths=sorted(parse_failure_paths),
+        import_sites=import_sites,
+    )
 
 
 def _candidate_dep_matches(*, module_norm: str, declared_norms: list[str]) -> list[str]:
@@ -453,7 +457,7 @@ def _write_report(*, repo_root: Path, out_file: Path) -> int:
         optional_non_test_norms |= norms
 
     declared_for_prod = core_norms | optional_non_test_norms
-    declared_for_tools = declared_for_prod
+    declared_for_tools = declared_for_prod | optional_test_norms
     declared_for_test = declared_for_prod | optional_test_norms
 
     py_files = _iter_py_files(repo_root)
@@ -553,6 +557,19 @@ def _write_report(*, repo_root: Path, out_file: Path) -> int:
         "pyproject_parse_warnings": len(dep_warnings),
         "stdlib_fallback": 1 if used_fallback else 0,
     }
+    status = (
+        "WARN"
+        if any(
+            (
+                counts["parse_failures"],
+                counts["undeclared_imports_prod"],
+                counts["unused_declared_deps"],
+                counts["unguarded_optional_imports"],
+                counts["pyproject_parse_warnings"],
+            )
+        )
+        else "PASS"
+    )
 
     lines: list[str] = []
     lines.append("Kindred Audit D: Deps vs imports (report-only)")
@@ -585,13 +602,26 @@ def _write_report(*, repo_root: Path, out_file: Path) -> int:
             ]
         )
     )
+    lines.append(f"AUDIT_D_STATUS|status={status}")
     lines.append("")
 
+    pyproject_status = "WARN" if dep_warnings else "PASS"
+    lines.append(f"PYPROJECT_WARNINGS ({pyproject_status}):")
     if dep_warnings:
-        lines.append("PYPROJECT_WARNINGS:")
         for w in dep_warnings:
             lines.append(f"- {w}")
-        lines.append("")
+    else:
+        lines.append("- (none)")
+    lines.append("")
+
+    parse_status = "WARN" if scan.parse_failure_paths else "PASS"
+    lines.append(f"SCAN_PARSE_FAILURES ({parse_status}):")
+    if scan.parse_failure_paths:
+        for relpath in scan.parse_failure_paths:
+            lines.append(f"- {relpath}")
+    else:
+        lines.append("- (none)")
+    lines.append("")
 
     lines.append("DECLARED_DEPENDENCIES:")
     if core_deps:
@@ -612,10 +642,12 @@ def _write_report(*, repo_root: Path, out_file: Path) -> int:
 
     lines.append("SCAN_SCOPE:")
     lines.append("- kindred/**, tools/**, tests/** (Python files only)")
-    lines.append("- excludes: _audit_reports/**,**, tools/audit/**, .venv/**, __pycache__/**, build/dist")
+    lines.append("- excludes: _audit_reports/**, .venv/**, __pycache__/**, build/dist")
+    lines.append("- dependency markers are evaluated across supported source paths, not only the running interpreter")
     lines.append("")
 
-    lines.append("UNDECLARED_IMPORTS_PROD (WARN):")
+    prod_status = "WARN" if undeclared_prod else "PASS"
+    lines.append(f"UNDECLARED_IMPORTS_PROD ({prod_status}):")
     if undeclared_prod:
         for root in undeclared_prod:
             lines.append(f"- {root}")
@@ -674,7 +706,8 @@ def _write_report(*, repo_root: Path, out_file: Path) -> int:
         lines.append("- (none)")
     lines.append("")
 
-    lines.append("OPTIONAL_DEP_IMPORTED_UNGUARDED (WARN):")
+    optional_guard_status = "WARN" if unguarded_optional_sites else "PASS"
+    lines.append(f"OPTIONAL_DEP_IMPORTED_UNGUARDED ({optional_guard_status}):")
     if unguarded_optional_sites:
         for site in unguarded_optional_sites:
             lines.append(f"- {site.module_root} | {site.relpath}:{site.lineno} | {site.module_full}")
@@ -682,7 +715,8 @@ def _write_report(*, repo_root: Path, out_file: Path) -> int:
         lines.append("- (none)")
     lines.append("")
 
-    lines.append("UNUSED_DECLARED_DEPS (WARN):")
+    unused_status = "WARN" if unused_declared_norms else "PASS"
+    lines.append(f"UNUSED_DECLARED_DEPS ({unused_status}):")
     if unused_declared_norms:
         for norm in unused_declared_norms:
             base = declared_norm_to_base.get(norm, norm)

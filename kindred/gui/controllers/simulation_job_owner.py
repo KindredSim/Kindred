@@ -3,48 +3,56 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import hashlib
 from numbers import Real
 import os
 from threading import Event
 from time import monotonic
-from typing import Callable, Iterable, Literal, Mapping
+from typing import Callable, Iterable, Literal
 
 import numpy as np
 from PySide6 import QtCore
 
 from kindred.core.exceptions import SimulationCancelled
-from kindred.core.intervention_schedule import coerce_intervention_schedule
-from kindred.core.mechanism_metadata import MechanismMetadataKeys
+from kindred.core.intervention_schedule_compiler import (
+    InterventionExecutionContract,
+)
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
     SimulationExecutionSettings,
     TabScientificSettings,
-    validate_simulation_execution_settings,
-    validate_tab_scientific_settings,
+    canonical_initial_values,
 )
 from kindred.core.result_repository import (
+    ExplicitResultCurrentFacts,
     ExplicitResultKey,
     PreviewResultIdentity,
     PreviewResultKey,
     ResultRepository,
     SimulationResultValue,
+    explicit_result_key_from_current_facts,
     explicit_result_key_from_values,
+    explicit_result_key_is_current,
     scientific_identity,
-    standard_concentration_identity,
 )
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulation_preparation import (
     PreparedSimulationRun,
     SimulationExecutionRequest,
+    build_simulation_execution_request,
+    metadata_view_for_mechanism,
     prepare_simulation_worker_run,
+    solver_config_for_execution_settings,
 )
 from kindred.core.simulation_result_finalization import (
     finalize_simulation_result,
 )
+from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
 from kindred.core.simulator.solvers import solve_ode
+from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.temperature import temperature_schedule_execution_identity
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
 )
@@ -55,8 +63,10 @@ from kindred.core.simulator.wegscheider_symbolic import (
 )
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
-from kindred.gui.widgets.mechanism_editor import (
+from kindred.gui.workflow_contracts import (
+    DetailedBalanceCorrectionCommitResult,
     DetailedBalanceCorrectionOutcome,
+    DetailedBalanceCorrectionProposal,
     DetailedBalanceCorrectionRequest,
 )
 
@@ -68,7 +78,6 @@ __all__ = [
     "SimulationJobOwner",
     "SimulationTerminalSummary",
     "RunParallelCapacity",
-    "build_execution_request",
     "build_explicit_target",
     "build_preview_target",
     "resolve_run_parallel_capacity",
@@ -126,51 +135,11 @@ def resolve_run_parallel_capacity(
 
 
 def _copied_execution_request(
-    value: SimulationExecutionRequest | Mapping[str, object],
+    value: SimulationExecutionRequest,
 ) -> SimulationExecutionRequest:
     if isinstance(value, SimulationExecutionRequest):
-        return SimulationExecutionRequest.from_mapping(value.to_payload())
-    if isinstance(value, Mapping):
-        return SimulationExecutionRequest.from_mapping(value)
-    raise TypeError(
-        "execution_request must be a SimulationExecutionRequest or mapping."
-    )
-
-
-def _policy_enabled(value: object, *, field: str) -> bool:
-    if type(value) is bool:
-        return bool(value)
-    raw = getattr(value, "value", value)
-    normalized = str(raw or "").strip().casefold().replace("_", "-")
-    if normalized in {"enabled", "enable", "on", "true", "yes", "auto"}:
-        return True
-    if normalized in {"disabled", "disable", "off", "false", "no", "never"}:
-        return False
-    raise ValueError(f"{field} has unsupported value {raw!r}.")
-
-
-def _solver_config_for_settings(
-    *,
-    execution_settings: SimulationExecutionSettings,
-    scientific_settings: TabScientificSettings,
-) -> dict[str, object]:
-    return {
-        "solver": str(execution_settings.solver),
-        "rtol": float(scientific_settings.rtol),
-        "atol": float(scientific_settings.atol),
-        "grid": {"N": int(execution_settings.integration_points)},
-        "use_sparse_jacobian": _policy_enabled(
-            scientific_settings.sparse_jacobian_policy,
-            field="sparse_jacobian_policy",
-        ),
-        MechanismMetadataKeys.TEMPERATURE_K: float(
-            scientific_settings.temperature
-        ),
-        MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED: _policy_enabled(
-            scientific_settings.wegscheider_policy,
-            field="wegscheider_policy",
-        ),
-    }
+        return value.isolated_copy()
+    raise TypeError("execution_request must be SimulationExecutionRequest.")
 
 
 def _validated_initial_values(
@@ -196,112 +165,15 @@ def _validated_initial_values(
     return tuple(normalized)
 
 
-def _validated_parameter_values(
-    values: Mapping[str, float] | None,
-) -> dict[str, float] | None:
-    if not values:
-        return None
-    normalized: dict[str, float] = {}
-    for raw_name, raw_value in values.items():
-        name = _required_id(raw_name, "parameter value name")
-        if name in normalized:
-            raise ValueError(
-                f"parameter values contain duplicate name {name!r}."
-            )
-        if type(raw_value) is bool or not isinstance(raw_value, Real):
-            raise TypeError(f"parameter value for {name!r} must be numeric.")
-        value = float(raw_value)
-        if not np.isfinite(value):
-            raise ValueError(
-                f"parameter value for {name!r} must be finite."
-            )
-        normalized[name] = value
-    return normalized
-
-
-def build_execution_request(
-    *,
-    prepared_dsl: PreparedDslRequestSet,
-    mechanism_source: MechanismAuthoringSource,
-    initial_values: Iterable[tuple[str, float]],
-    execution_settings: SimulationExecutionSettings,
-    scientific_settings: TabScientificSettings,
-    parameter_values: Mapping[str, float] | None = None,
-) -> SimulationExecutionRequest:
-    """Capture exactly four execution fields plus separate tab science."""
-
-    if not isinstance(mechanism_source, MechanismAuthoringSource):
-        raise TypeError("mechanism_source must be a MechanismAuthoringSource.")
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-    if not isinstance(execution_settings, SimulationExecutionSettings):
-        raise TypeError(
-            "execution_settings must be a SimulationExecutionSettings value."
-        )
-    validate_simulation_execution_settings(execution_settings)
-    validate_tab_scientific_settings(scientific_settings)
-    initials = dict(_validated_initial_values(initial_values))
-
-    t_start = float(execution_settings.t_start)
-    t_end = float(execution_settings.t_end)
-    points = int(execution_settings.integration_points)
-    if (
-        not np.isfinite(t_start)
-        or not np.isfinite(t_end)
-        or t_start < 0.0
-        or t_end <= t_start
-    ):
-        raise ValueError(
-            "execution settings require finite 0 <= t_start < t_end."
-        )
-    if not 10 <= points <= 100_000:
-        raise ValueError("integration_points must be between 10 and 100000.")
-    parameters = _validated_parameter_values(parameter_values)
-    solver_config = _solver_config_for_settings(
-        execution_settings=execution_settings,
-        scientific_settings=scientific_settings,
-    )
-    if (
-        prepared_dsl.analysis.normalized_text
-        != mechanism_source.reactions_text.strip()
-    ):
-        raise ValueError(
-            "prepared DSL source does not match the captured mechanism source."
-        )
-    if (
-        float(prepared_dsl.analysis.structure["temperature_K"])
-        != float(scientific_settings.temperature)
-    ):
-        raise ValueError(
-            "prepared DSL nominal temperature does not match tab science."
-        )
-    intervention_schedule = (
-        prepared_dsl.intervention_schedule_for_execution()
-    )
-    prepared_payload = prepared_dsl.process_execution_payload(
-        wegscheider_cyclicity_enabled=bool(
-            scientific_settings.wegscheider_policy
-        )
-    )
-    return SimulationExecutionRequest(
-        prepared_payload=prepared_payload,
-        initials=initials,
-        t_span=(t_start, t_end),
-        solver_config=solver_config,
-        parameter_overrides=parameters,
-        intervention_schedule=intervention_schedule,
-    )
-
-
 def _validate_request_against_result_key(
     request: SimulationExecutionRequest,
     key: ExplicitResultKey | PreviewResultKey,
+    *,
+    prepared_dsl: PreparedDslRequestSet,
 ) -> None:
-    if request.prepared_payload is None or request.simulation_identity:
-        raise ValueError(
-            "execution request requires one retained prepared DSL authority."
-        )
-    analysis = request.prepared_payload.get("dsl_analysis")
+    if not isinstance(prepared_dsl, PreparedDslRequestSet):
+        raise TypeError("prepared_dsl must be PreparedDslRequestSet.")
+    analysis = request.snapshot.analysis
     if (
         getattr(analysis, "normalized_text", None)
         != key.mechanism_source.reactions_text.strip()
@@ -313,33 +185,51 @@ def _validate_request_against_result_key(
         raise ValueError(
             "execution request analysis identity does not match result key."
         )
-    if tuple(request.initials.items()) != key.initial_values:
+    if tuple(
+        zip(request.snapshot.species_names, request.snapshot.y0, strict=True)
+    ) != key.initial_values:
         raise ValueError("execution request initials do not match result key.")
+    expected_temperature_schedule = (
+        metadata_view_for_mechanism(
+            prepared_dsl.mechanism_for_execution()
+        ).temperature_schedule
+    )
+    if temperature_schedule_execution_identity(
+        request.snapshot.temperature_schedule
+    ) != temperature_schedule_execution_identity(expected_temperature_schedule):
+        raise ValueError(
+            "execution request temperature schedule does not match "
+            "the result key authority."
+        )
     settings = key.execution_settings
     if tuple(request.t_span) != (settings.t_start, settings.t_end):
         raise ValueError("execution request interval does not match result key.")
-    actual_solver_config = dict(request.solver_config)
-    raw_grid = actual_solver_config.get("grid")
-    if isinstance(raw_grid, Mapping):
-        actual_solver_config["grid"] = dict(raw_grid)
-    expected_solver_config = _solver_config_for_settings(
+    expected_solver_config = solver_config_for_execution_settings(
         execution_settings=settings,
         scientific_settings=key.scientific_settings,
     )
-    if actual_solver_config != expected_solver_config:
+    if request.solver_config != expected_solver_config:
         raise ValueError(
             "execution request solver/scientific settings do not match "
             "result key."
         )
-    expected_schedule = coerce_intervention_schedule(
-        request.prepared_payload.get("unresolved_intervention_schedule")
-    )
-    if (
-        not request.has_intervention_schedule_authority
-        or request.intervention_schedule != expected_schedule
+    if not isinstance(
+        request.snapshot.intervention_execution,
+        InterventionExecutionContract,
     ):
         raise ValueError(
-            "execution request intervention schedule does not match source."
+            "execution request requires its bound intervention contract."
+        )
+    contract = request.snapshot.intervention_execution
+    if isinstance(key, PreviewResultKey) and (
+        key.intervention_declarative_fingerprint
+        != contract.declarative_fingerprint
+        or key.intervention_executable_fingerprint
+        != contract.executable_fingerprint
+    ):
+        raise ValueError(
+            "Preview key intervention identity does not match its compiled "
+            "request contract."
         )
 
 
@@ -366,7 +256,22 @@ class ExplicitRunTarget:
                 "ExplicitRunTarget prepared_dsl must be PreparedDslRequestSet."
             )
         request = _copied_execution_request(self.execution_request)
-        _validate_request_against_result_key(request, self.key)
+        _validate_request_against_result_key(
+            request,
+            self.key,
+            prepared_dsl=self.prepared_dsl,
+        )
+        contract = request.snapshot.intervention_execution
+        if not isinstance(contract, InterventionExecutionContract):
+            raise ValueError("Run target requires a compiled intervention contract.")
+        if self.key.scientific_identity != scientific_identity(
+            self.prepared_dsl,
+            intervention_execution=contract,
+        ):
+            raise ValueError(
+                "Run result key scientific identity does not match its exact "
+                "compiled intervention contract."
+            )
         if request.parameter_overrides:
             raise ValueError("explicit Run targets cannot carry Preview values.")
         object.__setattr__(self, "execution_request", request)
@@ -430,12 +335,26 @@ class PreviewTarget:
             )
         object.__setattr__(self, "set_name", _required_id(self.set_name, "set_name"))
         request = _copied_execution_request(self.execution_request)
-        _validate_request_against_result_key(request, self.key)
-        if tuple((request.parameter_overrides or {}).items()) != (
-            self.key.parameter_values
-        ):
+        _validate_request_against_result_key(
+            request,
+            self.key,
+            prepared_dsl=self.prepared_dsl,
+        )
+        request_parameter_values = tuple(
+            (request.parameter_overrides or {}).items()
+        )
+        request_parameter_names = {
+            name for name, _value in request_parameter_values
+        }
+        expected_worker_values = tuple(
+            (name, value)
+            for name, value in self.key.parameter_values
+            if name in request_parameter_names
+        )
+        if request_parameter_values != expected_worker_values:
             raise ValueError(
-                "execution request parameter values do not match Preview key."
+                "execution request worker parameter values are not an exact "
+                "subset of the Preview key."
             )
         object.__setattr__(self, "execution_request", request)
 
@@ -528,6 +447,16 @@ def build_explicit_target(
     publication_generation: int,
 ) -> ExplicitRunTarget:
     values = _validated_initial_values(initial_values)
+    execution_request = build_simulation_execution_request(
+        prepared_dsl=prepared_dsl,
+        mechanism_source=mechanism_source,
+        initial_values=values,
+        execution_settings=execution_settings,
+        scientific_settings=scientific_settings,
+    )
+    intervention_execution = execution_request.snapshot.intervention_execution
+    if not isinstance(intervention_execution, InterventionExecutionContract):
+        raise ValueError("Run target intervention contract was not compiled.")
     key = explicit_result_key_from_values(
         tab_id=tab_id,
         set_id=set_id,
@@ -537,19 +466,14 @@ def build_explicit_target(
         initial_values=values,
         execution_settings=execution_settings,
         scientific_settings=scientific_settings,
+        intervention_execution=intervention_execution,
     )
     return ExplicitRunTarget(
         key=key,
         set_name=set_name,
         publication_generation=publication_generation,
         prepared_dsl=prepared_dsl,
-        execution_request=build_execution_request(
-            prepared_dsl=prepared_dsl,
-            mechanism_source=mechanism_source,
-            initial_values=values,
-            execution_settings=execution_settings,
-            scientific_settings=scientific_settings,
-        ),
+        execution_request=execution_request,
     )
 
 
@@ -558,42 +482,25 @@ def build_preview_target(
     prepared_dsl: PreparedDslRequestSet,
     key: PreviewResultKey,
     set_name: str,
+    execution_request: SimulationExecutionRequest,
 ) -> PreviewTarget:
     return PreviewTarget(
         key=key,
         set_name=set_name,
         prepared_dsl=prepared_dsl,
-        execution_request=build_execution_request(
-            prepared_dsl=prepared_dsl,
-            mechanism_source=key.mechanism_source,
-            initial_values=key.initial_values,
-            execution_settings=key.execution_settings,
-            scientific_settings=key.scientific_settings,
-            parameter_values=dict(key.parameter_values),
-        ),
+        execution_request=execution_request,
     )
-
-
-def _cancel_event(cancelled: Event):
-    def event(_time: float, _state: np.ndarray) -> float:
-        return -1.0 if cancelled.is_set() else 1.0
-
-    event.terminal = True
-    event.direction = -1.0
-    event._kindred_cancel_event = True
-    event._kindred_cancelled = cancelled.is_set
-    return event
 
 
 def _prepare_target(
     target: ExplicitRunTarget | PreviewTarget,
     *,
-    cancelled: Event,
+    cancellation_control: SimulationCancellationControl,
 ) -> tuple[
     PreparedSimulationRun,
     tuple[tuple[str, float, str], ...],
 ]:
-    if cancelled.is_set():
+    if cancellation_control.cancel_requested():
         raise SimulationCancelled()
     request = target.execution_request
     parameters = _captured_parameter_coordinates(
@@ -602,7 +509,7 @@ def _prepare_target(
     )
     prepared = prepare_simulation_worker_run(
         execution_request=request,
-        events=[_cancel_event(cancelled)],
+        cancellation_control=cancellation_control,
     )
     return prepared, parameters
 
@@ -614,15 +521,11 @@ def _captured_parameter_coordinates(
 ) -> tuple[tuple[str, float, str], ...]:
     """Capture typed writable coordinate truth for one immutable request."""
 
-    solver_config = dict(request.solver_config)
-    cyclicity = solver_config[
-        MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED
-    ]
-    if type(cyclicity) is not bool:
-        raise TypeError("Wegscheider cyclicity execution truth must be a bool.")
     coordinates = enumerate_parameter_coordinates(
         prepared_dsl,
-        wegscheider_cyclicity_enabled=cyclicity,
+        wegscheider_cyclicity_enabled=(
+            request.solver_config.wegscheider_cyclicity_enabled
+        ),
     )
     by_name = {coordinate.name: coordinate for coordinate in coordinates}
     overrides = {
@@ -663,11 +566,7 @@ def _detailed_balance_report(
 def _source_energy_unit_for_prepared(prepared_dsl: PreparedDslRequestSet) -> str:
     """Return the accepted source energy unit carried by one DSL analysis."""
 
-    structure = prepared_dsl.analysis.structure
-    if not isinstance(structure, Mapping):
-        return "kJ/mol"
-    value = str(structure.get("energy_unit", "kJ/mol")).strip()
-    return value or "kJ/mol"
+    return str(prepared_dsl.analysis.energy_unit)
 
 
 def _detailed_balance_correction_for_capture(
@@ -686,10 +585,10 @@ def _detailed_balance_correction_for_capture(
         WegscheiderCyclicityReport,
     ] = {}
     for target in capture.targets:
-        if not _policy_enabled(
-            target.key.scientific_settings.wegscheider_policy,
-            field="wegscheider_policy",
-        ):
+        if not solver_config_for_execution_settings(
+            execution_settings=target.key.execution_settings,
+            scientific_settings=target.key.scientific_settings,
+        ).wegscheider_cyclicity_enabled:
             continue
         temperature = float(target.key.scientific_settings.temperature)
         analysis_identity = str(
@@ -799,12 +698,12 @@ def _solve_prepared(
     prepared: PreparedSimulationRun,
     *,
     parameters: tuple[tuple[str, float, str], ...],
-    cancelled: Event,
+    cancellation_control: SimulationCancellationControl,
 ) -> SimulationResultValue:
-    if cancelled.is_set():
+    if cancellation_control.cancel_requested():
         raise SimulationCancelled()
     solved = solve_ode(prepared.request)
-    if cancelled.is_set():
+    if cancellation_control.cancel_requested():
         raise SimulationCancelled()
     result = finalize_simulation_result(
         mechanism=prepared.mechanism,
@@ -812,11 +711,12 @@ def _solve_prepared(
         species_names=list(prepared.species_names),
         initials_for_algebra=prepared.initials_for_algebra,
         temperature_schedule=prepared.temperature_schedule,
-        simulation_plan=None,
+        parameter_algebra_spec=prepared.parameter_algebra_spec,
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
         parameters=parameters,
         preparation_warnings=prepared.warnings,
     )
-    if cancelled.is_set():
+    if cancellation_control.cancel_requested():
         raise SimulationCancelled()
     return result
 
@@ -840,6 +740,9 @@ class _DirectSimulationWorker(QtCore.QThread):
             min(int(max_parallel), len(self._targets)),
         )
         self._cancelled = Event()
+        self._cancellation_control = SimulationCancellationControl(
+            self._cancelled.is_set
+        )
 
     def cancel(self) -> None:
         self._cancelled.set()
@@ -892,7 +795,7 @@ class _DirectSimulationWorker(QtCore.QThread):
         try:
             prepared, parameters = _prepare_target(
                 target,
-                cancelled=self._cancelled,
+                cancellation_control=self._cancellation_control,
             )
         except SimulationCancelled:
             return _TargetTerminalOutcome(
@@ -912,7 +815,7 @@ class _DirectSimulationWorker(QtCore.QThread):
             result = _solve_prepared(
                 prepared,
                 parameters=parameters,
-                cancelled=self._cancelled,
+                cancellation_control=self._cancellation_control,
             )
         except SimulationCancelled:
             return _TargetTerminalOutcome(
@@ -937,7 +840,10 @@ class _DirectSimulationWorker(QtCore.QThread):
 
 
 RepositoryResolver = Callable[[str], ResultRepository | None]
-ExplicitKeyCurrentness = Callable[[ExplicitResultKey], bool]
+CurrentExplicitFactsResolver = Callable[
+    [str, str],
+    ExplicitResultCurrentFacts | None,
+]
 RawUserParallelMaximum = Callable[[], object]
 
 
@@ -948,6 +854,7 @@ class SimulationJobOwner(QtCore.QObject):
     owned_qthreads_changed = QtCore.Signal()
     status_changed = QtCore.Signal(str)
     results_changed = QtCore.Signal(str)
+    preview_endpoints_retired = QtCore.Signal(object)
     terminal = QtCore.Signal(object)
     run_dispatched = QtCore.Signal(str, object)
     detailed_balance_correction_requested = QtCore.Signal(object)
@@ -957,10 +864,14 @@ class SimulationJobOwner(QtCore.QObject):
         *,
         gate: ComputationGate,
         repository_for_tab: RepositoryResolver,
-        explicit_result_key_is_current: ExplicitKeyCurrentness,
-        commit_detailed_balance_source: Callable[
+        current_explicit_result_facts: CurrentExplicitFactsResolver,
+        propose_detailed_balance_source: Callable[
             [str, MechanismAuthoringSource],
-            PreparedDslRequestSet | None,
+            DetailedBalanceCorrectionProposal | None,
+        ],
+        commit_detailed_balance_source: Callable[
+            [DetailedBalanceCorrectionProposal],
+            DetailedBalanceCorrectionCommitResult,
         ],
         user_parallel_maximum: RawUserParallelMaximum | None = None,
         cpu_count: Callable[[], object] | None = None,
@@ -971,13 +882,16 @@ class SimulationJobOwner(QtCore.QObject):
             raise TypeError("gate must be a ComputationGate.")
         if not callable(repository_for_tab):
             raise TypeError("repository_for_tab must be callable.")
-        if not callable(explicit_result_key_is_current):
-            raise TypeError("explicit_result_key_is_current must be callable.")
+        if not callable(current_explicit_result_facts):
+            raise TypeError("current_explicit_result_facts must be callable.")
+        if not callable(propose_detailed_balance_source):
+            raise TypeError("propose_detailed_balance_source must be callable.")
         if not callable(commit_detailed_balance_source):
             raise TypeError("commit_detailed_balance_source must be callable.")
         self._gate = gate
         self._repository_for_tab = repository_for_tab
-        self._explicit_result_key_is_current = explicit_result_key_is_current
+        self._current_explicit_result_facts = current_explicit_result_facts
+        self._propose_detailed_balance_source = propose_detailed_balance_source
         self._commit_detailed_balance_source = commit_detailed_balance_source
         self._user_parallel_maximum = user_parallel_maximum or (lambda: None)
         self._cpu_count = cpu_count or os.cpu_count
@@ -1201,25 +1115,80 @@ class SimulationJobOwner(QtCore.QObject):
         self,
         tab_id: str,
         set_ids: Iterable[str],
-    ) -> None:
+    ) -> tuple[PreviewResultKey, ...]:
         tid = _required_id(tab_id, "tab_id")
+        retired: list[PreviewResultKey] = []
         for set_id in set_ids:
             sid = _required_id(set_id, "set_id")
-            self._current_preview_key_by_target.pop(
+            key = self._current_preview_key_by_target.pop(
                 (tid, sid),
                 None,
             )
+            if key is not None:
+                retired.append(key)
+        if retired:
+            self.preview_endpoints_retired.emit(tuple(retired))
+        return tuple(retired)
 
     def _retire_all_preview_keys_for_tab(self, tab_id: str) -> None:
         tid = _required_id(tab_id, "tab_id")
+        retired: list[PreviewResultKey] = []
         for target in tuple(self._current_preview_key_by_target):
             if target[0] == tid:
-                self._current_preview_key_by_target.pop(target, None)
+                key = self._current_preview_key_by_target.pop(target, None)
+                if key is not None:
+                    retired.append(key)
+        if retired:
+            self.preview_endpoints_retired.emit(tuple(retired))
+
+    def _preview_key_is_pending(self, key: PreviewResultKey) -> bool:
+        pending = self._pending_preview
+        return bool(
+            pending is not None
+            and any(target.key == key for target in pending.targets)
+        )
+
+    def _retire_unsuccessful_preview_key(
+        self,
+        key: PreviewResultKey,
+    ) -> bool:
+        """Retire one failed Preview unless its exact intent is pending."""
+
+        if not isinstance(key, PreviewResultKey):
+            return False
+        target = (key.tab_id, key.set_id)
+        if self._current_preview_key_by_target.get(target) != key:
+            return False
+        if self._preview_key_is_pending(key):
+            return False
+        self._retire_preview_keys(key.tab_id, (key.set_id,))
+        self._advance_preview_publication_generations(
+            key.tab_id,
+            (key.set_id,),
+        )
+        try:
+            self._repository(key.tab_id).clear_preview(
+                key.set_id,
+                clear_reference=False,
+            )
+        except LookupError:
+            pass
+        self.results_changed.emit(key.tab_id)
+        return True
+
+    def _retire_unsuccessful_preview_intent(
+        self,
+        intent: PreviewIntent,
+    ) -> None:
+        for target in intent.targets:
+            self._retire_unsuccessful_preview_key(target.key)
 
     def deauthorize_targets(
         self,
         tab_id: str,
         set_ids: Iterable[str],
+        *,
+        preserve_reference: bool = False,
     ) -> tuple[tuple[str, int], ...]:
         """Atomically fence in-flight Run publication and current eligibility."""
 
@@ -1234,7 +1203,13 @@ class SimulationJobOwner(QtCore.QObject):
         self._retire_preview_keys(tid, targets)
         generations = self.advance_explicit_publication_generations(tid, targets)
         repository = self._repository(tid)
-        repository.deauthorize_sets(targets)
+        if preserve_reference:
+            repository.deauthorize_sets(
+                targets,
+                preserve_reference=True,
+            )
+        else:
+            repository.deauthorize_sets(targets)
         self.results_changed.emit(tid)
         return generations
 
@@ -1242,30 +1217,33 @@ class SimulationJobOwner(QtCore.QObject):
         self,
         identity: PreviewResultIdentity,
     ) -> PreviewResultKey | None:
-        """Mint and install the next exact Preview key before debounce."""
+        """Install the exact Preview key after request construction.
+
+        The caller fences the affected targets before constructing the
+        request.  Reusing the already-advanced Preview generation keeps key
+        installation from becoming a second, provisional currentness fence.
+        """
 
         if not isinstance(identity, PreviewResultIdentity):
             raise TypeError("identity must be a PreviewResultIdentity.")
         if self._application_close_fenced:
             self.status_changed.emit("Preview rejected: simulation owner is closing.")
             return None
-        generation = self._advance_preview_publication_generations(
+        target = (identity.tab_id, identity.set_id)
+        generation = self._preview_publication_generation(
             identity.tab_id,
-            (identity.set_id,),
-        )[0][1]
+            identity.set_id,
+        )
+        if generation <= 0 or target in self._current_preview_key_by_target:
+            raise RuntimeError(
+                "Preview key installation requires a prior target fence."
+            )
         key = PreviewResultKey.from_identity(
             identity,
             generation=generation,
         )
         repository = self._repository(identity.tab_id)
-        self._drop_pending_preview_for_targets(
-            identity.tab_id,
-            (identity.set_id,),
-        )
-        self.advance_explicit_publication_generations(
-            identity.tab_id,
-            (identity.set_id,),
-        )
+        self._drop_pending_preview_for_targets(identity.tab_id, (identity.set_id,))
         repository.capture_preview_reference(key)
         repository.authorize_preview_display(key)
         self._current_preview_key_by_target[
@@ -1280,48 +1258,41 @@ class SimulationJobOwner(QtCore.QObject):
 
     def reconcile_canonical_targets(
         self,
-        keys: Iterable[ExplicitResultKey],
+        tab_id: str,
+        set_ids: Iterable[str],
     ) -> tuple[tuple[str, bool], ...]:
-        """Semantically clear/hydrate canonical targets in one publication batch."""
+        """Restore canonical targets from their retained exact Run keys."""
 
-        captured = tuple(keys)
-        if not captured:
-            return ()
-        for key in captured:
-            if not isinstance(key, ExplicitResultKey):
-                raise TypeError("keys must contain ExplicitResultKey values.")
-        tab_id = captured[0].tab_id
-        if any(key.tab_id != tab_id for key in captured):
-            raise ValueError("canonical-return keys must belong to one tab.")
-        set_ids = tuple(key.set_id for key in captured)
-        if len(set_ids) != len(set(set_ids)):
-            raise ValueError("canonical-return keys must target unique sets.")
-
-        repository = self._repository(tab_id)
-        live_keys = tuple(
-            key
-            for key in captured
-            if self._explicit_completion_is_live_key(key)
+        tid = _required_id(tab_id, "tab_id")
+        targets = tuple(
+            dict.fromkeys(_required_id(set_id, "set_id") for set_id in set_ids)
         )
-        live_set_ids = tuple(key.set_id for key in live_keys)
-        self._cancel_generation_counter_retirement(tab_id, live_set_ids)
-        self._drop_pending_preview_for_targets(tab_id, live_set_ids)
-        self._advance_preview_publication_generations(tab_id, live_set_ids)
+        if not targets:
+            return ()
+        repository = self._repository(tid)
+        self._cancel_generation_counter_retirement(tid, targets)
+        self._drop_pending_preview_for_targets(tid, targets)
+        self._advance_preview_publication_generations(tid, targets)
         hydrated_by_set_id: dict[str, bool] = {}
-        for key in live_keys:
-            self._retire_preview_keys(tab_id, (key.set_id,))
+        for set_id in targets:
+            self._retire_preview_keys(tid, (set_id,))
             repository.clear_preview(
-                key.set_id,
+                set_id,
                 clear_reference=False,
             )
-            hydrated = repository.hydrate_cached(key)
-            hydrated_by_set_id[key.set_id] = hydrated is not None
+            current_key = self._current_explicit_key(tid, set_id)
+            hydrated = (
+                None
+                if current_key is None
+                else repository.hydrate_cached(current_key)
+            )
+            hydrated_by_set_id[set_id] = hydrated is not None
             if hydrated is None:
-                repository.clear_preview(key.set_id)
-        self.results_changed.emit(tab_id)
+                repository.clear_preview(set_id)
+        self.results_changed.emit(tid)
         return tuple(
-            (key.set_id, hydrated_by_set_id.get(key.set_id, False))
-            for key in captured
+            (set_id, hydrated_by_set_id.get(set_id, False))
+            for set_id in targets
         )
 
     def purge_sets(
@@ -1523,7 +1494,7 @@ class SimulationJobOwner(QtCore.QObject):
         self,
         outcome: DetailedBalanceCorrectionOutcome,
     ) -> bool:
-        """Commit, rebase, and continue one exact admitted Run once."""
+        """Preflight, commit, and continue one exact admitted Run once."""
 
         if not isinstance(outcome, DetailedBalanceCorrectionOutcome):
             raise TypeError("outcome must be DetailedBalanceCorrectionOutcome.")
@@ -1580,6 +1551,7 @@ class SimulationJobOwner(QtCore.QObject):
             )
             return False
         corrected_source = original_source.with_reactions_text(corrected_text)
+        committed = False
         try:
             if (
                 self._application_close_fenced
@@ -1594,65 +1566,56 @@ class SimulationJobOwner(QtCore.QObject):
                     "Original Run capture is no longer the exact live "
                     "canonical request."
                 )
-            corrected_prepared = self._commit_detailed_balance_source(
+            proposal = self._propose_detailed_balance_source(
                 request.tab_id,
                 corrected_source,
             )
-            if not isinstance(
-                corrected_prepared,
-                PreparedDslRequestSet,
-            ):
+            if not isinstance(proposal, DetailedBalanceCorrectionProposal):
                 raise RuntimeError(
-                    "Canonical source admission rejected the correction."
+                    "Canonical source proposal rejected the correction."
                 )
-            _verify_detailed_balance_resolved(corrected_prepared)
+            self._build_detailed_balance_run_continuation(
+                pending,
+                proposal,
+                bind_postcommit=False,
+            )
+            commit_result = self._commit_detailed_balance_source(proposal)
+            if not isinstance(
+                commit_result,
+                DetailedBalanceCorrectionCommitResult,
+            ):
+                raise RuntimeError("Canonical source commit returned no result.")
+            if commit_result.proposal != proposal:
+                raise RuntimeError(
+                    "Canonical source commit returned a different proposal."
+                )
+            if not commit_result.committed:
+                raise RuntimeError(
+                    "Canonical source commit rejected the correction"
+                    + (
+                        f": {commit_result.error}"
+                        if commit_result.error
+                        else "."
+                    )
+                )
+            committed = True
+            if commit_result.error:
+                raise RuntimeError(
+                    "Canonical source commit completed with a postcommit "
+                    f"error: {commit_result.error}"
+                )
             if (
                 self._application_close_fenced
                 or self._pending_detailed_balance is not pending
                 or not self._gate.is_owned_by(self)
             ):
                 raise RuntimeError(
-                    "Run correction admission was retired during commit."
+                    "Run correction admission was retired after commit."
                 )
-            rebased_targets: list[ExplicitRunTarget] = []
-            for target in pending.capture.targets:
-                corrected_key = replace(
-                    target.key,
-                    mechanism_source=corrected_source,
-                    analysis_identity=corrected_prepared.analysis.identity,
-                    standard_concentration_identity=(
-                        standard_concentration_identity(corrected_prepared)
-                    ),
-                    scientific_identity=scientific_identity(corrected_prepared),
-                )
-                if not self._explicit_completion_is_live_key(corrected_key):
-                    raise RuntimeError(
-                        f"Corrected Run target {target.set_name!r} is not "
-                        "the exact live canonical target."
-                    )
-                rebased_targets.append(
-                    ExplicitRunTarget(
-                        key=corrected_key,
-                        set_name=target.set_name,
-                        publication_generation=(
-                            self.explicit_publication_generation(
-                                corrected_key.tab_id,
-                                corrected_key.set_id,
-                            )
-                        ),
-                        prepared_dsl=corrected_prepared,
-                        execution_request=build_execution_request(
-                            prepared_dsl=corrected_prepared,
-                            mechanism_source=corrected_source,
-                            initial_values=corrected_key.initial_values,
-                            execution_settings=corrected_key.execution_settings,
-                            scientific_settings=corrected_key.scientific_settings,
-                        ),
-                    )
-                )
-            rebased = ExplicitRunCapture(
-                tab_id=pending.capture.tab_id,
-                targets=tuple(rebased_targets),
+            rebased = self._build_detailed_balance_run_continuation(
+                pending,
+                proposal,
+                bind_postcommit=True,
             )
             self._pending_detailed_balance = None
             launched = self._launch_run_capture(
@@ -1661,23 +1624,40 @@ class SimulationJobOwner(QtCore.QObject):
             )
             if not launched:
                 if self._worker is not None:
+                    # _start_worker() retains custody when native start state
+                    # cannot be disproved.  Request cancellation, but never
+                    # tear down or release the owner/gate before the native
+                    # terminal signal settles that worker.
+                    self._worker.cancel()
                     self.status_changed.emit(
-                        "Detailed-balance correction committed; Run worker "
-                        "startup remains uncertain and owner-retained pending "
-                        "native terminal delivery."
+                        "Detailed-balance correction committed; Run aborted "
+                        "(native cancellation requested): worker startup "
+                        "remains uncertain and owner-retained pending native "
+                        "terminal delivery."
                     )
                     return False
                 self._gate.release(self)
                 raise RuntimeError("Corrected Run could not be dispatched.")
         except Exception as exc:
-            if self._pending_detailed_balance is pending:
+            if committed:
+                if self._pending_detailed_balance is pending:
+                    self._pending_detailed_balance = None
+                if self._worker is None and self._gate.is_owned_by(self):
+                    self._gate.release(self)
+                self.status_changed.emit(
+                    "Detailed-balance correction committed; Run aborted: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            elif self._pending_detailed_balance is pending:
                 self._abort_pending_detailed_balance(
-                    "Detailed-balance correction rejected; Run aborted: "
+                    "Detailed-balance correction rejected before canonical "
+                    "commit; source remains an uncommitted draft; Run aborted: "
                     f"{type(exc).__name__}: {exc}"
                 )
             else:
                 self.status_changed.emit(
-                    "Detailed-balance correction committed but Run aborted: "
+                    "Detailed-balance correction rejected before canonical "
+                    "commit; source remains an uncommitted draft; Run aborted: "
                     f"{type(exc).__name__}: {exc}"
                 )
             return False
@@ -1685,6 +1665,123 @@ class SimulationJobOwner(QtCore.QObject):
             "Detailed-balance correction committed; continuing Run once."
         )
         return True
+
+    def _build_detailed_balance_run_continuation(
+        self,
+        pending: _PendingRunDetailedBalanceCorrection,
+        proposal: DetailedBalanceCorrectionProposal,
+        *,
+        bind_postcommit: bool,
+    ) -> ExplicitRunCapture:
+        """Validate, then bind corrected Run targets to canonical currentness.
+
+        The proposal is the complete precommit validation source.  Once the
+        canonical commit succeeds, that commit's mutation fence advances the
+        captured Run generations, so the continuation is rebuilt from the
+        live current-facts boundary before worker admission.
+        """
+
+        if proposal.tab_id != pending.capture.tab_id:
+            raise RuntimeError(
+                "Detailed-balance proposal tab does not match the pending Run."
+            )
+        proposed_tab = proposal.proposed_document.tab(proposal.tab_id)
+        corrected_prepared = proposed_tab.prepared_dsl
+        if not isinstance(corrected_prepared, PreparedDslRequestSet):
+            raise RuntimeError("Proposed Run source has no retained prepared DSL.")
+        _verify_detailed_balance_resolved(corrected_prepared)
+        rebased_targets: list[ExplicitRunTarget] = []
+        for target in pending.capture.targets:
+            proposed_set = proposed_tab.initial_condition_set(target.key.set_id)
+            initial_values = canonical_initial_values(
+                proposed_tab,
+                target.key.set_id,
+            )
+            corrected_settings = proposed_tab.resolved_execution_settings(
+                target.key.set_id
+            )
+            corrected_request = build_simulation_execution_request(
+                prepared_dsl=corrected_prepared,
+                mechanism_source=proposed_tab.mechanism_source,
+                initial_values=initial_values,
+                execution_settings=corrected_settings,
+                scientific_settings=proposed_tab.scientific_settings,
+            )
+            corrected_contract = corrected_request.snapshot.intervention_execution
+            if not isinstance(corrected_contract, InterventionExecutionContract):
+                raise RuntimeError(
+                    "Corrected Run target has no compiled intervention contract."
+                )
+            corrected_key = explicit_result_key_from_values(
+                tab_id=target.key.tab_id,
+                set_id=target.key.set_id,
+                mechanism_source=proposed_tab.mechanism_source,
+                prepared_dsl=corrected_prepared,
+                analysis_identity=corrected_prepared.analysis.identity,
+                initial_values=initial_values,
+                execution_settings=corrected_settings,
+                scientific_settings=proposed_tab.scientific_settings,
+                intervention_execution=corrected_contract,
+            )
+            target_key = corrected_key
+            target_prepared = corrected_prepared
+            target_source = proposed_tab.mechanism_source
+            target_initial_values = initial_values
+            target_execution_settings = corrected_settings
+            target_scientific_settings = proposed_tab.scientific_settings
+            target_request = corrected_request
+            if bind_postcommit:
+                facts = self._current_explicit_result_facts(
+                    target.key.tab_id,
+                    target.key.set_id,
+                )
+                if not isinstance(facts, ExplicitResultCurrentFacts):
+                    raise RuntimeError(
+                        f"Corrected Run target {target.set_name!r} has no "
+                        "canonical postcommit current facts."
+                    )
+                current_key = explicit_result_key_from_current_facts(facts)
+                if current_key != corrected_key:
+                    raise RuntimeError(
+                        f"Corrected Run target {target.set_name!r} is not the "
+                        "exact canonical postcommit target."
+                    )
+                if not isinstance(facts.prepared_dsl, PreparedDslRequestSet):
+                    raise RuntimeError(
+                        f"Corrected Run target {target.set_name!r} has no "
+                        "canonical postcommit prepared DSL."
+                    )
+                target_key = current_key
+                target_prepared = facts.prepared_dsl
+                target_source = facts.mechanism_source
+                target_initial_values = facts.initial_values
+                target_execution_settings = facts.execution_settings
+                target_scientific_settings = facts.scientific_settings
+                target_request = build_simulation_execution_request(
+                    prepared_dsl=target_prepared,
+                    mechanism_source=target_source,
+                    initial_values=target_initial_values,
+                    execution_settings=target_execution_settings,
+                    scientific_settings=target_scientific_settings,
+                )
+            rebased_targets.append(
+                ExplicitRunTarget(
+                    key=target_key,
+                    set_name=proposed_set.name,
+                    publication_generation=(
+                        self.explicit_publication_generation(
+                            target_key.tab_id,
+                            target_key.set_id,
+                        )
+                    ),
+                    prepared_dsl=target_prepared,
+                    execution_request=target_request,
+                )
+            )
+        return ExplicitRunCapture(
+            tab_id=pending.capture.tab_id,
+            targets=tuple(rebased_targets),
+        )
 
     def _abort_pending_detailed_balance(self, detail: str) -> bool:
         pending = self._pending_detailed_balance
@@ -1700,6 +1797,7 @@ class SimulationJobOwner(QtCore.QObject):
         if not isinstance(intent, PreviewIntent):
             raise TypeError("intent must be a PreviewIntent.")
         if self._application_close_fenced:
+            self._retire_unsuccessful_preview_intent(intent)
             self.status_changed.emit("Preview rejected: simulation owner is closing.")
             return False
         current_intent = self._current_preview_intent(intent)
@@ -1726,6 +1824,7 @@ class SimulationJobOwner(QtCore.QObject):
                 gate_already_owned=False,
             )
         except Exception as exc:
+            self._retire_unsuccessful_preview_intent(intent)
             self.status_changed.emit(
                 f"Preview dispatch failed: {type(exc).__name__}: {exc}"
             )
@@ -1794,7 +1893,7 @@ class SimulationJobOwner(QtCore.QObject):
         return True
 
     def fence_application_close_admission(self) -> None:
-        """Permanently reject every later Run and Preview admission."""
+        """Reject Run and Preview admission for the active Close attempt."""
 
         if self._application_close_fenced:
             return
@@ -1830,20 +1929,23 @@ class SimulationJobOwner(QtCore.QObject):
         self._finish_after_synchronous_wait()
         return True
 
-    def show_cached(self, key: ExplicitResultKey) -> bool:
-        repository = self._repository(key.tab_id)
+    def show_cached(self, tab_id: str, set_id: str) -> bool:
+        tid = _required_id(tab_id, "tab_id")
+        sid = _required_id(set_id, "set_id")
+        repository = self._repository(tid)
+        current_key = self._current_explicit_key(tid, sid)
         if (
-            not self._explicit_completion_is_live_key(key)
-            or self._preview_target_is_active(key.tab_id, key.set_id)
+            current_key is None
+            or self._preview_target_is_active(tid, sid)
         ):
             self.status_changed.emit(
                 "Requested result is not currently display-eligible; display unchanged."
             )
             return False
-        if repository.hydrate_cached(key) is None:
+        if repository.hydrate_cached(current_key) is None:
             self.status_changed.emit("Requested result is not cached; display unchanged.")
             return False
-        self.results_changed.emit(key.tab_id)
+        self.results_changed.emit(tid)
         self.status_changed.emit("Cached result loaded for display.")
         return True
 
@@ -2277,6 +2379,8 @@ class SimulationJobOwner(QtCore.QObject):
             raise RuntimeError(
                 "a terminal outcome must belong to the immutable admitted roster."
             )
+        if isinstance(key, PreviewResultKey) and state != "success":
+            self._retire_unsuccessful_preview_key(key)
         self._outcomes[key] = state
         if detail is not None:
             message = str(detail)
@@ -2312,9 +2416,28 @@ class SimulationJobOwner(QtCore.QObject):
 
     def _explicit_completion_is_live_key(self, key: ExplicitResultKey) -> bool:
         try:
-            return bool(self._explicit_result_key_is_current(key))
+            current_key = self._current_explicit_key(key.tab_id, key.set_id)
+            return explicit_result_key_is_current(key, current_key)
         except Exception:
             return False
+
+    def _current_explicit_key(
+        self,
+        tab_id: str,
+        set_id: str,
+    ) -> ExplicitResultKey | None:
+        """Resolve one current exact key from the shell's typed capture."""
+
+        try:
+            facts = self._current_explicit_result_facts(
+                _required_id(tab_id, "tab_id"),
+                _required_id(set_id, "set_id"),
+            )
+            if facts is None:
+                return None
+            return explicit_result_key_from_current_facts(facts)
+        except Exception:
+            return None
 
     def _current_preview_intent(
         self,

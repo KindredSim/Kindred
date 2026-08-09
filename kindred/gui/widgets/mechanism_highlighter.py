@@ -21,7 +21,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     - Keywords (reaction, equilibrium, time, etc.) - bold purple
     - Species names (A, B, ATP, etc.) - blue
     - Operators (->, =>, <->, <=>, +) - red bold
-    - Rate constants (k=, kf=, kr=, Keq=, kappa=) - green
+    - Rate constants (k=, kf=, kr=, Keq=, local κ=) - green
     - Numbers (1.0, 1e-5, etc.) - orange
     - Comments (#...) - gray italic
     - Energy terms (Ea=, dG_act=, etc.) - cyan
@@ -103,7 +103,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         number_pattern = r'\b\d+\.?\d*(?:[eE][+-]?\d+)?\b|\.\d+(?:[eE][+-]?\d+)?\b'
         self.rules.append((re.compile(number_pattern), 'number', True))
 
-        # 3. Rate constants (k=, kf=, kr=, Keq=, kappa=, κ=)
+        # 3. Rate constants (k=, kf=, kr=, Keq=, local kappa=, κ=)
         rate_patterns = [
             (r'\bk\s*=', 0),                           # k=
             (r'\bk[fr]\s*=', re.IGNORECASE),           # kf=, kr=

@@ -19,14 +19,16 @@ from kindred.core.intervention_schedule_compiler import (
     validate_boundary_conflicts,
 )
 from kindred.core.temperature import declared_temperature_step_boundaries
-from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
-from kindred.core.symbolic.artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR
-
 from .nonnegative_invariant import (
     NonnegativeProjection,
     project_nonnegative_trajectory,
 )
-from .solver_types import Rhs2, SimulationOutput, SimulationRequest
+from .solver_types import (
+    Rhs2,
+    SimulationOutput,
+    SimulationPresentationBoundary,
+    SimulationRequest,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +81,8 @@ class SegmentExecutionRequest:
     t_eval: np.ndarray
     provenance: dict[str, object]
     method: str
+    boundary_events: tuple[Callable[[float, np.ndarray], float], ...] = ()
+    boundary_terminal_flags: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -138,6 +142,7 @@ class SegmentProjection:
 class _BoundaryApplicationResult:
     continuation_state: np.ndarray
     projection: NonnegativeProjection
+    presentation_boundary: SimulationPresentationBoundary | None = None
 
 
 class BaseSegmentRunner(Protocol):
@@ -169,11 +174,11 @@ class InterventionScheduleExecutionOwner:
         contract = request.schedule
         species_index = _species_index(req, contract)
         current_y = np.asarray(request.y0, dtype=float).reshape(-1).copy()
-        user_events = tuple(req.events or ())
-        cancellation_check = _cancellation_check(user_events)
-        base_request = replace(req, events=user_events) if user_events else req
-        user_terminal = _event_terminal_flags(base_request, user_events)
-        user_event_provenance = [[] for _ in user_events]
+        cancellation_check = (
+            req.cancellation_control.cancel_requested
+            if req.cancellation_control is not None
+            else None
+        )
         trigger_counts = [0 for _ in contract.triggers]
         trigger_last_times: list[float | None] = [None for _ in contract.triggers]
         trigger_firings: list[TriggerFiring] = []
@@ -182,6 +187,7 @@ class InterventionScheduleExecutionOwner:
         output_segment_ids: list[np.ndarray] = []
         output_segment_keys: list[tuple[str, ...]] = []
         output_discontinuity_ids: list[np.ndarray] = []
+        presentation_boundaries: list[SimulationPresentationBoundary] = []
         segment_solvers: list[str] = []
         segment_symbolic_jacobian_usage: list[bool] = []
         segment_symbolic_jacobian_runtime_fallbacks: list[
@@ -191,7 +197,6 @@ class InterventionScheduleExecutionOwner:
         segment_projections: dict[str, SegmentProjection] = {}
         segment_count = 0
         discontinuity_id = 0
-        terminal_stop = False
         temperature_boundaries = declared_temperature_step_boundaries(
             req.temperature_schedule,
             t_start=t0,
@@ -230,6 +235,10 @@ class InterventionScheduleExecutionOwner:
             cancellation_check=cancellation_check,
         )
         current_y = initial_boundary.continuation_state
+        _append_presentation_boundary(
+            presentation_boundaries,
+            initial_boundary.presentation_boundary,
+        )
         _append_identity_row(
             outputs_t,
             outputs_y,
@@ -292,24 +301,33 @@ class InterventionScheduleExecutionOwner:
                 # the segment.
                 trigger_observers = trigger_callables
                 trigger_stoppers = trigger_callables
-                segment_events = (
-                    user_events + trigger_observers + trigger_stoppers
+                purge_observers, purge_mapping = _purge_zero_crossing_events(
+                    active_fluxes,
+                    active_holds=active_holds,
+                    species_index=species_index,
+                    state=current_y,
                 )
-                segment_request = base_request
-                if segment_events:
-                    segment_request = replace(
-                        segment_request,
-                        events=segment_events,
-                        event_terminal=tuple(user_terminal)
-                        + tuple(False for _ in trigger_observers)
-                        + tuple(True for _ in trigger_stoppers),
-                    )
+                purge_stoppers = purge_observers
+                segment_events = (
+                    trigger_observers
+                    + purge_observers
+                    + trigger_stoppers
+                    + purge_stoppers
+                )
+                segment_request = req
+                segment_terminal_flags = (
+                        tuple(False for _ in trigger_observers)
+                        + tuple(False for _ in purge_observers)
+                        + tuple(True for _ in trigger_stoppers)
+                        + tuple(True for _ in purge_stoppers)
+                )
                 if active_holds or active_fluxes:
+                    segment_symbolic_jacobian = segment_request.symbolic_jacobian
                     transformed_jacobian = (
                         None
-                        if segment_request.jacobian_func is None
+                        if segment_symbolic_jacobian.jacobian_func is None
                         else _InterventionJacobian(
-                            segment_request.jacobian_func,
+                            segment_symbolic_jacobian.jacobian_func,
                             rhs=segment_rhs,
                             holds=active_holds,
                             fluxes=active_fluxes,
@@ -318,12 +336,15 @@ class InterventionScheduleExecutionOwner:
                     )
                     segment_request = replace(
                         segment_request,
-                        jacobian_func=transformed_jacobian,
-                        jac_sparsity=_transform_jacobian_sparsity(
-                            segment_request.jac_sparsity,
-                            holds=active_holds,
-                            species_index=species_index,
-                            size=current_y.size,
+                        symbolic_jacobian=replace(
+                            segment_symbolic_jacobian,
+                            jacobian_func=transformed_jacobian,
+                            jac_sparsity=_transform_jacobian_sparsity(
+                                segment_symbolic_jacobian.jac_sparsity,
+                                holds=active_holds,
+                                species_index=species_index,
+                                size=current_y.size,
+                            ),
                         ),
                     )
                 segment_request = _request_for_internal_segment(
@@ -360,6 +381,8 @@ class InterventionScheduleExecutionOwner:
                         t_eval=internal_eval,
                         provenance=segment_provenance,
                         method=request.method,
+                        boundary_events=segment_events,
+                        boundary_terminal_flags=segment_terminal_flags,
                     )
                 )
                 _raise_if_cancelled(cancellation_check)
@@ -388,22 +411,39 @@ class InterventionScheduleExecutionOwner:
                         ]
                         for states in event_states
                     ]
-                for index, times in enumerate(event_times[: len(user_events)]):
-                    user_event_provenance[index].extend(times)
-                terminal_event_time = _terminal_user_event_time(
-                    user_events, user_terminal, event_times[: len(user_events)]
-                )
-                terminal_stop = terminal_event_time is not None
                 trigger_hit = (
-                    None
-                    if terminal_stop
-                    else _first_trigger_hit(
+                    _first_trigger_hit(
                         event_times,
                         event_states,
                         trigger_mapping=trigger_mapping,
-                        user_event_count=len(user_events),
                     )
                 )
+                purge_hit = (
+                    _first_purge_hit(
+                        event_times,
+                        event_states,
+                        purge_mapping=purge_mapping,
+                        event_offset=len(trigger_observers),
+                    )
+                )
+                if (
+                    trigger_hit is not None
+                    and purge_hit is not None
+                    and trigger_hit[0] == purge_hit[0]
+                ):
+                    trigger_hit = (
+                        trigger_hit[0],
+                        trigger_hit[1],
+                        purge_hit[2].copy(),
+                    )
+                if (
+                    purge_hit is not None
+                    and (
+                        trigger_hit is None
+                        or purge_hit[0] < trigger_hit[0]
+                    )
+                ):
+                    trigger_hit = None
                 seg_t = np.asarray(segment_result.output.t, dtype=float).reshape(-1)
                 seg_y = _apply_holds_to_trajectory(
                     segment_result.output.Y,
@@ -422,9 +462,11 @@ class InterventionScheduleExecutionOwner:
                     float(trigger_hit[0])
                     if trigger_hit is not None
                     else (
-                        float(terminal_event_time)
-                        if terminal_event_time is not None
-                        else sub_end
+                        float(purge_hit[0])
+                        if purge_hit is not None
+                        else (
+                            sub_end
+                        )
                     )
                 )
                 segment_output_identity = replace(
@@ -491,7 +533,9 @@ class InterventionScheduleExecutionOwner:
                 if trigger_hit is not None:
                     root_time, trigger_indices, root_state = trigger_hit
                     current_y = root_state.copy()
-                elif not terminal_stop:
+                elif purge_hit is not None:
+                    current_y = purge_hit[2].copy()
+                else:
                     current_y = _apply_holds(
                         _required_raw_terminal_state(
                             segment_result,
@@ -503,7 +547,10 @@ class InterventionScheduleExecutionOwner:
                     )
                 scheduled_discontinuity = (
                     trigger_hit is None
-                    and not terminal_stop
+                    and (
+                        purge_hit is None
+                        or purge_hit[0] == sub_end
+                    )
                     and sub_end in contract.discontinuities
                 )
                 emit_count = min(requested.size, seg_t.size)
@@ -511,6 +558,10 @@ class InterventionScheduleExecutionOwner:
                 emit_y = seg_y[:, :emit_count]
                 if trigger_hit is not None:
                     emit_mask = emit_t < float(trigger_hit[0])
+                    emit_t = emit_t[emit_mask]
+                    emit_y = emit_y[:, emit_mask]
+                elif purge_hit is not None:
+                    emit_mask = emit_t < float(purge_hit[0])
                     emit_t = emit_t[emit_mask]
                     emit_y = emit_y[:, emit_mask]
                 elif scheduled_discontinuity:
@@ -529,10 +580,37 @@ class InterventionScheduleExecutionOwner:
                     segment_key=segment_identity.key,
                     discontinuity_id=discontinuity_id,
                 )
-                if terminal_stop:
-                    break
                 if trigger_hit is None:
+                    if purge_hit is not None and purge_hit[0] < sub_end:
+                        _append_identity_row(
+                            outputs_t,
+                            outputs_y,
+                            output_segment_ids,
+                            output_segment_keys,
+                            output_discontinuity_ids,
+                            float(purge_hit[0]),
+                            np.asarray(purge_hit[2], dtype=float).reshape(-1),
+                            segment_id=segment_count,
+                            segment_key=f"integration:{segment_count}",
+                            discontinuity_id=discontinuity_id,
+                        )
+                        sub_start = float(purge_hit[0])
+                        segment_starts_after_discontinuity = False
+                        continue
                     if next_rearm is not None and sub_end < outer_end:
+                        if purge_hit is not None and purge_hit[0] == sub_end:
+                            _append_identity_row(
+                                outputs_t,
+                                outputs_y,
+                                output_segment_ids,
+                                output_segment_keys,
+                                output_discontinuity_ids,
+                                float(purge_hit[0]),
+                                np.asarray(purge_hit[2], dtype=float).reshape(-1),
+                                segment_id=segment_count,
+                                segment_key=f"integration:{segment_count}",
+                                discontinuity_id=discontinuity_id,
+                            )
                         boundary_result = _apply_boundary(
                             current_y,
                             boundary=sub_end,
@@ -547,6 +625,10 @@ class InterventionScheduleExecutionOwner:
                             cancellation_check=cancellation_check,
                         )
                         current_y = boundary_result.continuation_state
+                        _append_presentation_boundary(
+                            presentation_boundaries,
+                            boundary_result.presentation_boundary,
+                        )
                         _raise_if_cancelled(cancellation_check)
                         _record_continuation_projection(
                             segment_projections,
@@ -571,6 +653,10 @@ class InterventionScheduleExecutionOwner:
                             cancellation_check=cancellation_check,
                         )
                         current_y = boundary_result.continuation_state
+                        _append_presentation_boundary(
+                            presentation_boundaries,
+                            boundary_result.presentation_boundary,
+                        )
                         _raise_if_cancelled(cancellation_check)
                         _record_continuation_projection(
                             segment_projections,
@@ -646,6 +732,10 @@ class InterventionScheduleExecutionOwner:
                     cancellation_check=cancellation_check,
                 )
                 current_y = boundary_result.continuation_state
+                _append_presentation_boundary(
+                    presentation_boundaries,
+                    boundary_result.presentation_boundary,
+                )
                 _raise_if_cancelled(cancellation_check)
                 _record_continuation_projection(
                     segment_projections,
@@ -672,8 +762,6 @@ class InterventionScheduleExecutionOwner:
                 )
                 segment_starts_after_discontinuity = root_time < t1
                 sub_start = root_time
-            if terminal_stop:
-                break
 
         if outputs_t:
             output_t = np.concatenate(outputs_t)
@@ -681,6 +769,25 @@ class InterventionScheduleExecutionOwner:
         else:
             output_t = np.empty(0, dtype=float)
             output_y = np.empty((current_y.size, 0), dtype=float)
+        if not output_t.size or float(output_t[-1]) != t1:
+            _append_identity_row(
+                outputs_t,
+                outputs_y,
+                output_segment_ids,
+                output_segment_keys,
+                output_discontinuity_ids,
+                t1,
+                np.asarray(current_y, dtype=float).reshape(-1),
+                segment_id=max(0, segment_count - 1),
+                segment_key=f"integration:{max(0, segment_count - 1)}",
+                discontinuity_id=discontinuity_id,
+            )
+            output_t = np.concatenate(outputs_t)
+            output_y = np.concatenate(outputs_y, axis=1)
+        if output_t.size > 1 and np.any(np.diff(output_t) <= 0.0):
+            raise InterventionScheduleError(
+                "Public result row times must be strictly increasing."
+            )
         _ensure_finite_nonnegative(
             output_y,
             solver=req.solver,
@@ -697,11 +804,7 @@ class InterventionScheduleExecutionOwner:
             provenance["symbolic_jacobian_runtime_fallbacks"] = list(
                 segment_symbolic_jacobian_runtime_fallbacks
             )
-        base_symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
-            jacobian_func=base_request.jacobian_func,
-            jac_sparsity=base_request.jac_sparsity,
-            status=base_request.symbolic_jacobian_status,
-        )
+        base_symbolic_jacobian = req.symbolic_jacobian
         if (
             base_symbolic_jacobian.has_executable_jacobian
             and segment_symbolic_jacobian_usage
@@ -755,36 +858,27 @@ class InterventionScheduleExecutionOwner:
             )
             if len(distinct) > 1:
                 provenance["intervention_segment_solvers"] = segment_solvers
-        if user_event_provenance:
-            provenance["events"] = [
-                list(values) for values in user_event_provenance
-            ]
         _raise_if_cancelled(cancellation_check)
         return SimulationOutput(
             t=output_t,
             Y=output_y,
             provenance=provenance,
             intervention_execution=final_contract,
+            presentation_boundaries=tuple(presentation_boundaries),
         )
 
 
-def _cancellation_check(
-    events: Sequence[Callable[[float, np.ndarray], float]],
-) -> Callable[[], bool] | None:
-    callbacks = tuple(
-        callback
-        for event in events
-        if bool(getattr(event, "_kindred_cancel_event", False))
-        for callback in (getattr(event, "_kindred_cancelled", None),)
-        if callable(callback)
-    )
-    if not callbacks:
-        return None
-
-    def cancelled() -> bool:
-        return any(bool(callback()) for callback in callbacks)
-
-    return cancelled
+def _append_presentation_boundary(
+    boundaries: list[SimulationPresentationBoundary],
+    boundary: SimulationPresentationBoundary | None,
+) -> None:
+    if boundary is None:
+        return
+    if boundaries and boundary.time <= boundaries[-1].time:
+        raise InterventionScheduleError(
+            "Presentation boundaries must remain strictly ordered."
+        )
+    boundaries.append(boundary)
 
 
 def _raise_if_cancelled(check: Callable[[], bool] | None) -> None:
@@ -963,6 +1057,47 @@ def _active_holds(
     )
 
 
+def _purge_zero_crossing_events(
+    fluxes: Sequence[ExecutableFlux],
+    *,
+    active_holds: Sequence[ExecutableHold],
+    species_index: Mapping[str, int],
+    state: np.ndarray,
+) -> tuple[
+    tuple[Callable[[float, np.ndarray], float], ...],
+    tuple[int, ...],
+]:
+    """Create private terminal events for active downward zero crossings."""
+
+    purge_indices: set[int] = set()
+    for flux in fluxes:
+        index = species_index[flux.species]
+        if flux.flux_rate < 0.0:
+            purge_indices.add(index)
+    held = {species_index[hold.species] for hold in active_holds}
+    values = np.asarray(state, dtype=float).reshape(-1)
+    indices = tuple(
+        index
+        for index in sorted(purge_indices)
+        if values[index] > 0.0
+        and index not in held
+    )
+    events: list[Callable[[float, np.ndarray], float]] = []
+    for index in indices:
+        def _zero_crossing(
+            _time: float,
+            values: np.ndarray,
+            *,
+            _index: int = index,
+        ) -> float:
+            return float(values[_index])
+
+        _zero_crossing.terminal = True  # type: ignore[attr-defined]
+        _zero_crossing.direction = -1.0  # type: ignore[attr-defined]
+        events.append(_zero_crossing)
+    return tuple(events), indices
+
+
 def _trigger_action_instant(
     trigger: ExecutableTrigger, *, time: float
 ) -> ExecutableInstant:
@@ -1014,10 +1149,6 @@ def _apply_boundary(
         if input_is_raw_solver_state
         else np.zeros(exact_root.shape, dtype=bool)
     )
-    exact_event_state = {
-        species: float(current[index])
-        for species, index in species_index.items()
-    }
     static = _static_instants_at(contract, boundary)
     entering_holds = tuple(
         hold for hold in active_holds if hold.start_time == boundary
@@ -1066,7 +1197,17 @@ def _apply_boundary(
         cancellation_check=cancellation_check,
     )
     new_firings: list[tuple[int, TriggerFiring]] = []
+    public_event_state: dict[str, float] | None = None
     if stage_six:
+        # Keep the exact solver-root state local to the boundary transaction.
+        # It is the state used for trigger action/conflict/continuation
+        # semantics; only a projected copy may cross into the public firing
+        # payload.
+        raw_event_state = {
+            species: float(exact_root[index])
+            for species, index in species_index.items()
+        }
+        public_event_state = _project_public_event_state(raw_event_state)
         current = _apply_instants(
             current,
             stage_six,
@@ -1076,6 +1217,10 @@ def _apply_boundary(
         for index in trigger_indices:
             trigger = contract.triggers[index]
             next_count = trigger_counts[index] + 1
+            if public_event_state is None:
+                raise InterventionScheduleError(
+                    "Trigger public event state was not constructed."
+                )
             new_firings.append(
                 (
                     index,
@@ -1085,7 +1230,7 @@ def _apply_boundary(
                         threshold=trigger.threshold,
                         direction=trigger.direction,
                         root_time=boundary,
-                        event_state=exact_event_state,
+                        event_state=public_event_state,
                         firing_ordinal=next_count,
                         nested_action_payload=trigger.then.to_payload(),
                     ),
@@ -1120,9 +1265,17 @@ def _apply_boundary(
         trigger_counts[index] += 1
         trigger_last_times[index] = boundary
         trigger_firings.append(firing)
+    presentation_boundary = _presentation_boundary_if_changed(
+        time=boundary,
+        pre_state=exact_root,
+        post_state=current,
+        species_index=species_index,
+        changed=bool(stage_three or stage_six or stage_seven or entering_holds),
+    )
     return _BoundaryApplicationResult(
         continuation_state=continuation.reshape(-1),
         projection=projection,
+        presentation_boundary=presentation_boundary,
     )
 
 
@@ -1134,6 +1287,69 @@ def _instant_canonical_order(
         {"ordinary": 0, "before": 1, "after": 2}[instant.phase],
         -1 if instant.window_ordinal is None else int(instant.window_ordinal),
         -1 if instant.authored_ordinal is None else int(instant.authored_ordinal),
+    )
+
+
+def _project_public_event_state(
+    raw_event_state: Mapping[str, float],
+) -> dict[str, float]:
+    """Project one raw solver-root mapping before publishing a firing.
+
+    The mapping is intentionally call-local: root crossing, action ordering,
+    and continuation continue to use their raw state, while the returned
+    mapping is a detached public pre-action snapshot.
+    """
+
+    names = tuple(str(name) for name in raw_event_state)
+    raw_values = np.asarray(
+        [float(raw_event_state[name]) for name in names],
+        dtype=float,
+    ).reshape(-1, 1)
+    projected, _projection = project_nonnegative_trajectory(
+        raw_values,
+        context="Trigger public event state",
+    )
+    return {
+        name: float(projected[index, 0])
+        for index, name in enumerate(names)
+    }
+
+
+def _presentation_boundary_if_changed(
+    *,
+    time: float,
+    pre_state: np.ndarray,
+    post_state: np.ndarray,
+    species_index: Mapping[str, int],
+    changed: bool,
+) -> SimulationPresentationBoundary | None:
+    """Capture one detached public boundary state after atomic actions."""
+
+    if not changed:
+        return None
+    names = tuple(species_index)
+    raw_pre = {
+        name: float(np.asarray(pre_state, dtype=float).reshape(-1)[index])
+        for name, index in species_index.items()
+    }
+    raw_post = {
+        name: float(np.asarray(post_state, dtype=float).reshape(-1)[index])
+        for name, index in species_index.items()
+    }
+    public_pre = _project_public_event_state(raw_pre)
+    public_post = _project_public_event_state(raw_post)
+    pre_pairs = tuple((name, public_pre[name]) for name in names)
+    post_pairs = tuple((name, public_post[name]) for name in names)
+    if all(pre_value == post_value for (_, pre_value), (_, post_value) in zip(
+        pre_pairs,
+        post_pairs,
+        strict=True,
+    )):
+        return None
+    return SimulationPresentationBoundary(
+        time=float(time),
+        pre_state=pre_pairs,
+        post_state=post_pairs,
     )
 
 
@@ -1226,29 +1442,43 @@ class _InterventionRhs:
         self._fluxes = tuple(fluxes)
         self._holds = tuple(holds)
         self._species_index = dict(species_index)
-
-    def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
-        evaluation_state = np.asarray(state, dtype=float).copy()
-        fixed: set[int] = set()
-        for hold in self._holds:
-            index = self._species_index[hold.species]
-            evaluation_state[index] = hold.value
-            fixed.add(index)
-        derivative = np.asarray(
-            self._rhs(time, evaluation_state), dtype=float
-        ).copy()
         signed_flux_by_index: dict[int, float] = {}
         has_negative_flux: set[int] = set()
         for flux in self._fluxes:
             index = self._species_index[flux.species]
             signed_flux_by_index[index] = (
-                signed_flux_by_index.get(index, 0.0) + flux.flux_rate
+                signed_flux_by_index.get(index, 0.0) + float(flux.flux_rate)
             )
             if flux.flux_rate < 0.0:
                 has_negative_flux.add(index)
-        for index, rate in signed_flux_by_index.items():
+        self._signed_flux_by_index = signed_flux_by_index
+        self._purge_indices = frozenset(has_negative_flux)
+
+    def _base_evaluation_state(
+        self,
+        state: np.ndarray,
+    ) -> tuple[np.ndarray, set[int]]:
+        raw = np.asarray(state, dtype=float).reshape(-1)
+        evaluation_state = raw.copy()
+        fixed: set[int] = set()
+        for hold in self._holds:
+            index = self._species_index[hold.species]
+            evaluation_state[index] = float(hold.value)
+            fixed.add(index)
+        for index in self._purge_indices:
+            if evaluation_state[index] < 0.0:
+                evaluation_state[index] = 0.0
+        return evaluation_state, fixed
+
+    def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
+        raw_state = np.asarray(state, dtype=float).reshape(-1)
+        evaluation_state, fixed = self._base_evaluation_state(raw_state)
+        derivative = np.asarray(
+            self._rhs(time, evaluation_state), dtype=float
+        ).copy()
+        for index, rate in self._signed_flux_by_index.items():
             candidate = float(derivative[index]) + rate
-            if index in has_negative_flux and evaluation_state[index] <= 0.0:
+            if index in self._purge_indices and raw_state[index] <= 0.0:
                 derivative[index] = max(0.0, candidate)
             else:
                 derivative[index] = candidate
@@ -1261,36 +1491,24 @@ class _InterventionRhs:
         time: float,
         state: np.ndarray,
     ) -> tuple[set[int], set[int]]:
-        """Return constant rows and branch boundaries for active purges.
+        """Return rows and columns masked by the active purge branch."""
 
-        A negative flux is a production-aware purge: at zero concentration it
-        removes up to the available production and therefore has a constant
-        zero derivative when the base production cannot satisfy the purge.
-        Equality is a piecewise branch boundary; the symbolic Jacobian is
-        unavailable there unless the transformed base row is itself constant.
-        """
-
-        evaluation_state = np.asarray(state, dtype=float).copy()
-        for hold in self._holds:
-            evaluation_state[self._species_index[hold.species]] = hold.value
+        raw_state = np.asarray(state, dtype=float).reshape(-1)
+        evaluation_state, _fixed = self._base_evaluation_state(raw_state)
         derivative = np.asarray(self._rhs(time, evaluation_state), dtype=float)
-        signed_flux_by_index: dict[int, float] = {}
-        for flux in self._fluxes:
-            index = self._species_index[flux.species]
-            signed_flux_by_index[index] = (
-                signed_flux_by_index.get(index, 0.0) + flux.flux_rate
-            )
         zero_rows: set[int] = set()
-        branch_boundaries: set[int] = set()
-        for index, rate in signed_flux_by_index.items():
-            if rate >= 0.0 or evaluation_state[index] > 0.0:
+        zero_columns: set[int] = set()
+        for index in self._purge_indices:
+            if raw_state[index] < 0.0:
+                zero_columns.add(index)
+            rate = self._signed_flux_by_index[index]
+            if raw_state[index] > 0.0:
                 continue
             candidate = float(derivative[index]) + rate
-            if candidate < 0.0:
+            if candidate <= 0.0:
                 zero_rows.add(index)
-            elif candidate == 0.0:
-                branch_boundaries.add(index)
-        return zero_rows, branch_boundaries
+                zero_columns.add(index)
+        return zero_rows, zero_columns
 
 
 class _InterventionJacobian:
@@ -1310,14 +1528,6 @@ class _InterventionJacobian:
         self._holds = tuple(holds)
         self._fluxes = tuple(fluxes)
         self._species_index = dict(species_index)
-        identity = getattr(jacobian, SYMBOLIC_JACOBIAN_IDENTITY_ATTR, None)
-        if identity is not None:
-            setattr(self, SYMBOLIC_JACOBIAN_IDENTITY_ATTR, identity)
-        setattr(
-            self,
-            "_kindred_symbolic_jacobian_finite_at_state",
-            self._finite_at_state,
-        )
 
     def _evaluate_state(self, state: np.ndarray) -> tuple[np.ndarray, set[int]]:
         values = np.asarray(state, dtype=float).reshape(-1)
@@ -1325,9 +1535,7 @@ class _InterventionJacobian:
             self._species_index[hold.species]
             for hold in self._holds
         }
-        used = values.copy()
-        for hold in self._holds:
-            used[self._species_index[hold.species]] = float(hold.value)
+        used, _fixed = self._rhs._base_evaluation_state(values)
         return used, held
 
     def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
@@ -1342,29 +1550,15 @@ class _InterventionJacobian:
             indices = np.fromiter(sorted(held), dtype=np.int64)
             matrix[indices, :] = 0.0
             matrix[:, indices] = 0.0
-        purge_rows, purge_boundaries = self._rhs.purge_jacobian_branches(
+        purge_rows, purge_columns = self._rhs.purge_jacobian_branches(
             float(time),
             np.asarray(state, dtype=float),
         )
-        if purge_boundaries and any(
-            np.any(matrix[index, :] != 0.0)
-            for index in purge_boundaries
-        ):
-            raise ValueError(
-                "production-aware purge Jacobian is unavailable at its "
-                "piecewise branch boundary"
-            )
         if purge_rows:
             matrix[np.fromiter(sorted(purge_rows), dtype=np.int64), :] = 0.0
+        if purge_columns:
+            matrix[:, np.fromiter(sorted(purge_columns), dtype=np.int64)] = 0.0
         return matrix
-
-    def _finite_at_state(self, time: float, state: np.ndarray) -> bool:
-        try:
-            matrix = self(float(time), np.asarray(state, dtype=float))
-        except (ArithmeticError, TypeError, ValueError, OverflowError):
-            return False
-        return bool(np.all(np.isfinite(matrix)))
-
 
 def _transform_jacobian_sparsity(
     sparsity: object,
@@ -1514,11 +1708,10 @@ def _first_trigger_hit(
     event_states: Sequence[Sequence[np.ndarray]],
     *,
     trigger_mapping: Sequence[int],
-    user_event_count: int,
 ) -> tuple[float, tuple[int, ...], np.ndarray] | None:
     hits: list[tuple[float, int, np.ndarray]] = []
     for offset, trigger_index in enumerate(trigger_mapping):
-        event_index = user_event_count + offset
+        event_index = offset
         if event_index >= len(event_times) or event_index >= len(event_states):
             continue
         for position, raw_time in enumerate(event_times[event_index]):
@@ -1553,6 +1746,50 @@ def _first_trigger_hit(
     return root_time, indices, state
 
 
+def _first_purge_hit(
+    event_times: Sequence[Sequence[float]],
+    event_states: Sequence[Sequence[np.ndarray]],
+    *,
+    purge_mapping: Sequence[int],
+    event_offset: int,
+) -> tuple[float, tuple[int, ...], np.ndarray] | None:
+    hits: list[tuple[float, int, np.ndarray]] = []
+    for offset, species_index in enumerate(purge_mapping):
+        event_index = event_offset + offset
+        if event_index >= len(event_times) or event_index >= len(event_states):
+            continue
+        for position, raw_time in enumerate(event_times[event_index]):
+            if position >= len(event_states[event_index]):
+                raise InterventionScheduleError(
+                    "Exact purge root is missing its event-time state."
+                )
+            hits.append(
+                (
+                    float(raw_time),
+                    int(species_index),
+                    np.asarray(
+                        event_states[event_index][position], dtype=float
+                    ).reshape(-1),
+                )
+            )
+    if not hits:
+        return None
+    root_time = min(item[0] for item in hits)
+    simultaneous = [item for item in hits if item[0] == root_time]
+    state = simultaneous[0][2].copy()
+    if any(item[2].size != state.size for item in simultaneous):
+        raise InterventionScheduleError(
+            "Simultaneous exact purge roots reported incompatible states."
+        )
+    for _time, species_index, _state in simultaneous:
+        state[species_index] = 0.0
+    return (
+        root_time,
+        tuple(dict.fromkeys(item[1] for item in simultaneous)),
+        state,
+    )
+
+
 def _normal_event_times(
     values: object, *, count: int
 ) -> list[list[float]]:
@@ -1584,34 +1821,6 @@ def _normal_event_states(
                 )
             output[index].append(array)
     return output
-
-
-def _event_terminal_flags(
-    request: SimulationRequest,
-    events: Sequence[Callable[[float, np.ndarray], float]],
-) -> tuple[bool, ...]:
-    explicit = tuple(request.event_terminal or ())
-    return tuple(
-        bool(explicit[index])
-        if index < len(explicit)
-        else bool(getattr(event, "terminal", False))
-        for index, event in enumerate(events)
-    )
-
-
-def _terminal_user_event_time(
-    events: Sequence[Callable[[float, np.ndarray], float]],
-    terminal: Sequence[bool],
-    times: Sequence[Sequence[float]],
-) -> float | None:
-    hits: list[float] = []
-    for index, values in enumerate(times):
-        if not values or index >= len(terminal) or not terminal[index]:
-            continue
-        if bool(getattr(events[index], "_kindred_cancel_event", False)):
-            continue
-        hits.extend(float(value) for value in values)
-    return min(hits) if hits else None
 
 
 def _requested_eval(

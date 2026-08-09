@@ -1,4 +1,4 @@
-"""Fit-local data-range and observation-count presentation."""
+"""Fit-local Data Range and dataset-local start controls."""
 
 from __future__ import annotations
 
@@ -17,6 +17,15 @@ from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
 
 class DataTab(QtWidgets.QWidget):
     """Presentation for one dataset's retained-observation controls."""
+
+    _OWNED_FIELDS = (
+        "t_start",
+        "data_range_min",
+        "data_range_max",
+        "maximum_observations_per_target",
+        "parametric_x",
+        "parametric_mode",
+    )
 
     fitSettingsApplied = QtCore.Signal(str, dict)
     statusMessage = QtCore.Signal(str)
@@ -40,6 +49,8 @@ class DataTab(QtWidgets.QWidget):
         self._display_names: dict[str, str] = {}
         self._pending: dict[str, dict[str, object]] = {}
         self._invalid_raw: dict[tuple[str, str], str] = {}
+        self._resolved_auto_modes: dict[str, str] = {}
+        self._changed_fields: dict[str, set[str]] = {}
         self._refreshing = False
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -79,7 +90,6 @@ class DataTab(QtWidgets.QWidget):
             panel,
             show_divider=False,
             show_reset=True,
-            show_secondary_error=True,
             messages_position="after_body",
             apply_requires_no_error=True,
             button_order=("reset", "revert", "apply"),
@@ -92,23 +102,21 @@ class DataTab(QtWidgets.QWidget):
         controls = QtWidgets.QGridLayout()
         controls.setHorizontalSpacing(6)
         controls.setVerticalSpacing(4)
-        self._start_edit = self._number_edit("global_fit_simulation_start")
         self._min_edit = self._number_edit("global_fit_data_range_min")
         self._max_edit = self._number_edit("global_fit_data_range_max")
+        self._start_edit = self._number_edit("global_fit_t_start")
         self._maximum_edit = QtWidgets.QLineEdit(self._footer)
         self._maximum_edit.setObjectName("global_fit_maximum_observations")
         self._maximum_edit.setPlaceholderText("All")
         self._maximum_edit.setValidator(QtGui.QIntValidator(0, 2_000_000_000, self))
-        controls.addWidget(
-            QtWidgets.QLabel("Simulation start", self._footer), 0, 0
-        )
-        controls.addWidget(self._start_edit, 0, 1)
         range_widget = QtWidgets.QWidget(self._footer)
         range_layout = QtWidgets.QHBoxLayout(range_widget)
         range_layout.setContentsMargins(0, 0, 0, 0)
         range_layout.addWidget(self._min_edit)
         range_layout.addWidget(QtWidgets.QLabel("to", range_widget))
         range_layout.addWidget(self._max_edit)
+        controls.addWidget(QtWidgets.QLabel("Simulation start", self._footer), 0, 0)
+        controls.addWidget(self._start_edit, 0, 1)
         controls.addWidget(QtWidgets.QLabel("Data Range", self._footer), 1, 0)
         controls.addWidget(range_widget, 1, 1)
         controls.addWidget(
@@ -117,21 +125,45 @@ class DataTab(QtWidgets.QWidget):
             0,
         )
         controls.addWidget(self._maximum_edit, 2, 1)
-        self._solver_combo = QtWidgets.QComboBox(self._footer)
-        self._solver_combo.setObjectName("global_fit_solver")
-        self._solver_combo.addItem("BDF", "BDF")
-        self._solver_combo.addItem("Radau", "Radau")
-        controls.addWidget(QtWidgets.QLabel("Fit solver", self._footer), 3, 0)
-        controls.addWidget(self._solver_combo, 3, 1)
+        self._x_combo = QtWidgets.QComboBox(self._footer)
+        self._x_combo.setObjectName("global_fit_parametric_x")
+        self._mode_combo = QtWidgets.QComboBox(self._footer)
+        self._mode_combo.setObjectName("global_fit_parametric_mode")
+        self._mode_combo.addItem("Auto", "auto")
+        self._mode_combo.addItem("Monotone", "monotone")
+        self._mode_combo.addItem("Time-guided", "time_guided")
+        controls.addWidget(QtWidgets.QLabel("Parametric X", self._footer), 3, 0)
+        controls.addWidget(self._x_combo, 3, 1)
+        controls.addWidget(QtWidgets.QLabel("Mapping mode", self._footer), 4, 0)
+        controls.addWidget(self._mode_combo, 4, 1)
+        self._resolved_mode_label = QtWidgets.QLabel("Resolved Auto: —", self._footer)
+        self._resolved_mode_label.setObjectName("global_fit_parametric_resolved_mode")
+        self._resolved_mode_label.setStyleSheet("font-size: 11px;")
+        controls.addWidget(self._resolved_mode_label, 5, 0, 1, 2)
         self._used_label = QtWidgets.QLabel("Used: —", self._footer)
         self._used_label.setObjectName("global_fit_used_count")
         self._used_label.setStyleSheet("font-size: 11px;")
-        controls.addWidget(self._used_label, 4, 0, 1, 2)
+        controls.addWidget(self._used_label, 6, 0, 1, 2)
         self._footer.body_layout.addLayout(controls)
 
-        for editor in (self._start_edit, self._min_edit, self._max_edit, self._maximum_edit):
-            editor.textChanged.connect(self._controls_changed)
-        self._solver_combo.currentIndexChanged.connect(self._controls_changed)
+        self._start_edit.textChanged.connect(
+            lambda *_args: self._controls_changed("t_start")
+        )
+        self._min_edit.textChanged.connect(
+            lambda *_args: self._controls_changed("data_range_min")
+        )
+        self._max_edit.textChanged.connect(
+            lambda *_args: self._controls_changed("data_range_max")
+        )
+        self._maximum_edit.textChanged.connect(
+            lambda *_args: self._controls_changed("maximum_observations_per_target")
+        )
+        self._x_combo.currentIndexChanged.connect(
+            lambda *_args: self._controls_changed("parametric_x")
+        )
+        self._mode_combo.currentIndexChanged.connect(
+            lambda *_args: self._controls_changed("parametric_mode")
+        )
         self._footer.applyRequested.connect(self._apply)
         self._footer.revertRequested.connect(self._revert)
         self._footer.resetRequested.connect(self._reset)
@@ -157,17 +189,27 @@ class DataTab(QtWidgets.QWidget):
             + ")"
         )
         self._header.setEnabled(enabled)
-        for editor in (self._start_edit, self._min_edit, self._max_edit, self._maximum_edit):
+        for editor in (
+            self._start_edit,
+            self._min_edit,
+            self._max_edit,
+            self._maximum_edit,
+        ):
             editor.setEnabled(enabled)
-        self._solver_combo.setEnabled(enabled)
+        self._x_combo.setEnabled(enabled)
         if self._footer.reset_button is not None:
             self._footer.reset_button.setEnabled(enabled)
         if not enabled:
             self._used_label.setText("Used: —")
+            self._resolved_mode_label.setText("Resolved Auto: —")
             self._footer.set_error(None)
             self._footer.set_dirty(False)
             return
-        config = dict(self._pending.get(self._current_dataset_id, self._settings_getter(self._current_dataset_id)))
+        accepted = self._owned_settings(
+            self._settings_getter(self._current_dataset_id)
+        )
+        pending = self._pending.get(self._current_dataset_id)
+        config = self._owned_settings(pending) if pending is not None else accepted
         self._refreshing = True
         try:
             self._start_edit.setText(
@@ -195,24 +237,76 @@ class DataTab(QtWidgets.QWidget):
                     "All" if maximum in (None, 0, "") else str(maximum),
                 )
             )
-            self._solver_combo.setCurrentText(str(config.get("solver", "BDF")))
+            selected_x = str(config.get("parametric_x", "t") or "t")
+            options = tuple(
+                str(item)
+                for item in self._settings_getter(
+                    self._current_dataset_id
+                ).get("eligible_parametric_x", ())
+            )
+            self._x_combo.clear()
+            self._x_combo.addItem("Time", "t")
+            for option in options:
+                self._x_combo.addItem(option, option)
+            selected_index = self._x_combo.findData(selected_x)
+            if selected_index < 0 and selected_x != "t":
+                # Preserve an accepted-but-no-longer-eligible value as an
+                # explicit invalid projection.  Never silently change it to
+                # Time; the owner must fail closed until the setup is fixed.
+                self._x_combo.addItem(
+                    f"{selected_x} (unavailable)",
+                    selected_x,
+                )
+                selected_index = self._x_combo.count() - 1
+            self._x_combo.setCurrentIndex(selected_index)
+            self._mode_combo.clear()
+            self._mode_combo.addItem("Auto", "auto")
+            self._mode_combo.addItem("Monotone", "monotone")
+            self._mode_combo.addItem("Time-guided", "time_guided")
+            requested_mode = str(config.get("parametric_mode", "auto") or "auto")
+            mode_index = self._mode_combo.findData(requested_mode)
+            if mode_index < 0:
+                self._mode_combo.addItem(
+                    f"{requested_mode} (unavailable)",
+                    requested_mode,
+                )
+                mode_index = self._mode_combo.count() - 1
+            self._mode_combo.setCurrentIndex(mode_index)
         finally:
             self._refreshing = False
+        self._refresh_parametric_presentation()
         self._controls_changed()
 
     @staticmethod
     def _format(value: object) -> str:
-        return format(float(value), ".12g")
+        return repr(float(value))
 
-    def _capture(self) -> dict[str, object]:
+    @classmethod
+    def _owned_settings(
+        cls,
+        settings: Mapping[str, object],
+    ) -> dict[str, object]:
+        return {field: settings.get(field) for field in cls._OWNED_FIELDS}
+
+    def _capture(self, changed_field: str | None = None) -> dict[str, object]:
         dataset_id = self._current_dataset_id
-        config = dict(self._pending.get(dataset_id, self._settings_getter(dataset_id)))
+        pending = self._pending.get(dataset_id)
+        config = (
+            self._owned_settings(pending)
+            if pending is not None
+            else self._owned_settings(self._settings_getter(dataset_id))
+        )
+        changed = set(self._changed_fields.get(dataset_id, ()))
+        if changed_field is not None:
+            changed.add(changed_field)
         controls = (
             ("t_start", self._start_edit),
             ("data_range_min", self._min_edit),
             ("data_range_max", self._max_edit),
         )
         for field, editor in controls:
+            if field not in changed:
+                continue
             raw = editor.text()
             try:
                 value = float(raw)
@@ -223,38 +317,46 @@ class DataTab(QtWidgets.QWidget):
             else:
                 self._invalid_raw.pop((dataset_id, field), None)
                 config[field] = value
-        raw_maximum = self._maximum_edit.text().strip()
-        try:
-            if not raw_maximum or raw_maximum.casefold() == "all":
-                maximum = None
+        if "maximum_observations_per_target" in changed:
+            raw_maximum = self._maximum_edit.text().strip()
+            try:
+                if not raw_maximum or raw_maximum.casefold() == "all":
+                    maximum = None
+                else:
+                    maximum = int(raw_maximum)
+                    if maximum < 2:
+                        raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                self._invalid_raw[(dataset_id, "maximum_observations_per_target")] = raw_maximum
             else:
-                maximum = int(raw_maximum)
-                if maximum < 2:
-                    raise ValueError
-        except (TypeError, ValueError, OverflowError):
-            self._invalid_raw[(dataset_id, "maximum_observations_per_target")] = raw_maximum
-        else:
-            self._invalid_raw.pop((dataset_id, "maximum_observations_per_target"), None)
-            config["maximum_observations_per_target"] = maximum
-        config["solver"] = str(self._solver_combo.currentData() or "BDF")
+                self._invalid_raw.pop((dataset_id, "maximum_observations_per_target"), None)
+                config["maximum_observations_per_target"] = maximum
+        if "parametric_x" in changed:
+            config["parametric_x"] = str(self._x_combo.currentData() or "t")
+        if "parametric_mode" in changed:
+            config["parametric_mode"] = str(self._mode_combo.currentData() or "auto")
         self._pending[dataset_id] = config
         return config
 
     @staticmethod
     def _signature(config: Mapping[str, object]) -> tuple[object, ...]:
         return (
-            config.get("solver", "BDF"),
             config.get("t_start"),
             config.get("data_range_min"),
             config.get("data_range_max"),
             config.get("maximum_observations_per_target"),
+            config.get("parametric_x", "t"),
+            config.get("parametric_mode", "auto"),
         )
 
     def _validation_error(self, dataset_id: str, config: Mapping[str, object]) -> str | None:
+        accepted = self._settings_getter(dataset_id)
         for field in ("t_start", "data_range_min", "data_range_max", "maximum_observations_per_target"):
             if (dataset_id, field) in self._invalid_raw:
                 return "Fit data values must be finite; Maximum observations must be All or an integer ≥ 2."
         try:
+            if float(config["t_start"]) < 0.0:
+                return "Simulation start must be finite and nonnegative."
             if float(config["data_range_min"]) > float(config["data_range_max"]):
                 return "Data Range minimum must be ≤ maximum."
         except (KeyError, TypeError, ValueError):
@@ -265,14 +367,30 @@ class DataTab(QtWidgets.QWidget):
             return str(exc)
         if not retained:
             return "Select at least one retained observation target."
-        if float(config["data_range_max"]) <= float(config["t_start"]):
-            return "Data Range maximum must be greater than Simulation start."
+        try:
+            if float(config["data_range_max"]) <= float(config["t_start"]):
+                return "Data Range maximum must be greater than Simulation start."
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return "Accepted Simulation start is invalid."
+        selected_x = str(config.get("parametric_x", "t") or "t")
+        if selected_x != "t" and selected_x not in tuple(
+            str(item) for item in accepted.get("eligible_parametric_x", ())
+        ):
+            return "Parametric X must be an eligible non-Y experimental series."
+        selected_mode = str(config.get("parametric_mode", "auto") or "auto")
+        if selected_mode not in {"auto", "monotone", "time_guided"}:
+            return "Parametric mapping mode is invalid."
         return None
 
-    def _controls_changed(self) -> None:
+    def _controls_changed(self, changed_field: str | None = None) -> None:
         if self._refreshing or not self._current_dataset_id:
             return
-        config = self._capture()
+        if changed_field is not None:
+            self._changed_fields.setdefault(self._current_dataset_id, set()).add(
+                changed_field
+            )
+        config = self._capture(changed_field)
+        self._refresh_parametric_presentation()
         error = self._validation_error(self._current_dataset_id, config)
         try:
             used = sum(len(item.t) for item in self._retained_observations_getter(self._current_dataset_id, config))
@@ -280,11 +398,18 @@ class DataTab(QtWidgets.QWidget):
         except ValueError:
             self._used_label.setText("Used: —")
         self._footer.set_error(error)
-        applied = self._settings_getter(self._current_dataset_id)
-        self._footer.set_dirty(
+        applied = self._owned_settings(
+            self._settings_getter(self._current_dataset_id)
+        )
+        dirty = (
             self._signature(config) != self._signature(applied)
             or any(key[0] == self._current_dataset_id for key in self._invalid_raw)
         )
+        if dirty:
+            self._pending[self._current_dataset_id] = config
+        else:
+            self._pending.pop(self._current_dataset_id, None)
+        self._footer.set_dirty(dirty)
         self.validityChanged.emit()
 
     def _apply(self) -> None:
@@ -297,12 +422,14 @@ class DataTab(QtWidgets.QWidget):
             return
         self.fitSettingsApplied.emit(self._current_dataset_id, dict(config))
         self._pending.pop(self._current_dataset_id, None)
+        self._changed_fields.pop(self._current_dataset_id, None)
         self._project_controls()
 
     def _revert(self) -> None:
         if not self._current_dataset_id:
             return
         self._pending.pop(self._current_dataset_id, None)
+        self._changed_fields.pop(self._current_dataset_id, None)
         for key in tuple(self._invalid_raw):
             if key[0] == self._current_dataset_id:
                 self._invalid_raw.pop(key, None)
@@ -311,9 +438,44 @@ class DataTab(QtWidgets.QWidget):
     def _reset(self) -> None:
         if not self._current_dataset_id:
             return
-        defaults = dict(self._default_settings_getter(self._current_dataset_id))
+        defaults = self._owned_settings(
+            self._default_settings_getter(self._current_dataset_id)
+        )
         self._pending[self._current_dataset_id] = defaults
+        self._changed_fields[self._current_dataset_id] = set(self._OWNED_FIELDS)
         for key in tuple(self._invalid_raw):
             if key[0] == self._current_dataset_id:
                 self._invalid_raw.pop(key, None)
         self._project_controls()
+
+    def clear_pending(self) -> None:
+        """Discard only this panel's raw drafts and validation state."""
+
+        self._pending.clear()
+        self._changed_fields.clear()
+        self._invalid_raw.clear()
+        self._project_controls()
+
+    def set_resolved_auto_modes(
+        self,
+        modes: tuple[tuple[str, str], ...],
+    ) -> None:
+        self._resolved_auto_modes = {
+            str(dataset_id): str(mode) for dataset_id, mode in modes
+        }
+        self._refresh_parametric_presentation()
+
+    def _refresh_parametric_presentation(self) -> None:
+        is_time = str(self._x_combo.currentData() or "t") == "t"
+        self._mode_combo.setEnabled(bool(self._current_dataset_id) and not is_time)
+        mode = self._resolved_auto_modes.get(self._current_dataset_id)
+        pending = self._pending.get(self._current_dataset_id)
+        if pending is not None and self._signature(pending) != self._signature(
+            self._owned_settings(self._settings_getter(self._current_dataset_id))
+        ):
+            mode = None
+        display = {
+            "monotone": "Monotone",
+            "time_guided": "Time-guided",
+        }.get(mode, "—")
+        self._resolved_mode_label.setText(f"Resolved Auto: {display}")

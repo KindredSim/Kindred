@@ -40,7 +40,6 @@ __all__ = [
     "compile_algebra_observables",
     "evaluate_algebra_series_for_simulation_with_errors",
     "evaluate_compiled_algebra_series_for_simulation",
-    "evaluate_algebra_series_for_simulation",
 ]
 
 
@@ -332,35 +331,3 @@ def evaluate_algebra_series_for_simulation_with_errors(
         return {}, {}, [_error_from_exception("__eval__", exc)]
 
     return series, scalars, errors
-
-
-def evaluate_algebra_series_for_simulation(
-    mechanism: object,
-    *,
-    t: np.ndarray,
-    species_series: Dict[str, np.ndarray],
-    initials: Dict[str, float],
-    temperature_K: Optional[float] = None,
-    symbol_series: Mapping[str, np.ndarray | float] | None = None,
-    symbol_values: Mapping[str, float] | None = None,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
-    """
-    Evaluate the Algebra program retained by accepted mechanism parsing against
-    time series arrays.
-
-    Returns
-    -------
-    (series, scalars)
-        series: dict of time-series outputs {name: y(t)}
-        scalars: dict of scalar outputs {name: value}
-    """
-    series, scalars, _errors = evaluate_algebra_series_for_simulation_with_errors(
-        mechanism,
-        t=t,
-        species_series=species_series,
-        initials=initials,
-        temperature_K=temperature_K,
-        symbol_series=symbol_series,
-        symbol_values=symbol_values,
-    )
-    return series, scalars

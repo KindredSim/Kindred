@@ -200,7 +200,3 @@ class SymbolTable:
     def protected_names(self) -> Set[str]:
         """Return the set of protected symbol names."""
         return set(PROTECTED_NAMES)
-
-    def user_names(self) -> Set[str]:
-        """Return names of currently defined user symbols."""
-        return set(self._user.keys())

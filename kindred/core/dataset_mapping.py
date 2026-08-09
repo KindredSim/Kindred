@@ -15,26 +15,14 @@ from kindred.core.datasets.observation_mapping import (
     normalize_observation_mapping,
     seed_species_values_at_exact_zero,
 )
-from kindred.core.datasets.csv_import import (
-    identify_physical_columns,
-    validate_tabular_source_bytes,
-)
+from kindred.core.datasets import foundation as dataset_foundation
 from kindred.core.project_document import (
     DatasetLink,
     InitialConditionSet,
     MechanismTabDocument,
-    ObservationSeries,
     ProjectDocument,
-    RawDatasetRecord,
-    SimulationExecutionSettings,
-    thaw_json_value,
-    validate_simulation_execution_settings,
+    new_set_id,
 )
-
-_MAX_SOURCE_BYTES = 32 * 1024 * 1024
-_MAX_PHYSICAL_COLUMNS = 256
-_MAX_RETAINED_OBSERVATION_CELLS = 1_000_000
-
 
 class DatasetMappingError(ValueError):
     """Raised when a proposed dataset mutation violates a real invariant."""
@@ -50,6 +38,76 @@ class OccupiedSetChoice(str, Enum):
     OVERRIDE = "override"
     CREATE_COPY = "create_copy"
     CANCEL = "cancel"
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetMappingProposal:
+    """One complete, immutable mapping choice for one committed dataset."""
+
+    dataset_id: str
+    action: DatasetMappingChoice | str
+    target_set_id: str | None = None
+    occupied_choice: OccupiedSetChoice | str | None = None
+    observation_mapping: tuple[tuple[str, str], ...] = ()
+    proposed_set_name: str | None = None
+
+    def __post_init__(self) -> None:
+        dataset_id = str(self.dataset_id).strip()
+        if not dataset_id:
+            raise DatasetMappingError("A mapping proposal requires a dataset ID.")
+        try:
+            action = DatasetMappingChoice(self.action)
+        except (TypeError, ValueError) as exc:
+            raise DatasetMappingError("A mapping proposal requires a valid action.") from exc
+        target = None if self.target_set_id is None else str(self.target_set_id).strip()
+        if target == "":
+            target = None
+        occupied = self.occupied_choice
+        if occupied is not None:
+            try:
+                occupied = OccupiedSetChoice(occupied)
+            except (TypeError, ValueError) as exc:
+                raise DatasetMappingError("A mapping proposal requires a valid occupancy choice.") from exc
+        mapping = tuple(
+            (str(raw_id).strip(), str(species).strip())
+            for raw_id, species in tuple(self.observation_mapping)
+        )
+        if any(not raw_id or not species for raw_id, species in mapping):
+            raise DatasetMappingError("Observation mappings cannot contain blank identities.")
+        proposed_name = None if self.proposed_set_name is None else str(self.proposed_set_name).strip()
+        if proposed_name == "":
+            proposed_name = None
+        if action is DatasetMappingChoice.MAP_EXISTING and not target:
+            raise DatasetMappingError("Map Existing requires a target set.")
+        if action is DatasetMappingChoice.CREATE_SET and target is not None:
+            raise DatasetMappingError("Create Set cannot target an existing set.")
+        object.__setattr__(self, "dataset_id", dataset_id)
+        object.__setattr__(self, "action", action)
+        object.__setattr__(self, "target_set_id", target)
+        object.__setattr__(self, "occupied_choice", occupied)
+        object.__setattr__(self, "observation_mapping", mapping)
+        object.__setattr__(self, "proposed_set_name", proposed_name)
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetMappingBatchProposal:
+    """One immutable, ordered proposal covering every committed dataset."""
+
+    tab_id: str
+    proposals: tuple[DatasetMappingProposal, ...]
+
+    def __post_init__(self) -> None:
+        tab_id = str(self.tab_id).strip()
+        proposals = tuple(self.proposals)
+        if not tab_id:
+            raise DatasetMappingError("A mapping batch requires an origin tab ID.")
+        if not proposals or any(not isinstance(item, DatasetMappingProposal) for item in proposals):
+            raise DatasetMappingError("A mapping batch requires one proposal per dataset.")
+        dataset_ids = tuple(item.dataset_id for item in proposals)
+        if len(set(dataset_ids)) != len(dataset_ids):
+            raise DatasetMappingError("A mapping batch cannot contain a dataset twice.")
+        object.__setattr__(self, "tab_id", tab_id)
+        object.__setattr__(self, "proposals", proposals)
 
 
 @dataclass(frozen=True)
@@ -69,395 +127,60 @@ class DatasetSetMappingPlan:
 
 @dataclass(frozen=True)
 class GlobalDatasetDeletePlan:
-    dataset_id: str
     referenced: bool
 
 
-@dataclass(frozen=True, slots=True)
-class DatasetMappedTarget:
-    dataset_id: str
-    raw_observation_id: str
-    raw_column: str
-    model_target: str
-    t: tuple[float, ...]
-    y: tuple[float, ...]
-    source_rows: tuple[int, ...]
+def resolve_fit_t_start(
+    tab: MechanismTabDocument,
+    set_id: str,
+    *,
+    label: str = "Fit inclusion",
+) -> float:
+    """Resolve and validate only the start-time scalar owned by Fit."""
 
-    def __post_init__(self) -> None:
-        dataset_id = str(self.dataset_id).strip()
-        if (
-            not isinstance(self.raw_observation_id, str)
-            or not self.raw_observation_id
-            or self.raw_observation_id != self.raw_observation_id.strip()
-        ):
-            raise ValueError(
-                "Mapped dataset target raw observation identity must be a "
-                "nonblank edge-normalized string."
-            )
-        raw_observation_id = self.raw_observation_id
-        raw_column = str(self.raw_column).strip()
-        model_target = str(self.model_target).strip()
-        if (
-            not dataset_id
-            or not raw_observation_id
-            or not raw_column
-            or not model_target
-        ):
-            raise ValueError("Mapped dataset target identities must be nonblank.")
-        if (
-            type(self.t) is not tuple
-            or type(self.y) is not tuple
-            or type(self.source_rows) is not tuple
-            or not self.t
-            or len(self.t) != len(self.y)
-            or len(self.t) != len(self.source_rows)
-        ):
-            raise ValueError(
-                "Mapped dataset target time, value, and source-row tuples "
-                "must be immutable and have equal nonzero length."
-            )
-        if (
-            any(
-                type(value) is not float or not math.isfinite(value)
-                for value in (*self.t, *self.y)
-            )
-            or any(
-                type(row) is not int or row <= 0
-                for row in self.source_rows
-            )
-            or len(set(self.source_rows)) != len(self.source_rows)
-        ):
-            raise ValueError(
-                "Mapped dataset targets require finite values and unique "
-                "positive physical source rows."
-            )
-        object.__setattr__(self, "dataset_id", dataset_id)
-        object.__setattr__(
-            self,
-            "raw_observation_id",
-            raw_observation_id,
-        )
-        object.__setattr__(self, "raw_column", raw_column)
-        object.__setattr__(self, "model_target", model_target)
-
-
-@dataclass(frozen=True, slots=True)
-class FitInclusionValidation:
-    dataset_id: str
-    set_id: str
-    execution: SimulationExecutionSettings
-    targets: tuple[DatasetMappedTarget, ...]
-
-    def __post_init__(self) -> None:
-        targets = tuple(self.targets)
-        if not targets or any(
-            target.dataset_id != self.dataset_id for target in targets
-        ):
-            raise ValueError(
-                "Fit inclusion targets must be nonempty and share the stable "
-                "dataset ID."
-            )
-        object.__setattr__(self, "targets", targets)
-
-
-@dataclass(frozen=True, slots=True)
-class FitInclusionRevalidation:
-    tab: MechanismTabDocument
-    excluded: tuple[tuple[str, str], ...]
-
-
-def validate_raw_dataset_record(
-    record: RawDatasetRecord,
-) -> RawDatasetRecord:
-    """Fail closed unless one immutable raw record satisfies Dataset law."""
-    if not isinstance(record, RawDatasetRecord):
-        raise TypeError("record must be a RawDatasetRecord.")
-    if (
-        not isinstance(record.dataset_id, str)
-        or not record.dataset_id
-        or record.dataset_id != record.dataset_id.strip()
-    ):
+    if not isinstance(tab, MechanismTabDocument):
+        raise TypeError("tab must be a MechanismTabDocument.")
+    target = tab.initial_condition_set(set_id).set_id
+    settings = dict(tab.run_overrides_by_set_id).get(target, tab.run_defaults)
+    raw_t_start = settings.t_start
+    if type(raw_t_start) is bool:
         raise DatasetMappingError(
-            "Raw dataset ID must be a nonblank edge-normalized string."
-        )
-    if (
-        not isinstance(record.display_name, str)
-        or not record.display_name
-        or record.display_name != record.display_name.strip()
-    ):
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} display name must be a "
-            "nonblank edge-normalized string."
-        )
-    if record.original_format not in {"csv", "xlsx"}:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} original_format must be "
-            "exactly 'csv' or 'xlsx'."
-        )
-    if (
-        not isinstance(record.original_filename, str)
-        or not record.original_filename
-        or record.original_filename != record.original_filename.strip()
-        or os.path.basename(record.original_filename) != record.original_filename
-    ):
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} original filename must be a "
-            "nonblank basename."
-        )
-    expected_suffix = f".{record.original_format}"
-    if Path(record.original_filename).suffix.lower() != expected_suffix:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} original filename must end "
-            f"in {expected_suffix!r}."
-        )
-    if type(record.exact_source_bytes) is not bytes:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} exact source must be immutable "
-            "bytes."
-        )
-    if not record.exact_source_bytes:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} exact source bytes must be "
-            "nonempty."
-        )
-    if len(record.exact_source_bytes) > _MAX_SOURCE_BYTES:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} exact source exceeds the "
-            "32 MiB supported-size limit."
+            f"{label} requires a numeric resolved start time."
         )
     try:
-        validate_tabular_source_bytes(
-            record.exact_source_bytes,
-            source_format=record.original_format,
-            source_label=record.original_filename,
-        )
-    except (TypeError, ValueError) as exc:
+        resolved_t_start = float(raw_t_start)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} exact source admission failed: "
-            f"{exc}"
+            f"{label} requires a numeric resolved start time."
         ) from exc
-    if type(record.observations) is not tuple:
+    if not math.isfinite(resolved_t_start) or resolved_t_start < 0.0:
         raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} observations must be an "
-            "immutable tuple."
+            f"{label} requires a finite nonnegative resolved start time."
         )
-    if not record.observations:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} requires at least one "
-            "observation series."
-        )
-
-    thawed_metadata = thaw_json_value(record.source_metadata)
-    if not isinstance(thawed_metadata, dict):
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} source metadata must be an "
-            "immutable JSON object."
-        )
-    physical_values = thawed_metadata.get("physical_columns")
-    if not isinstance(physical_values, list) or not physical_values:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} must retain its physical "
-            "source-column catalog."
-        )
-    if len(physical_values) > _MAX_PHYSICAL_COLUMNS:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} exceeds the 256 physical-"
-            "column supported-size limit."
-        )
-    physical_rows: list[tuple[int, str, str]] = []
-    for index, raw_physical in enumerate(physical_values):
-        if (
-            not isinstance(raw_physical, dict)
-            or set(raw_physical)
-            != {"source_index", "authored_name", "assigned_name"}
-        ):
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} physical column {index} "
-                "has an invalid schema."
-            )
-        source_index = raw_physical["source_index"]
-        authored_name = raw_physical["authored_name"]
-        assigned_name = raw_physical["assigned_name"]
-        if (
-            type(source_index) is not int
-            or source_index != index
-            or not isinstance(authored_name, str)
-            or not authored_name
-            or authored_name != authored_name.strip()
-            or not isinstance(assigned_name, str)
-            or not assigned_name
-            or assigned_name != assigned_name.strip()
-        ):
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} physical column {index} "
-                "does not retain exact ordered source identity."
-            )
-        physical_rows.append(
-            (source_index, authored_name, assigned_name)
-        )
-    expected_columns = identify_physical_columns(
-        [authored_name for _index, authored_name, _assigned in physical_rows]
-    )
-    expected_rows = tuple(
-        (
-            column.source_index,
-            column.authored_name,
-            column.assigned_name,
-        )
-        for column in expected_columns
-    )
-    if tuple(physical_rows) != expected_rows:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} physical column names do not "
-            "match the canonical case-sensitive duplicate allocation."
-        )
-
-    observation_names: list[str] = []
-    raw_observation_ids: set[str] = set()
-    retained_cells = 0
-    for series in record.observations:
-        if not isinstance(series, ObservationSeries):
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} observations must contain "
-                "only ObservationSeries values."
-            )
-        name = series.column_name
-        if (
-            not isinstance(name, str)
-            or not name
-            or name != name.strip()
-        ):
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} observation names must be "
-                "nonblank edge-normalized strings."
-            )
-        if name in observation_names:
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} contains duplicate "
-                f"assigned observation name {name!r}."
-            )
-        raw_observation_id = series.raw_observation_id
-        if (
-            not isinstance(raw_observation_id, str)
-            or not raw_observation_id
-            or raw_observation_id != raw_observation_id.strip()
-        ):
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} observation {name!r} "
-                "requires a nonblank edge-normalized raw observation ID."
-            )
-        if raw_observation_id in raw_observation_ids:
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} contains duplicate raw "
-                f"observation ID {raw_observation_id!r}."
-            )
-        raw_observation_ids.add(raw_observation_id)
-        if (
-            type(series.t) is not tuple
-            or type(series.y) is not tuple
-            or type(series.source_rows) is not tuple
-        ):
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} observation {name!r} "
-                "must own immutable t/y/source_rows tuples."
-            )
-        if (
-            not series.t
-            or len(series.t) != len(series.y)
-            or len(series.t) != len(series.source_rows)
-            or any(
-                type(value) is not float or not math.isfinite(value)
-                for value in (*series.t, *series.y)
-            )
-        ):
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} observation {name!r} "
-                "must retain equal nonempty finite float time/value tuples "
-                "aligned with source rows."
-            )
-        if any(
-            type(row) is not int or row <= 0
-            for row in series.source_rows
-        ):
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} observation {name!r} "
-                "source rows must be positive integers."
-            )
-        if len(set(series.source_rows)) != len(series.source_rows):
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} observation {name!r} "
-                "contains duplicate physical source-row identities."
-            )
-        retained_cells += len(series.t)
-        if retained_cells > _MAX_RETAINED_OBSERVATION_CELLS:
-            raise DatasetMappingError(
-                f"Raw dataset {record.dataset_id!r} exceeds the 1000000 "
-                "retained-observation-cell limit."
-            )
-        observation_names.append(name)
-    source_observation_columns = thawed_metadata.get("observation_columns")
-    if (
-        not isinstance(source_observation_columns, list)
-        or tuple(source_observation_columns) != tuple(observation_names)
-    ):
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} observation-column metadata "
-            "must exactly match its immutable ordered series labels."
-        )
-    physical_assigned = {
-        assigned_name
-        for _source_index, _authored_name, assigned_name in physical_rows
-    }
-    time_column = thawed_metadata.get("time_column")
-    if (
-        not isinstance(time_column, str)
-        or time_column not in physical_assigned
-        or time_column in observation_names
-        or any(
-            name not in physical_assigned
-            for name in observation_names
-        )
-    ):
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} time/observation columns do "
-            "not reference retained physical source columns."
-        )
-    if thawed_metadata.get("mapping_source") not in {"auto", "explicit"}:
-        raise DatasetMappingError(
-            f"Raw dataset {record.dataset_id!r} mapping source must be exactly "
-            "'auto' or 'explicit'."
-        )
-    sheet_name = thawed_metadata.get("sheet_name")
-    if record.original_format == "xlsx":
-        if (
-            not isinstance(sheet_name, str)
-            or not sheet_name
-            or not sheet_name.strip()
-        ):
-            raise DatasetMappingError(
-                f"Raw XLSX dataset {record.dataset_id!r} requires its exact "
-                "worksheet name."
-            )
-    elif sheet_name is not None:
-        raise DatasetMappingError(
-            f"Raw CSV dataset {record.dataset_id!r} cannot claim a worksheet."
-        )
-    return record
+    return resolved_t_start
 
 
 def export_original_source(
-    record: RawDatasetRecord,
+    document: ProjectDocument,
+    record: dataset_foundation.RawDatasetRecord,
     destination: str | os.PathLike[str],
 ) -> Path:
-    """Write a raw record's exact imported bytes to the chosen destination.
+    """Resolve and write a dataset's canonical source bytes to the destination.
 
     Passing a directory uses the original filename. Passing a file path writes
     to that exact path, allowing the integration-owned save dialog to control
     overwrite confirmation.
     """
-    validated_record = validate_raw_dataset_record(record)
-    original_filename = validated_record.original_filename
-    source_bytes = validated_record.exact_source_bytes
+    if not isinstance(document, ProjectDocument):
+        raise TypeError("document must be a ProjectDocument.")
+    try:
+        validated_record = dataset_foundation.validate_raw_dataset_record(record)
+        source = document.imported_source(validated_record.source_id)
+        source = dataset_foundation.validate_imported_source(source)
+    except dataset_foundation.RawDatasetValidationError as exc:
+        raise DatasetMappingError(str(exc)) from exc
+    original_filename = source.original_filename
+    source_bytes = source.exact_source_bytes
     target = Path(destination)
     if target.is_dir():
         target = target / original_filename
@@ -497,18 +220,13 @@ def export_original_source(
 def create_set_from_exact_zero(
     *,
     tab: MechanismTabDocument,
-    dataset: RawDatasetRecord,
+    dataset: dataset_foundation.RawDatasetRecord,
     set_id: str,
     set_name: str,
     model_species: Sequence[str],
     confirmed_mapping: Iterable[tuple[str, str]],
-    mapping_confirmed: bool,
 ) -> MechanismTabDocument:
     """Create and map one complete IC set from confirmed exact-zero values."""
-    if not mapping_confirmed:
-        raise DatasetMappingError(
-            "Create Set From t=0 requires explicit confirmation of the observation mapping."
-        )
     clean_set_id = str(set_id).strip()
     clean_name = str(set_name).strip()
     if not clean_set_id or not clean_name:
@@ -555,6 +273,191 @@ def create_set_from_exact_zero(
     )
 
 
+def allocate_initial_condition_set_name(
+    display_name: str,
+    *,
+    existing_names: Iterable[str],
+) -> str:
+    """Allocate a display-derived set name with extension-aware suffixes."""
+    raw_name = str(display_name).strip()
+    if not raw_name:
+        raise DatasetMappingError("Create Set requires a nonblank dataset display name.")
+    stem, dot, suffix = raw_name.rpartition(".")
+    base = stem if dot and stem else raw_name
+    extension = f".{suffix}" if dot and stem else ""
+    occupied = {str(name).strip().casefold() for name in existing_names}
+    candidate = raw_name
+    counter = 1
+    while candidate.casefold() in occupied:
+        candidate = f"{base}_{counter}{extension}"
+        counter += 1
+    return candidate
+
+
+def apply_dataset_mapping_batch(
+    *,
+    document: ProjectDocument,
+    tab: MechanismTabDocument,
+    batch: DatasetMappingBatchProposal,
+    mechanism_species: Sequence[str],
+) -> MechanismTabDocument:
+    """Validate and fold one complete mapping batch into one tab candidate.
+
+    No ProjectDocument or live tab is mutated while the proposal is folded;
+    callers publish the returned candidate exactly once through the registry.
+    """
+    if not isinstance(document, ProjectDocument):
+        raise TypeError("document must be a ProjectDocument.")
+    if not isinstance(tab, MechanismTabDocument):
+        raise TypeError("tab must be a MechanismTabDocument.")
+    if not isinstance(batch, DatasetMappingBatchProposal):
+        raise TypeError("batch must be a DatasetMappingBatchProposal.")
+    if batch.tab_id != tab.tab_id:
+        raise DatasetMappingError("Mapping batch origin does not match its tab.")
+    species = tuple(str(item).strip() for item in mechanism_species)
+    if not species or any(not item for item in species) or len(set(species)) != len(species):
+        raise DatasetMappingError("Mapping requires a unique mechanism species roster.")
+    records = {record.dataset_id: record for record in document.datasets}
+    if any(item.dataset_id not in records for item in batch.proposals):
+        raise DatasetMappingError("Mapping batch references a dataset absent from the committed document.")
+    current = dict(
+        validate_partial_bijection(
+            tab.dataset_links,
+            known_dataset_ids=records,
+            known_set_ids=(item.set_id for item in tab.initial_condition_sets),
+        )
+    )
+    sets = list(tab.initial_condition_sets)
+    used_names = {item.name.casefold() for item in sets}
+    for item in batch.proposals:
+        dataset = records[item.dataset_id]
+        selected = current.get(item.dataset_id, DatasetLink())
+        normalized_mapping = normalize_observation_mapping(
+            item.observation_mapping,
+            raw_observations=tuple(
+                (series.raw_observation_id, series.column_name)
+                for series in dataset.observations
+            ),
+            model_species=species,
+        )
+        if item.action is DatasetMappingChoice.LEAVE_UNMAPPED:
+            if item.target_set_id is not None or item.occupied_choice is not None:
+                raise DatasetMappingError("Leave Unmapped cannot include a target or occupancy choice.")
+            current[item.dataset_id] = DatasetLink(
+                set_id=None,
+                observation_mapping=normalized_mapping,
+                include_in_fit=False,
+            )
+            continue
+        if item.action is DatasetMappingChoice.CREATE_SET:
+            if item.occupied_choice is not None:
+                raise DatasetMappingError("Create Set cannot include an occupancy choice.")
+            expected_name = allocate_initial_condition_set_name(
+                dataset.display_name,
+                existing_names=used_names,
+            )
+            if item.proposed_set_name != expected_name:
+                raise DatasetMappingError(
+                    "Create Set name is not the canonical display-derived name."
+                )
+            observations = {
+                series.raw_observation_id: {
+                    "raw_column": series.column_name,
+                    "t": series.t,
+                    "y": series.y,
+                    "source_rows": series.source_rows,
+                }
+                for series in dataset.observations
+            }
+            values = seed_species_values_at_exact_zero(
+                observations=observations,
+                model_species=species,
+                confirmed_mapping=normalized_mapping,
+            )
+            new_set = InitialConditionSet(
+                set_id=new_set_id(),
+                name=expected_name,
+                values=values,
+            )
+            sets.append(new_set)
+            used_names.add(expected_name.casefold())
+            current[item.dataset_id] = DatasetLink(
+                set_id=new_set.set_id,
+                observation_mapping=normalized_mapping,
+                include_in_fit=False,
+            )
+            continue
+        target = item.target_set_id
+        if target is None:
+            raise DatasetMappingError("Map Existing requires a target set.")
+        try:
+            target_set = next(current_set for current_set in sets if current_set.set_id == target)
+        except StopIteration as exc:
+            raise DatasetMappingError(f"Unknown target set {target!r}.") from exc
+        occupant = next(
+            (dataset_id for dataset_id, link in current.items()
+             if dataset_id != item.dataset_id and link.set_id == target),
+            None,
+        )
+        destination = target
+        if occupant is not None:
+            if item.occupied_choice is OccupiedSetChoice.CANCEL:
+                current[item.dataset_id] = DatasetLink(
+                    set_id=None,
+                    observation_mapping=normalized_mapping,
+                    include_in_fit=False,
+                )
+                continue
+            if item.occupied_choice is OccupiedSetChoice.OVERRIDE:
+                old = current[occupant]
+                current[occupant] = DatasetLink(
+                    set_id=None,
+                    observation_mapping=old.observation_mapping,
+                    include_in_fit=False,
+                )
+            elif item.occupied_choice is OccupiedSetChoice.CREATE_COPY:
+                expected_name = allocate_initial_condition_set_name(
+                    target_set.name,
+                    existing_names=used_names,
+                )
+                if item.proposed_set_name != expected_name:
+                    raise DatasetMappingError(
+                        "Copied set name is not the canonical collision-safe name."
+                    )
+                destination = new_set_id()
+                sets.append(
+                    InitialConditionSet(
+                        set_id=destination,
+                        name=expected_name,
+                        values=target_set.values,
+                    )
+                )
+                used_names.add(expected_name.casefold())
+            else:
+                raise DatasetMappingError("An occupied target requires an explicit disposition.")
+        elif item.occupied_choice is not None:
+            raise DatasetMappingError("An unoccupied target cannot include an occupancy choice.")
+        current[item.dataset_id] = DatasetLink(
+            set_id=destination,
+            observation_mapping=normalized_mapping,
+            include_in_fit=selected.include_in_fit,
+        )
+    candidate = replace(
+        tab,
+        initial_condition_sets=tuple(sets),
+        dataset_links=validate_partial_bijection(
+            current.items(),
+            known_dataset_ids=records,
+            known_set_ids=(item.set_id for item in sets),
+        ),
+    )
+    return revalidate_fit_inclusions(
+        document=document,
+        tab=candidate,
+        mechanism_species=species,
+    )
+
+
 def apply_dataset_set_mapping_plan(
     *,
     document: ProjectDocument,
@@ -589,14 +492,14 @@ def apply_dataset_set_mapping_plan(
         document=document,
         tab=candidate,
         mechanism_species=mechanism_species,
-    ).tab
+    )
 
 
 def with_confirmed_observation_mapping(
     *,
     document: ProjectDocument,
     tab: MechanismTabDocument,
-    dataset: RawDatasetRecord,
+    dataset: dataset_foundation.RawDatasetRecord,
     model_species: Sequence[str],
     confirmed_mapping: Iterable[tuple[str, str]],
 ) -> MechanismTabDocument:
@@ -625,17 +528,17 @@ def with_confirmed_observation_mapping(
         document=document,
         tab=candidate,
         mechanism_species=model_species,
-    ).tab
+    )
 
 
-def validate_fit_inclusion(
+def _validate_current_fit_inclusion(
     *,
     document: ProjectDocument,
     tab: MechanismTabDocument,
     dataset_id: str,
     mechanism_species: Sequence[str],
-) -> FitInclusionValidation:
-    """Fully validate one Dataset-owned Fit-inclusion boundary."""
+) -> dataset_foundation.FitInclusionValidation:
+    """Resolve mapping-owned context before calling the lower pure validator."""
     try:
         dataset = document.dataset(dataset_id)
     except KeyError as exc:
@@ -653,86 +556,28 @@ def validate_fit_inclusion(
         raise DatasetMappingError(
             f"Mapped initial-condition set {current.set_id!r} is no longer present."
         ) from exc
-    roster = tuple(str(species).strip() for species in mechanism_species)
-    if not roster or any(not species for species in roster):
-        raise DatasetMappingError(
-            "Fit inclusion requires a nonempty valid mechanism species roster."
-        )
-    if len(set(roster)) != len(roster):
-        raise DatasetMappingError("Mechanism species identities must be unique.")
-    values = initial_set.values_dict()
-    if set(values) != set(roster):
-        missing = tuple(species for species in roster if species not in values)
-        extra = tuple(species for species in values if species not in set(roster))
-        raise DatasetMappingError(
-            "Mapped initial-condition state is incomplete for the current "
-            f"mechanism (missing={missing!r}, extra={extra!r})."
-        )
-    if any(
-        not math.isfinite(float(value)) or float(value) < 0.0
-        for value in values.values()
-    ):
-        raise DatasetMappingError(
-            "Mapped initial-condition state must be finite and nonnegative."
-        )
-    raw_observations = tuple(
-        (series.raw_observation_id, series.column_name)
-        for series in dataset.observations
-    )
     normalized_mapping = normalize_observation_mapping(
         current.observation_mapping,
-        raw_observations=raw_observations,
-        model_species=roster,
+        raw_observations=tuple(
+            (series.raw_observation_id, series.column_name)
+            for series in dataset.observations
+        ),
+        model_species=mechanism_species,
     )
     if normalized_mapping != current.observation_mapping:
         raise DatasetMappingError(
-            "Fit inclusion observation mapping must already be canonical and "
-            "ordered by raw observation identity."
+            "Fit inclusion observation mapping is not canonical."
         )
-    if not normalized_mapping:
-        raise DatasetMappingError(
-            "Fit inclusion requires at least one valid mapped observation target."
-        )
-    series_by_raw_id = {
-        series.raw_observation_id: series
-        for series in dataset.observations
-    }
-    for raw_observation_id, _model_target in normalized_mapping:
-        series = series_by_raw_id[raw_observation_id]
-        if (
-            not series.source_rows
-            or len(series.source_rows) != len(series.t)
-            or len(series.t) != len(series.y)
-            or any(type(row) is not int or row <= 0 for row in series.source_rows)
-        ):
-            raise DatasetMappingError(
-                f"Observation {series.column_name!r} (raw ID "
-                f"{raw_observation_id!r}) does not retain complete positive "
-                "physical source-row identity."
-            )
-    execution = validate_simulation_execution_settings(
-        tab.resolved_execution_settings(initial_set.set_id),
-        f"Fit inclusion for dataset {dataset.dataset_id!r}",
-    )
-    return FitInclusionValidation(
-        dataset_id=dataset.dataset_id,
+    return dataset_foundation.validate_fit_inclusion(
+        dataset=dataset,
         set_id=initial_set.set_id,
-        execution=execution,
-        targets=tuple(
-            DatasetMappedTarget(
-                dataset_id=dataset.dataset_id,
-                raw_observation_id=raw_observation_id,
-                raw_column=series_by_raw_id[
-                    raw_observation_id
-                ].column_name,
-                model_target=model_target,
-                t=series_by_raw_id[raw_observation_id].t,
-                y=series_by_raw_id[raw_observation_id].y,
-                source_rows=series_by_raw_id[
-                    raw_observation_id
-                ].source_rows,
-            )
-            for raw_observation_id, model_target in normalized_mapping
+        observation_mapping=normalized_mapping,
+        initial_values=initial_set.values_dict(),
+        mechanism_species=mechanism_species,
+        resolved_t_start=resolve_fit_t_start(
+            tab,
+            initial_set.set_id,
+            label=f"Fit inclusion for dataset {dataset.dataset_id!r}",
         ),
     )
 
@@ -742,32 +587,27 @@ def revalidate_fit_inclusions(
     document: ProjectDocument,
     tab: MechanismTabDocument,
     mechanism_species: Sequence[str],
-) -> FitInclusionRevalidation:
+) -> MechanismTabDocument:
     """Remove invalid included links after any dataset/set prerequisite change."""
     candidate = tab
-    excluded: list[tuple[str, str]] = []
     for dataset_id, link in tab.dataset_links:
         if not link.include_in_fit:
             continue
         try:
-            validate_fit_inclusion(
+            _validate_current_fit_inclusion(
                 document=document,
                 tab=candidate,
                 dataset_id=dataset_id,
                 mechanism_species=mechanism_species,
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError):
             current = candidate.dataset_link(dataset_id)
             if current is not None:
                 candidate = candidate.with_dataset_link(
                     dataset_id,
                     replace(current, include_in_fit=False),
                 )
-            excluded.append((dataset_id, str(exc)))
-    return FitInclusionRevalidation(
-        tab=candidate,
-        excluded=tuple(excluded),
-    )
+    return candidate
 
 
 def with_validated_fit_inclusion(
@@ -784,7 +624,7 @@ def with_validated_fit_inclusion(
         if current is None:
             return tab
     else:
-        validate_fit_inclusion(
+        _validate_current_fit_inclusion(
             document=document,
             tab=tab,
             dataset_id=dataset_id,
@@ -971,4 +811,4 @@ def plan_global_dataset_delete(
             for raw_dataset_id, _raw_columns in overlays_by_tab.get(raw_tab_id, ())
         ):
             referenced = True
-    return GlobalDatasetDeletePlan(dataset_id=target, referenced=referenced)
+    return GlobalDatasetDeletePlan(referenced=referenced)

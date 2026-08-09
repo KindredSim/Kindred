@@ -5,10 +5,11 @@ from __future__ import annotations
 import io
 import csv
 import json
+import unicodedata
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
+from typing import BinaryIO, Callable, Iterator, Mapping, Sequence, TypeAlias
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
@@ -28,27 +29,35 @@ from kindred.core.result_repository import (
     ResultRepository,
     SimulationResultValue,
 )
-from kindred.gui.dataset_payload_snapshot import ExperimentalLayerInput
+from kindred.core.simulator.solver_types import SimulationPresentationBoundary
+from kindred.gui.dataset_payload_snapshot import (
+    ExperimentalLayerIdentity,
+    ExperimentalLayerInput,
+)
 from kindred.gui.plot_config import AxisSelectionCandidate
 
 __all__ = [
     "ResultDataBlock",
     "ResultLayerKind",
+    "SimulationResultLayerIdentity",
     "VisibleResultSet",
+    "WorkspaceLayerIdentity",
     "WorkspacePlotLayer",
     "WorkspaceResultPresenter",
     "WorkspaceResultProjection",
     "XlsxExportCompletion",
+    "encode_clipboard_text",
     "encode_tsv_row",
 ]
 
 _MAX_COPY_CELLS = 1_000_000
 _MAX_COPY_CHARACTERS = 64 * 1024 * 1024
-_MAX_XLSX_CELLS = 5_000_000
-_MAX_XLSX_BYTES = 64 * 1024 * 1024
+_MAX_XLSX_STRING_LENGTH = 32_767
+_EXCEL_MAX_ROWS = 1_048_576
+_EXCEL_MAX_COLUMNS = 16_384
 
 
-class _BoundedXlsxDestination:
+class _XlsxDestination:
     def __init__(
         self,
         destination: BinaryIO,
@@ -67,12 +76,6 @@ class _BoundedXlsxDestination:
         if self._cancellation_check is not None:
             self._cancellation_check()
         payload = bytes(data)
-        end = int(self.tell()) + len(payload)
-        if max(self._maximum_size, end) > _MAX_XLSX_BYTES:
-            raise ValueError(
-                "Generated XLSX exceeds the bounded output-size limit "
-                f"({_MAX_XLSX_BYTES // (1024 * 1024)} MiB)."
-            )
         written = int(self._destination.write(payload))
         if written != len(payload):
             raise OSError(
@@ -94,7 +97,6 @@ class _BoundedXlsxDestination:
 class XlsxExportCompletion:
     worksheet_count: int
     data_row_count: int
-    cell_count: int
     bytes_written: int
 
 
@@ -195,6 +197,23 @@ def encode_tsv_row(values: Sequence[object]) -> str:
     )
     writer.writerow(tuple("" if value is None else str(value) for value in values))
     return output.getvalue()
+
+
+def encode_clipboard_text(value: str) -> str:
+    """Protect one dynamic clipboard text cell from spreadsheet formulas."""
+
+    if not isinstance(value, str):
+        raise TypeError("clipboard text must be a string.")
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character.isspace() or unicodedata.category(character).startswith("C"):
+            index += 1
+            continue
+        if character in "=+-@":
+            return "'" + value
+        break
+    return value
 
 
 def _canonical_json(value: object) -> str:
@@ -315,6 +334,31 @@ class ResultLayerKind(Enum):
     EXPERIMENTAL = "experimental"
 
 
+@dataclass(frozen=True, slots=True)
+class SimulationResultLayerIdentity:
+    """Tagged identity for one semantic result role and initial set."""
+
+    kind: ResultLayerKind
+    set_id: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in {
+            ResultLayerKind.EXPLICIT,
+            ResultLayerKind.PREVIEW,
+            ResultLayerKind.REFERENCE,
+        }:
+            raise ValueError(
+                "Simulation result layer identity requires an explicit, "
+                "Preview, or Reference kind."
+            )
+        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
+
+
+WorkspaceLayerIdentity: TypeAlias = (
+    SimulationResultLayerIdentity | ExperimentalLayerIdentity
+)
+
+
 def _result_warning_details(entry: ResultEntry | None) -> tuple[str, ...]:
     if not isinstance(entry, (ExplicitResultEntry, PreviewResultEntry)):
         raise TypeError("warning details require a repository result entry.")
@@ -371,8 +415,7 @@ def _result_entry_payload(entry: ResultEntry) -> Mapping[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class WorkspacePlotLayer:
-    layer_id: str
-    source_id: str
+    layer_id: WorkspaceLayerIdentity
     label: str
     kind: ResultLayerKind
     t: np.ndarray
@@ -390,10 +433,30 @@ class WorkspacePlotLayer:
     opacity: float = 1.0
     markers: bool = False
     point_size: float = 6.0
+    presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ResultLayerKind):
             raise TypeError("kind must be a ResultLayerKind.")
+        layer_id = self.layer_id
+        if not isinstance(
+            layer_id,
+            (SimulationResultLayerIdentity, ExperimentalLayerIdentity),
+        ):
+            raise TypeError("layer_id must be a tagged workspace layer identity.")
+        if self.kind is ResultLayerKind.EXPERIMENTAL:
+            if not isinstance(layer_id, ExperimentalLayerIdentity):
+                raise TypeError(
+                    "experimental plot layers require an experimental layer "
+                    "identity."
+                )
+        elif (
+            not isinstance(layer_id, SimulationResultLayerIdentity)
+            or layer_id.kind is not self.kind
+        ):
+            raise ValueError(
+                "simulation plot layer identity must match its semantic kind."
+            )
         time = _owned_vector(self.t, field="plot time")
         series: list[tuple[str, np.ndarray]] = []
         names: set[str] = set()
@@ -425,6 +488,15 @@ class WorkspacePlotLayer:
         if len(axis_identities) != len(set(axis_identities)):
             raise ValueError("plot series axis identities must be unique.")
         result_entry = self.result_entry
+        presentation_boundaries = tuple(self.presentation_boundaries)
+        if any(
+            not isinstance(boundary, SimulationPresentationBoundary)
+            for boundary in presentation_boundaries
+        ):
+            raise TypeError(
+                "presentation_boundaries must contain only "
+                "SimulationPresentationBoundary values."
+            )
         if self.kind is ResultLayerKind.EXPERIMENTAL:
             if result_entry is not None:
                 raise ValueError(
@@ -445,6 +517,10 @@ class WorkspacePlotLayer:
             segment_ids = None
             segment_keys = None
             discontinuity_ids = None
+            if presentation_boundaries:
+                raise ValueError(
+                    "experimental plot layers prohibit presentation boundaries."
+                )
         else:
             if not isinstance(
                 result_entry,
@@ -466,11 +542,17 @@ class WorkspacePlotLayer:
                 raise TypeError(
                     "plot layer kind conflicts with its repository entry type."
                 )
-            if result_entry.key.set_id != str(self.source_id).strip():
+            assert isinstance(layer_id, SimulationResultLayerIdentity)
+            if result_entry.key.set_id != layer_id.set_id:
                 raise ValueError(
                     "plot layer source must match its repository entry key."
                 )
             entry_result = result_entry.result
+            if presentation_boundaries is not entry_result.presentation_boundaries:
+                raise ValueError(
+                    "simulation plot layers must retain their repository "
+                    "entry's exact presentation boundaries."
+                )
             if (
                 time is not entry_result.t
                 or tuple(name for name, _values in series)
@@ -589,8 +671,7 @@ class WorkspacePlotLayer:
                 raise TypeError(
                     "simulation plot series require simulation axis identity."
                 )
-        object.__setattr__(self, "layer_id", _required_id(self.layer_id, "layer_id"))
-        object.__setattr__(self, "source_id", _required_id(self.source_id, "source_id"))
+        object.__setattr__(self, "layer_id", layer_id)
         object.__setattr__(self, "label", _required_id(self.label, "label"))
         object.__setattr__(self, "t", time)
         object.__setattr__(self, "series", tuple(series))
@@ -607,11 +688,16 @@ class WorkspacePlotLayer:
         object.__setattr__(self, "opacity", opacity)
         object.__setattr__(self, "markers", bool(self.markers))
         object.__setattr__(self, "point_size", point_size)
+        object.__setattr__(
+            self,
+            "presentation_boundaries",
+            presentation_boundaries,
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class ResultDataBlock:
-    block_id: str
+    block_id: WorkspaceLayerIdentity
     label: str
     kind: ResultLayerKind
     t: np.ndarray
@@ -630,6 +716,25 @@ class ResultDataBlock:
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ResultLayerKind):
             raise TypeError("kind must be a ResultLayerKind.")
+        block_id = self.block_id
+        if not isinstance(
+            block_id,
+            (SimulationResultLayerIdentity, ExperimentalLayerIdentity),
+        ):
+            raise TypeError("block_id must be a tagged workspace layer identity.")
+        if self.kind is ResultLayerKind.EXPERIMENTAL:
+            if not isinstance(block_id, ExperimentalLayerIdentity):
+                raise TypeError(
+                    "experimental data blocks require an experimental layer "
+                    "identity."
+                )
+        elif (
+            not isinstance(block_id, SimulationResultLayerIdentity)
+            or block_id.kind is not self.kind
+        ):
+            raise ValueError(
+                "simulation data block identity must match its semantic kind."
+            )
         time = _owned_vector(self.t, field="data time")
         normalized: list[tuple[str, np.ndarray]] = []
         names: set[str] = set()
@@ -794,7 +899,7 @@ class ResultDataBlock:
             raise ValueError(
                 "experimental X identity must match its raw-ID provenance."
             )
-        object.__setattr__(self, "block_id", _required_id(self.block_id, "block_id"))
+        object.__setattr__(self, "block_id", block_id)
         object.__setattr__(self, "label", _required_id(self.label, "label"))
         object.__setattr__(self, "x_name", _required_id(self.x_name, "x_name"))
         object.__setattr__(self, "t", time)
@@ -829,7 +934,7 @@ class WorkspaceResultProjection:
 
     tab_id: str
     current_set_id: str
-    primary_layer_id: str
+    primary_layer_id: SimulationResultLayerIdentity | None
     plot_layers: tuple[WorkspacePlotLayer, ...]
     parameters: tuple[tuple[str, float, str], ...]
     scalar_values: tuple[tuple[str, float], ...]
@@ -863,15 +968,23 @@ class WorkspaceResultProjection:
         layer_ids = {layer.layer_id for layer in layers}
         if len(layer_ids) != len(layers):
             raise ValueError("plot layer IDs must be unique.")
-        primary = str(self.primary_layer_id or "")
-        if primary and primary not in layer_ids:
+        primary = self.primary_layer_id
+        if primary is not None and not isinstance(
+            primary,
+            SimulationResultLayerIdentity,
+        ):
+            raise TypeError(
+                "primary_layer_id must be a simulation result layer identity "
+                "or None."
+            )
+        if primary is not None and primary not in layer_ids:
             raise ValueError("primary_layer_id must reference one plot layer.")
         current_set_id = str(self.current_set_id or "")
-        if primary:
+        if primary is not None:
             primary_layer = next(layer for layer in layers if layer.layer_id == primary)
             if (
                 not current_set_id
-                or primary_layer.source_id != current_set_id
+                or primary.set_id != current_set_id
                 or primary_layer.kind
                 not in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
             ):
@@ -1087,14 +1200,13 @@ def _result_layer(
         display_label = f"{label} [Reference]"
     else:
         display_label = label
-    layer_id = f"{kind.value}:{set_id}"
+    layer_id = SimulationResultLayerIdentity(kind, set_id)
     series_axes = tuple(
         (name, SimulationSeriesAxisSelection(name))
         for name in result.series
     )
     return WorkspacePlotLayer(
         layer_id=layer_id,
-        source_id=set_id,
         label=display_label,
         kind=kind,
         t=result.t,
@@ -1111,6 +1223,7 @@ def _result_layer(
         ),
         dashed=kind is ResultLayerKind.REFERENCE,
         opacity=0.42 if kind is ResultLayerKind.REFERENCE else 1.0,
+        presentation_boundaries=result.presentation_boundaries,
     )
 
 
@@ -1267,8 +1380,8 @@ def _export_column_header(
     }
     if identity:
         encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
-        return f"{header} [provenance={encoded}]"
-    return header
+        header = f"{header} [provenance={encoded}]"
+    return encode_clipboard_text(header)
 
 
 def _unique_result_entries(
@@ -1293,6 +1406,12 @@ def _xlsx_literal_cell(sheet: object, value: object) -> object:
 
     if not isinstance(value, str):
         return value
+    length = len(value)
+    if length > _MAX_XLSX_STRING_LENGTH:
+        raise ValueError(
+            "XLSX string cell exceeds Excel's physical limit of "
+            f"{_MAX_XLSX_STRING_LENGTH:,} characters (got {length:,})."
+        )
     cell = WriteOnlyCell(sheet, value=value)
     cell.data_type = "s"
     return cell
@@ -1303,6 +1422,73 @@ def _append_xlsx_row(sheet: object, values: Sequence[object]) -> None:
     if not callable(append):
         raise TypeError("XLSX worksheet must provide append().")
     append([_xlsx_literal_cell(sheet, value) for value in values])
+
+
+def _validate_xlsx_worksheet_dimensions(
+    dimensions: Sequence[tuple[str, int, int]],
+) -> None:
+    """Validate every planned worksheet against Excel's physical limits."""
+
+    for title, rows, columns in dimensions:
+        if rows > _EXCEL_MAX_ROWS:
+            raise ValueError(
+                f"XLSX worksheet {title!r} requires {rows:,} rows; "
+                f"Excel permits at most {_EXCEL_MAX_ROWS:,}."
+            )
+        if columns > _EXCEL_MAX_COLUMNS:
+            raise ValueError(
+                f"XLSX worksheet {title!r} requires {columns:,} columns; "
+                f"Excel permits at most {_EXCEL_MAX_COLUMNS:,}."
+            )
+
+
+def _planned_xlsx_worksheet_dimensions(
+    blocks: Sequence[ResultDataBlock],
+    *,
+    lineage_row_count: int,
+    result_entry_count: int,
+) -> tuple[tuple[str, int, int], ...]:
+    """Plan data and support worksheet dimensions without allocating them."""
+
+    used: set[str] = set()
+    dimensions: list[tuple[str, int, int]] = []
+    for block in blocks:
+        title = WorkspaceResultPresenter._worksheet_title(block.label, used)
+        identity_column_count = (
+            2
+            if block.kind is ResultLayerKind.EXPERIMENTAL
+            else 4
+        )
+        dimensions.append(
+            (
+                title,
+                int(block.t.size) + 1,
+                identity_column_count + len(block.series),
+            )
+        )
+    if lineage_row_count:
+        dimensions.append(
+            (
+                WorkspaceResultPresenter._worksheet_title(
+                    "_Kindred Lineage",
+                    used,
+                ),
+                lineage_row_count + 1,
+                7,
+            )
+        )
+    if result_entry_count:
+        dimensions.append(
+            (
+                WorkspaceResultPresenter._worksheet_title(
+                    "_Kindred Result Metadata",
+                    used,
+                ),
+                result_entry_count + 1,
+                2,
+            )
+        )
+    return tuple(dimensions)
 
 
 def _observation_provenance(
@@ -1401,7 +1587,6 @@ class WorkspaceResultPresenter:
             selected_x_series,
             field="selected_x_series",
         )
-        x_axis = selected_x
         selected_y_ordered = tuple(
             _axis_selection(selection, field="selected_y_series")
             for selection in selected_y_series
@@ -1465,6 +1650,18 @@ class WorkspaceResultPresenter:
                         selected_x_source.model_species
                     )
                 )
+        simulation_x_axis: AxisSeriesSelection = selected_x
+        if (
+            isinstance(selected_x, ExperimentalAxisSelection)
+            and selected_x_source is not None
+            and selected_x_source.model_species is not None
+        ):
+            # Experimental X remains the selected/source-row identity for raw
+            # observations, while simulated and Reference layers consume its
+            # current mapped model-series identity.
+            simulation_x_axis = SimulationSeriesAxisSelection(
+                selected_x_source.model_species
+            )
 
         layers: list[WorkspacePlotLayer] = []
         blocks: list[ResultDataBlock] = []
@@ -1484,7 +1681,7 @@ class WorkspaceResultPresenter:
         for selection in colors:
             if isinstance(selection, SimulationSeriesAxisSelection):
                 add_axis_candidate(selection, selection.series_name)
-        primary_layer_id = ""
+        primary_layer_id: SimulationResultLayerIdentity | None = None
         primary_entry: ResultEntry | None = None
         primary_block: ResultDataBlock | None = None
         annotations: list[Mapping[str, object]] = []
@@ -1518,7 +1715,7 @@ class WorkspaceResultPresenter:
                     add_axis_candidate(selection, name)
                 block = _data_block(
                     foreground,
-                    x_axis=x_axis,
+                    x_axis=simulation_x_axis,
                     y_axes=wanted_y,
                     excluded_y_axes=excluded_simulation_y,
                 )
@@ -1542,7 +1739,7 @@ class WorkspaceResultPresenter:
                         add_axis_candidate(selection, name)
                     block = _data_block(
                         reference_layer,
-                        x_axis=x_axis,
+                        x_axis=simulation_x_axis,
                         y_axes=wanted_y,
                         excluded_y_axes=excluded_simulation_y,
                     )
@@ -1622,8 +1819,7 @@ class WorkspaceResultPresenter:
                 experimental_x_provenance = _observation_provenance(x_source)
             label = candidate_label
             layer = WorkspacePlotLayer(
-                layer_id=f"experimental:{experimental.layer_id}",
-                source_id=experimental.layer_id,
+                layer_id=experimental.layer_id,
                 label=label,
                 kind=ResultLayerKind.EXPERIMENTAL,
                 t=experimental_x,
@@ -1687,14 +1883,16 @@ class WorkspaceResultPresenter:
         if not _is_time_selection(selected_x):
             unique_annotations.clear()
 
-        if _is_time_selection(selected_x):
-            x_label = "Time (s)"
-        elif isinstance(selected_x, SimulationSeriesAxisSelection):
-            x_label = selected_x.series_name
-        elif selected_x_source is None:
-            x_label = ""
-        else:
-            x_label = selected_x_source.model_species or selected_x_source.raw_column
+        selected_x_candidate = next(
+            candidate
+            for candidate in axis_candidates
+            if candidate.selection == selected_x
+        )
+        x_label = (
+            "Time (s)"
+            if _is_time_selection(selected_x)
+            else selected_x_candidate.label
+        )
 
         effective_y_axes = tuple(
             selection
@@ -1785,7 +1983,11 @@ class WorkspaceResultPresenter:
                 if block.source_row is None:
                     raise ValueError("experimental Copy block lacks source_row.")
                 columns.append(
-                    (f"{block.label} — source_row", block.source_row, "int")
+                    (
+                        encode_clipboard_text(f"{block.label} — source_row"),
+                        block.source_row,
+                        "int",
+                    )
                 )
             else:
                 if (
@@ -1795,10 +1997,20 @@ class WorkspaceResultPresenter:
                 ):
                     raise ValueError("simulation Copy block lacks executor identity.")
                 columns.extend((
-                    (f"{block.label} — segment_id", block.segment_ids, "int"),
-                    (f"{block.label} — segment_key", block.segment_keys, "text"),
                     (
-                        f"{block.label} — discontinuity_id",
+                        encode_clipboard_text(f"{block.label} — segment_id"),
+                        block.segment_ids,
+                        "int",
+                    ),
+                    (
+                        encode_clipboard_text(f"{block.label} — segment_key"),
+                        block.segment_keys,
+                        "text",
+                    ),
+                    (
+                        encode_clipboard_text(
+                            f"{block.label} — discontinuity_id"
+                        ),
                         block.discontinuity_ids,
                         "int",
                     ),
@@ -1837,7 +2049,9 @@ class WorkspaceResultPresenter:
             metadata_line = encode_tsv_row(
                 (
                     "# Kindred repository entry",
-                    _canonical_json(_result_entry_payload(entry)),
+                    encode_clipboard_text(
+                        _canonical_json(_result_entry_payload(entry))
+                    ),
                 )
             )
             total_characters += len(metadata_line)
@@ -1868,7 +2082,7 @@ class WorkspaceResultPresenter:
                             else (
                                 str(int(values[index]))
                                 if kind == "int"
-                                else str(values[index])
+                                else encode_clipboard_text(str(values[index]))
                             )
                         )
                         if index < len(values)
@@ -1886,43 +2100,45 @@ class WorkspaceResultPresenter:
             yield chunk
 
     @staticmethod
+    def validate_xlsx_export(
+        projection: WorkspaceResultProjection,
+    ) -> None:
+        """Validate XLSX worksheet planning before destination creation."""
+
+        if not isinstance(projection, WorkspaceResultProjection):
+            raise TypeError("projection must be a WorkspaceResultProjection.")
+        blocks = tuple(projection.copy_all_blocks)
+        if not blocks:
+            raise ValueError("No visible result, Reference, or experimental data.")
+        if any(not isinstance(block, ResultDataBlock) for block in blocks):
+            raise TypeError(
+                "XLSX export blocks must contain only ResultDataBlock values."
+            )
+        lineage_row_count = sum(
+            int(bool(block.x_provenance))
+            + sum(bool(provenance) for _, provenance in block.series_provenance)
+            for block in blocks
+        )
+        result_entry_count = len(_unique_result_entries(blocks))
+        dimensions = _planned_xlsx_worksheet_dimensions(
+            blocks,
+            lineage_row_count=lineage_row_count,
+            result_entry_count=result_entry_count,
+        )
+        _validate_xlsx_worksheet_dimensions(dimensions)
+
+    @staticmethod
     def write_xlsx(
         projection: WorkspaceResultProjection,
         destination: BinaryIO,
         *,
         cancellation_check: Callable[[], None] | None = None,
     ) -> XlsxExportCompletion:
-        """Write full-resolution worksheets directly to a bounded destination."""
+        """Write full-resolution worksheets directly to the destination."""
 
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError("projection must be a WorkspaceResultProjection.")
-        if not projection.copy_all_blocks:
-            raise ValueError("No visible result, Reference, or experimental data.")
+        WorkspaceResultPresenter.validate_xlsx_export(projection)
         blocks = projection.copy_all_blocks
-        result_entries = _unique_result_entries(blocks)
-        lineage_row_count = sum(
-            int(bool(block.x_provenance))
-            + sum(bool(provenance) for _, provenance in block.series_provenance)
-            for block in blocks
-        )
-        total_cells = sum(
-            (int(block.t.size) + 1)
-            * (
-                (2 if block.kind is ResultLayerKind.EXPERIMENTAL else 4)
-                + len(block.series)
-            )
-            for block in blocks
-        )
-        if lineage_row_count:
-            total_cells += (lineage_row_count + 1) * 7
-        if result_entries:
-            total_cells += (len(result_entries) + 1) * 2
-        if total_cells > _MAX_XLSX_CELLS:
-            raise ValueError(
-                "XLSX payload exceeds the bounded full-resolution cell limit "
-                f"({_MAX_XLSX_CELLS:,})."
-            )
-        output = _BoundedXlsxDestination(
+        output = _XlsxDestination(
             destination,
             cancellation_check=cancellation_check,
         )
@@ -2080,7 +2296,6 @@ class WorkspaceResultPresenter:
             return XlsxExportCompletion(
                 worksheet_count=len(used),
                 data_row_count=data_rows,
-                cell_count=total_cells,
                 bytes_written=output.bytes_written,
             )
         except BaseException as exc:

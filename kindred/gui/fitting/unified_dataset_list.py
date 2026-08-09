@@ -4,37 +4,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6 import QtGui, QtWidgets
+from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label
-
-
-class _ValidationForegroundDelegate(QtWidgets.QStyledItemDelegate):
-    """Paints item text using ForegroundRole color, bypassing stylesheet overrides."""
-
-    def paint(self, painter, option, index):
-        opt = QtWidgets.QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-        fg_variant = index.data(Qt.ForegroundRole)
-        if isinstance(fg_variant, QtGui.QBrush) and fg_variant.style() != Qt.BrushStyle.NoBrush:
-            text = opt.text
-            opt.text = ""
-            style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
-            style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
-            painter.save()
-            if opt.state & QtWidgets.QStyle.StateFlag.State_Selected:
-                painter.setPen(opt.palette.color(QtGui.QPalette.ColorRole.HighlightedText))
-            else:
-                painter.setPen(fg_variant.color())
-            text_rect = style.subElementRect(QtWidgets.QStyle.SubElement.SE_ItemViewItemText, opt, option.widget)
-            alignment = opt.displayAlignment
-            metrics = QtGui.QFontMetrics(opt.font)
-            elided = metrics.elidedText(text, Qt.ElideRight, text_rect.width())
-            painter.drawText(text_rect, alignment, elided)
-            painter.restore()
-        else:
-            super().paint(painter, option, index)
 
 
 class UnifiedDatasetList(QtWidgets.QWidget):
@@ -60,7 +33,6 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         self._list.setObjectName("global_fit_unified_dataset_list")
         self._list.setUniformItemSizes(True)
         self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._list.setItemDelegate(_ValidationForegroundDelegate(self._list))
         self._list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self._list.currentItemChanged.connect(self._on_current_item_changed)
         self._list.itemChanged.connect(self._on_item_changed)
@@ -74,33 +46,67 @@ class UnifiedDatasetList(QtWidgets.QWidget):
     # Public API
     # ------------------------------------------------------------------
 
-    def populate(self, dataset_entries: list) -> None:
+    def populate(
+        self,
+        dataset_entries: list,
+        *,
+        emit_selection: bool = True,
+    ) -> None:
         old_id = self.selected_dataset_id()
-        self._list.blockSignals(True)
-        self._list.clear()
-        self._check_states.clear()
+        normalized: list[tuple[str, str, str, bool]] = []
         for entry in dataset_entries:
             ds_id = str(entry.get("id") or "").strip()
             label = str(entry.get("label", "") or "").strip() or str(ds_id)
             compact = compact_dataset_label(label, max_chars=DATASET_LIST_LABEL_MAX_CHARS)
-            include = entry.get("include", True)
-            item = QtWidgets.QListWidgetItem(compact.display)
-            item.setToolTip(f"{compact.full}\nDataset ID: {ds_id}")
-            item.setData(Qt.UserRole, ds_id)
-            item.setData(Qt.UserRole + 1, compact.full)
-            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            item.setCheckState(Qt.Checked if include else Qt.Unchecked)
-            self._list.addItem(item)
-            self._check_states[self._list.count() - 1] = item.checkState()
-        # Re-select previous active dataset if still present, otherwise first.
-        if old_id and self._select_by_id(old_id):
-            pass
-        elif self._list.count() > 0:
-            self._list.setCurrentRow(0)
-        self._list.blockSignals(False)
+            normalized.append((ds_id, compact.display, compact.full, bool(entry.get("include", True))))
+
+        existing_ids = tuple(
+            str(self._list.item(index).data(Qt.UserRole) or "").strip()
+            for index in range(self._list.count())
+            if self._list.item(index) is not None
+        )
+        incoming_ids = tuple(item[0] for item in normalized)
+        self._list.blockSignals(True)
+        try:
+            if existing_ids != incoming_ids:
+                self._list.clear()
+                self._check_states.clear()
+                for ds_id, display, full, include in normalized:
+                    item = QtWidgets.QListWidgetItem(display)
+                    item.setToolTip(f"{full}\nDataset ID: {ds_id}")
+                    item.setData(Qt.UserRole, ds_id)
+                    item.setData(Qt.UserRole + 1, full)
+                    item.setFlags(
+                        Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                    )
+                    item.setCheckState(Qt.Checked if include else Qt.Unchecked)
+                    self._list.addItem(item)
+                    self._check_states[self._list.count() - 1] = item.checkState()
+            else:
+                # Keep the QListWidgetItems (and their selection/current index)
+                # when the roster is stable.  Accepted include/label changes
+                # only update the affected item in place.
+                for row, (_ds_id, display, full, include) in enumerate(normalized):
+                    item = self._list.item(row)
+                    if item is None:
+                        continue
+                    item.setText(display)
+                    item.setToolTip(f"{full}\nDataset ID: {_ds_id}")
+                    item.setData(Qt.UserRole + 1, full)
+                    state = Qt.Checked if include else Qt.Unchecked
+                    if item.checkState() != state:
+                        item.setCheckState(state)
+                    self._check_states[row] = state
+            # Re-select previous active dataset if still present, otherwise first.
+            if old_id and self._select_by_id(old_id):
+                pass
+            elif self._list.count() > 0:
+                self._list.setCurrentRow(0)
+        finally:
+            self._list.blockSignals(False)
 
         new_id = self.selected_dataset_id()
-        if new_id != old_id:
+        if emit_selection and new_id != old_id:
             self.currentDatasetChanged.emit(new_id or "")
 
     def selected_dataset_id(self) -> Optional[str]:
@@ -133,24 +139,6 @@ class UnifiedDatasetList(QtWidgets.QWidget):
                 label = str(item.data(Qt.UserRole + 1) or "").strip()
                 return label or requested
         return None
-
-    def set_validation_state(self, dataset_id: str, state: str) -> None:
-        ds_id = str(dataset_id or "").strip()
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if item is None:
-                continue
-            if str(item.data(Qt.UserRole) or "").strip() == ds_id:
-                if state == "invalid_applied":
-                    item.setBackground(QtGui.QBrush(QtGui.QColor(255, 225, 225)))
-                    item.setForeground(QtGui.QBrush(QtGui.QColor(80, 0, 0)))
-                elif state == "invalid_pending":
-                    item.setBackground(QtGui.QBrush(QtGui.QColor(255, 245, 210)))
-                    item.setForeground(QtGui.QBrush(QtGui.QColor(80, 60, 0)))
-                else:
-                    item.setBackground(QtGui.QBrush())
-                    item.setForeground(QtGui.QBrush())
-                break
 
     def set_running_state(self, running: bool) -> None:
         """Preserve the historical disabled/locked running-state visual."""

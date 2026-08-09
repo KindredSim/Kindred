@@ -19,7 +19,7 @@ Current contract
 - order: float  exact finite molecularity from rate_orders
   - rate: StructuredRate | Callable    (opaque holder here; evaluated upstream)
   - overrides: {"model": "Constant" | "Eyring" | "Arrhenius" | None,
-                "kappa": float | None, "A": float | None,
+                local "kappa": float | None, "A": float | None,
                 "Ea_J_per_mol": float | None, "dG_act_J_per_mol": float | None,
                 "standard_conc_M": float | None}
 - Equilibrium:
@@ -47,26 +47,19 @@ import math
 from collections import OrderedDict
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Tuple, Union, Protocol, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Union, Protocol, Optional
 
 from .species import Species
 from .validation import validate_name
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
     EquilibriumRateInputContext,
-    effective_equilibrium_forward_rate,
-    effective_equilibrium_keq,
-    effective_equilibrium_reverse_rate,
     effective_reverse_rate_from_keq,
-    json_safe_equilibrium_metadata_payload,
-    json_safe_equilibrium_authority_payload,
     normalize_equilibrium_rate_authority,
-    normalize_existing_equilibrium_rate_authority,
     plain_finite_float_or_none,
 )
-from .kinetics import K_from_deltaG_eq
+from .thermodynamics import K_from_deltaG_eq
 from .mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
-from .temperature import coerce_temperature_kelvin
 
 class StructuredRate(Protocol):
     pass
@@ -158,50 +151,6 @@ def _ensure_species_exist(stoich: Mapping[str, float], declared: Mapping[str, Sp
             raise KeyError(f"unknown species in stoichiometry: {n!r}")
 
 
-def _algebra_references_species(mechanism: object, species_name: str) -> bool:
-    """Inspect the retained typed Algebra AST without reparsing source text."""
-
-    from .algebra.parser import (
-        BinaryNode,
-        CallNode,
-        SpeciesRefNode,
-        UnaryNode,
-    )
-
-    def references(expression: object) -> bool:
-        if isinstance(expression, SpeciesRefNode):
-            return expression.name == species_name
-        if isinstance(expression, UnaryNode):
-            return references(expression.rhs)
-        if isinstance(expression, BinaryNode):
-            return references(expression.lhs) or references(expression.rhs)
-        if isinstance(expression, CallNode):
-            return any(references(argument) for argument in expression.args)
-        return False
-
-    metadata = getattr(mechanism, "metadata", {}) or {}
-    spec = (
-        metadata.get("parameter_algebra_spec")
-        if isinstance(metadata, MappingABC)
-        else None
-    )
-    compiled = getattr(mechanism, "_compiled_algebra_series", None)
-    blocks = (
-        getattr(spec, "parameter_block", None),
-        getattr(spec, "observable_block", None),
-        getattr(compiled, "block", None),
-    )
-    seen: set[int] = set()
-    for block in blocks:
-        if block is None or id(block) in seen:
-            continue
-        seen.add(id(block))
-        for statement in tuple(getattr(block, "lines", ()) or ()):
-            if references(getattr(statement, "expr", None)):
-                return True
-    return False
-
-
 def derive_molecularity(rate_orders: Mapping[str, float]) -> float:
     """
     Derive reaction molecularity (order) as the sum of kinetic exponents.
@@ -256,6 +205,7 @@ def _normalize_overrides(overrides: Optional[Mapping[str, Any]]) -> Dict[str, An
         "Ea_J_per_mol",
         "dG_act_J_per_mol",
         "standard_conc_M",
+        "degeneracy",
     }
     out: Dict[str, Any] = {}
     if not overrides:
@@ -276,6 +226,16 @@ def _normalize_overrides(overrides: Optional[Mapping[str, Any]]) -> Dict[str, An
             raise ValueError(
                 "overrides.model must be 'Constant', 'Eyring', "
                 "'Arrhenius', or None"
+            )
+    if "degeneracy" in out:
+        degeneracy = out["degeneracy"]
+        if type(degeneracy) is not int:
+            raise TypeError(
+                "overrides.degeneracy must be a positive exact integer if provided"
+            )
+        if degeneracy <= 0:
+            raise ValueError(
+                "overrides.degeneracy must be a positive exact integer if provided"
             )
     # numeric sanity where applicable
     for num_key in (
@@ -497,70 +457,6 @@ class Mechanism:
         self._sync_metadata_order()
         return sp
 
-    def set_initial(self, name: str, initial_conc: float) -> None:
-        n = validate_name(name)
-        if n not in self.species:
-            raise KeyError(f"unknown species {n!r}")
-        self.species[n] = replace(self.species[n], initial_conc=initial_conc)
-
-    def rename_species(self, old: str, new: str) -> None:
-        o = validate_name(old)
-        nn = validate_name(new)
-        if o not in self.species:
-            raise KeyError(f"unknown species {o!r}")
-        if nn in self.species and nn != o:
-            raise ValueError(f"species {nn!r} already exists")
-        if nn == o:
-            return
-        if any(
-            o in reaction.reactants
-            or o in reaction.products
-            or o in reaction.rate_orders
-            for reaction in self.reactions
-        ):
-            raise ValueError(
-                f"cannot rename species {o!r}: referenced by a reaction"
-            )
-        if any(
-            o in equilibrium.stoich_forward
-            or o in equilibrium.stoich_back
-            for equilibrium in self.equilibria
-        ):
-            raise ValueError(
-                f"cannot rename species {o!r}: referenced by an equilibrium"
-            )
-        if _algebra_references_species(self, o):
-            raise ValueError(
-                f"cannot rename species {o!r}: referenced by Algebra"
-            )
-        new_map: "OrderedDict[str, Species]" = _SpeciesMap()
-        for k, sp in self.species.items():
-            if k == o:
-                new_map[nn] = replace(sp, name=nn)
-            else:
-                new_map[k] = sp
-        self.species = new_map
-        self._sync_metadata_order()
-
-    def remove_species(self, name: str) -> None:
-        n = validate_name(name)
-        if n not in self.species:
-            raise KeyError(f"unknown species {n!r}")
-        # Removing a species invalidates any steps that reference it
-        # Do the conservative thing and block removal if referenced.
-        if any(
-            n in r.reactants
-            or n in r.products
-            or n in r.rate_orders
-            or n in r.net_stoich
-            for r in self.reactions
-        ):
-            raise ValueError(f"cannot remove species {n!r}: referenced by a reaction")
-        if any(n in e.stoich_forward or n in e.stoich_back for e in self.equilibria):
-            raise ValueError(f"cannot remove species {n!r}: referenced by an equilibrium")
-        del self.species[n]
-        self._sync_metadata_order()
-
     def species_names(self) -> List[str]:
         return list(self.species.keys())
 
@@ -614,37 +510,6 @@ class Mechanism:
                 }
             )
         return rxn
-
-    def add_equilibrium(
-        self,
-        stoich_forward: Mapping[str, float],
-        stoich_back: Mapping[str, float],
-        *,
-        Keq: Any | None = None,
-        kf: Any | None = None,
-        kr: Any | None = None,
-        fast: bool = False,
-        metadata: Optional[Mapping[str, Any]] = None,
-        record_step_index: bool = True,
-    ) -> Equilibrium:
-        """
-        Add an equilibrium pair.
-
-        kf is required, plus exactly one reverse-side authority: kr or thermodynamic
-        Keq/dG_eq metadata. Equilibrium authority and numeric sanity are validated
-        by the equilibrium-rate authority layer.
-        """
-        return self._add_equilibrium_with_authority_context(
-            stoich_forward,
-            stoich_back,
-            Keq=Keq,
-            kf=kf,
-            kr=kr,
-            fast=fast,
-            metadata=metadata,
-            record_step_index=record_step_index,
-            authority_context=EquilibriumRateInputContext.PUBLIC,
-        )
 
     def _add_equilibrium_with_authority_context(
         self,
@@ -762,88 +627,3 @@ class Mechanism:
             entry.update(authority.step_map_fields())
             self._append_step_index_map_entry(entry)
         return eq
-
-    # ---------- vectorization helpers ----------
-
-    def reaction_stoich_matrix(self) -> List[List[float]]:
-        """
-        Matrix with shape (n_species, n_reactions) in declaration order.
-
-        Each column corresponds to a reaction's stoichiometric vector.
-        """
-        names = self.species_names()
-        cols: List[List[float]] = [r.net_stoich_vector(names) for r in self.reactions]
-        # transpose to species-major rows
-        if not cols:
-            return [[] for _ in names]
-        rows = list(map(list, zip(*cols)))
-        return rows
-
-    def equilibrium_pair_vectors(self) -> List[Tuple[List[float], List[float]]]:
-        """
-        List of (forward_vector, back_vector), each aligned to declaration order.
-        """
-        names = self.species_names()
-        return [(e.forward_vector(names), e.back_vector(names)) for e in self.equilibria]
-
-    # ---------- serialization for provenance ----------
-
-    def to_serializable(self) -> Dict[str, Any]:
-        """
-        Deterministic serialization of the mechanism structure.
-
-        Equilibrium entries publish authored owner/basis coordinates only. Derived
-        reverse-side readouts are not emitted as peer authored fields.
-        """
-        declaration_order = self.metadata["declaration_order"]
-        order_map = {name: idx for idx, name in enumerate(declaration_order)}
-
-        species_block = OrderedDict((n, {"initial_conc": sp.initial_conc}) for n, sp in self.species.items())
-        reactions_block = [
-            {
-                "reactants": OrderedDict(sorted(r.reactants.items(), key=lambda kv: order_map[kv[0]])),
-                "products": OrderedDict(sorted(r.products.items(), key=lambda kv: order_map[kv[0]])),
-                "rate_orders": OrderedDict(sorted(r.rate_orders.items(), key=lambda kv: order_map[kv[0]])),
-                "net_stoich": OrderedDict(sorted(r.net_stoich.items(), key=lambda kv: order_map[kv[0]])),
-                "order": r.order,
-                "overrides": OrderedDict(
-                    (key, json_safe_equilibrium_authority_payload(value))
-                    for key, value in sorted(r.overrides.items())
-                ),
-                "rate": json_safe_equilibrium_authority_payload(r.rate),
-            }
-            for r in self.reactions
-        ]
-        temperature_K = coerce_temperature_kelvin(
-            self.metadata.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15),
-            field=MechanismMetadataKeys.TEMPERATURE_K,
-        )
-
-        equilibria_block = []
-        for e in self.equilibria:
-            metadata = json_safe_equilibrium_metadata_payload(e)
-            entry = {
-                "stoich_forward": OrderedDict(sorted(e.stoich_forward.items(), key=lambda kv: order_map[kv[0]])),
-                "stoich_back":   OrderedDict(sorted(e.stoich_back.items(),   key=lambda kv: order_map[kv[0]])),
-                "fast": e.fast,
-                "metadata": OrderedDict(sorted(metadata.items())),
-            }
-            effective_kf = effective_equilibrium_forward_rate(e, temperature_K=temperature_K)
-            effective_keq = effective_equilibrium_keq(e, temperature_K=temperature_K)
-            effective_kr = effective_equilibrium_reverse_rate(e, temperature_K=temperature_K)
-            authority = normalize_existing_equilibrium_rate_authority(e)
-            kf_value = effective_kf if effective_kf is not None else e.kf
-            entry["kf"] = json_safe_equilibrium_authority_payload(kf_value)
-            if authority.kind == EquilibriumRateAuthorityKind.KR:
-                kr_value = effective_kr if effective_kr is not None else authority.kr
-                entry["kr"] = json_safe_equilibrium_authority_payload(kr_value)
-            elif authority.has_explicit_keq_param:
-                keq_value = effective_keq if effective_keq is not None else authority.Keq
-                entry["Keq"] = json_safe_equilibrium_authority_payload(keq_value)
-            equilibria_block.append(entry)
-        return {
-            "species": species_block,
-            "reactions": reactions_block,
-            "equilibria": equilibria_block,
-            "metadata": {"declaration_order": declaration_order[:]},
-        }

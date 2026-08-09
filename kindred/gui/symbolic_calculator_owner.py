@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.errors import DSLError
@@ -31,7 +31,7 @@ class SymbolicCalculatorHistoryEntry:
 @dataclass(frozen=True, slots=True)
 class SymbolicCalculatorSnapshot:
     source: str
-    mechanism: Any
+    mechanism: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +178,22 @@ class SymbolicCalculatorOwner:
             )
         source = prepared_dsl.analysis.normalized_text
         try:
+            parameterized_interventions = (
+                prepared_dsl.parameterized_intervention_schedule_for_binding()
+            )
+            intervention_execution = (
+                prepared_dsl.intervention_execution_contract()
+            )
+            if parameterized_interventions is not None or bool(
+                intervention_execution is not None
+                and not intervention_execution.is_empty
+            ):
+                return (
+                    None,
+                    False,
+                    "Symbolic calculator is unavailable for mechanisms with "
+                    "scheduled interventions.",
+                )
             mechanism = prepared_dsl.mechanism_for_execution()
             apply_parameter_algebra_spec_to_mechanism(
                 prepared_dsl.parameter_algebra_spec_for_execution(),

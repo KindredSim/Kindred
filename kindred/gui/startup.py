@@ -69,10 +69,6 @@ def apply_qt_startup_workarounds(
     return True
 
 
-def apply_pre_qapplication_startup(*, qt_core: object) -> bool:
-    return apply_qt_startup_workarounds(qt_core=qt_core)
-
-
 def load_app_icon(q_icon_type: object):
     """Return the application icon if available, otherwise None."""
     from kindred.io.resources import get_resource_path

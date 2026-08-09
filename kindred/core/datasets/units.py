@@ -5,7 +5,6 @@ from typing import Sequence
 __all__ = [
     "CONCENTRATION_UNIT_DISPLAY",
     "TIME_UNIT_DISPLAY",
-    "default_unit_assumptions",
     "looks_like_unit_row",
     "parse_concentration_unit",
     "parse_time_unit",
@@ -119,14 +118,6 @@ def parse_unit(unit: str) -> tuple[str, float]:
         f"Supported time units: {', '.join(_TIME_DISPLAY_UNITS)}. "
         f"Supported concentration units: {', '.join(_CONCENTRATION_DISPLAY_UNITS)}."
     )
-
-
-def default_unit_assumptions() -> dict[str, tuple[str, float]]:
-    """Return canonical default units used when no dataset unit row is present."""
-    return {
-        "time": ("s", 1.0),
-        "concentration": ("M", 1.0),
-    }
 
 
 def _normalize_unit_text(unit: str) -> str:

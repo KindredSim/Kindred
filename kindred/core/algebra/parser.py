@@ -359,12 +359,6 @@ class Parser:
             raise AlgebraSyntaxError(msg, line=t.line, col=t.col, line_text=t.line_text)
         return self._advance()
 
-    def _expect_ident_text(self, text: str) -> Token:
-        t = self._cur()
-        if not (t.kind is TokenKind.IDENT and t.text == text):
-            raise AlgebraSyntaxError(f"expected identifier {text!r}", line=t.line, col=t.col, line_text=t.line_text)
-        return self._advance()
-
     # Entry: "# Algebra" newline { let_stmt }
     def parse_block(self) -> AlgebraBlock:
         # header: '#' 'Algebra'

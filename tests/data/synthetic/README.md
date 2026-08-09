@@ -45,4 +45,6 @@ Each CSV shares the same time grid (0–120 s, 0.5 s spacing) and columns:
 - Noise: σ = 0.002 for reactants (A/B/C) and σ = 0.0015 for intermediates/products.
 - Use case: demanding regression/global-fitting workflows that require simultaneous handling of reversible steps, intermediates, and fast consumption reactions.
 
-All datasets maintain strictly increasing time axes, non-negative concentrations, and are ready to load via `kindred.gui.widgets.data_manager.load_csv_dataset()`.
+All datasets maintain strictly increasing time axes and non-negative
+concentrations, and can be loaded through the `DataManagerPanel` CSV import
+workflow.

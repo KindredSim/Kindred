@@ -80,24 +80,6 @@ class DSLError(ReactionValidationError, ValueError):
         return "\n".join(parts)
 
 
-# Common error factories for frequently encountered issues
-
-def invalid_temperature_error(value: str) -> DSLError:
-    """Error for invalid temperature value."""
-    return DSLError(
-        f"Invalid nominal temperature: {value} K",
-        suggestion=(
-            "Set the nominal temperature in the mechanism tab to a value "
-            "within 0.1–10000 K."
-        ),
-        examples=[
-            "Mechanism tab nominal temperature: 298.15 K",
-            "Mechanism tab nominal temperature: 310 K",
-            "Mechanism tab nominal temperature: 373.15 K",
-        ],
-    )
-
-
 def invalid_number_error(value: str, field: str) -> DSLError:
     """Error for non-numeric value where number expected."""
     return DSLError(
@@ -123,50 +105,6 @@ def missing_arrow_error(line: str) -> DSLError:
             "equilibrium: A <=> B; kf=1.0; Keq=2.0",
         ],
         line_content=line
-    )
-
-
-def missing_rate_parameters_error(reaction_type: str) -> DSLError:
-    """Error for reaction missing rate constants or thermodynamic parameters."""
-    if reaction_type == "Eyring":
-        return DSLError(
-            "Eyring reaction requires either 'k' or 'dG_act' parameter",
-            suggestion="Provide explicit rate constant or activation free energy",
-            examples=[
-                "reaction: A -> B; k=1.5",
-                "reaction: A -> B; dG_act=75.5",
-            ],
-        )
-    elif reaction_type == "Arrhenius":
-        return DSLError(
-            "Arrhenius reaction requires both 'A' and 'Ea' parameters",
-            suggestion="Provide pre-exponential factor and activation energy",
-            examples=[
-                "reaction: A -> B; A=1.5e10; Ea=65.0",
-                "reaction: A -> B; A=1e13; Ea=50.0",
-            ]
-        )
-    else:
-        return DSLError(
-            "Reaction requires rate constant or thermodynamic parameters",
-            examples=[
-                "reaction: A -> B; k=1.5",
-                "reaction: A -> B; dG_act=75.5"
-            ]
-        )
-
-
-def missing_equilibrium_parameters_error() -> DSLError:
-    """Error for equilibrium missing required parameters."""
-    return DSLError(
-        "Equilibrium requires kf and exactly one of kr or Keq/dG_eq",
-        suggestion="Provide kf with either kr, Keq, or dG_eq, but not more than one reverse authority",
-        examples=[
-            "equilibrium: A <-> B; kf=1.5; Keq=2.0",
-            "equilibrium: A <-> B; kf=1.5; dG_eq=-8.5",
-            "equilibrium: A <-> B; kf=1.5; kr=0.75",
-            "equilibrium: A <=> B; kf=1.5; Keq=2.0",
-        ]
     )
 
 
@@ -216,34 +154,6 @@ def non_positive_stoichiometry_error() -> DSLError:
     )
 
 
-def non_integer_molecularity_error() -> DSLError:
-    """Error for fractional molecularity."""
-    return DSLError(
-        "Molecularity must be an integer (sum of reactant coefficients)",
-        suggestion="Ensure reactant stoichiometry sums to a whole number",
-        examples=[
-            "A -> B            (molecularity = 1)",
-            "A + B -> C        (molecularity = 2)",
-            "2*A -> B          (molecularity = 2)",
-            "A + 2*B -> C      (molecularity = 3)"
-        ]
-    )
-
-
-def reversible_arrhenius_missing_kr_error() -> DSLError:
-    """Error for reversible Arrhenius without reverse rate."""
-    return DSLError(
-        "Reversible Arrhenius reaction needs exactly one of kr or Keq/dG_eq",
-        suggestion="For reversible Arrhenius reactions, specify one reverse authority",
-        examples=[
-            "reaction: A <-> B; A=1e10; Ea=50.0; kr=0.5",
-            "reaction: A <-> B; A=1e10; Ea=50.0; Keq=2.0",
-            "reaction: A <-> B; A=1e10; Ea=50.0; dG_eq=-8.5",
-            "reaction: A <=> B; A=1e10; Ea=50.0; Keq=2.0",
-        ]
-    )
-
-
 def invalid_keyvalue_pair_error(chunk: str) -> DSLError:
     """Error for malformed key=value pair."""
     return DSLError(
@@ -254,19 +164,5 @@ def invalid_keyvalue_pair_error(chunk: str) -> DSLError:
             "dG_act=75.5",
             "C0=1.0",
             "energy=kJ/mol"
-        ]
-    )
-
-
-def invalid_boolean_error(value: str, field: str) -> DSLError:
-    """Error for invalid boolean value."""
-    return DSLError(
-        f"Invalid boolean for '{field}': {value}",
-        suggestion="Use: 1/true/yes/on or 0/false/no/off",
-        examples=[
-            f"{field}=true",
-            f"{field}=false",
-            f"{field}=1",
-            f"{field}=0"
         ]
     )

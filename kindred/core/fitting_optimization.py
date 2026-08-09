@@ -25,7 +25,6 @@ from kindred.core.scipy_optimize import load_scipy_optimize
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "FitProgress",
     "FitResult",
     "fit_parameters",
 ]
@@ -50,29 +49,14 @@ def _is_expected_candidate_domain_error(exc: BaseException) -> bool:
 
 
 @dataclass
-class FitProgress:
-    """Progress information during fitting."""
-
-    iteration: int
-    nfev: int
-    cost: float
-    parameters: Dict[str, float]
-    message: str = ""
-
-
-@dataclass
 class FitResult:
     """Results from parameter fitting."""
 
     success: bool
     parameters: Dict[str, float]
-    uncertainties: Optional[Dict[str, float]]
-    residual_mse: float
-    r_squared: float
     residuals: np.ndarray
     nfev: int
     message: str
-    covariance: Optional[np.ndarray] = None
     identifiability_warning: Optional[str] = None
     parameter_space: str = "optimizer"
 
@@ -81,13 +65,12 @@ def fit_parameters(
     objective_func: Callable[[np.ndarray], np.ndarray],
     initial_params: Dict[str, float],
     bounds: Optional[Dict[str, Tuple[float, float]]] = None,
-    method: str = "lm",
-    progress_callback: Optional[Callable[[FitProgress], None]] = None,
     max_nfev: int = 1000,
     seed: Optional[int] = None,
     ftol: float = 1e-10,
     xtol: float = 1e-10,
     *,
+    method: str,
     cancellation_check: Callable[[], bool] | None = None,
     de_penalty: float | None = None,
     scipy_loader: Callable[[], tuple[Callable[..., Any], Callable[..., Any]]] | None = None,
@@ -125,9 +108,6 @@ def fit_parameters(
         return FitResult(
             success=False,
             parameters=params,
-            uncertainties=None,
-            residual_mse=np.inf,
-            r_squared=float("nan"),
             residuals=np.array([]),
             nfev=(
                 de_evaluation_budget.nfev
@@ -135,7 +115,6 @@ def fit_parameters(
                 else iteration_counter[0]
             ),
             message=message,
-            covariance=None,
             identifiability_warning=None,
             parameter_space=space,
         )
@@ -145,22 +124,10 @@ def fit_parameters(
             raise FittingCancelled()
         residuals = objective_func(params)
         iteration_counter[0] += 1
-        if progress_callback is not None and iteration_counter[0] % 10 == 0:
-            param_dict = {name: val for name, val in zip(param_names, params)}
-            cost = np.sum(residuals**2)
-            progress_callback(
-                FitProgress(
-                    iteration=iteration_counter[0],
-                    nfev=iteration_counter[0],
-                    cost=cost,
-                    parameters=param_dict,
-                    message=f"Iteration {iteration_counter[0]}",
-                )
-            )
         return residuals
 
     try:
-        if method.lower() == "de":
+        if method == "differential_evolution":
             _least_squares, differential_evolution = scipy_loader()
             if bounds is None:
                 raise ValueError("Differential Evolution requires bounds")
@@ -193,16 +160,6 @@ def fit_parameters(
                     raise FittingCancelled()
                 de_evaluation_budget.claim(reserve=reserve)
                 residuals = np.asarray(objective_func(params), dtype=float).reshape(-1)
-                if progress_callback is not None and de_evaluation_budget.nfev % 10 == 0:
-                    progress_callback(
-                        FitProgress(
-                            iteration=de_evaluation_budget.nfev,
-                            nfev=de_evaluation_budget.nfev,
-                            cost=float(np.sum(residuals**2)),
-                            parameters=_vector_to_param_dict(params),
-                            message=f"Iteration {de_evaluation_budget.nfev}",
-                        )
-                    )
                 return residuals
 
             def de_objective(params):
@@ -284,36 +241,10 @@ def fit_parameters(
                     parameter_space="optimizer",
                 )
             nfev = de_evaluation_budget.nfev
-            covariance = None
         else:
             least_squares, _de = scipy_loader()
-            if method.lower() == "lm":
-                scipy_method = "lm"
-                if bounds is not None:
-                    lower_arr = np.asarray(scipy_bounds[0], dtype=float).reshape(-1)
-                    upper_arr = np.asarray(scipy_bounds[1], dtype=float).reshape(-1)
-                    bounded_params = [
-                        name
-                        for idx, name in enumerate(param_names)
-                        if idx < lower_arr.size
-                        and idx < upper_arr.size
-                        and (np.isfinite(lower_arr[idx]) or np.isfinite(upper_arr[idx]))
-                    ]
-                    if bounded_params:
-                        raise ValueError(
-                            "Levenberg-Marquardt fitting does not support finite bounds. "
-                            "Use trf or dogbox, or remove bounds for: "
-                            + ", ".join(sorted(set(bounded_params)))
-                        )
-                scipy_bounds = (-np.inf, np.inf)
-            elif method.lower() == "trf":
-                scipy_method = "trf"
-            elif method.lower() == "dogbox":
-                scipy_method = "dogbox"
-            else:
-                raise ValueError(f"Unknown method: {method}")
 
-            if scipy_method in ("trf", "dogbox") and bounds is not None:
+            if bounds is not None:
                 _lb = np.array(scipy_bounds[0])
                 _ub = np.array(scipy_bounds[1])
                 _eps = np.minimum(1e-12, (_ub - _lb) / 3.0)
@@ -326,7 +257,7 @@ def fit_parameters(
                 ftol=ftol,
                 xtol=xtol,
                 max_nfev=max_nfev,
-                method=scipy_method,
+                method=method,
                 bounds=scipy_bounds,
                 diff_step=diff_step,
                 verbose=0,
@@ -334,27 +265,13 @@ def fit_parameters(
             result = least_squares(wrapped_objective, x0, **lsq_kwargs)
 
             x_opt = result.x
-            success = result.success
-            message = result.message
-            nfev = result.nfev
-            try:
-                residuals = objective_func(x_opt)
-            except FittingCancelled:
-                raise
-            except FitSimulationError as exc:
-                if not _is_expected_candidate_domain_error(exc):
-                    raise
-                logger.error("Simulation failed when evaluating optimal parameters: %s", exc)
-                if exc.failed_params:
-                    return _build_failed_result(
-                        str(exc),
-                        failed_params=exc.failed_params,
-                        parameter_space="physical",
-                    )
-                return _build_failed_result(
-                    str(exc),
-                    failed_params=_vector_to_param_dict(x_opt),
-                    parameter_space="optimizer",
+            success = bool(result.success)
+            message = str(result.message)
+            nfev = int(result.nfev)
+            residuals = np.asarray(result.fun, dtype=float).reshape(-1)
+            if residuals.size == 0 or not np.all(np.isfinite(residuals)):
+                raise OptimizationError(
+                    "Least-squares optimizer returned empty or non-finite residuals."
                 )
 
             try:
@@ -363,22 +280,12 @@ def fit_parameters(
                 rank = int(np.linalg.matrix_rank(J))
                 if rank < param_count:
                     identifiability_warning = (
-                        "Covariance and uncertainties were not reported because the Jacobian is "
-                        f"rank deficient (rank {rank} < {param_count})."
+                        "Fit Jacobian is rank deficient; parameter identifiability "
+                        f"is limited (rank {rank} < {param_count})."
                     )
                     message = f"{message}; {identifiability_warning}"
-                    covariance = None
-                else:
-                    JtJ = J.T @ J
-                    residual_sum = np.sum(residuals**2)
-                    dof = len(residuals) - len(x_opt)
-                    if dof <= 0:
-                        dof = max(1, len(residuals))
-                    residual_var = residual_sum / dof
-                    covariance = np.linalg.pinv(JtJ) * residual_var
             except Exception as exc:
-                logger.debug("Failed to calculate covariance: %s", exc)
-                covariance = None
+                logger.debug("Failed to assess Fit Jacobian rank: %s", exc)
     except FittingCancelled:
         raise
     except FitSimulationError:
@@ -391,26 +298,12 @@ def fit_parameters(
 
     fitted_params = {name: val for name, val in zip(param_names, x_opt)}
 
-    uncertainties = None
-    if covariance is not None:
-        try:
-            std_devs = np.sqrt(np.diag(covariance))
-            uncertainties = {name: std for name, std in zip(param_names, std_devs)}
-        except Exception as exc:
-            logger.debug("Failed to calculate uncertainties: %s", exc)
-
-    residual_mse = np.sum(residuals**2) / len(residuals) if len(residuals) > 0 else np.inf
-
     return FitResult(
         success=success,
         parameters=fitted_params,
-        uncertainties=uncertainties,
-        residual_mse=residual_mse,
-        r_squared=float("nan"),
         residuals=residuals,
         nfev=nfev,
         message=message,
-        covariance=covariance,
         identifiability_warning=identifiability_warning,
         parameter_space="optimizer",
     )

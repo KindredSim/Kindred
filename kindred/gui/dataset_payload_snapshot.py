@@ -8,8 +8,8 @@ import math
 from kindred.core.project_document import (
     MechanismTabDocument,
     ProjectDocument,
-    RawDatasetRecord,
 )
+from kindred.core.datasets.foundation import RawDatasetRecord
 from kindred.core.project_presentation_state import ProjectPresentationState
 
 
@@ -35,10 +35,33 @@ class DataManagerSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ExperimentalLayerIdentity:
+    """Tagged immutable identity for one dataset-local raw observation."""
+
+    dataset_id: str
+    raw_observation_id: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.dataset_id, "dataset"),
+            (self.raw_observation_id, "raw observation"),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+            ):
+                raise ValueError(
+                    f"Experimental layer {label} ID must be a nonblank "
+                    "edge-normalized string."
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class ExperimentalLayerInput:
     """One immutable selected raw series with separate mapped-model identity."""
 
-    layer_id: str
+    layer_id: ExperimentalLayerIdentity
     dataset_id: str
     raw_observation_id: str
     dataset_name: str
@@ -49,8 +72,11 @@ class ExperimentalLayerInput:
     source_rows: tuple[int, ...]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.layer_id, ExperimentalLayerIdentity):
+            raise TypeError(
+                "Experimental layer_id must be an ExperimentalLayerIdentity."
+            )
         for value, label in (
-            (self.layer_id, "layer"),
             (self.dataset_id, "dataset"),
             (self.raw_observation_id, "raw observation"),
             (self.dataset_name, "dataset name"),
@@ -65,6 +91,13 @@ class ExperimentalLayerInput:
                     f"Experimental {label} identity must be a nonblank "
                     "edge-normalized string."
                 )
+        if self.layer_id != ExperimentalLayerIdentity(
+            self.dataset_id,
+            self.raw_observation_id,
+        ):
+            raise ValueError(
+                "Experimental layer identity must match its dataset/raw IDs."
+            )
         if self.model_species is not None and (
             not isinstance(self.model_species, str)
             or not self.model_species
@@ -95,11 +128,6 @@ class ExperimentalLayerInput:
                 "Experimental layer values require immutable aligned finite "
                 "float t/y tuples and unique positive physical source rows."
             )
-
-    @property
-    def presented_species(self) -> str:
-        return self.model_species or self.raw_column
-
 
 def build_data_manager_snapshot(
     *,
@@ -189,9 +217,9 @@ def build_experimental_layer_inputs(
                 continue
             layers.append(
                 ExperimentalLayerInput(
-                    layer_id=(
-                        f"{record.dataset_id}:"
-                        f"{series.raw_observation_id}"
+                    layer_id=ExperimentalLayerIdentity(
+                        record.dataset_id,
+                        series.raw_observation_id,
                     ),
                     dataset_id=record.dataset_id,
                     raw_observation_id=raw_observation_id,

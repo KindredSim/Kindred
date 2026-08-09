@@ -18,9 +18,7 @@ from kindred.core.project_document import (
     next_set_name,
 )
 from kindred.core.project_presentation_state import ProjectPresentationState
-from kindred.core.result_repository import (
-    explicit_result_key_for_tab,
-)
+from kindred.core.project_session import ProjectContentToken
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
 from kindred.gui.workspace_tab_registry import CanonicalMutationResult
 
@@ -65,7 +63,9 @@ class _ProjectedRow:
         invalid = dict(self.invalid_raw_values)
         if species in invalid:
             return invalid[species]
-        return f"{dict(self.canonical_values).get(species, 0.0):.12g}"
+        # Preserve the exact accepted binary64 value in the editable
+        # projection; formatting must never become a scientific write.
+        return repr(float(dict(self.canonical_values).get(species, 0.0)))
 
 
 class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
@@ -604,6 +604,8 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._simulation_jobs = simulation_jobs
         self._species_for_tab = species_for_tab or canonical_species_names
         self._rendering = False
+        self._editor_settlement_expected_token: ProjectContentToken | None = None
+        self._editor_settlement_successor_token: ProjectContentToken | None = None
         model.initialValueEditRequested.connect(self.accept_value_edit)
         model.setNameEditRequested.connect(self.accept_name_edit)
         model.sliderPinChangeRequested.connect(self.set_slider_pinned)
@@ -697,8 +699,46 @@ class InitialConditionsTableActions(QtCore.QObject):
     def render(self) -> None:
         self.apply_render_projection(self.prepare_render())
 
-    def settle_active_editor(self) -> None:
-        self._table.settle_active_editor()
+    def settle_active_editor(
+        self,
+        *,
+        expected_token: ProjectContentToken | None = None,
+    ) -> ProjectContentToken | None:
+        """Submit one active cell edit and carry its exact accepted successor."""
+
+        if expected_token is None:
+            self._table.settle_active_editor()
+            return None
+        if not isinstance(expected_token, ProjectContentToken):
+            raise TypeError("expected_token must be ProjectContentToken or None.")
+        if self._editor_settlement_expected_token is not None:
+            raise RuntimeError("Initial-condition editor settlement is re-entrant.")
+        self._editor_settlement_expected_token = expected_token
+        self._editor_settlement_successor_token = expected_token
+        try:
+            self._table.settle_active_editor()
+            return self._editor_settlement_successor_token
+        finally:
+            self._editor_settlement_expected_token = None
+            self._editor_settlement_successor_token = None
+
+    def _editor_mutation_token(self) -> ProjectContentToken:
+        expected = self._editor_settlement_expected_token
+        return (
+            expected
+            if expected is not None
+            else self._registry.capture_content_token()
+        )
+
+    def _carry_editor_mutation(
+        self,
+        result: CanonicalMutationResult | None,
+    ) -> None:
+        if (
+            result is not None
+            and self._editor_settlement_expected_token is not None
+        ):
+            self._editor_settlement_successor_token = result.token
 
     def selected_run_set_ids(self) -> tuple[str, ...]:
         return tuple(
@@ -787,10 +827,11 @@ class InitialConditionsTableActions(QtCore.QObject):
             result = self._registry.replace_initial_condition_set(
                 self._tab_id,
                 initial_set.with_values(values),
-                expected_token=self._registry.capture_content_token(),
+                expected_token=self._editor_mutation_token(),
             )
             if result is None:
                 return False
+            self._carry_editor_mutation(result)
             self._consume_document_delta(result)
         invalid_cleared = self._clear_invalid_value(set_id, species)
         if was_invalid and not changed:
@@ -909,8 +950,9 @@ class InitialConditionsTableActions(QtCore.QObject):
         result = self._registry.replace_initial_condition_set(
             self._tab_id,
             replace(initial_set, name=normalized),
-            expected_token=self._registry.capture_content_token(),
+            expected_token=self._editor_mutation_token(),
         )
+        self._carry_editor_mutation(result)
         accepted = self._consume_document_delta(result)
         self.render()
         return accepted
@@ -1045,18 +1087,17 @@ class InitialConditionsTableActions(QtCore.QObject):
     def set_workspace_run_defaults(
         self,
         settings: SimulationExecutionSettings,
-    ) -> bool:
-        tab = self._registry.tab(self._tab_id)
-        if settings == tab.run_defaults:
-            return False
+        *,
+        expected_token: ProjectContentToken,
+    ) -> CanonicalMutationResult | None:
         result = self._registry.set_run_defaults(
             self._tab_id,
             settings,
-            expected_token=self._registry.capture_content_token(),
+            expected_token=expected_token,
         )
-        accepted = self._consume_document_delta(result)
+        self._consume_document_delta(result)
         self.render()
-        return accepted
+        return result
 
     def set_tab_scientific_settings(
         self,
@@ -1208,11 +1249,13 @@ class InitialConditionsTableActions(QtCore.QObject):
         tab: MechanismTabDocument,
         set_ids: Iterable[str],
     ) -> None:
-        keys = tuple(
-            explicit_result_key_for_tab(tab, set_id)
-            for set_id in dict.fromkeys(str(item) for item in set_ids)
+        targets = tuple(
+            dict.fromkeys(str(item) for item in set_ids)
         )
-        self._simulation_jobs.reconcile_canonical_targets(keys)
+        self._simulation_jobs.reconcile_canonical_targets(
+            tab.tab_id,
+            targets,
+        )
 
     def _reject(self, message: str) -> bool:
         self.errorRaised.emit(str(message))

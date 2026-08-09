@@ -80,12 +80,3 @@ def project_nonnegative_trajectory(
         count=count,
         max_negative_magnitude=max_negative_magnitude,
     )
-
-
-def apply_nonnegative_trajectory_invariant(
-    Y: np.ndarray,
-    *,
-    context: str,
-) -> np.ndarray:
-    projected, _provenance = project_nonnegative_trajectory(Y, context=context)
-    return projected

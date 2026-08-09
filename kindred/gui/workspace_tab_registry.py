@@ -18,7 +18,6 @@ from kindred.core.project_presentation_state import (
     ProjectPresentationState,
     WorkspacePresentationState,
     default_project_presentation_state,
-    reconcile_workspace_presentation_state,
     validate_project_presentation_state,
     validate_workspace_presentation_state,
 )
@@ -201,7 +200,7 @@ class WorkspaceTabRegistry:
 
         if not isinstance(document, ProjectDocument):
             raise TypeError("document must be a ProjectDocument.")
-        validated_presentation = reconcile_workspace_presentation_state(
+        validated_presentation = validate_workspace_presentation_state(
             document,
             presentation,
         )
@@ -238,13 +237,36 @@ class WorkspaceTabRegistry:
             raise TypeError("prepared must be PreparedWorkspaceInstall.")
         self._installed = prepared
 
-    def reconcile_document(
+    @staticmethod
+    def _clone_runtime(runtime: TabRuntimeState) -> TabRuntimeState:
+        """Copy mutable transient containers while retaining owned resources."""
+
+        if not isinstance(runtime, TabRuntimeState):
+            raise TypeError("runtime must be TabRuntimeState.")
+        return TabRuntimeState(
+            reactions_draft=runtime.reactions_draft,
+            notes_draft=runtime.notes_draft,
+            invalid_initial_text_by_set_id={
+                set_id: dict(values)
+                for set_id, values in runtime.invalid_initial_text_by_set_id.items()
+            },
+            selected_run_set_ids=tuple(runtime.selected_run_set_ids),
+            slider_parameter_draft=dict(runtime.slider_parameter_draft),
+            slider_species_drafts_by_set_id={
+                set_id: dict(values)
+                for set_id, values in runtime.slider_species_drafts_by_set_id.items()
+            },
+            result_repository=runtime.result_repository,
+        )
+
+    def _prepare_reconciled_install(
         self,
         *,
         previous_document: ProjectDocument,
-    ) -> ScientificDocumentDelta:
-        """Reconcile transient state and return the accepted scientific delta."""
-        document = self._session.document
+        document: ProjectDocument,
+    ) -> tuple[PreparedWorkspaceInstall, ScientificDocumentDelta]:
+        """Build a complete reconciled registry value without live mutation."""
+
         scientific_delta = self._scientific_document_delta(
             previous_document,
             document,
@@ -256,7 +278,7 @@ class WorkspaceTabRegistry:
             if tab_id in tab_ids
         }
         next_runtime = {
-            tab_id: state
+            tab_id: self._clone_runtime(state)
             for tab_id, state in self._installed.runtime_by_tab_id
             if tab_id in tab_ids
         }
@@ -339,7 +361,7 @@ class WorkspaceTabRegistry:
         active_tab_id = self.active_tab_id
         if active_tab_id not in tab_ids:
             active_tab_id = document.tabs[0].tab_id
-        self._installed = PreparedWorkspaceInstall(
+        prepared = PreparedWorkspaceInstall(
             active_tab_id=active_tab_id,
             presentation_by_tab_id=tuple(
                 (tab.tab_id, next_presentation[tab.tab_id])
@@ -350,7 +372,7 @@ class WorkspaceTabRegistry:
                 for tab in document.tabs
             ),
         )
-        return scientific_delta
+        return prepared, scientific_delta
 
     def replace_document(
         self,
@@ -361,19 +383,26 @@ class WorkspaceTabRegistry:
         """Conditionally install one document and return its exact result fence."""
 
         previous = self._session.document
-        changed = document != previous
-        token = self._session.replace_document(
-            document,
+        prepared_document = self._session.prepare_document_mutation(document)
+        candidate = prepared_document.document
+        changed = candidate != previous
+        if changed:
+            prepared_workspace, delta = self._prepare_reconciled_install(
+                previous_document=previous,
+                document=candidate,
+            )
+        else:
+            prepared_workspace = self._installed
+            delta = ScientificDocumentDelta()
+        token = self._session.commit_document_mutation(
+            prepared_document,
             expected_token=expected_token,
             fence_deletions=self._fence_document_deletions,
         )
         if token is None:
             return None
-        delta = (
-            self.reconcile_document(previous_document=previous)
-            if changed
-            else ScientificDocumentDelta()
-        )
+        if changed:
+            self._installed = prepared_workspace
         return CanonicalMutationResult(token=token, delta=delta, changed=changed)
 
     def _fence_document_deletions(

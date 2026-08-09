@@ -16,9 +16,12 @@ from kindred.gui.display_name_policy import (
     compact_plot_title_label,
     compact_text,
 )
-from kindred.gui.fitting.worker import FitCurveDataset
+from kindred.gui.fitting.worker import FitCurveDataset, FitCurveYSemantic
 from kindred.gui.plot_config import try_import_pyqtgraph
-from kindred.gui.workspace_result_presenter import encode_tsv_row
+from kindred.gui.workspace_result_presenter import (
+    encode_clipboard_text,
+    encode_tsv_row,
+)
 
 __all__ = ["DatasetPlotPresentation", "GridPlotView"]
 
@@ -40,6 +43,20 @@ def _color_value(value: object) -> object:
     return str(value)
 
 
+def _fit_y_axis_label(
+    y_semantics: tuple[tuple[str, FitCurveYSemantic], ...],
+    visible_y_names: Iterable[str],
+) -> tuple[str, str | None]:
+    visible = tuple(dict.fromkeys(str(name) for name in visible_y_names))
+    semantics = dict(y_semantics)
+    if visible and all(
+        semantics.get(name) is FitCurveYSemantic.CONCENTRATION
+        for name in visible
+    ):
+        return "Concentration", "M"
+    return "Value", None
+
+
 class GridPlotView(QtWidgets.QWidget):
     """Render immutable live and terminal Fit curves in the Fit-local plot."""
 
@@ -50,6 +67,7 @@ class GridPlotView(QtWidgets.QWidget):
         self,
         *,
         color_resolver: ColorResolver | None = None,
+        show_generic_controls: bool = True,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -76,6 +94,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._structure_key: tuple[tuple[str, ...], int, int] | None = None
         self._dark_mode = False
         self._autorange_locked = False
+        self._autorange_lock_pending = False
         self._locked_view_ranges: dict[
             int, tuple[tuple[float, float], tuple[float, float]]
         ] = {}
@@ -123,6 +142,7 @@ class GridPlotView(QtWidgets.QWidget):
         controls_layout.addWidget(self._species_list)
         controls_layout.addStretch()
         layout.addWidget(self._controls_widget)
+        self._controls_widget.setVisible(bool(show_generic_controls))
 
         ok, pg, _error = try_import_pyqtgraph()
         if ok:
@@ -141,11 +161,41 @@ class GridPlotView(QtWidgets.QWidget):
             self._message.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(self._message)
 
-    def set_curves(self, curves: Iterable[FitCurveDataset]) -> None:
+    @staticmethod
+    def _normalize_dataset_presentation(
+        presentation: Mapping[str, DatasetPlotPresentation],
+    ) -> Mapping[str, DatasetPlotPresentation]:
+        if not isinstance(presentation, Mapping):
+            raise TypeError("presentation must be a mapping.")
+        normalized: dict[str, DatasetPlotPresentation] = {}
+        for dataset_id, value in presentation.items():
+            if not isinstance(dataset_id, str) or not dataset_id:
+                raise TypeError("presentation keys must be non-empty strings.")
+            if (
+                not isinstance(value, tuple)
+                or len(value) != 2
+                or not all(isinstance(item, str) for item in value)
+            ):
+                raise TypeError(
+                    "presentation values must be (title, tooltip) string tuples."
+                )
+            normalized[dataset_id] = value
+        return MappingProxyType(normalized)
+
+    def set_projection(
+        self,
+        curves: Iterable[FitCurveDataset],
+        presentation: Mapping[str, DatasetPlotPresentation],
+    ) -> None:
+        """Install curves and presentation together, then redraw exactly once."""
+
         self._cancel_copy()
         values = tuple(curves)
         if any(not isinstance(item, FitCurveDataset) for item in values):
             raise TypeError("curves must contain FitCurveDataset values.")
+        normalized_presentation = self._normalize_dataset_presentation(
+            presentation
+        )
         species_names = tuple(
             dict.fromkeys(
                 species
@@ -163,7 +213,7 @@ class GridPlotView(QtWidgets.QWidget):
             if self._color_resolver is not None
             else {}
         )
-        self._dataset_presentation = MappingProxyType({})
+        self._dataset_presentation = normalized_presentation
         self._curves = values
         self._render_succeeded = False
         self._render_failure_reported = False
@@ -185,30 +235,6 @@ class GridPlotView(QtWidgets.QWidget):
         self._available_species_cache = ()
         self._redraw()
 
-    def set_dataset_presentation(
-        self,
-        presentation: Mapping[str, DatasetPlotPresentation],
-    ) -> None:
-        """Apply bounded terminal title/tooltip text by typed dataset ID."""
-
-        if not isinstance(presentation, Mapping):
-            raise TypeError("presentation must be a mapping.")
-        normalized: dict[str, DatasetPlotPresentation] = {}
-        for dataset_id, value in presentation.items():
-            if not isinstance(dataset_id, str) or not dataset_id:
-                raise TypeError("presentation keys must be non-empty strings.")
-            if (
-                not isinstance(value, tuple)
-                or len(value) != 2
-                or not all(isinstance(item, str) for item in value)
-            ):
-                raise TypeError(
-                    "presentation values must be (title, tooltip) string tuples."
-                )
-            normalized[dataset_id] = value
-        self._dataset_presentation = MappingProxyType(normalized)
-        self._redraw()
-
     def copy_eligible(self) -> bool:
         """Whether this Fit-local panel owns a rendered Copy projection."""
 
@@ -217,9 +243,22 @@ class GridPlotView(QtWidgets.QWidget):
     def copy_all_to_clipboard(self) -> None:
         if not self.copy_eligible():
             raise ValueError("No rendered Fit curves are available to copy.")
+        self.copy_projection_to_clipboard(self._curves)
+
+    def copy_projection_to_clipboard(
+        self,
+        curves: Iterable[FitCurveDataset],
+    ) -> None:
+        """Copy a fresh canonical projection without using retained plot data."""
+
+        values = tuple(curves)
+        if any(not isinstance(item, FitCurveDataset) for item in values):
+            raise TypeError("curves must contain FitCurveDataset values.")
+        if not values or not self._render_succeeded:
+            raise ValueError("No rendered Fit curves are available to copy.")
         if self._copy_timer.isActive():
             return
-        self._copy_chunks = iter(self._iter_copy_chunks())
+        self._copy_chunks = iter(self._iter_copy_chunks(values))
         self._copy_output = io.StringIO()
         self._copy_timer.start()
 
@@ -230,10 +269,13 @@ class GridPlotView(QtWidgets.QWidget):
         self._copy_chunks = None
         self._copy_output = None
 
-    def _iter_copy_chunks(self) -> Iterable[str]:
+    @staticmethod
+    def _iter_copy_chunks(
+        curves: tuple[FitCurveDataset, ...],
+    ) -> Iterable[str]:
         row_count = sum(
             len(values)
-            for dataset in self._curves
+            for dataset in curves
             for _species, values in dataset.objective_model_y
         )
         cell_count = (row_count + 1) * _FIT_COPY_COLUMNS
@@ -265,7 +307,7 @@ class GridPlotView(QtWidgets.QWidget):
         output = io.StringIO()
         output.write(header)
         rows_in_chunk = 0
-        for dataset in self._curves:
+        for dataset in curves:
             model_x = dict(dataset.objective_model_x)
             model_y = dict(dataset.objective_model_y)
             observed_x = dict(dataset.observed_x)
@@ -289,17 +331,25 @@ class GridPlotView(QtWidgets.QWidget):
                     output.write(
                         encode_tsv_row(
                             (
-                                dataset.dataset_id,
-                                dataset.display_name,
-                                species,
-                                observation_ids[species][index],
-                                raw_columns[species][index],
+                                encode_clipboard_text(dataset.dataset_id),
+                                encode_clipboard_text(dataset.display_name),
+                                encode_clipboard_text(species),
+                                encode_clipboard_text(
+                                    observation_ids[species][index]
+                                ),
+                                encode_clipboard_text(
+                                    raw_columns[species][index]
+                                ),
                                 str(source_rows[species][index]),
                                 str(segment_ids[species][index]),
-                                segment_keys[species][index],
+                                encode_clipboard_text(
+                                    segment_keys[species][index]
+                                ),
                                 str(discontinuity_ids[species][index]),
-                                selection[species][index],
-                                dataset.x_name,
+                                encode_clipboard_text(
+                                    selection[species][index]
+                                ),
+                                encode_clipboard_text(dataset.x_name),
                                 f"{float(obs_x):.17g}",
                                 f"{float(obs_y):.17g}",
                                 f"{float(selected_x):.17g}",
@@ -396,7 +446,8 @@ class GridPlotView(QtWidgets.QWidget):
         curves: tuple[FitCurveDataset, ...],
     ) -> tuple[tuple[str, ...], int, int]:
         identifiers = tuple(
-            f"{curve.dataset_id}\x00{curve.display_name}" for curve in curves
+            f"{curve.dataset_id}\x00{curve.display_name}\x00{curve.x_name}"
+            for curve in curves
         )
         rows, columns = GridPlotView._calculate_grid_size(len(identifiers))
         return identifiers, rows, columns
@@ -426,7 +477,7 @@ class GridPlotView(QtWidgets.QWidget):
             plot.setLabel("bottom", x_label, units="s")
         else:
             plot.setLabel("bottom", x_label)
-        plot.setLabel("left", "Concentration", units="M")
+        plot.setLabel("left", "Value")
         plot.showGrid(x=True, y=True, alpha=0.3)
         font = QtGui.QFont()
         font.setPointSize(7)
@@ -595,6 +646,16 @@ class GridPlotView(QtWidgets.QWidget):
             model_segments = model_segments_by_dataset[dataset_index]
             model_segment_keys = model_segment_keys_by_dataset[dataset_index]
             model_discontinuities = model_discontinuities_by_dataset[dataset_index]
+            visible_y_names = tuple(
+                name
+                for name in self._selected_species_list
+                if name in model_y or name in observed_y
+            )
+            y_label, y_units = _fit_y_axis_label(
+                curve.y_semantics,
+                visible_y_names,
+            )
+            plot.setLabel("left", y_label, units=y_units)
 
             for species in self._selected_species_list:
                 color = self._color_by_species[species]
@@ -900,30 +961,19 @@ class GridPlotView(QtWidgets.QWidget):
         """Freeze or restore historical pyqtgraph autorange during live updates."""
 
         requested = bool(locked)
-        if requested == self._autorange_locked:
+        if requested and (self._autorange_locked or self._autorange_lock_pending):
             return
-        self._autorange_locked = requested
         if requested:
-            self._set_scrollbars_locked(True)
-            self._snapshot_plot_view_ranges()
-            self._snapshot_locked_axis_geometry()
-            for index, plot in enumerate(self._plot_items):
-                view_box = plot.getViewBox()
-                self._apply_locked_axis_style(plot)
-                try:
-                    previous = view_box.autoRangeEnabled()
-                    self._locked_autorange_prev[index] = (
-                        bool(previous[0]),
-                        bool(previous[1]),
-                    )
-                except Exception:
-                    self._locked_autorange_prev[index] = (True, True)
-                try:
-                    view_box.enableAutoRange(x=False, y=False)
-                except Exception:
-                    pass
+            if not self._curves or not self._plot_items:
+                self._autorange_lock_pending = True
+                return
+            self._activate_autorange_lock()
             return
 
+        self._autorange_lock_pending = False
+        if not self._autorange_locked:
+            return
+        self._autorange_locked = False
         self._set_scrollbars_locked(False)
         for index, plot in enumerate(self._plot_items):
             view_box = plot.getViewBox()
@@ -947,6 +997,48 @@ class GridPlotView(QtWidgets.QWidget):
         self._locked_bottom_axis_height = None
         self._redraw()
 
+    def _activate_autorange_lock(self) -> None:
+        """Snapshot one established view and freeze it for the active run."""
+
+        self._autorange_lock_pending = False
+        self._autorange_locked = True
+        self._set_scrollbars_locked(True)
+        self._snapshot_plot_view_ranges()
+        self._snapshot_locked_axis_geometry()
+        for index, plot in enumerate(self._plot_items):
+            view_box = plot.getViewBox()
+            self._apply_locked_axis_style(plot)
+            try:
+                previous = view_box.autoRangeEnabled()
+                self._locked_autorange_prev[index] = (
+                    bool(previous[0]),
+                    bool(previous[1]),
+                )
+            except Exception:
+                self._locked_autorange_prev[index] = (True, True)
+            try:
+                view_box.enableAutoRange(x=False, y=False)
+            except Exception:
+                pass
+
+    def _establish_first_valid_ranges(self) -> None:
+        """Autorange one first payload before satisfying a deferred lock."""
+
+        if (
+            not self._autorange_lock_pending
+            or not self._curves
+            or len(self._plot_items) != len(self._curves)
+        ):
+            return
+        for plot in self._plot_items:
+            view_box = plot.getViewBox()
+            try:
+                view_box.enableAutoRange(x=True, y=True)
+                view_box.autoRange()
+            except Exception:
+                pass
+        self._activate_autorange_lock()
+
     def _update_grid(self) -> None:
         if self._pg is None or self._canvas is None:
             return
@@ -960,12 +1052,13 @@ class GridPlotView(QtWidgets.QWidget):
         ):
             self._rebuild_structure()
         self._update_plot_data_in_place()
+        self._establish_first_valid_ranges()
         self._restore_locked_view_ranges()
 
     def _redraw(self) -> None:
         if self._curves and self._render_failure_reported:
             # The installed payload already failed physical rendering.  Keep
-            # that failure contained until a new set_curves() payload resets
+            # that failure contained until a new set_projection() payload resets
             # the panel instead of repeatedly exercising the broken scene.
             self._render_succeeded = False
             self.renderStateChanged.emit(False)

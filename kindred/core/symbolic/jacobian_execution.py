@@ -3,10 +3,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .artifacts import symbolic_jacobian_identity_payload
+import numpy as np
+
 from .errors import UnsupportedSymbolicExpressionError
 from .identity import normalize_symbolic_identity_mapping
 from .namespaces import symbolic_status_payload
+
+
+def normalize_jacobian_sparsity(value: Any) -> np.ndarray | None:
+    """Materialize one SciPy-compatible immutable boolean sparsity matrix."""
+
+    if value is None:
+        return None
+    try:
+        dense = value.toarray()
+    except AttributeError:
+        dense = value
+    matrix = np.asarray(dense, dtype=bool)
+    if matrix.ndim != 2:
+        raise ValueError("Jacobian sparsity must be a two-dimensional matrix.")
+    matrix = matrix.copy()
+    matrix.setflags(write=False)
+    return matrix
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,20 +43,23 @@ class SymbolicJacobianExecution:
                 raise ValueError("Symbolic Jacobian identity requires an executable Jacobian.")
             if state in {"supported", "partially_disabled"}:
                 raise ValueError("Executable symbolic Jacobian state requires a Jacobian callable.")
+        else:
+            if not identity:
+                raise ValueError(
+                    "Executable symbolic Jacobian requires an explicit identity."
+                )
             if state in {"unsupported", "disabled"}:
-                object.__setattr__(self, "jac_sparsity", None)
-        elif state in {"unsupported", "disabled"}:
-            raise ValueError("Unsupported or disabled symbolic Jacobian state cannot carry a callable.")
+                raise ValueError(
+                    "Unsupported or disabled symbolic Jacobian state cannot carry a callable."
+                )
+        jac_sparsity = normalize_jacobian_sparsity(self.jac_sparsity)
+        object.__setattr__(self, "jac_sparsity", jac_sparsity)
         object.__setattr__(self, "identity", identity)
         object.__setattr__(self, "status", status)
 
     @property
     def has_executable_jacobian(self) -> bool:
         return self.jacobian_func is not None
-
-    @classmethod
-    def absent(cls) -> "SymbolicJacobianExecution":
-        return cls()
 
     @classmethod
     def supported(
@@ -82,8 +103,10 @@ class SymbolicJacobianExecution:
         *,
         code: str,
         reason: str,
+        jac_sparsity: Any = None,
     ) -> "SymbolicJacobianExecution":
         return cls(
+            jac_sparsity=jac_sparsity,
             status=symbolic_status_payload(
                 kind="jacobian",
                 state="disabled",
@@ -91,13 +114,6 @@ class SymbolicJacobianExecution:
                 reason=reason,
             )
         )
-
-    @classmethod
-    def from_support_status(cls, status: Mapping[str, Any]) -> "SymbolicJacobianExecution":
-        status_payload = dict(status)
-        if status_payload.get("state") == "supported":
-            raise ValueError("Supported preflight status is not an executable symbolic Jacobian.")
-        return cls(status=status_payload)
 
     @classmethod
     def from_bind_failure(
@@ -114,32 +130,6 @@ class SymbolicJacobianExecution:
             reason=str(exc) or "Symbolic Jacobian binding failed.",
         )
 
-    @classmethod
-    def from_request_fields(
-        cls,
-        *,
-        jacobian_func: Any,
-        jac_sparsity: Any,
-        status: Mapping[str, Any] | None,
-    ) -> "SymbolicJacobianExecution":
-        identity = symbolic_jacobian_identity_payload(jacobian_func)
-        if identity:
-            return cls(
-                jacobian_func=jacobian_func,
-                jac_sparsity=jac_sparsity,
-                identity=identity,
-                status=dict(status or {}) if isinstance(status, Mapping) else None,
-            )
-        status_payload = dict(status or {}) if isinstance(status, Mapping) else None
-        if status_payload and status_payload.get("state") == "supported":
-            status_payload = symbolic_status_payload(
-                kind="jacobian",
-                state="unsupported",
-                code="missing-executable",
-                reason="Symbolic Jacobian status cannot be supported without an executable Jacobian.",
-            )
-        return cls(status=status_payload)
-
     def with_runtime_disabled(
         self,
         *,
@@ -150,7 +140,7 @@ class SymbolicJacobianExecution:
         state = "partially_disabled" if partially and self.has_executable_jacobian else "disabled"
         return SymbolicJacobianExecution(
             jacobian_func=self.jacobian_func if state == "partially_disabled" else None,
-            jac_sparsity=self.jac_sparsity if state == "partially_disabled" else None,
+            jac_sparsity=self.jac_sparsity,
             identity=dict(self.identity or {}) if state == "partially_disabled" and self.identity else None,
             status=symbolic_status_payload(
                 kind="jacobian",
@@ -159,13 +149,6 @@ class SymbolicJacobianExecution:
                 reason=reason,
             ),
         )
-
-    def to_request_kwargs(self) -> dict[str, Any]:
-        return {
-            "jacobian_func": self.jacobian_func,
-            "jac_sparsity": self.jac_sparsity,
-            "symbolic_jacobian_status": dict(self.status) if self.status else None,
-        }
 
     def metadata_kwargs(self) -> dict[str, Any]:
         return {

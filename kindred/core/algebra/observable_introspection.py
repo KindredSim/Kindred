@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
 
@@ -30,7 +29,6 @@ from kindred.core.simulator.parameter_namespace import (
 
 __all__ = [
     "FitLocalObservable",
-    "FitLocalScalar",
     "fit_observable_names",
     "validate_fit_local_observable",
 ]
@@ -39,67 +37,29 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(frozen=True, slots=True)
-class FitLocalScalar:
-    name: str
-    value: float = 1.0
-    minimum: float = float("-inf")
-    maximum: float = float("inf")
-    scope: str = "shared"
-
-    def __post_init__(self) -> None:
-        name = str(self.name or "").strip()
-        value = float(self.value)
-        minimum = float(self.minimum)
-        maximum = float(self.maximum)
-        scope = str(self.scope or "").strip().lower()
-        if not _IDENTIFIER.fullmatch(name):
-            raise ValueError("Fit-local scalar name is not a valid identifier.")
-        if (
-            not math.isfinite(value)
-            or math.isnan(minimum)
-            or math.isnan(maximum)
-            or minimum >= maximum
-            or not minimum <= value <= maximum
-        ):
-            raise ValueError(
-                f"Fit-local scalar {name!r} requires finite value within "
-                "ordered non-NaN bounds."
-            )
-        if scope not in {"shared", "per_dataset"}:
-            raise ValueError(
-                "Fit-local scalar scope must be Shared or Per-dataset."
-            )
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "value", value)
-        object.__setattr__(self, "minimum", minimum)
-        object.__setattr__(self, "maximum", maximum)
-        object.__setattr__(self, "scope", scope)
-
-
-@dataclass(frozen=True, slots=True)
 class FitLocalObservable:
     name: str
     expression: str
-    scalar_parameters: tuple[FitLocalScalar, ...] = ()
+    scalar_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         name = str(self.name or "").strip()
         expression = str(self.expression or "").strip()
-        scalars = tuple(self.scalar_parameters)
+        raw_scalar_names = tuple(self.scalar_names)
+        if any(not isinstance(item, str) for item in raw_scalar_names):
+            raise TypeError("Fit-local observable scalar names must be strings.")
+        scalar_names = tuple(item.strip() for item in raw_scalar_names)
         if not _IDENTIFIER.fullmatch(name):
             raise ValueError("Fit-local observable name is not a valid identifier.")
         if not expression:
             raise ValueError("Fit-local observable expression must be nonblank.")
-        if any(not isinstance(item, FitLocalScalar) for item in scalars):
-            raise TypeError(
-                "Fit-local observable scalars must be FitLocalScalar values."
-            )
-        scalar_names = [item.name for item in scalars]
+        if any(not _IDENTIFIER.fullmatch(item) for item in scalar_names):
+            raise ValueError("Fit-local observable scalar names must be identifiers.")
         if len(scalar_names) != len(set(scalar_names)):
             raise ValueError("Fit-local observable scalar names must be unique.")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "expression", expression)
-        object.__setattr__(self, "scalar_parameters", scalars)
+        object.__setattr__(self, "scalar_names", scalar_names)
 
 
 def _identifiers(expr: ExprNode) -> set[str]:
@@ -152,7 +112,6 @@ def validate_fit_local_observable(
     expression: str,
     prepared_dsl: PreparedDslRequestSet,
     additional_known_observables: tuple[str, ...] = (),
-    unknown_scalar_scope: str = "shared",
 ) -> FitLocalObservable:
     """Validate one local definition without mutating canonical project text."""
     observable_name = str(name or "").strip()
@@ -229,9 +188,6 @@ def validate_fit_local_observable(
             raise ValueError(
                 f"Observable references protected identifier {unknown!r}."
             )
-    scope = str(unknown_scalar_scope or "").strip().lower()
-    if scope not in {"shared", "per_dataset"}:
-        raise ValueError("Unknown scalar scope must be Shared or Per-dataset.")
     canonical = canonicalize_observable_rhs_source(
         expression_source,
         mechanism_namespace=namespace,
@@ -239,8 +195,5 @@ def validate_fit_local_observable(
     return FitLocalObservable(
         observable_name,
         canonical,
-        tuple(
-            FitLocalScalar(name=item, scope=scope)
-            for item in sorted(unknown_identifiers)
-        ),
+        tuple(sorted(unknown_identifiers)),
     )

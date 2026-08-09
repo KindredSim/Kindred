@@ -6,8 +6,9 @@ import math
 import uuid
 from dataclasses import dataclass, field, replace
 from numbers import Real
-from typing import Callable, Iterable, Mapping, Sequence, TypeAlias
+from typing import Callable, Iterable, Mapping, Sequence
 
+from kindred.core.datasets import foundation as dataset_foundation
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.dsl_parse import (
@@ -27,24 +28,23 @@ __all__ = [
     "DatasetLink",
     "DetailedBalanceAdmission",
     "FitDefaults",
-    "FrozenJsonArray",
-    "FrozenJsonObject",
-    "FrozenJsonValue",
     "InitialConditionSet",
     "MechanismSourceCollision",
     "MechanismSourceFailure",
     "MechanismSourceReconciliation",
     "MechanismTabDocument",
-    "ObservationSeries",
     "ProjectDocument",
-    "RawDatasetRecord",
     "SimulationExecutionSettings",
     "TabScientificSettings",
     "default_fit_defaults",
     "default_project_document",
     "default_simulation_execution_settings",
     "default_tab_scientific_settings",
-    "freeze_json_value",
+    "FIT_MAX_NFEV_RANGE",
+    "FIT_SEED_RANGE",
+    "SUPPORTED_FIT_METHODS",
+    "SUPPORTED_SOLVERS",
+    "validate_fit_solver",
     "fresh_mechanism_tab",
     "new_dataset_id",
     "new_project_id",
@@ -55,29 +55,14 @@ __all__ = [
     "canonical_analysis_identity",
     "canonical_initial_values",
     "canonical_species_names",
+    "retained_tab_mechanism_source",
     "reconcile_tab_mechanism_source",
     "resolve_simulation_execution_settings",
-    "thaw_json_value",
-    "validate_raw_observation_id",
+    "validate_fit_defaults",
     "validate_project_document",
     "validate_simulation_execution_settings",
     "validate_tab_scientific_settings",
 ]
-
-JsonScalar: TypeAlias = str | int | float | bool | None
-
-
-@dataclass(frozen=True, slots=True)
-class FrozenJsonArray:
-    items: tuple["FrozenJsonValue", ...]
-
-
-@dataclass(frozen=True, slots=True)
-class FrozenJsonObject:
-    items: tuple[tuple[str, "FrozenJsonValue"], ...]
-
-
-FrozenJsonValue: TypeAlias = JsonScalar | FrozenJsonArray | FrozenJsonObject
 
 _SIMULATION_POINT_RANGE = (10, 100_000)
 _TEMPERATURE_RANGE_K = (0.1, 10_000.0)
@@ -85,10 +70,13 @@ _SOLVERS = ("Radau", "BDF")
 _FITTING_METHODS = ("trf", "dogbox", "differential_evolution")
 _FITTING_MAX_NFEV_RANGE = (10, 10_000)
 _FITTING_SEED_RANGE = (0, 999_999)
-_SCIENTIFIC_VALUE_MAX = 1e300
-_MAX_CANONICAL_DATASETS = 256
-_MAX_PROJECT_SOURCE_BYTES = 256 * 1024 * 1024
-_MAX_PROJECT_RETAINED_OBSERVATION_CELLS = 1_000_000
+
+# Public option policy owned by the canonical project model.  GUI controls
+# project these immutable values; they must not restate or narrow them.
+SUPPORTED_SOLVERS = _SOLVERS
+SUPPORTED_FIT_METHODS = _FITTING_METHODS
+FIT_MAX_NFEV_RANGE = _FITTING_MAX_NFEV_RANGE
+FIT_SEED_RANGE = _FITTING_SEED_RANGE
 
 
 def _new_id(prefix: str) -> str:
@@ -125,19 +113,6 @@ def _require_id(value: object, label: str) -> str:
     if normalized != value:
         raise ValueError(f"{label} must not contain edge whitespace.")
     return normalized
-
-
-def validate_raw_observation_id(
-    value: object,
-    label: str = "raw observation ID",
-) -> str:
-    """Require one already-allocated opaque raw observation identity."""
-
-    if type(value) is not str:
-        raise TypeError(f"{label} must be a str.")
-    if not value or value != value.strip():
-        raise ValueError(f"{label} must be nonblank and edge-normalized.")
-    return value
 
 
 def _require_bool(value: object, label: str) -> bool:
@@ -177,38 +152,29 @@ def _require_finite(
     return parsed
 
 
-def freeze_json_value(value: object) -> FrozenJsonValue:
-    """Normalize a JSON-compatible value into an immutable representation."""
-    if value is None or isinstance(value, (str, bool)):
-        return value
-    if type(value) is int:
-        return int(value)
-    if type(value) is float:
-        return _require_finite(value, "JSON number")
-    if isinstance(value, Mapping):
-        items: list[tuple[str, FrozenJsonValue]] = []
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError("JSON object keys must be strings.")
-            items.append((key, freeze_json_value(item)))
-        items.sort(key=lambda item: item[0])
-        return FrozenJsonObject(tuple(items))
-    if isinstance(value, (list, tuple)):
-        return FrozenJsonArray(tuple(freeze_json_value(item) for item in value))
-    raise TypeError(f"Unsupported JSON value type: {type(value).__name__}.")
+def validate_fit_solver(value: object) -> str:
+    """Validate and return one canonical solver name for Fit execution."""
 
-
-def thaw_json_value(value: FrozenJsonValue) -> object:
-    if isinstance(value, FrozenJsonObject):
-        return {str(key): thaw_json_value(item) for key, item in value.items}
-    if isinstance(value, FrozenJsonArray):
-        return [thaw_json_value(item) for item in value.items]
-    return value
+    try:
+        normalized = normalize_solver_name(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Fit solver must be one of {SUPPORTED_SOLVERS!r}."
+        ) from exc
+    if normalized not in SUPPORTED_SOLVERS:
+        raise ValueError(
+            f"Fit solver must be one of {SUPPORTED_SOLVERS!r}."
+        )
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
 class SimulationExecutionSettings:
-    """Complete per-target execution value shared by Run, Preview, and Fit."""
+    """Complete per-target Run/Preview settings.
+
+    Fit resolves only ``t_start`` at its inclusion boundary and does not carry
+    this Run-owned aggregate.
+    """
 
     solver: str = "BDF"
     t_start: float = 0.0
@@ -223,7 +189,7 @@ class TabScientificSettings:
     temperature: float = 298.15
     rtol: float = 1e-6
     atol: float = 1e-12
-    sparse_jacobian_policy: bool = True
+    analytic_jacobian_policy: bool = True
     wegscheider_policy: bool = True
 
 
@@ -265,29 +231,6 @@ class InitialConditionSet:
                 for species, value in items
             ),
         )
-
-
-@dataclass(frozen=True, slots=True)
-class ObservationSeries:
-    raw_observation_id: str
-    column_name: str
-    t: tuple[float, ...]
-    y: tuple[float, ...]
-    source_rows: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        validate_raw_observation_id(self.raw_observation_id)
-
-
-@dataclass(frozen=True, slots=True)
-class RawDatasetRecord:
-    dataset_id: str
-    display_name: str
-    original_filename: str
-    original_format: str
-    exact_source_bytes: bytes
-    source_metadata: FrozenJsonValue
-    observations: tuple[ObservationSeries, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,9 +486,10 @@ class MechanismTabDocument:
 @dataclass(frozen=True, slots=True)
 class ProjectDocument:
     project_id: str
-    datasets: tuple[RawDatasetRecord, ...]
+    datasets: tuple[dataset_foundation.RawDatasetRecord, ...]
     tabs: tuple[MechanismTabDocument, ...]
     fit_defaults: FitDefaults
+    imported_sources: tuple[dataset_foundation.ImportedSource, ...] = ()
 
     def tab(self, tab_id: str) -> MechanismTabDocument:
         target = str(tab_id)
@@ -554,12 +498,19 @@ class ProjectDocument:
                 return item
         raise KeyError(f"Unknown mechanism tab ID: {target!r}.")
 
-    def dataset(self, dataset_id: str) -> RawDatasetRecord:
+    def dataset(self, dataset_id: str) -> dataset_foundation.RawDatasetRecord:
         target = str(dataset_id)
         for item in self.datasets:
             if item.dataset_id == target:
                 return item
         raise KeyError(f"Unknown dataset ID: {target!r}.")
+
+    def imported_source(self, source_id: str) -> dataset_foundation.ImportedSource:
+        target = str(source_id)
+        for source in self.imported_sources:
+            if source.source_id == target:
+                return source
+        raise KeyError(f"Unknown imported source ID: {target!r}.")
 
     def replace_tab(self, tab: MechanismTabDocument) -> "ProjectDocument":
         if not isinstance(tab, MechanismTabDocument):
@@ -605,22 +556,35 @@ class ProjectDocument:
 
     def add_datasets(
         self,
-        records: tuple[RawDatasetRecord, ...],
+        records: tuple[dataset_foundation.RawDatasetRecord, ...],
+        *,
+        sources: tuple[dataset_foundation.ImportedSource, ...],
     ) -> "ProjectDocument":
         """Prepare one complete dataset batch as one atomic proposal."""
 
         if type(records) is not tuple or any(
-            not isinstance(record, RawDatasetRecord) for record in records
+            not isinstance(record, dataset_foundation.RawDatasetRecord)
+            for record in records
         ):
             raise TypeError(
                 "records must be an exact tuple of RawDatasetRecord values."
             )
-        if not records:
-            return self
-        return replace(self, datasets=(*self.datasets, *records))
+        if type(sources) is not tuple or any(
+            not isinstance(source, dataset_foundation.ImportedSource)
+            for source in sources
+        ):
+            raise TypeError("sources must be an exact tuple of ImportedSource values.")
+        return replace(
+            self,
+            datasets=(*self.datasets, *records),
+            imported_sources=(*self.imported_sources, *sources),
+        )
 
-    def replace_dataset(self, record: RawDatasetRecord) -> "ProjectDocument":
-        if not isinstance(record, RawDatasetRecord):
+    def replace_dataset(
+        self,
+        record: dataset_foundation.RawDatasetRecord,
+    ) -> "ProjectDocument":
+        if not isinstance(record, dataset_foundation.RawDatasetRecord):
             raise TypeError("record must be a RawDatasetRecord.")
         if not any(
             item.dataset_id == record.dataset_id for item in self.datasets
@@ -654,13 +618,21 @@ class ProjectDocument:
         target = str(dataset_id)
         if not any(item.dataset_id == target for item in self.datasets):
             raise KeyError(f"Unknown dataset ID: {target!r}.")
+        datasets = tuple(
+            item
+            for item in self.datasets
+            if item.dataset_id != target
+        )
+        referenced_source_ids = {item.source_id for item in datasets}
+        imported_sources = tuple(
+            source
+            for source in self.imported_sources
+            if source.source_id in referenced_source_ids
+        )
         return replace(
             self,
-            datasets=tuple(
-                item
-                for item in self.datasets
-                if item.dataset_id != target
-            ),
+            datasets=datasets,
+            imported_sources=imported_sources,
             tabs=tuple(tab.without_dataset(target) for tab in self.tabs),
         )
 
@@ -703,6 +675,7 @@ class MechanismSourceCollision:
     """A pure pre-mutation request for exact named-set replacement consent."""
 
     existing_names: tuple[str, ...]
+    replacement: MechanismSourceReconciliation
 
     def __post_init__(self) -> None:
         if (
@@ -715,6 +688,10 @@ class MechanismSourceCollision:
         ):
             raise ValueError(
                 "Mechanism source collision names must be nonempty text."
+            )
+        if not isinstance(self.replacement, MechanismSourceReconciliation):
+            raise TypeError(
+                "Mechanism source collision replacement must be prepared."
             )
 
 
@@ -767,18 +744,18 @@ def default_project_document(
     scientific_settings: TabScientificSettings | None = None,
     fit_defaults: FitDefaults | None = None,
 ) -> ProjectDocument:
-    return validate_project_document(
-        ProjectDocument(
-            project_id=new_project_id(),
-            datasets=(),
-            tabs=(
-                fresh_mechanism_tab(
-                    run_defaults=run_defaults,
-                    scientific_settings=scientific_settings,
-                ),
+    """Construct one default project candidate without admitting it."""
+
+    return ProjectDocument(
+        project_id=new_project_id(),
+        datasets=(),
+        tabs=(
+            fresh_mechanism_tab(
+                run_defaults=run_defaults,
+                scientific_settings=scientific_settings,
             ),
-            fit_defaults=fit_defaults or default_fit_defaults(),
-        )
+        ),
+        fit_defaults=fit_defaults or default_fit_defaults(),
     )
 
 
@@ -827,13 +804,8 @@ def validate_simulation_execution_settings(
 ) -> SimulationExecutionSettings:
     if not isinstance(settings, SimulationExecutionSettings):
         raise TypeError(f"{label} must be SimulationExecutionSettings.")
-    try:
-        normalized_solver = normalize_solver_name(settings.solver)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{label}.solver must be one of {_SOLVERS!r}."
-        ) from exc
-    if normalized_solver != settings.solver or normalized_solver not in _SOLVERS:
+    normalized_solver = validate_fit_solver(settings.solver)
+    if normalized_solver != settings.solver:
         raise ValueError(
             f"{label}.solver must use canonical supported spelling."
         )
@@ -868,18 +840,16 @@ def validate_tab_scientific_settings(
     _require_finite(
         settings.rtol,
         f"{label}.rtol",
-        maximum=_SCIENTIFIC_VALUE_MAX,
         strictly_positive=True,
     )
     _require_finite(
         settings.atol,
         f"{label}.atol",
-        maximum=_SCIENTIFIC_VALUE_MAX,
         strictly_positive=True,
     )
     _require_bool(
-        settings.sparse_jacobian_policy,
-        f"{label}.sparse_jacobian_policy",
+        settings.analytic_jacobian_policy,
+        f"{label}.analytic_jacobian_policy",
     )
     _require_bool(
         settings.wegscheider_policy,
@@ -903,31 +873,33 @@ def resolve_simulation_execution_settings(
     return validate_simulation_execution_settings(settings)
 
 
-def _validate_fit_defaults(defaults: FitDefaults) -> None:
+def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
+    """Validate the narrow Fit-default value without walking a project."""
+
     if not isinstance(defaults, FitDefaults):
         raise TypeError("fit_defaults must be FitDefaults.")
-    if defaults.method not in _FITTING_METHODS:
+    if defaults.method not in SUPPORTED_FIT_METHODS:
         raise ValueError(
-            f"fit_defaults.method must be one of {_FITTING_METHODS!r}."
+            f"fit_defaults.method must be one of {SUPPORTED_FIT_METHODS!r}."
         )
     _require_int(
         defaults.max_nfev,
         "fit_defaults.max_nfev",
-        *_FITTING_MAX_NFEV_RANGE,
+        *FIT_MAX_NFEV_RANGE,
     )
     for field_name in ("ftol", "xtol"):
         _require_finite(
             getattr(defaults, field_name),
             f"fit_defaults.{field_name}",
-            maximum=_SCIENTIFIC_VALUE_MAX,
             strictly_positive=True,
         )
     _require_bool(defaults.use_seed, "fit_defaults.use_seed")
     _require_int(
         defaults.seed,
         "fit_defaults.seed",
-        *_FITTING_SEED_RANGE,
+        *FIT_SEED_RANGE,
     )
+    return defaults
 
 
 def _normalized_dsl_text(text: str) -> str:
@@ -1043,7 +1015,7 @@ def _prepared_dsl_matches_tab(tab: MechanismTabDocument) -> bool:
         tab.mechanism_source.reactions_text
     ):
         return False
-    analysis_temperature = analysis.structure.get("temperature_K")
+    analysis_temperature = analysis.temperature_K
     return (
         type(analysis_temperature) in {int, float}
         and float(analysis_temperature)
@@ -1051,12 +1023,43 @@ def _prepared_dsl_matches_tab(tab: MechanismTabDocument) -> bool:
     )
 
 
+def retained_tab_mechanism_source(
+    document: ProjectDocument,
+    tab_id: str,
+) -> MechanismSourceReconciliation:
+    """Return one action admission from retained accepted mechanism truth.
+
+    This is the no-draft half of the mechanism-dependent admission boundary.
+    It never parses or rewrites source: the canonical tab already owns the
+    exact source and its matching prepared DSL request set.
+    """
+
+    if not isinstance(document, ProjectDocument):
+        raise TypeError("document must be a ProjectDocument.")
+    tab = document.tab(tab_id)
+    if not _prepared_dsl_matches_tab(tab):
+        raise ValueError(
+            f"Mechanism tab {tab.tab_id!r} has no matching retained prepared DSL."
+        )
+    return MechanismSourceReconciliation(
+        proposed_document=document,
+        introduced_species=(),
+        removed_species=(),
+        inline_initial_conditions=DslInitialConditionAdmission(
+            materialized_source=tab.mechanism_source.reactions_text,
+        ),
+        prepared_dsl=tab.prepared_dsl,
+        detailed_balance=_detailed_balance_admission(
+            tab.prepared_dsl,
+            policy_enabled=tab.scientific_settings.wegscheider_policy,
+        ),
+    )
+
+
 def reconcile_tab_mechanism_source(
     document: ProjectDocument,
     tab_id: str,
     visible_source: MechanismAuthoringSource,
-    *,
-    replace_initial_condition_names: Iterable[str] = (),
 ) -> (
     MechanismSourceReconciliation
     | MechanismSourceCollision
@@ -1119,37 +1122,13 @@ def reconcile_tab_mechanism_source(
         existing_by_name = {
             item.name.casefold(): item for item in reconciled_sets
         }
-        authorized_names = {
-            _require_name(
-                name,
-                "authorized initial-condition replacement name",
-            ).casefold()
-            for name in replace_initial_condition_names
-        }
         declared_named = tuple(admission.named_declarations)
         collisions = tuple(
             existing_by_name[declaration.source_name.casefold()].name
             for declaration in declared_named
             if declaration.source_name is not None
             and declaration.source_name.casefold() in existing_by_name
-            and declaration.source_name.casefold() not in authorized_names
         )
-        if collisions:
-            return MechanismSourceCollision(
-                existing_names=tuple(dict.fromkeys(collisions))
-            )
-        unused_authorizations = authorized_names.difference(
-            declaration.source_name.casefold()
-            for declaration in declared_named
-            if declaration.source_name is not None
-            and declaration.source_name.casefold() in existing_by_name
-        )
-        if unused_authorizations:
-            raise ValueError(
-                "Initial-condition replacement authorization does not match "
-                "the current typed admission: "
-                + ", ".join(sorted(unused_authorizations))
-            )
 
         anonymous_declarations = tuple(
             declaration
@@ -1347,7 +1326,7 @@ def reconcile_tab_mechanism_source(
                 for item in document.tabs
             ),
         )
-        return MechanismSourceReconciliation(
+        reconciliation = MechanismSourceReconciliation(
             proposed_document=proposed_document,
             introduced_species=introduced,
             removed_species=removed,
@@ -1359,6 +1338,12 @@ def reconcile_tab_mechanism_source(
             ),
             materialized_set_ids=tuple(dict.fromkeys(materialized_ids)),
         )
+        if collisions:
+            return MechanismSourceCollision(
+                existing_names=tuple(dict.fromkeys(collisions)),
+                replacement=reconciliation,
+            )
+        return reconciliation
     except (DSLError, KeyError, TypeError, ValueError) as exc:
         return MechanismSourceFailure(message=str(exc))
 
@@ -1367,10 +1352,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
     """Validate every canonical value and cross-reference."""
     if not isinstance(document, ProjectDocument):
         raise TypeError("document must be a ProjectDocument.")
-    from kindred.core.dataset_mapping import (
-        validate_fit_inclusion,
-        validate_raw_dataset_record,
-    )
     from kindred.core.datasets.observation_mapping import (
         normalize_observation_mapping,
     )
@@ -1379,32 +1360,30 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
         raise ValueError("A project must contain at least one mechanism tab.")
     if type(document.datasets) is not tuple:
         raise TypeError("Project datasets must be an immutable tuple.")
-    if len(document.datasets) > _MAX_CANONICAL_DATASETS:
-        raise ValueError(
-            "A project cannot contain more than 256 canonical datasets."
-        )
-    _validate_fit_defaults(document.fit_defaults)
+    if type(document.imported_sources) is not tuple or any(
+        not isinstance(source, dataset_foundation.ImportedSource)
+        for source in document.imported_sources
+    ):
+        raise TypeError("Project imported_sources must be an exact ImportedSource tuple.")
+    validate_fit_defaults(document.fit_defaults)
 
-    project_source_bytes = 0
-    project_retained_cells = 0
+    for source in document.imported_sources:
+        dataset_foundation.validate_imported_source(source)
+    _validate_unique(
+        (source.source_id for source in document.imported_sources),
+        "imported source IDs",
+    )
+    referenced_source_ids: set[str] = set()
     for dataset in document.datasets:
-        validate_raw_dataset_record(dataset)
-        project_source_bytes += len(dataset.exact_source_bytes)
-        project_retained_cells += sum(
-            len(series.t) for series in dataset.observations
-        )
-        if project_source_bytes > _MAX_PROJECT_SOURCE_BYTES:
+        dataset_foundation.validate_raw_dataset_record(dataset)
+        referenced_source_ids.add(dataset.source_id)
+        if not any(source.source_id == dataset.source_id for source in document.imported_sources):
             raise ValueError(
-                "Project canonical dataset sources exceed the 256 MiB "
-                "aggregate exact-source limit."
-            )
-        if project_retained_cells > _MAX_PROJECT_RETAINED_OBSERVATION_CELLS:
-            raise ValueError(
-                "Project datasets exceed the 1000000 retained-observation-cell "
-                "limit."
+                f"Dataset {dataset.dataset_id!r} references unknown imported source "
+                f"{dataset.source_id!r}."
             )
         raw_observation_ids = tuple(
-            validate_raw_observation_id(
+            dataset_foundation.validate_raw_observation_id(
                 series.raw_observation_id,
                 (
                     f"Raw dataset {dataset.dataset_id!r} observation "
@@ -1417,14 +1396,18 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
             raw_observation_ids,
             f"raw observation IDs in dataset {dataset.dataset_id!r}",
         )
-        normalized_metadata = freeze_json_value(
-            thaw_json_value(dataset.source_metadata)
+        normalized_metadata = dataset_foundation.freeze_json_value(
+            dataset_foundation.thaw_json_value(dataset.source_metadata)
         )
         if normalized_metadata != dataset.source_metadata:
             raise TypeError(
                 f"Raw dataset {dataset.dataset_id!r} source_metadata must "
                 "be created with freeze_json_value()."
             )
+    source_ids = {source.source_id for source in document.imported_sources}
+    if referenced_source_ids != source_ids:
+        orphaned = tuple(sorted(source_ids - referenced_source_ids))
+        raise ValueError(f"Project contains unreferenced imported sources: {orphaned!r}.")
 
     _validate_unique(
         (_require_id(tab.tab_id, "tab ID") for tab in document.tabs),
@@ -1461,6 +1444,7 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
     mechanism_species_by_tab_id: dict[str, tuple[str, ...]] = {}
     hydrated_tabs: list[MechanismTabDocument] = []
     all_entity_ids = [document.project_id]
+    all_entity_ids.extend(source.source_id for source in document.imported_sources)
     all_entity_ids.extend(tab.tab_id for tab in document.tabs)
     all_entity_ids.extend(
         dataset.dataset_id
@@ -1684,13 +1668,24 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 else f"<missing> (ID {link.set_id!r})"
             )
             try:
-                validate_fit_inclusion(
-                    document=hydrated_document,
-                    tab=tab,
-                    dataset_id=dataset_id,
-                    mechanism_species=mechanism_species_by_tab_id[
-                        tab.tab_id
-                    ],
+                if dataset is None:
+                    raise ValueError(
+                        f"Dataset link references missing dataset ID {dataset_id!r}."
+                    )
+                if initial_set is None:
+                    raise ValueError(
+                        f"Mapped initial-condition set {link.set_id!r} is no longer present."
+                    )
+                resolved_settings = tab.resolved_execution_settings(
+                    initial_set.set_id
+                )
+                dataset_foundation.validate_fit_inclusion(
+                    dataset=dataset,
+                    set_id=initial_set.set_id,
+                    observation_mapping=link.observation_mapping,
+                    initial_values=initial_set.values_dict(),
+                    mechanism_species=mechanism_species_by_tab_id[tab.tab_id],
+                    resolved_t_start=resolved_settings.t_start,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(

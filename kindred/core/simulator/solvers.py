@@ -17,9 +17,7 @@ from typing import (
     Any,
     Callable,
     Dict,
-    List,
     Mapping,
-    Optional,
     Sequence,
     Tuple,
     cast,
@@ -28,11 +26,11 @@ from typing import (
 import numpy as np
 from kindred.core.scipy_integrate import load_scipy_integrate
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
-
 from kindred.core.temperature import (
     TemperatureScheduleDictProtocol,
     TemperatureScheduleProtocol,
     coerce_temperature_schedule,
+    temperature_schedule_execution_identity,
 )
 from kindred.core.exceptions import (
     InitialConditionError,
@@ -41,7 +39,7 @@ from kindred.core.exceptions import (
     TimeGridError,
     create_solver_error,
 )
-from kindred.core.time_grid import build_time_grid
+from kindred.core.time_grid import build_time_grid as _build_time_grid
 from .nonnegative_invariant import (
     NonnegativeProjection,
     project_nonnegative_trajectory,
@@ -55,12 +53,12 @@ from .intervention_schedule_execution import (
     SegmentRunResult,
 )
 from .solver_types import (
-    DEFAULT_SOLVER_NAME,
-    ODERhsNoTemp,
-    ODERhsWithTemp,
-    Rhs2,
-    SimulationOutput,
-    SimulationRequest,
+    ODERhsNoTemp as _ODERhsNoTemp,
+    ODERhsWithTemp as _ODERhsWithTemp,
+    Rhs2 as _Rhs2,
+    SimulationCancellationControl as _SimulationCancellationControl,
+    SimulationOutput as _SimulationOutput,
+    SimulationRequest as _SimulationRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,10 +78,6 @@ def _solve_ivp(*, fun: Callable[[float, np.ndarray], np.ndarray], t_span: Tuple[
 
 
 __all__ = [
-    "SimulationRequest",
-    "SimulationOutput",
-    "DEFAULT_SOLVER_NAME",
-    "build_time_grid",
     "normalize_solver_name",
     "solve_ode",
 ]
@@ -167,7 +161,7 @@ def normalize_solver_name(name: object) -> str:
 
 
 class _TemperatureInjectedRhs:
-    def __init__(self, rhs: ODERhsWithTemp, schedule: TemperatureScheduleProtocol) -> None:
+    def __init__(self, rhs: _ODERhsWithTemp, schedule: TemperatureScheduleProtocol) -> None:
         self._rhs = rhs
         schedule_obj = (
             schedule
@@ -186,7 +180,7 @@ class _TemperatureInjectedRhs:
 class _ProgressRhs:
     def __init__(
         self,
-        rhs: Rhs2,
+        rhs: _Rhs2,
         *,
         callback: Callable[[float, float, float], None],
         t0: float,
@@ -218,12 +212,29 @@ class _ProgressRhs:
         return self._rhs(t, y)
 
 
-def _prepare_time_grid(req: SimulationRequest, *, t0: float, t1: float) -> np.ndarray:
+class _CancellationRhs:
+    """Poll request cancellation immediately before scientific RHS work."""
+
+    def __init__(
+        self,
+        rhs: _Rhs2,
+        control: _SimulationCancellationControl,
+    ) -> None:
+        self._rhs = rhs
+        self._control = control
+
+    def __call__(self, t: float, y: np.ndarray) -> np.ndarray:
+        if self._control.cancel_requested():
+            raise SimulationCancelled()
+        return self._rhs(t, y)
+
+
+def _prepare_time_grid(req: _SimulationRequest, *, t0: float, t1: float) -> np.ndarray:
     if req.t_eval is None:
         if not isinstance(req.grid, Mapping) or not req.grid:
             raise TimeGridError("SimulationRequest.grid is required when t_eval is not provided")
         try:
-            return build_time_grid(t0, t1, req.grid)
+            return _build_time_grid(t0, t1, req.grid)
         except ValueError as exc:
             raise TimeGridError(str(exc)) from exc
     t_eval = np.asarray(req.t_eval, dtype=float).reshape(-1)
@@ -238,25 +249,23 @@ def _prepare_time_grid(req: SimulationRequest, *, t0: float, t1: float) -> np.nd
     return t_eval
 
 
-def _prepare_rhs(req: SimulationRequest, *, t0: float, t1: float) -> Rhs2:
+def _prepare_rhs(req: _SimulationRequest, *, t0: float, t1: float) -> _Rhs2:
     if req.temperature_schedule is None:
-        rhs: Rhs2 = cast(ODERhsNoTemp, req.rhs)
+        rhs: _Rhs2 = cast(_ODERhsNoTemp, req.rhs)
     else:
         rhs = _TemperatureInjectedRhs(
-            cast(ODERhsWithTemp, req.rhs), req.temperature_schedule
+            cast(_ODERhsWithTemp, req.rhs), req.temperature_schedule
         )
 
     if req.progress_callback is not None:
         rhs = _ProgressRhs(rhs, callback=req.progress_callback, t0=t0, t1=t1)
+    if req.cancellation_control is not None:
+        rhs = _CancellationRhs(rhs, req.cancellation_control)
     return rhs
 
 
-def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
-    symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
-        jacobian_func=req.jacobian_func,
-        jac_sparsity=req.jac_sparsity,
-        status=req.symbolic_jacobian_status,
-    )
+def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
+    symbolic_jacobian = req.symbolic_jacobian
     prov: Dict[str, object] = {
         "solver_requested": req.solver,
         "rtol": float(req.rtol),
@@ -268,7 +277,7 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
         "has_temperature_schedule": req.temperature_schedule is not None,
     }
     prov.update(symbolic_jacobian.provenance_fields())
-    prov["jacobian_sparsity_hint"] = req.jac_sparsity is not None
+    prov["jacobian_sparsity_hint"] = symbolic_jacobian.jac_sparsity is not None
     if isinstance(req.symbolic_wegscheider_identity, Mapping) and req.symbolic_wegscheider_identity:
         prov["symbolic_wegscheider_identity"] = dict(req.symbolic_wegscheider_identity)
     intervention_execution = req.intervention_execution
@@ -280,10 +289,14 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
 
     if req.temperature_schedule is not None:
         temperature_schedule = coerce_temperature_schedule(req.temperature_schedule)
-        if isinstance(temperature_schedule, TemperatureScheduleDictProtocol):
-            prov["temperature_schedule"] = dict(temperature_schedule.to_dict())
-        else:
-            prov["temperature_schedule"] = str(temperature_schedule)
+        schedule_identity = temperature_schedule_execution_identity(
+            temperature_schedule
+        )
+        prov["temperature_schedule"] = (
+            dict(schedule_identity)
+            if schedule_identity is not None
+            else str(temperature_schedule)
+        )
 
     return prov
 
@@ -292,16 +305,10 @@ def _scrub_unused_jacobian_provenance(
     prov: Dict[str, object],
     *,
     method: str,
-    req: SimulationRequest,
 ) -> None:
     if str(method) in {"Radau", "BDF"}:
         return
-    disabled_symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
-        jacobian_func=req.jacobian_func,
-        jac_sparsity=req.jac_sparsity,
-        status=req.symbolic_jacobian_status,
-    ).with_runtime_disabled(
-        partially=False,
+    disabled_symbolic_jacobian = SymbolicJacobianExecution.disabled(
         code="non-implicit-solver",
         reason=f"Symbolic Jacobian disabled because solver {method} does not consume Jacobian callables.",
     )
@@ -311,10 +318,16 @@ def _scrub_unused_jacobian_provenance(
 
 def _guard_runtime_symbolic_jacobian(
     jacobian_func: Callable[[float, np.ndarray], np.ndarray],
+    cancellation_control: _SimulationCancellationControl | None,
 ) -> Callable[[float, np.ndarray], np.ndarray]:
     """Reject a non-finite symbolic Jacobian without reclassifying RHS errors."""
 
     def guarded(time: float, state: np.ndarray) -> np.ndarray:
+        if (
+            cancellation_control is not None
+            and cancellation_control.cancel_requested()
+        ):
+            raise SimulationCancelled()
         values = np.asarray(state, dtype=float).reshape(-1)
         try:
             matrix = np.asarray(
@@ -334,33 +347,53 @@ def _guard_runtime_symbolic_jacobian(
 
 
 def _execute_scipy(
-    req: SimulationRequest,
+    req: _SimulationRequest,
     *,
     segment_identity: SegmentIdentity,
-    rhs: Rhs2,
+    rhs: _Rhs2,
     t0: float,
     t1: float,
     y0: np.ndarray,
     t_eval: np.ndarray,
     prov: Dict[str, object],
     method: str,
+    boundary_events: Sequence[Callable[[float, np.ndarray], float]],
+    boundary_terminal_flags: Sequence[bool],
 ) -> SegmentRunResult:
     base_kwargs: Dict[str, Any] = dict(t_eval=t_eval, rtol=float(req.rtol), atol=float(req.atol))
     if req.max_step is not None:
         base_kwargs["max_step"] = float(req.max_step)
     if req.first_step is not None:
         base_kwargs["first_step"] = float(req.first_step)
-    events_list = _event_callables_for_request(req)
-    if events_list is not None:
+    boundary_events = tuple(boundary_events)
+    events_list: list[Callable[[float, np.ndarray], float]] = []
+    for index, event in enumerate(boundary_events):
+        terminal = (
+            bool(boundary_terminal_flags[index])
+            if index < len(boundary_terminal_flags)
+            else bool(getattr(event, "terminal", False))
+        )
+
+        def _wrapped_event(
+            t: float,
+            y: np.ndarray,
+            *,
+            _event=event,
+        ) -> float:
+            return float(_event(t, y))
+
+        _wrapped_event.terminal = terminal  # type: ignore[attr-defined]
+        if hasattr(event, "direction"):
+            _wrapped_event.direction = getattr(event, "direction")  # type: ignore[attr-defined]
+        events_list.append(_wrapped_event)
+    if req.cancellation_control is not None:
+        events_list.append(_cancellation_event(req.cancellation_control))
+    if events_list:
         base_kwargs["events"] = events_list
 
-    symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
-        jacobian_func=req.jacobian_func,
-        jac_sparsity=req.jac_sparsity,
-        status=req.symbolic_jacobian_status,
-    )
-    jac_callable = req.jacobian_func
-    jac_sparsity = req.jac_sparsity
+    symbolic_jacobian = req.symbolic_jacobian
+    jac_callable = symbolic_jacobian.jacobian_func
+    jac_sparsity = symbolic_jacobian.jac_sparsity
 
     def _disable_symbolic_jacobian_for_segment(
         *,
@@ -369,9 +402,8 @@ def _execute_scipy(
     ) -> None:
         nonlocal jac_callable, jac_sparsity
         jac_callable = None
-        jac_sparsity = None
         prov["symbolic_jacobian"] = False
-        prov["jacobian_sparsity_hint"] = False
+        prov["jacobian_sparsity_hint"] = jac_sparsity is not None
         if symbolic_jacobian.has_executable_jacobian:
             runtime_symbolic_jacobian = (
                 symbolic_jacobian.with_runtime_disabled(
@@ -389,7 +421,10 @@ def _execute_scipy(
         and jac_callable is not None
         and symbolic_jacobian.has_executable_jacobian
     ):
-        jac_callable = _guard_runtime_symbolic_jacobian(jac_callable)
+        jac_callable = _guard_runtime_symbolic_jacobian(
+            jac_callable,
+            req.cancellation_control,
+        )
     prov["symbolic_jacobian"] = bool(
         implicit_method and jac_callable is not None
     )
@@ -413,17 +448,11 @@ def _execute_scipy(
     def _looks_like_brentq_sign_error(exc: BaseException) -> bool:
         return "different signs" in str(exc).lower()
 
-    def _cancel_requested_via_event() -> bool:
-        for ev in events_list or []:
-            if not bool(getattr(ev, "_kindred_cancel_event", False)):
-                continue
-            cancelled_cb = getattr(ev, "_kindred_cancelled", None)
-            if callable(cancelled_cb) and bool(cancelled_cb()):
-                return True
-        return False
-
     def _solve_once(method_name: str):
-        if _cancel_requested_via_event():
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
             raise SimulationCancelled()
         try:
             solved = _solve_ivp(
@@ -434,12 +463,17 @@ def _execute_scipy(
             )  # type: ignore[misc]
         except ValueError as exc:
             # SciPy event root-finder can raise on cancellation races (brentq sign error).
-            # If we have an explicit cancellation event and it reports cancellation requested,
-            # translate to a typed cancellation signal.
-            if events_list and _looks_like_brentq_sign_error(exc) and _cancel_requested_via_event():
+            if (
+                _looks_like_brentq_sign_error(exc)
+                and req.cancellation_control is not None
+                and req.cancellation_control.cancel_requested()
+            ):
                 raise SimulationCancelled() from exc
             raise
-        if _cancel_requested_via_event():
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
             raise SimulationCancelled()
         return solved
 
@@ -458,17 +492,12 @@ def _execute_scipy(
             "time": float(exc.time),
             "segment": segment_identity.to_payload(),
         }
-        if _cancel_requested_via_event():
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
             raise SimulationCancelled() from exc
         sol = _solve_once(method)
-
-    if events_list and getattr(sol, "status", 0) == 1 and getattr(sol, "t_events", None):
-        for idx, ev in enumerate(events_list):
-            if not bool(getattr(ev, "_kindred_cancel_event", False)):
-                continue
-            t_events = sol.t_events[idx] if idx < len(sol.t_events) else None
-            if t_events is not None and len(t_events) > 0:
-                raise SimulationCancelled()
 
     if not sol.success:
         prov["solver_failure"] = str(sol.message)
@@ -499,9 +528,11 @@ def _execute_scipy(
     )
     if nonnegative_projection.projected:
         prov["nonnegative_projection"] = nonnegative_projection.to_payload()
-    if hasattr(sol, "t_events") and sol.t_events:
-        prov["events"] = [list(te) for te in sol.t_events]
-    event_count = len(events_list or ())
+    event_count = len(boundary_events)
+    event_times = _normal_event_provenance(
+        getattr(sol, "t_events", None),
+        count=event_count,
+    )
     raw_event_states, event_state_projection = (
         _normal_event_states_with_projection(
             getattr(sol, "y_events", None),
@@ -513,9 +544,12 @@ def _execute_scipy(
         prov["event_state_nonnegative_projection"] = (
             event_state_projection.to_payload()
         )
-    if _cancel_requested_via_event():
+    if (
+        req.cancellation_control is not None
+        and req.cancellation_control.cancel_requested()
+    ):
         raise SimulationCancelled()
-    output = SimulationOutput(
+    output = _SimulationOutput(
         t=t_out,
         Y=Y_out,
         provenance=prov,
@@ -524,10 +558,7 @@ def _execute_scipy(
     return SegmentRunResult(
         identity=segment_identity,
         output=output,
-        event_times=_normal_event_provenance(
-            output.provenance.get("events"),
-            count=event_count,
-        ),
+        event_times=event_times,
         raw_event_states=raw_event_states,
         raw_terminal_state=raw_terminal_state,
         trajectory_projection=nonnegative_projection,
@@ -553,45 +584,22 @@ def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
         t_eval=request.t_eval,
         prov=request.provenance,
         method=request.method,
+        boundary_events=request.boundary_events,
+        boundary_terminal_flags=request.boundary_terminal_flags,
     )
 
 
-def _event_terminal_flags(
-    req: SimulationRequest,
-    events: Sequence[Callable[[float, np.ndarray], float]],
-) -> list[bool]:
-    explicit = [] if req.event_terminal is None else list(req.event_terminal)
-    flags: list[bool] = []
-    for idx, event in enumerate(events):
-        if idx < len(explicit):
-            flags.append(bool(explicit[idx]))
-        else:
-            flags.append(bool(getattr(event, "terminal", False)))
-    return flags
+def _cancellation_event(
+    control: _SimulationCancellationControl,
+) -> Callable[[float, np.ndarray], float]:
+    """Create the solver-owned event used only for secondary early stop."""
 
+    def event(_time: float, _state: np.ndarray) -> float:
+        return -1.0 if control.cancel_requested() else 1.0
 
-def _event_callables_for_request(req: SimulationRequest) -> Optional[List[Callable[[float, np.ndarray], float]]]:
-    if req.events is None:
-        return None
-    raw_events = list(req.events)
-    terminal_flags = _event_terminal_flags(req, raw_events)
-    event_callables: List[Callable[[float, np.ndarray], float]] = []
-    for idx, event in enumerate(raw_events):
-        terminal = bool(terminal_flags[idx]) if idx < len(terminal_flags) else bool(getattr(event, "terminal", False))
-
-        def _wrapped_event(t: float, y: np.ndarray, _event=event) -> float:
-            return float(_event(t, y))
-
-        _wrapped_event.terminal = terminal  # type: ignore[attr-defined]
-        if hasattr(event, "direction"):
-            _wrapped_event.direction = getattr(event, "direction")  # type: ignore[attr-defined]
-        if bool(getattr(event, "_kindred_cancel_event", False)):
-            _wrapped_event._kindred_cancel_event = True  # type: ignore[attr-defined]
-            cancelled_cb = getattr(event, "_kindred_cancelled", None)
-            if callable(cancelled_cb):
-                _wrapped_event._kindred_cancelled = cancelled_cb  # type: ignore[attr-defined]
-        event_callables.append(_wrapped_event)
-    return event_callables
+    event.terminal = True  # type: ignore[attr-defined]
+    event.direction = -1.0  # type: ignore[attr-defined]
+    return event
 
 
 def _normal_event_provenance(
@@ -611,9 +619,14 @@ def _normal_event_provenance(
             continue
     return out
 
-def solve_ode(req: SimulationRequest) -> SimulationOutput:
-    if not isinstance(req, SimulationRequest):
+def solve_ode(req: _SimulationRequest) -> _SimulationOutput:
+    if not isinstance(req, _SimulationRequest):
         raise TypeError(f"solve_ode expects SimulationRequest, got {type(req)!r}")
+    if (
+        req.cancellation_control is not None
+        and req.cancellation_control.cancel_requested()
+    ):
+        raise SimulationCancelled()
     if req.temperature_schedule is not None:
         schedule = (
             req.temperature_schedule
@@ -635,7 +648,7 @@ def solve_ode(req: SimulationRequest) -> SimulationOutput:
     prov = _build_provenance(req, t_eval=t_eval)
 
     method = _scipy_method_for(req.solver)
-    _scrub_unused_jacobian_provenance(prov, method=method, req=req)
+    _scrub_unused_jacobian_provenance(prov, method=method)
     return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
         ScheduleExecutionRequest(
             request=req,

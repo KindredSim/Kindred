@@ -47,7 +47,6 @@ class TemplateEditorDialog(QtWidgets.QDialog):
             Complete mechanism source for new templates.
         """
         super().__init__(parent)
-        self._template = template
         self._is_edit_mode = template is not None
         normalized_operation = str(operation or "").strip().casefold()
         if normalized_operation not in {"create", "update"}:

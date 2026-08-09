@@ -1,23 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
-
 from .backend import SymbolicBackendMetadata
-from .errors import UnsupportedSymbolicExpressionError
-from .identity import normalize_symbolic_identity_mapping, symbolic_fingerprint
-
-
-SYMBOLIC_JACOBIAN_IDENTITY_ATTR = "_kindred_symbolic_jacobian_identity"
-
-
-def symbolic_jacobian_identity_payload(value: object) -> dict[str, Any] | None:
-    payload = getattr(value, SYMBOLIC_JACOBIAN_IDENTITY_ATTR, None)
-    if payload is None:
-        return None
-    if not isinstance(payload, Mapping):
-        raise UnsupportedSymbolicExpressionError("Symbolic Jacobian identity payload must be a JSON-safe mapping.")
-    return normalize_symbolic_identity_mapping(payload, label="Symbolic Jacobian identity payload")
+from .identity import symbolic_fingerprint
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,32 +17,6 @@ class SymbolicArtifactIdentity:
     structure_fingerprint: str = ""
     evaluation_snapshot_fingerprint: str = ""
     parameter_symbols: tuple[str, ...] = ()
-
-    @classmethod
-    def none(cls, metadata: SymbolicBackendMetadata) -> "SymbolicArtifactIdentity":
-        payload = {
-            "kind": "none",
-            "backend_name": metadata.backend_name,
-            "backend_version": metadata.backend_version,
-            "profile_version": metadata.profile_version,
-            "source_fingerprint": "",
-            "artifact_fingerprint": "",
-            "structure_fingerprint": "",
-            "evaluation_snapshot_fingerprint": "",
-            "parameter_symbols": [],
-        }
-        return cls(
-            kind="none",
-            backend_name=metadata.backend_name,
-            backend_version=metadata.backend_version,
-            profile_version=metadata.profile_version,
-            source_fingerprint="",
-            artifact_fingerprint="",
-            structure_fingerprint="",
-            evaluation_snapshot_fingerprint="",
-            parameter_symbols=(),
-            fingerprint=symbolic_fingerprint(payload),
-        )
 
     @classmethod
     def jacobian(

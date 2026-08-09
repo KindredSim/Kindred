@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import itertools
-import logging
 import math
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -13,25 +12,14 @@ from kindred.core.datasets.observation_payload import (
     immutable_dataset_payload,
     new_raw_observation_id,
 )
-
-logger = logging.getLogger(__name__)
+from kindred.core.datasets.source_rules import PhysicalColumn
 
 __all__ = [
     "CsvImportInterrupted",
-    "PhysicalColumn",
+    "PhysicalRow",
     "UncachedFormulaCell",
-    "identify_physical_columns",
     "parse_physical_rows",
-    "validate_tabular_source_bytes",
 ]
-
-_ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-_OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
-_MAX_SOURCE_BYTES = 32 * 1024 * 1024
-_MAX_PHYSICAL_ROWS = 100_000
-_MAX_PHYSICAL_COLUMNS = 256
-_MAX_RETAINED_OBSERVATION_CELLS = 1_000_000
-
 
 class CsvImportInterrupted(Exception):
     """Raised internally to unwind when an import is interrupted."""
@@ -55,116 +43,26 @@ class UncachedFormulaCell:
         return self.formula
 
 
-def validate_tabular_source_bytes(
-    source_bytes: bytes,
-    *,
-    source_format: str,
-    source_label: str,
-) -> None:
-    """Admit exact nonempty bytes for one current CSV or XLSX source."""
-
-    if type(source_bytes) is not bytes:
-        raise TypeError("Dataset source content must be exact bytes.")
-    label = str(source_label).strip() or "<dataset>"
-    if not source_bytes:
-        raise ValueError(f"Dataset source {label!r} is empty.")
-    if len(source_bytes) > _MAX_SOURCE_BYTES:
-        raise ValueError(
-            f"File {label!r} exceeds the 32 MiB supported-size limit."
-        )
-    signature = source_bytes[:8]
-    if source_format == "xlsx":
-        if not signature.startswith(_ZIP_SIGNATURES):
-            raise ValueError(
-                f"File {label!r} has an .xlsx extension but is not an XLSX "
-                "workbook."
-            )
-        return
-    if source_format != "csv":
-        raise ValueError(
-            f"Unsupported exact dataset source format {source_format!r}."
-        )
-    if signature.startswith(_ZIP_SIGNATURES) or signature.startswith(
-        _OLE_SIGNATURE
-    ):
-        raise ValueError(
-            f"File {label!r} has a .csv extension but contains a workbook or "
-            "other binary container."
-        )
-    if b"\x00" in source_bytes:
-        raise ValueError(
-            f"File {label!r} is binary data, not a UTF-8 CSV source."
-        )
-    try:
-        source_bytes.decode("utf-8-sig", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"File {label!r} is not a valid UTF-8 CSV source."
-        ) from exc
-
-
 @dataclass(frozen=True, slots=True)
-class PhysicalColumn:
-    """One source-position identity with its stable assigned observation name."""
+class PhysicalRow:
+    """One parsed logical row with its exact physical source-row start."""
 
-    source_index: int
-    authored_name: str
-    assigned_name: str
+    source_row: int
+    values: Mapping[PhysicalColumn, object]
 
     def __post_init__(self) -> None:
-        if type(self.source_index) is not int or self.source_index < 0:
-            raise ValueError("Physical column source_index must be nonnegative.")
-        authored = str(self.authored_name).strip()
-        assigned = str(self.assigned_name).strip()
-        if not authored or not assigned:
-            raise ValueError("Physical column names must be nonblank.")
-        object.__setattr__(self, "authored_name", authored)
-        object.__setattr__(self, "assigned_name", assigned)
-
-
-def identify_physical_columns(
-    headers: Sequence[object],
-) -> tuple[PhysicalColumn, ...]:
-    """Assign exact-case collision-safe names before any row mapping exists."""
-    authored = tuple(str(value).strip() for value in headers)
-    if not authored:
-        raise ValueError("The source has no columns.")
-    if any(not name for name in authored):
-        raise ValueError("Source column names must be nonblank after trimming.")
-    reserved = set(authored)
-    assigned: set[str] = set()
-    occurrences: dict[str, int] = {}
-    columns: list[PhysicalColumn] = []
-    for source_index, name in enumerate(authored):
-        occurrence = occurrences.get(name, 0)
-        if occurrence == 0 and name not in assigned:
-            candidate = name
-        else:
-            suffix = occurrence
-            while True:
-                candidate = f"{name}_copy_{suffix}"
-                if candidate not in reserved and candidate not in assigned:
-                    break
-                suffix += 1
-            occurrences[name] = suffix
-        occurrences[name] = occurrences.get(name, 0) + 1
-        assigned.add(candidate)
-        columns.append(
-            PhysicalColumn(
-                source_index=source_index,
-                authored_name=name,
-                assigned_name=candidate,
-            )
-        )
-    return tuple(columns)
+        if type(self.source_row) is not int or self.source_row <= 0:
+            raise ValueError("Physical row source_row must be a positive integer.")
+        if not isinstance(self.values, Mapping):
+            raise TypeError("Physical row values must be a column mapping.")
 
 
 def parse_physical_rows(
-    rows: Iterable[Mapping[PhysicalColumn, object]],
+    rows: Iterable[Mapping[PhysicalColumn, object] | PhysicalRow],
     *,
     columns: Sequence[PhysicalColumn],
-    time_column: PhysicalColumn | None = None,
-    species_columns: Sequence[PhysicalColumn] | None = None,
+    time_column: PhysicalColumn,
+    species_columns: Sequence[PhysicalColumn],
     interruption_checker: Callable[[], bool] | None = None,
     source_label: str | None = None,
     sheet_name: str | None = None,
@@ -172,15 +70,11 @@ def parse_physical_rows(
     time_factor: float = 1.0,
     observation_factors: Mapping[str, float] | None = None,
     metadata_extras: Mapping[str, object] | None = None,
-) -> tuple[PhysicalColumn, DatasetObservationPayload]:
+) -> DatasetObservationPayload:
     """Convert physical source rows without ever keying by authored headers."""
     physical_columns = tuple(columns)
     if not physical_columns:
         raise ValueError("The source has no columns.")
-    if len(physical_columns) > _MAX_PHYSICAL_COLUMNS:
-        raise ValueError(
-            "The source exceeds the 256 physical-column supported-size limit."
-        )
     if len({column.source_index for column in physical_columns}) != len(
         physical_columns
     ):
@@ -195,53 +89,38 @@ def parse_physical_rows(
             raise CsvImportInterrupted()
 
     row_iter = iter(rows)
-    first = next(row_iter, None)
-    if first is None:
+    first_item = next(row_iter, None)
+    if first_item is None:
         raise ValueError("The source contains no data rows.")
-
-    explicit_mapping = time_column is not None or species_columns is not None
-    explicit_species_mapping = species_columns is not None
-    if time_column is not None:
-        if time_column not in physical_columns:
-            raise ValueError("The selected time column is absent from the source.")
-        resolved_time = time_column
-    else:
-        resolved_time = next(
-            (
-                column
-                for candidate in ("time", "time_s", "t", "Time", "T", "x")
-                for column in physical_columns
-                if column.assigned_name == candidate
-            ),
-            None,
-        )
-        if resolved_time is None:
-            raise ValueError(
-                "Time column not found. Select one of time, time_s, t, Time, T, or x."
-            )
-
-    if species_columns is None:
-        resolved_species = tuple(
-            column for column in physical_columns if column != resolved_time
-        )
-    else:
-        resolved_species = tuple(species_columns)
-        if not resolved_species:
-            raise ValueError("Select at least one observation column.")
-        if len(set(resolved_species)) != len(resolved_species):
-            raise ValueError("Selected observation columns must be unique.")
-        if any(column not in physical_columns for column in resolved_species):
-            raise ValueError(
-                "A selected observation column is absent from the source."
-            )
-        if resolved_time in resolved_species:
-            raise ValueError(
-                "The time column cannot also be an observation column."
-            )
-
     first_source_row = int(source_row_start)
     if first_source_row <= 0:
         raise ValueError("source_row_start must be a positive physical row number.")
+
+    def _row_values_and_source_row(
+        item: Mapping[PhysicalColumn, object] | PhysicalRow,
+        logical_index: int,
+    ) -> tuple[Mapping[PhysicalColumn, object], int]:
+        if isinstance(item, PhysicalRow):
+            return item.values, item.source_row
+        return item, first_source_row + logical_index
+
+    first, first_row_source = _row_values_and_source_row(first_item, 0)
+
+    if not isinstance(time_column, PhysicalColumn):
+        raise TypeError("An exact admitted PhysicalColumn time column is required.")
+    if time_column not in physical_columns:
+        raise ValueError("The admitted time column is absent from the source.")
+    resolved_time = time_column
+    resolved_species = tuple(species_columns)
+    if not resolved_species:
+        raise ValueError("At least one exact admitted observation column is required.")
+    if len(set(resolved_species)) != len(resolved_species):
+        raise ValueError("Admitted observation columns must be unique.")
+    if any(column not in physical_columns for column in resolved_species):
+        raise ValueError("An admitted observation column is absent from the source.")
+    if resolved_time in resolved_species:
+        raise ValueError("The admitted time column cannot also be an observation column.")
+
     resolved_time_factor = float(time_factor)
     if (
         isinstance(time_factor, bool)
@@ -277,8 +156,6 @@ def parse_physical_rows(
         for column in resolved_species
     }
     saw_nonempty_row = False
-    retained_cells = 0
-
     def _cell(row: Mapping[PhysicalColumn, object], column: PhysicalColumn) -> str:
         value = row.get(column, "")
         if isinstance(value, UncachedFormulaCell):
@@ -296,15 +173,14 @@ def parse_physical_rows(
             parts.append(f"sheet {str(sheet_name).strip()!r}")
         return "" if not parts else ", ".join(parts) + ", "
 
-    for row_index, row in enumerate(
-        itertools.chain((first,), row_iter),
-        start=first_source_row,
-    ):
-        if row_index - first_source_row + 1 > _MAX_PHYSICAL_ROWS:
-            raise ValueError(
-                "The source exceeds the 100000 physical-row supported-size "
-                "limit."
-            )
+    row_items = itertools.chain((first,), row_iter)
+    for logical_index, row_item in enumerate(row_items):
+        if logical_index == 0:
+            row, row_index = first, first_row_source
+        else:
+            row, row_index = _row_values_and_source_row(row_item, logical_index)
+        if row_index <= 0:
+            raise ValueError("Physical source rows must be positive.")
         _raise_if_interrupted()
         raw_values = tuple(row.get(column, "") for column in physical_columns)
         if not any(
@@ -344,29 +220,15 @@ def parse_physical_rows(
                     * resolved_observation_factors[column.assigned_name]
                 )
             except (TypeError, ValueError) as exc:
-                if explicit_species_mapping:
-                    raise ValueError(
-                        f"{_source_prefix()}row {row_index}, column "
-                        f"{column.assigned_name!r}: invalid numeric observation "
-                        f"{raw_value!r}."
-                    ) from exc
-                logger.debug(
-                    "Skipping nonnumeric observation in physical column %d.",
-                    column.source_index,
-                )
-                continue
-            if not math.isfinite(parsed_value):
-                if explicit_species_mapping:
-                    raise ValueError(
-                        f"{_source_prefix()}row {row_index}, column "
-                        f"{column.assigned_name!r}: observation must be finite."
-                    )
-                continue
-            retained_cells += 1
-            if retained_cells > _MAX_RETAINED_OBSERVATION_CELLS:
                 raise ValueError(
-                    "The import exceeds the 1000000 retained-observation-cell "
-                    "limit."
+                    f"{_source_prefix()}row {row_index}, column "
+                    f"{column.assigned_name!r}: invalid numeric observation "
+                    f"{raw_value!r}."
+                ) from exc
+            if not math.isfinite(parsed_value):
+                raise ValueError(
+                    f"{_source_prefix()}row {row_index}, column "
+                    f"{column.assigned_name!r}: observation must be finite."
                 )
             spec = observations_by_column[column]
             spec["t"].append(parsed_time)
@@ -406,7 +268,7 @@ def parse_physical_rows(
             }
             for column in physical_columns
         ],
-        "mapping_source": "explicit" if explicit_mapping else "auto",
+        "mapping_source": "explicit",
     }
     if sheet_name is not None and str(sheet_name).strip():
         metadata["sheet_name"] = str(sheet_name)
@@ -418,7 +280,4 @@ def parse_physical_rows(
             + ", ".join(sorted(collisions))
         )
     metadata.update(extras)
-    return (
-        resolved_time,
-        immutable_dataset_payload(observations, metadata=metadata),
-    )
+    return immutable_dataset_payload(observations, metadata=metadata)

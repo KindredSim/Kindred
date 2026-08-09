@@ -11,6 +11,5 @@ preset_set1 = {
 }
 
 # Algebra
-let kcat = 1.0
-let v    = kcat * [ES]
-let Et   = [E]_0 + [ES]
+let v    = k2 * [ES]
+let Et   = [E] + [ES]

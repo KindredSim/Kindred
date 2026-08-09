@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
+
+from kindred.gui.symbolic_calculator_owner import SymbolicCalculatorViewState
 
 
 class SymbolicCalculatorPanel(QtWidgets.QWidget):
     def __init__(
         self,
         *,
-        on_evaluate: Callable[[str], Any],
+        on_evaluate: Callable[[str], SymbolicCalculatorViewState],
         on_copy_result: Callable[[], str],
         on_copy_context: Callable[[], str],
         parent: QtWidgets.QWidget | None = None,
@@ -21,7 +23,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._on_copy_context = on_copy_context
         self._latest_query = ""
         self._latest_result_text = ""
-        self._latest_context_text = ""
         self._latest_is_error = False
         self._history_count = 0
 
@@ -82,7 +83,12 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         examples.setWordWrap(True)
         layout.addWidget(examples)
 
-        self.set_available(False, "Canonical mechanism unavailable.")
+        self.render_state(
+            SymbolicCalculatorViewState(
+                available=False,
+                reason="Canonical mechanism unavailable.",
+            )
+        )
 
     def set_query_text(self, text: str) -> None:
         self._query_edit.setText(str(text or ""))
@@ -96,34 +102,39 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
     def inputs_enabled(self) -> bool:
         return bool(self._query_edit.isEnabled() and self._evaluate_button.isEnabled())
 
-    def set_available(self, available: bool, reason: str = "") -> None:
-        enabled = bool(available)
-        self._query_edit.setEnabled(enabled)
-        self._evaluate_button.setEnabled(enabled)
-        has_result = bool(self._history_count)
-        self._copy_result_button.setEnabled(enabled and has_result)
-        self._copy_context_button.setEnabled(enabled and has_result)
-        self._status_label.setText("" if enabled else str(reason or "Symbolic calculator unavailable."))
-
-    def render_state(self, state: Any) -> None:
-        available = bool(getattr(state, "available", False))
-        self._latest_query = str(getattr(state, "latest_query", "") or "")
-        self._latest_result_text = str(getattr(state, "latest_result_text", "") or "")
-        self._latest_context_text = str(getattr(state, "latest_context_text", "") or "")
-        self._latest_is_error = bool(getattr(state, "latest_is_error", False))
-        self._history_count = int(getattr(state, "history_count", 0) or 0)
+    def render_state(self, state: SymbolicCalculatorViewState) -> None:
+        if not isinstance(state, SymbolicCalculatorViewState):
+            self._render_unavailable_after_invalid_state()
+            raise TypeError("state must be SymbolicCalculatorViewState.")
+        available = state.available
+        self._latest_query = state.latest_query
+        self._latest_result_text = state.latest_result_text
+        self._latest_is_error = state.latest_is_error
+        self._history_count = state.history_count
         self._query_edit.setEnabled(available)
         self._evaluate_button.setEnabled(available)
-        self._copy_result_button.setEnabled(bool(getattr(state, "can_copy_result", False)))
-        self._copy_context_button.setEnabled(bool(getattr(state, "can_copy_context", False)))
-        reason = str(getattr(state, "reason", "") or "Symbolic calculator unavailable.")
+        self._copy_result_button.setEnabled(state.can_copy_result)
+        self._copy_context_button.setEnabled(state.can_copy_context)
+        reason = state.reason
         self._status_label.setText("" if available else reason)
         if self._latest_result_text:
             prefix = "Error" if self._latest_is_error else "Result"
-            query = self._latest_query or str(self._query_edit.text() or "").strip()
+            query = self._latest_query
             self._result_view.setPlainText(f"{query}\n{prefix}: {self._latest_result_text}")
         else:
             self._result_view.clear()
+
+    def _render_unavailable_after_invalid_state(self) -> None:
+        self._latest_query = ""
+        self._latest_result_text = ""
+        self._latest_is_error = False
+        self._history_count = 0
+        self._query_edit.setEnabled(False)
+        self._evaluate_button.setEnabled(False)
+        self._copy_result_button.setEnabled(False)
+        self._copy_context_button.setEnabled(False)
+        self._status_label.setText("Symbolic calculator unavailable.")
+        self._result_view.clear()
 
     @QtCore.Slot()
     def evaluate_current_query(self) -> None:

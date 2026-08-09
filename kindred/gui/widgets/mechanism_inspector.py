@@ -10,10 +10,12 @@ from PySide6 import QtWidgets
 
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
-    compile_intervention_schedule,
 )
-from kindred.core.intervention_schedule import InterventionScheduleError, intervention_schedule_parameter_names
-from kindred.core.mechanism_metadata import MechanismMetadataKeys
+from kindred.core.intervention_schedule import (
+    InterventionSchedule,
+    intervention_schedule_parameter_names,
+)
+from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
@@ -43,10 +45,30 @@ def build_mechanism_inspector_sections(
         mechanism=mechanism,
         require_mutable=False,
     )
+    parameterized_schedule = prepared_dsl.parameterized_intervention_schedule_for_binding()
+    intervention_execution = prepared_dsl.intervention_execution_contract()
     return MechanismInspectorSections(
-        steps_text=_safe_format_section("steps", lambda: _format_steps(mechanism)),
-        equations_text=_safe_format_section("equations", lambda: _format_equations(mechanism)),
-        interventions_text=_safe_format_section("interventions", lambda: _format_interventions(mechanism)),
+        steps_text=_safe_format_section(
+            "steps",
+            lambda: _format_steps_from_authority(mechanism),
+        ),
+        equations_text=_safe_format_section(
+            "equations",
+            lambda: _format_equations(
+                mechanism,
+                has_interventions=(
+                    parameterized_schedule is not None
+                    or bool(intervention_execution and intervention_execution.declarative_payload.get("operations"))
+                ),
+            ),
+        ),
+        interventions_text=_safe_format_section(
+            "interventions",
+            lambda: _format_interventions(
+                parameterized_schedule=parameterized_schedule,
+                intervention_execution=intervention_execution,
+            ),
+        ),
     )
 
 
@@ -57,7 +79,19 @@ def _safe_format_section(label: str, formatter: Callable[[], str]) -> str:
         return f"Unable to inspect {label}:\n{exc}"
 
 
-def _format_steps(mechanism: object) -> str:
+def _format_steps_from_authority(mechanism: object) -> str:
+    coefficient_authority = build_effective_rate_coefficient_evaluator(mechanism)
+    return _format_steps(
+        mechanism,
+        authority_snapshot=coefficient_authority.authority_snapshot,
+    )
+
+
+def _format_steps(
+    mechanism: object,
+    *,
+    authority_snapshot: tuple[Mapping[str, object], ...],
+) -> str:
     entries = get_step_index_map(mechanism)
     parameter_names_by_step_index: dict[int, list[str]] = {}
     for param_name, entry, _role in iter_canonical_parameters(mechanism):
@@ -76,17 +110,51 @@ def _format_steps(mechanism: object) -> str:
             authority = entry.get("equilibrium_authority")
             if authority:
                 lines.append(f"  Equilibrium authority: {json.dumps(authority, sort_keys=True)}")
+            rate_authority = _rate_authority_for_step(
+                mechanism,
+                entry,
+                authority_snapshot,
+            )
+            if rate_authority is not None:
+                lines.append(
+                    "  Effective-rate authority: "
+                    + json.dumps(
+                        _plain_json_value(rate_authority),
+                        sort_keys=True,
+                    )
+                )
     else:
         lines.append("No indexed DSL reaction or equilibrium steps.")
 
     return "\n".join(lines)
 
 
-def _format_equations(mechanism: object) -> str:
+def _rate_authority_for_step(
+    mechanism: object,
+    entry: Mapping[str, object],
+    authority_snapshot: tuple[Mapping[str, object], ...],
+) -> Mapping[str, object] | None:
+    """Select the evaluator-owned snapshot for one indexed mechanism step."""
+    kind = str(entry.get("kind") or "")
+    try:
+        if kind == "reaction":
+            index = int(entry["reaction_index"])
+        elif kind == "equilibrium":
+            index = len(tuple(getattr(mechanism, "reactions", ()) or ())) + int(
+                entry["equilibrium_index"]
+            )
+        else:
+            return None
+        snapshot = authority_snapshot[index]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return snapshot if isinstance(snapshot, Mapping) else None
+
+
+def _format_equations(mechanism: object, *, has_interventions: bool) -> str:
     structure = build_symbolic_jacobian_structure(mechanism)
-    schedule = getattr(mechanism, "metadata", {}).get(MechanismMetadataKeys.INTERVENTION_SCHEDULE)
     lines = ["Canonical symbolic RHS equations:"]
-    if schedule is not None:
+    if has_interventions:
         lines.append("Note: intervention schedules are compiled execution inputs; equations here are the base unscheduled mechanism RHS.")
         lines.append("")
     for species_name, rhs_expression in zip(
@@ -108,41 +176,27 @@ def _format_equations(mechanism: object) -> str:
     return "\n".join(lines)
 
 
-def _format_interventions(mechanism: object) -> str:
-    schedule = getattr(mechanism, "metadata", {}).get(MechanismMetadataKeys.INTERVENTION_SCHEDULE)
-    if schedule is None:
-        return "No intervention schedule."
-
-    if schedule.is_parameterized:
-        parameter_names = sorted(intervention_schedule_parameter_names(schedule))
+def _format_interventions(
+    *,
+    parameterized_schedule: InterventionSchedule | None,
+    intervention_execution: InterventionExecutionContract | None,
+) -> str:
+    if parameterized_schedule is not None:
+        parameter_names = sorted(intervention_schedule_parameter_names(parameterized_schedule))
         lines = [
             "Declarative schedule payload:",
-            json.dumps(schedule.to_payload(), indent=2, sort_keys=True),
+            json.dumps(parameterized_schedule.to_payload(), indent=2, sort_keys=True),
             "",
-            f"Declarative schedule fingerprint: {schedule.fingerprint or 'none'}",
+            f"Declarative schedule fingerprint: {parameterized_schedule.fingerprint or 'none'}",
             "",
             "Typed executable schedule is unavailable until schedule parameters are resolved.",
         ]
         if parameter_names:
             lines.append(f"Schedule parameters: {', '.join(parameter_names)}")
         return "\n".join(lines)
-
-    try:
-        compiled = compile_intervention_schedule(schedule)
-    except InterventionScheduleError as exc:
-        return "\n".join(
-            [
-                "Declarative schedule payload:",
-                json.dumps(schedule.to_payload(), indent=2, sort_keys=True),
-                "",
-                f"Declarative schedule fingerprint: {schedule.fingerprint or 'none'}",
-                "",
-                "Typed executable schedule is unavailable:",
-                str(exc),
-            ]
-        )
-
-    return _format_intervention_execution(compiled)
+    if intervention_execution is None:
+        return "No intervention schedule."
+    return _format_intervention_execution(intervention_execution)
 
 
 def _format_intervention_execution(
