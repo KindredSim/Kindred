@@ -23,6 +23,21 @@ from kindred.core.exceptions import (
     SimulationCancelled,
     SolverError,
 )
+from kindred.core.algebra.errors import (
+    AlgebraDomainError,
+    AlgebraTypeError,
+    AlgebraZeroDivError,
+)
+from kindred.core.algebra.parser import (
+    BinaryNode,
+    CallNode,
+    ExprNode,
+    IdentNode,
+    UnaryNode,
+)
+from kindred.core.algebra.simulation_series import (
+    compiled_algebra_for_mechanism,
+)
 from kindred.core.runtime_defaults import (
     USE_ANALYTIC_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
@@ -158,8 +173,10 @@ def _candidate_domain_error(
     *,
     stage: str,
     failed_params: Optional[Dict[str, float]],
+    extra_details: Mapping[str, object] | None = None,
 ) -> FitSimulationError:
     details = dict(getattr(exc, "details", None) or {})
+    details.update(dict(extra_details or {}))
     details.update(
         {
             "fatal": False,
@@ -181,8 +198,10 @@ def _fatal_evaluation_error(
     message: str,
     stage: str,
     failed_params: Optional[Dict[str, float]],
+    extra_details: Mapping[str, object] | None = None,
 ) -> FitSimulationError:
     details = dict(getattr(exc, "details", None) or {})
+    details.update(dict(extra_details or {}))
     details.update(
         {
             "fatal": True,
@@ -196,6 +215,92 @@ def _fatal_evaluation_error(
         details=details,
         context=getattr(exc, "context", None),
     )
+
+
+def _algebra_identifier_dependencies(expr: ExprNode) -> frozenset[str]:
+    if isinstance(expr, IdentNode):
+        return frozenset((str(expr.name),))
+    if isinstance(expr, UnaryNode):
+        return _algebra_identifier_dependencies(expr.rhs)
+    if isinstance(expr, BinaryNode):
+        return (
+            _algebra_identifier_dependencies(expr.lhs)
+            | _algebra_identifier_dependencies(expr.rhs)
+        )
+    if isinstance(expr, CallNode):
+        dependencies: set[str] = set()
+        for argument in expr.args:
+            dependencies.update(_algebra_identifier_dependencies(argument))
+        return frozenset(dependencies)
+    return frozenset()
+
+
+def _strict_algebra_failure_evidence(
+    exc: BaseException,
+    *,
+    mechanism: object,
+    optimizer_authority_names: frozenset[str],
+) -> Mapping[str, object] | None:
+    """Return exact evidence only for candidate-sensitive strict failures."""
+
+    candidate_sensitive_type = isinstance(
+        exc,
+        (AlgebraZeroDivError, AlgebraDomainError),
+    ) or (
+        isinstance(exc, AlgebraTypeError)
+        and str(getattr(exc, "msg", "")).startswith("non-finite")
+    )
+    if not candidate_sensitive_type:
+        return None
+    compiled = compiled_algebra_for_mechanism(mechanism)
+    if compiled is None:
+        return None
+    line = getattr(exc, "line", None)
+    line_text = str(getattr(exc, "line_text", "") or "")
+    matching = tuple(
+        statement
+        for statement in compiled.block.lines
+        if int(statement.line) == int(line or -1)
+        and (
+            not line_text
+            or str(statement.line_text or "").strip() == line_text.strip()
+        )
+    )
+    if len(matching) != 1:
+        return None
+    statement = matching[0]
+    statements_by_name = {
+        str(item.name): item for item in compiled.block.lines
+    }
+    dependencies = set(_algebra_identifier_dependencies(statement.expr))
+    pending = list(dependencies)
+    while pending:
+        dependency = pending.pop()
+        dependency_statement = statements_by_name.get(dependency)
+        if dependency_statement is None:
+            continue
+        for nested in _algebra_identifier_dependencies(
+            dependency_statement.expr
+        ):
+            if nested not in dependencies:
+                dependencies.add(nested)
+                pending.append(nested)
+    fitted_intersection = frozenset(dependencies) & optimizer_authority_names
+    return {
+        "algebra_code": str(getattr(exc, "code", "") or ""),
+        "algebra_location": {
+            "line": int(statement.line),
+            "column": int(getattr(exc, "col", statement.col)),
+        },
+        "algebra_statement": {
+            "name": str(statement.name),
+            "source": str(statement.line_text or ""),
+        },
+        "algebra_dependencies": tuple(sorted(dependencies)),
+        "fitted_authority_intersection": tuple(
+            sorted(fitted_intersection)
+        ),
+    }
 
 
 class FittingSeriesEvaluator(Protocol):
@@ -962,9 +1067,27 @@ class SerialFittingEvaluator:
         except Exception as exc:
             if isinstance(exc, (FittingCancelled, SimulationCancelled)):
                 raise FittingCancelled() from exc
-            raise FitSimulationError(
-                f"Fitting result finalization failed: {exc}",
-                details={"fatal": True, "stage": "result_finalization"},
+            algebra_evidence = _strict_algebra_failure_evidence(
+                exc,
+                mechanism=prepared_run.mechanism,
+                optimizer_authority_names=optimizer_authority_names,
+            )
+            if (
+                algebra_evidence is not None
+                and algebra_evidence["fitted_authority_intersection"]
+            ):
+                raise _candidate_domain_error(
+                    exc,
+                    stage="result_finalization",
+                    failed_params=failed_params,
+                    extra_details=algebra_evidence,
+                ) from exc
+            raise _fatal_evaluation_error(
+                exc,
+                message=f"Fitting result finalization failed: {exc}",
+                stage="result_finalization",
+                failed_params=failed_params,
+                extra_details=algebra_evidence,
             ) from exc
         final_solver_provenance = dict(admitted.provenance.solver)
         final_solver_provenance.update(

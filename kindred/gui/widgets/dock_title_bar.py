@@ -65,9 +65,6 @@ class DockTitleBar(QtWidgets.QWidget):
     def set_title(self, title: str) -> None:
         self._title_label.setText(str(title))
 
-    def is_minimized(self) -> bool:
-        return self._minimized
-
     def restore(self) -> None:
         if not self._minimized:
             return

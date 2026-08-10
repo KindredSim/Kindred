@@ -415,7 +415,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._numeric_transaction_active = False
         self._parameter_dataset_backing: dict[tuple[str, str], float] = {}
         self._pending_parameter_dataset_values: dict[tuple[str, str], float] = {}
-        self._parameter_changed_fields: dict[str, set[str]] = {}
         self._defaults_backing: FitDefaults | None = None
         self._default_changed_fields: set[str] = set()
         self._running = False
@@ -606,7 +605,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             for dataset_id, value in parameter.selected_config.dataset_values
         }
         self._pending_parameter_dataset_values.clear()
-        self._parameter_changed_fields.clear()
         self._projecting = True
         projection_blockers = [
             QtCore.QSignalBlocker(control)
@@ -671,7 +669,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     for key, value in self._pending_parameter_dataset_values.items()
                     if key[0] != intent.parameter.name
                 }
-                self._parameter_changed_fields.pop(intent.parameter.name, None)
                 local_table_needed = local_table_needed or (
                     intent.parameter.scope == "per_dataset"
                 )
@@ -839,7 +836,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         """Discard only Parameters-owned raw drafts and validation state."""
 
         self._pending_parameter_dataset_values.clear()
-        self._parameter_changed_fields.clear()
         self._default_changed_fields.clear()
         self._clear_invalid_numeric_state()
 
@@ -1319,6 +1315,31 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if changed:
             self.validityChanged.emit()
 
+    def _parameter_numeric_items(
+        self,
+        name: str,
+    ) -> tuple[tuple[tuple[str, ...], QtWidgets.QTableWidgetItem], ...]:
+        row = self._parameter_row(name)
+        if row < 0:
+            return ()
+        return tuple(
+            (("parameter", name, field), item)
+            for column, field in (
+                (3, "initial"), (4, "minimum"), (5, "maximum")
+            )
+            if (item := self._param_table.item(row, column)) is not None
+        )
+
+    def _set_parameter_row_invalid(self, name: str, message: str) -> None:
+        for key, item in self._parameter_numeric_items(name):
+            self._set_invalid_numeric(key, item.text(), message, item=item)
+
+    def _clear_parameter_row_invalid(self, name: str) -> None:
+        for key, item in self._parameter_numeric_items(name):
+            self._clear_invalid_numeric(
+                key, item=item
+            )
+
     def _clear_invalid_numeric_state(self) -> None:
         if not self._invalid_numeric_text:
             return
@@ -1506,20 +1527,20 @@ class ParametersIcsTab(QtWidgets.QWidget):
         )
         numeric_values = {
             "initial": selected_config.value,
-            "minimum": selected_config.minimum,
-            "maximum": selected_config.maximum,
+            "minimum": self._parse_number(
+                self._param_table.item(row, 4).text(),
+                f"{name} minimum",
+            ),
+            "maximum": self._parse_number(
+                self._param_table.item(row, 5).text(),
+                f"{name} maximum",
+            ),
         }
-        if changed_key is not None and changed_key[:2] == ("parameter", name):
-            field = str(changed_key[2])
-            if field in numeric_values:
-                numeric_values[field] = self._parse_number(
-                    self._param_table.item(
-                        row,
-                        {"initial": 3, "minimum": 4, "maximum": 5}[field],
-                    ).text(),
-                    f"{name} {field}",
-                )
-                self._parameter_changed_fields.setdefault(name, set()).add(field)
+        if not per_dataset:
+            numeric_values["initial"] = self._parse_number(
+                self._param_table.item(row, 3).text(),
+                f"{name} value",
+            )
         active = FitParameterConfiguration(
             value=float(numeric_values["initial"]),
             minimum=float(numeric_values["minimum"]),
@@ -1583,20 +1604,26 @@ class ParametersIcsTab(QtWidgets.QWidget):
             OverflowError,
         ) as exc:
             if changed_key is not None:
-                item = changed_item
-                if item is not None:
-                    self._set_invalid_numeric(
-                        changed_key,
-                        item.text(),
-                        str(exc),
-                        item=item,
-                    )
+                if changed_key[:2] == ("parameter", name):
+                    self._set_parameter_row_invalid(name, str(exc))
+                else:
+                    item = changed_item
+                    if item is not None:
+                        self._set_invalid_numeric(
+                            changed_key,
+                            item.text(),
+                            str(exc),
+                            item=item,
+                        )
             self.statusMessage.emit(f"Fit parameter edit is invalid: {exc}")
             return False
         finally:
             self._numeric_transaction_active = False
         if changed_key is not None:
-            self._clear_invalid_numeric(changed_key, item=changed_item)
+            if changed_key[:2] == ("parameter", name):
+                self._clear_parameter_row_invalid(name)
+            else:
+                self._clear_invalid_numeric(changed_key, item=changed_item)
         self.setupEditsRequested.emit((intent,))
         return True
 

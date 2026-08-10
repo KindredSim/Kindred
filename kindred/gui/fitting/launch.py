@@ -633,14 +633,6 @@ class FitOriginSnapshot:
                         self.scientific_settings.wegscheider_policy
                     ),
                 },
-                "fit_defaults": {
-                    "method": self.fit_defaults.method,
-                    "max_nfev": self.fit_defaults.max_nfev,
-                    "ftol": self.fit_defaults.ftol,
-                    "xtol": self.fit_defaults.xtol,
-                    "use_seed": self.fit_defaults.use_seed,
-                    "seed": self.fit_defaults.seed,
-                },
                 "datasets": [
                     {
                         "dataset_id": item.dataset_id,
@@ -660,7 +652,11 @@ class FitOriginSnapshot:
                         ],
                     }
                     for item in sorted(
-                        self.mapped_datasets,
+                        (
+                            mapped
+                            for mapped in self.mapped_datasets
+                            if mapped.included_at_launch
+                        ),
                         key=lambda value: value.dataset_id,
                     )
                 ],
@@ -1330,14 +1326,30 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
 def fit_origin_science_matches(
     captured: FitOriginSnapshot,
     current: FitOriginSnapshot,
+    *,
+    included_dataset_ids: Iterable[str] | None = None,
 ) -> bool:
-    """Compare Fit admission science while excluding mutable display labels."""
+    """Compare only science that entered the active Fit dataset roster."""
 
     if not isinstance(captured, FitOriginSnapshot) or not isinstance(
         current,
         FitOriginSnapshot,
     ):
         raise TypeError("Fit origin comparison requires FitOriginSnapshot values.")
+
+    active_ids = frozenset(
+        str(dataset_id)
+        for dataset_id in (
+            included_dataset_ids
+            if included_dataset_ids is not None
+            else (
+                item.dataset_id
+                for item in captured.mapped_datasets
+                if item.included_at_launch
+            )
+        )
+        if str(dataset_id).strip()
+    )
 
     def dataset_science(
         item: FitMappedDatasetSnapshot,
@@ -1346,7 +1358,6 @@ def fit_origin_science_matches(
             item.dataset_id,
             item.set_id,
             item.initial_values,
-            item.included_at_launch,
             item.resolved_t_start,
             tuple(
                 (
@@ -1371,6 +1382,7 @@ def fit_origin_science_matches(
                 captured.mapped_datasets,
                 key=lambda value: value.dataset_id,
             )
+            if item.dataset_id in active_ids
         )
         == tuple(
             dataset_science(item)
@@ -1378,12 +1390,24 @@ def fit_origin_science_matches(
                 current.mapped_datasets,
                 key=lambda value: value.dataset_id,
             )
+            if item.dataset_id in active_ids
+        )
+        and active_ids.issubset(
+            item.dataset_id for item in captured.mapped_datasets
+        )
+        and active_ids.issubset(
+            item.dataset_id for item in current.mapped_datasets
         )
         and captured.parameter_defaults == current.parameter_defaults
     )
 
 
-def capture_fit_origin(document: ProjectDocument, tab_id: str) -> FitOriginSnapshot:
+def capture_fit_origin(
+    document: ProjectDocument,
+    tab_id: str,
+    *,
+    dataset_ids: Iterable[str] | None = None,
+) -> FitOriginSnapshot:
     """Copy mapped dataset science from one exact tab."""
     if not isinstance(document, ProjectDocument):
         raise TypeError("document must be ProjectDocument.")
@@ -1391,9 +1415,23 @@ def capture_fit_origin(document: ProjectDocument, tab_id: str) -> FitOriginSnaps
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
         raise ValueError("Fit requires an accepted visible mechanism.")
     mechanism_species = canonical_species_names(tab)
+    selected_dataset_ids = (
+        None
+        if dataset_ids is None
+        else frozenset(
+            str(dataset_id)
+            for dataset_id in dataset_ids
+            if str(dataset_id).strip()
+        )
+    )
     mapped: list[FitMappedDatasetSnapshot] = []
     for dataset_id, link in tab.dataset_links:
         if link.set_id is None:
+            continue
+        if (
+            selected_dataset_ids is not None
+            and dataset_id not in selected_dataset_ids
+        ):
             continue
         dataset = dataset_foundation.validate_raw_dataset_record(
             document.dataset(dataset_id)

@@ -88,10 +88,6 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         self._snapshot_render_timer.setSingleShot(True)
         self._snapshot_render_timer.timeout.connect(self.snapshotRendered)
 
-    @property
-    def binding_generation(self) -> int:
-        return self._binding_generation
-
     def render_snapshot(
         self,
         tab: MechanismTabDocument,
@@ -760,34 +756,6 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     def has_invalid_cells(self, set_ids: Iterable[str] | None = None) -> bool:
         return bool(self.invalid_cells(set_ids))
-
-    def discard_invalid_cells(self, set_ids: Iterable[str] | None = None) -> bool:
-        runtime = self._registry.tab_runtime(self._tab_id)
-        allowed = None if set_ids is None else {str(item) for item in set_ids}
-        changed = False
-        recovered_set_ids: list[str] = []
-        for set_id in tuple(runtime.invalid_initial_text_by_set_id):
-            if allowed is not None and set_id not in allowed:
-                continue
-            values = runtime.invalid_initial_text_by_set_id.pop(set_id)
-            changed = changed or bool(values)
-            if values:
-                recovered_set_ids.append(set_id)
-            for species in values:
-                self.invalidCellStateChanged.emit(
-                    self._tab_id,
-                    set_id,
-                    species,
-                    False,
-                )
-        if changed:
-            self._reconcile_canonical_sets(
-                self._registry.tab(self._tab_id),
-                recovered_set_ids,
-            )
-            self.render()
-            self.activeSnapshotChanged.emit()
-        return changed
 
     @QtCore.Slot(str, str, str)
     def accept_value_edit(self, set_id: str, species: str, raw_text: str) -> bool:

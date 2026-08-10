@@ -222,12 +222,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             for name in self._values
         ]
 
-    def slider_species_names(self) -> list[str]:
-        return list(self._values)
-
-    def species_visible(self, species: str) -> bool:
-        return str(species) in self._values and str(species) not in self._hidden_species
-
     def set_species_visible(self, species: str, visible: bool) -> None:
         name = str(species)
         if name not in self._values:
@@ -252,9 +246,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             for species in self._rows
             if species not in self._hidden_species
         )
-
-    def has_visible_entries(self) -> bool:
-        return any(name not in self._hidden_species for name in self._rows)
 
     def clear(self, *, preserve_visibility: bool = True) -> None:
         if preserve_visibility:

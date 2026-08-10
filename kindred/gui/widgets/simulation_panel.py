@@ -204,13 +204,6 @@ class SimulationPanel(QtWidgets.QWidget):
         self._simulation_job_kind = kind
         self._sync_controls()
 
-    def has_unsettled_run_defaults(self) -> bool:
-        return bool(self._candidate_dirty)
-
-    def run_is_enabled(self) -> bool:
-        """Shared local truth for every Run entry point."""
-        return bool(self.run_btn.isEnabled())
-
     def settle_run_defaults(
         self,
         publish_candidate: (

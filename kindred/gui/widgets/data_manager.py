@@ -574,7 +574,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         """Render one staging-owned aggregate progress event."""
         if not isinstance(event, DatasetImportProgress):
             raise TypeError("Dataset import progress event has the wrong type.")
-        if not self._owns_worker_request(event.request):
+        if event.request is not self._initiating_import_request:
             return
         if self._progress_dialog:
             self._progress_dialog.setValue(event.percent)

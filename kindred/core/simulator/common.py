@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import math
 from typing import Dict
-from .errors import DSLError, non_positive_stoichiometry_error
+from .errors import non_positive_stoichiometry_error
 
 __all__ = [
-    "DSLError",
     "STANDARD_ENERGY_UNIT_MAP",
     "molecularity",
     "normalize_energy_unit",

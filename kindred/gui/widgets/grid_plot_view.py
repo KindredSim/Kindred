@@ -17,13 +17,15 @@ from kindred.gui.display_name_policy import (
     compact_text,
 )
 from kindred.gui.fitting.worker import FitCurveDataset, FitCurveYSemantic
-from kindred.gui.plot_config import try_import_pyqtgraph
+from kindred.gui.plot_config import require_pyqtgraph
 from kindred.gui.workspace_result_presenter import (
     encode_clipboard_text,
     encode_tsv_row,
 )
 
 __all__ = ["DatasetPlotPresentation", "GridPlotView"]
+
+pg = require_pyqtgraph(context="Kindred GUI")
 
 ColorResolver = Callable[[str], object]
 DatasetPlotPresentation: TypeAlias = tuple[str, str]
@@ -79,15 +81,12 @@ class GridPlotView(QtWidgets.QWidget):
         self._dataset_presentation: Mapping[str, DatasetPlotPresentation] = (
             MappingProxyType({})
         )
-        self._pg = None
-        self._canvas = None
-        self._message = None
+        self._pg = pg
         self._legend_visible = True
         self._selected_species_list: list[str] = []
         self._available_species_cache: tuple[str, ...] = ()
         self._seen_nonempty_payload = False
         self._render_succeeded = False
-        self._render_failure_reported = False
         self._plot_items: list[object] = []
         self._plot_series_items: list[dict[str, object]] = []
         self._plot_legends: list[object | None] = []
@@ -144,22 +143,12 @@ class GridPlotView(QtWidgets.QWidget):
         layout.addWidget(self._controls_widget)
         self._controls_widget.setVisible(bool(show_generic_controls))
 
-        ok, pg, _error = try_import_pyqtgraph()
-        if ok:
-            self._pg = pg
-            self._canvas = pg.GraphicsLayoutWidget(self)
-            try:
-                self._canvas.useOpenGL(False)
-            except (AttributeError, RuntimeError):
-                pass
-            layout.addWidget(self._canvas)
-        else:
-            self._message = QtWidgets.QLabel(
-                "Plotting is unavailable; Fit values and Apply remain usable.",
-                self,
-            )
-            self._message.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(self._message)
+        self._canvas = pg.GraphicsLayoutWidget(self)
+        try:
+            self._canvas.useOpenGL(False)
+        except (AttributeError, RuntimeError):
+            pass
+        layout.addWidget(self._canvas)
 
     @staticmethod
     def _normalize_dataset_presentation(
@@ -216,7 +205,6 @@ class GridPlotView(QtWidgets.QWidget):
         self._dataset_presentation = normalized_presentation
         self._curves = values
         self._render_succeeded = False
-        self._render_failure_reported = False
         if not values:
             self._seen_nonempty_payload = False
             self._selected_species_list = []
@@ -229,7 +217,6 @@ class GridPlotView(QtWidgets.QWidget):
         self._color_by_species = MappingProxyType({})
         self._dataset_presentation = MappingProxyType({})
         self._render_succeeded = False
-        self._render_failure_reported = False
         self._seen_nonempty_payload = False
         self._selected_species_list = []
         self._available_species_cache = ()
@@ -409,37 +396,21 @@ class GridPlotView(QtWidgets.QWidget):
                 str(exc),
             )
 
-    def _contain_render_failure(self, error: BaseException) -> None:
-        """Keep a plotting failure local to presentation and Fit semantics."""
+    def _reject_render_failure(self, error: BaseException) -> None:
+        """Revoke failed physical presentation before propagating the error."""
 
         self._render_succeeded = False
         self._cancel_copy()
-        if self._canvas is not None:
-            try:
-                self._canvas.clear()
-                self._plot_items.clear()
-                self._plot_series_items.clear()
-                self._plot_legends.clear()
-                self._structure_key = None
-                placeholder = self._canvas.addPlot(row=0, col=0)
-                placeholder.hideAxis("left")
-                placeholder.hideAxis("bottom")
-                text = self._pg.TextItem(
-                    "Fit plot unavailable",
-                    color=(170, 70, 70),
-                    anchor=(0.5, 0.5),
-                )
-                placeholder.addItem(text)
-                text.setPos(0.5, 0.5)
-            except Exception:
-                pass
+        try:
+            self._canvas.clear()
+        except Exception:
+            pass
+        self._plot_items.clear()
+        self._plot_series_items.clear()
+        self._plot_legends.clear()
+        self._structure_key = None
         self.renderStateChanged.emit(False)
-        if self._render_failure_reported:
-            return
-        self._render_failure_reported = True
-        self.renderFailed.emit(
-            f"Fit plot unavailable; Fit values and Apply remain usable. ({error})"
-        )
+        self.renderFailed.emit(str(error))
 
     @staticmethod
     def _dataset_structure_key(
@@ -539,15 +510,12 @@ class GridPlotView(QtWidgets.QWidget):
         key: str,
         *,
         is_model: bool,
-        species_name: str,
         color: object,
-    ) -> object | None:
+    ) -> object:
         series_map = self._plot_series_items[index]
         item = series_map.get(key)
         if item is not None:
             return item
-        if self._pg is None:
-            return None
         if is_model:
             item = plot.plot(
                 [],
@@ -600,8 +568,6 @@ class GridPlotView(QtWidgets.QWidget):
         return x_render, y_render
 
     def _update_plot_data_in_place(self) -> None:
-        if self._pg is None or self._canvas is None:
-            return
         if len(self._plot_items) != len(self._curves):
             return
         model_x_by_dataset = [dict(curve.model_x) for curve in self._curves]
@@ -665,20 +631,18 @@ class GridPlotView(QtWidgets.QWidget):
                         dataset_index,
                         f"{species}::observed",
                         is_model=False,
-                        species_name=species,
                         color=color,
                     )
-                    if observed_item is not None:
-                        observed_item.setSymbol("o")
-                        observed_item.setSymbolSize(5)
-                        observed_item.setSymbolBrush(self._pg.mkBrush(color))
-                        observed_item.setSymbolPen(self._pg.mkPen(color=color, width=1))
-                        observed_item.setData(
-                            list(observed_x[species]),
-                            list(observed_y[species]),
-                        )
-                        observed_item.setVisible(True)
-                        active_keys.add(f"{species}::observed")
+                    observed_item.setSymbol("o")
+                    observed_item.setSymbolSize(5)
+                    observed_item.setSymbolBrush(self._pg.mkBrush(color))
+                    observed_item.setSymbolPen(self._pg.mkPen(color=color, width=1))
+                    observed_item.setData(
+                        list(observed_x[species]),
+                        list(observed_y[species]),
+                    )
+                    observed_item.setVisible(True)
+                    active_keys.add(f"{species}::observed")
 
                 if species in model_y:
                     model_item = self._ensure_curve_item(
@@ -686,21 +650,19 @@ class GridPlotView(QtWidgets.QWidget):
                         dataset_index,
                         f"{species}::model",
                         is_model=True,
-                        species_name=species,
                         color=color,
                     )
-                    if model_item is not None:
-                        model_item.setPen(self._pg.mkPen(color=color, width=2))
-                        model_render_x, model_render_y = self._with_segment_gaps(
-                            model_x[species],
-                            model_y[species],
-                            model_segments[species],
-                            model_segment_keys[species],
-                            model_discontinuities[species],
-                        )
-                        model_item.setData(model_render_x, model_render_y)
-                        model_item.setVisible(True)
-                        active_keys.add(f"{species}::model")
+                    model_item.setPen(self._pg.mkPen(color=color, width=2))
+                    model_render_x, model_render_y = self._with_segment_gaps(
+                        model_x[species],
+                        model_y[species],
+                        model_segments[species],
+                        model_segment_keys[species],
+                        model_discontinuities[species],
+                    )
+                    model_item.setData(model_render_x, model_render_y)
+                    model_item.setVisible(True)
+                    active_keys.add(f"{species}::model")
 
             for key, item in self._plot_series_items[dataset_index].items():
                 if key in active_keys:
@@ -709,8 +671,6 @@ class GridPlotView(QtWidgets.QWidget):
             self._ensure_legend_state(plot, dataset_index, active_keys)
 
     def _rebuild_structure(self) -> None:
-        if self._pg is None or self._canvas is None:
-            return
         self._canvas.setUpdatesEnabled(False)
         try:
             self._canvas.clear()
@@ -757,8 +717,6 @@ class GridPlotView(QtWidgets.QWidget):
             self._canvas.setUpdatesEnabled(True)
 
     def _set_scrollbars_locked(self, locked: bool) -> None:
-        if self._canvas is None:
-            return
         if locked:
             if self._scrollbar_policies_prev is None:
                 try:
@@ -912,25 +870,6 @@ class GridPlotView(QtWidgets.QWidget):
     def _species_item_name(item: QtWidgets.QListWidgetItem) -> str:
         return str(item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text())
 
-    def set_species_selection(self, species_names: Iterable[str]) -> None:
-        """Select available species without changing the typed curve payload."""
-
-        names = {str(name).casefold() for name in species_names if str(name)}
-        if not names or self._species_list.count() == 0:
-            return
-        self._species_list.blockSignals(True)
-        try:
-            for index in range(self._species_list.count()):
-                item = self._species_list.item(index)
-                item.setSelected(self._species_item_name(item).casefold() in names)
-            self._selected_species_list = [
-                self._species_item_name(item)
-                for item in self._species_list.selectedItems()
-            ]
-        finally:
-            self._species_list.blockSignals(False)
-        self._redraw()
-
     def _on_species_selection_changed(self) -> None:
         self._selected_species_list = [
             self._species_item_name(item) for item in self._species_list.selectedItems()
@@ -945,8 +884,6 @@ class GridPlotView(QtWidgets.QWidget):
         """Apply the historical Fit-grid dark/light background and axis pens."""
 
         self._dark_mode = bool(enabled)
-        if self._canvas is None or self._pg is None:
-            return
         try:
             self._canvas.setBackground(
                 (30, 30, 30) if self._dark_mode else (248, 248, 248)
@@ -1040,8 +977,6 @@ class GridPlotView(QtWidgets.QWidget):
         self._activate_autorange_lock()
 
     def _update_grid(self) -> None:
-        if self._pg is None or self._canvas is None:
-            return
         if self._autorange_locked:
             self._snapshot_plot_view_ranges()
         desired_key = self._dataset_structure_key(self._curves)
@@ -1056,23 +991,6 @@ class GridPlotView(QtWidgets.QWidget):
         self._restore_locked_view_ranges()
 
     def _redraw(self) -> None:
-        if self._curves and self._render_failure_reported:
-            # The installed payload already failed physical rendering.  Keep
-            # that failure contained until a new set_projection() payload resets
-            # the panel instead of repeatedly exercising the broken scene.
-            self._render_succeeded = False
-            self.renderStateChanged.emit(False)
-            return
-        if self._canvas is None or self._pg is None:
-            self._render_succeeded = False
-            if self._message is not None:
-                self._message.setText(
-                    "No Fit curves yet."
-                    if not self._curves
-                    else "Plotting is unavailable; Fit values and Apply remain usable."
-                )
-            self.renderStateChanged.emit(False)
-            return
         try:
             self._update_species_selector()
             self._update_grid()
@@ -1083,4 +1001,5 @@ class GridPlotView(QtWidgets.QWidget):
             )
             self.renderStateChanged.emit(self._render_succeeded)
         except Exception as exc:
-            self._contain_render_failure(exc)
+            self._reject_render_failure(exc)
+            raise

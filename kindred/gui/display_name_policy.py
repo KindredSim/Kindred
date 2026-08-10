@@ -8,11 +8,9 @@ labels into labels, tabs, list rows, status/footer messages, or plot titles.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
 
 __all__ = [
     "CompactText",
-    "NamedCountSummary",
     "DATASET_LIST_LABEL_MAX_CHARS",
     "DIAGNOSTIC_LABEL_MAX_CHARS",
     "FOOTER_SUMMARY_MAX_CHARS",
@@ -24,12 +22,8 @@ __all__ = [
     "compact_dataset_label",
     "compact_diagnostic_text",
     "compact_plot_title_label",
-    "compact_set_label",
     "compact_text",
     "dataset_alias",
-    "format_named_count_summary",
-    "summarize_named_count",
-    "tooltip_for_compact_text",
 ]
 
 ELLIPSIS = "…"
@@ -113,16 +107,8 @@ def compact_text(
     )
 
 
-def tooltip_for_compact_text(compact: CompactText) -> str:
-    return compact.tooltip
-
-
 def compact_dataset_label(text: object, *, max_chars: int = DATASET_LIST_LABEL_MAX_CHARS) -> CompactText:
     return compact_text(text, max_chars=max_chars, empty_text="dataset", mode="middle")
-
-
-def compact_set_label(text: object, *, max_chars: int = STATUS_ITEM_LABEL_MAX_CHARS) -> CompactText:
-    return compact_text(text, max_chars=max_chars, empty_text="set", mode="middle")
 
 
 def compact_plot_title_label(text: object, *, max_chars: int = PLOT_TITLE_LABEL_MAX_CHARS) -> CompactText:
@@ -139,86 +125,3 @@ def dataset_alias(index: int, *, prefix: str = "D") -> str:
     except (TypeError, ValueError):
         idx = 0
     return f"{str(prefix or 'D')}{max(0, idx) + 1}"
-
-
-
-@dataclass(frozen=True, slots=True)
-class NamedCountSummary:
-    """Compact count summary plus full item truth for tooltip/details."""
-
-    display: str
-    full: str
-    count: int
-
-    @property
-    def tooltip(self) -> str:
-        return self.full if self.full and self.full != self.display else ""
-
-def _plural(noun: str, plural: str | None = None) -> str:
-    noun_s = str(noun or "item")
-    return str(plural) if plural else f"{noun_s}s"
-
-
-def summarize_named_count(
-    names: Sequence[object] | Iterable[object],
-    *,
-    singular: str = "dataset",
-    plural: str | None = None,
-    max_items: int = 3,
-    item_max_chars: int = STATUS_ITEM_LABEL_MAX_CHARS,
-    empty_text: str = "none",
-) -> NamedCountSummary:
-    """Summarize item names without taking ownership of their full truth.
-
-    The visible ``display`` is compact and count-first.  The ``full`` field
-    keeps every non-empty input item, including duplicates, for tooltips or
-    message-box details.  Callers that have stable ids should include them in
-    the input values before calling this helper.
-    """
-
-    items: list[tuple[str, str]] = []
-    for name in names or ():
-        full = _raw_full_text(name).strip()
-        display_source = _normalize_text(name)
-        if not display_source:
-            continue
-        items.append((full or display_source, display_source))
-    count = len(items)
-    if count <= 0:
-        empty = str(empty_text)
-        return NamedCountSummary(display=empty, full=empty, count=0)
-    noun = str(singular or "item") if count == 1 else _plural(singular, plural)
-    limit = max(0, int(max_items))
-    examples = [
-        compact_text(display_source, max_chars=item_max_chars, mode="middle").display
-        for _, display_source in items[:limit]
-    ]
-    if examples:
-        suffix = "" if count <= len(examples) else f", +{count - len(examples)} more"
-        display = f"{count} {noun}: {', '.join(examples)}{suffix}"
-    else:
-        display = f"{count} {noun}"
-    full_lines = "\n".join(f"- {full}" for full, _ in items)
-    full = f"{count} {noun}:\n{full_lines}" if full_lines else display
-    return NamedCountSummary(display=display, full=full, count=count)
-
-
-def format_named_count_summary(
-    names: Sequence[object] | Iterable[object],
-    *,
-    singular: str = "dataset",
-    plural: str | None = None,
-    max_items: int = 3,
-    item_max_chars: int = STATUS_ITEM_LABEL_MAX_CHARS,
-    empty_text: str = "none",
-) -> str:
-    """Return the compact display string for ``summarize_named_count``."""
-
-    return summarize_named_count(
-        names,
-        singular=singular,
-        plural=plural,
-        max_items=max_items,
-        item_max_chars=item_max_chars,
-        empty_text=empty_text,
-    ).display

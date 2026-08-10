@@ -3,10 +3,13 @@ Computational Simulator DSL tools.
 
 Current contract
 ----------------
-- Entries: `reaction:` and `equilibrium:`.
+- Steps may be bare or prefixed with `reaction:` or `equilibrium:`.
+- Irreversible arrows: `->` and `=>`; reversible arrows: `<->` and `<=>`.
 - Accepted keys with normalization:
-  degeneracy, κ, C°|C0, dG_act|ΔG‡, Ea, dG_eq|ΔG°, k|kf|kr, A, k_fast,
+  degeneracy, κ, C°|C0, dG_act|ΔG‡, Ea, dG_eq|ΔG°, k|kf|kr, A,
   energy=kcal/mol|kJ/mol|J/mol
+- Packaged preset sources use this same public syntax and remain admitted by
+  the same parser.
 - Source-level `T=` is rejected; set nominal temperature in the mechanism tab.
 - If dG_eq/ΔG° is provided and Keq is omitted, compute Keq = exp(-ΔG°/(R*T)).
 - Default per step is Eyring; Arrhenius override via A/Ea.
@@ -43,7 +46,7 @@ from ..equilibrium_rate_authority import (
 )
 from ..units import UnitsModel
 from .errors import (
-    DSLError,
+    DSLError as _DSLError,
     invalid_number_error,
     missing_arrow_error,
     invalid_species_term_error,
@@ -72,7 +75,6 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = [
-    "DSLError",
     "DslAnalysis",
     "DslDerivedObservableDefinition",
     "DslDerivedScalarDefinition",
@@ -111,7 +113,6 @@ _KEY_ALIASES: Dict[str, str] = {
     "keq": "Keq",
     "kf": "kf",
     "kr": "kr",
-    "k_fast": "k_fast",
     # units selector
     "energy": "energy",
 }
@@ -709,7 +710,7 @@ def _parse_keyvals(
         canonical_key = _norm_key(raw_key)
         previous_spelling = original_spellings.get(canonical_key)
         if reject_duplicate_canonical_keys and previous_spelling is not None:
-            raise DSLError(
+            raise _DSLError(
                 f"Duplicate parameter: '{previous_spelling}' and '{raw_key}' both resolve to {canonical_key}",
                 line_number=line_number,
                 line_content=line_content,
@@ -730,7 +731,7 @@ def _parse_species_side(text: str) -> Dict[str, float]:
     for term in _STOICH_TERM_SPLIT_RE.split(text):
         term = term.strip()
         if not term:
-            raise DSLError("Malformed stoichiometry: empty term (e.g., consecutive '+' signs)")
+            raise _DSLError("Malformed stoichiometry: empty term (e.g., consecutive '+' signs)")
         m = _SPECIES_TERM_RE.match(term)
         if not m and "*" in term:
             # Allow patterns like "2 * B" while rejecting "A B"
@@ -740,7 +741,7 @@ def _parse_species_side(text: str) -> Dict[str, float]:
         coef_s, name = m.groups()
         coef = _float_or_none(coef_s) if coef_s is not None else 1.0
         if coef is None or coef <= 0.0:
-            raise DSLError("Stoichiometric coefficients must be positive finite real numbers")
+            raise _DSLError("Stoichiometric coefficients must be positive finite real numbers")
         result[name] = result.get(name, 0.0) + coef
     if not result:
         raise empty_stoichiometry_error()
@@ -788,27 +789,27 @@ def _parse_degeneracy(
     """Admit only a positive integer literal for an Eyring degeneracy."""
 
     if type(raw) is bool:
-        raise DSLError(
+        raise _DSLError(
             "degeneracy must be a positive integer literal, not a boolean",
             line_number=line_number,
             line_content=line_content,
         )
     if type(raw) is not str:
-        raise DSLError(
+        raise _DSLError(
             "degeneracy must be a positive integer literal",
             line_number=line_number,
             line_content=line_content,
         )
     literal = raw.strip()
     if not _DEGENERACY_LITERAL_RE.fullmatch(literal):
-        raise DSLError(
+        raise _DSLError(
             "degeneracy must be a positive integer literal",
             line_number=line_number,
             line_content=line_content,
         )
     value = int(literal)
     if value <= 0:
-        raise DSLError(
+        raise _DSLError(
             "degeneracy must be a positive integer",
             line_number=line_number,
             line_content=line_content,
@@ -826,7 +827,7 @@ def _validate_rate_or_K(
     if value is None:
         return
     if math.isnan(value) or math.isinf(value) or value <= 0:
-        raise DSLError(
+        raise _DSLError(
             f"'{name}' must be a positive finite number, got {value}",
             line_number=line_number,
             line_content=line_content,
@@ -846,9 +847,9 @@ def _reverse_standard_state_ratio(
         )
         ratio = math.pow(standard, exponent)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise DSLError("standard concentration ratio must be finite") from exc
+        raise _DSLError("standard concentration ratio must be finite") from exc
     if not math.isfinite(standard) or standard <= 0.0 or not math.isfinite(ratio) or ratio <= 0.0:
-        raise DSLError("standard concentration ratio must be positive and finite")
+        raise _DSLError("standard concentration ratio must be positive and finite")
     return float(ratio)
 
 
@@ -869,13 +870,13 @@ def _reverse_rate_for_dsl(
         )
         result = float(value)
     except (TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
-        raise DSLError(
+        raise _DSLError(
             "Thermodynamic reverse rate is not representable as a positive finite real",
             line_number=line_number,
             line_content=line_content,
         ) from exc
     if not math.isfinite(result) or result <= 0.0:
-        raise DSLError(
+        raise _DSLError(
             "Thermodynamic reverse rate is not representable as a positive finite real",
             line_number=line_number,
             line_content=line_content,
@@ -901,7 +902,7 @@ def _derive_fast_equilibrium_rates_with_context(
             kwargs["temperature_K"] = kwargs.pop("T")
         return derive_fast_equilibrium_rates(**kwargs)
     except (ValueError, OverflowError, ZeroDivisionError) as exc:
-        raise DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
+        raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
 
 
 def _validate_equilibrium_rate_authority_for_dsl(
@@ -921,7 +922,7 @@ def _validate_equilibrium_rate_authority_for_dsl(
             has_dG_eq=has_dG_eq,
         )
     except ValueError as exc:
-        raise DSLError(
+        raise _DSLError(
             str(exc),
             suggestion="Provide kf=... with either kr=... or Keq=/dG_eq=..., but not both.",
             examples=[
@@ -943,7 +944,7 @@ def _forward_rate_family_from_params(
     """Select exactly one authored Constant/Arrhenius/Eyring family."""
 
     if "kf" in params and "k" in params:
-        raise DSLError(
+        raise _DSLError(
             "Forward rate authority cannot contain both k and kf.",
             line_number=line_number,
             line_content=line_content,
@@ -958,7 +959,7 @@ def _forward_rate_family_from_params(
         if present
     }
     if len(families) > 1:
-        raise DSLError(
+        raise _DSLError(
             "Forward rate authority must use exactly one of Constant "
             "(k or kf), Arrhenius (A and Ea), or Eyring (dG_act).",
             line_number=line_number,
@@ -966,7 +967,7 @@ def _forward_rate_family_from_params(
         )
     family = next(iter(families), "Eyring")
     if "κ" in params and family != "Eyring":
-        raise DSLError(
+        raise _DSLError(
             "Per-step κ is valid only for an Eyring forward rate.",
             line_number=line_number,
             line_content=line_content,
@@ -1002,13 +1003,13 @@ def _inline_initial_number(
     try:
         value = float(str(token).strip())
     except (TypeError, ValueError, OverflowError) as exc:
-        raise DSLError(
+        raise _DSLError(
             f"Initial condition value for {context} must be numeric.",
             line_number=line_number,
             line_content=line_content,
         ) from exc
     if not math.isfinite(value) or value < 0.0:
-        raise DSLError(
+        raise _DSLError(
             f"Initial condition value for {context} must be finite and "
             "nonnegative.",
             line_number=line_number,
@@ -1031,7 +1032,7 @@ def _inline_initial_assignments(
         _prefix, body = stripped.split(":", 1)
         raw_parts = body.split(",")
         if not body.strip() or any(not part.strip() for part in raw_parts):
-            raise DSLError(
+            raise _DSLError(
                 "Initial condition directive requires comma-separated "
                 "species=value assignments.",
                 line_number=line_number,
@@ -1040,7 +1041,7 @@ def _inline_initial_assignments(
         pairs: list[tuple[str, str]] = []
         for part in raw_parts:
             if part.count("=") != 1:
-                raise DSLError(
+                raise _DSLError(
                     "Initial condition directive assignments must use exactly "
                     "one '='.",
                     line_number=line_number,
@@ -1049,7 +1050,7 @@ def _inline_initial_assignments(
             species, value_token = part.split("=", 1)
             species = species.strip()
             if not _DSL_IDENTIFIER_RE.fullmatch(species):
-                raise DSLError(
+                raise _DSLError(
                     f"Initial condition species {species!r} must be an "
                     "identifier.",
                     line_number=line_number,
@@ -1059,7 +1060,7 @@ def _inline_initial_assignments(
     else:
         raw_parts = stripped.split(",")
         if any(not part.strip() for part in raw_parts):
-            raise DSLError(
+            raise _DSLError(
                 "Bracket initial conditions must be comma-separated "
                 "assignments.",
                 line_number=line_number,
@@ -1069,7 +1070,7 @@ def _inline_initial_assignments(
         for part in raw_parts:
             match = _BRACKET_INITIAL_ASSIGNMENT_RE.fullmatch(part.strip())
             if match is None:
-                raise DSLError(
+                raise _DSLError(
                     "Initial conditions must use '[Species] = value' or "
                     "'init: Species=value' syntax.",
                     line_number=line_number,
@@ -1143,7 +1144,7 @@ def _admit_inline_initial_conditions(
                 continue
             key = set_name.casefold()
             if key in named_keys:
-                raise DSLError(
+                raise _DSLError(
                     f"Duplicate inline initial-condition set name: "
                     f"{set_name!r}.",
                     line_number=index + 1,
@@ -1156,7 +1157,7 @@ def _admit_inline_initial_conditions(
             if "}" in body:
                 before_close, close, after_close = body.partition("}")
                 if close and after_close.strip():
-                    raise DSLError(
+                    raise _DSLError(
                         "Inline initial-condition block closing '}' must end "
                         "the declaration.",
                         line_number=index + 1,
@@ -1200,7 +1201,7 @@ def _admit_inline_initial_conditions(
                             "}"
                         )
                         if not close or after_close.strip():
-                            raise DSLError(
+                            raise _DSLError(
                                 "Inline initial-condition block closing '}' "
                                 "must end the declaration.",
                                 line_number=cursor + 1,
@@ -1228,7 +1229,7 @@ def _admit_inline_initial_conditions(
                     assignment_ordinal += len(parsed)
                     cursor += 1
                 if cursor >= len(lines):
-                    raise DSLError(
+                    raise _DSLError(
                         f"Inline initial-condition set {set_name!r} is "
                         "missing a closing '}'.",
                         line_number=start + 1,
@@ -1297,7 +1298,7 @@ def _admit_temperature_directive(text: str) -> str | None:
     if len(directives) > 1:
         line_number, raw, _kind = directives[1]
         kinds = ", ".join(kind for _number, _raw, kind in directives)
-        raise DSLError(
+        raise _DSLError(
             "At most one top-level temperature schedule directive is "
             f"allowed; found {len(directives)} ({kinds}).",
             suggestion="Keep only one temp_step: or temp_response: directive.",
@@ -1343,7 +1344,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
     raw_lines = text.splitlines()
     if not any(line.strip() and not line.strip().startswith("#") for line in raw_lines):
-        raise DSLError("DSL text is empty. Provide at least one reaction or directive.")
+        raise _DSLError("DSL text is empty. Provide at least one reaction or directive.")
     lines = [ln.rstrip() for ln in raw_lines]
 
     # Resolve source-wide settings before lowering any reaction.  A directive
@@ -1365,7 +1366,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         if key is None:
             continue
         if key in global_directives:
-            raise DSLError(
+            raise _DSLError(
                 f"Duplicate global {key} directive.",
                 suggestion=f"Keep exactly one source-wide {key}= definition.",
                 line_number=line_no,
@@ -1378,9 +1379,9 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         line_no, raw = global_directives["energy"]
         try:
             energy_unit = _parse_energy_unit_directive(raw.strip())
-        except DSLError as exc:
+        except _DSLError as exc:
             if exc.line_number is None:
-                raise DSLError(
+                raise _DSLError(
                     str(exc.message),
                     suggestion=exc.suggestion,
                     examples=exc.examples,
@@ -1393,9 +1394,9 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         line_no, raw = global_directives["C0"]
         try:
             standard_conc_M = _parse_standard_conc_directive(raw.strip())
-        except DSLError as exc:
+        except _DSLError as exc:
             if exc.line_number is None:
-                raise DSLError(
+                raise _DSLError(
                     str(exc.message),
                     suggestion=exc.suggestion,
                     examples=exc.examples,
@@ -1423,7 +1424,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             continue
 
         if lower.startswith("t="):
-            raise DSLError(
+            raise _DSLError(
                 "Source-level T= is not supported; the mechanism tab "
                 "temperature is the nominal scientific authority.",
                 line_number=line_no,
@@ -1442,7 +1443,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
         if classification.kind == "invalid_step_key_identifier":
             target = classification.raw_name or raw.strip()
-            raise DSLError(
+            raise _DSLError(
                 f"{target!r} is a step-local DSL key and cannot be declared as a parameter or observable.",
                 suggestion=(
                     "Use a canonical indexed mechanism parameter such as k1, kf1, kr1, or Keq1, "
@@ -1454,7 +1455,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
         if classification.kind == "unsupported_bare_assignment":
             target = classification.raw_name or raw.strip()
-            raise DSLError(
+            raise _DSLError(
                 f"Bare algebra assignment {target!r} is not supported.",
                 suggestion="Use 'let name = expr' or 'param name = expr'.",
                 line_number=line_no,
@@ -1504,7 +1505,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             )
             continue
 
-        raise DSLError(f"unrecognized line: {line!r}", line_number=line_no, line_content=raw)
+        raise _DSLError(f"unrecognized line: {line!r}", line_number=line_no, line_content=raw)
 
     if temperature_schedule is not None:
         notes.append(f"Temperature schedule detected: {temperature_schedule}")
@@ -1533,11 +1534,11 @@ def _parse_energy_unit_directive(line: str) -> str:
     kv = _parse_keyvals(line, reject_duplicate_canonical_keys=True)
     raw = kv.get("energy")
     if not raw:
-        raise DSLError("energy= directive requires a value (kJ/mol, kcal/mol, or J/mol)")
+        raise _DSLError("energy= directive requires a value (kJ/mol, kcal/mol, or J/mol)")
     try:
         return normalize_energy_unit(raw)
     except ValueError:
-        raise DSLError(
+        raise _DSLError(
             f"energy must be 'kJ/mol', 'kcal/mol', or 'J/mol', got {raw!r}",
             examples=["energy=kJ/mol", "energy=kcal/mol", "energy=J/mol"],
         )
@@ -1547,10 +1548,10 @@ def _parse_standard_conc_directive(line: str) -> float:
     kv = _parse_keyvals(line, reject_duplicate_canonical_keys=True)
     raw = kv.get("C0")
     if not raw:
-        raise DSLError("C0= directive requires a numeric value")
+        raise _DSLError("C0= directive requires a numeric value")
     C0 = _float_or_none(raw)
     if C0 is None or C0 <= 0:
-        raise DSLError("C0 must be positive")
+        raise _DSLError("C0 must be positive")
     return float(C0)
 
 
@@ -1585,13 +1586,13 @@ def _reject_per_step_globals(
 ) -> None:
     """Reject per-reaction T= and energy= overrides."""
     if "T" in params:
-        raise DSLError(
+        raise _DSLError(
             "Per-reaction T= is not supported; set the nominal temperature "
             "in the mechanism tab.",
             line_number=line_number, line_content=line_content,
         )
     if "energy" in params:
-        raise DSLError(
+        raise _DSLError(
             "Per-reaction energy= is not supported; use a global energy= directive",
             line_number=line_number, line_content=line_content,
         )
@@ -1608,7 +1609,7 @@ def _reject_unknown_params(
     """Reject parameter keys not in known_keys."""
     unknown = set(params) - known_keys
     if unknown:
-        raise DSLError(
+        raise _DSLError(
             f"Unknown {step_label} parameter(s): {', '.join(sorted(unknown))}",
             line_number=line_number, line_content=line_content,
         )
@@ -1635,18 +1636,18 @@ def _resolve_Keq_from_params(
     if Keq is None:
         dG_eq_val = _float_or_none(params["dG_eq"])
         if dG_eq_val is None:
-            raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
+            raise _DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
         dG = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
         dG_eqJ = dG
         try:
             Keq = K_from_deltaG_eq(dG, T)
         except (ValueError, OverflowError) as exc:
-            raise DSLError(
+            raise _DSLError(
                 "Equilibrium constant overflow (dG_eq too large for given T)",
                 line_number=line_number, line_content=line_content,
             ) from exc
         if Keq <= 0:
-            raise DSLError(
+            raise _DSLError(
                 "Equilibrium constant underflowed to zero (dG_eq too large for given T)",
                 line_number=line_number, line_content=line_content,
             )
@@ -1670,9 +1671,9 @@ def _parse_reaction_like_step(
 
     try:
         react, prod, arrow = _parse_stoich(stoich_part)
-    except DSLError as exc:
+    except _DSLError as exc:
         if exc.line_number is None:
-            raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
+            raise _DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
                            line_number=line_number, line_content=line_content) from exc
         raise
     reversible = arrow in ("<->", "<=>")
@@ -1689,7 +1690,7 @@ def _parse_reaction_like_step(
     degeneracy = 1
     if "degeneracy" in params:
         if model != "Eyring" or "dG_act" not in params:
-            raise DSLError(
+            raise _DSLError(
                 "degeneracy is valid only with an Eyring dG_act forward rate",
                 line_number=line_number,
                 line_content=line_content,
@@ -1729,7 +1730,7 @@ def _parse_reaction_like_step(
     if "Keq" in params:
         _Keq_early = _float_or_none(params["Keq"])
         if _Keq_early is not None and _Keq_early <= 0:
-            raise DSLError(
+            raise _DSLError(
                 f"Keq must be positive, got {_Keq_early}",
                 line_number=line_number, line_content=line_content,
             )
@@ -1744,26 +1745,26 @@ def _parse_reaction_like_step(
         A = _float_or_none(params.get("A"))
         Ea = params.get("Ea")
         if A is None or Ea is None:
-            raise DSLError(
+            raise _DSLError(
                 "Arrhenius requires A and Ea",
                 examples=["A -> B ; A=1e13 ; Ea=50"],
                 line_number=line_number, line_content=line_content,
             )
         if A <= 0:
-            raise DSLError(
+            raise _DSLError(
                 f"Arrhenius pre-exponential factor A must be positive, got {A}",
                 line_number=line_number, line_content=line_content,
             )
         Ea_val = _float_or_none(Ea)
         if Ea_val is None:
-            raise DSLError("Ea must be numeric", line_number=line_number, line_content=line_content)
+            raise _DSLError("Ea must be numeric", line_number=line_number, line_content=line_content)
         EaJ = normalize_energy_to_J_per_mol(Ea_val, energy_unit)
         arrhenius_A = A
         arrhenius_EaJ = EaJ
         try:
             kf = arrhenius_rate(A, EaJ, T)
         except (ValueError, OverflowError) as exc:
-            raise DSLError(
+            raise _DSLError(
                 "Arrhenius rate computation overflowed (A and Ea produce an unrepresentable rate)",
                 line_number=line_number, line_content=line_content,
             ) from exc
@@ -1783,7 +1784,7 @@ def _parse_reaction_like_step(
                 )
                 Keq_input = Keq if "Keq" in params else None
             else:
-                raise DSLError(
+                raise _DSLError(
                     "reversible Arrhenius step needs exactly one of kr or Keq/dG_eq",
                     examples=["A <-> B ; A=1e10 ; Ea=50 ; Keq=2.0"],
                     line_number=line_number, line_content=line_content,
@@ -1791,18 +1792,18 @@ def _parse_reaction_like_step(
     elif model == "Eyring":
         if kf is None:
             if "dG_act" not in params:
-                raise DSLError(
+                raise _DSLError(
                     missing_eyring_message,
                     examples=["A -> B ; dG_act=75.5", "A -> B ; k=1.5"],
                     line_number=line_number, line_content=line_content,
                 )
             dG_act_val = _float_or_none(params["dG_act"])
             if dG_act_val is None:
-                raise DSLError("dG_act must be numeric", line_number=line_number, line_content=line_content)
+                raise _DSLError("dG_act must be numeric", line_number=line_number, line_content=line_content)
             dGJ = normalize_energy_to_J_per_mol(dG_act_val, energy_unit)
             eyring_dGJ = dGJ
             if kappa <= 0:
-                raise DSLError(
+                raise _DSLError(
                     f"Per-step kappa must be positive for Eyring rate computation, got {kappa}",
                     line_number=line_number, line_content=line_content,
                 )
@@ -1816,7 +1817,7 @@ def _parse_reaction_like_step(
                     degeneracy=degeneracy,
                 )
             except (ValueError, OverflowError) as exc:
-                raise DSLError(
+                raise _DSLError(
                     "Eyring rate computation overflowed (dG_act too large for given T)",
                     line_number=line_number, line_content=line_content,
                 ) from exc
@@ -1837,7 +1838,7 @@ def _parse_reaction_like_step(
                 Keq_input = Keq if "Keq" in params else None
     else:
         if kf is None:
-            raise DSLError(
+            raise _DSLError(
                 "Constant reaction requires explicit k or kf",
                 line_number=line_number,
                 line_content=line_content,
@@ -1965,13 +1966,13 @@ def _parse_equilibrium_step(
     )
     try:
         react, prod, arrow = _parse_stoich(stoich_part)
-    except DSLError as exc:
+    except _DSLError as exc:
         if exc.line_number is None:
-            raise DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
+            raise _DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
                            line_number=line_number, line_content=line_content) from exc
         raise
     if arrow not in ("<->", "<=>"):
-        raise DSLError(
+        raise _DSLError(
             "equilibrium must use '<->' or '<=>'",
             examples=["equilibrium: A <-> B ; Keq=2.0 ; kf=10"],
             line_number=line_number, line_content=line_content,
@@ -1986,7 +1987,7 @@ def _parse_equilibrium_step(
     has_explicit_dG_eq = "dG_eq" in params
     Keq = _float_or_none(params.get("Keq"))
     if has_explicit_Keq and Keq is None:
-        raise DSLError(
+        raise _DSLError(
             "Keq must be numeric",
             line_number=line_number,
             line_content=line_content,
@@ -2001,14 +2002,14 @@ def _parse_equilibrium_step(
     if "kf" in params:
         kfv = _float_or_none(params["kf"])
         if kfv is None:
-            raise DSLError("kf must be numeric", line_number=line_number, line_content=line_content)
+            raise _DSLError("kf must be numeric", line_number=line_number, line_content=line_content)
         _validate_rate_or_K(kfv, "kf", line_number=line_number, line_content=line_content)
         kf_explicit = kfv
         exp_rates.append(kfv)
     if "kr" in params:
         krv = _float_or_none(params["kr"])
         if krv is None:
-            raise DSLError("kr must be numeric", line_number=line_number, line_content=line_content)
+            raise _DSLError("kr must be numeric", line_number=line_number, line_content=line_content)
         _validate_rate_or_K(krv, "kr", line_number=line_number, line_content=line_content)
         kr_explicit = krv
         exp_rates.append(krv)
@@ -2039,7 +2040,7 @@ def _parse_equilibrium_step(
         )
         dG_eq_val = _float_or_none(dG_eq)
         if dG_eq_val is None:
-            raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
+            raise _DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
         dG_eqJ = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
     fe = _derive_fast_equilibrium_rates_with_context(
         Keq=Keq,
@@ -2191,7 +2192,7 @@ def _validate_static_parameter_algebra(parameter_algebra_spec: object) -> None:
             or (dynamic_names & identifiers(expr))
         )
         if runtime:
-            raise DSLError(
+            raise _DSLError(
                 "Parameter expressions may only reference static solver parameters and constants; "
                 "runtime temperature, time, concentration, scalar, and observable references belong in let expressions.",
                 line_number=int(getattr(assignment, "line_number", 0) or 0),
@@ -2251,7 +2252,7 @@ def prepare_dsl_request_set(
             retained_spec=parameter_algebra_spec,
         )
     except ValueError as exc:
-        raise DSLError(str(exc)) from exc
+        raise _DSLError(str(exc)) from exc
     setattr(mechanism, "_compiled_algebra_series", compiled_algebra_series)
     definitions = tuple(extract_parameters_from_mechanism(mechanism))
     species_names = tuple(str(item) for item in mechanism.species_names())
@@ -2354,7 +2355,7 @@ def derive_prepared_dsl_with_parameter_updates(
     *,
     wegscheider_cyclicity_enabled: bool,
 ) -> PreparedDslRequestSet:
-    """Derive typed Slider science without a text-input or reparse lane."""
+    """Apply typed updates, render source, and return its final admission."""
 
     from kindred.core.equilibrium_rate_authority import (
         EquilibriumRateAuthorityKind,
@@ -2591,7 +2592,17 @@ def derive_prepared_dsl_with_parameter_updates(
                     energy_unit=metadata_view.energy_unit,
                 ).from_jmol(rewritten.dG_act_J_per_mol)
             else:
-                source_token = "k"
+                authored_forward_tokens = [
+                    pair[0]
+                    for pair in tokens
+                    if str(pair[0]).strip().casefold() in {"k", "kf"}
+                ]
+                if len(authored_forward_tokens) != 1:
+                    raise ValueError(
+                        f"Parameter {update.name!r} has no unique admitted "
+                        "irreversible forward-rate token."
+                    )
+                source_token = authored_forward_tokens[0]
         elif kind == "equilibrium":
             equilibrium = mechanism.equilibria[index]
             equilibrium_metadata = dict(equilibrium.metadata)
@@ -2884,7 +2895,7 @@ def derive_prepared_dsl_with_observables(
             retained_spec=retained_spec,
         )
     except ValueError as exc:
-        raise DSLError(str(exc)) from exc
+        raise _DSLError(str(exc)) from exc
     setattr(mechanism, "_compiled_algebra_series", compiled_algebra_series)
 
     base_text = base.analysis.normalized_text.rstrip()

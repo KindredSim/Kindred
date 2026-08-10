@@ -302,14 +302,6 @@ class ParameterAlgebraNamespace:
 
 
 @dataclass(frozen=True)
-class ParameterOverrideWarning:
-    param_name: str
-    inline_name: str
-    step_index: int
-    message: str
-
-
-@dataclass(frozen=True)
 class ParameterAlgebraSpec:
     """
     Parsed `param` statements from mechanism DSL text.
@@ -327,7 +319,6 @@ class ParameterAlgebraSpec:
     observable_names: Set[str]
     mechanism_namespace: MechanismParameterNamespace
     scalar_input_names: Set[str] = field(default_factory=set)
-    override_warnings: Tuple[ParameterOverrideWarning, ...] = field(default_factory=tuple)
     parameter_block: AlgebraBlock | None = None
     observable_block: AlgebraBlock | None = None
     raw_to_canonical_identifiers_by_assignment: Mapping[str, Mapping[str, str]] = field(
@@ -338,7 +329,6 @@ class ParameterAlgebraSpec:
         object.__setattr__(self, "param_statements", tuple(self.param_statements))
         object.__setattr__(self, "observable_names", frozenset(self.observable_names))
         object.__setattr__(self, "scalar_input_names", frozenset(self.scalar_input_names))
-        object.__setattr__(self, "override_warnings", tuple(self.override_warnings))
         aliases = {
             str(name): MappingProxyType(
                 {
@@ -364,7 +354,6 @@ class ParameterAlgebraSpec:
             self.observable_names,
             copy.deepcopy(self.mechanism_namespace, memo),
             self.scalar_input_names,
-            self.override_warnings,
             copy.deepcopy(self.parameter_block, memo),
             copy.deepcopy(self.observable_block, memo),
             {
@@ -383,7 +372,6 @@ class ParameterAlgebraSpec:
                 self.observable_names,
                 self.mechanism_namespace,
                 self.scalar_input_names,
-                self.override_warnings,
                 self.parameter_block,
                 self.observable_block,
                 {

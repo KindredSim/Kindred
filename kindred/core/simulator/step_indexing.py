@@ -14,13 +14,12 @@ Policy:
 from __future__ import annotations
 
 import re
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.validation import try_parse_int
 
 __all__ = [
-    "canonical_parameter_names",
     "get_step_index_map",
     "iter_canonical_parameters",
     "lookup_step_param_target",
@@ -62,10 +61,6 @@ def iter_canonical_parameters(mechanism: object) -> Iterator[Tuple[str, Dict[str
         if role is None:
             continue
         yield (item.canonical_name, entry, role)
-
-
-def canonical_parameter_names(mechanism: object) -> Set[str]:
-    return build_namespace_from_mechanism(mechanism).flat_names()
 
 
 def lookup_step_param_target(

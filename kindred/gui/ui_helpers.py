@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import sys
 from typing import Optional
 
@@ -17,10 +16,8 @@ from kindred.gui.display_name_policy import (
 __all__ = [
     "apply_slider_name_label_layout_policy",
     "make_bounded_label",
-    "make_compact_label",
     "make_placeholder_label",
     "make_scroll_area",
-    "safe_float_parse",
     "set_bounded_label_text",
     "set_compact_label_text",
     "setup_scientific_validator",
@@ -136,29 +133,6 @@ def make_bounded_label(
     label = QtWidgets.QLabel("", parent)
     set_bounded_label_text(label, str(text), max_width=max_width, tooltip=tooltip)
     return label
-
-
-def make_compact_label(
-    text: str = "",
-    parent: Optional[QtWidgets.QWidget] = None,
-    *,
-    max_chars: int = DEFAULT_COMPACT_LABEL_MAX_CHARS,
-    max_width: int = DEFAULT_COMPACT_LABEL_MAX_WIDTH,
-    tooltip: bool = True,
-) -> QtWidgets.QLabel:
-    label = QtWidgets.QLabel("", parent)
-    set_compact_label_text(label, str(text), max_chars=max_chars, max_width=max_width, tooltip=tooltip)
-    return label
-
-
-def safe_float_parse(val_str: str, default: float) -> float:
-    try:
-        parsed = float(val_str)
-    except (ValueError, TypeError):
-        return float(default)
-    if not math.isfinite(parsed):
-        return float(default)
-    return float(parsed)
 
 
 def setup_scientific_validator(

@@ -311,19 +311,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._invalid_initial_raw.clear()
         self._origin = origin
 
-    def clear_pending_edits(self) -> None:
-        """Discard this presenter's raw drafts and validation state."""
-
-        self._pending_target_selections.clear()
-        self._pending_target_weights.clear()
-        self._pending_dataset_weights.clear()
-        self._pending_initial_rows.clear()
-        self._pending_initial_values.clear()
-        self._initial_changed_fields.clear()
-        self._invalid_raw.clear()
-        self._invalid_initial_raw.clear()
-        self._refresh_visible_presentation()
-
     # ------------------------------------------------------------------
     # Typed snapshot projection
     # ------------------------------------------------------------------

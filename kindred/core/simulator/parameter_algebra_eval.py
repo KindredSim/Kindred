@@ -640,7 +640,6 @@ def evaluate_parameter_algebra(
                 val_map = evaluate_parameter_algebra_in_context(
                     tmp_spec,
                     base_values=dict(base_values),
-                    enforce_defaults=False,
                 )
                 scalar_defaults[assignment.name] = float(val_map[assignment.name])
             except DSLError:
@@ -710,7 +709,6 @@ def evaluate_parameter_algebra_in_context(
     spec: ParameterAlgebraSpec,
     *,
     base_values: Dict[str, float],
-    enforce_defaults: bool,
 ) -> Dict[str, float]:
     statements = list(spec.param_statements)
     if not statements:

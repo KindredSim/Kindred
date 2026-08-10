@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional, TypeGuard
 
@@ -16,7 +17,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "find_outputs_dir",
     "resolve_export_start_dir",
-    "resolve_start_dir",
 ]
 
 _APP_NAME = "Kindred"
@@ -35,6 +35,55 @@ def _dir_from_env(env_var: str) -> Optional[Path]:
         return Path(str(raw)).expanduser().resolve()
     except Exception:
         return None
+
+
+def _explicit_output_dir() -> Optional[Path]:
+    """Return the explicit output directory, rejecting invalid configuration."""
+    if "KINDRED_OUTPUT_DIR" not in os.environ:
+        return None
+
+    raw = str(os.environ["KINDRED_OUTPUT_DIR"])
+    if not raw.strip():
+        raise OSError(
+            "Invalid KINDRED_OUTPUT_DIR: expected a non-empty directory path; "
+            "unset KINDRED_OUTPUT_DIR to use the default output directory."
+        )
+    try:
+        return Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise OSError(
+            f"Invalid KINDRED_OUTPUT_DIR value {raw!r}: {exc}"
+        ) from exc
+
+
+def _prepare_explicit_output_dir(path: Path) -> None:
+    """Ensure an explicit output directory is usable without falling back."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        is_directory = path.is_dir()
+    except OSError as exc:
+        raise OSError(
+            f"Cannot use KINDRED_OUTPUT_DIR {str(path)!r}: {exc}"
+        ) from exc
+    if not is_directory:
+        raise OSError(
+            f"Cannot use KINDRED_OUTPUT_DIR {str(path)!r}: "
+            "the configured path is not a directory."
+        )
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".kindred-output-probe-",
+            dir=path,
+        ) as probe:
+            probe.write(b"Kindred output probe")
+            probe.flush()
+    except OSError as exc:
+        raise OSError(
+            f"Cannot use KINDRED_OUTPUT_DIR {str(path)!r}: "
+            "could not create, write, and remove a temporary file in the "
+            f"configured directory: {exc}"
+        ) from exc
 
 
 def _qt_app_data_dir() -> Optional[Path]:
@@ -119,7 +168,7 @@ def _app_base_dir() -> Path:
 
 def find_outputs_dir() -> str:
     """Return an override, source-checkout, or installed user-data output path."""
-    override = _dir_from_env("KINDRED_OUTPUT_DIR")
+    override = _explicit_output_dir()
     if override is not None:
         return str(override)
     base = _app_base_dir()
@@ -130,33 +179,27 @@ def _is_dirlike(path: Optional[str]) -> TypeGuard[str]:
     return isinstance(path, str) and bool(path.strip())
 
 
-def resolve_start_dir(last_folder: Optional[str]) -> str:
-    """Pick a start directory for file dialogs.
-
-    Priority:
-      1) explicit `last_folder` arg if provided
-      2) outputs/ at app/repo root
-    """
-    if _is_dirlike(last_folder):
-        return str(Path(last_folder).expanduser().resolve())
-
-    # Do not create directories during startup/browse; provide a deterministic default.
-    return find_outputs_dir()
-
-
 def resolve_export_start_dir(last_folder: Optional[str]) -> str:
     """Return an existing directory for a request-time export dialog.
 
-    An existing explicit last-export directory remains authoritative.  Without
-    one, the configured/default outputs directory is created lazily.  If that
-    creation fails, only the configured path's finite parent chain is searched
-    for the nearest existing directory.
+    Explicit output configuration is validated first and never falls back.  An
+    existing remembered last-export directory remains authoritative once that
+    configuration is valid.  Without either, the default outputs directory is
+    created lazily; if creation fails, its finite parent chain is searched for
+    the nearest existing directory.
     """
 
+    explicit_output = _explicit_output_dir()
+    if explicit_output is not None:
+        _prepare_explicit_output_dir(explicit_output)
+
     if _is_dirlike(last_folder):
-        explicit = Path(last_folder).expanduser().resolve()
-        if explicit.is_dir():
-            return str(explicit)
+        remembered = Path(last_folder).expanduser().resolve()
+        if remembered.is_dir():
+            return str(remembered)
+
+    if explicit_output is not None:
+        return str(explicit_output)
 
     configured = Path(find_outputs_dir()).expanduser().resolve()
     try:

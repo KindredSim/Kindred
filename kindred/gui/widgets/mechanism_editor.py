@@ -38,7 +38,6 @@ __all__ = [
 class _MechanismEditorRenderProjection:
     source: object
     notes: str
-    slider_dirty: bool
     reactions_draft: bool
     accepted_reactions: bool
     document_identity: tuple[int, str]
@@ -119,6 +118,7 @@ class _DetailedBalanceCorrectionDialog(QtWidgets.QDialog):
             corrected = apply_wegscheider_resolution_to_reactions_text(
                 self._request.source,
                 updates,
+                units=self._request.accepted_parse_units,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(
@@ -192,8 +192,6 @@ class _PersistentToggleMenu(QtWidgets.QMenu):
 
 
 class MechanismEditorTabbed(QtWidgets.QWidget):
-    speciesModeChanged = Signal(bool)
-    speciesResetRequested = Signal()
     mechanismInspectRequested = Signal()
     sourceDraftEdited = Signal(object)
     reactionsRevertRequested = Signal()
@@ -382,6 +380,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         )
         self._reset_runtime_parameters_btn.clicked.connect(self.sliderResetRequested)
         slider_actions_layout.addWidget(self._reset_runtime_parameters_btn)
+        self.set_slider_draft_actions_enabled(False)
 
         # Visibility picker for the unified slider surface.
         self._slider_visibility_picker_btn = QtWidgets.QToolButton()
@@ -898,23 +897,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "Apply \N{BULLET}" if dirty else "Apply"
         )
 
-    def reset_slider_session_presentation(self) -> None:
-        """Restore the owned Slider widgets to a neutral project session."""
-
-        variable_blocker = QtCore.QSignalBlocker(self._variable_sliders)
-        species_blocker = QtCore.QSignalBlocker(self._species_sliders)
-        try:
-            self._variable_sliders.clear(preserve_visibility=False)
-            self._species_sliders.clear(preserve_visibility=False)
-            self._fine_btn.setChecked(False)
-        finally:
-            del species_blocker
-            del variable_blocker
-        self.clear_preview_detailed_balance_block()
-        self.set_slider_draft_actions_enabled(False)
-        self.set_slider_edit_targets_summary("Slider edit targets: none")
-        self.render_slider_workspace_presentation()
-
     def set_reactions_status_text(self, text: str, *, state: str) -> None:
         self._set_validation_state(str(state or "idle"), str(text or ""))
 
@@ -1108,7 +1090,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         *,
         source,
         notes: str,
-        slider_dirty: bool,
     ) -> None:
         """Render one tab snapshot without retaining canonical state."""
         from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -1123,9 +1104,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             notes_text = str(notes)
             if self._notes_text.toPlainText() != notes_text:
                 self._notes_text.setPlainText(notes_text)
-            self.set_slider_draft_actions_enabled(
-                bool(slider_dirty),
-            )
         finally:
             del notes_blocker
             del reactions_blocker
@@ -1133,9 +1111,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def variable_sliders_widget(self) -> VariableSliders:
         return self._variable_sliders
-
-    def notes_text(self) -> str:
-        return str(self._notes_text.toPlainText())
 
     def focused_native_editor(self) -> str | None:
         focused = QtWidgets.QApplication.focusWidget()
@@ -1252,10 +1227,6 @@ class MechanismEditorBinding(QtCore.QObject):
                 if runtime.notes_draft is None
                 else runtime.notes_draft
             ),
-            slider_dirty=bool(
-                runtime.slider_parameter_draft
-                or runtime.slider_species_drafts_by_set_id
-            ),
             reactions_draft=runtime.reactions_draft is not None,
             accepted_reactions=tab.prepared_dsl is not None,
             document_identity=document_identity,
@@ -1279,7 +1250,6 @@ class MechanismEditorBinding(QtCore.QObject):
             self._editor.render_authoring_snapshot(
                 source=projection.source,
                 notes=projection.notes,
-                slider_dirty=projection.slider_dirty,
             )
             self._editor.render_reactions_acceptance_status(
                 has_draft=projection.reactions_draft,
@@ -1320,9 +1290,6 @@ class MechanismEditorBinding(QtCore.QObject):
             None if visible_notes == tab.notes else visible_notes
         )
         self.draftStateChanged.emit(tab.tab_id, runtime.has_dirty_drafts)
-
-    def has_reactions_draft(self) -> bool:
-        return self._registry.tab_runtime(self._tab_id).reactions_draft is not None
 
     def apply_accepted_source_rewrite(
         self,

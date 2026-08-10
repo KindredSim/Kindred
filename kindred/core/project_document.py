@@ -314,19 +314,6 @@ class MechanismTabDocument:
             )
         )
 
-    def rename_initial_condition_set(
-        self,
-        set_id: str,
-        name: str,
-    ) -> "MechanismTabDocument":
-        initial_set = self.initial_condition_set(set_id)
-        return self.replace_initial_condition_set(
-            replace(
-                initial_set,
-                name=_require_name(name, "initial-condition set name"),
-            )
-        )
-
     def with_run_defaults(
         self,
         settings: SimulationExecutionSettings,
@@ -662,8 +649,6 @@ class DetailedBalanceAdmission:
 @dataclass(frozen=True, slots=True)
 class MechanismSourceReconciliation:
     proposed_document: ProjectDocument
-    introduced_species: tuple[str, ...]
-    removed_species: tuple[str, ...]
     inline_initial_conditions: DslInitialConditionAdmission
     prepared_dsl: PreparedDslRequestSet | None
     detailed_balance: DetailedBalanceAdmission
@@ -1043,8 +1028,6 @@ def retained_tab_mechanism_source(
         )
     return MechanismSourceReconciliation(
         proposed_document=document,
-        introduced_species=(),
-        removed_species=(),
         inline_initial_conditions=DslInitialConditionAdmission(
             materialized_source=tab.mechanism_source.reactions_text,
         ),
@@ -1101,12 +1084,6 @@ def reconcile_tab_mechanism_source(
             for species in new_species
             if species not in old_species_set
         )
-        removed = tuple(
-            species
-            for species in old_species
-            if species not in new_species_set
-        )
-
         reconciled_sets: list[InitialConditionSet] = []
         for initial_set in tab.initial_condition_sets:
             values = {
@@ -1328,8 +1305,6 @@ def reconcile_tab_mechanism_source(
         )
         reconciliation = MechanismSourceReconciliation(
             proposed_document=proposed_document,
-            introduced_species=introduced,
-            removed_species=removed,
             inline_initial_conditions=admission,
             prepared_dsl=prepared_dsl,
             detailed_balance=_detailed_balance_admission(

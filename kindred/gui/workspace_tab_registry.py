@@ -95,14 +95,6 @@ class ScientificDocumentDelta:
 
     affected_targets_by_tab: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
-    def affected_set_ids(self, tab_id: str) -> tuple[str, ...]:
-        target = str(tab_id)
-        for current_tab_id, set_ids in self.affected_targets_by_tab:
-            if current_tab_id == target:
-                return set_ids
-        return ()
-
-
 @dataclass(frozen=True, slots=True)
 class CanonicalMutationResult:
     """One accepted exact-revision document mutation and its result fence."""
@@ -297,6 +289,14 @@ class WorkspaceTabRegistry:
                 if not isinstance(runtime, TabRuntimeState):
                     raise TypeError("runtime_factory must return TabRuntimeState.")
                 next_runtime[tab.tab_id] = runtime
+            if (
+                runtime.reactions_draft is not None
+                and runtime.reactions_draft.reactions_text
+                == tab.mechanism_source.reactions_text
+            ):
+                # Runtime replacement establishes the Draft/canonical invariant
+                # before callers perform any later persistence or view work.
+                runtime.reactions_draft = None
             set_ids = {item.set_id for item in tab.initial_condition_sets}
             runtime.invalid_initial_text_by_set_id = {
                 set_id: values
@@ -320,12 +320,20 @@ class WorkspaceTabRegistry:
                 if previous_tab is None or previous_tab.dsl_analysis is None
                 else previous_tab.dsl_analysis.species_names
             )
+            current_initials_by_set_id = {
+                initial_set.set_id: initial_set.values_dict()
+                for initial_set in tab.initial_condition_sets
+            }
             runtime.slider_species_drafts_by_set_id = {
                 set_id: {
                     species: value
                     for species, value in values.items()
                     if species in current_species
                     and species in previous_species
+                    and float(value)
+                    != float(
+                        current_initials_by_set_id[set_id].get(species, 0.0)
+                    )
                 }
                 for set_id, values
                 in runtime.slider_species_drafts_by_set_id.items()

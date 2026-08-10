@@ -9,7 +9,6 @@ Contracts
 - External selectable units: "kcal/mol" or "kJ/mol".
 - Temperature in kelvin (K), default 298.15.
 - Standard state concentration default: 1.0 M.
-- Standard state pressure default: 1.0e5 Pa.
 """
 from __future__ import annotations
 
@@ -47,7 +46,6 @@ class UnitsModel:
     energy_unit: str = "kJ/mol"           # or "kcal/mol"
     temperature_K: float = 298.15
     standard_conc_M: float = 1.0
-    standard_pressure_Pa: float = 1.0e5
 
     def from_jmol(self, value: float) -> float:
         """Convert from canonical J/mol to current energy_unit."""

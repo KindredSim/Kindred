@@ -231,7 +231,7 @@ def scientific_identity(
         },
         "c0": c0_identity,
     }
-    from kindred.core.algebra.simulation_series import algebra_block_to_source
+    from kindred.core.algebra.printer import algebra_block_to_source
 
     compiled = getattr(mechanism, "_compiled_algebra_series", None)
     payload["observable_program"] = (
@@ -1348,10 +1348,6 @@ class ResultRepository:
     def tab_id(self) -> str:
         return self._tab_id
 
-    @property
-    def cache_capacity(self) -> int:
-        return self._cache_capacity
-
     def resize_cache_capacity(self, cache_capacity: int) -> None:
         """Apply a positive capacity immediately and trim this repository's LRU."""
 
@@ -1478,11 +1474,12 @@ class ResultRepository:
     ) -> None:
         """Clear display authorization while retaining exact reusable values.
 
-        Slider Preview uses the same canonical deauthorization boundary as
-        every other scientific edit, but its established Run-to-Reference
-        behavior moves the prior explicit entry to comparison-only storage
-        before the new request is constructed.  The reference is never an
-        eligible foreground entry and remains absent for ordinary invalidation.
+        Slider Preview reaches this canonical deauthorization boundary only
+        after constructing its exact request/key candidates. Its established
+        Run-to-Reference behavior moves the prior explicit entry to
+        comparison-only storage during the single admission fence. The
+        reference is never an eligible foreground entry and remains absent for
+        ordinary invalidation.
         """
 
         targets = {

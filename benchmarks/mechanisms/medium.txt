@@ -64,6 +64,7 @@ reaction: S18 + S21 -> S25; k=0.1
 reaction: S25 -> ; k=0.05
 
 # Initial conditions
+benchmark = {
 [S1] = 1.0
 [S2] = 0.0
 [S3] = 0.0
@@ -89,3 +90,4 @@ reaction: S25 -> ; k=0.05
 [S23] = 0.0
 [S24] = 0.0
 [S25] = 0.0
+}

@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "get_resource_text",
     "get_resource_path",
-    "list_resources",
     "get_preset_mechanism_source",
     "get_intervention_example_source",
     "get_all_intervention_example_specs",
@@ -220,39 +219,6 @@ def get_resource_path(relative_path: str) -> Path:
         raise FileNotFoundError(
             f"Resource not found: kindred/data/{relative_path}"
         ) from e
-
-
-def list_resources(subdirectory: str = "") -> list[str]:
-    """
-    List available resources in kindred/data subdirectory.
-
-    Parameters
-    ----------
-    subdirectory : str
-        Subdirectory within kindred/data (e.g., "presets")
-        Empty string lists root data directory
-
-    Returns
-    -------
-    list of str
-        Resource names (filenames only, not full paths)
-    """
-    from importlib.resources import files
-
-    try:
-        data_pkg = files("kindred").joinpath("data")
-        target = data_pkg.joinpath(subdirectory) if subdirectory else data_pkg
-
-        resources = []
-        for item in target.iterdir():
-            if item.is_file():
-                resources.append(item.name)
-
-        return sorted(resources)
-
-    except Exception as e:
-        logger.warning(f"Could not list resources in kindred/data/{subdirectory}: {e}")
-        return []
 
 
 # Convenience functions for common resources

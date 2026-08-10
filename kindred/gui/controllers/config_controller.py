@@ -516,17 +516,6 @@ class ConfigController(QtCore.QObject):
     def validate_fit_defaults_candidate(candidate: FitDefaults) -> FitDefaults:
         return validate_fit_defaults(candidate)
 
-    def persist_run_defaults(
-        self,
-        candidate: SimulationExecutionSettings,
-    ) -> SimulationExecutionSettings:
-        accepted = self.validate_run_defaults_candidate(candidate)
-        settings = self._settings()
-        for field_name, key in _RUN_SETTINGS_KEYS.items():
-            settings.setValue(key, getattr(accepted, field_name))
-        self._sync_or_report(settings, "Run defaults")
-        return accepted
-
     def persist_scientific_defaults(
         self,
         candidate: TabScientificSettings,
@@ -816,21 +805,6 @@ class ConfigController(QtCore.QObject):
         settings.setValue(_SPECIES_COLORS_KEY, overrides)
         self._sync_or_report(settings, "species colors")
         self.applicationPlotPreferencesChanged.emit()
-
-    def species_color_strings(
-        self,
-        known_species: Iterable[str],
-    ) -> Mapping[str, str]:
-        """Return the presenter's immutable color-string mapping."""
-        roster = self._clean_species_names(known_species)
-        return MappingProxyType(
-            {
-                name: self.species_color(name, roster).name(
-                    QtGui.QColor.NameFormat.HexRgb
-                )
-                for name in roster
-            }
-        )
 
     def experimental_point_size(self) -> int:
         value = self._setting(

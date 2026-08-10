@@ -31,18 +31,7 @@ This module performs no I/O and has no side effects.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Protocol
-
-class _ErrorFactory(Protocol):
-    def __call__(
-        self,
-        msg: str,
-        *,
-        line: int,
-        col: int,
-        end_col: int | None = None,
-        line_text: str | None = None,
-    ) -> "AlgebraError": ...
+from typing import Optional
 
 __all__ = [
     "AlgebraError",
@@ -53,9 +42,6 @@ __all__ = [
     "AlgebraZeroDivError",
     "AlgebraTypeError",
     "AlgebraBoolCastError",
-    "ERROR_CLASSES",
-    "error_from_kind",
-    "make_error",
 ]
 
 
@@ -174,68 +160,3 @@ class AlgebraTypeError(AlgebraError):
 class AlgebraBoolCastError(AlgebraError):
     def __init__(self, msg: str, *, line: int, col: int, end_col: int | None = None, line_text: str | None = None):
         super().__init__(msg=msg, code="E170", line=line, col=col, end_col=end_col, line_text=line_text)
-
-
-# Public mapping for parsers/evaluators that dispatch by kind string
-ERROR_CLASSES: Dict[str, _ErrorFactory] = {
-    "SyntaxError": AlgebraSyntaxError,
-    "NameError": AlgebraNameError,
-    "ShadowError": AlgebraShadowError,
-    "DomainError": AlgebraDomainError,
-    "ZeroDiv": AlgebraZeroDivError,
-    "TypeError": AlgebraTypeError,
-    "BoolCastError": AlgebraBoolCastError,
-}
-
-
-def error_from_kind(kind: str) -> _ErrorFactory:
-    """
-    Return the AlgebraError subclass for a given spec kind name.
-
-    Examples
-    --------
-    error_from_kind("SyntaxError") -> AlgebraSyntaxError
-    """
-    try:
-        return ERROR_CLASSES[kind]
-    except KeyError:
-        raise KeyError(f"unknown algebra error kind {kind!r}") from None
-
-
-# ----------------------------- convenience API -------------------------------
-
-
-def make_error(
-    kind: str,
-    msg: str,
-    *,
-    line: int,
-    col: int,
-    end_col: int | None = None,
-    line_text: str | None = None,
-) -> AlgebraError:
-    """
-    Construct an AlgebraError of the given kind with location and excerpt.
-
-    Parameters
-    ----------
-    kind : str
-        One of: "SyntaxError","NameError","ShadowError","DomainError",
-                "ZeroDiv","TypeError","BoolCastError".
-    msg : str
-        Human-readable message (without code prefix).
-    line : int
-        1-based source line number.
-    col : int
-        1-based start column.
-    end_col : int | None
-        1-based inclusive end column; if None, a single-caret is rendered.
-    line_text : str | None
-        Source line for caret rendering.
-
-    Returns
-    -------
-    AlgebraError
-    """
-    factory = error_from_kind(kind)
-    return factory(msg, line=line, col=col, end_col=end_col, line_text=line_text)

@@ -25,8 +25,9 @@ from kindred.core.algebra.parser import (
     UnaryNode,
 )
 from kindred.core.algebra.identifier_canonicalization import canonicalize_algebra_block
-from kindred.core.algebra.printer import algebra_block_to_source
-from kindred.core.algebra.symbol_table import build_algebra_symbol_table
+from kindred.core.algebra.symbol_table import (
+    build_algebra_symbol_table as _build_algebra_symbol_table,
+)
 from kindred.core.simulator.parameter_algebra_spec import (
     invalid_parameter_algebra_identifier_reference_message,
 )
@@ -35,7 +36,6 @@ from kindred.core.simulator.parameter_namespace import MechanismParameterNamespa
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "build_algebra_symbol_table",
     "compiled_algebra_for_mechanism",
     "compile_algebra_observables",
     "evaluate_algebra_series_for_simulation_with_errors",
@@ -86,7 +86,6 @@ def _reject_invalid_identifier_references(
 class CompiledAlgebraSeries:
     """Pre-parsed algebra observables for repeated evaluation."""
 
-    processed_text: str
     block: AlgebraBlock
     observable_names: Tuple[str, ...]
 
@@ -117,10 +116,8 @@ def compile_algebra_observables(
     if not isinstance(retained_block, AlgebraBlock):
         raise TypeError("retained Algebra spec has no observable AST block.")
     algebra_block = retained_block
-    processed = algebra_block_to_source(algebra_block)
     if mechanism_namespace is not None:
         algebra_block = canonicalize_algebra_block(algebra_block, mechanism_namespace=mechanism_namespace)
-        processed = algebra_block_to_source(algebra_block)
     allowed_names = {
         str(name)
         for name in getattr(retained_spec, "mechanism_param_names", ()) or ()
@@ -136,7 +133,6 @@ def compile_algebra_observables(
     )
     observable_names = tuple(str(stmt.name) for stmt in (algebra_block.lines or []))
     return CompiledAlgebraSeries(
-        processed_text=processed,
         block=algebra_block,
         observable_names=observable_names,
     )
@@ -158,7 +154,7 @@ def _build_simulation_context(
     runtime_series.setdefault("t", t_arr)
     if temperature_K is not None and "T" not in runtime_series:
         runtime_series["T"] = float(temperature_K)
-    symtab = build_algebra_symbol_table(mechanism)
+    symtab = _build_algebra_symbol_table(mechanism)
     return EvaluationContext(
         t=t_arr,
         species_series={k: np.asarray(v, dtype=float).reshape(-1) for k, v in species_series.items()},

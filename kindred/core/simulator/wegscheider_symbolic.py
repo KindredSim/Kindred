@@ -39,6 +39,7 @@ from kindred.core.symbolic.backend import get_symbolic_backend_metadata
 from kindred.core.symbolic.identity import symbolic_fingerprint
 from kindred.core.symbolic.proof import prove_product_identity
 from kindred.core.temperature import TemperatureScheduleDictProtocol
+from kindred.core.units import UnitsModel
 
 __all__ = [
     "UnresolvedWegscheiderCyclicityError",
@@ -473,7 +474,11 @@ def build_wegscheider_resolution_updates(
 def apply_wegscheider_resolution_to_reactions_text(
     dsl_text: str,
     updates: Sequence[WegscheiderResolutionUpdate],
+    *,
+    units: UnitsModel,
 ) -> str:
+    if type(units) is not UnitsModel:
+        raise TypeError("Detailed-balance correction units must be UnitsModel.")
     pending = {str(update.parameter_name).lower(): update for update in updates}
     if not pending:
         return str(dsl_text or "")
@@ -494,6 +499,7 @@ def apply_wegscheider_resolution_to_reactions_text(
         lines = _materialize_admitted_dG_source_updates(
             str(dsl_text or ""),
             dg_updates,
+            units=units,
         )
         pending = {
             key: update
@@ -534,6 +540,8 @@ def apply_wegscheider_resolution_to_reactions_text(
 def _materialize_admitted_dG_source_updates(
     dsl_text: str,
     updates: Mapping[str, WegscheiderResolutionUpdate],
+    *,
+    units: UnitsModel,
 ) -> list[str]:
     """Materialize dG corrections through admitted origins and coordinates."""
 
@@ -551,7 +559,7 @@ def _materialize_admitted_dG_source_updates(
     )
     from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
 
-    prepared = prepare_dsl_request_set(dsl_text)
+    prepared = prepare_dsl_request_set(dsl_text, units=units)
     analysis = prepared.analysis
     lines = analysis.normalized_text.splitlines()
     positions = origin_line_positions(analysis)

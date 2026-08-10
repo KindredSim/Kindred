@@ -502,19 +502,6 @@ class TemperatureSchedule:
         """
         return self._intervals.copy()
 
-    def get_time_range(self) -> Optional[Tuple[float, float]]:
-        """
-        Get time range covered by schedule.
-
-        Returns
-        -------
-        tuple of (float, float) or None
-            (t_min, t_max) for piecewise schedules, None for constant
-        """
-        if self.schedule_type in {"piecewise", "response"} and self._intervals:
-            return (self._intervals[0].t_start, self._intervals[-1].t_end)
-        return None
-
     def to_dict(self) -> dict:
         """
         Convert schedule to dictionary (for serialization).

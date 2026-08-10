@@ -385,6 +385,18 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         row.addWidget(self._copy_identity_json_button)
         layout.addLayout(row)
 
+        self._body_scroll = QtWidgets.QScrollArea(self)
+        self._body_scroll.setObjectName("results_summary_body_scroll")
+        self._body_scroll.setWidgetResizable(True)
+        self._body_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._body_scroll.setMinimumHeight(0)
+        self._body_content = QtWidgets.QWidget(self._body_scroll)
+        body_layout = QtWidgets.QVBoxLayout(self._body_content)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(8)
+        self._body_scroll.setWidget(self._body_content)
+        layout.addWidget(self._body_scroll, stretch=1)
+
         stats_group = QtWidgets.QGroupBox("Fit Statistics")
         form = QtWidgets.QFormLayout(stats_group)
         self._stats_labels: dict[str, QtWidgets.QLabel] = {}
@@ -403,10 +415,17 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             "Message",
             "Objective SSQ",
         ):
+            field_label = QtWidgets.QLabel(f"{label_text}:")
+            field_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
             value_label = QtWidgets.QLabel("\u2014")
-            form.addRow(f"{label_text}:", value_label)
+            value_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            form.addRow(field_label, value_label)
             self._stats_labels[label_text] = value_label
-        layout.addWidget(stats_group)
+        body_layout.addWidget(stats_group)
 
         params_group = QtWidgets.QGroupBox("Fitted Parameters")
         params_group.setObjectName("fitted_params_group")
@@ -422,14 +441,8 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         self._params_content_label.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
         )
-        params_scroll = QtWidgets.QScrollArea()
-        params_scroll.setObjectName("fitted_params_scroll")
-        params_scroll.setWidgetResizable(True)
-        params_scroll.setMaximumHeight(200)
-        params_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        params_scroll.setWidget(self._params_content_label)
-        params_layout.addWidget(params_scroll)
-        layout.addWidget(params_group)
+        params_layout.addWidget(self._params_content_label)
+        body_layout.addWidget(params_group)
 
         metrics_group = QtWidgets.QGroupBox("Per-dataset Metrics")
         metrics_layout = QtWidgets.QVBoxLayout(metrics_group)
@@ -442,7 +455,8 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
         )
         metrics_layout.addWidget(self._dataset_metrics_label)
-        layout.addWidget(metrics_group)
+        body_layout.addWidget(metrics_group)
+        body_layout.addStretch(1)
 
         self.refresh(
             identity,
@@ -965,13 +979,10 @@ class RunResultsTab(QtWidgets.QWidget):
 
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be a FitCandidate.")
-        available, reasons = self._normalize_apply_availability(
+        self.set_apply_availability(
             available_scopes,
             unavailable_reasons,
         )
-        self._available_apply_scopes = available
-        self._unavailable_apply_reasons = MappingProxyType(reasons)
-        self._project_apply_availability()
         self.set_run_identity(candidate.run_identity)
         self._candidate = candidate
         self._last_fitted_params = tuple(candidate.parameters)
@@ -1081,6 +1092,21 @@ class RunResultsTab(QtWidgets.QWidget):
             for scope, reason in (unavailable_reasons or {}).items()
         }
         return available, reasons
+
+    def set_apply_availability(
+        self,
+        available_scopes: frozenset[str] | None,
+        unavailable_reasons: Mapping[str, str] | None,
+    ) -> None:
+        """Project owner-retained Apply feasibility independently of the view."""
+
+        available, reasons = self._normalize_apply_availability(
+            available_scopes,
+            unavailable_reasons,
+        )
+        self._available_apply_scopes = available
+        self._unavailable_apply_reasons = MappingProxyType(reasons)
+        self._project_apply_availability()
 
     def _project_apply_availability(self) -> None:
         has_owner_projection = bool(

@@ -4,6 +4,8 @@ import logging
 import os
 from typing import Callable, Mapping
 
+from kindred.gui.plot_config import require_pyqtgraph
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,8 +47,17 @@ def apply_qt_startup_workarounds(
     - auto    : force software OpenGL only on WSL (default)
     """
     env = os.environ if environ is None else environ
-    raw_mode = str(env.get("KINDRED_QT_OPENGL", "auto")).strip().lower()
-    mode = raw_mode if raw_mode in {"auto", "software", "default"} else "auto"
+    if "KINDRED_QT_OPENGL" in env:
+        raw_mode = str(env["KINDRED_QT_OPENGL"])
+        mode = raw_mode.strip().lower()
+        if mode not in {"auto", "software", "default"}:
+            raise ValueError(
+                f"Invalid KINDRED_QT_OPENGL value {raw_mode!r}; "
+                "expected one of: auto, software, default."
+            )
+    else:
+        mode = "auto"
+    require_pyqtgraph(context="Kindred GUI")
     is_wsl = detect_wsl_environment(environ=env)
 
     apply_software = False

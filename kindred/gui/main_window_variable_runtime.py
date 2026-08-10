@@ -16,7 +16,6 @@ from kindred.core.project_document import (
     canonical_initial_values,
     canonical_species_names,
 )
-from kindred.core.project_session import ProjectContentToken
 from kindred.core.result_repository import (
     PreviewResultIdentity,
     PreviewResultKey,
@@ -67,10 +66,6 @@ class ParameterSliderProjection:
     def metadata_dict(self) -> dict[str, dict[str, object]]:
         return {name: dict(items) for name, items in self.metadata}
 
-    def coordinate_dict(self) -> dict[str, GuiParameterCoordinate]:
-        return {coordinate.name: coordinate for coordinate in self.coordinates}
-
-
 @dataclass(frozen=True, slots=True)
 class ActiveSliderRenderProjection:
     tab: MechanismTabDocument
@@ -106,7 +101,7 @@ class _PendingGesture:
 class _GestureCapture:
     """Gesture-invariant accepted facts reusable at slider cadence."""
 
-    content_token: ProjectContentToken
+    document_identity: tuple[int, str]
     tab: MechanismTabDocument
     projection: ParameterSliderProjection
     targets: tuple[str, ...]
@@ -355,7 +350,7 @@ class TabSliderBinding(QtCore.QObject):
             return
         tab, projection = prepared
         self._gesture_capture = _GestureCapture(
-            content_token=self._registry.capture_content_token(),
+            document_identity=self._registry.document_identity(self._tab_id),
             tab=tab,
             projection=projection,
             targets=targets,
@@ -706,6 +701,7 @@ class TabSliderBinding(QtCore.QObject):
                 f"draft and semantic state were retained: {exc}"
             )
             self.clear_projection()
+            self.publish_slider_draft_state()
             return False
         try:
             self.apply_render_projection(prepared)
@@ -716,7 +712,9 @@ class TabSliderBinding(QtCore.QObject):
                 f"draft and semantic state were retained: {exc}"
             )
             self.clear_projection()
+            self.publish_slider_draft_state()
             return False
+        self.publish_slider_draft_state()
         return True
 
     def clear_projection(self) -> None:
@@ -1087,7 +1085,8 @@ class TabSliderBinding(QtCore.QObject):
         if (
             capture.tab.tab_id != self._tab_id
             or capture.targets != tuple(targets)
-            or self._registry.capture_content_token() != capture.content_token
+            or self._registry.document_identity(self._tab_id)
+            != capture.document_identity
             or self._registry.tab(self._tab_id) != capture.tab
         ):
             self.errorRaised.emit(
@@ -1203,23 +1202,6 @@ class TabSliderBinding(QtCore.QObject):
             )
             return
 
-        # The draft is accepted at this point.  Fence every affected target
-        # before constructing any request/algebra/intervention schedule so a
-        # post-acceptance failure cannot leave old foreground science eligible.
-        # Preserve the established Run-to-Reference presentation while the
-        # canonical owner advances both publication generations.
-        self._stop_preview_timers()
-        self._preview_capture = None
-        self.previewTransitionOriginCaptureRequested.emit(
-            dirty_targets,
-            bool(animate_preview),
-        )
-        self._simulation_jobs.deauthorize_targets(
-            tab.tab_id,
-            dirty_targets,
-            preserve_reference=True,
-        )
-
         constructed: list[
             tuple[PreviewResultIdentity, str, SimulationExecutionRequest]
         ] = []
@@ -1260,37 +1242,41 @@ class TabSliderBinding(QtCore.QObject):
                 )
         except Exception as exc:  # noqa: BLE001
             self._reject(
-                "Preview construction failed after acceptance "
+                "Preview construction failed before admission "
                 f"({type(exc).__name__}: {exc})."
             )
             self.cancel_pending_preview_intent()
             return
 
-        captured: list[
-            tuple[PreviewResultKey, str, SimulationExecutionRequest]
-        ] = []
-        for identity, set_name, execution_request in constructed:
-            key = self._simulation_jobs.begin_preview_edit(
-                identity
-            )
-            if key is not None:
-                captured.append(
-                    (
-                        key,
-                        set_name,
-                        execution_request,
-                    )
-                )
-        if not captured:
+        # Construction above is fallible. Only a complete exact batch reaches
+        # the scheduler's single fence/admission transition.
+        self._stop_preview_timers()
+        self._preview_capture = None
+        self.previewTransitionOriginCaptureRequested.emit(
+            dirty_targets,
+            bool(animate_preview),
+        )
+        keys = self._simulation_jobs.admit_preview_edits(
+            identity for identity, _set_name, _request in constructed
+        )
+        if not keys:
             self.cancel_pending_preview_intent()
             return
+        captured = tuple(
+            (key, set_name, execution_request)
+            for key, (_identity, set_name, execution_request) in zip(
+                keys,
+                constructed,
+                strict=True,
+            )
+        )
         for key, _set_name, _execution_request in captured:
             self._latest_preview_keys[key.set_id] = key
         self._preview_capture = _PreviewCapture(
             tab_id=tab.tab_id,
             prepared_dsl=prepared_dsl,
             projection=projection,
-            targets=tuple(captured),
+            targets=captured,
             debounce_kind=str(debounce_kind),
         )
         self.previewEndpointPresentationRequested.emit(
@@ -1531,6 +1517,14 @@ class TabSliderBinding(QtCore.QObject):
             or runtime.slider_species_drafts_by_set_id
         )
 
+    def publish_slider_draft_state(self) -> None:
+        """Publish this exact binding's current Slider Draft truth."""
+
+        self.sliderDraftStateChanged.emit(
+            self._tab_id,
+            self.has_slider_draft(),
+        )
+
     def suspend_preview_disposition(self) -> _SuspendedPreviewDisposition:
         """Fence one nested Run/Fit disposition without changing its draft."""
 
@@ -1583,6 +1577,7 @@ class TabSliderBinding(QtCore.QObject):
             or runtime.slider_species_drafts_by_set_id
         )
         if not changed:
+            self.publish_slider_draft_state()
             return False
         tab = self._tab_snapshot or self._registry.tab(self._tab_id)
         if tab is None:
@@ -1624,6 +1619,7 @@ class TabSliderBinding(QtCore.QObject):
             if values
         }
         if not parameter_updates and not species_updates:
+            self.publish_slider_draft_state()
             return False
         preflight_targets = tuple(
             dict.fromkeys(
@@ -1718,6 +1714,7 @@ class TabSliderBinding(QtCore.QObject):
             runtime.slider_species_drafts_by_set_id.get(set_id)
             for set_id in targets
         ):
+            self.publish_slider_draft_state()
             return False
         changed = parameter_dirty
         runtime.slider_parameter_draft.clear()
@@ -1774,12 +1771,11 @@ class TabSliderBinding(QtCore.QObject):
         )
 
     def _emit_draft_state(self) -> None:
-        slider_dirty = self.has_slider_draft()
         self.draftStateChanged.emit(
             self._tab_id,
             self._registry.tab_runtime(self._tab_id).has_dirty_drafts,
         )
-        self.sliderDraftStateChanged.emit(self._tab_id, slider_dirty)
+        self.publish_slider_draft_state()
 
     def _reject(self, message: str) -> bool:
         self.errorRaised.emit(str(message))

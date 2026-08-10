@@ -44,7 +44,6 @@ class ProjectTransientState:
 
     reactions_draft: bool = False
     notes_draft: bool = False
-    invalid_reactions: bool = False
     invalid_initial_conditions: bool = False
     slider_drafts: bool = False
     active_run_or_preview: bool = False
@@ -56,7 +55,6 @@ class ProjectTransientState:
         for field_name in (
             "reactions_draft",
             "notes_draft",
-            "invalid_reactions",
             "invalid_initial_conditions",
             "slider_drafts",
             "active_run_or_preview",
@@ -66,8 +64,6 @@ class ProjectTransientState:
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise TypeError(f"{field_name} must be bool.")
-        if self.invalid_reactions and not self.reactions_draft:
-            raise ValueError("invalid_reactions requires reactions_draft.")
 
     @property
     def has_authoring_edits(self) -> bool:
@@ -79,7 +75,7 @@ class ProjectTransientState:
 
     @property
     def has_invalid_authoring(self) -> bool:
-        return bool(self.invalid_reactions or self.invalid_initial_conditions)
+        return self.invalid_initial_conditions
 
     @property
     def has_active_work(self) -> bool:
@@ -119,7 +115,6 @@ class _DispositionChoice(Enum):
 class AuthoringDiscardMode(Enum):
     """Exact scope for one direct Integration authoring-discard action."""
 
-    INVALID_ONLY = "invalid_only"
     ALL_UNACCEPTED = "all_unaccepted"
 
 
@@ -355,7 +350,9 @@ class ProjectController(QtCore.QObject):
         if choice is _DispositionChoice.SAVE:
             saved_token = self._save_project_from_token(
                 expected_token,
-                discard_invalid_authoring=request.transient.has_invalid_authoring,
+                discard_invalid_initial_conditions=(
+                    request.transient.invalid_initial_conditions
+                ),
             )
             if saved_token is None:
                 return None
@@ -383,9 +380,7 @@ class ProjectController(QtCore.QObject):
                 "The project document or saved workspace presentation has "
                 "unsaved changes."
             )
-        if transient.invalid_reactions:
-            details.append("Visible Reactions text is invalid.")
-        elif transient.reactions_draft:
+        if transient.reactions_draft:
             details.append("Visible Reactions text has not yet been accepted.")
         if transient.notes_draft:
             details.append("Visible Notes text has not yet been saved.")
@@ -412,10 +407,7 @@ class ProjectController(QtCore.QObject):
         if (
             request.archive_dirty
             or transient.notes_draft
-            or (
-                transient.reactions_draft
-                and not transient.invalid_reactions
-            )
+            or transient.reactions_draft
         ):
             if request.application_close:
                 if transient.has_active_work:
@@ -446,11 +438,7 @@ class ProjectController(QtCore.QObject):
         if request.archive_dirty:
             discard_parts.append("Project Changes")
         if transient.reactions_draft:
-            discard_parts.append(
-                "Invalid Reactions"
-                if transient.invalid_reactions
-                else "Reactions Edit"
-            )
+            discard_parts.append("Reactions Edit")
         if transient.notes_draft:
             discard_parts.append("Notes Edit")
         if transient.invalid_initial_conditions:
@@ -725,19 +713,6 @@ class ProjectController(QtCore.QObject):
             expected_token=operative_token,
         )
 
-    def open_project_path(self, path: str) -> bool:
-        if self._reject_mutation_during_close("Open Project"):
-            return False
-        entry_token = self._session.capture_content_token()
-        operative_token = self._settle_execution_candidate(entry_token)
-        if operative_token is None:
-            return False
-        return self._open_project_candidate(
-            path,
-            remove_missing_recent=False,
-            expected_token=operative_token,
-        )
-
     def _open_project_candidate(
         self,
         path: str,
@@ -841,7 +816,7 @@ class ProjectController(QtCore.QObject):
         if operative_token is None:
             return False
         candidate = self._prepared_save_document(
-            discard_invalid_authoring=False,
+            discard_invalid_initial_conditions=False,
         )
         if candidate is None:
             return False
@@ -862,7 +837,7 @@ class ProjectController(QtCore.QObject):
         if operative_token is None:
             return False
         candidate = self._prepared_save_document(
-            discard_invalid_authoring=False,
+            discard_invalid_initial_conditions=False,
         )
         if candidate is None:
             return False
@@ -879,7 +854,7 @@ class ProjectController(QtCore.QObject):
         self,
         expected_token: ProjectContentToken,
         *,
-        discard_invalid_authoring: bool,
+        discard_invalid_initial_conditions: bool,
     ) -> ProjectContentToken | None:
         """Save during one already-fenced project disposition."""
 
@@ -892,7 +867,9 @@ class ProjectController(QtCore.QObject):
         if operative_token is None:
             return None
         candidate = self._prepared_save_document(
-            discard_invalid_authoring=discard_invalid_authoring,
+            discard_invalid_initial_conditions=(
+                discard_invalid_initial_conditions
+            ),
         )
         if candidate is None:
             return None
@@ -905,9 +882,11 @@ class ProjectController(QtCore.QObject):
     def _prepared_save_document(
         self,
         *,
-        discard_invalid_authoring: bool,
+        discard_invalid_initial_conditions: bool,
     ) -> ProjectDocument | None:
-        candidate = self._prepare_before_save(discard_invalid_authoring)
+        candidate = self._prepare_before_save(
+            discard_invalid_initial_conditions
+        )
         if candidate is None:
             return None
         if not isinstance(candidate, ProjectDocument):

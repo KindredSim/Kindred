@@ -47,7 +47,6 @@ from kindred.core.simulator.parameter_algebra_eval import (
 )
 from kindred.core.simulator.parameter_algebra_spec import (
     ParameterAlgebraSpec,
-    ParameterOverrideWarning,
     mechanism_parameter_name_pattern,
 )
 from kindred.core.simulator.step_indexing import (
@@ -407,67 +406,12 @@ def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebra
     return spec if isinstance(spec, ParameterAlgebraSpec) else None
 
 
-def _parameter_override_warnings_for_spec(
-    spec: ParameterAlgebraSpec,
-    *,
-    mechanism: object,
-) -> tuple[ParameterOverrideWarning, ...]:
-    warnings: list[ParameterOverrideWarning] = []
-    rxns = getattr(mechanism, "reactions", []) or []
-    eqs = getattr(mechanism, "equilibria", []) or []
-
-    for stmt in spec.param_statements:
-        target = lookup_step_param_target(mechanism, stmt.name)
-        if target is None:
-            continue
-        kind, index, role, entry = target
-        step_index = int(entry.get("step_index", 0) or 0)
-        inline_name: str | None = None
-
-        if kind == "reaction" and role == "k":
-            if not (0 <= index < len(rxns)):
-                continue
-            overrides = getattr(rxns[index], "overrides", {}) or {}
-            has_energy_model_override = overrides.get("model") in {"Arrhenius", "Eyring"} and any(
-                overrides.get(key) is not None
-                for key in ("A", "Ea", "Ea_J_per_mol", "dG_act_J_per_mol")
-            )
-            if not has_energy_model_override:
-                inline_name = "k"
-        elif kind == "equilibrium":
-            if not (0 <= index < len(eqs)):
-                continue
-            if role == "kf" and bool(entry.get("user_provided_kf")):
-                inline_name = "kf"
-            elif role == "kr" and bool(entry.get("user_provided_kr")):
-                inline_name = "kr"
-            elif role == "Keq" and bool(step_entry_authored_role_is_editable(entry, "Keq")):
-                inline_name = "Keq"
-
-        if inline_name is None:
-            continue
-        warnings.append(
-            ParameterOverrideWarning(
-                param_name=str(stmt.name),
-                inline_name=str(inline_name),
-                step_index=int(step_index),
-                message=f"param {stmt.name} overrides inline {inline_name} on step {step_index}",
-            )
-        )
-
-    return tuple(warnings)
-
-
 def apply_parameter_algebra_spec_to_mechanism(
     spec: ParameterAlgebraSpec,
     *,
     mechanism: object,
     require_mutable: bool,
 ) -> Dict[str, float]:
-    spec = replace(
-        spec,
-        override_warnings=_parameter_override_warnings_for_spec(spec, mechanism=mechanism),
-    )
     meta = getattr(mechanism, "metadata", None)
     _validate_parameter_algebra_editable_targets(mechanism, spec)
     active_keq_names = _active_equilibrium_keq_names(mechanism, spec)
@@ -536,7 +480,6 @@ def apply_parameter_algebra_spec_to_mechanism(
             tmp_vals = _evaluate_param_block_in_context(
                 tmp_spec,
                 base_values=dict(base_values),
-                enforce_defaults=False,
             )
             default_val = float(tmp_vals.get(stmt.name, float("nan")))
         except Exception:

@@ -76,22 +76,6 @@ class FitTargetSelection:
         object.__setattr__(self, "eligible_targets", eligible)
         object.__setattr__(self, "selected_targets", selected)
 
-    def all(self) -> "FitTargetSelection":
-        return replace(self, selected_targets=self.eligible_targets)
-
-    def none(self) -> "FitTargetSelection":
-        return replace(self, selected_targets=())
-
-    def invert(self) -> "FitTargetSelection":
-        selected = set(self.selected_targets)
-        return replace(
-            self,
-            selected_targets=tuple(
-                item for item in self.eligible_targets if item not in selected
-            ),
-        )
-
-
 def copy_target_selection(
     source: FitTargetSelection,
     destinations: tuple[FitTargetSelection, ...],

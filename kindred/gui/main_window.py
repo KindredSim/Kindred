@@ -912,6 +912,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         editor.sliderApplyRequested.connect(sliders.apply)
         editor.sliderResetRequested.connect(sliders.reset)
+        sliders.sliderDraftStateChanged.connect(
+            self._on_slider_draft_state_changed
+        )
         editor.symbolic_calculator_btn.clicked.connect(
             lambda _checked=False, captured=tab_id: self._open_symbolic_calculator(
                 captured
@@ -1009,6 +1012,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle.overlay_panel.experimentalPointOpacityRequested.connect(
             self._set_experimental_point_opacity
         )
+        sliders.publish_slider_draft_state()
 
     def _drop_tab_surface(self, tab_id: str) -> None:
         target = str(tab_id)
@@ -1240,6 +1244,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "xSeriesRequested",
             "ySeriesRequested",
             "plotPresentationIntentRequested",
+            "resultDiagnostic",
             "renderFailed",
         )
         if any(
@@ -1283,6 +1288,7 @@ class MainWindow(QtWidgets.QMainWindow):
         plot.plotPresentationIntentRequested.connect(
             lambda intent: self._set_plot_presentation(target, intent)
         )
+        plot.resultDiagnostic.connect(self._on_workspace_result_diagnostic)
         plot.renderFailed.connect(
             lambda message: self._on_workspace_plot_render_failed(
                 target,
@@ -1435,6 +1441,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     target,
                 )
                 failures.append(f"sliders clear: {clear_exc}")
+        finally:
+            bundle.slider_binding.publish_slider_draft_state()
         try:
             data_snapshot = build_data_manager_snapshot(
                 document=document,
@@ -1764,6 +1772,12 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Result display failed for mechanism {str(tab_id)!r}: {message}"
         )
         self._refresh_actions()
+
+    @QtCore.Slot(str)
+    def _on_workspace_result_diagnostic(self, message: str) -> None:
+        """Surface a successful result projection's exact diagnostic."""
+
+        self.set_status_text(str(message))
 
     @QtCore.Slot(str)
     def _on_results_changed(self, tab_id: str) -> None:
@@ -2412,7 +2426,6 @@ class MainWindow(QtWidgets.QMainWindow):
         return ProjectTransientState(
             reactions_draft=reactions_draft,
             notes_draft=notes_draft,
-            invalid_reactions=False,
             invalid_initial_conditions=invalid_initials,
             slider_drafts=slider_drafts,
             active_run_or_preview=bool(
@@ -2570,6 +2583,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if tab_id == self._workspace_tab_registry.active_tab_id:
             self._set_tab_run_enabled(tab_id, self._run_admitted(tab_id))
         self._refresh_title()
+
+    @QtCore.Slot(str, bool)
+    def _on_slider_draft_state_changed(
+        self,
+        tab_id: str,
+        dirty: bool,
+    ) -> None:
+        """Project only one exact tab binding's Slider Draft actions."""
+
+        target = str(tab_id)
+        bundle = self._tab_surfaces.get(target)
+        if bundle is None or bundle.slider_binding.tab_id != target:
+            return
+        bundle.editor.set_slider_draft_actions_enabled(bool(dirty))
 
     def _refresh_slider_target_summary(self, tab_id: str) -> None:
         bundle = self._tab_surfaces[str(tab_id)]
@@ -4318,6 +4345,16 @@ class MainWindow(QtWidgets.QMainWindow):
         projection = self._active_current_export_projection()
         if projection is None:
             self.set_status_text("No result data is available to export.")
+            return
+        try:
+            WorkspaceResultPresenter.validate_xlsx_export(projection)
+        except (TypeError, ValueError) as exc:
+            self.set_status_text(str(exc))
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export Results XLSX",
+                str(exc),
+            )
             return
         try:
             start_directory = resolve_export_start_dir(

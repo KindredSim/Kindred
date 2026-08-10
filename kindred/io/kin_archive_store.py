@@ -47,6 +47,9 @@ __all__ = [
 CURRENT_PROJECT_FORMAT = "kindred-kin-4"
 _PROJECT_MEMBER = "project.json"
 _SOURCE_MEMBER_PREFIX = "sources/"
+_CANONICAL_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+_CANONICAL_ZIP_CREATE_SYSTEM = 3
+_CANONICAL_ZIP_FILE_MODE = stat.S_IFREG | 0o644
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +84,19 @@ def _decode_json_bytes(data: bytes, *, label: str) -> object:
         )
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError(f"{label} is not valid strict JSON.") from exc
+
+
+def _canonical_zip_info(member_name: str) -> zipfile.ZipInfo:
+    """Return host-independent metadata for one canonical archive member."""
+
+    info = zipfile.ZipInfo(
+        filename=member_name,
+        date_time=_CANONICAL_ZIP_TIMESTAMP,
+    )
+    info.create_system = _CANONICAL_ZIP_CREATE_SYSTEM
+    info.external_attr = _CANONICAL_ZIP_FILE_MODE << 16
+    info.compress_type = zipfile.ZIP_STORED
+    return info
 
 
 def _finite(
@@ -1186,9 +1202,15 @@ class KinArchiveStore:
                     mode="w",
                     compression=zipfile.ZIP_STORED,
                 ) as archive:
-                    archive.writestr(_PROJECT_MEMBER, encoded)
-                    for member_name, source_bytes in source_members:
-                        archive.writestr(member_name, source_bytes)
+                    members = (
+                        (_PROJECT_MEMBER, encoded),
+                        *source_members,
+                    )
+                    for member_name, member_bytes in sorted(members):
+                        archive.writestr(
+                            _canonical_zip_info(member_name),
+                            member_bytes,
+                        )
                 handle.flush()
             try:
                 existing_mode = stat.S_IMODE(os.stat(archive_path).st_mode)

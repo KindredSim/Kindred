@@ -180,4 +180,4 @@ reaction: S90 -> S5; k=0.02
 reaction: S80 -> S3; k=0.02
 
 # Initial conditions (only S1 has initial concentration)
-[S1] = 1.0
+benchmark = { [S1] = 1.0 }

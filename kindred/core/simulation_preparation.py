@@ -57,7 +57,7 @@ from kindred.core.simulator.dsl_parse import (
     PreparedDslRequestSet,
 )
 from kindred.core.simulation_preparation_stages import (
-    PreparedSolverConfig,
+    PreparedSolverConfig as _PreparedSolverConfig,
     build_prepared_run_context,
     build_solver_config,
 )
@@ -103,7 +103,6 @@ __all__ = [
     "BoundMechanism",
     "SimulationExecutionSnapshot",
     "SimulationExecutionRequest",
-    "PreparedSolverConfig",
     "PreparedSimulationMetadata",
     "PreparedSimulationRun",
     "SimulationParameterValuePartition",
@@ -454,7 +453,7 @@ class PreparedSimulationRun:
     symbolic_wegscheider_identity: Mapping[str, Any] | None
     initials_for_algebra: Optional[Mapping[str, float]]
     warnings: tuple[str, ...]
-    solver_config: PreparedSolverConfig
+    solver_config: _PreparedSolverConfig
     request: SimulationRequest | SimulationExecutionRequest
     unresolved_intervention_schedule: InterventionSchedule | None = None
     cancellation_control: SimulationCancellationControl | None = None
@@ -465,7 +464,7 @@ class PreparedSimulationRun:
         object.__setattr__(self, "y0", y0)
         object.__setattr__(self, "species_names", tuple(self.species_names))
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
-        if not isinstance(self.solver_config, PreparedSolverConfig):
+        if not isinstance(self.solver_config, _PreparedSolverConfig):
             raise TypeError("solver_config must be PreparedSolverConfig.")
         if isinstance(self.request, SimulationExecutionRequest):
             if self.request.solver_config != self.solver_config:
@@ -603,7 +602,7 @@ class PreparedSimulationMetadata:
     t_end: float
     num_points: int
     temperature_K: float
-    solver_config: PreparedSolverConfig
+    solver_config: _PreparedSolverConfig
     initial_prefix: str
     intervention_schedule_declarative_fingerprint: str = ""
     intervention_schedule_executable_fingerprint: str = ""
@@ -612,7 +611,7 @@ class PreparedSimulationMetadata:
     symbolic_wegscheider_identity: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.solver_config, PreparedSolverConfig):
+        if not isinstance(self.solver_config, _PreparedSolverConfig):
             raise TypeError(
                 "prepared simulation metadata requires PreparedSolverConfig."
             )
@@ -788,7 +787,7 @@ class SimulationExecutionRequest:
 
     snapshot: SimulationExecutionSnapshot
     t_span: tuple[float, float]
-    solver_config: PreparedSolverConfig
+    solver_config: _PreparedSolverConfig
     parameter_overrides: Mapping[str, float] | None = None
 
     def __post_init__(self) -> None:
@@ -808,7 +807,7 @@ class SimulationExecutionRequest:
             raise ValueError(
                 "execution request requires finite 0 <= t_start < t_end."
             )
-        if not isinstance(self.solver_config, PreparedSolverConfig):
+        if not isinstance(self.solver_config, _PreparedSolverConfig):
             raise TypeError(
                 "execution request solver_config must be PreparedSolverConfig."
             )
@@ -974,7 +973,7 @@ def solver_config_for_execution_settings(
     *,
     execution_settings: Any,
     scientific_settings: Any,
-) -> PreparedSolverConfig:
+) -> _PreparedSolverConfig:
     """Project accepted tab settings into the sole direct-request policy."""
 
     from kindred.core.project_document import (
@@ -1708,7 +1707,7 @@ def _apply_execution_parameter_algebra_and_cyclicity(
     *,
     mechanism: Any,
     parameter_algebra_spec: Any,
-    prepared_solver_config: PreparedSolverConfig,
+    prepared_solver_config: _PreparedSolverConfig,
     require_mutable: bool,
 ) -> None:
     from kindred.core.simulator.parameter_algebra import (

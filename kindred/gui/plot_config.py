@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any
 
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
@@ -13,15 +13,10 @@ from kindred.core.project_presentation_state import (
 )
 
 __all__ = [
-    "try_import_pyqtgraph",
-    "is_pyqtgraph_available",
     "require_pyqtgraph",
-    "pyqtgraph_import_error",
     "AxisSelectionCandidate",
     "PlotPresentationIntent",
 ]
-
-_PYQTGRAPH_IMPORT_CACHE: Optional[Tuple[bool, Any, Optional[BaseException]]] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,49 +61,14 @@ class PlotPresentationIntent:
         object.__setattr__(self, "option", normalized)
 
 
-def try_import_pyqtgraph() -> Tuple[bool, Any, Optional[BaseException]]:
-    """
-    Attempt to import PyQtGraph and cache the result.
-
-    This function is intentionally silent: it must not log at import time, so
-    packaging tools (PyInstaller/Nuitka) can safely import Kindred modules during
-    dependency analysis without producing misleading stderr output.
-    """
-    global _PYQTGRAPH_IMPORT_CACHE
-    if _PYQTGRAPH_IMPORT_CACHE is not None:
-        return _PYQTGRAPH_IMPORT_CACHE
+def require_pyqtgraph(*, context: str = "Kindred") -> Any:
+    """Return the required plotting backend or raise one dependency error."""
 
     try:
         import pyqtgraph as pg  # type: ignore[import-not-found]
-    except BaseException as exc:  # pragma: no cover - exercised via tests using import blocking
-        _PYQTGRAPH_IMPORT_CACHE = (False, None, exc)
-    else:
-        _PYQTGRAPH_IMPORT_CACHE = (True, pg, None)
-    return _PYQTGRAPH_IMPORT_CACHE
-
-
-def pyqtgraph_import_error() -> Optional[BaseException]:
-    """Return the cached PyQtGraph import exception, if any (without logging)."""
-    ok, _pg, exc = try_import_pyqtgraph()
-    if ok:
-        return None
-    return exc
-
-
-def is_pyqtgraph_available() -> bool:
-    ok, _pg, _exc = try_import_pyqtgraph()
-    return bool(ok)
-
-
-def require_pyqtgraph(*, context: str = "Kindred") -> Any:
-    ok, pg, exc = try_import_pyqtgraph()
-    if ok:
-        return pg
-
-    detail = ""
-    if exc is not None:
-        detail = f" (import failed: {exc!r})"
-    raise ImportError(
-        f"{context} requires PyQtGraph for plotting.{detail} "
-        "Install with: pip install pyqtgraph"
-    ) from exc
+    except Exception as exc:
+        raise ImportError(
+            f"{context} requires PyQtGraph for plotting "
+            f"(import failed: {exc!r}). Install with: pip install pyqtgraph"
+        ) from exc
+    return pg

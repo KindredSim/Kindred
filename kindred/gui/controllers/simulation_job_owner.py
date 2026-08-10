@@ -949,14 +949,6 @@ class SimulationJobOwner(QtCore.QObject):
     def pending_preview_tab_id(self) -> str | None:
         return self._pending_preview.tab_id if self._pending_preview else None
 
-    def is_tab_executing(self, tab_id: str) -> bool:
-        target = str(tab_id or "")
-        pending = self._pending_detailed_balance
-        return bool(
-            (self._worker is not None and self._origin_tab_id == target)
-            or (pending is not None and pending.capture.tab_id == target)
-        )
-
     def explicit_publication_generation(self, tab_id: str, set_id: str) -> int:
         target = (
             _required_id(tab_id, "tab_id"),
@@ -1213,48 +1205,67 @@ class SimulationJobOwner(QtCore.QObject):
         self.results_changed.emit(tid)
         return generations
 
-    def begin_preview_edit(
+    def admit_preview_edits(
         self,
-        identity: PreviewResultIdentity,
-    ) -> PreviewResultKey | None:
-        """Install the exact Preview key after request construction.
+        identities: Iterable[PreviewResultIdentity],
+    ) -> tuple[PreviewResultKey, ...]:
+        """Fence once and install one fully constructed exact Preview batch."""
 
-        The caller fences the affected targets before constructing the
-        request.  Reusing the already-advanced Preview generation keeps key
-        installation from becoming a second, provisional currentness fence.
-        """
-
-        if not isinstance(identity, PreviewResultIdentity):
-            raise TypeError("identity must be a PreviewResultIdentity.")
+        captured = tuple(identities)
+        if not captured:
+            raise ValueError("Preview admission requires at least one identity.")
+        if any(
+            not isinstance(identity, PreviewResultIdentity)
+            for identity in captured
+        ):
+            raise TypeError(
+                "Preview admission identities must be PreviewResultIdentity values."
+            )
+        tab_id = captured[0].tab_id
+        if any(identity.tab_id != tab_id for identity in captured):
+            raise ValueError("One Preview admission batch cannot span tabs.")
+        set_ids = tuple(identity.set_id for identity in captured)
+        if len(set(set_ids)) != len(set_ids):
+            raise ValueError("Preview admission targets must be unique.")
         if self._application_close_fenced:
             self.status_changed.emit("Preview rejected: simulation owner is closing.")
-            return None
-        target = (identity.tab_id, identity.set_id)
-        generation = self._preview_publication_generation(
-            identity.tab_id,
-            identity.set_id,
-        )
-        if generation <= 0 or target in self._current_preview_key_by_target:
-            raise RuntimeError(
-                "Preview key installation requires a prior target fence."
+            return ()
+
+        # Construct every exact key against the next generation before the
+        # existing deauthorization fence changes foreground authority.
+        keys = tuple(
+            PreviewResultKey.from_identity(
+                identity,
+                generation=(
+                    self._preview_publication_generation(
+                        identity.tab_id,
+                        identity.set_id,
+                    )
+                    + 1
+                ),
             )
-        key = PreviewResultKey.from_identity(
-            identity,
-            generation=generation,
+            for identity in captured
         )
-        repository = self._repository(identity.tab_id)
-        self._drop_pending_preview_for_targets(identity.tab_id, (identity.set_id,))
-        repository.capture_preview_reference(key)
-        repository.authorize_preview_display(key)
-        self._current_preview_key_by_target[
-            (identity.tab_id, identity.set_id)
-        ] = key
-        self._cancel_generation_counter_retirement(
-            identity.tab_id,
-            (identity.set_id,),
+        repository = self._repository(tab_id)
+        self.deauthorize_targets(
+            tab_id,
+            set_ids,
+            preserve_reference=True,
         )
-        self.results_changed.emit(identity.tab_id)
-        return key
+        for key in keys:
+            if key.generation != self._preview_publication_generation(
+                key.tab_id,
+                key.set_id,
+            ):
+                raise RuntimeError(
+                    "Preview admission generation changed during its exact fence."
+                )
+            repository.capture_preview_reference(key)
+            repository.authorize_preview_display(key)
+            self._current_preview_key_by_target[(key.tab_id, key.set_id)] = key
+        self._cancel_generation_counter_retirement(tab_id, set_ids)
+        self.results_changed.emit(tab_id)
+        return keys
 
     def reconcile_canonical_targets(
         self,

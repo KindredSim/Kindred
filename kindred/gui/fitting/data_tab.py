@@ -448,14 +448,6 @@ class DataTab(QtWidgets.QWidget):
                 self._invalid_raw.pop(key, None)
         self._project_controls()
 
-    def clear_pending(self) -> None:
-        """Discard only this panel's raw drafts and validation state."""
-
-        self._pending.clear()
-        self._changed_fields.clear()
-        self._invalid_raw.clear()
-        self._project_controls()
-
     def set_resolved_auto_modes(
         self,
         modes: tuple[tuple[str, str], ...],

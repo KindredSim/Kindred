@@ -46,7 +46,6 @@ class FastEquilibriumRates:
     kf: float
     kr: float
     Keq: float
-    k_fast: float
     source: str
 
 
@@ -90,7 +89,6 @@ def derive_fast_equilibrium_rates(
         kf=forward,
         kr=reverse,
         Keq=equilibrium_constant,
-        k_fast=forward,
         source=source,
     )
 
@@ -668,17 +666,6 @@ def normalize_existing_equilibrium_rate_authority(eq: object) -> EquilibriumRate
         metadata=meta if isinstance(meta, Mapping) else {},
         context=context,
     )
-
-
-def json_safe_equilibrium_metadata_payload(source: object) -> dict[str, object]:
-    if isinstance(source, Mapping) and "equilibrium_authority" not in source:
-        metadata = source
-    else:
-        metadata = getattr(source, "metadata", {}) or {}
-    payload = json_safe_equilibrium_authority_payload(metadata)
-    if not isinstance(payload, Mapping):
-        return {}
-    return {str(key): payload[key] for key in payload}
 
 
 def authority_fields_from_step_entry(entry: Mapping[str, Any] | None) -> Mapping[str, Any]:

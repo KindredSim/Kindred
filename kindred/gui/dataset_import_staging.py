@@ -267,13 +267,13 @@ class DatasetImportWorkerRequest:
 
 @dataclass(frozen=True, slots=True)
 class DatasetImportProgress:
-    request: DatasetImportWorkerRequest
+    request: DatasetImportRequest
     percent: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.request, DatasetImportWorkerRequest):
+        if not isinstance(self.request, DatasetImportRequest):
             raise TypeError(
-                "Dataset import progress requires DatasetImportWorkerRequest."
+                "Dataset import progress requires DatasetImportRequest."
             )
         if type(self.percent) is not int or not 0 <= self.percent <= 100:
             raise ValueError(
@@ -964,14 +964,13 @@ class DatasetImportStaging(QtCore.QObject):
         if progress <= previous:
             return True
         active.latest_progress_by_worker[request.worker_id] = progress
-        self._publish_aggregate_progress(active, request=request)
+        self._publish_aggregate_progress(active)
         return True
 
     def _publish_aggregate_progress(
         self,
         active: _ActiveImport,
         *,
-        request: DatasetImportWorkerRequest | None = None,
         force_complete: bool = False,
     ) -> None:
         """Publish monotonic progress weighted by admitted dataset units."""
@@ -998,9 +997,8 @@ class DatasetImportStaging(QtCore.QObject):
         if aggregate <= active.aggregate_progress:
             return
         active.aggregate_progress = aggregate
-        event_request = request or active.worker_requests[0]
         self.workerProgressed.emit(
-            DatasetImportProgress(request=event_request, percent=aggregate)
+            DatasetImportProgress(request=active.request, percent=aggregate)
         )
 
     def _worker_failed(

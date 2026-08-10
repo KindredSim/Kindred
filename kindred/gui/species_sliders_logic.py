@@ -9,14 +9,11 @@ from __future__ import annotations
 
 import math
 import sys
-from typing import Iterable
-
 from kindred.core.validation import try_parse_nonneg_finite_float
 
 __all__ = [
     "try_nonneg_finite",
     "sanitize_nonneg_finite",
-    "compute_row_max",
     "compute_slider_max_option_c",
 ]
 
@@ -40,20 +37,6 @@ def sanitize_nonneg_finite(value: object) -> float:
     """
     v, ok = try_nonneg_finite(value)
     return float(v) if ok else 0.0
-
-
-def compute_row_max(values: Iterable[object]) -> float:
-    """
-    Return the maximum sanitized value across the row.
-
-    Values are sanitized via `sanitize_nonneg_finite`.
-    """
-    row_max = 0.0
-    for raw in values:
-        v = sanitize_nonneg_finite(raw)
-        if v > row_max:
-            row_max = v
-    return float(row_max)
 
 
 def compute_slider_max_option_c(*, v: object, row_max: object) -> float:

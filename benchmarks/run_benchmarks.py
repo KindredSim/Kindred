@@ -29,16 +29,34 @@ import numpy as np
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
+from kindred.core.mechanism import Mechanism
+from kindred.core.simulator.dsl_parse import (
+    DslInitialConditionDeclaration,
+    prepare_dsl_request_set,
+)
 from kindred.core.intervention_schedule_compiler import (
     compile_intervention_schedule,
 )
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
-from kindred.core.simulator.solvers import solve_ode, SimulationRequest
+from kindred.core.simulator.solver_types import SimulationRequest
+from kindred.core.simulator.solvers import solve_ode
+from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 
 logger = logging.getLogger(__name__)
 
 _EMPTY_INTERVENTION_EXECUTION = compile_intervention_schedule(None)
+_BENCHMARK_SYMBOLIC_JACOBIAN = SymbolicJacobianExecution.disabled(
+    code="benchmark-numeric-solver",
+    reason="The performance benchmark exercises the numeric solver path.",
+)
+
+
+@dataclass(frozen=True)
+class LoadedBenchmarkMechanism:
+    """One admitted mechanism and its sole selected typed initial state."""
+
+    mechanism: Mechanism
+    initial_condition: DslInitialConditionDeclaration
 
 
 @dataclass
@@ -65,17 +83,36 @@ class BenchmarkSuite:
     summary: Dict[str, float]
 
 
-def load_mechanism_from_file(filepath: Path):
+def load_mechanism_from_file(filepath: Path) -> LoadedBenchmarkMechanism:
     """Load mechanism from DSL file."""
     try:
         with open(filepath, 'r') as f:
             dsl_text = f.read()
 
-        mechanism = prepare_dsl_request_set(
+        prepared = prepare_dsl_request_set(
             dsl_text,
             initials={},
-        ).mechanism_for_execution()
-        return mechanism
+        )
+        declarations = prepared.analysis.inline_initial_conditions.declarations
+        if len(declarations) != 1:
+            raise ValueError(
+                "Benchmark source must admit exactly one typed initial-condition "
+                f"declaration; found {len(declarations)}."
+            )
+        mechanism = prepared.mechanism_for_execution()
+        initial_condition = declarations[0]
+        unknown_species = sorted(
+            set(initial_condition.values) - set(mechanism.species_names())
+        )
+        if unknown_species:
+            raise ValueError(
+                "Benchmark initial-condition declaration contains unknown "
+                "species: " + ", ".join(unknown_species)
+            )
+        return LoadedBenchmarkMechanism(
+            mechanism=mechanism,
+            initial_condition=initial_condition,
+        )
 
     except Exception as exc:
         logger.error(f"Failed to load mechanism from {filepath}: {exc}")
@@ -83,7 +120,7 @@ def load_mechanism_from_file(filepath: Path):
 
 
 def benchmark_simulation(
-    mechanism,
+    loaded: LoadedBenchmarkMechanism,
     mechanism_name: str,
     t_span=(0, 100),
     solver='BDF',
@@ -95,8 +132,8 @@ def benchmark_simulation(
 
     Parameters
     ----------
-    mechanism : Mechanism
-        Mechanism to benchmark
+    loaded : LoadedBenchmarkMechanism
+        Admitted mechanism and its sole typed initial-condition declaration
     mechanism_name : str
         Name for reporting
     t_span : tuple
@@ -113,6 +150,7 @@ def benchmark_simulation(
     BenchmarkResult
         Benchmark results
     """
+    mechanism = loaded.mechanism
     n_species = len(mechanism.species_names())
     n_reactions = len(mechanism.reactions) + len(mechanism.equilibria)
 
@@ -124,7 +162,16 @@ def benchmark_simulation(
     # Build ODE system
     rhs = build_ode_rhs_from_mechanism(mechanism)
     species_names = mechanism.species_names()
-    y0 = np.array([mechanism.species[sp].initial_conc for sp in species_names])
+    initial_values = loaded.initial_condition.values
+    y0 = np.array(
+        [float(initial_values.get(species, 0.0)) for species in species_names],
+        dtype=float,
+    )
+    if not np.any(y0 > 0.0):
+        raise ValueError(
+            "Benchmark initial-condition declaration must contain a positive "
+            "concentration."
+        )
 
     # Run simulation with timing
     start_time = time.time()
@@ -140,6 +187,7 @@ def benchmark_simulation(
             t_span=t_span,
             y0=y0,
             intervention_execution=_EMPTY_INTERVENTION_EXECUTION,
+            symbolic_jacobian=_BENCHMARK_SYMBOLIC_JACOBIAN,
             solver=solver,
             rtol=rtol,
             atol=atol,
@@ -148,6 +196,15 @@ def benchmark_simulation(
 
         # Run simulation
         result = solve_ode(request)
+        trajectory = np.asarray(result.Y, dtype=float)
+        if (
+            trajectory.ndim != 2
+            or trajectory.shape[1] < 2
+            or not np.any(trajectory[:, -1] != trajectory[:, 0])
+        ):
+            raise RuntimeError(
+                "Benchmark execution did not change any scientific state."
+            )
 
         success = True  # solve_ode doesn't return success flag
         n_steps = len(result.t)
@@ -224,8 +281,8 @@ def run_benchmark_suite(
     # Run benchmarks
     for mech_file in mechanism_files:
         try:
-            mechanism = load_mechanism_from_file(mech_file)
-            result = benchmark_simulation(mechanism, mech_file.stem)
+            loaded = load_mechanism_from_file(mech_file)
+            result = benchmark_simulation(loaded, mech_file.stem)
             results.append(result)
 
         except Exception as exc:

@@ -662,9 +662,6 @@ class _FitOptimizerCompilation:
     included_ids: tuple[str, ...]
     shared_variables: tuple[FitSharedVariableParamSpec, ...]
     coupled_variables: tuple[FitCoupledVariableParamSpec, ...]
-    variable_by_dataset: tuple[
-        tuple[str, tuple[FitDatasetVariableParamSpec, ...]], ...
-    ]
     fixed_by_dataset: tuple[
         tuple[str, tuple[tuple[str, float], ...]], ...
     ]
@@ -794,10 +791,6 @@ def _compile_optimizer_coordinates(
         (dataset_id, tuple(values.items()))
         for dataset_id, values in fixed_by_dataset.items()
     )
-    variable_items = tuple(
-        (dataset_id, tuple(values))
-        for dataset_id, values in variable_by_dataset.items()
-    )
     overrides = tuple(
         FitDatasetParameterOverrides(
             dataset_id=dataset_id,
@@ -817,7 +810,6 @@ def _compile_optimizer_coordinates(
         included_ids=included_ids,
         shared_variables=tuple(shared_variables),
         coupled_variables=tuple(coupled_variables),
-        variable_by_dataset=variable_items,
         fixed_by_dataset=fixed_items,
         overrides=overrides,
         candidate_names=candidate_names,

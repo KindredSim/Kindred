@@ -24,7 +24,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._latest_query = ""
         self._latest_result_text = ""
         self._latest_is_error = False
-        self._history_count = 0
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -90,15 +89,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
             )
         )
 
-    def set_query_text(self, text: str) -> None:
-        self._query_edit.setText(str(text or ""))
-
-    def latest_result_text(self) -> str:
-        return self._latest_result_text
-
-    def history_count(self) -> int:
-        return int(self._history_count)
-
     def inputs_enabled(self) -> bool:
         return bool(self._query_edit.isEnabled() and self._evaluate_button.isEnabled())
 
@@ -110,7 +100,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._latest_query = state.latest_query
         self._latest_result_text = state.latest_result_text
         self._latest_is_error = state.latest_is_error
-        self._history_count = state.history_count
         self._query_edit.setEnabled(available)
         self._evaluate_button.setEnabled(available)
         self._copy_result_button.setEnabled(state.can_copy_result)
@@ -128,7 +117,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._latest_query = ""
         self._latest_result_text = ""
         self._latest_is_error = False
-        self._history_count = 0
         self._query_edit.setEnabled(False)
         self._evaluate_button.setEnabled(False)
         self._copy_result_button.setEnabled(False)

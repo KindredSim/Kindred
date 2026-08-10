@@ -14,8 +14,7 @@ Current contract
 Notes
 -----
 - This module performs no I/O and keeps zero global mutable state.
-- `T` exists in the table and is protected against user redefinition. The
-  application or simulator may update it through `SymbolTable.update_temperature`.
+- `T` exists in the table and is protected against user redefinition.
 """
 
 from __future__ import annotations
@@ -126,7 +125,6 @@ class SymbolTable:
     - Protected names (constants and T) cannot be shadowed by user code.
     - Built-in function names cannot be used as symbols.
     - The table stores only scalars for values (evaluator enforces this).
-    - `update_temperature` is the sanctioned way for the application to change T.
     """
 
     temperature_K: float = 298.15
@@ -180,14 +178,6 @@ class SymbolTable:
         if species_names and name in species_names:
             raise ValueError(f"attempted shadowing of species {name!r}")
         self._user[name] = float(value)
-
-    def update_temperature(self, T: float) -> None:
-        """
-        System-only: update protected temperature `T`.
-
-        This is not exposed to user algebra; evaluators should not allow 'let T = ...'.
-        """
-        self._values["T"] = float(T)
 
     # --- function exposure ---------------------------------------------------
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import ProjectDocument
-from kindred.gui.plot_config import require_pyqtgraph
 from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
 
 __all__ = ["MechanismWorkspaceView"]
@@ -58,7 +57,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         layout.addWidget(self._plot_stack, 1)
 
     def _new_plot_panel(self) -> PyQtGraphPlotPanel:
-        require_pyqtgraph(context="Kindred GUI")
         plot = PyQtGraphPlotPanel(
             embed_analysis_tabs=self._embed_analysis_tabs,
             workspace_splitter_object_name="mainPlotWorkspaceSplitter",
@@ -92,9 +90,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         self._plot_by_tab_id[target] = plot
         self.plotCreated.emit(target, plot)
         return plot
-
-    def tab_bar(self) -> QtWidgets.QTabBar:
-        return self._tab_bar
 
     def active_plot(self) -> PyQtGraphPlotPanel:
         if self._active_tab_id is not None:

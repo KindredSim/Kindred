@@ -1096,6 +1096,7 @@ class FittingWindow(QtWidgets.QDialog):
         reasons = {
             str(scope): str(reason or "") for scope, reason in unavailable_reasons.items()
         }
+        self.set_candidate_apply_availability(available, reasons)
         self._run_identity = candidate.run_identity
         self.set_resolved_auto_modes(candidate.resolved_auto_modes)
         self._copy_run_json.setEnabled(True)
@@ -1105,17 +1106,13 @@ class FittingWindow(QtWidgets.QDialog):
             available_scopes=available,
             unavailable_reasons=reasons,
         )
-        for checkbox, scope in self._apply_controls():
-            checkbox.setEnabled(scope in available)
-            checkbox.setChecked(scope in available)
-            checkbox.setToolTip(reasons.get(scope, ""))
-        self._refresh_apply_button()
         self._set_copy_available(self._run_results_tab.copy_eligible())
         self._tabs.setCurrentIndex(2)
         return bool(rendered)
 
     def clear_candidate(self) -> None:
-        self._run_results_tab.clear_candidate()
+        # Clear actionable Copy/view authority first.  A physical plot teardown
+        # is fallible and must never leave stale controls enabled.
         self._run_identity = None
         self._clear_resolved_auto_modes()
         for checkbox, _scope in self._apply_controls():
@@ -1126,6 +1123,26 @@ class FittingWindow(QtWidgets.QDialog):
         self._copy_button.setEnabled(False)
         self._copy_run_json.setEnabled(False)
         self._results_summary_button.setEnabled(False)
+        self._run_results_tab.clear_candidate()
+
+    def set_candidate_apply_availability(
+        self,
+        available_scopes: frozenset[str],
+        unavailable_reasons: Mapping[str, str],
+    ) -> None:
+        """Project retained owner Apply scopes without requiring a result view."""
+
+        available = frozenset(str(scope) for scope in available_scopes)
+        reasons = {
+            str(scope): str(reason or "")
+            for scope, reason in unavailable_reasons.items()
+        }
+        for checkbox, scope in self._apply_controls():
+            checkbox.setEnabled(scope in available)
+            checkbox.setChecked(scope in available)
+            checkbox.setToolTip(reasons.get(scope, ""))
+        self._refresh_apply_button()
+        self._run_results_tab.set_apply_availability(available, reasons)
 
     def _apply_controls(self):
         return (

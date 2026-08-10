@@ -16,8 +16,8 @@ from kindred.core.project_presentation_state import (
     SimulationSeriesAxisSelection,
 )
 from kindred.core.result_repository import PreviewResultKey
+from kindred.gui.plot_config import PlotPresentationIntent, require_pyqtgraph
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
-from kindred.gui.plot_config import PlotPresentationIntent
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.workspace_result_presenter import (
@@ -29,10 +29,7 @@ from kindred.gui.workspace_result_presenter import (
     WorkspaceResultProjection,
 )
 
-try:
-    import pyqtgraph as pg
-except ImportError:  # pragma: no cover - plot_config rejects this before construction
-    pg = None
+pg = require_pyqtgraph(context="Kindred GUI")
 
 __all__ = ["PyQtGraphPlotPanel"]
 
@@ -94,6 +91,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     xSeriesRequested = QtCore.Signal(object)
     ySeriesRequested = QtCore.Signal(object)
     plotPresentationIntentRequested = QtCore.Signal(object)
+    resultDiagnostic = QtCore.Signal(str)
     renderFailed = QtCore.Signal(str)
 
     def __init__(
@@ -106,36 +104,29 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         enable_reference_layer_toggle_action: bool = True,
         enable_copy_visible_data_action: bool = True,
     ) -> None:
-        if pg is None:
-            raise ImportError("PyQtGraphPlotPanel requires pyqtgraph.")
         super().__init__(parent)
         self._enable_axis_inversion_actions = bool(enable_axis_inversion_actions)
         self._enable_reference_layer_toggle_action = bool(
             enable_reference_layer_toggle_action
         )
-        self._enable_copy_visible_data_action = bool(
-            enable_copy_visible_data_action
-        )
+        self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
         self._applied_projection: WorkspaceResultProjection | None = None
+        self._analysis_set_id: str | None = None
         self._rendered_blocks: tuple[ResultDataBlock, ...] = ()
         self._sampling_limit_by_tab: dict[str, int | None] = {}
         self._curve_items: list[object] = []
         self._plot_items_by_key: dict[tuple[object, ...], object] = {}
-        self._plot_structure_signature: tuple[object, ...] | None = None
         self._physical_items_by_axis: dict[
             tuple[AxisSeriesSelection, bool], list[object]
         ] = {}
         self._annotation_items: list[object] = []
-        self._manual_annotations_by_tab: dict[
-            str, list[tuple[str, float, float]]
-        ] = {}
+        self._manual_annotations_by_tab: dict[str, list[tuple[str, float, float]]] = {}
         self._scalar_guides_by_tab: dict[str, list[str]] = {}
         self._interaction_mode_by_tab: dict[str, str] = {}
         self._presentation_by_tab: dict[str, _PlotPresentation] = {}
         self._axis_range_by_tab: dict[str, _AxisRangeSession] = {}
         self._preview_endpoint_keys: set[PreviewResultKey] = set()
         self._preview_origin_snapshots: tuple[_PreviewCurveSnapshot, ...] = ()
-        self._preview_origin_set_ids: frozenset[str] = frozenset()
         self._preview_origin_range: (
             tuple[tuple[float, float], tuple[float, float]] | None
         ) = None
@@ -144,9 +135,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._preview_transition_duration_s = 0.18
         self._preview_transition_timer = QtCore.QTimer(self)
         self._preview_transition_timer.setInterval(16)
-        self._preview_transition_timer.timeout.connect(
-            self._advance_preview_transition
-        )
+        self._preview_transition_timer.timeout.connect(self._advance_preview_transition)
         self._dark_mode = False
         self._copy_chunks = None
         self._copy_output: io.StringIO | None = None
@@ -164,9 +153,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._plot_widget.setContextMenuPolicy(
             QtCore.Qt.ContextMenuPolicy.CustomContextMenu
         )
-        self._plot_widget.customContextMenuRequested.connect(
-            self._show_context_menu
-        )
+        self._plot_widget.customContextMenuRequested.connect(self._show_context_menu)
 
         self._axis_toolbar = AxisToolbar(self)
         self._axis_toolbar.xChanged.connect(self.xSeriesRequested.emit)
@@ -174,9 +161,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar.optionsRequested.connect(self._on_axis_option)
         self._axis_toolbar.axisRangeChanged.connect(self._apply_axis_range)
         self._axis_toolbar.addGuideRequested.connect(self._add_scalar_guide)
-        self._axis_toolbar.interactionModeRequested.connect(
-            self._set_interaction_mode
-        )
+        self._axis_toolbar.interactionModeRequested.connect(self._set_interaction_mode)
         self._axis_toolbar.presentationOptionRequested.connect(
             self._request_plot_presentation
         )
@@ -185,9 +170,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             "Completed with warnings",
             self,
         )
-        self._completion_warning_badge.setObjectName(
-            "completedWithWarningsBadge"
-        )
+        self._completion_warning_badge.setObjectName("completedWithWarningsBadge")
         self._completion_warning_badge.setStyleSheet(
             "QLabel { border: 1px solid #b7791f; border-radius: 6px; "
             "padding: 2px 7px; color: #8a5a12; background: #fff7df; }"
@@ -248,18 +231,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._details_tabs.show()
         return self._details_tabs
 
-    @property
-    def applied_projection(self) -> WorkspaceResultProjection | None:
-        return self._applied_projection
-
-    def copy_all_eligible(self) -> bool:
-        projection = self._applied_projection
-        return bool(projection is not None and projection.copy_all_blocks)
-
     def xlsx_export_projection(self) -> WorkspaceResultProjection | None:
         """Return this page's export authority, or None when unavailable."""
 
-        return self._applied_projection if self.copy_all_eligible() else None
+        projection = self._applied_projection
+        if projection is None:
+            return None
+        if projection.copy_all_blocks or projection.unavailable_x_diagnostic:
+            return projection
+        return None
 
     @QtCore.Slot(object, bool)
     def capture_preview_transition_origins(
@@ -271,7 +251,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         try:
             targets = frozenset(
-                str(set_id).strip() for set_id in tuple(set_ids)  # type: ignore[arg-type]
+                str(set_id).strip()
+                for set_id in tuple(set_ids)  # type: ignore[arg-type]
             )
         except TypeError as exc:
             raise TypeError("set_ids must be an iterable of set IDs.") from exc
@@ -284,7 +265,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         snapshots = self._snapshot_visible_preview_items(targets)
         self._stop_preview_transition(remove_transient=True)
         self._preview_origin_snapshots = snapshots
-        self._preview_origin_set_ids = targets
         projection = self._applied_projection
         self._preview_origin_auto_range = bool(
             projection is not None
@@ -294,9 +274,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             ).auto
         )
         self._preview_origin_range = (
-            self._current_view_range()
-            if self._preview_origin_auto_range
-            else None
+            self._current_view_range() if self._preview_origin_auto_range else None
         )
 
     @QtCore.Slot(object, bool)
@@ -310,13 +288,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         try:
             captured = tuple(keys)  # type: ignore[arg-type]
         except TypeError as exc:
-            raise TypeError("keys must be an iterable of PreviewResultKey values.") from exc
+            raise TypeError(
+                "keys must be an iterable of PreviewResultKey values."
+            ) from exc
         if not captured or any(
             not isinstance(key, PreviewResultKey) for key in captured
         ):
-            raise TypeError(
-                "keys must contain at least one PreviewResultKey value."
-            )
+            raise TypeError("keys must contain at least one PreviewResultKey value.")
         tab_ids = {key.tab_id for key in captured}
         if len(tab_ids) != 1:
             raise ValueError("Preview endpoint keys must belong to one tab.")
@@ -334,7 +312,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         try:
             retired = tuple(keys)  # type: ignore[arg-type]
         except TypeError as exc:
-            raise TypeError("keys must be an iterable of PreviewResultKey values.") from exc
+            raise TypeError(
+                "keys must be an iterable of PreviewResultKey values."
+            ) from exc
         if any(not isinstance(key, PreviewResultKey) for key in retired):
             raise TypeError("retired keys must be PreviewResultKey values.")
         self._preview_endpoint_keys.difference_update(retired)
@@ -355,8 +335,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         if not isinstance(projection, WorkspaceResultProjection):
             raise TypeError(
-                "apply_workspace_result_projection requires "
-                "WorkspaceResultProjection."
+                "apply_workspace_result_projection requires WorkspaceResultProjection."
             )
         animated_keys = {
             layer.result_entry.key
@@ -382,15 +361,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             if animated_keys:
                 self._start_preview_endpoint_transition(
                     origin_snapshots,
-                    target_set_ids=frozenset(
-                        key.set_id for key in animated_keys
-                    ),
+                    target_set_ids=frozenset(key.set_id for key in animated_keys),
                     origin_range=origin_range,
                     auto_range=origin_auto_range,
                 )
                 self._preview_endpoint_keys.difference_update(animated_keys)
                 self._preview_origin_snapshots = ()
-                self._preview_origin_set_ids = frozenset()
                 self._preview_origin_range = None
                 self._preview_origin_auto_range = False
             elif self._preview_origin_snapshots:
@@ -403,6 +379,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             raise
         self._applied_projection = projection
         self._rendered_blocks = rendered
+        if projection.unavailable_x_diagnostic is not None:
+            self.resultDiagnostic.emit(projection.unavailable_x_diagnostic)
 
     @staticmethod
     def _preview_item_set_id(item_key: tuple[object, ...]) -> str | None:
@@ -434,11 +412,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         opacity_getter = getattr(item, "opacity", None)
         opacity = float(opacity_getter()) if callable(opacity_getter) else 1.0
         raw_options = getattr(item, "opts", {})
-        options = (
-            dict(raw_options)
-            if isinstance(raw_options, Mapping)
-            else {}
-        )
+        options = dict(raw_options) if isinstance(raw_options, Mapping) else {}
         return _PreviewCurveSnapshot(
             item_key=item_key,
             x=x,
@@ -554,10 +528,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             start_range=self._preview_origin_range,
             target_range=None,
         )
-        if (
-            self._preview_origin_auto_range
-            and self._preview_origin_range is not None
-        ):
+        if self._preview_origin_auto_range and self._preview_origin_range is not None:
             self._set_transition_view_range(self._preview_origin_range)
 
     def _start_preview_endpoint_transition(
@@ -739,7 +710,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _clear_preview_transition_pixels(self) -> None:
         self._stop_preview_transition(remove_transient=True)
         self._preview_origin_snapshots = ()
-        self._preview_origin_set_ids = frozenset()
         self._preview_origin_range = None
         self._preview_origin_auto_range = False
         projection = self._applied_projection
@@ -814,9 +784,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                             )
                     color = color_for_species(color_name, tuple(known_species))
                     if not isinstance(color, QtGui.QColor) or not color.isValid():
-                        raise ValueError(
-                            "Resolved plot color must be a valid QColor."
-                        )
+                        raise ValueError("Resolved plot color must be a valid QColor.")
                     for item in items:
                         self._apply_item_color(item, color)
                         if is_experimental_marker:
@@ -865,12 +833,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def drop_tab_session_state(self, tab_id: str) -> None:
         target = str(tab_id)
-        if (
-            any(key.tab_id == target for key in self._preview_endpoint_keys)
-            or (
-                self._applied_projection is not None
-                and self._applied_projection.tab_id == target
-            )
+        if any(key.tab_id == target for key in self._preview_endpoint_keys) or (
+            self._applied_projection is not None
+            and self._applied_projection.tab_id == target
         ):
             self._preview_endpoint_keys.clear()
             self._clear_preview_transition_pixels()
@@ -898,9 +863,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar.set_auto_range(True)
         self._apply_interaction_mode("pan")
 
-    def rendered_point_blocks(self) -> tuple[ResultDataBlock, ...]:
-        return self._rendered_blocks
-
     def clear_workspace_result_projection(self) -> None:
         """Clear rejected public truth without affecting other tab-local state."""
 
@@ -924,6 +886,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 pass
         self._applied_projection = None
         self._rendered_blocks = ()
+        self._analysis_set_id = None
 
     def _clear_completion_warning(self) -> None:
         self._completion_warning_badge.setText("Completed with warnings")
@@ -934,26 +897,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self,
         projection: WorkspaceResultProjection,
     ) -> tuple[ResultDataBlock, ...]:
-        structure_signature = self._plot_structure_signature_for_projection(
-            projection
-        )
-        rebuild = structure_signature != self._plot_structure_signature
-        existing_items = self._plot_items_by_key if not rebuild else {}
-        if rebuild:
-            self._clear_plot_items()
-        else:
-            self._clear_annotation_items()
+        existing_items = dict(self._plot_items_by_key)
+        self._clear_annotation_items()
         self._plot_widget.setLabel("bottom", projection.x_label)
         self._plot_widget.setLabel("left", projection.y_label)
-        block_by_id = {
-            block.block_id: block
-            for block in projection.copy_all_blocks
-        }
+        block_by_id = {block.block_id: block for block in projection.copy_all_blocks}
         rendered_blocks: list[ResultDataBlock] = []
         rendered_items: dict[tuple[object, ...], object] = {}
-        physical_items: dict[
-            tuple[AxisSeriesSelection, bool], list[object]
-        ] = {}
+        physical_items: dict[tuple[AxisSeriesSelection, bool], list[object]] = {}
         self._curve_items = []
         for layer in projection.plot_layers:
             block = block_by_id.get(layer.layer_id)
@@ -962,9 +913,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             rendered = self._render_layer(
                 layer,
                 block,
-                sampling_limit=self._sampling_limit_by_tab.get(
-                    projection.tab_id
-                ),
+                sampling_limit=self._sampling_limit_by_tab.get(projection.tab_id),
                 existing_items=existing_items,
                 rendered_items=rendered_items,
                 physical_items=physical_items,
@@ -972,10 +921,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             if rendered is not None:
                 rendered_blocks.append(rendered)
 
+        for item_key, item in existing_items.items():
+            if item_key in rendered_items:
+                continue
+            self._remove_plot_item(item)
+
         self._plot_items_by_key = rendered_items
         self._physical_items_by_axis = physical_items
-        self._plot_structure_signature = structure_signature
-
         self._axis_toolbar.set_x_candidates(
             projection.axis_candidates,
             selected=projection.selected_x_series,
@@ -1037,79 +989,47 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._project_completion_warning(projection)
         return tuple(rendered_blocks)
 
-    def _plot_structure_signature_for_projection(
-        self,
-        projection: WorkspaceResultProjection,
-    ) -> tuple[object, ...]:
-        """Return only the physical plot shape, not numerical point data."""
+    @staticmethod
+    def _physical_layer_identity(layer: WorkspacePlotLayer) -> object:
+        """Map semantic role changes onto the compatible retained-result slot."""
 
-        block_by_id = {
-            block.block_id: block for block in projection.copy_all_blocks
-        }
-        layers: list[tuple[object, ...]] = []
-        for layer in projection.plot_layers:
-            block = block_by_id.get(layer.layer_id)
-            if block is None:
-                continue
-            sample, chunks = self._sample_and_chunks(
-                block,
-                self._sampling_limit_by_tab.get(projection.tab_id),
+        identity = layer.layer_id
+        if isinstance(identity, SimulationResultLayerIdentity) and identity.kind in {
+            ResultLayerKind.EXPLICIT,
+            ResultLayerKind.REFERENCE,
+        }:
+            return SimulationResultLayerIdentity(
+                ResultLayerKind.REFERENCE,
+                identity.set_id,
             )
-            item_layout = tuple(
-                (
-                    series_name,
-                    axis_selection,
-                    tuple(
-                        (
-                            chunk_index,
-                            "marker"
-                            if layer.markers or end - start == 1
-                            else "line",
-                        )
-                        for chunk_index, (start, end) in enumerate(chunks)
-                    ),
-                )
-                for series_name, axis_selection in block.series_axes
-            )
-            connector_layout = tuple(
-                (index, species_name)
-                for index, species_name, _time, _pre, _post in (
-                    self._intervention_connector_entries(layer, block)
-                )
-            )
-            provenance_units = tuple(
-                sorted(
-                    (
-                        name,
-                        str(payload.get("unit") or payload.get("units") or ""),
-                    )
-                    for name, payload in block.series_provenance
-                    if isinstance(payload, Mapping)
-                )
-            )
-            layers.append(
-                (
-                    layer.layer_id,
-                    str(layer.label),
-                    layer.kind,
-                    block.kind,
-                    block.x_axis,
-                    block.x_name,
-                    tuple(name for name, _values in block.series),
-                    item_layout,
-                    connector_layout,
-                    tuple(sample.shape),
-                    provenance_units,
-                    str(block.x_provenance.get("unit") or block.x_provenance.get("units") or "")
-                    if isinstance(block.x_provenance, Mapping)
-                    else "",
-                )
-            )
-        return (
-            str(projection.x_label),
-            str(projection.y_label),
-            tuple(layers),
-        )
+        return identity
+
+    def _update_plot_item_legend(
+        self,
+        item: object,
+        name: str | None,
+    ) -> None:
+        set_name = getattr(item, "setName", None)
+        if callable(set_name):
+            set_name(name)
+        if name is None or self._legend is None:
+            return
+        get_label = getattr(self._legend, "getLabel", None)
+        label = get_label(item) if callable(get_label) else None
+        set_text = getattr(label, "setText", None)
+        if callable(set_text):
+            set_text(name)
+
+    def _remove_plot_item(self, item: object) -> None:
+        if self._legend is not None:
+            try:
+                self._legend.removeItem(item)
+            except (KeyError, RuntimeError, TypeError, ValueError):
+                pass
+        try:
+            self._plot_widget.removeItem(item)
+        except (RuntimeError, TypeError, ValueError):
+            pass
 
     def _render_layer(
         self,
@@ -1119,9 +1039,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         sampling_limit: int | None,
         existing_items: Mapping[tuple[object, ...], object] | None = None,
         rendered_items: dict[tuple[object, ...], object] | None = None,
-        physical_items: dict[
-            tuple[AxisSeriesSelection, bool], list[object]
-        ] | None = None,
+        physical_items: dict[tuple[AxisSeriesSelection, bool], list[object]]
+        | None = None,
     ) -> ResultDataBlock | None:
         if layer.kind is not block.kind:
             raise ValueError("plot layer and data block kinds must match.")
@@ -1142,9 +1061,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             ):
                 raise ValueError("simulation plot block lacks executor identity.")
             segment_ids = block.segment_ids[sample]
-            segment_keys = tuple(
-                block.segment_keys[int(index)] for index in sample
-            )
+            segment_keys = tuple(block.segment_keys[int(index)] for index in sample)
             discontinuity_ids = block.discontinuity_ids[sample]
             source_row = None
         colors = dict(layer.color_by_series)
@@ -1153,6 +1070,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         item_store = rendered_items if rendered_items is not None else {}
         physical_store = physical_items if physical_items is not None else {}
         existing_store = existing_items if existing_items is not None else {}
+        physical_layer_identity = self._physical_layer_identity(layer)
         for series_name, values in block.series:
             y = values[sample]
             color = colors[series_name]
@@ -1161,9 +1079,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             name = f"{layer.label}: {series_name}"
             for chunk_index, (start, end) in enumerate(chunks):
                 singleton = end - start == 1
-                item_key = (layer.layer_id, series_name, chunk_index)
-                item = existing_store.get(item_key)
                 marker = bool(layer.markers or singleton)
+                item_key = (
+                    physical_layer_identity,
+                    series_name,
+                    chunk_index,
+                    "marker" if marker else "line",
+                )
+                item = existing_store.get(item_key)
                 if item is None:
                     if marker:
                         item = self._plot_widget.plot(
@@ -1171,9 +1094,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                             y[start:end],
                             pen=None,
                             symbol="o",
-                            symbolSize=(
-                                layer.point_size if layer.markers else 5.0
-                            ),
+                            symbolSize=(layer.point_size if layer.markers else 5.0),
                             symbolBrush=pg.mkBrush(color),
                             symbolPen=pg.mkPen(color),
                             name=name if chunk_index == 0 else None,
@@ -1199,9 +1120,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     if marker:
                         item.setSymbolBrush(pg.mkBrush(color))
                         item.setSymbolPen(pg.mkPen(color))
-                        item.setSymbolSize(
-                            layer.point_size if layer.markers else 5.0
-                        )
+                        item.setSymbolSize(layer.point_size if layer.markers else 5.0)
                     else:
                         item.setPen(
                             pg.mkPen(
@@ -1214,6 +1133,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                                 ),
                             )
                         )
+                self._update_plot_item_legend(
+                    item,
+                    name if chunk_index == 0 else None,
+                )
                 item.setOpacity(layer.opacity)
                 item_store[item_key] = item
                 self._curve_items.append(item)
@@ -1222,12 +1145,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     [],
                 ).append(item)
             rendered_series.append((series_name, y))
-        for boundary_index, species_name, boundary_time, pre_value, post_value in (
-            self._intervention_connector_entries(layer, block)
-        ):
+        for (
+            boundary_index,
+            species_name,
+            boundary_time,
+            pre_value,
+            post_value,
+        ) in self._intervention_connector_entries(layer, block):
             color = colors[species_name]
             item_key = (
-                layer.layer_id,
+                physical_layer_identity,
                 "intervention-boundary",
                 boundary_index,
                 species_name,
@@ -1327,9 +1254,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         sample = self._sample_indices(block.t.size, sampling_limit)
         if block.kind is not ResultLayerKind.EXPERIMENTAL:
             region_endpoints = self._execution_region_endpoints(block)
-            sample = np.unique(
-                np.concatenate((sample, region_endpoints))
-            )
+            sample = np.unique(np.concatenate((sample, region_endpoints)))
             if (
                 block.segment_ids is None
                 or block.segment_keys is None
@@ -1337,9 +1262,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             ):
                 raise ValueError("simulation plot block lacks executor identity.")
             segment_ids = block.segment_ids[sample]
-            segment_keys = tuple(
-                block.segment_keys[int(index)] for index in sample
-            )
+            segment_keys = tuple(block.segment_keys[int(index)] for index in sample)
             chunks = self._execution_region_chunks(
                 segment_ids,
                 segment_keys,
@@ -1350,15 +1273,29 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         return sample, chunks
 
     def _render_analysis(self, projection: WorkspaceResultProjection) -> None:
+        has_pending_reference = any(
+            layer.kind is ResultLayerKind.REFERENCE
+            and isinstance(layer.layer_id, SimulationResultLayerIdentity)
+            and layer.layer_id.set_id == projection.current_set_id
+            for layer in projection.plot_layers
+        )
+        if (
+            projection.primary_layer_id is None
+            and has_pending_reference
+            and self._analysis_set_id == projection.current_set_id
+        ):
+            return
         self._parameter_table.update_parameters(
-            {
-                name: (value, unit)
-                for name, value, unit in projection.parameters
-            }
+            {name: (value, unit) for name, value, unit in projection.parameters}
         )
         block = projection.primary_statistics
         if block is None:
             self._species_table.setRowCount(0)
+            self._analysis_set_id = (
+                projection.current_set_id
+                if projection.primary_layer_id is not None
+                else None
+            )
             return
         self._species_table.update_results(
             canonical_time=block.t,
@@ -1369,15 +1306,27 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 else None
             ),
         )
+        self._analysis_set_id = projection.current_set_id
 
     def _project_completion_warning(
         self,
         projection: WorkspaceResultProjection,
     ) -> None:
-        visible = bool(projection.completion_warnings)
-        self._completion_warning_badge.setText("Completed with warnings")
-        self._completion_warning_badge.setToolTip(
-            projection.completion_warning_tooltip if visible else ""
+        diagnostic = projection.unavailable_x_diagnostic
+        visible = bool(diagnostic or projection.completion_warnings)
+        self._completion_warning_badge.setText(
+            "Selected X unavailable"
+            if diagnostic is not None
+            else "Completed with warnings"
+        )
+        details = (
+            diagnostic
+            if diagnostic is not None
+            else projection.completion_warning_tooltip
+        )
+        self._completion_warning_badge.setToolTip(details if visible else "")
+        self._completion_warning_badge.setAccessibleDescription(
+            details if visible else ""
         )
         self._completion_warning_badge.setVisible(visible)
 
@@ -1554,10 +1503,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 index
                 for index in range(1, count)
                 if (
-                    int(block.segment_ids[index])
-                    != int(block.segment_ids[index - 1])
-                    or block.segment_keys[index]
-                    != block.segment_keys[index - 1]
+                    int(block.segment_ids[index]) != int(block.segment_ids[index - 1])
+                    or block.segment_keys[index] != block.segment_keys[index - 1]
                     or int(block.discontinuity_ids[index])
                     != int(block.discontinuity_ids[index - 1])
                 )
@@ -1584,8 +1531,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             if (
                 int(segment_ids[index]) != int(segment_ids[index - 1])
                 or segment_keys[index] != segment_keys[index - 1]
-                or int(discontinuity_ids[index])
-                != int(discontinuity_ids[index - 1])
+                or int(discontinuity_ids[index]) != int(discontinuity_ids[index - 1])
             )
         )
         return tuple(
@@ -1625,7 +1571,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._plot_widget.clear()
         self._curve_items.clear()
         self._plot_items_by_key.clear()
-        self._plot_structure_signature = None
         self._physical_items_by_axis.clear()
         self._annotation_items.clear()
         self._legend = self._plot_widget.addLegend()
@@ -1675,9 +1620,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return
         tab_id = projection.tab_id
         previous_limit = self._sampling_limit_by_tab.get(tab_id)
-        self._sampling_limit_by_tab[tab_id] = (
-            1000 if str(value) == "coarse" else None
-        )
+        self._sampling_limit_by_tab[tab_id] = 1000 if str(value) == "coarse" else None
         try:
             self.apply_workspace_result_projection(projection)
         except Exception:
@@ -1699,11 +1642,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             current_x, current_y = (
                 self._plot_widget.getPlotItem().getViewBox().viewRange()
             )
-            if (
-                x_min is None
-                or x_max is None
-                or x_max <= x_min
-            ):
+            if x_min is None or x_max is None or x_max <= x_min:
                 x_min = self._view_to_raw_coordinate(
                     current_x[0],
                     log_enabled=presentation.log_x,
@@ -1712,11 +1651,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     current_x[1],
                     log_enabled=presentation.log_x,
                 )
-            if (
-                y_min is None
-                or y_max is None
-                or y_max <= y_min
-            ):
+            if y_min is None or y_max is None or y_max <= y_min:
                 y_min = self._view_to_raw_coordinate(
                     current_y[0],
                     log_enabled=presentation.log_y,
@@ -1760,11 +1695,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             state.x_max,
             log_enabled=presentation.log_x,
         )
-        if (
-            x_min is not None
-            and x_max is not None
-            and x_max > x_min
-        ):
+        if x_min is not None and x_max is not None and x_max > x_min:
             self._plot_widget.setXRange(
                 x_min,
                 x_max,
@@ -1778,11 +1709,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             state.y_max,
             log_enabled=presentation.log_y,
         )
-        if (
-            y_min is not None
-            and y_max is not None
-            and y_max > y_min
-        ):
+        if y_min is not None and y_max is not None and y_max > y_min:
             self._plot_widget.setYRange(
                 y_min,
                 y_max,
@@ -1795,9 +1722,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         projection = self._applied_projection
         if self._enable_copy_visible_data_action:
             copy_all = menu.addAction("Copy All")
-            copy_all.setEnabled(
-                self.copy_all_eligible()
-            )
+            copy_all.setEnabled(projection is not None)
             copy_all.triggered.connect(self._copy_all_to_clipboard)
             copy_rendered = menu.addAction("Copy Rendered Points")
             copy_rendered.setEnabled(bool(self._rendered_blocks))
@@ -1815,19 +1740,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         annotations.setChecked(
             bool(projection and projection.intervention_annotations_visible)
         )
-        annotations.toggled.connect(
-            self.interventionAnnotationsVisibilityRequested
-        )
+        annotations.toggled.connect(self.interventionAnnotationsVisibilityRequested)
         menu.addSeparator()
         add_annotation = menu.addAction("Add Annotation…")
         add_annotation.setEnabled(projection is not None)
         add_annotation.triggered.connect(self._add_manual_annotation)
         clear_annotations = menu.addAction("Clear All Annotations")
         clear_annotations.setEnabled(
-            bool(
-                projection
-                and self._manual_annotations_by_tab.get(projection.tab_id)
-            )
+            bool(projection and self._manual_annotations_by_tab.get(projection.tab_id))
         )
         clear_annotations.triggered.connect(self._clear_manual_annotations)
         state = (
@@ -1911,9 +1831,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _set_interaction_mode(self, mode: str) -> None:
         normalized = str(mode or "").strip().lower()
         if normalized not in {"pan", "rectangle_zoom"}:
-            raise ValueError(
-                "Plot interaction mode must be Pan or Rectangle Zoom."
-            )
+            raise ValueError("Plot interaction mode must be Pan or Rectangle Zoom.")
         projection = self._applied_projection
         if projection is not None:
             self._interaction_mode_by_tab[projection.tab_id] = normalized
@@ -1923,9 +1841,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _apply_interaction_mode(self, mode: str) -> None:
         view_box = self._plot_widget.getPlotItem().getViewBox()
         view_box.setMouseMode(
-            view_box.PanMode
-            if str(mode) == "pan"
-            else view_box.RectMode
+            view_box.PanMode if str(mode) == "pan" else view_box.RectMode
         )
 
     def _request_plot_presentation(
@@ -1973,15 +1889,17 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     @QtCore.Slot()
     def _copy_all_to_clipboard(self) -> None:
         projection = self._applied_projection
-        if (
-            projection is None
-            or not self.copy_all_eligible()
-        ):
+        if projection is None:
             QtWidgets.QMessageBox.critical(
                 self,
                 "Copy All",
                 "No current result data is available to copy.",
             )
+            return
+        try:
+            WorkspaceResultPresenter.validate_copy(projection)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Copy All", str(exc))
             return
         self._start_responsive_copy(
             projection.copy_all_blocks,
@@ -1990,6 +1908,17 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _copy_rendered_to_clipboard(self) -> None:
+        projection = self._applied_projection
+        if projection is not None:
+            try:
+                WorkspaceResultPresenter.validate_copy(projection)
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Copy Rendered Points",
+                    str(exc),
+                )
+                return
         self._start_responsive_copy(
             self._rendered_blocks,
             title="Copy Rendered Points",

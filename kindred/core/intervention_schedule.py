@@ -970,10 +970,6 @@ class InterventionSchedule:
         return tuple(item for item in self.operations if isinstance(item, InterventionHold))
 
     @property
-    def protocols(self) -> tuple[InterventionProtocol, ...]:
-        return tuple(item for item in self.operations if isinstance(item, InterventionProtocol))
-
-    @property
     def triggers(self) -> tuple[InterventionTrigger, ...]:
         return tuple(item for item in self.operations if isinstance(item, InterventionTrigger))
 

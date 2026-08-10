@@ -161,10 +161,6 @@ class FitSessionOwner(QtCore.QObject):
         self._application_close_fenced = False
 
     @property
-    def has_window(self) -> bool:
-        return self._window is not None
-
-    @property
     def project_defaults(self) -> FitDefaults:
         return self._session.document.fit_defaults
 
@@ -1603,6 +1599,11 @@ class FitSessionOwner(QtCore.QObject):
         try:
             # Clear old Apply/Copy authority before rebuilding the physical view.
             window.clear_candidate()
+            if rebased_candidate is not None:
+                window.set_candidate_apply_availability(
+                    available_scopes,
+                    unavailable_reasons,
+                )
             window.rebase(
                 rebased,
                 setup=refreshed_snapshot,
@@ -1618,6 +1619,11 @@ class FitSessionOwner(QtCore.QObject):
                 window.clear_candidate()
             except Exception:
                 pass
+            if rebased_candidate is not None:
+                window.set_candidate_apply_availability(
+                    available_scopes,
+                    unavailable_reasons,
+                )
             self._set_status(
                 "Selected Fit values were applied and remaining scopes were "
                 "preserved, but their view projection failed: "
@@ -2096,32 +2102,31 @@ class FitSessionOwner(QtCore.QObject):
         origin = self._origin
         if origin is None:
             return False
+        setup = self._local_setup_snapshot
+        active_dataset_ids = frozenset(
+            item.dataset_id
+            for item in (
+                self._local_request.datasets
+                if self._local_request is not None
+                else setup.datasets
+                if setup is not None
+                else ()
+            )
+            if item.included
+        )
         try:
             current = capture_fit_origin(
                 self._session.document,
                 origin.tab_id,
+                dataset_ids=active_dataset_ids,
             )
         except Exception:
             return False
-        if not fit_origin_science_matches(origin, current):
-            return False
-        if current != origin:
-            setup = self._local_setup_snapshot
-            self._origin = current
-            self._rebase_owner_snapshots(current)
-            if setup is not None:
-                setup = replace(
-                    setup,
-                    origin_tab_id=current.tab_id,
-                    origin_capture_id=current.capture_id,
-                )
-                self._local_setup_snapshot = setup
-                if self._window is not None:
-                    self._window.rebase(
-                        current,
-                        setup=setup,
-                    )
-        return True
+        return fit_origin_science_matches(
+            origin,
+            current,
+            included_dataset_ids=active_dataset_ids,
+        )
 
     def _rebase_owner_snapshots(self, origin: FitOriginSnapshot) -> None:
         """Re-key owner-retained reset snapshots after a currentness rebase."""

@@ -40,9 +40,7 @@ class SymbolicCalculatorViewState:
     reason: str = ""
     latest_query: str = ""
     latest_result_text: str = ""
-    latest_context_text: str = ""
     latest_is_error: bool = False
-    history_count: int = 0
     can_copy_result: bool = False
     can_copy_context: bool = False
 
@@ -140,9 +138,7 @@ class SymbolicCalculatorOwner:
             reason="" if self._available else str(self._reason or "Symbolic calculator unavailable."),
             latest_query="" if latest is None else latest.query,
             latest_result_text="" if latest is None else latest.result_text,
-            latest_context_text="" if latest is None else latest.context_text,
             latest_is_error=False if latest is None else bool(latest.is_error),
-            history_count=len(self._history),
             can_copy_result=can_copy,
             can_copy_context=can_copy,
         )

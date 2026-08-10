@@ -21,7 +21,6 @@ from ..ui_helpers import (
     make_bounded_label,
     make_placeholder_label,
     make_scroll_area,
-    set_bounded_label_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -202,7 +201,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._containers: Dict[str, QtWidgets.QWidget] = {}
         self._metadata: Dict[str, Dict[str, object]] = {}
         self._last_valid_values: Dict[str, float] = {}
-        self._freeze_ranges: bool = False
         self._fine_mode: bool = False
         self._slider_callbacks: Dict[str, Dict[str, object]] = {}
         self._hidden_names: set[str] = set()
@@ -536,13 +534,6 @@ class VariableSliders(QtWidgets.QWidget):
             return f"{display_name}{unit_suffix}{derived_suffix}"
         return f"{name}{unit_suffix}{derived_suffix}"
 
-    def _set_name_label_text(self, name: str) -> None:
-        label = self._labels.get(name)
-        if label is None:
-            return
-        set_bounded_label_text(label, self._format_label_text(name), max_width=260)
-        apply_slider_name_label_layout_policy(label)
-
     def _on_slider_changed(self, name: str, slider_pos: int) -> None:
         """
         Handle slider value change.
@@ -674,10 +665,6 @@ class VariableSliders(QtWidgets.QWidget):
             visibility_scope_signature=visibility_scope_signature,
         )
 
-    def update_metadata(self, name: str, meta: Dict[str, object]) -> None:
-        self._metadata[name] = dict(meta)
-        self._set_name_label_text(name)
-
     def update_variable(self, name: str, value: float) -> None:
         """
         Update a variable value programmatically.
@@ -755,13 +742,6 @@ class VariableSliders(QtWidgets.QWidget):
     def visible_slider_count(self) -> int:
         return sum(1 for name in self._containers if self.variable_visible(name))
 
-    def has_visible_entries(self) -> bool:
-        return self.visible_slider_count() > 0
-
-    def has_variable(self, name: str) -> bool:
-        """Return True if a slider exists for the given variable."""
-        return name in self._sliders
-
     def slider_picker_entries(self) -> list[tuple[str, str, bool]]:
         entries: list[tuple[str, str, bool]] = []
         for name in self._variables:
@@ -802,14 +782,6 @@ class VariableSliders(QtWidgets.QWidget):
                 else:
                     self._hidden_names.add(name)
         self._sync_visibility_state()
-
-    def begin_live_drag(self) -> None:
-        """Prevent range recentering while the user drags a slider."""
-        self._freeze_ranges = True
-
-    def end_live_drag(self) -> None:
-        """Re-enable automatic range management after dragging."""
-        self._freeze_ranges = False
 
     def set_fine_mode(self, enabled: bool) -> None:
         """
@@ -1385,8 +1357,6 @@ class VariableSliders(QtWidgets.QWidget):
         project_slider: bool = True,
     ) -> None:
         """Expand the GUI-only range if needed to include the given value."""
-        if self._freeze_ranges and self._slider_scales.get(name, "log") == "log":
-            return
         if name not in self._slider_ranges:
             return
 

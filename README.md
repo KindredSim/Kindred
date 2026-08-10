@@ -1,91 +1,67 @@
 # Kindred
 
-Kindred is a desktop GUI for chemical kinetics simulation and fitting.
+Kindred is a desktop application for building chemical kinetic mechanisms,
+simulating their behavior, comparing results with experimental data, and
+fitting kinetic parameters.
 
-## Status
+## Capabilities
 
-Kindred supports Python 3.10, 3.11, and 3.12. The repository CI currently validates on Python 3.12.
+- Build and inspect multi-step reaction mechanisms in a line-oriented DSL.
+- Run kinetic simulations with configurable time ranges, solvers, tolerances,
+  temperatures, initial conditions, temperature schedules, and interventions.
+- Explore simulation results in interactive plots and analysis views.
+- Import experimental datasets from CSV and XLSX files, map observations to
+  model species or observables, and fit one or more datasets.
+- Copy fit results, export current result data to XLSX, and save complete
+  projects as `.kin` files.
+- Start from bundled mechanism presets and intervention examples.
+
+Mechanism steps may use bare reaction lines or the `reaction:` and
+`equilibrium:` prefixes. Irreversible arrows may be written as `->` or `=>`,
+and reversible arrows as `<->` or `<=>`. The bundled presets use the same
+accepted DSL. Open the Reactions Help tab in Kindred for the syntax reference
+and examples.
 
 ## Installation
 
-Create a Python 3.10-3.12 environment, then install the project:
+Kindred requires Python 3.10, 3.11, or 3.12. From the repository root, create
+and activate a virtual environment, then install the application:
 
+    python -m venv .venv
     python -m pip install --upgrade pip
     python -m pip install .
 
-The pinned GUI runtime dependency set used by this repository is listed in `requirements.txt`:
-
-    python -m pip install -r requirements.txt
-
-For development and tests:
-
-    python -m pip install -e ".[test]"
+The standard installation includes the required desktop and plotting
+dependencies, including PySide6 and PyQtGraph. The same pinned runtime set is
+listed in `requirements.txt` for environments that install dependencies from a
+requirements file.
 
 ## Launch
 
-    python -m kindred
-
-or, if installed as a script:
+Launch the installed application with either command:
 
     kindred
 
-## Current architecture map
+    python -m kindred
 
-Kindred keeps semantic state in a small set of accepted owners. `ProjectSession`
-admits complete `ProjectDocument` state, `WorkspaceTabRegistry` owns tab
-identity/selection, and `ProjectController` owns Save/disposition and the
-application Close lifecycle. `SimulationJobOwner` owns direct Run/Preview
-generations, workers, cancellation, and publication; `ResultRepository` owns
-exact result identity and compatible numerical cache entries. `FitSessionOwner`
-owns modal Fit setup, Local initial-condition state plus an explicitly active
-Global configuration, and scalar-scope state, Apply/Reset, and terminal result
-admission, while `GlobalFitWorker` retains QThread custody. `DatasetImportStaging`
-owns a raw import batch until `ProjectSession` admits it; `ProjectDocument`
-retains each imported source once and datasets carry source references. The
-strict archive stores one source member per source, rejects unknown members
-structurally, and has no byte, member-count, batch, or other defensive limit as
-product policy. Import publication has one terminal success/failure outcome
-before staging is ready for the next import. `kindred.core.datasets` owns
-immutable dataset values and shared source rules. `MainWindow` composes these
-owners and wires presentation without duplicating their semantic state.
+Kindred launches only the desktop interface and does not accept command-line
+arguments.
 
-Run and Preview use the typed `SimulationExecutionRequest` boundary and the
-canonical `prepare_simulation_worker_run` preparation path. Run publishes
-canonical results through `SimulationJobOwner` and `ResultRepository`; Preview
-uses the same execution contract but remains transient and latest-only. Fit
-starts from an accepted `FitSessionOwner` setup, gives each candidate a fresh
-canonical preparation through the same boundary, and applies terminal results
-only through the owner’s current-result checks.
+## Basic workflow
 
-Scientific policy stays below the GUI: `dsl_parse` owns the line parser and
-the sole syntax-admission boundary, including `prepare_dsl_request_set`.
-`dsl_derivation` owns only the narrow source-coordinate rewrite helpers used
-when an admitted typed request is derived for Fit or another explicitly
-admitted consumer. The preparation boundary owns validated solver/ODE
-lowering. `param` is static solver-parameter algebra while `let` is dynamic
-row-local algebra; chemistry rate/equilibrium and detailed-balance policy
-remain canonical core authorities. Typing and ordinary presentation do not
-perform scientific preparation.
+1. Choose a bundled example or enter a mechanism in the Reactions editor.
+2. Set initial concentrations and simulation settings, then select **Run**.
+3. Inspect and configure the plot, parameters, statistics, and analysis views.
+4. To compare with experiments, load CSV or XLSX data and map its time and
+   observation columns to the mechanism.
+5. Open **Fitting → Global Fit**, choose datasets and adjustable values, and run
+   the fit.
+6. Export current results to XLSX or save the project as a `.kin` file.
 
-`ProjectDocument` owns Fit method, solver, evaluation, and seed rosters and
-ranges. `ftol` and `xtol` are submitted as exact positive finite values, with
-no product-level upper bound of 1; core `FitProgress` owns improvement and the
-best-simulation payload. Statistics and plot identity remain current-result,
-projected-roster, and display-label aware.
+## Links
 
-Developer validation is:
-
-    bash tools/audit/run_ci.sh
-
-This runs the strict audit and then `pytest -q`. At present the repository has
-no test modules matching pytest’s collection patterns, so `pytest -q` exits 5
-with no tests collected; that status is reported explicitly rather than as a
-passing test suite.
-
-## Repository
-
-GitHub: https://github.com/kindredsim/kindred
-
-## License
-
-Kindred source code is released under the MIT License. Third-party dependencies are distributed under their own licenses. In particular, PySide6 / Qt is licensed separately and may impose additional obligations for binary redistribution.
+- [Source repository](https://github.com/kindredsim/kindred)
+- [Issue tracker](https://github.com/kindredsim/kindred/issues)
+- [Kindred license](LICENSE)
+- [Third-party notices](NOTICE.txt)
+- [Third-party licenses](THIRD_PARTY_LICENSES.txt)

@@ -19,7 +19,6 @@ from .namespaces import (
 @dataclass(frozen=True, slots=True)
 class SymbolicExpression:
     expression: Any
-    normalized_source: str
     canonical_identifiers: tuple[str, ...]
     fingerprint: str
     symbol_context: dict[str, object]
@@ -121,7 +120,6 @@ def translate_parameter_expression(
     )
     return SymbolicExpression(
         expression=expression,
-        normalized_source=str(expression),
         canonical_identifiers=identifiers,
         fingerprint=fingerprint,
         symbol_context=symbol_context,

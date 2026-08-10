@@ -10,6 +10,7 @@ from kindred.core.project_document import ProjectDocument
 from kindred.core.project_session import ProjectContentToken
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
+from kindred.core.units import UnitsModel
 
 __all__ = [
     "DetailedBalanceCorrectionCommitResult",
@@ -123,6 +124,15 @@ class DetailedBalanceCorrectionRequest:
             raise ValueError("source_energy_unit must be nonblank.")
         object.__setattr__(self, "temperature_K", temperature)
         object.__setattr__(self, "source_energy_unit", source_energy_unit)
+
+    @property
+    def accepted_parse_units(self) -> UnitsModel:
+        """Return the parse context that produced the accepted cycle report."""
+
+        return UnitsModel(
+            energy_unit=self.source_energy_unit,
+            temperature_K=self.temperature_K,
+        )
 
 
 @dataclass(frozen=True, slots=True)

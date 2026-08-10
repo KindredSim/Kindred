@@ -24,7 +24,6 @@ Public API
 ----------
 set_x_candidates(candidates, *, selected)
 set_y_candidates(candidates, *, disabled=())
-select_y(selections)
 selected_y() -> tuple[AxisSeriesSelection, ...]
 current_x() -> AxisSeriesSelection
 is_auto_range() -> bool
@@ -41,7 +40,7 @@ No filesystem, no network, no cwd usage.
 from __future__ import annotations
 
 import math
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -343,42 +342,6 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_list.blockSignals(False)
         self._update_y_selector_text()
 
-    def select_y(self, selections: Iterable[AxisSeriesSelection]) -> None:
-        values = tuple(selections)
-        if any(
-            not isinstance(
-                selection,
-                (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
-            )
-            for selection in values
-        ):
-            raise TypeError("Selected Y values must be typed axis identities.")
-        target = set(values)
-        candidates = {
-            self._y_list.item(index).data(Qt.ItemDataRole.UserRole)
-            for index in range(self._y_list.count())
-        }
-        missing = target - candidates
-        if missing:
-            raise ValueError(
-                "Selected Y values must already be reconciled into the "
-                "candidate roster."
-            )
-        self._y_list.blockSignals(True)
-        try:
-            for i in range(self._y_list.count()):
-                it = self._y_list.item(i)
-                if it.flags() & Qt.ItemFlag.ItemIsEnabled:
-                    selection = it.data(Qt.ItemDataRole.UserRole)
-                    it.setCheckState(
-                        Qt.CheckState.Checked
-                        if selection in target
-                        else Qt.CheckState.Unchecked
-                    )
-        finally:
-            self._y_list.blockSignals(False)
-        self._update_y_selector_text()
-
     def invert_y_selection(self) -> None:
         """Invert enabled Y-series rows while leaving disabled scalar rows unchecked."""
         self._y_list.blockSignals(True)
@@ -424,13 +387,6 @@ class AxisToolbar(QtWidgets.QWidget):
         ):
             raise TypeError("X selector lacks a typed axis identity.")
         return selection
-
-    def interaction_mode(self) -> str:
-        return (
-            "rectangle_zoom"
-            if self._rectangle_zoom_button.isChecked()
-            else "pan"
-        )
 
     def set_interaction_mode(self, mode: str) -> None:
         normalized = str(mode or "").strip().lower()
