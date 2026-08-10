@@ -201,13 +201,6 @@ class WorkspacePresentationState:
         tuple[str, ProjectPresentationState], ...
     ]
 
-    def presentation(self, tab_id: str) -> ProjectPresentationState:
-        target = str(tab_id)
-        for current_id, state in self.presentation_by_tab_id:
-            if current_id == target:
-                return state
-        raise KeyError(f"Unknown presentation tab ID: {target!r}.")
-
 
 def default_project_presentation_state(
     tab: MechanismTabDocument,

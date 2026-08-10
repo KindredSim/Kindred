@@ -47,6 +47,20 @@ Launch the installed application with either command:
 Kindred launches only the desktop interface and does not accept command-line
 arguments.
 
+## Diagnostics
+
+Kindred keeps detailed rotating logs in the platform log directory:
+
+- Linux: `~/.cache/kindred/logs/kindred.log` (or
+  `$XDG_CACHE_HOME/kindred/logs/kindred.log`)
+- macOS: `~/Library/Logs/kindred/kindred.log`
+- Windows: `%LOCALAPPDATA%\kindred\logs\kindred.log`
+
+Set `KINDRED_LOG_DIR` to choose another normal log directory. If that location
+cannot be opened, Kindred writes the log to the system temporary directory at
+`kindred/logs/kindred.log`. `LOG_LEVEL` or `KINDRED_LOG_LEVEL` may be set to
+`DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
+
 ## Basic workflow
 
 1. Choose a bundled example or enter a mechanism in the Reactions editor.

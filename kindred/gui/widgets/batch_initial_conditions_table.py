@@ -392,7 +392,6 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
 
 class BatchInitialConditionsTableView(QtWidgets.QTableView):
     pasteRequested = QtCore.Signal(int, int, str)
-    pasteError = QtCore.Signal(str)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -574,7 +573,6 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     errorRaised = QtCore.Signal(str)
     activeSnapshotChanged = QtCore.Signal()
-    invalidCellStateChanged = QtCore.Signal(str, str, str, bool)
     selectedRunSetIdsChanged = QtCore.Signal(object)
 
     def __init__(
@@ -774,9 +772,6 @@ class InitialConditionsTableActions(QtCore.QObject):
             if invalid.get(set_id, {}).get(species) == raw:
                 return False
             invalid.setdefault(set_id, {})[species] = str(raw_text)
-            self.invalidCellStateChanged.emit(
-                tab.tab_id, set_id, species, True
-            )
             self.render()
             self.activeSnapshotChanged.emit()
             return False
@@ -1044,9 +1039,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         self.activeSnapshotChanged.emit()
         return True
 
-    def fence_inheriting_run_defaults_edit(self) -> None:
-        """Draft start is not an accepted scientific change and never fences."""
-
     def set_workspace_run_defaults(
         self,
         settings: SimulationExecutionSettings,
@@ -1185,12 +1177,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         set_values.pop(species, None)
         if not set_values:
             invalid.pop(set_id, None)
-        self.invalidCellStateChanged.emit(
-            self._tab_id,
-            set_id,
-            species,
-            False,
-        )
         return True
 
     def _consume_document_delta(

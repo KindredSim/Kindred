@@ -1275,18 +1275,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         return sample, chunks
 
     def _render_analysis(self, projection: WorkspaceResultProjection) -> None:
-        has_retained_reference = any(
-            layer.kind is ResultLayerKind.REFERENCE
-            and isinstance(layer.layer_id, SimulationResultLayerIdentity)
-            and layer.layer_id.set_id == projection.current_set_id
-            for layer in projection.plot_layers
-        )
-        if (
-            projection.primary_layer_id is None
-            and has_retained_reference
-            and self._analysis_set_id == projection.current_set_id
-        ):
-            return
         self._parameter_table.update_parameters(
             {name: (value, unit) for name, value, unit in projection.parameters}
         )

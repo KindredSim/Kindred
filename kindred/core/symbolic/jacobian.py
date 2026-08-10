@@ -55,7 +55,6 @@ class SymbolicJacobianStructure:
     structure_fingerprint: str
     artifact_fingerprint: str
     _compiled: Callable[..., Any]
-    _coefficient_public_names: tuple[str, ...]
     jac_sparsity: tuple[tuple[bool, ...], ...]
 
     def bind(
@@ -1063,8 +1062,5 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
         structure_fingerprint=structure_fingerprint,
         artifact_fingerprint=artifact_fingerprint,
         _compiled=compiled,
-        _coefficient_public_names=_coefficient_public_parameter_names(
-            mechanism
-        ),
         jac_sparsity=jac_sparsity,
     )

@@ -779,7 +779,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 if projected is not None
                 else 1.0
             )
-            if math.isclose(value, baseline, rel_tol=1e-12, abs_tol=1e-12):
+            if value == baseline:
                 self._pending_target_weights.pop((dataset_id, species), None)
             else:
                 self._pending_target_weights[(dataset_id, species)] = value
@@ -971,7 +971,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
         self._invalid_raw.pop(key, None)
         self._clear_invalid_line_edit(self._dataset_weight_edit)
-        if math.isclose(value, projected.weight, rel_tol=1e-12, abs_tol=1e-12):
+        if value == projected.weight:
             self._pending_dataset_weights.pop(dataset_id, None)
         else:
             self._pending_dataset_weights[dataset_id] = value

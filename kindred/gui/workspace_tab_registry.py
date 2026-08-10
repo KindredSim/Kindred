@@ -259,7 +259,7 @@ class WorkspaceTabRegistry:
     ) -> tuple[PreparedWorkspaceInstall, ScientificDocumentDelta]:
         """Build a complete reconciled registry value without live mutation."""
 
-        scientific_delta = self._scientific_document_delta(
+        scientific_delta = self.scientific_document_delta(
             previous_document,
             document,
         )
@@ -298,11 +298,26 @@ class WorkspaceTabRegistry:
                 # before callers perform any later persistence or view work.
                 runtime.reactions_draft = None
             set_ids = {item.set_id for item in tab.initial_condition_sets}
+            current_species = set(
+                ()
+                if tab.dsl_analysis is None
+                else tab.dsl_analysis.species_names
+            )
+            runtime.invalid_initial_text_by_set_id = {
+                set_id: {
+                    species: raw
+                    for species, raw in values.items()
+                    if species in current_species
+                }
+                for set_id, values
+                in runtime.invalid_initial_text_by_set_id.items()
+                if set_id in set_ids
+            }
             runtime.invalid_initial_text_by_set_id = {
                 set_id: values
                 for set_id, values
                 in runtime.invalid_initial_text_by_set_id.items()
-                if set_id in set_ids
+                if values
             }
             runtime.selected_run_set_ids = tuple(
                 set_id
@@ -310,11 +325,6 @@ class WorkspaceTabRegistry:
                 if set_id in set_ids
             )
             previous_tab = previous_tabs.get(tab.tab_id)
-            current_species = set(
-                ()
-                if tab.dsl_analysis is None
-                else tab.dsl_analysis.species_names
-            )
             previous_species = set(
                 ()
                 if previous_tab is None or previous_tab.dsl_analysis is None
@@ -715,7 +725,7 @@ class WorkspaceTabRegistry:
         )
 
     @staticmethod
-    def _scientific_document_delta(
+    def scientific_document_delta(
         previous: ProjectDocument,
         current: ProjectDocument,
     ) -> ScientificDocumentDelta:

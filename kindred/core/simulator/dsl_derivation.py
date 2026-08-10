@@ -196,7 +196,6 @@ def scalar_origin(
 
     pattern = re.compile(
         rf"^\s*param\s+{re.escape(name)}\s*=",
-        re.IGNORECASE,
     )
     matches = [
         origin

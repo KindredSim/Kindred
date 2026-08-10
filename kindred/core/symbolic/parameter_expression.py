@@ -27,7 +27,6 @@ class SymbolicExpression:
     expression: Any
     canonical_identifiers: tuple[str, ...]
     fingerprint: str
-    symbol_context: dict[str, object]
 
 
 def _unsupported(message: str) -> UnsupportedSymbolicExpressionError:
@@ -173,5 +172,4 @@ def translate_parameter_expression(
         expression=expression,
         canonical_identifiers=identifiers,
         fingerprint=fingerprint,
-        symbol_context=symbol_context,
     )

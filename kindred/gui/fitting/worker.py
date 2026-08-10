@@ -29,6 +29,7 @@ from kindred.core.analysis.global_fitting import fit_global
 from kindred.core.analysis.global_fit_execution import (
     FitProgress,
     GlobalFitResult,
+    fit_result_target_values,
     select_fit_rows,
 )
 from kindred.core.analysis.parametric_alignment import (
@@ -39,6 +40,7 @@ from kindred.core.exceptions import FitSimulationError, FittingCancelled
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     SerialFittingEvaluator,
+    is_candidate_domain_failure,
     prepare_fitting_execution_context,
 )
 from kindred.core.result_repository import SimulationResultValue
@@ -820,7 +822,6 @@ def _compile_optimizer_coordinates(
 class _FitDatasetContextCompilation:
     """Stable dataset sampling inputs used to build one evaluator context."""
 
-    selected: tuple[FitSelectedObservation, ...]
     retained_times: tuple[float, ...]
     grid_points: int
     fit_sampling_policy: str
@@ -845,7 +846,6 @@ def _compile_dataset_context(
         else "fit_internal_regular_grid_union_retained_endpoints"
     )
     return _FitDatasetContextCompilation(
-        selected=selected,
         retained_times=retained_times,
         grid_points=grid_points,
         fit_sampling_policy=policy,
@@ -1170,10 +1170,10 @@ def _canonical_curve_projection(
     axis = (
         time
         if x_name == "t"
-        else np.asarray(result.series[x_name], dtype=float).reshape(-1)
+        else fit_result_target_values(result, x_name)
     )
     values = {
-        name: np.asarray(result.series[name], dtype=float).reshape(-1)
+        name: fit_result_target_values(result, name)
         for name in names
     }
     return (
@@ -1394,7 +1394,6 @@ def _curves_from_evaluations(
             selected,
             x_by_target=observed_axes,
         )
-        result_series = evaluation.series
         segment_ids = tuple(
             int(value)
             for value in np.asarray(
@@ -1421,18 +1420,18 @@ def _curves_from_evaluations(
         model_axis = (
             np.asarray(evaluation.t, dtype=float)
             if x_name == "t"
-            else np.asarray(result_series[x_name], dtype=float)
+            else fit_result_target_values(evaluation, x_name)
         )
         objective_rows = {
             item.model_species: select_fit_rows(
                 model_y=np.asarray(
-                    result_series[item.model_species],
+                    fit_result_target_values(evaluation, item.model_species),
                     dtype=float,
                 ),
                 model_x=(
                     None
                     if x_name == "t"
-                    else np.asarray(result_series[x_name], dtype=float)
+                    else fit_result_target_values(evaluation, x_name)
                 ),
                 x_name=x_name,
                 x_mode=(
@@ -1483,7 +1482,10 @@ def _curves_from_evaluations(
                         tuple(
                             float(value)
                             for value in np.asarray(
-                                result_series[item.model_species],
+                                fit_result_target_values(
+                                    evaluation,
+                                    item.model_species,
+                                ),
                                 dtype=float,
                             )
                         ),
@@ -1873,14 +1875,6 @@ def _compile_fit_run_identity_payload(
     }
 
 
-@dataclass(frozen=True, slots=True)
-class _FitTerminalAssembly:
-    """Deterministic successful terminal projection owned by no Qt object."""
-
-    candidate: FitCandidate
-    run_identity: FitRunIdentity
-
-
 def _assemble_fit_terminal(
     *,
     request: FitExecutionRequest,
@@ -1894,7 +1888,7 @@ def _assemble_fit_terminal(
     evaluators: Mapping[str, SerialFittingEvaluator],
     prepared_ids: dict[str, dict[str, object]],
     run_identity_payload: dict[str, object],
-) -> _FitTerminalAssembly:
+) -> FitCandidate:
     """Validate provenance and build candidate/curves without worker custody."""
 
     effective_dataset_weights: dict[str, float] = {}
@@ -2006,7 +2000,7 @@ def _assemble_fit_terminal(
         setup_snapshot=terminal_snapshot,
         resolved_auto_modes=resolved_modes,
     )
-    return _FitTerminalAssembly(candidate=candidate, run_identity=run_identity)
+    return candidate
 
 
 class GlobalFitWorker(QtCore.QThread):
@@ -2388,8 +2382,14 @@ class GlobalFitWorker(QtCore.QThread):
                                 dtype=float,
                             ),
                             t_sim=series.t,
-                            x_model=series.series[provisional.x_name],
-                            y_model=series.series[target_name],
+                            x_model=fit_result_target_values(
+                                series,
+                                provisional.x_name,
+                            ),
+                            y_model=fit_result_target_values(
+                                series,
+                                target_name,
+                            ),
                             segment_ids=series.segment_ids,
                             segment_keys=series.segment_keys,
                             discontinuity_ids=series.discontinuity_ids,
@@ -2446,12 +2446,14 @@ class GlobalFitWorker(QtCore.QThread):
                 starting_evaluations,
                 effective_local,
             )
-        except DeterministicParametricResolutionError:
+        except FitSimulationError as exc:
             # The starting evaluation is scientific input to Auto-mode
             # resolution, but its aligned curve is only presentation.  A
-            # candidate-domain no-crossing therefore suppresses this optional
+            # candidate-domain failure therefore suppresses this optional
             # projection without preventing the optimizer from exploring the
-            # admitted domain.
+            # admitted domain.  Fatal Fit failures remain job-fatal.
+            if not is_candidate_domain_failure(exc):
+                raise
             initial_curves = ()
         if self._checkpoint():
             raise FittingCancelled()
@@ -2557,7 +2559,7 @@ class GlobalFitWorker(QtCore.QThread):
 
         if self._checkpoint():
             raise FittingCancelled()
-        terminal_assembly = _assemble_fit_terminal(
+        candidate = _assemble_fit_terminal(
             request=request,
             result=result,
             included=included,
@@ -2570,13 +2572,13 @@ class GlobalFitWorker(QtCore.QThread):
             prepared_ids=prepared_ids,
             run_identity_payload=run_identity_payload,
         )
-        run_identity = terminal_assembly.run_identity
+        run_identity = candidate.run_identity
         if self._checkpoint():
             raise FittingCancelled()
         self.progress.emit(100, f"Fit complete · {run_identity.short_hash}")
         if self._checkpoint():
             raise FittingCancelled()
-        return terminal_assembly.candidate
+        return candidate
 
     def _live_update(self) -> FitLiveUpdate:
         best_progress = self._best_progress

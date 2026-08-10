@@ -21,8 +21,6 @@ __all__ = ["SolverSettingsDialog", "TabScientificSettingsDialog"]
 class SolverSettingsDialog(QtWidgets.QDialog):
     """Edit one complete override; partial values never leave the dialog."""
 
-    settingsAccepted = QtCore.Signal(object)
-
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
@@ -114,7 +112,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
     @QtCore.Slot()
     def _accept_candidate(self) -> None:
         try:
-            candidate = self.execution_settings()
+            self.execution_settings()
         except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -122,14 +120,11 @@ class SolverSettingsDialog(QtWidgets.QDialog):
                 str(exc),
             )
             return
-        self.settingsAccepted.emit(candidate)
         self.accept()
 
 
 class TabScientificSettingsDialog(QtWidgets.QDialog):
     """Edit tab-wide science separately from per-set execution overrides."""
-
-    settingsAccepted = QtCore.Signal(object)
 
     def __init__(
         self,
@@ -235,7 +230,7 @@ class TabScientificSettingsDialog(QtWidgets.QDialog):
     @QtCore.Slot()
     def _accept_candidate(self) -> None:
         try:
-            candidate = self.scientific_settings()
+            self.scientific_settings()
         except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -243,5 +238,4 @@ class TabScientificSettingsDialog(QtWidgets.QDialog):
                 str(exc),
             )
             return
-        self.settingsAccepted.emit(candidate)
         self.accept()

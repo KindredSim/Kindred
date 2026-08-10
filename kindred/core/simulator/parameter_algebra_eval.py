@@ -15,19 +15,15 @@ from kindred.core.algebra.parser import (
     ExprNode,
     IdentNode,
     LetStatement,
-    NumberNode,
     SpeciesRefNode,
     UnaryNode,
 )
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
-from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
 from kindred.core.simulator.parameter_algebra_spec import (
     ParameterAlgebraNamespace,
     ParameterAlgebraSpec,
     ParameterAssignment,
-    _raise_invalid_protected_indexed_identifier_error,
-    is_protected_indexed_parameter_identifier,
     mechanism_parameter_name_pattern,
 )
 
@@ -101,119 +97,9 @@ def _map_algebra_error_to_assignment(
 
 
 @dataclass(frozen=True)
-class _CanonicalizedExpr:
-    expr: ExprNode
-    raw_to_canonical_identifiers: Mapping[str, str]
-
-
-@dataclass(frozen=True)
 class _CanonicalizedParameterBlock:
     block: AlgebraBlock
     raw_to_canonical_identifiers_by_assignment: Mapping[str, Mapping[str, str]]
-
-
-def _merge_raw_identifier_maps(*maps: Mapping[str, str]) -> Dict[str, str]:
-    merged: Dict[str, str] = {}
-    for mapping in maps:
-        for raw_name, canonical_name in mapping.items():
-            existing = merged.get(raw_name)
-            if existing is not None and existing != canonical_name:
-                raise ValueError(
-                    f"Conflicting canonical mechanism identifier mapping for {raw_name!r}: {existing!r} vs {canonical_name!r}"
-                )
-            merged[raw_name] = canonical_name
-    return merged
-
-
-def _canonicalize_mechanism_param_identifiers(
-    expr: ExprNode,
-    *,
-    mechanism_namespace: MechanismParameterNamespace,
-    scalar_input_names: Set[str],
-    assignment: ParameterAssignment,
-) -> _CanonicalizedExpr:
-    if isinstance(expr, NumberNode):
-        return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
-    if isinstance(expr, SpeciesRefNode):
-        return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
-    if isinstance(expr, IdentNode):
-        resolution = mechanism_namespace.resolve(expr.name)
-        invalid_protected = (
-            mechanism_namespace.invalid_protected_indexed_identifier(expr.name)
-            if resolution.canonical_name is None
-            else None
-        )
-        if invalid_protected is not None:
-            _raise_invalid_protected_indexed_identifier_error(
-                expr.name,
-                suggested_names=invalid_protected.suggested_names,
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        if resolution.canonical_name is None:
-            if is_protected_indexed_parameter_identifier(expr.name):
-                _raise_invalid_protected_indexed_identifier_error(
-                    expr.name,
-                    suggested_names=[],
-                    line_number=assignment.line_number,
-                    line_content=assignment.line_content,
-                )
-            # Non-protected exact-case scalar names keep their original binding.
-            if expr.name in scalar_input_names:
-                return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
-            return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
-        return _CanonicalizedExpr(
-            expr=IdentNode(resolution.canonical_name),
-            raw_to_canonical_identifiers={expr.name: resolution.canonical_name},
-        )
-    if isinstance(expr, UnaryNode):
-        rhs = _canonicalize_mechanism_param_identifiers(
-            expr.rhs,
-            mechanism_namespace=mechanism_namespace,
-            scalar_input_names=scalar_input_names,
-            assignment=assignment,
-        )
-        return _CanonicalizedExpr(
-            expr=UnaryNode(op=expr.op, rhs=rhs.expr),
-            raw_to_canonical_identifiers=dict(rhs.raw_to_canonical_identifiers),
-        )
-    if isinstance(expr, BinaryNode):
-        lhs = _canonicalize_mechanism_param_identifiers(
-            expr.lhs,
-            mechanism_namespace=mechanism_namespace,
-            scalar_input_names=scalar_input_names,
-            assignment=assignment,
-        )
-        rhs = _canonicalize_mechanism_param_identifiers(
-            expr.rhs,
-            mechanism_namespace=mechanism_namespace,
-            scalar_input_names=scalar_input_names,
-            assignment=assignment,
-        )
-        return _CanonicalizedExpr(
-            expr=BinaryNode(op=expr.op, lhs=lhs.expr, rhs=rhs.expr),
-            raw_to_canonical_identifiers=_merge_raw_identifier_maps(
-                lhs.raw_to_canonical_identifiers,
-                rhs.raw_to_canonical_identifiers,
-            ),
-        )
-    if isinstance(expr, CallNode):
-        canonical_args: List[ExprNode] = []
-        raw_map: Dict[str, str] = {}
-        for arg in expr.args:
-            canonical_arg = _canonicalize_mechanism_param_identifiers(
-                arg,
-                mechanism_namespace=mechanism_namespace,
-                scalar_input_names=scalar_input_names,
-                assignment=assignment,
-            )
-            canonical_args.append(canonical_arg.expr)
-            raw_map = _merge_raw_identifier_maps(raw_map, canonical_arg.raw_to_canonical_identifiers)
-        return _CanonicalizedExpr(
-            expr=CallNode(name=expr.name, args=tuple(canonical_args)),
-            raw_to_canonical_identifiers=raw_map,
-        )
-    return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
 
 
 def _parse_canonicalized_param_block(

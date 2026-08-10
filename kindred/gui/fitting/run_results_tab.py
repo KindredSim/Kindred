@@ -1381,7 +1381,8 @@ class RunResultsTab(QtWidgets.QWidget):
             max_chars=DIAGNOSTIC_LABEL_MAX_CHARS,
         )
         self._render_diagnostic_label.setText(
-            f"Plot unavailable: {compact.display or 'Fit plot rendering failed.'}"
+            "Fitted values remain available; plot unavailable: "
+            f"{compact.display or 'Fit plot rendering failed.'}"
         )
         self._render_diagnostic_label.setToolTip(compact.full)
         self._render_diagnostic_label.show()
@@ -1407,7 +1408,8 @@ class RunResultsTab(QtWidgets.QWidget):
             max_chars=DIAGNOSTIC_LABEL_MAX_CHARS,
         )
         self._render_diagnostic_label.setText(
-            f"Plot unavailable: {compact.display or 'Fit plot rendering failed.'}"
+            "Fitted values remain available; plot unavailable: "
+            f"{compact.display or 'Fit plot rendering failed.'}"
         )
         self._render_diagnostic_label.setToolTip(compact.full)
         self._render_diagnostic_label.show()

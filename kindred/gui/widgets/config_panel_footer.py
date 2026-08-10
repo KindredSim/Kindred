@@ -35,16 +35,12 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         self,
         parent: Optional[QtWidgets.QWidget] = None,
         *,
-        hint_text: str = "Changes take effect after Apply.",
-        show_hint: bool = True,
         show_dirty: bool = False,
         messages_position: str = "before_body",
         show_divider: bool = False,
         show_reset: bool = False,
         apply_requires_no_error: bool = False,
         button_order: Optional[Sequence[str]] = None,
-        hint_object_name: Optional[str] = None,
-        dirty_object_name: Optional[str] = None,
         error_object_name: Optional[str] = None,
         apply_object_name: Optional[str] = None,
         revert_object_name: Optional[str] = None,
@@ -76,18 +72,13 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        self.hint_label = QtWidgets.QLabel(str(hint_text))
+        self.hint_label = QtWidgets.QLabel("Changes take effect after Apply.")
         self.hint_label.setWordWrap(True)
         self.hint_label.setStyleSheet("font-size: 11px;")
-        if hint_object_name:
-            self.hint_label.setObjectName(str(hint_object_name))
-        self.hint_label.setVisible(bool(show_hint))
         layout.addWidget(self.hint_label)
 
         self.dirty_label = QtWidgets.QLabel("Pending changes")
         self.dirty_label.setStyleSheet("font-weight: bold; font-size: 11px;")
-        if dirty_object_name:
-            self.dirty_label.setObjectName(str(dirty_object_name))
         self.dirty_label.setVisible(False)
         layout.addWidget(self.dirty_label)
         if not self._show_dirty:

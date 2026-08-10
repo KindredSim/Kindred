@@ -48,7 +48,6 @@ def build_mechanism_from_ir(
         temperature_K=float(T),
         standard_conc_M=float(C0),
         energy_unit=str(energy_unit),
-        step_index_policy="dsl_only",
     ).apply_to_metadata(mechanism.metadata)
 
     # Canonical step-index mapping (global DSL step order).
@@ -157,7 +156,6 @@ def build_mechanism_from_ir(
                 if step.dG_eq_J_per_mol is not None
                 else None,
                 Keq_input=Keq_input,
-                explicit_rates=step.explicit_rates,
                 forward_model=forward_model,
                 standard_conc_M=step.standard_conc_M
                 if step.standard_conc_M is not None

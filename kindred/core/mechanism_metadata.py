@@ -23,7 +23,6 @@ class MechanismMetadataKeys:
     TEMPERATURE_K = "temperature_K"
     STANDARD_CONC_M = "standard_conc_M"
     ENERGY_UNIT = "energy_unit"
-    STEP_INDEX_POLICY = "step_index_policy"
     TEMPERATURE_SCHEDULE = "temperature_schedule"
     WEGSCHEIDER_CYCLICITY_ENABLED = "wegscheider_cyclicity_enabled"
 
@@ -34,7 +33,6 @@ class EquilibriumMetadataKeys:
     USER_PROVIDED_KR = "user_provided_kr"
     DG_EQ_J_PER_MOL = "dG_eq_J_per_mol"
     KEQ_INPUT = "Keq_input"
-    EXPLICIT_RATES = "explicit_rates"
     FORWARD_MODEL = "forward_model"
     STANDARD_CONC_M = "standard_conc_M"
 
@@ -81,7 +79,6 @@ class MechanismMetadataView:
     temperature_K: float = 298.15
     standard_conc_M: float = 1.0
     energy_unit: str = "kJ/mol"
-    step_index_policy: str = "dsl_only"
     temperature_schedule: Optional[TemperatureScheduleProtocol] = None
 
     def __post_init__(self) -> None:
@@ -120,9 +117,6 @@ class MechanismMetadataView:
                 meta.get(MechanismMetadataKeys.ENERGY_UNIT, "kJ/mol"),
                 default="kJ/mol",
             ),
-            step_index_policy=str(
-                meta.get(MechanismMetadataKeys.STEP_INDEX_POLICY, "dsl_only")
-            ),
             temperature_schedule=coerce_temperature_schedule(
                 meta.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE)
             ),
@@ -132,7 +126,6 @@ class MechanismMetadataView:
         meta[MechanismMetadataKeys.TEMPERATURE_K] = float(self.temperature_K)
         meta[MechanismMetadataKeys.STANDARD_CONC_M] = float(self.standard_conc_M)
         meta[MechanismMetadataKeys.ENERGY_UNIT] = str(self.energy_unit)
-        meta[MechanismMetadataKeys.STEP_INDEX_POLICY] = str(self.step_index_policy)
         if self.temperature_schedule is not None:
             meta[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = self.temperature_schedule
 
@@ -144,7 +137,6 @@ class EquilibriumMetadataView:
     user_provided_kr: bool
     dG_eq_J_per_mol: Optional[float] = None
     Keq_input: Optional[object] = None
-    explicit_rates: tuple[float, ...] = ()
     forward_model: Optional[dict[str, object]] = None
     standard_conc_M: Optional[float] = None
 
@@ -157,14 +149,6 @@ class EquilibriumMetadataView:
     ) -> "EquilibriumMetadataView":
         if not isinstance(meta, Mapping):
             meta = {}
-        explicit_rates = meta.get(EquilibriumMetadataKeys.EXPLICIT_RATES, ())
-        if not isinstance(explicit_rates, (list, tuple)):
-            explicit_rates = ()
-        explicit_rates_f = []
-        for x in explicit_rates:
-            coerced = _optional_finite_float(x)
-            if coerced is not None:
-                explicit_rates_f.append(coerced)
         forward_model = meta.get(EquilibriumMetadataKeys.FORWARD_MODEL)
         if isinstance(forward_model, Mapping):
             forward_model = dict(forward_model)
@@ -185,7 +169,6 @@ class EquilibriumMetadataView:
             user_provided_kr=_as_bool(meta.get(EquilibriumMetadataKeys.USER_PROVIDED_KR)),
             dG_eq_J_per_mol=dG_f,
             Keq_input=meta.get(EquilibriumMetadataKeys.KEQ_INPUT),
-            explicit_rates=tuple(explicit_rates_f),
             forward_model=forward_model,
             standard_conc_M=std_f,
         )
@@ -200,8 +183,6 @@ class EquilibriumMetadataView:
             out[EquilibriumMetadataKeys.DG_EQ_J_PER_MOL] = float(self.dG_eq_J_per_mol)
         if self.Keq_input is not None:
             out[EquilibriumMetadataKeys.KEQ_INPUT] = self.Keq_input
-        if self.explicit_rates:
-            out[EquilibriumMetadataKeys.EXPLICIT_RATES] = list(self.explicit_rates)
         if self.forward_model is not None:
             out[EquilibriumMetadataKeys.FORWARD_MODEL] = dict(self.forward_model)
         if self.standard_conc_M is not None:

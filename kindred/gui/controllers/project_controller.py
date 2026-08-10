@@ -131,7 +131,6 @@ class ProjectController(QtCore.QObject):
     """The sole New/Open/Convert/Save/Save As/Close disposition owner."""
 
     documentReplaced = QtCore.Signal()
-    projectSaved = QtCore.Signal()
     projectStateChanged = QtCore.Signal()
     closePendingChanged = QtCore.Signal(bool)
     nativeCloseAuthorized = QtCore.Signal()
@@ -1037,7 +1036,6 @@ class ProjectController(QtCore.QObject):
             self._config.record_recent_project(absolute_path)
         except Exception:
             logger.warning("Recent-project update failed", exc_info=True)
-        self.projectSaved.emit()
         self.projectStateChanged.emit()
         return committed_token
 

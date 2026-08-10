@@ -93,8 +93,6 @@ def _required_id(value: object, field: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class RunParallelCapacity:
-    cpu_budget: int
-    default_user_max: int
     resolved_user_max: int
     effective: int
 
@@ -122,8 +120,6 @@ def resolve_run_parallel_capacity(
         else default_user_max
     )
     return RunParallelCapacity(
-        cpu_budget=cpu_budget,
-        default_user_max=default_user_max,
         resolved_user_max=resolved_user_max,
         effective=min(
             targets,
@@ -855,7 +851,6 @@ class SimulationJobOwner(QtCore.QObject):
     status_changed = QtCore.Signal(str)
     results_changed = QtCore.Signal(str)
     preview_endpoints_retired = QtCore.Signal(object)
-    terminal = QtCore.Signal(object)
     run_dispatched = QtCore.Signal(str, object)
     detailed_balance_correction_requested = QtCore.Signal(object)
 
@@ -2215,7 +2210,6 @@ class SimulationJobOwner(QtCore.QObject):
         self._finish_current()
         if self._application_close_fenced:
             return
-        self.terminal.emit(summary)
         self.status_changed.emit(self._terminal_status(summary))
         self._schedule_pending_preview()
 
@@ -2261,7 +2255,6 @@ class SimulationJobOwner(QtCore.QObject):
         summary = self._terminal_summary()
         self._job_id += 1
         self._finish_current()
-        self.terminal.emit(summary)
         self.status_changed.emit(self._terminal_status(summary))
 
     def _finish_current(self) -> None:

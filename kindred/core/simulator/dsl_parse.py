@@ -29,14 +29,13 @@ Non-goals
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping as MappingABC
 import copy
 import hashlib
 import json
 import logging
 import math
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Mapping, Optional, Tuple, cast, TYPE_CHECKING
+from typing import Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
 import re
 
@@ -83,7 +82,6 @@ __all__ = [
     "DslInitialConditionDeclaration",
     "DslParameterCoordinateUpdate",
     "DslSourceOrigin",
-    "FrozenDslMapping",
     "PreparedDslRequestSet",
     "derive_prepared_dsl_with_observables",
     "derive_prepared_dsl_with_parameter_updates",
@@ -153,47 +151,6 @@ class DSLIR:
     steps: List[DslBuildStep]
     inline_initial_conditions: "DslInitialConditionAdmission"
     notes: List[str] = field(default_factory=list)
-
-
-class FrozenDslMapping(MappingABC[str, object]):
-    """Pickle-safe deeply immutable mapping used by public DSL evidence."""
-
-    __slots__ = ("__items",)
-
-    def __init__(
-        self,
-        values: Mapping[str, object] | tuple[tuple[str, object], ...] = (),
-    ) -> None:
-        items = (
-            tuple(values.items())
-            if isinstance(values, MappingABC)
-            else tuple(values)
-        )
-        normalized: list[tuple[str, object]] = []
-        seen: set[str] = set()
-        for key, value in items:
-            if type(key) is not str:
-                raise TypeError("Frozen DSL mapping keys must be exact strings.")
-            if key in seen:
-                raise ValueError(f"Duplicate frozen DSL mapping key: {key!r}.")
-            seen.add(key)
-            normalized.append((key, value))
-        self.__items = tuple(normalized)
-
-    def __getitem__(self, key: str) -> object:
-        for candidate, value in self.__items:
-            if candidate == key:
-                return value
-        raise KeyError(key)
-
-    def __iter__(self) -> Iterator[str]:
-        return (key for key, _value in self.__items)
-
-    def __len__(self) -> int:
-        return len(self.__items)
-
-    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
-        return (type(self), (self.__items,))
 
 
 def _dsl_identity_payload(
@@ -360,14 +317,6 @@ class DslInitialConditionDeclaration:
             raise TypeError(
                 "Inline initial-condition source lines must match the span."
             )
-
-    @property
-    def values(self) -> Mapping[str, float]:
-        values: dict[str, float] = {}
-        for assignment in self.assignments:
-            values[assignment.species] = assignment.value
-        return cast(Mapping[str, float], FrozenDslMapping(values))
-
 
 @dataclass(frozen=True, slots=True)
 class DslInitialConditionAdmission:
@@ -576,16 +525,6 @@ class DslAnalysis:
                 f"DSL analysis energy_unit is invalid: {self.energy_unit!r}."
             ) from exc
         object.__setattr__(self, "energy_unit", energy_unit)
-    @property
-    def parameter_values(self) -> Mapping[str, float]:
-        return cast(
-            Mapping[str, float],
-            FrozenDslMapping(
-                {item.name: item.value for item in self.parameters}
-            ),
-        )
-
-
 class PreparedDslRequestSet:
     """Single-parse owner of one immutable analysis and execution structure."""
 

@@ -28,16 +28,6 @@ from kindred.core.algebra.errors import (
     AlgebraTypeError,
     AlgebraZeroDivError,
 )
-from kindred.core.algebra.parser import (
-    BinaryNode,
-    CallNode,
-    ExprNode,
-    IdentNode,
-    UnaryNode,
-)
-from kindred.core.algebra.simulation_series import (
-    compiled_algebra_for_mechanism,
-)
 from kindred.core.runtime_defaults import (
     USE_ANALYTIC_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
@@ -84,6 +74,7 @@ __all__ = [
     "FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED",
     "PreparedFittingExecutionContext",
     "SerialFittingEvaluator",
+    "is_candidate_domain_failure",
     "evaluate_fitting_series",
     "prepare_fitting_execution_context",
 ]
@@ -146,26 +137,22 @@ def _optimizer_origin_names(origins: Mapping[str, str]) -> frozenset[str]:
     )
 
 
-def _optimizer_authority_names(
-    origins: Mapping[str, str],
-    parameter_partition: object,
-) -> frozenset[str]:
-    raw_names = _optimizer_origin_names(origins)
-    authority_names = set(raw_names)
-    for mapping_name in (
-        "mechanism_parameter_name_by_raw",
-        "unbound_mechanism_parameter_name_by_raw",
-        "schedule_parameter_name_by_raw",
-    ):
-        name_mapping = getattr(parameter_partition, mapping_name, {})
-        if not isinstance(name_mapping, Mapping):
-            continue
-        authority_names.update(
-            str(owner_name)
-            for raw_name, owner_name in name_mapping.items()
-            if str(raw_name) in raw_names and str(owner_name).strip()
-        )
-    return frozenset(authority_names)
+def is_candidate_domain_failure(exc: BaseException) -> bool:
+    """Return whether *exc* is an admitted, nonfatal candidate outcome.
+
+    Candidate-domain status is a semantic contract carried by the typed
+    ``FitSimulationError`` flags.  No parameter-name attribution is involved:
+    a valid fitted parameter can drive an otherwise independent expression or
+    trajectory outside its admitted numerical domain.
+    """
+
+    details = getattr(exc, "details", None)
+    return bool(
+        isinstance(exc, FitSimulationError)
+        and isinstance(details, Mapping)
+        and details.get("candidate_domain") is True
+        and details.get("fatal") is False
+    )
 
 
 def _candidate_domain_error(
@@ -217,31 +204,8 @@ def _fatal_evaluation_error(
     )
 
 
-def _algebra_identifier_dependencies(expr: ExprNode) -> frozenset[str]:
-    if isinstance(expr, IdentNode):
-        return frozenset((str(expr.name),))
-    if isinstance(expr, UnaryNode):
-        return _algebra_identifier_dependencies(expr.rhs)
-    if isinstance(expr, BinaryNode):
-        return (
-            _algebra_identifier_dependencies(expr.lhs)
-            | _algebra_identifier_dependencies(expr.rhs)
-        )
-    if isinstance(expr, CallNode):
-        dependencies: set[str] = set()
-        for argument in expr.args:
-            dependencies.update(_algebra_identifier_dependencies(argument))
-        return frozenset(dependencies)
-    return frozenset()
-
-
-def _strict_algebra_failure_evidence(
-    exc: BaseException,
-    *,
-    mechanism: object,
-    optimizer_authority_names: frozenset[str],
-) -> Mapping[str, object] | None:
-    """Return exact evidence only for candidate-sensitive strict failures."""
+def _strict_algebra_failure_details(exc: BaseException) -> Mapping[str, object] | None:
+    """Retain typed Algebra location without using dependency provenance."""
 
     candidate_sensitive_type = isinstance(
         exc,
@@ -252,54 +216,20 @@ def _strict_algebra_failure_evidence(
     )
     if not candidate_sensitive_type:
         return None
-    compiled = compiled_algebra_for_mechanism(mechanism)
-    if compiled is None:
-        return None
     line = getattr(exc, "line", None)
     line_text = str(getattr(exc, "line_text", "") or "")
-    matching = tuple(
-        statement
-        for statement in compiled.block.lines
-        if int(statement.line) == int(line or -1)
-        and (
-            not line_text
-            or str(statement.line_text or "").strip() == line_text.strip()
-        )
-    )
-    if len(matching) != 1:
-        return None
-    statement = matching[0]
-    statements_by_name = {
-        str(item.name): item for item in compiled.block.lines
-    }
-    dependencies = set(_algebra_identifier_dependencies(statement.expr))
-    pending = list(dependencies)
-    while pending:
-        dependency = pending.pop()
-        dependency_statement = statements_by_name.get(dependency)
-        if dependency_statement is None:
-            continue
-        for nested in _algebra_identifier_dependencies(
-            dependency_statement.expr
-        ):
-            if nested not in dependencies:
-                dependencies.add(nested)
-                pending.append(nested)
-    fitted_intersection = frozenset(dependencies) & optimizer_authority_names
+    if line is None and not line_text:
+        return {"algebra_code": str(getattr(exc, "code", "") or "")}
     return {
         "algebra_code": str(getattr(exc, "code", "") or ""),
         "algebra_location": {
-            "line": int(statement.line),
-            "column": int(getattr(exc, "col", statement.col)),
+            "line": int(line) if line is not None else None,
+            "column": int(getattr(exc, "col", 1)),
         },
         "algebra_statement": {
-            "name": str(statement.name),
-            "source": str(statement.line_text or ""),
+            "name": "",
+            "source": line_text,
         },
-        "algebra_dependencies": tuple(sorted(dependencies)),
-        "fitted_authority_intersection": tuple(
-            sorted(fitted_intersection)
-        ),
     }
 
 
@@ -806,10 +736,7 @@ class SerialFittingEvaluator:
                 failed_params=failed_params,
                 details={"fatal": True, "stage": "parameter_binding"},
             ) from exc
-        optimizer_authority_names = _optimizer_authority_names(
-            origin_map,
-            preflight_partition,
-        )
+        candidate_authority_present = bool(_optimizer_origin_names(origin_map))
 
         try:
             # Every candidate, including the first, receives a fresh isolated
@@ -823,10 +750,7 @@ class SerialFittingEvaluator:
                 cancellation_control=self._cancellation_control,
             )
         except SimulationPreparationError as exc:
-            candidate_domain = bool(
-                exc.candidate_domain_eligible
-                and exc.parameter_names & optimizer_authority_names
-            )
+            candidate_domain = bool(exc.candidate_domain_eligible)
             raise fit_simulation_error_from_preparation_error(
                 exc,
                 fatal=not candidate_domain,
@@ -978,10 +902,7 @@ class SerialFittingEvaluator:
                     ),
                 )
             except SimulationPreparationError as exc:
-                candidate_schedule = bool(
-                    exc.candidate_domain_eligible
-                    and exc.parameter_names & optimizer_authority_names
-                )
+                candidate_schedule = bool(exc.candidate_domain_eligible)
                 raise fit_simulation_error_from_preparation_error(
                     exc,
                     fatal=not candidate_schedule,
@@ -1029,7 +950,7 @@ class SerialFittingEvaluator:
                 failed_params=failed_params,
             ) from exc
         except (SolverError, InterventionScheduleError) as exc:
-            if optimizer_authority_names:
+            if candidate_authority_present:
                 raise _candidate_domain_error(
                     exc,
                     stage="solver",
@@ -1067,27 +988,20 @@ class SerialFittingEvaluator:
         except Exception as exc:
             if isinstance(exc, (FittingCancelled, SimulationCancelled)):
                 raise FittingCancelled() from exc
-            algebra_evidence = _strict_algebra_failure_evidence(
-                exc,
-                mechanism=prepared_run.mechanism,
-                optimizer_authority_names=optimizer_authority_names,
-            )
-            if (
-                algebra_evidence is not None
-                and algebra_evidence["fitted_authority_intersection"]
-            ):
+            algebra_details = _strict_algebra_failure_details(exc)
+            if algebra_details is not None and candidate_authority_present:
                 raise _candidate_domain_error(
                     exc,
                     stage="result_finalization",
                     failed_params=failed_params,
-                    extra_details=algebra_evidence,
+                    extra_details=algebra_details,
                 ) from exc
             raise _fatal_evaluation_error(
                 exc,
                 message=f"Fitting result finalization failed: {exc}",
                 stage="result_finalization",
                 failed_params=failed_params,
-                extra_details=algebra_evidence,
+                extra_details=algebra_details,
             ) from exc
         final_solver_provenance = dict(admitted.provenance.solver)
         final_solver_provenance.update(

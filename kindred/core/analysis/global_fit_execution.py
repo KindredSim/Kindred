@@ -33,6 +33,7 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
     evaluate_fitting_series,
+    is_candidate_domain_failure,
 )
 from kindred.core.objective import ObjectiveContext
 from kindred.core.result_repository import SimulationResultValue
@@ -59,6 +60,7 @@ __all__ = [
     "normalize_weights",
     "evaluate_dataset_simulation",
     "evaluate_dataset_simulations",
+    "fit_result_target_values",
     "select_fit_rows",
     "dataset_evaluation_is_fatal",
     "assemble_global_fit_result",
@@ -76,17 +78,6 @@ def _raise_if_fitting_cancel_requested(
         return
     if cancellation_control.cancel_requested():
         raise FittingCancelled()
-
-
-def _is_expected_candidate_domain_failure(exc: BaseException) -> bool:
-    """Accept penalties only for the evaluator's explicit candidate domain."""
-
-    return bool(
-        isinstance(exc, FitSimulationError)
-        and isinstance(exc.details, Mapping)
-        and exc.details.get("candidate_domain") is True
-        and exc.details.get("fatal") is False
-    )
 
 
 def _candidate_trajectory_failure(
@@ -773,6 +764,45 @@ def _payload_x_obs_by_species(payload: FitDatasetSpec) -> Dict[str, np.ndarray]:
     }
 
 
+def fit_result_target_values(
+    result: SimulationResultValue,
+    name: str,
+) -> np.ndarray:
+    """Resolve a Fit target from the canonical scalar/series result split.
+
+    The retained Algebra DAG and evaluator decide whether a let is scalar or
+    row-varying.  This boundary consumes that typed result directly; it never
+    infers type from static parser tables or sampled values.
+    """
+
+    if not isinstance(result, SimulationResultValue):
+        raise TypeError("Fit target lookup requires a SimulationResultValue.")
+    target_name = str(name)
+    time_size = np.asarray(result.t, dtype=float).reshape(-1).size
+    if target_name in result.series:
+        values = np.asarray(result.series[target_name], dtype=float).reshape(-1)
+    elif target_name in result.scalars:
+        value = float(result.scalars[target_name])
+        if not np.isfinite(value):
+            raise FitSimulationError(
+                f"Fit scalar target {target_name!r} is non-finite.",
+                details={"fatal": True, "stage": "fit_target_lookup"},
+            )
+        values = np.full(time_size, value, dtype=float)
+    else:
+        raise FitSimulationError(
+            f"Fit target {target_name!r} is absent from the canonical "
+            "simulation scalar/series outputs.",
+            details={"fatal": True, "stage": "fit_target_lookup"},
+        )
+    if values.size != time_size or not np.all(np.isfinite(values)):
+        raise FitSimulationError(
+            f"Fit target {target_name!r} is not a finite row-aligned output.",
+            details={"fatal": True, "stage": "fit_target_lookup"},
+        )
+    return values
+
+
 @dataclass(frozen=True)
 class FitParameterLayout:
     param_names: tuple[str, ...]
@@ -1163,7 +1193,7 @@ class DatasetSimulationEvaluation:
 
 def dataset_evaluation_is_fatal(result: DatasetSimulationEvaluation) -> bool:
     error = result.error
-    return error is not None and not _is_expected_candidate_domain_failure(error)
+    return error is not None and not is_candidate_domain_failure(error)
 
 
 def evaluate_dataset_simulation(
@@ -1375,6 +1405,57 @@ class GlobalFitObjective:
             )
         }
 
+        candidate_authority_present = any(
+            origin
+            in {
+                FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+                FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
+            }
+            for item in dataset_inputs
+            for origin in item.parameter_origins.values()
+        )
+
+        def candidate_penalty_residuals() -> np.ndarray:
+            """Return one complete penalty vector for this parameter vector."""
+
+            blocks: list[np.ndarray] = []
+            for item in dataset_inputs:
+                payload = item.payload
+                target_multipliers = _normalized_target_weight_multipliers(
+                    species_list=payload.species_list,
+                    target_weights=dict(payload.target_weights),
+                )
+                dataset_weight = _objective_dataset_weight_multiplier(
+                    self._weights.get(payload.dataset_id, 1.0)
+                )
+                observations = _payload_observations(payload)
+                for species_name in payload.species_list:
+                    y_exp = np.asarray(
+                        observations[species_name]["y"], dtype=float
+                    ).reshape(-1)
+                    blocks.append(
+                        np.full_like(
+                            y_exp,
+                            float(dataset_weight)
+                            * float(target_multipliers.get(species_name, 1.0))
+                            * self._penalty_value,
+                        )
+                    )
+            return (
+                np.concatenate(blocks).astype(float, copy=False)
+                if blocks
+                else np.asarray([], dtype=float)
+            )
+
+        def reject_candidate(exc: BaseException, provenance: object) -> np.ndarray:
+            self._ctx.set_error(exc, provenance)
+            self._objective_calls += 1
+            key = ("__candidate__", "__simulation__", str(exc).splitlines()[0])
+            if key not in self._warned_objective_keys:
+                self._warned_objective_keys.add(key)
+                logger.warning("Fit candidate rejected: %s", exc)
+            return candidate_penalty_residuals()
+
         for evaluation in simulation_evaluations.values():
             if not dataset_evaluation_is_fatal(evaluation):
                 continue
@@ -1382,6 +1463,11 @@ class GlobalFitObjective:
             if isinstance(exc, FitSimulationError):
                 self._ctx.set_error(exc, evaluation.error_provenance)
                 raise exc
+
+        for evaluation in simulation_evaluations.values():
+            exc = evaluation.error
+            if exc is not None and is_candidate_domain_failure(exc):
+                return reject_candidate(exc, evaluation.error_provenance)
 
         for item in dataset_inputs:
             _raise_if_fitting_cancel_requested(self._cancellation_control)
@@ -1416,21 +1502,9 @@ class GlobalFitObjective:
                         context=getattr(exc, "context", None),
                     )
                 self._ctx.set_error(exc, evaluation.error_provenance)
-                if not _is_expected_candidate_domain_failure(exc):
+                if not is_candidate_domain_failure(exc):
                     raise exc
-                key = (str(ds_id), "__simulation__", str(exc).splitlines()[0])
-                if key not in self._warned_objective_keys:
-                    self._warned_objective_keys.add(key)
-                    logger.warning("Simulation failed for %s: %s", ds_id, exc)
-                for species_name in species_list:
-                    target_weight = float(target_multipliers.get(species_name, 1.0))
-                    dataset_weight = _objective_dataset_weight_multiplier(weight)
-                    y_exp = np.asarray(observations[species_name]["y"], dtype=float).reshape(-1)
-                    all_residuals.extend(
-                        (float(dataset_weight) * float(target_weight) * self._penalty_value)
-                        * np.ones_like(y_exp, dtype=float)
-                    )
-                continue
+                return reject_candidate(exc, evaluation.error_provenance)
 
             simulation = evaluation.result
             if simulation is None:
@@ -1439,7 +1513,6 @@ class GlobalFitObjective:
                     failed_params=failed_param_snapshot,
                 )
             sim_time = simulation.t
-            sim_species = simulation.series
             segment_ids = simulation.segment_ids
             segment_keys = simulation.segment_keys
             discontinuity_ids = simulation.discontinuity_ids
@@ -1456,16 +1529,11 @@ class GlobalFitObjective:
                 )
                 target_weight = float(target_multipliers.get(str(species_name), 1.0))
                 effective_weight = _objective_dataset_weight_multiplier(weight) * float(target_weight)
-                model_series = sim_species.get(species_name)
-                if model_series is None:
-                    err = FitSimulationError(
-                        f"Species '{species_name}' missing in simulation result for dataset '{ds_id}'",
-                        failed_params=failed_param_snapshot,
-                    )
-                    self._ctx.set_error(err, {"dataset": ds_id})
-                    raise err
-
                 try:
+                    model_series = fit_result_target_values(
+                        simulation,
+                        species_name,
+                    )
                     if x_name != "t" and species_x_obs is None:
                         raise FitSimulationError(
                             f"Dataset '{ds_id}' species '{species_name}' is missing x observations for X='{x_name}'.",
@@ -1476,7 +1544,7 @@ class GlobalFitObjective:
                         model_x=(
                             None
                             if x_name == "t"
-                            else sim_species.get(x_name)
+                            else fit_result_target_values(simulation, x_name)
                         ),
                         x_name=x_name,
                         x_mode=x_mode,
@@ -1508,15 +1576,9 @@ class GlobalFitObjective:
                         context=getattr(exc, "context", None),
                     )
                     self._ctx.set_error(err, {"dataset": ds_id})
-                    if not _is_expected_candidate_domain_failure(err):
+                    if not is_candidate_domain_failure(err):
                         raise err
-                    key = (str(ds_id), str(species_name), str(exc).splitlines()[0])
-                    if key not in self._warned_objective_keys:
-                        self._warned_objective_keys.add(key)
-                        logger.warning("Alignment failed for %s:%s: %s", ds_id, species_name, exc)
-                    y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
-                    continue
+                    return reject_candidate(err, {"dataset": ds_id})
                 except Exception as exc:
                     if isinstance(exc, (FittingCancelled, SimulationCancelled)):
                         raise FittingCancelled() from exc
@@ -1535,6 +1597,14 @@ class GlobalFitObjective:
                         failed_params=failed_param_snapshot,
                     )
                     self._ctx.set_error(err, {"dataset": ds_id})
+                    if candidate_authority_present:
+                        return reject_candidate(
+                            _candidate_trajectory_failure(
+                                err,
+                                stage="objective_nonfinite",
+                            ),
+                            {"dataset": ds_id},
+                        )
                     raise err
 
                 residual_vector = effective_weight * (
@@ -1546,6 +1616,14 @@ class GlobalFitObjective:
                         failed_params=failed_param_snapshot,
                     )
                     self._ctx.set_error(err, {"dataset": ds_id})
+                    if candidate_authority_present:
+                        return reject_candidate(
+                            _candidate_trajectory_failure(
+                                err,
+                                stage="objective_nonfinite",
+                            ),
+                            {"dataset": ds_id},
+                        )
                     raise err
                 all_residuals.extend(np.asarray(residual_vector, dtype=float).reshape(-1))
 
@@ -1697,10 +1775,10 @@ def assemble_global_fit_result(
         _raise_if_fitting_cancel_requested(cancellation_control)
 
         sim_time: Optional[np.ndarray] = None
-        sim_species: Mapping[str, np.ndarray] = {}
         segment_ids: Optional[np.ndarray] = None
         segment_keys: tuple[str, ...] | None = None
         discontinuity_ids: Optional[np.ndarray] = None
+        simulation: SimulationResultValue | None = None
         evaluation = simulation_evaluations.get(int(item.index))
         if evaluation is None:
             raise RuntimeError(f"Missing fitting simulation result for dataset '{ds_id}'.")
@@ -1737,7 +1815,6 @@ def assemble_global_fit_result(
                 )
             simulation_results_by_dataset[ds_id] = simulation
             sim_time = simulation.t
-            sim_species = simulation.series
             segment_ids = simulation.segment_ids
             segment_keys = simulation.segment_keys
             discontinuity_ids = simulation.discontinuity_ids
@@ -1756,29 +1833,26 @@ def assemble_global_fit_result(
             )
             penalty_block = np.full_like(y_exp, penalty_value, dtype=float)
 
-            if species_name not in sim_species:
-                if ds_id not in final_dataset_failures:
-                    final_dataset_failures[ds_id] = build_fit_diagnostic_from_failure(
-                        build_simulation_failure(
-                            kind="simulation_error",
-                            message=f"Species '{species_name}' missing in simulation result.",
-                        ),
-                        phase="final_replay",
-                        dataset_id=ds_id,
-                    )
+            if simulation is None:
                 residual_blocks.append(penalty_block)
                 continue
 
             try:
+                model_series = fit_result_target_values(
+                    simulation,
+                    species_name,
+                )
                 if x_name != "t" and species_x_obs is None:
                     raise FitSimulationError(
                         f"Dataset '{ds_id}' species '{species_name}' is missing x observations for X='{x_name}'.",
                         failed_params=failed_param_snapshot,
                     )
                 selected_rows = select_fit_rows(
-                    model_y=np.asarray(sim_species[species_name], dtype=float),
+                    model_y=np.asarray(model_series, dtype=float),
                     model_x=(
-                        None if x_name == "t" else sim_species.get(x_name)
+                        None
+                        if x_name == "t"
+                        else fit_result_target_values(simulation, x_name)
                     ),
                     x_name=x_name,
                     x_mode=x_mode,

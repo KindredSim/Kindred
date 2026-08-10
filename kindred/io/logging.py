@@ -18,40 +18,42 @@ _BACKUP_COUNT = 5
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
-def _get_log_dir() -> Path:
-    """Create and return the first available platform-appropriate log directory."""
+def _get_normal_log_dir() -> Path:
+    """Return the platform log directory, honoring the supported override."""
 
     configured_dir = os.environ.get("KINDRED_LOG_DIR")
     if configured_dir:
-        log_dir = Path(configured_dir).expanduser()
-        try:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            return log_dir
-        except OSError:
-            pass
+        return Path(configured_dir).expanduser()
 
     if sys.platform == "darwin":
-        log_dir = Path.home() / "Library" / "Logs" / "kindred"
-    elif sys.platform == "win32":
+        return Path.home() / "Library" / "Logs" / "kindred"
+    if sys.platform == "win32":
         local_app_data = os.getenv(
             "LOCALAPPDATA",
             str(Path.home() / "AppData" / "Local"),
         )
-        log_dir = Path(local_app_data) / "kindred" / "logs"
-    else:
-        xdg_cache = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
-        log_dir = Path(xdg_cache) / "kindred" / "logs"
+        return Path(local_app_data) / "kindred" / "logs"
+    xdg_cache = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+    return Path(xdg_cache) / "kindred" / "logs"
 
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        return log_dir
-    except OSError:
-        fallback = Path(tempfile.gettempdir()) / "kindred" / "logs"
-        try:
-            fallback.mkdir(parents=True, exist_ok=True)
-            return fallback
-        except OSError:
-            return log_dir
+
+def _get_fallback_log_dir() -> Path:
+    """Return the system temporary-directory log location."""
+
+    return Path(tempfile.gettempdir()) / "kindred" / "logs"
+
+
+def _usable_stderr() -> object | None:
+    """Return a usable stderr stream, if this process has one."""
+
+    for stream in (getattr(sys, "stderr", None), getattr(sys, "__stderr__", None)):
+        if stream is None or getattr(stream, "closed", False):
+            continue
+        if callable(getattr(stream, "write", None)) and callable(
+            getattr(stream, "flush", None)
+        ):
+            return stream
+    return None
 
 
 def _get_log_level_from_env() -> str:
@@ -64,22 +66,18 @@ def _get_log_level_from_env() -> str:
     return _DEFAULT_LOG_LEVEL
 
 
-def setup_logging(
-    level: str | None = None,
-    log_file: str | None = None,
-    console: bool = True,
-    file_handler: bool = True,
-    format_string: str | None = None,
-) -> None:
-    """Configure console and bounded rotating-file logging for Kindred.
+def setup_logging(level: str | None = None) -> None:
+    """Configure bounded rotating-file logging and usable terminal diagnostics.
 
-    Calling this function replaces and closes all existing root handlers. If
-    the requested file cannot be opened, startup continues with the console
-    handler when one was requested; otherwise setup fails explicitly.
+    Calling this function replaces and closes all existing root handlers. The
+    platform log file is always attempted first, followed by a system
+    temporary-directory file when the normal location cannot be opened.
     """
 
     resolved_level = (level or _get_log_level_from_env()).upper()
-    numeric_level = getattr(logging, resolved_level, logging.INFO)
+    if resolved_level not in _VALID_LOG_LEVELS:
+        resolved_level = _DEFAULT_LOG_LEVEL
+    numeric_level = getattr(logging, resolved_level)
 
     root_logger = logging.getLogger()
     root_logger.setLevel(numeric_level)
@@ -88,24 +86,28 @@ def setup_logging(
         root_logger.removeHandler(existing_handler)
         existing_handler.close()
 
-    if format_string is None:
-        format_string = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    formatter = logging.Formatter(format_string, datefmt="%Y-%m-%d %H:%M:%S")
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-    if console:
-        console_stream = sys.__stderr__ if sys.__stderr__ is not None else sys.stderr
+    console_stream = _usable_stderr()
+    if console_stream is not None:
         console_handler = logging.StreamHandler(console_stream)
         console_handler.setLevel(numeric_level)
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
 
-    if file_handler:
-        if log_file is None:
-            log_file = str(_get_log_dir() / _DEFAULT_LOG_FILENAME)
-
+    normal_log = _get_normal_log_dir() / _DEFAULT_LOG_FILENAME
+    fallback_log = _get_fallback_log_dir() / _DEFAULT_LOG_FILENAME
+    log_paths = tuple(dict.fromkeys((normal_log, fallback_log)))
+    file_error: OSError | None = None
+    log_path: Path | None = None
+    for candidate in log_paths:
         try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
             rotating_handler = logging.handlers.RotatingFileHandler(
-                log_file,
+                candidate,
                 maxBytes=_MAX_LOG_SIZE,
                 backupCount=_BACKUP_COUNT,
                 encoding="utf-8",
@@ -113,23 +115,28 @@ def setup_logging(
             rotating_handler.setLevel(numeric_level)
             rotating_handler.setFormatter(formatter)
             root_logger.addHandler(rotating_handler)
+            log_path = candidate
             root_logger.info(
                 "Logging configured: level=%s, file=%s",
                 resolved_level,
-                log_file,
+                candidate,
             )
+            if candidate != normal_log:
+                root_logger.warning(
+                    "Normal log location %s is unavailable; using temporary log %s",
+                    normal_log,
+                    candidate,
+                )
+            break
         except OSError as error:
-            if not console:
-                raise RuntimeError(f"Failed to set up logging: {error}") from error
-            root_logger.warning("Failed to create log file %s: %s", log_file, error)
-            root_logger.warning("Continuing with console logging only")
+            file_error = error
 
-    logging.getLogger("PIL").setLevel(logging.WARNING)
+    if log_path is None:
+        message = f"Failed to set up normal and temporary log files: {file_error}"
+        raise RuntimeError(message) from file_error
 
     root_logger.debug("Log level: %s", resolved_level)
-    root_logger.debug("Console handler: %s", console)
-    root_logger.debug("File handler: %s", file_handler)
-    if file_handler and log_file:
-        root_logger.debug("Log file: %s", log_file)
-        root_logger.debug("Max log size: %.1f MB", _MAX_LOG_SIZE / (1024 * 1024))
-        root_logger.debug("Backup count: %s", _BACKUP_COUNT)
+    root_logger.debug("Console handler: %s", console_stream is not None)
+    root_logger.debug("Log file: %s", log_path)
+    root_logger.debug("Max log size: %.1f MB", _MAX_LOG_SIZE / (1024 * 1024))
+    root_logger.debug("Backup count: %s", _BACKUP_COUNT)

@@ -900,9 +900,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 settings,
             )
         )
-        panel.defaultsEditStarted.connect(
-            actions.fence_inheriting_run_defaults_edit
-        )
         panel.runEnabledChanged.connect(
             lambda enabled, captured=tab_id: self._set_tab_run_enabled(
                 captured,
@@ -1987,9 +1984,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, self._refresh_workspace_tab_structure)
             return
         created = self._workspace_tab_registry.create_tab(
-            run_defaults=self.config_controller.fresh_tab_run_defaults(),
+            run_defaults=self.config_controller.application_run_defaults(),
             scientific_settings=(
-                self.config_controller.fresh_tab_scientific_defaults()
+                self.config_controller.application_scientific_defaults()
             ),
             expected_token=self._project_session.capture_content_token(),
         )
@@ -2034,9 +2031,9 @@ class MainWindow(QtWidgets.QMainWindow):
         invalid_cells = bool(runtime.invalid_initial_text_by_set_id)
         has_content = self._workspace_tab_registry.tab_has_content_or_drafts(
             tab_id,
-            fresh_run_defaults=self.config_controller.fresh_tab_run_defaults(),
+            fresh_run_defaults=self.config_controller.application_run_defaults(),
             fresh_scientific_settings=(
-                self.config_controller.fresh_tab_scientific_defaults()
+                self.config_controller.application_scientific_defaults()
             ),
         )
         if has_content:
@@ -2177,6 +2174,31 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self._refresh_project_state()
         return result.token
+
+    def _activate_materialized_set(
+        self,
+        tab_id: str,
+        set_id: str,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        """Activate one admitted set through every existing presentation view."""
+
+        target = str(tab_id)
+        active_set_id = str(set_id)
+        tab = self._workspace_tab_registry.tab(target)
+        tab.initial_condition_set(active_set_id)
+        state = self._workspace_tab_registry.presentation(target)
+        token = self._workspace_tab_registry.set_presentation(
+            target,
+            replace(state, current_set_id=active_set_id),
+            expected_token=expected_token,
+        )
+        if token is not None:
+            self._workspace_tab_registry.tab_runtime(
+                target
+            ).selected_run_set_ids = (active_set_id,)
+        return token
 
     @QtCore.Slot(str, bool)
     def _on_plot_membership_requested(
@@ -2319,17 +2341,24 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> MechanismSourceReconciliation | None:
         if not self._settle_execution_candidate(tab_id):
             return None
+        proposal = self._accept_visible_source_result(
+            tab_id,
+            description="Preview",
+        )
+        if proposal is None:
+            return None
+        # Source admission may replace the selected row with an inline
+        # materialized set.  Validate the post-admission target roster, not
+        # the gesture's pre-admission snapshot.
+        live_targets = self._tab_surfaces[tab_id].slider_binding.resolve_target_set_ids()
         if self._tab_surfaces[tab_id].initial_actions.has_invalid_cells(
-            target_ids
+            live_targets
         ):
             self.set_status_text(
                 "Preview blocked by invalid visible Initial Conditions."
             )
             return None
-        return self._accept_visible_source_result(
-            tab_id,
-            description="Preview",
-        )
+        return proposal
 
     def _confirm_discard_slider_preview(
         self,
@@ -2561,9 +2590,16 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             for tab_id, set_ids in prepared_materialized[1]:
                 if set_ids:
-                    self._workspace_tab_registry.tab_runtime(
-                        tab_id
-                    ).selected_run_set_ids = set_ids[:1]
+                    activation_token = self._activate_materialized_set(
+                        tab_id,
+                        set_ids[0],
+                        expected_token=result.token,
+                    )
+                    if activation_token is None:
+                        raise RuntimeError(
+                            "Materialized Initial Conditions could not become active."
+                        )
+                    result = replace(result, token=activation_token)
         for tab_id, visible_draft in captured_reaction_drafts:
             tab = document.tab(tab_id)
             self._tab_surfaces[
@@ -2591,6 +2627,12 @@ class MainWindow(QtWidgets.QMainWindow):
         for bundle in self._tab_surfaces.values():
             bundle.editor_binding.render()
             bundle.initial_actions.render()
+            tab = self._workspace_tab_registry.tab(bundle.tab_id)
+            bundle.simulation_panel.render_run_defaults(
+                tab.run_defaults,
+                run_admitted=self._run_admitted(bundle.tab_id),
+                simulation_job_kind=self._simulation_jobs.current_kind,
+            )
 
     def _discard_all_slider_drafts(self) -> None:
         for tab in self._project_session.document.tabs:
@@ -2722,25 +2764,21 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle = self._tab_surfaces[tab_id]
         if proposal.materialized_set_ids:
             active_set_id = proposal.materialized_set_ids[0]
-            runtime.selected_run_set_ids = (active_set_id,)
-            presentation_token = self._workspace_tab_registry.set_presentation(
+            activation_token = self._activate_materialized_set(
                 tab_id,
-                replace(
-                    self._workspace_tab_registry.presentation(tab_id),
-                    current_set_id=active_set_id,
-                ),
+                active_set_id,
                 expected_token=(
                     result.token
                     if result is not None
                     else self._project_session.capture_content_token()
                 ),
             )
-            if presentation_token is None:
+            if activation_token is None:
                 raise RuntimeError(
                     "Materialized Initial Conditions could not become active."
                 )
             if result is not None:
-                result = replace(result, token=presentation_token)
+                result = replace(result, token=activation_token)
         if result is not None:
             self._consume_canonical_mutation(result)
         if source is None:
@@ -3099,17 +3137,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         from kindred.gui.widgets.template_manager_dialog import TemplateManagerDialog
 
-        if not self._accept_visible_source(
-            description="Open Template Manager"
-        ):
-            return
         source_tab = self._workspace_tab_registry.tab(
             self._workspace_tab_registry.active_tab_id
         )
         dialog = TemplateManagerDialog(
             parent=self,
             template_manager=self._template_manager,
-            current_mechanism_source=source_tab.mechanism_source,
+            current_mechanism_source=self._visible_source_for_tab(source_tab.tab_id),
             source_preflight=lambda source: self._preflight_template_source(
                 source_tab.tab_id,
                 source,
@@ -4638,6 +4672,12 @@ class MainWindow(QtWidgets.QMainWindow):
         body_label = QtWidgets.QLabel(
             "Desktop GUI for reaction mechanism investigation, kinetic "
             "modeling, and data fitting.\n\n"
+            "Diagnostic logs are written to the platform log directory "
+            "(Linux: `~/.cache/kindred/logs`, macOS: "
+            "`~/Library/Logs/kindred`, Windows: `%LOCALAPPDATA%\\kindred\\logs`; "
+            "override with `KINDRED_LOG_DIR`). If that location is unavailable, "
+            "logs are written to the system temporary directory under "
+            "`kindred/logs`.\n\n"
             "The initial development of Kindred was led primarily by Pedro "
             "Helou de Oliveira.\n"
             "Kindred is now developed and maintained jointly by Pedro Helou "

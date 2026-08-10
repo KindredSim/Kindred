@@ -15,9 +15,7 @@ from .parameter_expression import translate_parameter_expression
 @dataclass(frozen=True, slots=True)
 class SymbolicProofResult:
     proven: bool
-    reason: str
     fingerprint: str
-    symbol_context: dict[str, object]
 
 
 def _assignment_sources(assignments: Mapping[str, ParameterAssignment]) -> dict[str, dict[str, object]]:
@@ -97,7 +95,7 @@ def prove_product_identity(
                 "symbol_context": proof_context_payload,
             }
         )
-        return SymbolicProofResult(proven=False, reason="unsupported", fingerprint=fingerprint, symbol_context=proof_context_payload)
+        return SymbolicProofResult(proven=False, fingerprint=fingerprint)
 
     candidate_name = str(candidate.name)
     target_expr = sympy.Integer(1)
@@ -120,7 +118,7 @@ def prove_product_identity(
                 "symbol_context": proof_context_payload,
             }
         )
-        return SymbolicProofResult(proven=False, reason="unsupported", fingerprint=fingerprint, symbol_context=proof_context_payload)
+        return SymbolicProofResult(proven=False, fingerprint=fingerprint)
     proven = bool(simplified == 0)
     reason = "identity" if proven else "not_identity"
     fingerprint = symbolic_fingerprint(
@@ -135,4 +133,4 @@ def prove_product_identity(
             "symbol_context": proof_context_payload,
         }
     )
-    return SymbolicProofResult(proven=proven, reason=reason, fingerprint=fingerprint, symbol_context=proof_context_payload)
+    return SymbolicProofResult(proven=proven, fingerprint=fingerprint)

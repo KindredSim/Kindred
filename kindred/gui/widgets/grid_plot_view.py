@@ -211,26 +211,10 @@ class GridPlotView(QtWidgets.QWidget):
             self._available_species_cache = ()
         return self._redraw()
 
-    def clear(self) -> None:
-        self._cancel_copy()
-        self._curves = ()
-        self._color_by_species = MappingProxyType({})
-        self._dataset_presentation = MappingProxyType({})
-        self._render_succeeded = False
-        self._seen_nonempty_payload = False
-        self._selected_species_list = []
-        self._available_species_cache = ()
-        self._redraw()
-
     def copy_eligible(self) -> bool:
         """Whether this Fit-local panel owns a rendered Copy projection."""
 
         return bool(self._curves and self._render_succeeded)
-
-    def copy_all_to_clipboard(self) -> None:
-        if not self.copy_eligible():
-            raise ValueError("No rendered Fit curves are available to copy.")
-        self.copy_projection_to_clipboard(self._curves)
 
     def copy_projection_to_clipboard(
         self,

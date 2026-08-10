@@ -154,30 +154,12 @@ def _as_float(x: Any, *, stmt: LetStatement) -> float:
     return xf
 
 
-def _is_time_varying(expr: ExprNode, sym_timevary: Set[str]) -> bool:
-    """Decide if an expression depends on time t."""
-    if isinstance(expr, SpeciesRefNode):
-        return expr.kind == "now"
-    if isinstance(expr, IdentNode):
-        return expr.name in sym_timevary
-    if isinstance(expr, (NumberNode,)):
-        return False
-    if isinstance(expr, UnaryNode):
-        return _is_time_varying(expr.rhs, sym_timevary)
-    if isinstance(expr, BinaryNode):
-        return _is_time_varying(expr.lhs, sym_timevary) or _is_time_varying(expr.rhs, sym_timevary)
-    if isinstance(expr, CallNode):
-        return any(_is_time_varying(a, sym_timevary) for a in expr.args)
-    return True
-
-
 # ----------------------------- evaluator core --------------------------------
 
 
 class _Evaluator:
     def __init__(self, block: AlgebraBlock, ctx: EvaluationContext) -> None:
         self.block = block
-        self.static_values = block.static_value_map()
         self.ctx = ctx
         self.N = int(ctx.t.size)
         self.symbol_series: Dict[str, np.ndarray] = {}
@@ -200,22 +182,65 @@ class _Evaluator:
         # happen to be constant over one particular grid.
         self.timevary: Set[str] = {"t"} | set(self.symbol_series)
 
+    def _scalar_let_names(self) -> Set[str]:
+        """Classify the complete retained let DAG by row dependence.
+
+        Parser static folding is intentionally conservative and only covers
+        literal RHS trees.  A retained identifier can nevertheless refer to a
+        scalar let several edges away, so classifying one statement from the
+        current output dictionaries makes an equivalent expression a series.
+        Resolve the retained dependency graph recursively instead; a let is
+        row-varying only when its transitive closure reaches a current species,
+        time, or row-aligned runtime symbol.
+        """
+        statements = {str(stmt.name): stmt for stmt in self.block.lines}
+        state: Dict[str, bool] = {}
+
+        def expr_dynamic(expr: ExprNode) -> bool:
+            if isinstance(expr, SpeciesRefNode):
+                return expr.kind == "now"
+            if isinstance(expr, IdentNode):
+                if expr.name in statements:
+                    return let_dynamic(expr.name)
+                return expr.name in self.timevary
+            if isinstance(expr, NumberNode):
+                return False
+            if isinstance(expr, UnaryNode):
+                return expr_dynamic(expr.rhs)
+            if isinstance(expr, BinaryNode):
+                return expr_dynamic(expr.lhs) or expr_dynamic(expr.rhs)
+            if isinstance(expr, CallNode):
+                return any(expr_dynamic(arg) for arg in expr.args)
+            return True
+
+        def let_dynamic(name: str) -> bool:
+            if name in state:
+                return state[name]
+            # The parser retains and validates a topological order, so this is
+            # only defensive protection for manually constructed blocks.
+            state[name] = True
+            state[name] = expr_dynamic(statements[name].expr)
+            return state[name]
+
+        for name in self.block.evaluation_order:
+            let_dynamic(str(name))
+        return {name for name, dynamic in state.items() if not dynamic}
+
     # Public entry
     def run(self) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
-        # Pre-classify time variance based on AST shape and dependencies
+        scalar_names = self._scalar_let_names()
         for stmt in self.block.statements_in_evaluation_order():
             name = stmt.name
             # shadowing guards
             self._guard_shadow(name, stmt)
-            # dynamic if it contains a current-state reference or depends on
-            # prior dynamic symbols
-            is_dyn = _is_time_varying(stmt.expr, self.timevary)
+            is_dyn = name not in scalar_names
             if is_dyn:
                 self.timevary.add(name)
 
-            if not is_dyn and name in self.static_values:
-                # Fully static fold available
-                val = _as_float(self.static_values[name], stmt=stmt)
+            if not is_dyn:
+                # Evaluate scalar lets through the typed evaluator, including
+                # transitive constants and immediate binary/domain failures.
+                val = _as_float(self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt)
                 self.scalars[name] = val
                 self.ctx.symtab.define_user(name, val, species_names=self.ctx.species_names)
             else:
@@ -236,17 +261,18 @@ class _Evaluator:
         - Strict invariants (shape checks, shadowing guards) still apply per statement.
         """
         errors: List[AlgebraObservableError] = []
+        scalar_names = self._scalar_let_names()
 
         for stmt in self.block.statements_in_evaluation_order():
             name = stmt.name
             try:
                 self._guard_shadow(name, stmt)
-                is_dyn = _is_time_varying(stmt.expr, self.timevary)
+                is_dyn = stmt.name not in scalar_names
                 if is_dyn:
                     self.timevary.add(name)
 
-                if (not is_dyn) and (name in self.static_values):
-                    val = _as_float(self.static_values[name], stmt=stmt)
+                if not is_dyn:
+                    val = _as_float(self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt)
                     self.scalars[name] = val
                     self.ctx.symtab.define_user(name, val, species_names=self.ctx.species_names)
                     continue

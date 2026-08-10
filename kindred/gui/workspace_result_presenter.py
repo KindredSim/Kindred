@@ -932,10 +932,15 @@ class WorkspaceResultProjection:
                 not current_set_id
                 or primary.set_id != current_set_id
                 or primary_layer.kind
-                not in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
+                not in {
+                    ResultLayerKind.EXPLICIT,
+                    ResultLayerKind.PREVIEW,
+                    ResultLayerKind.REFERENCE,
+                }
             ):
                 raise ValueError(
-                    "primary must be the explicit or Preview layer for current_set_id."
+                    "primary must be an accepted explicit, Preview, or Reference "
+                    "layer for current_set_id."
                 )
         elif (
             self.parameters or self.scalar_values or self.primary_statistics is not None
@@ -1293,21 +1298,13 @@ def _statistics_block(
 
 def _selected_x_unavailable_diagnostic(
     selected_x: AxisSeriesSelection,
-    simulation_x_axis: AxisSeriesSelection,
-    layers: Sequence[WorkspacePlotLayer],
+    unavailable_layers: Sequence[WorkspacePlotLayer],
 ) -> str | None:
-    """Return one deterministic diagnostic for semantic result layers lacking X."""
+    """Return one deterministic diagnostic for visible semantic layers lacking X."""
 
     if _is_time_selection(selected_x):
         return None
-    unavailable = tuple(
-        layer
-        for layer in layers
-        if (
-            layer.kind is not ResultLayerKind.EXPERIMENTAL
-            and simulation_x_axis not in dict(layer.series_axes).values()
-        )
-    )
+    unavailable = tuple(unavailable_layers)
     if not unavailable:
         return None
     labels = ", ".join(repr(layer.label) for layer in unavailable)
@@ -1324,14 +1321,6 @@ def _selected_x_unavailable_diagnostic(
         f"result layer(s) {labels}. The semantic result layer(s) are retained, "
         "but plot, Copy, and XLSX rows cannot be produced without X values."
     )
-
-
-def _finite_float(value: object) -> float | None:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return parsed if np.isfinite(parsed) else None
 
 
 def _export_column_header(
@@ -1625,6 +1614,7 @@ class WorkspaceResultPresenter:
         blocks: list[ResultDataBlock] = []
         axis_candidates: list[AxisSelectionCandidate] = []
         axis_candidate_ids: set[AxisSeriesSelection] = set()
+        unavailable_layers: list[WorkspacePlotLayer] = []
 
         def add_axis_candidate(
             selection: AxisSeriesSelection,
@@ -1679,10 +1669,15 @@ class WorkspaceResultPresenter:
                 )
                 if block is not None:
                     blocks.append(block)
+                elif (
+                    simulation_x_axis not in dict(foreground.series_axes).values()
+                ):
+                    unavailable_layers.append(foreground)
             else:
                 foreground = None
 
             reference = repository.reference_entry(visible.set_id)
+            reference_layer: WorkspacePlotLayer | None = None
             if reference is not None:
                 reference_layer = _result_layer(
                     set_id=visible.set_id,
@@ -1712,14 +1707,26 @@ class WorkspaceResultPresenter:
                     _annotations_from_execution(foreground.result_entry.result)
                 )
             if visible.set_id == current_id and foreground is not None:
-                primary_layer_id = foreground.layer_id
-                primary_entry = foreground.result_entry
-                assert primary_entry is not None
-                primary_block = _statistics_block(
-                    foreground,
-                    y_axes=wanted_y,
-                    excluded_y_axes=excluded_simulation_y,
-                )
+                if isinstance(foreground.result_entry, PreviewResultEntry):
+                    if reference_layer is not None:
+                        # Preview owns only the foreground curves.  The last
+                        # accepted Run retained as Reference remains analysis truth.
+                        primary_layer_id = reference_layer.layer_id
+                        primary_entry = reference_layer.result_entry
+                        primary_block = _statistics_block(
+                            reference_layer,
+                            y_axes=wanted_y,
+                            excluded_y_axes=excluded_simulation_y,
+                        )
+                else:
+                    primary_layer_id = foreground.layer_id
+                    primary_entry = foreground.result_entry
+                    assert primary_entry is not None
+                    primary_block = _statistics_block(
+                        foreground,
+                        y_axes=wanted_y,
+                        excluded_y_axes=excluded_simulation_y,
+                    )
 
         for experimental in experimental_inputs:
             y_axis = ExperimentalAxisSelection(
@@ -1738,6 +1745,7 @@ class WorkspaceResultPresenter:
             )
             experimental_x_provenance: Mapping[str, object] = MappingProxyType({})
             selected_source_rows = tuple(experimental.source_rows)
+            unavailable_physical_projection = False
             if not _is_time_selection(selected_x):
                 if isinstance(selected_x, SimulationSeriesAxisSelection):
                     x_source = next(
@@ -1756,18 +1764,22 @@ class WorkspaceResultPresenter:
                     or x_source.dataset_id != experimental.dataset_id
                     or y_axis in excluded_experimental_y
                 ):
-                    continue
-                paired = _same_source_row_values(x_source, experimental)
-                if paired is None:
-                    continue
-                (
-                    experimental_x,
-                    experimental_y,
-                    selected_source_rows,
-                ) = paired
-                experimental_x_name = x_source.raw_column
-                experimental_x_axis = selected_x
-                experimental_x_provenance = _observation_provenance(x_source)
+                    if y_axis in excluded_experimental_y:
+                        continue
+                    unavailable_physical_projection = True
+                else:
+                    paired = _same_source_row_values(x_source, experimental)
+                    if paired is None:
+                        unavailable_physical_projection = True
+                    else:
+                        (
+                            experimental_x,
+                            experimental_y,
+                            selected_source_rows,
+                        ) = paired
+                        experimental_x_name = x_source.raw_column
+                        experimental_x_axis = selected_x
+                        experimental_x_provenance = _observation_provenance(x_source)
             label = candidate_label
             layer = WorkspacePlotLayer(
                 layer_id=experimental.layer_id,
@@ -1798,7 +1810,10 @@ class WorkspaceResultPresenter:
                 point_size=point_size,
             )
             layers.append(layer)
-            if wanted_y is None or y_axis in wanted_y:
+            if unavailable_physical_projection:
+                if wanted_y is None or y_axis in wanted_y:
+                    unavailable_layers.append(layer)
+            elif wanted_y is None or y_axis in wanted_y:
                 blocks.append(
                     ResultDataBlock(
                         block_id=layer.layer_id,
@@ -1911,8 +1926,7 @@ class WorkspaceResultPresenter:
             ),
             unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(
                 selected_x,
-                simulation_x_axis,
-                layers,
+                unavailable_layers,
             ),
         )
 

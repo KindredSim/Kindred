@@ -16,8 +16,6 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class PanelDockComponents:
     dock: QDockWidget
-    container: QWidget
-    panel: QWidget
 
 
 @dataclass(frozen=True)
@@ -127,4 +125,4 @@ def build_module_dock(
     )
     dock.setWidget(container)
     main_window.addDockWidget(spec.default_area, dock)
-    return PanelDockComponents(dock=dock, container=container, panel=panel)
+    return PanelDockComponents(dock=dock)

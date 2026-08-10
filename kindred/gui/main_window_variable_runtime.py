@@ -112,6 +112,13 @@ class _SuspendedPreviewDisposition:
     capture: _PreviewCapture | None
 
 
+@dataclass(frozen=True, slots=True)
+class _PreviewPreflight:
+    tab: MechanismTabDocument
+    projection: ParameterSliderProjection
+    targets: tuple[str, ...]
+
+
 def build_parameter_slider_projection(
     prepared_dsl: PreparedDslRequestSet,
     *,
@@ -427,7 +434,14 @@ class TabSliderBinding(QtCore.QObject):
             prepared = self._preflight_preview_action(targets)
             if prepared is None:
                 return
-            tab, projection = prepared
+            if isinstance(prepared, _PreviewPreflight):
+                tab, projection, targets = (
+                    prepared.tab,
+                    prepared.projection,
+                    prepared.targets,
+                )
+            else:
+                tab, projection = prepared
             capture = _GestureCapture(
                 document_identity=self._registry.document_identity(
                     self._tab_id
@@ -693,11 +707,11 @@ class TabSliderBinding(QtCore.QObject):
         ):
             prepared = self._preflight_preview_action(targets)
             if prepared is not None:
-                current_tab, _current_projection = prepared
+                current_tab = prepared.tab
                 if current_tab.tab_id == tab.tab_id:
                     self._begin_preview_cycle(
-                        prepared,
-                        targets,
+                        (current_tab, prepared.projection),
+                        prepared.targets,
                         debounce_kind=(
                             "parameter"
                             if runtime.slider_parameter_draft
@@ -856,14 +870,9 @@ class TabSliderBinding(QtCore.QObject):
                 )
             projected[species] = first
             # Mixed-state display authority is a discrete projection choice.
-            # Numerically equivalent accepted values share one display value.
+            # Exact binary64 equality defines authored identity.
             if any(
-                not math.isclose(
-                    float(values.get(species, 0.0)),
-                    first,
-                    rel_tol=1e-12,
-                    abs_tol=1e-12,
-                )
+                float(values.get(species, 0.0)) != first
                 for values in target_values[1:]
             ):
                 mixed.add(species)
@@ -913,7 +922,15 @@ class TabSliderBinding(QtCore.QObject):
         )
         if prepared is None:
             return self._restore_rejected_slider_action()
-        tab, projection = prepared
+        # Admission returns the exact post-admission target identity.
+        if isinstance(prepared, _PreviewPreflight):
+            tab, projection, targets = (
+                prepared.tab,
+                prepared.projection,
+                prepared.targets,
+            )
+        else:
+            tab, projection = prepared
         metadata = projection.metadata_dict()
         coordinate_metadata = metadata.get(str(name))
         if coordinate_metadata is None:
@@ -978,7 +995,7 @@ class TabSliderBinding(QtCore.QObject):
         else:
             role = str(coordinate_metadata.get("role") or "")
             preview_admitted = self._begin_preview_cycle(
-                prepared,
+                (tab, projection),
                 targets,
                 debounce_kind=(
                     "equilibrium" if role == "Keq" else "parameter"
@@ -1030,7 +1047,14 @@ class TabSliderBinding(QtCore.QObject):
         )
         if prepared is None:
             return self._restore_rejected_slider_action()
-        tab, projection = prepared
+        if isinstance(prepared, _PreviewPreflight):
+            tab, projection, targets = (
+                prepared.tab,
+                prepared.projection,
+                prepared.targets,
+            )
+        else:
+            tab, projection = prepared
         species_name = str(species)
         if species_name not in canonical_species_names(tab):
             return self._reject_slider_action(
@@ -1046,12 +1070,7 @@ class TabSliderBinding(QtCore.QObject):
         for set_id in targets:
             initial_set = tab.initial_condition_set(set_id)
             canonical = initial_set.values_dict().get(species_name, 0.0)
-            if math.isclose(
-                value_f,
-                float(canonical),
-                rel_tol=1e-12,
-                abs_tol=1e-12,
-            ):
+            if value_f == float(canonical):
                 set_drafts = drafts.get(set_id)
                 if set_drafts is not None:
                     set_drafts.pop(species_name, None)
@@ -1073,7 +1092,7 @@ class TabSliderBinding(QtCore.QObject):
             )
             return True
         preview_admitted = self._begin_preview_cycle(
-            prepared,
+            (tab, projection),
             targets,
             debounce_kind="species",
             animate_preview=_animate_preview,
@@ -1109,7 +1128,7 @@ class TabSliderBinding(QtCore.QObject):
     def _preflight_preview_action(
         self,
         targets: tuple[str, ...],
-    ) -> tuple[MechanismTabDocument, ParameterSliderProjection] | None:
+    ) -> _PreviewPreflight | None:
         """Use one canonical source result before any Slider mutation."""
 
         tab = self._registry.tab(self._tab_id)
@@ -1118,12 +1137,19 @@ class TabSliderBinding(QtCore.QObject):
         visible_prepared: PreparedDslRequestSet | None = tab.prepared_dsl
         callback_result: object = True
         callback = self._preview_preflight
+        admitted_targets = tuple(targets)
         if callback is not None:
             callback_result = callback(targets)
             if isinstance(callback_result, MechanismSourceReconciliation):
                 tab = self._registry.tab(self._tab_id)
                 visible_source = tab.mechanism_source
                 visible_prepared = callback_result.prepared_dsl
+                if callback_result.materialized_set_ids:
+                    admitted_targets = (
+                        str(callback_result.materialized_set_ids[0]),
+                    )
+                else:
+                    admitted_targets = self.resolve_target_set_ids()
                 if callback_result.detailed_balance.requires_correction:
                     request = self._preview_detailed_balance_request(
                         tab,
@@ -1172,7 +1198,7 @@ class TabSliderBinding(QtCore.QObject):
         self._projection = projection
         self._tab_snapshot = tab
         self.clear_preview_detailed_balance_block()
-        return tab, projection
+        return _PreviewPreflight(tab, projection, admitted_targets)
 
     def _begin_preview_cycle(
         self,
@@ -1658,7 +1684,10 @@ class TabSliderBinding(QtCore.QObject):
         prepared = self._preflight_preview_action(preflight_targets)
         if prepared is None:
             return False
-        tab, _projection = prepared
+        if isinstance(prepared, _PreviewPreflight):
+            tab, _projection = prepared.tab, prepared.projection
+        else:
+            tab, _projection = prepared
         runtime = self._registry.tab_runtime(self._tab_id)
         parameter_updates = dict(runtime.slider_parameter_draft)
         species_updates = {

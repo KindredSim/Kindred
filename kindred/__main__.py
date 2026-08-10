@@ -22,7 +22,7 @@ def main() -> int:
         print("Kindred launches the desktop GUI and does not accept command-line arguments.", file=sys.stderr)
         return 64
 
-    setup_logging(level=None)
+    setup_logging()
     try:
         from PySide6 import QtCore, QtGui, QtWidgets
     except ModuleNotFoundError:

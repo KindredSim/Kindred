@@ -113,7 +113,6 @@ class ConfigController(QtCore.QObject):
     """The sole QSettings-backed owner of application configuration."""
 
     applicationPlotPreferencesChanged = QtCore.Signal()
-    runUserMaximumChanged = QtCore.Signal(int)
     resultCacheCapacityChanged = QtCore.Signal(int)
     mechanismParameterDebounceChanged = QtCore.Signal(int)
     equilibriumKDebounceChanged = QtCore.Signal(int)
@@ -164,7 +163,6 @@ class ConfigController(QtCore.QObject):
         if type(value) is not int:
             raise TypeError("Run user maximum must be an integer.")
         accepted = min(MAX_PARALLEL_WORKERS_CEILING, max(1, value))
-        previous = self.run_user_maximum_preference()
         settings = self._settings()
         settings.setValue(_RUN_USER_MAXIMUM_KEY, accepted)
         self._sync_or_report(
@@ -172,8 +170,6 @@ class ConfigController(QtCore.QObject):
             "Run user maximum",
             success_message=f"Run parallel maximum set to {accepted}.",
         )
-        if previous != accepted:
-            self.runUserMaximumChanged.emit(accepted)
         return accepted
 
     @property
@@ -473,7 +469,7 @@ class ConfigController(QtCore.QObject):
                     )
                 ),
             )
-            return self.validate_fit_defaults_candidate(candidate)
+            return validate_fit_defaults(candidate)
         except (TypeError, ValueError, OverflowError) as exc:
             logger.warning(
                 "Ignoring invalid persisted application Fit defaults: %s", exc
@@ -487,12 +483,6 @@ class ConfigController(QtCore.QObject):
             scientific_settings=self.application_scientific_defaults(),
             fit_defaults=self.application_fit_defaults(),
         )
-
-    def fresh_tab_run_defaults(self) -> SimulationExecutionSettings:
-        return self.application_run_defaults()
-
-    def fresh_tab_scientific_defaults(self) -> TabScientificSettings:
-        return self.application_scientific_defaults()
 
     @staticmethod
     def validate_run_defaults_candidate(
@@ -512,10 +502,6 @@ class ConfigController(QtCore.QObject):
             "application tab-scientific defaults",
         )
 
-    @staticmethod
-    def validate_fit_defaults_candidate(candidate: FitDefaults) -> FitDefaults:
-        return validate_fit_defaults(candidate)
-
     def persist_scientific_defaults(
         self,
         candidate: TabScientificSettings,
@@ -528,7 +514,7 @@ class ConfigController(QtCore.QObject):
         return accepted
 
     def persist_fit_defaults(self, candidate: FitDefaults) -> FitDefaults:
-        accepted = self.validate_fit_defaults_candidate(candidate)
+        accepted = validate_fit_defaults(candidate)
         settings = self._settings()
         for field_name, key in _FIT_SETTINGS_KEYS.items():
             settings.setValue(key, getattr(accepted, field_name))

@@ -144,10 +144,10 @@ class FitSessionOwner(QtCore.QObject):
         self._window: FittingWindow | None = None
         self._worker: GlobalFitWorker | None = None
         self._candidate: FitCandidate | None = None
+        self._candidate_applied_scopes: frozenset[str] = frozenset()
         self._candidate_available_scopes: frozenset[str] = frozenset()
         self._candidate_unavailable_reasons: dict[str, str] = {}
         self._origin: FitOriginSnapshot | None = None
-        self._local_observables: tuple[FitLocalObservable, ...] = ()
         self._local_request: FitExecutionRequest | None = None
         self._local_setup_snapshot: FitSetupSnapshot | None = None
         self._initial_setup_snapshot: FitSetupSnapshot | None = None
@@ -231,7 +231,6 @@ class FitSessionOwner(QtCore.QObject):
             raise TypeError("window_factory must return FittingWindow.")
         self._origin = origin
         self._window = window
-        self._local_observables = ()
         self._local_request = None
         initial_setup = create_initial_fit_setup(origin)
         self._local_setup_snapshot = initial_setup
@@ -239,6 +238,7 @@ class FitSessionOwner(QtCore.QObject):
         self._last_fit_setup_snapshot = None
         self._pending_detailed_balance = None
         self._candidate = None
+        self._candidate_applied_scopes = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         try:
@@ -433,11 +433,11 @@ class FitSessionOwner(QtCore.QObject):
     ) -> None:
         """Replace prior local/candidate state only after native start is known."""
 
-        self._local_observables = request.local_observables
         self._local_request = request
         self._local_setup_snapshot = FitSetupSnapshot.from_request(request)
         self._pending_detailed_balance = None
         self._candidate = None
+        self._candidate_applied_scopes = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         window.clear_candidate()
@@ -679,7 +679,6 @@ class FitSessionOwner(QtCore.QObject):
             )
             return
         self._local_setup_snapshot = setup
-        self._local_observables = setup.local_observables
         self._local_request = None
         window.accept_setup_edits(setup, intents)
 
@@ -1176,7 +1175,7 @@ class FitSessionOwner(QtCore.QObject):
             return False
         try:
             prior_definitions = fit_local_observable_definitions(
-                self._local_observables,
+                setup.local_observables,
                 setup.parameters,
             )
             prior_prepared = (
@@ -1196,7 +1195,7 @@ class FitSessionOwner(QtCore.QObject):
                 expression=expression,
                 prepared_dsl=prior_prepared,
                 additional_known_observables=tuple(
-                    item.name for item in self._local_observables
+                    item.name for item in setup.local_observables
                 ),
             )
             mapped = next(
@@ -1317,13 +1316,13 @@ class FitSessionOwner(QtCore.QObject):
                 ),
                 tuple(local_observables),
             )
-            self._local_observables = tuple(local_observables)
             self._local_setup_snapshot = setup
             window.project_setup_snapshot(setup)
         except (StopIteration, TypeError, ValueError, KeyError) as exc:
             self._set_status(f"Add Observable rejected: {exc}")
             return False
         self._candidate = None
+        self._candidate_applied_scopes = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         self._local_request = None
@@ -1377,10 +1376,10 @@ class FitSessionOwner(QtCore.QObject):
         except (TypeError, ValueError, KeyError) as exc:
             self._set_status(f"Fit setup reset failed: {exc}")
             return False
-        self._local_observables = restored_snapshot.local_observables
         self._local_request = None
         self._local_setup_snapshot = restored_snapshot
         self._candidate = None
+        self._candidate_applied_scopes = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         self._set_status(f"Fit setup {kind.replace('_', ' ')} snapshot restored.")
@@ -1456,7 +1455,7 @@ class FitSessionOwner(QtCore.QObject):
         if not selected:
             self._set_status("Apply contains an unavailable or empty scope selection.")
             return False
-        if not self._origin_is_current():
+        if not self._candidate_origin_is_current(candidate):
             self._set_status("Apply rejected: origin science is no longer current.")
             return False
         origin = self._origin
@@ -1511,10 +1510,7 @@ class FitSessionOwner(QtCore.QObject):
                     )
                 )
             )
-            remaining_candidate = self._remaining_candidate_after_apply(
-                candidate,
-                selected,
-            )
+            applied_scopes = self._candidate_applied_scopes | selected
             preserved = self._preserved_setup_with_terminal_values(
                 preserved,
                 candidate,
@@ -1527,11 +1523,6 @@ class FitSessionOwner(QtCore.QObject):
                 origin,
             )
             next_document = previous_document.replace_tab(next_tab)
-            remaining_local_observables = (
-                ()
-                if remaining_candidate is None
-                else remaining_candidate.local_observables
-            )
             # Prepare the complete semantic rebase against the exact proposed
             # document.  Nothing canonical is published unless this succeeds.
             rebased = capture_fit_origin(next_document, origin.tab_id)
@@ -1539,25 +1530,52 @@ class FitSessionOwner(QtCore.QObject):
                 preserved,
                 rebased,
                 selected,
-                remaining_local_observables,
+                candidate.local_observables,
             )
-            if remaining_candidate is None:
-                rebased_candidate = None
-                available_scopes = frozenset()
-                unavailable_reasons: dict[str, str] = {}
-            else:
-                rebased_candidate = replace(
-                    remaining_candidate,
-                    origin=rebased,
-                    local_observables=refreshed_snapshot.local_observables,
-                    setup_snapshot=refreshed_snapshot,
+            rebased_apply_context = replace(
+                candidate,
+                origin=rebased,
+                local_observables=refreshed_snapshot.local_observables,
+                setup_snapshot=refreshed_snapshot,
+            )
+            available_scopes, unavailable_reasons = (
+                self._candidate_apply_feasibility(
+                    rebased_apply_context,
+                    applied_scopes=applied_scopes,
                 )
-                available_scopes, unavailable_reasons = (
-                    self._candidate_apply_feasibility(rebased_candidate)
-                )
+            )
         except Exception as exc:
             self._set_status(f"Apply rejected: {exc}")
             return False
+
+        # Compute the complete affected target delta against the exact old
+        # and proposed documents before the canonical replacement.  This is
+        # the same registry-owned delta authority used by replace_document.
+        planned_delta = self._registry.scientific_document_delta(
+            previous_document,
+            next_document,
+        )
+        try:
+            for affected_tab_id, set_ids in planned_delta.affected_targets_by_tab:
+                self._deauthorize_targets(affected_tab_id, set_ids)
+        except Exception as exc:
+            # Deauthorization may have fenced only a prefix of the old
+            # targets.  Keep the old document, but clear all Fit view/result
+            # authority so no partially fenced old result can be reused.
+            self._candidate = None
+            self._candidate_applied_scopes = frozenset()
+            self._candidate_available_scopes = frozenset()
+            self._candidate_unavailable_reasons = {}
+            try:
+                window.clear_candidate()
+            except Exception:
+                pass
+            self._set_status(
+                "Apply rejected before document publication; affected Fit "
+                f"results were fenced and the view was cleared: {exc}"
+            )
+            return False
+
         try:
             result = self._registry.replace_document(
                 next_document,
@@ -1565,13 +1583,55 @@ class FitSessionOwner(QtCore.QObject):
             )
             if result is None:
                 self._set_status(
-                    "Apply rejected: project content changed before publication."
+                    "Apply rejected after result fencing: project content "
+                    "changed before publication; affected results were cleared."
                 )
+                self._candidate = None
+                self._candidate_applied_scopes = frozenset()
+                self._candidate_available_scopes = frozenset()
+                self._candidate_unavailable_reasons = {}
+                try:
+                    window.clear_candidate()
+                except Exception:
+                    pass
                 return False
             changed = result.changed
         except Exception as exc:
+            self._candidate = None
+            self._candidate_applied_scopes = frozenset()
+            self._candidate_available_scopes = frozenset()
+            self._candidate_unavailable_reasons = {}
+            try:
+                window.clear_candidate()
+            except Exception:
+                pass
             self._set_status(
-                f"Apply failed at the document boundary: {exc}"
+                "Apply failed after result fencing; old inputs remain and "
+                f"affected results were cleared: {exc}"
+            )
+            return False
+
+        # replace_document uses the same registry delta helper above.  A
+        # mismatch would mean a new target escaped the pre-publication fence;
+        # fence the returned delta before any publication signal and fail
+        # closed if that defensive check ever trips.
+        if result.delta != planned_delta:
+            try:
+                for affected_tab_id, set_ids in result.delta.affected_targets_by_tab:
+                    self._deauthorize_targets(affected_tab_id, set_ids)
+            except Exception:
+                pass
+            self._candidate = None
+            self._candidate_applied_scopes = frozenset()
+            self._candidate_available_scopes = frozenset()
+            self._candidate_unavailable_reasons = {}
+            try:
+                window.clear_candidate()
+            except Exception:
+                pass
+            self._set_status(
+                "Apply failed closed: canonical result delta changed during "
+                "publication and the Fit view was cleared."
             )
             return False
 
@@ -1581,60 +1641,53 @@ class FitSessionOwner(QtCore.QObject):
         self._origin = rebased
         self._rebase_owner_snapshots(rebased)
         self._local_setup_snapshot = refreshed_snapshot
-        self._local_observables = refreshed_snapshot.local_observables
-        self._candidate = rebased_candidate
+        # Keep the complete terminal candidate as the sole Summary/Copy
+        # carrier.  The rebased context above was call-local Apply state only.
+        self._candidate = candidate
+        self._candidate_applied_scopes = applied_scopes
         self._candidate_available_scopes = available_scopes
         self._candidate_unavailable_reasons = unavailable_reasons
         self.canonical_applied.emit(origin.tab_id, selected)
 
-        deauthorization_error: Exception | None = None
-        try:
-            for affected_tab_id, set_ids in (
-                result.delta.affected_targets_by_tab
-            ):
-                self._deauthorize_targets(affected_tab_id, set_ids)
-        except Exception as exc:
-            deauthorization_error = exc
-
         try:
             # Clear old Apply/Copy authority before rebuilding the physical view.
             window.clear_candidate()
-            if rebased_candidate is not None:
-                window.set_candidate_apply_availability(
-                    available_scopes,
-                    unavailable_reasons,
-                )
+            window.set_candidate_apply_availability(
+                available_scopes,
+                unavailable_reasons,
+            )
             window.rebase(
                 rebased,
                 setup=refreshed_snapshot,
             )
-            if rebased_candidate is not None:
-                window.set_candidate(
-                    rebased_candidate,
-                    available_scopes=available_scopes,
-                    unavailable_reasons=unavailable_reasons,
-                )
+            rendered = window.set_candidate(
+                candidate,
+                available_scopes=available_scopes,
+                unavailable_reasons=unavailable_reasons,
+            )
         except Exception as exc:
             try:
                 window.clear_candidate()
             except Exception:
                 pass
-            if rebased_candidate is not None:
+            try:
                 window.set_candidate_apply_availability(
                     available_scopes,
                     unavailable_reasons,
                 )
+            except Exception as recovery_exc:
+                exc = RuntimeError(f"{exc}; Apply recovery failed: {recovery_exc}")
             self._set_status(
                 "Selected Fit values were applied and remaining scopes were "
                 "preserved, but their view projection failed: "
                 f"{exc}"
             )
             return True
-        if deauthorization_error is not None:
+        if not rendered:
             self._set_status(
                 "Selected Fit values were applied and remaining scopes were "
-                "preserved, but stale result deauthorization failed: "
-                f"{deauthorization_error}"
+                "preserved, but fitted values remain available while their "
+                "plot is unavailable."
             )
             return True
         if unapplied_local_items:
@@ -1652,7 +1705,7 @@ class FitSessionOwner(QtCore.QObject):
                 + names
                 + ". Apply Observable Definitions to publish them."
             )
-        elif remaining_candidate is not None:
+        elif available_scopes:
             self._set_status(
                 "Selected Fit scopes applied; remaining terminal Fit "
                 "values are still available."
@@ -1820,13 +1873,13 @@ class FitSessionOwner(QtCore.QObject):
 
     def _discard_local(self) -> None:
         self._candidate = None
+        self._candidate_applied_scopes = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         self._local_request = None
         self._local_setup_snapshot = None
         self._initial_setup_snapshot = None
         self._last_fit_setup_snapshot = None
-        self._local_observables = ()
         self._origin = None
         self._pending_detailed_balance = None
         if self._window is not None:
@@ -1838,13 +1891,13 @@ class FitSessionOwner(QtCore.QObject):
             return
         self._window = None
         self._candidate = None
+        self._candidate_applied_scopes = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         self._local_request = None
         self._local_setup_snapshot = None
         self._initial_setup_snapshot = None
         self._last_fit_setup_snapshot = None
-        self._local_observables = ()
         self._origin = None
         self._pending_detailed_balance = None
         worker = self._worker
@@ -2033,6 +2086,7 @@ class FitSessionOwner(QtCore.QObject):
                 self._set_status(failure_message)
             return
         self._candidate = candidate
+        self._candidate_applied_scopes = frozenset()
         self._last_fit_setup_snapshot = candidate.setup_snapshot
         (
             self._candidate_available_scopes,
@@ -2148,6 +2202,37 @@ class FitSessionOwner(QtCore.QObject):
             return False
         return fit_origin_science_matches(
             origin,
+            current,
+            included_dataset_ids=active_dataset_ids,
+        )
+
+    def _candidate_origin_is_current(self, candidate: FitCandidate) -> bool:
+        """Check Apply against the roster admitted for the terminal candidate."""
+
+        if not isinstance(candidate, FitCandidate):
+            return False
+        comparison_origin = (
+            self._origin
+            if self._candidate_applied_scopes
+            else candidate.origin
+        )
+        if comparison_origin is None:
+            return False
+        active_dataset_ids = frozenset(
+            item.dataset_id
+            for item in candidate.setup_snapshot.datasets
+            if item.included
+        )
+        try:
+            current = capture_fit_origin(
+                self._session.document,
+                comparison_origin.tab_id,
+                dataset_ids=active_dataset_ids,
+            )
+        except Exception:
+            return False
+        return fit_origin_science_matches(
+            comparison_origin,
             current,
             included_dataset_ids=active_dataset_ids,
         )
@@ -2429,64 +2514,11 @@ class FitSessionOwner(QtCore.QObject):
             local_observables,
         )
 
-    @classmethod
-    def _remaining_candidate_after_apply(
-        cls,
-        candidate: FitCandidate,
-        scopes: frozenset[str],
-    ) -> FitCandidate | None:
-        local_scalar_names = cls._candidate_local_scalar_names(candidate)
-        retired_parameter_names: set[str] = set()
-        if "parameters" in scopes:
-            retired_parameter_names.update(
-                name
-                for name, _value in candidate.parameters
-                if name not in local_scalar_names
-            )
-        if "observable_definitions" in scopes:
-            retired_parameter_names.update(local_scalar_names)
-        remaining = replace(
-            candidate,
-            parameters=tuple(
-                (name, value)
-                for name, value in candidate.parameters
-                if name not in retired_parameter_names
-            ),
-            scalar_values_by_dataset=tuple(
-                (
-                    dataset_id,
-                    tuple(
-                        (name, value)
-                        for name, value in values
-                        if name not in retired_parameter_names
-                    ),
-                )
-                for dataset_id, values in candidate.scalar_values_by_dataset
-            ),
-            initial_values_by_set=(
-                ()
-                if "initial_concentrations" in scopes
-                else candidate.initial_values_by_set
-            ),
-            local_observables=(
-                ()
-                if "observable_definitions" in scopes
-                else candidate.local_observables
-            ),
-        )
-        return (
-            remaining
-            if (
-                remaining.parameters
-                or remaining.initial_values_by_set
-                or remaining.local_observables
-            )
-            else None
-        )
-
     def _candidate_apply_feasibility(
         self,
         candidate: FitCandidate,
+        *,
+        applied_scopes: frozenset[str] = frozenset(),
     ) -> tuple[frozenset[str], dict[str, str]]:
         """Decide terminal Apply feasibility once in the sole Fit owner."""
 
@@ -2526,6 +2558,10 @@ class FitSessionOwner(QtCore.QObject):
                 "Observable Definitions Apply is unavailable because the "
                 "candidate contains no Fit-local observable definitions."
             )
+        applied = frozenset(str(scope) for scope in applied_scopes)
+        available.difference_update(applied)
+        for scope in applied:
+            unavailable[scope] = "This Fit scope has already been applied."
         return frozenset(available), unavailable
 
     @classmethod
