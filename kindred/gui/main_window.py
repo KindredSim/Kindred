@@ -494,14 +494,28 @@ class _XlsxExportOwner(QtCore.QObject):
         self,
         deadline: float,
     ) -> bool:
+        generation_before_cancel = self._generation
         worker = self._cancel_active()
-        if worker is None or not worker.isRunning():
+        if worker is None:
             return True
-        remaining_ms = max(
-            0,
-            int((float(deadline) - time.monotonic()) * 1000.0),
-        )
-        return bool(worker.wait(remaining_ms))
+        if worker.isRunning():
+            remaining_ms = max(
+                0,
+                int((float(deadline) - time.monotonic()) * 1000.0),
+            )
+            if not worker.wait(remaining_ms):
+                return False
+        if worker is self._active_worker:
+            # The native worker may already have committed and emitted queued
+            # success/finished callbacks that cannot settle while project
+            # replacement synchronously waits on the GUI thread. Retire that
+            # exact authority before the replacement turn can continue.
+            if self._generation == generation_before_cancel:
+                self._generation += 1
+            self._active_worker = None
+            worker.deleteLater()
+            self.owned_qthreads_changed.emit()
+        return True
 
     def cancel_for_application_close(self) -> None:
         self._application_close_fenced = True
@@ -531,6 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_action: QtGui.QAction | None = None
         self._xlsx_export_action: QtGui.QAction | None = None
         self._last_export_directory: str | None = None
+        self._slider_apply_refreshing: set[str] = set()
         self._prepared_save_materialized: tuple[
             ProjectDocument,
             tuple[tuple[str, tuple[str, ...]], ...],
@@ -910,7 +925,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 captured
             )
         )
-        editor.sliderApplyRequested.connect(sliders.apply)
+        editor.sliderApplyRequested.connect(
+            lambda captured=tab_id: self._apply_slider_draft(captured)
+        )
         editor.sliderResetRequested.connect(sliders.reset)
         sliders.sliderDraftStateChanged.connect(
             self._on_slider_draft_state_changed
@@ -1363,6 +1380,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """Refresh a tab, narrowing scientific-settings invalidation when known."""
 
         target = str(tab_id)
+        bundle = self._tab_surfaces[target]
+        if scientific_fields:
+            bundle.slider_binding.clear_preview_detailed_balance_block()
+            bundle.editor.clear_preview_detailed_balance_block()
         if scientific_fields and scientific_fields <= {
             "rtol",
             "atol",
@@ -1373,7 +1394,6 @@ class MainWindow(QtWidgets.QMainWindow):
             finally:
                 self._refresh_project_state()
             return
-        bundle = self._tab_surfaces[target]
         document = self._project_session.document
         tab = self._workspace_tab_registry.tab(target)
         presentation = self._workspace_tab_registry.presentation(target)
@@ -1783,7 +1803,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_results_changed(self, tab_id: str) -> None:
         """Ignore late results from a replaced/closed semantic tab."""
 
-        self._render_results_for_tab(str(tab_id))
+        target = str(tab_id)
+        if target in self._slider_apply_refreshing:
+            return
+        self._render_results_for_tab(target)
 
     @QtCore.Slot(str, object)
     def _on_run_dispatched(self, tab_id: str, set_ids: object) -> None:
@@ -2296,12 +2319,6 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> MechanismSourceReconciliation | None:
         if not self._settle_execution_candidate(tab_id):
             return None
-        proposal = self._accept_visible_source_result(
-            tab_id,
-            description="Preview",
-        )
-        if proposal is None:
-            return None
         if self._tab_surfaces[tab_id].initial_actions.has_invalid_cells(
             target_ids
         ):
@@ -2309,7 +2326,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Preview blocked by invalid visible Initial Conditions."
             )
             return None
-        return proposal
+        return self._accept_visible_source_result(
+            tab_id,
+            description="Preview",
+        )
 
     def _confirm_discard_slider_preview(
         self,
@@ -2364,6 +2384,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._confirm_discard_slider_preview(target, "Run"):
             return False
         if not self._settle_execution_candidate(target):
+            return False
+        selected = bundle.initial_actions.selected_run_set_ids()
+        if bundle.initial_actions.has_invalid_cells(selected):
+            self.set_status_text(
+                "Run blocked by invalid visible Initial Conditions in a selected row."
+            )
             return False
         if not self._accept_visible_source(target, description="Run"):
             return False
@@ -2607,6 +2633,24 @@ class MainWindow(QtWidgets.QMainWindow):
             "Slider edit targets: " + (", ".join(names) if names else "none")
         )
 
+    @QtCore.Slot(str)
+    def _apply_slider_draft(self, tab_id: str) -> bool:
+        """Publish one Slider Apply, then reproject every existing consumer."""
+
+        target = str(tab_id)
+        bundle = self._tab_surfaces.get(target)
+        if bundle is None or target in self._slider_apply_refreshing:
+            return False
+        self._slider_apply_refreshing.add(target)
+        try:
+            accepted = bundle.slider_binding.apply()
+        finally:
+            self._slider_apply_refreshing.discard(target)
+        if not accepted:
+            return False
+        self._refresh_tab_controls(target)
+        return True
+
     # ------------------------------------------------------------------
     # Source/examples/templates
     # ------------------------------------------------------------------
@@ -2624,6 +2668,7 @@ class MainWindow(QtWidgets.QMainWindow):
         description: str,
         source: MechanismAuthoringSource | None = None,
         report_error: bool = True,
+        refresh_after_admission: bool = True,
     ) -> MechanismSourceReconciliation | None:
         """Admit one action against retained truth or one exact visible draft."""
         if not self._mutation_input_admitted(description):
@@ -2671,17 +2716,39 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if result is None:
                 return None
-            self._consume_canonical_mutation(result)
+        else:
+            result = None
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
         bundle = self._tab_surfaces[tab_id]
+        if proposal.materialized_set_ids:
+            active_set_id = proposal.materialized_set_ids[0]
+            runtime.selected_run_set_ids = (active_set_id,)
+            presentation_token = self._workspace_tab_registry.set_presentation(
+                tab_id,
+                replace(
+                    self._workspace_tab_registry.presentation(tab_id),
+                    current_set_id=active_set_id,
+                ),
+                expected_token=(
+                    result.token
+                    if result is not None
+                    else self._project_session.capture_content_token()
+                ),
+            )
+            if presentation_token is None:
+                raise RuntimeError(
+                    "Materialized Initial Conditions could not become active."
+                )
+            if result is not None:
+                result = replace(result, token=presentation_token)
+        if result is not None:
+            self._consume_canonical_mutation(result)
         if source is None:
             bundle.editor_binding.apply_accepted_source_rewrite(
                 visible,
                 proposed_tab.mechanism_source,
             )
         runtime.reactions_draft = None
-        if proposal.materialized_set_ids:
-            runtime.selected_run_set_ids = proposal.materialized_set_ids[:1]
         valid_species = set(canonical_species_names(proposed_tab))
         runtime.invalid_initial_text_by_set_id = {
             set_id: {
@@ -2692,14 +2759,15 @@ class MainWindow(QtWidgets.QMainWindow):
             for set_id, values in runtime.invalid_initial_text_by_set_id.items()
             if any(species in valid_species for species in values)
         }
-        bundle.editor_binding.render()
-        if source_changed:
-            self._refresh_tab_controls(
-                tab_id,
-                preserve_reactions_editor=True,
-            )
-        else:
-            self._refresh_project_state()
+        if refresh_after_admission:
+            bundle.editor_binding.render()
+            if source_changed:
+                self._refresh_tab_controls(
+                    tab_id,
+                    preserve_reactions_editor=True,
+                )
+            else:
+                self._refresh_project_state()
         return proposal
 
     def _accept_visible_source(
@@ -2709,12 +2777,14 @@ class MainWindow(QtWidgets.QMainWindow):
         description: str,
         source: MechanismAuthoringSource | None = None,
         report_error: bool = True,
+        refresh_after_admission: bool = True,
     ) -> bool:
         return self._accept_visible_source_result(
             tab_id,
             description=description,
             source=source,
             report_error=report_error,
+            refresh_after_admission=refresh_after_admission,
         ) is not None
 
     def _prepare_source_reconciliation(
@@ -2972,10 +3042,13 @@ class MainWindow(QtWidgets.QMainWindow):
             target,
             description=description,
             source=source,
+            refresh_after_admission=False,
         ):
             return False
         runtime.reactions_draft = None
-        self._tab_surfaces[target].slider_binding.discard_slider_draft()
+        self._tab_surfaces[target].slider_binding.discard_slider_draft(
+            render=False
+        )
         self._refresh_tab_controls(target)
         return True
 

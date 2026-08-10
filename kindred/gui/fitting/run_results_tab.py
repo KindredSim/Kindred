@@ -886,6 +886,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._dataset_plot_views: dict[_FitResultViewIdentity, GridPlotView] = {}
         self._all_datasets_plot_view: GridPlotView | None = None
         self._stale_plot_view_ids: set[_FitResultViewIdentity] = set()
+        self._render_failures: dict[_FitResultViewIdentity, str] = {}
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -905,6 +906,11 @@ class RunResultsTab(QtWidgets.QWidget):
         identity_row.addWidget(self._run_identity_label, stretch=1)
         identity_row.addWidget(self._copy_run_hash_button)
         layout.addLayout(identity_row)
+
+        self._render_diagnostic_label = QtWidgets.QLabel(self)
+        self._render_diagnostic_label.setWordWrap(True)
+        self._render_diagnostic_label.hide()
+        layout.addWidget(self._render_diagnostic_label, stretch=0)
 
         self._apply_group = QtWidgets.QGroupBox("Apply to Project", self)
         apply_form = QtWidgets.QFormLayout(self._apply_group)
@@ -992,10 +998,15 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_stats = self._candidate_stats(candidate)
         self._tracker_panel.update_final(candidate, set_labels=self._set_labels)
         self._refresh_summary_dialog()
-        curves = project_fit_candidate_curves(candidate)
-        presentation = self._candidate_plot_presentation(candidate, curves)
-        self._install_plot_projection(curves, presentation)
-        return bool(self._curves)
+        self._clear_render_failures()
+        try:
+            curves = project_fit_candidate_curves(candidate)
+            presentation = self._candidate_plot_presentation(candidate, curves)
+            rendered = self._install_plot_projection(curves, presentation)
+        except Exception as exc:
+            self._reject_terminal_projection(exc)
+            return False
+        return bool(curves and rendered)
 
     def clear_candidate(self) -> None:
         """Clear all terminal/live result presentation without touching ownership."""
@@ -1014,6 +1025,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._run_identity_label.setToolTip("")
         self._copy_run_hash_button.setEnabled(False)
         self._tracker_panel.clear()
+        self._clear_render_failures()
         self._install_plot_projection((), {})
         self.copyAvailableChanged.emit(False)
         if self._summary_dialog is not None and self._summary_dialog.isVisible():
@@ -1142,10 +1154,19 @@ class RunResultsTab(QtWidgets.QWidget):
         if view is None or candidate is None:
             raise ValueError("No rendered Fit curves are available to copy.")
         if _FIT_AGGREGATE_VIEW in self._stale_plot_view_ids:
-            self._refresh_plot_view(_FIT_AGGREGATE_VIEW)
-        view.copy_projection_to_clipboard(
-            project_fit_candidate_curves(candidate)
-        )
+            if not self._refresh_plot_view(_FIT_AGGREGATE_VIEW):
+                return
+        if not view.copy_eligible():
+            self.copyAvailableChanged.emit(False)
+            return
+        try:
+            curves = project_fit_candidate_curves(candidate)
+        except Exception as exc:
+            view.reject_projection(exc)
+            self._stale_plot_view_ids.discard(_FIT_AGGREGATE_VIEW)
+            self.copyAvailableChanged.emit(False)
+            return
+        view.copy_projection_to_clipboard(curves)
 
     def set_view_autorange_locked(self, running: bool) -> None:
         """Retain the historical presentation state at this composition boundary."""
@@ -1194,7 +1215,8 @@ class RunResultsTab(QtWidgets.QWidget):
                 max_chars=TAB_LABEL_MAX_CHARS,
             )
             plot_view = self._create_plot_view(
-                f"global_fit_results_plot_{curve.dataset_id}"
+                f"global_fit_results_plot_{curve.dataset_id}",
+                view_identity,
             )
             self._dataset_plot_views[view_identity] = plot_view
             self._subtab_stack.addWidget(plot_view)
@@ -1213,7 +1235,8 @@ class RunResultsTab(QtWidgets.QWidget):
             )
 
         self._all_datasets_plot_view = self._create_plot_view(
-            "global_fit_results_plot_all_datasets"
+            "global_fit_results_plot_all_datasets",
+            _FIT_AGGREGATE_VIEW,
         )
         self._subtab_stack.addWidget(self._all_datasets_plot_view)
         self._subtabs.addTab("All Datasets")
@@ -1221,7 +1244,11 @@ class RunResultsTab(QtWidgets.QWidget):
         self._subtabs.setCurrentIndex(0)
         self._subtab_stack.setCurrentIndex(0)
 
-    def _create_plot_view(self, object_name: str) -> GridPlotView:
+    def _create_plot_view(
+        self,
+        object_name: str,
+        view_id: _FitResultViewIdentity,
+    ) -> GridPlotView:
         plot_view = GridPlotView(
             color_resolver=self._color_resolver,
             show_generic_controls=False,
@@ -1230,7 +1257,12 @@ class RunResultsTab(QtWidgets.QWidget):
         plot_view.setObjectName(object_name)
         plot_view.set_dark_mode(self._dark_mode)
         plot_view.set_autorange_locked(self._view_autorange_locked)
-        plot_view.renderFailed.connect(self.statusMessage)
+        plot_view.renderFailed.connect(
+            lambda message, identity=view_id: self._record_render_failure(
+                identity,
+                message,
+            )
+        )
         plot_view.renderStateChanged.connect(
             lambda _rendered: self.copyAvailableChanged.emit(self.copy_eligible())
         )
@@ -1240,7 +1272,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self,
         curves: Sequence[FitCurveDataset],
         presentation: Mapping[str, DatasetPlotPresentation],
-    ) -> None:
+    ) -> bool:
         """Install one Fit payload and project only the active Results view."""
 
         values = tuple(curves)
@@ -1258,8 +1290,9 @@ class RunResultsTab(QtWidgets.QWidget):
         self._stale_plot_view_ids.update(self._dataset_plot_views)
         if self._all_datasets_plot_view is not None:
             self._stale_plot_view_ids.add(_FIT_AGGREGATE_VIEW)
-        self._refresh_active_plot_view()
+        rendered = self._refresh_active_plot_view()
         self.copyAvailableChanged.emit(self.copy_eligible())
+        return rendered
 
     def _active_plot_view_id(self) -> _FitResultViewIdentity | None:
         index = self._subtabs.currentIndex()
@@ -1271,14 +1304,18 @@ class RunResultsTab(QtWidgets.QWidget):
             return self._dataset_tab_ids[index]
         return None
 
-    def _refresh_active_plot_view(self) -> None:
+    def _refresh_active_plot_view(self) -> bool:
         view_id = self._active_plot_view_id()
-        if view_id is not None:
-            self._refresh_plot_view(view_id)
+        return bool(view_id is not None and self._refresh_plot_view(view_id))
 
-    def _refresh_plot_view(self, view_id: _FitResultViewIdentity) -> None:
+    def _refresh_plot_view(self, view_id: _FitResultViewIdentity) -> bool:
         if view_id not in self._stale_plot_view_ids:
-            return
+            plot_view = (
+                self._all_datasets_plot_view
+                if view_id.kind == "aggregate"
+                else self._dataset_plot_views.get(view_id)
+            )
+            return bool(plot_view is not None and plot_view.copy_eligible())
         if view_id.kind == "aggregate":
             plot_view = self._all_datasets_plot_view
             curves = self._curves
@@ -1290,15 +1327,90 @@ class RunResultsTab(QtWidgets.QWidget):
                 if curve.dataset_id == view_id.dataset_id
             )
         if plot_view is None:
-            return
-        plot_view.set_projection(curves, self._dataset_presentation)
+            return False
+        try:
+            rendered = plot_view.set_projection(
+                curves,
+                self._dataset_presentation,
+            )
+        except Exception as exc:
+            plot_view.reject_projection(exc)
+            rendered = False
         self._stale_plot_view_ids.discard(view_id)
+        if not curves:
+            self._clear_render_failure(view_id)
+        elif rendered:
+            self._clear_render_failure(view_id)
+        elif view_id not in self._render_failures:
+            self._record_render_failure(view_id, "Fit plot rendering failed.")
+        # A failed Grid emits its render-state signal before this lazy view is
+        # removed from the stale set.  Re-emit after settlement so aggregate
+        # Copy cannot retain that transient pre-render authority.
+        self.copyAvailableChanged.emit(self.copy_eligible())
+        return bool(rendered)
 
     def _on_subtab_changed(self, index: int) -> None:
         if 0 <= int(index) < self._subtab_stack.count():
             self._subtab_stack.setCurrentIndex(int(index))
         self._refresh_active_plot_view()
         self.copyAvailableChanged.emit(self.copy_eligible())
+
+    def _reject_terminal_projection(self, error: BaseException) -> None:
+        """Clear physical/Copy authority while retaining terminal semantics."""
+
+        self._curves = ()
+        self._dataset_presentation = MappingProxyType({})
+        self._stale_plot_view_ids.clear()
+        for plot_view in (
+            *self._dataset_plot_views.values(),
+            *((self._all_datasets_plot_view,) if self._all_datasets_plot_view else ()),
+        ):
+            plot_view.reject_projection(error)
+        self._record_render_failure(_FIT_AGGREGATE_VIEW, str(error))
+        self.copyAvailableChanged.emit(False)
+
+    def _record_render_failure(
+        self,
+        view_id: _FitResultViewIdentity,
+        message: object,
+    ) -> None:
+        diagnostic = str(message or "Fit plot rendering failed.")
+        self._render_failures[view_id] = diagnostic
+        compact = compact_diagnostic_text(
+            diagnostic,
+            max_chars=DIAGNOSTIC_LABEL_MAX_CHARS,
+        )
+        self._render_diagnostic_label.setText(
+            f"Plot unavailable: {compact.display or 'Fit plot rendering failed.'}"
+        )
+        self._render_diagnostic_label.setToolTip(compact.full)
+        self._render_diagnostic_label.show()
+        self.statusMessage.emit(diagnostic)
+
+    def _clear_render_failure(self, view_id: _FitResultViewIdentity) -> None:
+        self._render_failures.pop(view_id, None)
+        self._refresh_render_diagnostic()
+
+    def _clear_render_failures(self) -> None:
+        self._render_failures.clear()
+        self._refresh_render_diagnostic()
+
+    def _refresh_render_diagnostic(self) -> None:
+        if not self._render_failures:
+            self._render_diagnostic_label.clear()
+            self._render_diagnostic_label.setToolTip("")
+            self._render_diagnostic_label.hide()
+            return
+        diagnostic = next(reversed(self._render_failures.values()))
+        compact = compact_diagnostic_text(
+            diagnostic,
+            max_chars=DIAGNOSTIC_LABEL_MAX_CHARS,
+        )
+        self._render_diagnostic_label.setText(
+            f"Plot unavailable: {compact.display or 'Fit plot rendering failed.'}"
+        )
+        self._render_diagnostic_label.setToolTip(compact.full)
+        self._render_diagnostic_label.show()
 
     def _candidate_plot_presentation(
         self,

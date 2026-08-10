@@ -1004,6 +1004,10 @@ class WorkspaceResultProjection:
                 raise ValueError(
                     "copy block must retain the exact projected repository entry."
                 )
+            if not layer.visible:
+                raise ValueError(
+                    "copy blocks must not physically project a hidden result layer."
+                )
         selected_x = _axis_selection(
             self.selected_x_series,
             field="selected_x_series",
@@ -1133,6 +1137,7 @@ def _result_layer(
     entry: ResultEntry,
     kind: ResultLayerKind,
     color_by_axis_selection: Mapping[AxisSeriesSelection, str],
+    visible: bool = True,
 ) -> WorkspacePlotLayer:
     if not isinstance(entry, (ExplicitResultEntry, PreviewResultEntry)):
         raise TypeError("result layer requires a repository result entry.")
@@ -1163,6 +1168,7 @@ def _result_layer(
             (name, str(color_by_axis_selection[selection]))
             for name, selection in series_axes
         ),
+        visible=visible,
         dashed=kind is ResultLayerKind.REFERENCE,
         opacity=0.42 if kind is ResultLayerKind.REFERENCE else 1.0,
         presentation_boundaries=result.presentation_boundaries,
@@ -1287,27 +1293,34 @@ def _statistics_block(
 
 def _selected_x_unavailable_diagnostic(
     selected_x: AxisSeriesSelection,
+    simulation_x_axis: AxisSeriesSelection,
     layers: Sequence[WorkspacePlotLayer],
 ) -> str | None:
     """Return one deterministic diagnostic for semantic result layers lacking X."""
 
-    if not isinstance(selected_x, SimulationSeriesAxisSelection):
-        return None
-    if selected_x.series_name == "t":
+    if _is_time_selection(selected_x):
         return None
     unavailable = tuple(
         layer
         for layer in layers
         if (
             layer.kind is not ResultLayerKind.EXPERIMENTAL
-            and selected_x not in dict(layer.series_axes).values()
+            and simulation_x_axis not in dict(layer.series_axes).values()
         )
     )
     if not unavailable:
         return None
     labels = ", ".join(repr(layer.label) for layer in unavailable)
+    selected_identity = (
+        f"series {selected_x.series_name!r}"
+        if isinstance(selected_x, SimulationSeriesAxisSelection)
+        else (
+            f"raw observation {selected_x.raw_observation_id!r} "
+            f"in dataset {selected_x.dataset_id!r}"
+        )
+    )
     return (
-        f"Selected X series {selected_x.series_name!r} is unavailable for "
+        f"Selected X {selected_identity} is unavailable for "
         f"result layer(s) {labels}. The semantic result layer(s) are retained, "
         "but plot, Copy, and XLSX rows cannot be produced without X values."
     )
@@ -1669,19 +1682,20 @@ class WorkspaceResultPresenter:
             else:
                 foreground = None
 
-            if bool(reference_lines_visible):
-                reference = repository.reference_entry(visible.set_id)
-                if reference is not None:
-                    reference_layer = _result_layer(
-                        set_id=visible.set_id,
-                        label=visible.label,
-                        entry=reference,
-                        kind=ResultLayerKind.REFERENCE,
-                        color_by_axis_selection=colors,
-                    )
-                    layers.append(reference_layer)
-                    for name, selection in reference_layer.series_axes:
-                        add_axis_candidate(selection, name)
+            reference = repository.reference_entry(visible.set_id)
+            if reference is not None:
+                reference_layer = _result_layer(
+                    set_id=visible.set_id,
+                    label=visible.label,
+                    entry=reference,
+                    kind=ResultLayerKind.REFERENCE,
+                    color_by_axis_selection=colors,
+                    visible=bool(reference_lines_visible),
+                )
+                layers.append(reference_layer)
+                for name, selection in reference_layer.series_axes:
+                    add_axis_candidate(selection, name)
+                if bool(reference_lines_visible):
                     block = _data_block(
                         reference_layer,
                         x_axis=simulation_x_axis,
@@ -1818,6 +1832,18 @@ class WorkspaceResultPresenter:
         if not _is_time_selection(selected_x):
             unique_annotations.clear()
 
+        if selected_x not in axis_candidate_ids:
+            add_axis_candidate(
+                selected_x,
+                (
+                    selected_x.series_name
+                    if isinstance(selected_x, SimulationSeriesAxisSelection)
+                    else (
+                        f"{selected_x.dataset_id}: "
+                        f"{selected_x.raw_observation_id}"
+                    )
+                ),
+            )
         selected_x_candidate = next(
             candidate
             for candidate in axis_candidates
@@ -1885,6 +1911,7 @@ class WorkspaceResultPresenter:
             ),
             unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(
                 selected_x,
+                simulation_x_axis,
                 layers,
             ),
         )

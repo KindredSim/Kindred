@@ -163,7 +163,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._pending_initial_values: dict[
             tuple[str, str], dict[str, object]
         ] = {}
-        self._initial_changed_fields: dict[tuple[str, str], set[str]] = {}
         self._invalid_raw: dict[tuple[str, ...], str] = {}
         self._invalid_initial_raw: dict[tuple[str, str, str], str] = {}
         self._refreshing = False
@@ -306,7 +305,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._pending_dataset_weights.clear()
             self._pending_initial_rows.clear()
             self._pending_initial_values.clear()
-            self._initial_changed_fields.clear()
             self._invalid_raw.clear()
             self._invalid_initial_raw.clear()
         self._origin = origin
@@ -793,15 +791,24 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
 
     def _stage_initial_row(self, item: QtWidgets.QTableWidgetItem) -> None:
-        """Retain one Local IC draft while parsing only the edited field."""
+        """Reconstruct and validate one complete Local-IC row Draft."""
 
         set_id = str(item.data(_SET_ROLE) or "").strip()
         species = str(item.data(_SPECIES_ROLE) or "").strip()
         if not set_id or not species:
             return
+        items = {
+            "initial": self._table.item(item.row(), _Col.INITIAL),
+            "minimum": self._table.item(item.row(), _Col.MINIMUM),
+            "maximum": self._table.item(item.row(), _Col.MAXIMUM),
+        }
         fit_item = self._table.item(item.row(), _Col.FIT)
         log_item = self._table.item(item.row(), _Col.LOG10)
-        if fit_item is None or log_item is None:
+        if (
+            any(value is None for value in items.values())
+            or fit_item is None
+            or log_item is None
+        ):
             return
         setup = self._current_setup()
         accepted = next(
@@ -815,61 +822,51 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if accepted is None:
             return
         key = (set_id, species)
-        typed = dict(
-            self._pending_initial_values.get(
-                key,
-                {
-                    "initial": accepted.initial,
-                    "minimum": accepted.minimum,
-                    "maximum": accepted.maximum,
-                    "fit": accepted.fit,
-                    "log10": accepted.log10,
-                },
-            )
-        )
-        raw = dict(
-            self._pending_initial_rows.get(key, self._initial_raw(accepted))
-        )
-        changed = self._initial_changed_fields.setdefault(key, set())
-        field_by_column = {
-            _Col.INITIAL: "initial",
-            _Col.MINIMUM: "minimum",
-            _Col.MAXIMUM: "maximum",
-            _Col.FIT: "fit",
-            _Col.LOG10: "log10",
+        fit = fit_item.checkState() == Qt.CheckState.Checked
+        log10 = log_item.checkState() == Qt.CheckState.Checked
+        if not fit and log10:
+            blocker = QtCore.QSignalBlocker(self._table)
+            log_item.setCheckState(Qt.CheckState.Unchecked)
+            del blocker
+            log10 = False
+        raw = {
+            field: str(value.text())
+            for field, value in items.items()
+            if value is not None
         }
-        changed_field = field_by_column.get(item.column())
-        if changed_field in {"initial", "minimum", "maximum"}:
+        raw.update({"fit": fit, "log10": log10})
+        self._pending_initial_rows[key] = raw
+
+        typed: dict[str, object] = {"fit": fit, "log10": log10}
+        parse_errors: dict[str, str] = {}
+        for field, field_item in items.items():
+            assert field_item is not None
             try:
-                parsed = float(item.text())
+                parsed = float(field_item.text())
                 if not math.isfinite(parsed):
                     raise ValueError("value must be finite")
             except (TypeError, ValueError, OverflowError) as exc:
-                self._pending_initial_rows[key] = raw
-                self._pending_initial_values[key] = typed
-                field_key = (set_id, species, changed_field)
-                self._invalid_initial_raw[field_key] = item.text()
-                self._decorate_initial_field(item.row(), item.column(), str(exc))
-                self._refresh_footer_dirty()
-                self._refresh_footer_validity()
-                return
-            typed[changed_field] = parsed
-            raw[changed_field] = item.text()
-            changed.add(changed_field)
-        elif changed_field in {"fit", "log10"}:
-            fit = fit_item.checkState() == Qt.CheckState.Checked
-            log10 = log_item.checkState() == Qt.CheckState.Checked
-            if not fit and log10:
-                blocker = QtCore.QSignalBlocker(self._table)
-                log_item.setCheckState(Qt.CheckState.Unchecked)
-                del blocker
-                log10 = False
-            typed["fit"] = fit
-            typed["log10"] = log10
-            raw["fit"] = fit
-            raw["log10"] = log10
-            changed.update({"fit", "log10"})
-        self._pending_initial_rows[key] = raw
+                parse_errors[field] = str(exc)
+            else:
+                typed[field] = parsed
+        self._clear_initial_row_errors(set_id, species, item.row())
+        if parse_errors:
+            self._pending_initial_values.pop(key, None)
+            for field, message in parse_errors.items():
+                field_key = (set_id, species, field)
+                self._invalid_initial_raw[field_key] = str(raw[field])
+                self._decorate_initial_field(
+                    item.row(),
+                    {
+                        "initial": _Col.INITIAL,
+                        "minimum": _Col.MINIMUM,
+                        "maximum": _Col.MAXIMUM,
+                    }[field],
+                    message,
+                )
+            self._refresh_footer_dirty()
+            self._refresh_footer_validity()
+            return
         try:
             initial = FitInitialVariable(
                 set_id=set_id,
@@ -881,18 +878,16 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 log10=bool(typed["log10"]),
             )
         except (TypeError, ValueError, OverflowError) as exc:
-            self._pending_initial_values[key] = typed
-            if changed_field in {"initial", "minimum", "maximum"}:
-                field_key = (set_id, species, changed_field)
-                self._invalid_initial_raw[field_key] = raw.get(
-                    changed_field,
-                    item.text(),
-                )
-            self._decorate_initial_field(item.row(), item.column(), str(exc))
+            self._pending_initial_values.pop(key, None)
+            for field, column in (
+                ("initial", _Col.INITIAL),
+                ("minimum", _Col.MINIMUM),
+                ("maximum", _Col.MAXIMUM),
+            ):
+                self._invalid_initial_raw[(set_id, species, field)] = str(raw[field])
+                self._decorate_initial_field(item.row(), column, str(exc))
         else:
-            if changed_field in {"initial", "minimum", "maximum"}:
-                self._invalid_initial_raw.pop((set_id, species, changed_field), None)
-            self._decorate_initial_field(item.row(), item.column(), None)
+            self._clear_initial_row_errors(set_id, species, item.row())
             self._pending_initial_values[key] = {
                 "initial": initial.initial,
                 "minimum": initial.minimum,
@@ -903,9 +898,22 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             if accepted is not None and initial == accepted:
                 self._pending_initial_rows.pop(key, None)
                 self._pending_initial_values.pop(key, None)
-                self._initial_changed_fields.pop(key, None)
         self._refresh_footer_dirty()
         self._refresh_footer_validity()
+
+    def _clear_initial_row_errors(
+        self,
+        set_id: str,
+        species: str,
+        row: int,
+    ) -> None:
+        for field, column in (
+            ("initial", _Col.INITIAL),
+            ("minimum", _Col.MINIMUM),
+            ("maximum", _Col.MAXIMUM),
+        ):
+            self._invalid_initial_raw.pop((set_id, species, field), None)
+            self._decorate_initial_field(row, column, None)
 
     def _decorate_initial_field(
         self,
@@ -1116,7 +1124,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._pending_dataset_weights.clear()
         self._pending_initial_rows.clear()
         self._pending_initial_values.clear()
-        self._initial_changed_fields.clear()
         self._invalid_raw.clear()
         self._invalid_initial_raw.clear()
         self._refresh_visible_presentation()
@@ -1219,7 +1226,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 if current == intent.initial:
                     self._pending_initial_rows.pop(key, None)
                     self._pending_initial_values.pop(key, None)
-                    self._initial_changed_fields.pop(key, None)
                     for invalid_key in tuple(self._invalid_initial_raw):
                         if invalid_key[:2] == key:
                             self._invalid_initial_raw.pop(invalid_key, None)

@@ -2440,11 +2440,19 @@ class GlobalFitWorker(QtCore.QThread):
         self.auto_modes_resolved.emit(resolved_modes)
         if self._checkpoint():
             raise FittingCancelled()
-        initial_curves = _curves_from_evaluations(
-            request,
-            starting_evaluations,
-            effective_local,
-        )
+        try:
+            initial_curves = _curves_from_evaluations(
+                request,
+                starting_evaluations,
+                effective_local,
+            )
+        except DeterministicParametricResolutionError:
+            # The starting evaluation is scientific input to Auto-mode
+            # resolution, but its aligned curve is only presentation.  A
+            # candidate-domain no-crossing therefore suppresses this optional
+            # projection without preventing the optimizer from exploring the
+            # admitted domain.
+            initial_curves = ()
         if self._checkpoint():
             raise FittingCancelled()
         self.curves_updated.emit(

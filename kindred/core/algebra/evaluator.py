@@ -349,17 +349,17 @@ class _Evaluator:
             op = node.op
             try:
                 if op == "+":
-                    return lv + rv
+                    return _as_float(lv + rv, stmt=stmt)
                 if op == "-":
-                    return lv - rv
+                    return _as_float(lv - rv, stmt=stmt)
                 if op == "*":
-                    return lv * rv
+                    return _as_float(lv * rv, stmt=stmt)
                 if op == "/":
                     if rv == 0.0:
                         raise AlgebraZeroDivError("division by zero", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-                    return lv / rv
+                    return _as_float(lv / rv, stmt=stmt)
                 if op in ("**", "^"):
-                    return float(lv ** rv)
+                    return _as_float(lv ** rv, stmt=stmt)
                 if op == "==":
                     return lv == rv
                 if op == "!=":
@@ -372,8 +372,15 @@ class _Evaluator:
                     return lv > rv
                 if op == ">=":
                     return lv >= rv
-            except AlgebraZeroDivError:
+            except (AlgebraTypeError, AlgebraZeroDivError):
                 raise
+            except OverflowError as exc:
+                raise AlgebraTypeError(
+                    "non-finite result in numeric context",
+                    line=stmt.line,
+                    col=stmt.col,
+                    line_text=stmt.line_text,
+                ) from exc
             except Exception as e:
                 logger.debug(f"Binary operation {op} failed", exc_info=True)
                 # Generic math domain/type issues

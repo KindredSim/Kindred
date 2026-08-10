@@ -40,6 +40,7 @@ class _MechanismEditorRenderProjection:
     notes: str
     reactions_draft: bool
     accepted_reactions: bool
+    scientific_settings: object
     document_identity: tuple[int, str]
 
 
@@ -323,7 +324,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             DetailedBalanceCorrectionRequest | None
         ) = None
         self._detailed_balance_context_provider: (
-            Callable[[], tuple[str, str]] | None
+            Callable[[], tuple[str, str, float, bool]] | None
         ) = None
         self._detailed_balance_fix_button.clicked.connect(
             self._run_pending_detailed_balance_fix
@@ -958,6 +959,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             raise TypeError("request must be DetailedBalanceCorrectionRequest.")
         if request.origin.strip().casefold() != "preview":
             raise ValueError("Preview Fix requires a Preview-origin request.")
+        if not self._detailed_balance_request_is_current(request):
+            self.clear_preview_detailed_balance_block()
+            self.detailedBalanceCorrectionCompleted.emit(
+                self._cancelled_detailed_balance_outcome(request)
+            )
+            return
         self._pending_detailed_balance_request = request
         self.set_reactions_status_text(
             f"Preview blocked: {request.issue}",
@@ -975,6 +982,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         if request is None:
             return
         if not self._detailed_balance_request_is_current(request):
+            self.clear_preview_detailed_balance_block()
             self.detailedBalanceCorrectionCompleted.emit(
                 self._cancelled_detailed_balance_outcome(request)
             )
@@ -997,7 +1005,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def set_detailed_balance_context_provider(
         self,
-        provider: Callable[[], tuple[str, str]],
+        provider: Callable[[], tuple[str, str, float, bool]],
     ) -> None:
         if not callable(provider):
             raise TypeError("provider must be callable.")
@@ -1011,10 +1019,24 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         if provider is None:
             return False
         try:
-            tab_id, source = provider()
-        except (KeyError, RuntimeError, ValueError):
+            tab_id, source, temperature_K, policy_enabled = provider()
+        except (KeyError, RuntimeError, TypeError, ValueError):
             return False
-        return str(tab_id) == request.tab_id and str(source) == request.source
+        return (
+            str(tab_id) == request.tab_id
+            and str(source) == request.source
+            and float(temperature_K) == request.temperature_K
+            and bool(policy_enabled)
+        )
+
+    def retire_stale_detailed_balance_request(self) -> bool:
+        """Retire Preview's Fix action when its admitted context changed."""
+
+        request = self._pending_detailed_balance_request
+        if request is None or self._detailed_balance_request_is_current(request):
+            return False
+        self.clear_preview_detailed_balance_block()
+        return True
 
     @staticmethod
     def _cancelled_detailed_balance_outcome(
@@ -1189,6 +1211,7 @@ class MechanismEditorBinding(QtCore.QObject):
         self._registry = registry
         self._rendering = False
         self._rendered_document_identity: tuple[int, str] | None = None
+        self._rendered_scientific_settings: object | None = None
         editor.set_detailed_balance_context_provider(
             self._detailed_balance_context
         )
@@ -1200,11 +1223,17 @@ class MechanismEditorBinding(QtCore.QObject):
     def tab_id(self) -> str:
         return self._tab_id
 
-    def _detailed_balance_context(self) -> tuple[str, str]:
+    def _detailed_balance_context(self) -> tuple[str, str, float, bool]:
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
         source = runtime.reactions_draft or tab.mechanism_source
-        return tab.tab_id, source.reactions_text
+        settings = tab.scientific_settings
+        return (
+            tab.tab_id,
+            source.reactions_text,
+            float(settings.temperature),
+            bool(settings.wegscheider_policy),
+        )
 
     def prepare_render(self) -> _MechanismEditorRenderProjection:
         """Prepare every fallible authoring projection before widget mutation."""
@@ -1229,6 +1258,7 @@ class MechanismEditorBinding(QtCore.QObject):
             ),
             reactions_draft=runtime.reactions_draft is not None,
             accepted_reactions=tab.prepared_dsl is not None,
+            scientific_settings=tab.scientific_settings,
             document_identity=document_identity,
         )
 
@@ -1245,6 +1275,11 @@ class MechanismEditorBinding(QtCore.QObject):
         identity_changed = (
             projection.document_identity != self._rendered_document_identity
         )
+        settings_changed = (
+            self._rendered_scientific_settings is not None
+            and projection.scientific_settings
+            != self._rendered_scientific_settings
+        )
         self._rendering = True
         try:
             self._editor.render_authoring_snapshot(
@@ -1255,9 +1290,16 @@ class MechanismEditorBinding(QtCore.QObject):
                 has_draft=projection.reactions_draft,
                 has_accepted_reactions=projection.accepted_reactions,
             )
+            if settings_changed:
+                self._editor.clear_preview_detailed_balance_block()
+            else:
+                self._editor.retire_stale_detailed_balance_request()
             if identity_changed:
                 self._editor.clear_native_text_history()
             self._rendered_document_identity = projection.document_identity
+            self._rendered_scientific_settings = (
+                projection.scientific_settings
+            )
         finally:
             self._rendering = False
 
@@ -1277,6 +1319,7 @@ class MechanismEditorBinding(QtCore.QObject):
             has_draft=runtime.reactions_draft is not None,
             has_accepted_reactions=tab.prepared_dsl is not None,
         )
+        self._editor.retire_stale_detailed_balance_request()
         self.draftStateChanged.emit(tab.tab_id, runtime.has_dirty_drafts)
 
     @QtCore.Slot(str)

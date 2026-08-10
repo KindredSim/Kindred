@@ -2493,9 +2493,10 @@ def derive_prepared_dsl_with_parameter_updates(
                 base.analysis,
                 name=update.name,
             )
-            old_line = source_lines[
-                origin_positions[origin.authored_ordinal]
-            ]
+            old_line = updated_origin_lines.get(
+                origin.authored_ordinal,
+                source_lines[origin_positions[origin.authored_ordinal]],
+            )
             before_comment, marker, comment = old_line.partition("#")
             match = re.match(
                 rf"^(\s*param\s+{re.escape(update.name)}\s*=\s*)(.*?)\s*$",
@@ -2557,9 +2558,10 @@ def derive_prepared_dsl_with_parameter_updates(
             base.analysis,
             step_index=int(entry["step_index"]),
         )
-        old_line = source_lines[
-            origin_positions[origin.authored_ordinal]
-        ]
+        old_line = updated_origin_lines.get(
+            origin.authored_ordinal,
+            source_lines[origin_positions[origin.authored_ordinal]],
+        )
         prefix, tokens, comment = coordinate_source_parts(old_line)
         source_token = role
         source_value = update.value
@@ -2657,7 +2659,17 @@ def derive_prepared_dsl_with_parameter_updates(
                         energy_unit=source_energy_unit,
                     ).from_jmol(rewritten.dG_act_J_per_mol)
                 else:
-                    source_token = "kf"
+                    authored_forward_tokens = [
+                        pair[0]
+                        for pair in tokens
+                        if str(pair[0]).strip().casefold() in {"k", "kf"}
+                    ]
+                    if len(authored_forward_tokens) != 1:
+                        raise ValueError(
+                            f"Parameter {update.name!r} has no unique admitted "
+                            "reversible forward-rate token."
+                        )
+                    source_token = authored_forward_tokens[0]
             elif role == "kr":
                 if authority.kind != EquilibriumRateAuthorityKind.KR:
                     raise ValueError(

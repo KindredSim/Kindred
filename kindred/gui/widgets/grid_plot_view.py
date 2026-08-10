@@ -175,7 +175,7 @@ class GridPlotView(QtWidgets.QWidget):
         self,
         curves: Iterable[FitCurveDataset],
         presentation: Mapping[str, DatasetPlotPresentation],
-    ) -> None:
+    ) -> bool:
         """Install curves and presentation together, then redraw exactly once."""
 
         self._cancel_copy()
@@ -209,7 +209,7 @@ class GridPlotView(QtWidgets.QWidget):
             self._seen_nonempty_payload = False
             self._selected_species_list = []
             self._available_species_cache = ()
-        self._redraw()
+        return self._redraw()
 
     def clear(self) -> None:
         self._cancel_copy()
@@ -397,10 +397,16 @@ class GridPlotView(QtWidgets.QWidget):
             )
 
     def _reject_render_failure(self, error: BaseException) -> None:
-        """Revoke failed physical presentation before propagating the error."""
+        """Revoke one failed physical presentation and its Copy authority."""
 
         self._render_succeeded = False
         self._cancel_copy()
+        self._curves = ()
+        self._color_by_species = MappingProxyType({})
+        self._dataset_presentation = MappingProxyType({})
+        self._seen_nonempty_payload = False
+        self._selected_species_list = []
+        self._available_species_cache = ()
         try:
             self._canvas.clear()
         except Exception:
@@ -411,6 +417,11 @@ class GridPlotView(QtWidgets.QWidget):
         self._structure_key = None
         self.renderStateChanged.emit(False)
         self.renderFailed.emit(str(error))
+
+    def reject_projection(self, error: BaseException) -> None:
+        """Contain an outer presentation failure at this physical view."""
+
+        self._reject_render_failure(error)
 
     @staticmethod
     def _dataset_structure_key(
@@ -990,7 +1001,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._establish_first_valid_ranges()
         self._restore_locked_view_ranges()
 
-    def _redraw(self) -> None:
+    def _redraw(self) -> bool:
         try:
             self._update_species_selector()
             self._update_grid()
@@ -1000,6 +1011,7 @@ class GridPlotView(QtWidgets.QWidget):
                 and len(self._plot_series_items) == len(self._curves)
             )
             self.renderStateChanged.emit(self._render_succeeded)
+            return self._render_succeeded
         except Exception as exc:
             self._reject_render_failure(exc)
-            raise
+            return False

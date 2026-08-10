@@ -774,11 +774,6 @@ class InitialConditionsTableActions(QtCore.QObject):
             if invalid.get(set_id, {}).get(species) == raw:
                 return False
             invalid.setdefault(set_id, {})[species] = str(raw_text)
-            if not was_invalid:
-                self._simulation_jobs.deauthorize_targets(
-                    tab.tab_id,
-                    (set_id,),
-                )
             self.invalidCellStateChanged.emit(
                 tab.tab_id, set_id, species, True
             )

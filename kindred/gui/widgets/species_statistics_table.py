@@ -8,6 +8,9 @@ from typing import Mapping, Optional
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.intervention_schedule_compiler import (
+    InterventionExecutionContract,
+)
 from kindred.core.results import integrate_ctc
 
 __all__ = ["SpeciesStatisticsTable"]
@@ -44,6 +47,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         self._statistics_cache: tuple[
             object,
             tuple[str, ...],
+            bool,
             tuple[tuple[str, ...], ...],
         ] | None = None
 
@@ -82,6 +86,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         canonical_time: np.ndarray,
         species_data: Mapping[str, np.ndarray],
         *,
+        intervention_execution: InterventionExecutionContract,
         accepted_result_key: object | None = None,
     ) -> None:
         """
@@ -94,10 +99,22 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             at this scientific-statistics boundary.
         species_data : dict
             Dictionary of {species_name: concentration_array}
+        intervention_execution : InterventionExecutionContract
+            Accepted Run intervention truth. Any intervention makes CTC
+            inapplicable for the complete result.
         accepted_result_key : object, optional
             Accepted-result identity used with the projected species roster
             for the single-entry statistics cache.
         """
+        if not isinstance(
+            intervention_execution,
+            InterventionExecutionContract,
+        ):
+            raise TypeError(
+                "intervention_execution must be an "
+                "InterventionExecutionContract."
+            )
+        ctc_applicable = intervention_execution.is_empty
         time = np.asarray(canonical_time, dtype=float)
         if (
             time.ndim != 1
@@ -136,8 +153,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             and accepted_result_key is not None
             and cached[0] == accepted_result_key
             and cached[1] == projected_roster
+            and cached[2] is ctc_applicable
         ):
-            rows = cached[2]
+            rows = cached[3]
         else:
             calculated: list[tuple[str, ...]] = []
             for species_name in projected_roster:
@@ -145,28 +163,31 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                 final_conc = concentrations[-1]
                 max_conc = np.max(concentrations)
                 idx_max = np.argmax(concentrations)
-                threshold = max(
-                    1e-10,
-                    0.01 * float(np.max(np.abs(concentrations))),
-                )
-                integrand = (
-                    concentrations
-                    if abs(float(final_conc)) < threshold
-                    else np.abs(concentrations - final_conc)
-                )
-                ctc, _method, _uniform, _eps, _tail = integrate_ctc(
-                    time,
-                    integrand,
-                    uniformity_eps=1e-6,
-                    tail_strategy="38",
-                )
+                ctc_text = "—"
+                if ctc_applicable:
+                    threshold = max(
+                        1e-10,
+                        0.01 * float(np.max(np.abs(concentrations))),
+                    )
+                    integrand = (
+                        concentrations
+                        if abs(float(final_conc)) < threshold
+                        else np.abs(concentrations - final_conc)
+                    )
+                    ctc, _method, _uniform, _eps, _tail = integrate_ctc(
+                        time,
+                        integrand,
+                        uniformity_eps=1e-6,
+                        tail_strategy="38",
+                    )
+                    ctc_text = f"{ctc:.6g}"
                 calculated.append(
                     (
                         species_name,
                         f"{final_conc:.6g}",
                         f"{max_conc:.6g}",
                         f"{time[idx_max]:.6g}",
-                        f"{ctc:.6g}",
+                        ctc_text,
                     )
                 )
             rows = tuple(calculated)
@@ -174,6 +195,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                 self._statistics_cache = (
                     accepted_result_key,
                     projected_roster,
+                    ctc_applicable,
                     rows,
                 )
             else:

@@ -1107,7 +1107,7 @@ class FitSessionOwner(QtCore.QObject):
     def _retire_after_committed_install_failure(
         self,
         *,
-        request: FitExecutionRequest,
+        request: DetailedBalanceCorrectionRequest,
         worker: GlobalFitWorker,
         detail: Exception,
     ) -> None:
@@ -1116,7 +1116,7 @@ class FitSessionOwner(QtCore.QObject):
         self._pending_detailed_balance = None
         self._publication_fenced_generation = self._worker_generation
         try:
-            current = capture_fit_origin(self._session.document, request.origin.tab_id)
+            current = capture_fit_origin(self._session.document, request.tab_id)
             self._origin = current
             self._rebase_owner_snapshots(current)
             if self._window is not None:
@@ -1950,6 +1950,9 @@ class FitSessionOwner(QtCore.QObject):
             != float(
                 execution_request.origin.scientific_settings.temperature
             )
+            or not bool(
+                execution_request.origin.scientific_settings.wegscheider_policy
+            )
         ):
             self._worker.submit_detailed_balance_correction(
                 correction.request_id,
@@ -2035,22 +2038,43 @@ class FitSessionOwner(QtCore.QObject):
             self._candidate_available_scopes,
             self._candidate_unavailable_reasons,
         ) = self._candidate_apply_feasibility(candidate)
-        rendered = (
-            self._window.set_candidate(
-                candidate,
-                available_scopes=self._candidate_available_scopes,
-                unavailable_reasons=self._candidate_unavailable_reasons,
-            )
-            if self._window
-            else False
-        )
+        render_error: Exception | None = None
+        rendered = False
+        if self._window is not None:
+            try:
+                rendered = self._window.set_candidate(
+                    candidate,
+                    available_scopes=self._candidate_available_scopes,
+                    unavailable_reasons=self._candidate_unavailable_reasons,
+                )
+            except Exception as exc:
+                # Terminal rendering is optional physical presentation.  Keep
+                # the semantic candidate and reassert its independent Run and
+                # Apply projections before containing the failed view.
+                render_error = exc
+                try:
+                    self._window.set_run_identity(candidate.run_identity)
+                    self._window.set_candidate_apply_availability(
+                        self._candidate_available_scopes,
+                        self._candidate_unavailable_reasons,
+                    )
+                except Exception as recovery_exc:
+                    render_error = RuntimeError(
+                        f"{exc}; Fit presentation recovery failed: {recovery_exc}"
+                    )
         if self._window is not None:
             self._window.set_last_fit_reset_available(self._last_fit_setup_snapshot)
-        self._set_status(
-            "Fit completed; candidate is ready to Apply."
-            if rendered
-            else "Fit completed; plotting failed, but the candidate remains ready to Apply."
-        )
+        if rendered:
+            self._set_status("Fit completed; candidate is ready to Apply.")
+        elif render_error is not None:
+            self._set_status(
+                "Fit completed; plotting failed, but the candidate remains "
+                f"ready to Apply: {render_error}"
+            )
+        else:
+            self._set_status(
+                "Fit completed; plotting failed, but the candidate remains ready to Apply."
+            )
 
     def _finish_worker(
         self,

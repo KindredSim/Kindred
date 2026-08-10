@@ -142,12 +142,11 @@ class ProjectPresentationState:
                 "selected_y_series must be a tuple of typed simulation or "
                 "experimental axis selections."
             )
-        if not _axis_selection_is_current(
-            selected_x,
-            simulation_series=simulation_series,
-            experimental_series=experimental_series,
-        ):
-            selected_x = SimulationSeriesAxisSelection("t")
+        # Selected X is accepted presentation identity, not a request to pick
+        # whichever physical axis happens to remain available now.  Keep it
+        # through temporary mechanism/overlay gaps so result projection can
+        # report the unavailable physical boundary without silently changing
+        # the user's scientific comparison to time.
         selected_y = tuple(
             selection
             for selection in self.selected_y_series
@@ -283,6 +282,7 @@ def _validate_axis_selection(
     *,
     simulation_series: frozenset[SimulationSeriesAxisSelection],
     experimental_series: frozenset[ExperimentalAxisSelection],
+    allow_unavailable: bool = False,
 ) -> None:
     if not isinstance(
         value,
@@ -292,7 +292,7 @@ def _validate_axis_selection(
             f"{label} must be a typed simulation or experimental axis "
             "selection."
         )
-    if _axis_selection_is_current(
+    if allow_unavailable or _axis_selection_is_current(
         value,
         simulation_series=simulation_series,
         experimental_series=experimental_series,
@@ -409,6 +409,7 @@ def validate_project_presentation_state(
         "selected_x_series",
         simulation_series=simulation_series,
         experimental_series=experimental_series,
+        allow_unavailable=True,
     )
     if not isinstance(state.selected_y_series, tuple):
         raise TypeError("selected_y_series must be a tuple.")
@@ -433,7 +434,7 @@ def reconcile_workspace_presentation_state(
     document: ProjectDocument,
     state: WorkspacePresentationState,
 ) -> WorkspacePresentationState:
-    """Resolve every saved axis against one complete current project value."""
+    """Reconcile current choices while retaining accepted selected-X identity."""
 
     if not isinstance(state, WorkspacePresentationState):
         raise TypeError("state must be WorkspacePresentationState.")

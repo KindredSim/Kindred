@@ -4,6 +4,12 @@ from dataclasses import dataclass
 import ast
 from typing import Any
 
+from kindred.core.algebra.parser import (
+    BinaryNode,
+    IdentNode,
+    NumberNode,
+    UnaryNode,
+)
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, ParameterAssignment
 
 from .backend import get_symbolic_backend_metadata, require_sympy
@@ -79,6 +85,50 @@ def _validate_ast(node: ast.AST) -> None:
     raise _unsupported(f"Unsupported symbolic expression node: {type(node).__name__}.")
 
 
+def _validate_retained_proof_arithmetic(assignment: ParameterAssignment) -> None:
+    """Admit only arithmetic whose symbolic proof preserves Algebra meaning.
+
+    Algebra evaluates every numeric operation as binary64 in retained AST
+    order.  SymPy may reassociate additive trees and eliminate cancellation,
+    so an additive parameter expression cannot safely establish a scientific
+    identity.  Multiplicative detailed-balance relations remain supported;
+    everything else fails closed instead of proving a different program.
+    """
+
+    def visit(node: object) -> None:
+        if isinstance(node, (NumberNode, IdentNode)):
+            return
+        if isinstance(node, UnaryNode):
+            if node.op not in {"+", "-"}:
+                raise _unsupported(
+                    "Only unary plus/minus are supported in symbolic proof."
+                )
+            visit(node.rhs)
+            return
+        if isinstance(node, BinaryNode):
+            if node.op in {"+", "-"}:
+                raise _unsupported(
+                    "Additive binary64 parameter arithmetic cannot establish "
+                    "an exact symbolic identity."
+                )
+            if node.op not in {"*", "/", "**", "^"}:
+                raise _unsupported(
+                    f"Unsupported retained Algebra operator: {node.op!r}."
+                )
+            visit(node.lhs)
+            visit(node.rhs)
+            return
+        raise _unsupported(
+            "Symbolic proof requires the retained admitted Algebra AST."
+        )
+
+    if assignment.expr_ast is None:
+        raise _unsupported(
+            "Symbolic proof requires the retained admitted Algebra AST."
+        )
+    visit(assignment.expr_ast)
+
+
 def _identifier_order(node: ast.AST) -> tuple[str, ...]:
     names: list[str] = []
     for child in ast.walk(node):
@@ -93,6 +143,7 @@ def translate_parameter_expression(
     spec: ParameterAlgebraSpec | None = None,
     namespace: SymbolicParameterNamespaceContext | None = None,
 ) -> SymbolicExpression:
+    _validate_retained_proof_arithmetic(assignment)
     parameter_namespace = _coerce_parameter_namespace(spec=spec, namespace=namespace)
     normalized = _normalize_source(assignment.expr_src, parameter_namespace)
     try:

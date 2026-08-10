@@ -166,7 +166,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
 
         try:
             MechanismAuthoringSource.from_parts(
-                reactions_text=self._mechanism_edit.toPlainText().strip()
+                reactions_text=self._mechanism_edit.toPlainText()
             )
         except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(
@@ -192,7 +192,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         tags = [t.strip() for t in tags_text.split(',') if t.strip()]
 
         source = MechanismAuthoringSource.from_parts(
-            reactions_text=self._mechanism_edit.toPlainText().strip()
+            reactions_text=self._mechanism_edit.toPlainText()
         )
         return {
             'name': self._name_edit.text().strip(),

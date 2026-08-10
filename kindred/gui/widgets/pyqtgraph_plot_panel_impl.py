@@ -907,6 +907,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         physical_items: dict[tuple[AxisSeriesSelection, bool], list[object]] = {}
         self._curve_items = []
         for layer in projection.plot_layers:
+            if not layer.visible:
+                continue
             block = block_by_id.get(layer.layer_id)
             if block is None:
                 continue
@@ -1273,7 +1275,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         return sample, chunks
 
     def _render_analysis(self, projection: WorkspaceResultProjection) -> None:
-        has_pending_reference = any(
+        has_retained_reference = any(
             layer.kind is ResultLayerKind.REFERENCE
             and isinstance(layer.layer_id, SimulationResultLayerIdentity)
             and layer.layer_id.set_id == projection.current_set_id
@@ -1281,7 +1283,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         if (
             projection.primary_layer_id is None
-            and has_pending_reference
+            and has_retained_reference
             and self._analysis_set_id == projection.current_set_id
         ):
             return
@@ -1300,6 +1302,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._species_table.update_results(
             canonical_time=block.t,
             species_data=dict(block.series),
+            intervention_execution=(
+                block.result_entry.result.intervention_execution
+            ),
             accepted_result_key=(
                 getattr(block.result_entry, "key", None)
                 if block.result_entry is not None
