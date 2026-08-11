@@ -742,20 +742,6 @@ class ExplicitResultKey:
         validate_simulation_execution_settings(self.execution_settings)
         validate_tab_scientific_settings(self.scientific_settings)
 
-    @property
-    def cache_identity(self) -> tuple[object, ...]:
-        """Exact numerical-cache identity, deliberately excluding provenance."""
-
-        return (
-            self.tab_id,
-            self.set_id,
-            self.scientific_identity,
-            self.initial_values,
-            self.execution_settings,
-            self.scientific_settings,
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class ExplicitResultCurrentFacts:
     """Typed live facts captured for one current explicit-result target.
@@ -1316,7 +1302,7 @@ ResultEntry: TypeAlias = ExplicitResultEntry | PreviewResultEntry
 
 
 class ResultRepository:
-    """Store results while enforcing owner-issued Preview display eligibility."""
+    """Store completed result values and a bounded exact-key Run cache."""
 
     def __init__(
         self,
@@ -1332,13 +1318,9 @@ class ResultRepository:
             raise ValueError("cache_capacity must be at least one.")
         self._explicit_by_set_id: dict[str, ExplicitResultEntry] = {}
         self._preview_by_set_id: dict[str, PreviewResultEntry] = {}
-        self._preview_display_key_by_set_id: dict[
-            str,
-            PreviewResultKey,
-        ] = {}
         self._reference_by_set_id: dict[str, ExplicitResultEntry] = {}
         self._explicit_cache: OrderedDict[
-            tuple[object, ...],
+            ExplicitResultKey,
             ExplicitResultEntry,
         ] = OrderedDict()
 
@@ -1360,44 +1342,29 @@ class ResultRepository:
         return self._explicit_by_set_id.get(str(set_id or ""))
 
     def preview_entry(self, set_id: str) -> PreviewResultEntry | None:
-        sid = str(set_id or "")
-        entry = self._preview_by_set_id.get(sid)
-        if (
-            entry is None
-            or self._preview_display_key_by_set_id.get(sid) != entry.key
-        ):
-            return None
-        return entry
+        return self._preview_by_set_id.get(str(set_id or ""))
 
     def reference_entry(self, set_id: str) -> ExplicitResultEntry | None:
         return self._reference_by_set_id.get(str(set_id or ""))
 
-    def capture_preview_reference(self, key: PreviewResultKey) -> None:
-        """Move the exact foreground Run to Reference before Preview debounce."""
-        self._require_preview_key(key)
-        explicit = self._explicit_by_set_id.pop(key.set_id, None)
+    def retain_explicit_as_reference(self, set_id: str) -> None:
+        """Move one completed foreground Run to comparison-only storage."""
+
+        sid = _required_id(set_id, "set_id")
+        explicit = self._explicit_by_set_id.pop(sid, None)
         if explicit is not None:
-            self._reference_by_set_id[key.set_id] = explicit
-
-    def authorize_preview_display(self, key: PreviewResultKey) -> None:
-        """Authorize exactly one owner-current key for display/export."""
-
-        self._require_preview_key(key)
-        self._preview_display_key_by_set_id[key.set_id] = key
+            self._reference_by_set_id[sid] = explicit
 
     def store_preview(
         self,
         key: PreviewResultKey,
         result: SimulationResultValue,
     ) -> PreviewResultEntry:
-        """Store one Preview result after owner authorization."""
+        """Store one completed Preview value already accepted by its owner."""
+
         self._require_preview_key(key)
         if not isinstance(result, SimulationResultValue):
             raise TypeError("result must be a SimulationResultValue.")
-        if self._preview_display_key_by_set_id.get(key.set_id) != key:
-            raise ValueError(
-                "Preview result key is not owner-authorized for display."
-            )
         entry = PreviewResultEntry(key=key, result=result)
         self._preview_by_set_id[key.set_id] = entry
         self._explicit_by_set_id.pop(key.set_id, None)
@@ -1406,7 +1373,6 @@ class ResultRepository:
     def clear_preview(self, set_id: str, *, clear_reference: bool = True) -> None:
         sid = _required_id(set_id, "set_id")
         self._preview_by_set_id.pop(sid, None)
-        self._preview_display_key_by_set_id.pop(sid, None)
         if clear_reference:
             self._reference_by_set_id.pop(sid, None)
 
@@ -1421,38 +1387,29 @@ class ResultRepository:
         entry = ExplicitResultEntry(key=key, result=result)
         self._explicit_by_set_id[key.set_id] = entry
         self._preview_by_set_id.pop(key.set_id, None)
-        self._preview_display_key_by_set_id.pop(key.set_id, None)
         self._reference_by_set_id.pop(key.set_id, None)
-        cache_identity = key.cache_identity
-        self._explicit_cache[cache_identity] = entry
-        self._explicit_cache.move_to_end(cache_identity)
+        self._explicit_cache[key] = entry
+        self._explicit_cache.move_to_end(key)
         self._trim_explicit_cache()
         return entry
 
-    def cached_result(self, key: ExplicitResultKey) -> SimulationResultValue | None:
-        self._require_explicit_key(key)
-        cache_identity = key.cache_identity
-        entry = self._explicit_cache.get(cache_identity)
-        if entry is not None:
-            self._explicit_cache.move_to_end(cache_identity)
-            return entry.result
-        return None
-
     def hydrate_cached(self, key: ExplicitResultKey) -> ExplicitResultEntry | None:
-        """Hydrate one owner-authorized exact cache hit; a miss changes nothing."""
-        result = self.cached_result(key)
-        if result is None:
-            retained = self._reference_by_set_id.get(key.set_id)
-            if retained is None:
-                retained = self._explicit_by_set_id.get(key.set_id)
-            if retained is not None and retained.key == key:
-                result = retained.result
-        if result is None:
+        """Hydrate one exact-key cache hit; a miss changes nothing."""
+
+        self._require_explicit_key(key)
+        entry = self._explicit_cache.get(key)
+        if entry is not None:
+            self._explicit_cache.move_to_end(key)
+        else:
+            entry = self._reference_by_set_id.get(key.set_id)
+            if entry is None:
+                entry = self._explicit_by_set_id.get(key.set_id)
+            if entry is not None and entry.key != key:
+                entry = None
+        if entry is None:
             return None
-        entry = ExplicitResultEntry(key=key, result=result)
         self._explicit_by_set_id[key.set_id] = entry
         self._preview_by_set_id.pop(key.set_id, None)
-        self._preview_display_key_by_set_id.pop(key.set_id, None)
         self._reference_by_set_id.pop(key.set_id, None)
         return entry
 
@@ -1461,7 +1418,6 @@ class ResultRepository:
         sid = _required_id(set_id, "set_id")
         self._explicit_by_set_id.pop(sid, None)
         self._preview_by_set_id.pop(sid, None)
-        self._preview_display_key_by_set_id.pop(sid, None)
         self._reference_by_set_id.pop(sid, None)
 
     def deauthorize_sets(
@@ -1470,14 +1426,14 @@ class ResultRepository:
         *,
         preserve_reference: bool = False,
     ) -> None:
-        """Clear display authorization while retaining exact reusable values.
+        """Clear foreground values while retaining exact reusable Run cache.
 
         Slider Preview reaches this canonical deauthorization boundary only
         after constructing its exact request/key candidates. Its established
-        Run-to-Reference behavior moves the prior explicit entry to
-        comparison-only storage during the single admission fence. The
-        reference is never an eligible foreground entry and remains absent for
-        ordinary invalidation.
+        Run-to-Reference behavior moves the prior explicit entry separately,
+        before this boundary. Deauthorization never manufactures a Reference
+        value. An existing Reference may be retained for Preview admission but
+        remains absent for ordinary invalidation.
         """
 
         targets = {
@@ -1487,18 +1443,14 @@ class ResultRepository:
         if not targets:
             return
         for set_id in targets:
-            explicit = self._explicit_by_set_id.pop(set_id, None)
-            if preserve_reference and explicit is not None:
-                self._reference_by_set_id[set_id] = explicit
-            elif not preserve_reference:
+            self._explicit_by_set_id.pop(set_id, None)
+            if not preserve_reference:
                 self._reference_by_set_id.pop(set_id, None)
             self._preview_by_set_id.pop(set_id, None)
-            self._preview_display_key_by_set_id.pop(set_id, None)
 
     def clear_all_semantic_entries(self) -> None:
         self._explicit_by_set_id.clear()
         self._preview_by_set_id.clear()
-        self._preview_display_key_by_set_id.clear()
         self._reference_by_set_id.clear()
 
     def purge_set(self, set_id: str) -> None:
@@ -1506,9 +1458,9 @@ class ResultRepository:
 
         sid = _required_id(set_id, "set_id")
         self.clear_semantic_set(sid)
-        for cache_identity in tuple(self._explicit_cache):
-            if cache_identity[1] == sid:
-                self._explicit_cache.pop(cache_identity, None)
+        for key in tuple(self._explicit_cache):
+            if key.set_id == sid:
+                self._explicit_cache.pop(key, None)
 
     def purge_sets(self, set_ids: Iterable[str]) -> None:
         for set_id in tuple(set_ids):

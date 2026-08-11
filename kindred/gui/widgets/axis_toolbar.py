@@ -23,7 +23,7 @@ optionsRequested(action: str, data: object)  # generic hook (e.g. "sampling", ..
 Public API
 ----------
 set_x_candidates(candidates, *, selected)
-set_y_candidates(candidates, *, disabled=())
+set_y_candidates(candidates, *, disabled=(), locked_checked=None)
 selected_y() -> tuple[AxisSeriesSelection, ...]
 current_x() -> AxisSeriesSelection
 is_auto_range() -> bool
@@ -40,7 +40,7 @@ No filesystem, no network, no cwd usage.
 from __future__ import annotations
 
 import math
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -90,6 +90,7 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._y_list.setMaximumHeight(160)
         self._y_list.setMinimumWidth(220)
+        self._locked_checked_y: frozenset[AxisSeriesSelection] = frozenset()
 
         self._y_selector_btn = QtWidgets.QToolButton(self)
         self._y_selector_btn.setText("Y: none")
@@ -297,6 +298,7 @@ class AxisToolbar(QtWidgets.QWidget):
         candidates: Sequence[tuple[AxisSelectionCandidate, bool]],
         *,
         disabled: Sequence[AxisSeriesSelection] = (),
+        locked_checked: Mapping[AxisSeriesSelection, str] | None = None,
     ) -> None:
         """
         Populate Y list.
@@ -307,6 +309,9 @@ class AxisToolbar(QtWidgets.QWidget):
             Typed candidates paired with their projected checked state.
         disabled
             Typed identities that must remain visible but not selectable.
+        locked_checked
+            Derived overlay identities that remain checked and emit no
+            authored Y selection, mapped to their model-series identity.
         """
         values = tuple(candidates)
         if any(
@@ -321,6 +326,33 @@ class AxisToolbar(QtWidgets.QWidget):
         if len(identities) != len(set(identities)):
             raise ValueError("Y candidate identities must be unique.")
         disabled_set = set(disabled)
+        locked_checked_by_identity = dict(locked_checked or {})
+        if any(identity not in identities for identity in disabled_set):
+            raise ValueError("Disabled Y identities must exist in candidates.")
+        if any(
+            not isinstance(identity, ExperimentalAxisSelection)
+            or identity not in identities
+            for identity in locked_checked_by_identity
+        ):
+            raise ValueError(
+                "Locked-checked Y identities must be active experimental "
+                "candidates."
+            )
+        if disabled_set.intersection(locked_checked_by_identity):
+            raise ValueError(
+                "Disabled and locked-checked Y identities must be distinct."
+            )
+        for model_identity in locked_checked_by_identity.values():
+            if (
+                type(model_identity) is not str
+                or not model_identity
+                or model_identity != model_identity.strip()
+            ):
+                raise ValueError(
+                    "Locked-checked Y model identities must be nonblank "
+                    "edge-normalized strings."
+                )
+        self._locked_checked_y = frozenset(locked_checked_by_identity)
 
         self._y_list.blockSignals(True)
         self._y_list.clear()
@@ -336,6 +368,16 @@ class AxisToolbar(QtWidgets.QWidget):
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEnabled)
                 it.setToolTip("Scalar values cannot be plotted as Y; use 'Add Guide from Scalar' in Options.")
                 it.setCheckState(Qt.CheckState.Unchecked)
+            elif candidate.selection in locked_checked_by_identity:
+                it.setFlags(
+                    it.flags() & ~Qt.ItemFlag.ItemIsUserCheckable
+                )
+                it.setToolTip(
+                    "Shown because this active overlay maps to "
+                    f"{locked_checked_by_identity[candidate.selection]}; "
+                    "disable it in Plot Overlays."
+                )
+                it.setCheckState(Qt.CheckState.Checked)
             else:
                 it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             self._y_list.addItem(it)
@@ -347,6 +389,10 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_list.blockSignals(True)
         for i in range(self._y_list.count()):
             it = self._y_list.item(i)
+            selection = it.data(Qt.ItemDataRole.UserRole)
+            if selection in self._locked_checked_y:
+                it.setCheckState(Qt.CheckState.Checked)
+                continue
             if not (it.flags() & Qt.ItemFlag.ItemIsEnabled):
                 it.setCheckState(Qt.CheckState.Unchecked)
                 continue
@@ -376,6 +422,8 @@ class AxisToolbar(QtWidgets.QWidget):
                     raise TypeError(
                         "Y selector item lacks a typed axis identity."
                     )
+                if selection in self._locked_checked_y:
+                    continue
                 out.append(selection)
         return tuple(out)
 
@@ -625,7 +673,16 @@ class AxisToolbar(QtWidgets.QWidget):
     def _on_interaction_requested(self, mode: str) -> None:
         self.interactionModeRequested.emit(str(mode))
 
-    def _on_y_item_changed(self, _item: QtWidgets.QListWidgetItem) -> None:
+    def _on_y_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
+        selection = item.data(Qt.ItemDataRole.UserRole)
+        if selection in self._locked_checked_y:
+            blocker = QtCore.QSignalBlocker(self._y_list)
+            try:
+                item.setCheckState(Qt.CheckState.Checked)
+            finally:
+                del blocker
+            self._update_y_selector_text()
+            return
         self._update_y_selector_text()
         self.ySelectionChanged.emit(self.selected_y())
 

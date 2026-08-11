@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from collections.abc import Callable, Mapping
-from time import monotonic
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -15,7 +14,6 @@ from kindred.core.project_presentation_state import (
     ExperimentalAxisSelection,
     SimulationSeriesAxisSelection,
 )
-from kindred.core.result_repository import PreviewResultKey
 from kindred.gui.plot_config import PlotPresentationIntent, require_pyqtgraph
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
@@ -50,37 +48,6 @@ class _AxisRangeSession:
     x_max: float | None = None
     y_min: float | None = None
     y_max: float | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _PreviewCurveSnapshot:
-    item_key: tuple[object, ...]
-    x: np.ndarray
-    y: np.ndarray
-    opacity: float
-    options: Mapping[str, object]
-
-
-@dataclass(slots=True)
-class _PreviewCurveAnimation:
-    item: object
-    start_x: np.ndarray
-    start_y: np.ndarray
-    target_x: np.ndarray
-    target_y: np.ndarray
-    start_opacity: float
-    target_opacity: float
-    interpolate_coordinates: bool
-
-
-@dataclass(slots=True)
-class _PreviewTransition:
-    started_at: float
-    animations: tuple[_PreviewCurveAnimation, ...]
-    transient_items: tuple[tuple[tuple[object, ...], object], ...]
-    auto_range: bool
-    start_range: tuple[tuple[float, float], tuple[float, float]] | None
-    target_range: tuple[tuple[float, float], tuple[float, float]] | None
 
 
 class PyQtGraphPlotPanel(QtWidgets.QWidget):
@@ -128,18 +95,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._interaction_mode = "pan"
         self._presentation = _PlotPresentation()
         self._axis_range = _AxisRangeSession()
-        self._preview_endpoint_keys: set[PreviewResultKey] = set()
-        self._preview_origin_snapshots: tuple[_PreviewCurveSnapshot, ...] = ()
-        self._preview_origin_range: (
-            tuple[tuple[float, float], tuple[float, float]] | None
-        ) = None
-        self._preview_origin_auto_range = False
-        self._preview_transition: _PreviewTransition | None = None
-        self._preview_transition_duration_s = 0.18
-        self._preview_transition_timer = QtCore.QTimer(self)
-        self._preview_transition_timer.setInterval(16)
-        self._preview_transition_timer.timeout.connect(self._advance_preview_transition)
         self._dark_mode = False
+        self._copy_generation = 0
+        self._active_copy_generation: int | None = None
         self._copy_chunks = None
         self._copy_output: io.StringIO | None = None
         self._copy_title = "Copy"
@@ -247,133 +205,19 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return projection
         return None
 
-    @QtCore.Slot(object, bool)
-    def capture_preview_transition_origins(
-        self,
-        set_ids: object,
-        animate: bool,
-    ) -> None:
-        """Capture only visible pixels before an exact Slider admission fence."""
-
-        try:
-            targets = frozenset(
-                str(set_id).strip()
-                for set_id in tuple(set_ids)  # type: ignore[arg-type]
-            )
-        except TypeError as exc:
-            raise TypeError("set_ids must be an iterable of set IDs.") from exc
-        if not targets or any(not set_id for set_id in targets):
-            raise ValueError("set_ids must contain nonblank set IDs.")
-        if not bool(animate):
-            self._preview_endpoint_keys.clear()
-            self._clear_preview_transition_pixels()
-            return
-        snapshots = self._snapshot_visible_preview_items(targets)
-        self._stop_preview_transition(remove_transient=True)
-        self._preview_origin_snapshots = snapshots
-        projection = self._applied_projection
-        self._preview_origin_auto_range = bool(
-            projection is not None
-            and self._axis_range.auto
-        )
-        self._preview_origin_range = (
-            self._current_view_range() if self._preview_origin_auto_range else None
-        )
-
-    @QtCore.Slot(object, bool)
-    def authorize_preview_endpoint_presentation(
-        self,
-        keys: object,
-        animate: bool,
-    ) -> None:
-        """Authorize animation for exact keys without changing semantic truth."""
-
-        try:
-            captured = tuple(keys)  # type: ignore[arg-type]
-        except TypeError as exc:
-            raise TypeError(
-                "keys must be an iterable of PreviewResultKey values."
-            ) from exc
-        if not captured or any(
-            not isinstance(key, PreviewResultKey) for key in captured
-        ):
-            raise TypeError("keys must contain at least one PreviewResultKey value.")
-        tab_ids = {key.tab_id for key in captured}
-        if len(tab_ids) != 1:
-            raise ValueError("Preview endpoint keys must belong to one tab.")
-        projection = self._applied_projection
-        if projection is not None and tab_ids != {projection.tab_id}:
-            raise ValueError("Preview endpoint keys do not belong to this panel.")
-        self._preview_endpoint_keys = set(captured) if bool(animate) else set()
-        if not animate:
-            self._clear_preview_transition_pixels()
-
-    @QtCore.Slot(object)
-    def retire_preview_endpoint_presentations(self, keys: object) -> None:
-        """Retire widget-only pixels when their exact owner keys are fenced."""
-
-        try:
-            retired = tuple(keys)  # type: ignore[arg-type]
-        except TypeError as exc:
-            raise TypeError(
-                "keys must be an iterable of PreviewResultKey values."
-            ) from exc
-        if any(not isinstance(key, PreviewResultKey) for key in retired):
-            raise TypeError("retired keys must be PreviewResultKey values.")
-        self._preview_endpoint_keys.difference_update(retired)
-        QtCore.QTimer.singleShot(0, self._settle_retired_preview_endpoints)
-
-    @QtCore.Slot()
-    def _settle_retired_preview_endpoints(self) -> None:
-        # A newer exact admission installs its keys synchronously after retiring
-        # the prior endpoint. Only an unclaimed retirement clears held pixels.
-        if not self._preview_endpoint_keys:
-            self._clear_preview_transition_pixels()
-
     def apply_workspace_result_projection(
         self,
         projection: WorkspaceResultProjection,
     ) -> None:
-        """Apply one projection; failure invalidates this panel's projection."""
+        """Apply one completed projection exactly at its immutable endpoint."""
 
         if not isinstance(projection, WorkspaceResultProjection):
             raise TypeError(
                 "apply_workspace_result_projection requires WorkspaceResultProjection."
             )
-        animated_keys = {
-            layer.result_entry.key
-            for layer in projection.plot_layers
-            if (
-                layer.kind is ResultLayerKind.PREVIEW
-                and layer.result_entry is not None
-                and isinstance(layer.result_entry.key, PreviewResultKey)
-                and layer.result_entry.key in self._preview_endpoint_keys
-            )
-        }
-        origin_snapshots = tuple(
-            snapshot
-            for snapshot in self._preview_origin_snapshots
-            if self._preview_item_set_id(snapshot.item_key)
-            in {key.set_id for key in animated_keys}
-        )
-        origin_range = self._preview_origin_range
-        origin_auto_range = self._preview_origin_auto_range
-        self._stop_preview_transition(remove_transient=True)
+        self._cancel_copy()
         try:
             rendered = self._render_projection(projection)
-            if animated_keys:
-                self._start_preview_endpoint_transition(
-                    origin_snapshots,
-                    target_set_ids=frozenset(key.set_id for key in animated_keys),
-                    origin_range=origin_range,
-                    auto_range=origin_auto_range,
-                )
-                self._preview_endpoint_keys.difference_update(animated_keys)
-                self._preview_origin_snapshots = ()
-                self._preview_origin_range = None
-                self._preview_origin_auto_range = False
-            elif self._preview_origin_snapshots:
-                self._install_held_preview_origin_pixels()
         except Exception as exc:
             # A failed projection is ordinary unavailability for this panel:
             # never retain a stale scene or export authority.
@@ -384,343 +228,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._rendered_blocks = rendered
         if projection.unavailable_x_diagnostic is not None:
             self.resultDiagnostic.emit(projection.unavailable_x_diagnostic)
-
-    @staticmethod
-    def _preview_item_set_id(item_key: tuple[object, ...]) -> str | None:
-        if not item_key:
-            return None
-        identity = item_key[0]
-        if (
-            isinstance(identity, SimulationResultLayerIdentity)
-            and identity.kind is ResultLayerKind.PREVIEW
-        ):
-            return identity.set_id
-        return None
-
-    @staticmethod
-    def _snapshot_preview_item(
-        item_key: tuple[object, ...],
-        item: object,
-    ) -> _PreviewCurveSnapshot | None:
-        get_data = getattr(item, "getData", None)
-        if not callable(get_data):
-            return None
-        x_values, y_values = get_data()
-        if x_values is None or y_values is None:
-            return None
-        x = np.asarray(x_values, dtype=float).copy()
-        y = np.asarray(y_values, dtype=float).copy()
-        if x.ndim != 1 or y.ndim != 1 or x.size != y.size:
-            return None
-        opacity_getter = getattr(item, "opacity", None)
-        opacity = float(opacity_getter()) if callable(opacity_getter) else 1.0
-        raw_options = getattr(item, "opts", {})
-        options = dict(raw_options) if isinstance(raw_options, Mapping) else {}
-        return _PreviewCurveSnapshot(
-            item_key=item_key,
-            x=x,
-            y=y,
-            opacity=opacity,
-            options=options,
-        )
-
-    def _snapshot_visible_preview_items(
-        self,
-        set_ids: frozenset[str],
-    ) -> tuple[_PreviewCurveSnapshot, ...]:
-        snapshots: list[_PreviewCurveSnapshot] = []
-        item_keys: set[tuple[object, ...]] = set()
-        for item_key, item in self._plot_items_by_key.items():
-            if self._preview_item_set_id(item_key) not in set_ids:
-                continue
-            snapshot = self._snapshot_preview_item(item_key, item)
-            if snapshot is not None:
-                snapshots.append(snapshot)
-                item_keys.add(item_key)
-        transition = self._preview_transition
-        if transition is not None:
-            for transient_index, (item_key, item) in enumerate(
-                transition.transient_items
-            ):
-                if self._preview_item_set_id(item_key) not in set_ids:
-                    continue
-                snapshot = self._snapshot_preview_item(item_key, item)
-                if snapshot is not None:
-                    # A topology-changing crossfade may have both its fading
-                    # source and fading-in endpoint under the same semantic
-                    # curve key.  Keep both visible pixels for a seamless
-                    # mid-transition retarget; the suffix is widget-only.
-                    if item_key in item_keys:
-                        snapshot = replace(
-                            snapshot,
-                            item_key=(
-                                *item_key,
-                                "preview-transition-origin",
-                                transient_index,
-                            ),
-                        )
-                    snapshots.append(snapshot)
-                    item_keys.add(snapshot.item_key)
-        return tuple(snapshots)
-
-    @staticmethod
-    def _preview_item_options(snapshot: _PreviewCurveSnapshot) -> dict[str, object]:
-        return {
-            name: snapshot.options[name]
-            for name in (
-                "pen",
-                "shadowPen",
-                "fillLevel",
-                "fillBrush",
-                "symbol",
-                "symbolSize",
-                "symbolPen",
-                "symbolBrush",
-                "connect",
-                "stepMode",
-            )
-            if name in snapshot.options
-        }
-
-    def _clone_preview_snapshot(
-        self,
-        snapshot: _PreviewCurveSnapshot,
-    ) -> object:
-        item = pg.PlotDataItem(
-            snapshot.x,
-            snapshot.y,
-            **self._preview_item_options(snapshot),
-        )
-        item.setOpacity(snapshot.opacity)
-        self._plot_widget.addItem(item)
-        return item
-
-    def _current_view_range(
-        self,
-    ) -> tuple[tuple[float, float], tuple[float, float]]:
-        x_range, y_range = self._plot_widget.getPlotItem().getViewBox().viewRange()
-        return (
-            (float(x_range[0]), float(x_range[1])),
-            (float(y_range[0]), float(y_range[1])),
-        )
-
-    def _set_transition_view_range(
-        self,
-        value: tuple[tuple[float, float], tuple[float, float]],
-    ) -> None:
-        view_box = self._plot_widget.getPlotItem().getViewBox()
-        view_box.state["autoRange"] = [False, False]
-        view_box.setRange(
-            xRange=value[0],
-            yRange=value[1],
-            padding=0.0,
-            disableAutoRange=False,
-        )
-        view_box.state["autoRange"] = [False, False]
-
-    def _install_held_preview_origin_pixels(self) -> None:
-        transient = tuple(
-            (snapshot.item_key, self._clone_preview_snapshot(snapshot))
-            for snapshot in self._preview_origin_snapshots
-        )
-        self._preview_transition = _PreviewTransition(
-            started_at=monotonic(),
-            animations=(),
-            transient_items=transient,
-            auto_range=self._preview_origin_auto_range,
-            start_range=self._preview_origin_range,
-            target_range=None,
-        )
-        if self._preview_origin_auto_range and self._preview_origin_range is not None:
-            self._set_transition_view_range(self._preview_origin_range)
-
-    def _start_preview_endpoint_transition(
-        self,
-        origins: tuple[_PreviewCurveSnapshot, ...],
-        *,
-        target_set_ids: frozenset[str],
-        origin_range: tuple[tuple[float, float], tuple[float, float]] | None,
-        auto_range: bool,
-    ) -> None:
-        targets = tuple(
-            (item_key, item)
-            for item_key, item in self._plot_items_by_key.items()
-            if self._preview_item_set_id(item_key) in target_set_ids
-        )
-        if not targets:
-            return
-        target_range = self._current_view_range() if auto_range else None
-        origin_by_key = {snapshot.item_key: snapshot for snapshot in origins}
-        target_snapshots = {
-            item_key: self._snapshot_preview_item(item_key, item)
-            for item_key, item in targets
-        }
-        target_keys = {item_key for item_key, _item in targets}
-        matching_topology = (
-            bool(origins)
-            and set(origin_by_key) == target_keys
-            and all(
-                (target := target_snapshots.get(item_key)) is not None
-                and origin_by_key[item_key].x.shape == target.x.shape
-                and origin_by_key[item_key].y.shape == target.y.shape
-                for item_key in target_keys
-            )
-        )
-        animations: list[_PreviewCurveAnimation] = []
-        transient: list[tuple[tuple[object, ...], object]] = []
-        if matching_topology:
-            for item_key, item in targets:
-                origin = origin_by_key[item_key]
-                target = target_snapshots[item_key]
-                assert target is not None
-                item.setData(origin.x, origin.y)
-                item.setOpacity(origin.opacity)
-                animations.append(
-                    _PreviewCurveAnimation(
-                        item=item,
-                        start_x=origin.x,
-                        start_y=origin.y,
-                        target_x=target.x,
-                        target_y=target.y,
-                        start_opacity=origin.opacity,
-                        target_opacity=target.opacity,
-                        interpolate_coordinates=True,
-                    )
-                )
-        else:
-            for origin in origins:
-                ghost = self._clone_preview_snapshot(origin)
-                transient.append((origin.item_key, ghost))
-                animations.append(
-                    _PreviewCurveAnimation(
-                        item=ghost,
-                        start_x=origin.x,
-                        start_y=origin.y,
-                        target_x=origin.x,
-                        target_y=origin.y,
-                        start_opacity=origin.opacity,
-                        target_opacity=0.0,
-                        interpolate_coordinates=False,
-                    )
-                )
-            for item_key, item in targets:
-                target = target_snapshots[item_key]
-                assert target is not None
-                item.setOpacity(0.0)
-                animations.append(
-                    _PreviewCurveAnimation(
-                        item=item,
-                        start_x=target.x,
-                        start_y=target.y,
-                        target_x=target.x,
-                        target_y=target.y,
-                        start_opacity=0.0,
-                        target_opacity=target.opacity,
-                        interpolate_coordinates=False,
-                    )
-                )
-        self._preview_transition = _PreviewTransition(
-            started_at=monotonic(),
-            animations=tuple(animations),
-            transient_items=tuple(transient),
-            auto_range=bool(auto_range),
-            start_range=origin_range,
-            target_range=target_range,
-        )
-        if auto_range and origin_range is not None and target_range is not None:
-            self._set_transition_view_range(origin_range)
-        self._preview_transition_timer.start()
-
-    @QtCore.Slot()
-    def _advance_preview_transition(self) -> None:
-        transition = self._preview_transition
-        if transition is None or not transition.animations:
-            self._preview_transition_timer.stop()
-            return
-        elapsed = max(0.0, monotonic() - transition.started_at)
-        linear = min(1.0, elapsed / self._preview_transition_duration_s)
-        progress = linear * linear * (3.0 - 2.0 * linear)
-        for animation in transition.animations:
-            if animation.interpolate_coordinates:
-                animation.item.setData(
-                    animation.start_x
-                    + (animation.target_x - animation.start_x) * progress,
-                    animation.start_y
-                    + (animation.target_y - animation.start_y) * progress,
-                )
-            animation.item.setOpacity(
-                animation.start_opacity
-                + (animation.target_opacity - animation.start_opacity) * progress
-            )
-        if (
-            transition.auto_range
-            and transition.start_range is not None
-            and transition.target_range is not None
-        ):
-            self._set_transition_view_range(
-                (
-                    tuple(
-                        start + (end - start) * progress
-                        for start, end in zip(
-                            transition.start_range[0],
-                            transition.target_range[0],
-                        )
-                    ),
-                    tuple(
-                        start + (end - start) * progress
-                        for start, end in zip(
-                            transition.start_range[1],
-                            transition.target_range[1],
-                        )
-                    ),
-                )
-            )
-        if linear >= 1.0:
-            self._finish_preview_transition()
-
-    def _finish_preview_transition(self) -> None:
-        transition = self._preview_transition
-        if transition is None:
-            return
-        self._preview_transition_timer.stop()
-        for animation in transition.animations:
-            if animation.interpolate_coordinates:
-                animation.item.setData(animation.target_x, animation.target_y)
-            animation.item.setOpacity(animation.target_opacity)
-        for _item_key, item in transition.transient_items:
-            try:
-                self._plot_widget.removeItem(item)
-            except (RuntimeError, TypeError, ValueError):
-                pass
-        if transition.auto_range and transition.target_range is not None:
-            self._set_transition_view_range(transition.target_range)
-            self._plot_widget.getPlotItem().getViewBox().enableAutoRange()
-        self._preview_transition = None
-
-    def _stop_preview_transition(self, *, remove_transient: bool) -> None:
-        transition = self._preview_transition
-        self._preview_transition_timer.stop()
-        if transition is None:
-            return
-        if remove_transient:
-            for _item_key, item in transition.transient_items:
-                try:
-                    self._plot_widget.removeItem(item)
-                except (RuntimeError, TypeError, ValueError):
-                    pass
-        self._preview_transition = None
-
-    def _clear_preview_transition_pixels(self) -> None:
-        self._stop_preview_transition(remove_transient=True)
-        self._preview_origin_snapshots = ()
-        self._preview_origin_range = None
-        self._preview_origin_auto_range = False
-        projection = self._applied_projection
-        if (
-            projection is not None
-            and self._axis_range.auto
-        ):
-            self._plot_widget.getPlotItem().getViewBox().enableAutoRange()
 
     def apply_application_plot_preferences(
         self,
@@ -825,8 +332,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._apply_plot_presentation(state)
 
     def drop_tab_session_state(self) -> None:
-        self._preview_endpoint_keys.clear()
-        self._clear_preview_transition_pixels()
         self._manual_annotations.clear()
         self._scalar_guides.clear()
         self._interaction_mode = "pan"
@@ -837,8 +342,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
 
-        self._preview_endpoint_keys.clear()
-        self._clear_preview_transition_pixels()
         self._manual_annotations.clear()
         self._scalar_guides.clear()
         self._interaction_mode = "pan"
@@ -860,8 +363,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Revoke only this physical page's applied result authority."""
 
         self._cancel_copy()
-        self._preview_endpoint_keys.clear()
-        self._clear_preview_transition_pixels()
         for clear in (
             self._clear_plot_items,
             lambda: self._parameter_table.setRowCount(0),
@@ -932,15 +433,46 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 and candidate.selection.series_name == "t"
             )
         )
+        derived_overlay_y = set(projection.derived_overlay_y_series)
+        locked_checked: dict[AxisSeriesSelection, str] = {}
+        for layer in projection.plot_layers:
+            if layer.kind is not ResultLayerKind.EXPERIMENTAL:
+                continue
+            provenance_by_name = dict(layer.series_provenance)
+            for name, selection in layer.series_axes:
+                if selection not in derived_overlay_y:
+                    continue
+                mapped_model = str(
+                    provenance_by_name.get(name, {}).get("model_species")
+                    or ""
+                )
+                if not mapped_model:
+                    raise ValueError(
+                        "Derived overlay Y identity lacks mapped-model "
+                        "provenance."
+                    )
+                previous = locked_checked.setdefault(selection, mapped_model)
+                if previous != mapped_model:
+                    raise ValueError(
+                        "Derived overlay Y identity has conflicting "
+                        "mapped-model provenance."
+                    )
+        if set(locked_checked) != derived_overlay_y:
+            raise ValueError(
+                "Derived overlay Y identities must match active projected "
+                "overlay layers."
+            )
         self._axis_toolbar.set_y_candidates(
             [
                 (
                     candidate,
                     projection.selected_y_uses_default_all
-                    or candidate.selection in projection.selected_y_series,
+                    or candidate.selection in projection.selected_y_series
+                    or candidate.selection in derived_overlay_y,
                 )
                 for candidate in y_candidates
-            ]
+            ],
+            locked_checked=locked_checked,
         )
         self._axis_toolbar.set_coarse_sampling(
             self._sampling_limit is not None
@@ -1529,7 +1061,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self.apply_workspace_result_projection(projection)
 
     def _clear_plot_items(self) -> None:
-        self._stop_preview_transition(remove_transient=False)
         self._plot_widget.clear()
         self._curve_items.clear()
         self._plot_items_by_key.clear()
@@ -1546,9 +1077,18 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._annotation_items.clear()
 
     def _cancel_copy(self) -> None:
+        chunks = self._copy_chunks
+        self._copy_generation += 1
+        self._active_copy_generation = None
         self._copy_timer.stop()
         self._copy_chunks = None
         self._copy_output = None
+        close = getattr(chunks, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     @staticmethod
     def _apply_item_color(item: object, color: QtGui.QColor) -> None:
@@ -1897,8 +1437,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         *,
         title: str,
     ) -> None:
-        if self._copy_timer.isActive():
-            return
+        self._cancel_copy()
+        generation = self._copy_generation
         try:
             self._copy_chunks = iter(
                 WorkspaceResultPresenter.iter_blocks_tsv_chunks(
@@ -1907,8 +1447,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
             self._copy_output = io.StringIO()
             self._copy_title = str(title)
+            self._active_copy_generation = generation
             self._copy_timer.start()
         except Exception as exc:
+            if generation == self._copy_generation:
+                self._active_copy_generation = None
+                self._copy_chunks = None
+                self._copy_output = None
             QtWidgets.QMessageBox.critical(
                 self,
                 str(title),
@@ -1917,9 +1462,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _continue_copy(self) -> None:
+        generation = self._active_copy_generation
         chunks = self._copy_chunks
         output = self._copy_output
-        if chunks is None or output is None:
+        if (
+            generation is None
+            or generation != self._copy_generation
+            or chunks is None
+            or output is None
+        ):
             self._copy_timer.stop()
             return
         try:
@@ -1929,11 +1480,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             text = output.getvalue()
             self._copy_chunks = None
             self._copy_output = None
-            QtWidgets.QApplication.clipboard().setText(text)
+            self._active_copy_generation = None
+            if generation == self._copy_generation:
+                QtWidgets.QApplication.clipboard().setText(text)
         except Exception as exc:
             self._copy_timer.stop()
             self._copy_chunks = None
             self._copy_output = None
+            self._active_copy_generation = None
+            if generation != self._copy_generation:
+                return
             QtWidgets.QMessageBox.critical(
                 self,
                 self._copy_title,

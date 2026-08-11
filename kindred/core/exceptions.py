@@ -268,6 +268,8 @@ def create_solver_error(
     solver_name: str,
     t_current: float,
     message: str,
+    *,
+    candidate_domain_eligible: bool = False,
 ) -> SolverError:
     """
     Factory for ODE solver errors.
@@ -280,11 +282,20 @@ def create_solver_error(
         Time at which error occurred
     message : str
         Error message from solver
+    candidate_domain_eligible : bool, optional
+        Whether this failure is a proven numerical candidate-domain failure.
 
     Returns
     -------
     SolverError
     """
+    details: Dict[str, Any] = {
+        "solver": solver_name,
+        "time": t_current,
+        "solver_message": message,
+    }
+    if candidate_domain_eligible is True:
+        details["candidate_domain_eligible"] = True
     return SolverError(
         f"Solver '{solver_name}' failed at t={t_current:.4e}",
         suggestion="Try reducing tolerances (rtol, atol) or using a different solver method",
@@ -292,9 +303,5 @@ def create_solver_error(
             "solver='Radau' (implicit, good for stiff systems)",
             "solver='BDF' (implicit, multistep)",
         ],
-        details={
-            "solver": solver_name,
-            "time": t_current,
-            "solver_message": message,
-        },
+        details=details,
     )

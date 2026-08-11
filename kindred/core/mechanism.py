@@ -463,14 +463,6 @@ class Mechanism:
     def _sync_metadata_order(self) -> None:
         self.metadata["declaration_order"] = self.species_names()
 
-    def _append_step_index_map_entry(self, entry: Mapping[str, Any]) -> None:
-        raw_mapping = self.metadata.get("step_index_map")
-        step_index_map = raw_mapping if isinstance(raw_mapping, list) else []
-        step_index = len(step_index_map) + 1
-        mapped_entry = {"step_index": int(step_index), **dict(entry)}
-        step_index_map.append(mapped_entry)
-        self.metadata["step_index_map"] = step_index_map
-
     # ---------- step additions ----------
 
     def add_reaction(
@@ -481,7 +473,6 @@ class Mechanism:
         rate: Any,
         rate_orders: Optional[Mapping[str, float]] = None,
         overrides: Optional[Mapping[str, Any]] = None,
-        record_step_index: bool = True,
     ) -> Reaction:
         """
         Add a reaction step.
@@ -502,13 +493,6 @@ class Mechanism:
         ov = _normalize_overrides(overrides)
         rxn = Reaction(reactants=r, products=p, rate=rate, rate_orders=ro, overrides=ov)
         self.reactions.append(rxn)
-        if bool(record_step_index):
-            self._append_step_index_map_entry(
-                {
-                    "kind": "reaction",
-                    "reaction_index": len(self.reactions) - 1,
-                }
-            )
         return rxn
 
     def _add_equilibrium_with_authority_context(
@@ -521,7 +505,6 @@ class Mechanism:
         kr: Any | None = None,
         fast: bool = False,
         metadata: Optional[Mapping[str, Any]] = None,
-        record_step_index: bool = True,
         authority_context: EquilibriumRateInputContext | str | None = None,
     ) -> Equilibrium:
         sf = _validate_positive_side(stoich_forward, label="stoich_forward")
@@ -619,11 +602,4 @@ class Mechanism:
             metadata=meta,
         )
         self.equilibria.append(eq)
-        if bool(record_step_index):
-            entry: Dict[str, object] = {
-                "kind": "equilibrium",
-                "equilibrium_index": len(self.equilibria) - 1,
-            }
-            entry.update(authority.step_map_fields())
-            self._append_step_index_map_entry(entry)
         return eq

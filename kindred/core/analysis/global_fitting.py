@@ -16,11 +16,9 @@ from kindred.core.analysis.dataset_parameter_overrides import (
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.exceptions import (
-    FitSimulationError,
     FittingCancelled,
     SimulationCancelled,
 )
-from kindred.core import fitting_completion as _fitting_completion
 from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.objective import ObjectiveContext
 from kindred.core.simulation_failure import build_simulation_failure
@@ -147,39 +145,6 @@ def fit_global(
     penalty_value = 1e6
     objective_total_points = int(sum(item.point_count for item in payloads))
     context = ObjectiveContext()
-    objective: Optional[_fit_execution.GlobalFitObjective] = None
-    optimizer_completed = False
-    de_optimizer_nfev: Optional[int] = None
-
-    def failed_result(
-        message: str,
-        *,
-        diagnostic: Optional[_fitting_completion.FitDiagnostic] = None,
-    ) -> _fit_execution.GlobalFitResult:
-        chosen = _fit_execution.ensure_failure_diagnostic(
-            diagnostic,
-            message=str(message or "Global fit failed before replay completed."),
-        )
-        return _fit_execution.GlobalFitResult(
-            shared_params=dict(shared_params),
-            dataset_params={item.dataset_id: {} for item in payloads},
-            weighted_residual_sse=np.inf,
-            weighted_residual_mse=np.inf,
-            dataset_info=[],
-            nfev=(
-                de_optimizer_nfev
-                if de_optimizer_nfev is not None
-                else int(getattr(objective, "_objective_calls", 0))
-            ),
-            message=str(message),
-            completion=_fitting_completion.GlobalFitCompletion(
-                status="fail",
-                optimizer_converged=False,
-                nonfinite_metrics=False,
-                optimizer_diagnostic=chosen,
-                dataset_failures={},
-            ),
-        )
 
     try:
         objective = _fit_execution.GlobalFitObjective(
@@ -212,12 +177,9 @@ def fit_global(
             cancellation_check=cancellation_check,
             de_penalty=de_penalty,
         )
-        if method == "differential_evolution":
-            de_optimizer_nfev = int(optimizer_result.nfev)
-        optimizer_completed = True
         success = bool(optimizer_result.success)
         message = str(optimizer_result.message)
-        diagnostic: Optional[_fitting_completion.FitDiagnostic] = None
+        diagnostic = None
         identifiability = str(
             optimizer_result.identifiability_warning or ""
         ).strip()
@@ -242,12 +204,6 @@ def fit_global(
                 phase="optimizer",
                 dataset_id=dataset_id,
             )
-        if (
-            not success
-            and str(optimizer_result.parameter_space) == "physical"
-        ):
-            return failed_result(message, diagnostic=diagnostic)
-
         keys = layout.opt_param_keys()
         vector = np.asarray(
             [optimizer_result.parameters[key] for key in keys],
@@ -276,7 +232,6 @@ def fit_global(
             fixed_dataset_params=fixed_dataset_params,
             combined_dataset_params=combined_dataset_params,
             weights=weights_norm,
-            penalty_value=penalty_value,
             cancellation_check=cancellation_check,
             cancellation_control=cancellation_control,
             success=success,
@@ -290,24 +245,5 @@ def fit_global(
         )
     except FittingCancelled:
         raise
-    except FitSimulationError as exc:
-        if optimizer_completed:
-            raise
-        logger.error("Global fitting failed: %s", exc, exc_info=False)
-        return failed_result(
-            str(exc),
-            diagnostic=_fit_execution.build_fit_diagnostic_from_exception(
-                exc,
-                phase="fatal",
-            ),
-        )
-    except Exception as exc:
-        if isinstance(exc, (FittingCancelled, SimulationCancelled)):
-            raise FittingCancelled() from exc
-        if optimizer_completed:
-            raise
-        logger.error("Global fitting failed: %s", exc, exc_info=True)
-        return failed_result(
-            f"Fitting failed: {exc}",
-            diagnostic=_fit_execution.build_fit_diagnostic_from_exception(exc, phase="fatal"),
-        )
+    except SimulationCancelled as exc:
+        raise FittingCancelled() from exc

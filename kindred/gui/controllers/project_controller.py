@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -185,20 +185,23 @@ class ProjectController(QtCore.QObject):
         for method_name in (
             "cancel_and_wait_for_project_replacement",
             "cancel_for_application_close",
-            "owned_qthreads",
         ):
             if not callable(getattr(xlsx_exports, method_name, None)):
                 raise TypeError(
                     f"xlsx_exports must provide {method_name}()."
                 )
-        xlsx_threads_changed = getattr(
+        xlsx_settlement_changed = getattr(
             xlsx_exports,
-            "owned_qthreads_changed",
+            "application_close_settlement_changed",
             None,
         )
-        if not callable(getattr(xlsx_threads_changed, "connect", None)):
+        if not callable(getattr(xlsx_settlement_changed, "connect", None)):
             raise TypeError(
-                "xlsx_exports must provide owned_qthreads_changed."
+                "xlsx_exports must provide application_close_settlement_changed."
+            )
+        if type(getattr(xlsx_exports, "application_close_settled", None)) is not bool:
+            raise TypeError(
+                "xlsx_exports must provide boolean application_close_settled."
             )
         if not callable(set_status_text):
             raise TypeError("set_status_text must be callable.")
@@ -242,16 +245,16 @@ class ProjectController(QtCore.QObject):
         self._close_timer.setSingleShot(True)
         self._close_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._close_timer.timeout.connect(self._on_application_close_deadline)
-        self._simulation_jobs.owned_qthreads_changed.connect(
+        self._simulation_jobs.application_close_settlement_changed.connect(
             self.notify_close_progress
         )
-        self._dataset_imports.owned_qthreads_changed.connect(
+        self._dataset_imports.application_close_settlement_changed.connect(
             self.notify_close_progress
         )
-        self._fit_session.owned_qthreads_changed.connect(
+        self._fit_session.application_close_settlement_changed.connect(
             self.notify_close_progress
         )
-        self._xlsx_exports.owned_qthreads_changed.connect(
+        self._xlsx_exports.application_close_settlement_changed.connect(
             self.notify_close_progress
         )
 
@@ -1068,7 +1071,7 @@ class ProjectController(QtCore.QObject):
             disposition.content_token
         ):
             return False
-        if disposition.clean_idle and self._owned_qthreads_are_settled():
+        if disposition.clean_idle and self._async_owners_are_settled():
             try:
                 fit_idle_closed = bool(
                     self._fit_session.close_idle_for_application_close()
@@ -1150,7 +1153,7 @@ class ProjectController(QtCore.QObject):
         if time.monotonic() >= deadline:
             self._authorize_application_close(hard_exit=True)
             return
-        if self._owned_qthreads_are_settled():
+        if self._async_owners_are_settled():
             self._authorize_application_close(hard_exit=False)
 
     @QtCore.Slot()
@@ -1172,8 +1175,8 @@ class ProjectController(QtCore.QObject):
             return
         self._authorize_application_close(hard_exit=True)
 
-    def _owned_qthreads_are_settled(self) -> bool:
-        """Use owner-retained thread receipts, never native thread status."""
+    def _async_owners_are_settled(self) -> bool:
+        """Read each asynchronous owner's explicit Close settlement truth."""
 
         settled = True
         for owner_label, owner in (
@@ -1183,24 +1186,21 @@ class ProjectController(QtCore.QObject):
             ("XLSX export", self._xlsx_exports),
         ):
             try:
-                collection = owner.owned_qthreads()
-                if isinstance(collection, (str, bytes, bytearray, Mapping)):
-                    raise TypeError("owned-QThread collection has invalid type")
-                retained = tuple(collection)
+                owner_settled = owner.application_close_settled
             except Exception:
                 logger.exception(
-                    "%s owned-QThread collection could not be read during Close",
+                    "%s settlement could not be read during Close",
                     owner_label,
                 )
                 settled = False
                 continue
-            if any(not isinstance(thread, QtCore.QThread) for thread in retained):
+            if type(owner_settled) is not bool:
                 logger.error(
-                    "%s returned a malformed owned-QThread collection during Close",
+                    "%s returned malformed application Close settlement",
                     owner_label,
                 )
                 settled = False
-            elif retained:
+            elif not owner_settled:
                 settled = False
         return settled
 

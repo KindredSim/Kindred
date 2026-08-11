@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
@@ -127,30 +126,6 @@ def make_parameter_expression_context(
     return SymbolicParameterExpressionContext(
         canonical_identifiers=tuple(str(name) for name in canonical_identifiers),
     )
-
-
-def make_parameter_namespace_context(spec: ParameterAlgebraSpec) -> SymbolicParameterNamespaceContext:
-    return SymbolicParameterNamespaceContext.from_spec(spec)
-
-
-def make_product_identity_proof_context(
-    *,
-    target_factors: Mapping[str, int],
-    spec: ParameterAlgebraSpec,
-) -> SymbolicProductIdentityProofContext:
-    return SymbolicProductIdentityProofContext.from_spec(target_factors=target_factors, spec=spec)
-
-
-def reject_unsupported_parameter_symbol_source(source: str) -> None:
-    source_s = str(source or "").strip()
-    if not source_s:
-        raise UnsupportedSymbolicExpressionError("Empty symbolic expression is not supported.")
-    if "[" in source_s or "]" in source_s:
-        raise UnsupportedSymbolicExpressionError(
-            "State concentration symbols such as [A] or [A]_0 are not supported in parameter/proof context."
-        )
-    if re.search(r"\b(if|else|and|or|not)\b", source_s):
-        raise UnsupportedSymbolicExpressionError("Dynamic or logical expressions are not supported in symbolic proof.")
 
 
 def symbolic_status_payload(

@@ -376,14 +376,9 @@ class TemperatureSchedule:
                     if interval.contains(t):
                         return interval.temperature
 
-            # If t is beyond last interval, extrapolate with last temperature
+            # The final authored temperature defines the schedule's tail.
             last_interval = time_intervals[-1]
             if t >= last_interval.t_end:
-                logger.warning(
-                    f"Time t={t} exceeds piecewise schedule range "
-                    f"[{time_intervals[0].t_start}, {last_interval.t_end}]. "
-                    f"Using last temperature: {last_interval.temperature} K"
-                )
                 return last_interval.temperature
 
             # Should never reach here if validation is correct

@@ -60,12 +60,9 @@ _MECH_PARAM_RE = mechanism_parameter_name_pattern()
 _WEGSCHEIDER_META_KEY = "wegscheider_cyclicity_enabled"
 _PARAMETER_ALGEBRA_SPEC_META_KEY = "parameter_algebra_spec"
 
-def mechanism_parameter_names(mechanism: object) -> Set[str]:
-    return build_namespace_from_mechanism(mechanism).flat_names()
-
 
 def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[str]] = None) -> Dict[str, float]:
-    wanted = names or mechanism_parameter_names(mechanism)
+    wanted = names or build_namespace_from_mechanism(mechanism).flat_names()
     out: Dict[str, float] = {}
 
     def _as_float(x: object) -> Optional[float]:

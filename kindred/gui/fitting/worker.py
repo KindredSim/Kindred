@@ -472,6 +472,28 @@ class FitCandidate:
         expected_dataset_ids = {
             item.dataset_id
             for item in self.setup_snapshot.datasets
+            if item.included
+        }
+        scalar_dataset_ids = {
+            dataset_id
+            for dataset_id, _values in self.scalar_values_by_dataset
+        }
+        result_dataset_ids = set(self.result.dataset_params)
+        simulation_dataset_ids = set(
+            self.result.simulation_results_by_dataset
+        )
+        if (
+            scalar_dataset_ids != expected_dataset_ids
+            or result_dataset_ids != expected_dataset_ids
+            or simulation_dataset_ids != expected_dataset_ids
+        ):
+            raise ValueError(
+                "Fit candidate terminal rosters must exactly match the "
+                "included datasets."
+            )
+        expected_auto_dataset_ids = {
+            item.dataset_id
+            for item in self.setup_snapshot.datasets
             if (
                 item.included
                 and item.parametric is not None
@@ -481,7 +503,7 @@ class FitCandidate:
         if (
             any(not dataset_id for dataset_id in resolved_dataset_ids)
             or len(resolved_dataset_ids) != len(set(resolved_dataset_ids))
-            or set(resolved_dataset_ids) != expected_dataset_ids
+            or set(resolved_dataset_ids) != expected_auto_dataset_ids
             or any(
                 mode not in {"monotone", "time_guided"}
                 for _dataset_id, mode in resolved_auto_modes
@@ -1699,6 +1721,26 @@ def _compile_fit_run_identity_payload(
 ) -> dict[str, object]:
     """Build a compact identity; scientific arrays are represented by digests."""
 
+    included_ids = {item.dataset_id for item in included}
+    included_set_ids = {
+        mapped_by_id[dataset_id].set_id
+        for dataset_id in included_ids
+    }
+    included_initial_species = {
+        species
+        for dataset_id in included_ids
+        for species, _value in mapped_by_id[dataset_id].initial_values
+    }
+    if (
+        {item.dataset_id for item in datasets} != included_ids
+        or set(effective_local) != included_ids
+        or set(prepared_ids) != included_ids
+        or set(dict(resolved_modes))
+        - included_ids
+    ):
+        raise ValueError(
+            "Fit run identity inputs must exactly match the included datasets."
+        )
     dataset_payloads: list[dict[str, object]] = []
     for item in datasets:
         mapped = mapped_by_id[item.dataset_id]
@@ -1822,7 +1864,11 @@ def _compile_fit_run_identity_payload(
                 "maximum": _stamp_bound(item.selected_config.maximum),
                 "log10": item.selected_config.log10,
                 "scope": item.scope,
-                "dataset_values": dict(item.selected_config.dataset_values),
+                "dataset_values": {
+                    dataset_id: value
+                    for dataset_id, value in item.selected_config.dataset_values
+                    if dataset_id in included_ids
+                },
                 "family": item.family,
                 "role": item.role,
                 "unit": item.unit,
@@ -1841,6 +1887,7 @@ def _compile_fit_run_identity_payload(
                 "scope": "local",
             }
             for item in request.initials
+            if item.set_id in included_set_ids
         ],
         "global_initials": [
             {
@@ -1853,6 +1900,7 @@ def _compile_fit_run_identity_payload(
                 "scope": dict(request.initial_scopes).get(item.species),
             }
             for item in request.global_initials
+            if item.species in included_initial_species
         ],
         "settings": {
             "method": request.defaults.method,
@@ -1872,6 +1920,7 @@ def _compile_fit_run_identity_payload(
         "prepared_identities": {
             dataset_id: {"sha256": _metadata_digest(metadata)}
             for dataset_id, metadata in sorted(prepared_ids.items())
+            if dataset_id in included_ids
         },
         "resolved_auto_modes": dict(resolved_modes),
     }
@@ -1912,6 +1961,15 @@ def _assemble_fit_terminal(
             "Fit terminal effective weights do not exactly match the "
             "included datasets."
         )
+    included_id_set = set(included_ids)
+    if set(result.dataset_params) != included_id_set:
+        raise ValueError(
+            "Fit terminal parameter results do not exactly match the included datasets."
+        )
+    if set(evaluators) != included_id_set or set(prepared_ids) != included_id_set:
+        raise ValueError(
+            "Fit terminal prepared identities do not exactly match the included datasets."
+        )
     solver_provenance_by_dataset = {
         str(dataset_id or "").strip(): simulation.provenance.solver
         for dataset_id, simulation in result.simulation_results_by_dataset.items()
@@ -1937,6 +1995,7 @@ def _assemble_fit_terminal(
             ),
         )
         for dataset_id, values in sorted(result.dataset_params.items())
+        if dataset_id in included_id_set
     )
     initial_values_by_set = _initial_values_from_result(request, result)
     terminal_snapshot = _terminal_setup_snapshot(
@@ -1947,12 +2006,15 @@ def _assemble_fit_terminal(
         initial_values_by_set=initial_values_by_set,
     )
     for dataset_id, evaluator in evaluators.items():
+        if dataset_id not in included_id_set:
+            continue
         prepared_ids[dataset_id]["prepared_simulation"] = (
             evaluator.prepared_metadata.to_serializable_dict()
         )
     run_identity_payload["prepared_identities"] = {
         dataset_id: {"sha256": _metadata_digest(metadata)}
         for dataset_id, metadata in sorted(prepared_ids.items())
+        if dataset_id in included_id_set
     }
     run_identity_payload["terminal"] = {
         "fit_solver": request.solver,
@@ -1984,6 +2046,7 @@ def _assemble_fit_terminal(
                 for name, value in sorted(values.items())
             }
             for dataset_id, values in sorted(result.dataset_params.items())
+            if dataset_id in included_id_set
         },
         "result_array_identity": _result_array_identity(result),
         "simulation_result_array_identity": (
@@ -2599,10 +2662,6 @@ class GlobalFitWorker(QtCore.QThread):
         )
         if self._checkpoint():
             raise FittingCancelled()
-        if result.completion.status == "fail":
-            message = result.message or "Fit did not produce a candidate."
-            raise RuntimeError(message)
-
         if self._checkpoint():
             raise FittingCancelled()
         candidate = _assemble_fit_terminal(

@@ -80,6 +80,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_identity: FitRunIdentity | None = None
         self._executing = False
         self._setup_projecting = False
+        self._candidate_has_per_dataset_values = False
 
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
@@ -230,7 +231,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._copy_run_json.clicked.connect(self._copy_run_identity_json)
         actions.addWidget(self._copy_run_json)
 
-        self._apply_parameters = QtWidgets.QCheckBox("Parameters", footer)
+        self._apply_parameters = QtWidgets.QCheckBox("Shared Parameters", footer)
         self._apply_initials = QtWidgets.QCheckBox(
             "Initial Conditions", footer
         )
@@ -548,10 +549,17 @@ class FittingWindow(QtWidgets.QDialog):
 
     @property
     def has_invalid_setup_edits(self) -> bool:
+        setup = self._projected_setup
+        data_tab_errors = (
+            ()
+            if setup is None
+            else self._data_tab.active_validation_errors(
+                self._included_dataset_ids(setup)
+            )
+        )
         return bool(
             self._invalid_setup_edits
-            or self._data_tab.invalid_editor_keys
-            or self._data_range_validation_errors()
+            or data_tab_errors
             or self._species_table.invalid_editor_keys
             or self._species_table.has_pending_initial_changes
             or self._params_ics_tab.has_invalid_edits
@@ -622,26 +630,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_block_reason_label.setVisible(bool(reason))
         self._run_block_reason_label.setText(reason)
         self._refresh_apply_button()
-
-    def _data_range_validation_errors(self) -> tuple[str, ...]:
-        pending_by_dataset = getattr(
-            self._data_tab,
-            "_pending",
-            {},
-        )
-        if not isinstance(pending_by_dataset, Mapping):
-            return ()
-        return tuple(
-            error
-            for dataset_id, config in pending_by_dataset.items()
-            for error in (
-                self._data_tab.data_range_validation_error(
-                    dataset_id=str(dataset_id),
-                    config=dict(config),
-                ),
-            )
-            if error
-        )
 
     def _populate_dataset_list(self, snapshot: FitSetupSnapshot) -> None:
         by_id = {item.dataset_id: item for item in self._origin.mapped_datasets}
@@ -1092,6 +1080,10 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> bool:
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be FitCandidate.")
+        self._candidate_has_per_dataset_values = any(
+            bool(values)
+            for _dataset_id, values in candidate.scalar_values_by_dataset
+        )
         available = frozenset(str(scope) for scope in available_scopes)
         reasons = {
             str(scope): str(reason or "") for scope, reason in unavailable_reasons.items()
@@ -1122,6 +1114,10 @@ class FittingWindow(QtWidgets.QDialog):
 
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be FitCandidate.")
+        self._candidate_has_per_dataset_values = any(
+            bool(values)
+            for _dataset_id, values in candidate.scalar_values_by_dataset
+        )
         available = frozenset(str(scope) for scope in available_scopes)
         reasons = {
             str(scope): str(reason or "")
@@ -1145,6 +1141,7 @@ class FittingWindow(QtWidgets.QDialog):
         # Clear actionable Copy/view authority first.  A physical plot teardown
         # is fallible and must never leave stale controls enabled.
         self._run_identity = None
+        self._candidate_has_per_dataset_values = False
         self._clear_resolved_auto_modes()
         for checkbox, _scope in self._apply_controls():
             checkbox.setChecked(False)
@@ -1171,7 +1168,18 @@ class FittingWindow(QtWidgets.QDialog):
         for checkbox, scope in self._apply_controls():
             checkbox.setEnabled(scope in available)
             checkbox.setChecked(scope in available)
-            checkbox.setToolTip(reasons.get(scope, ""))
+            tooltip = reasons.get(scope, "")
+            if (
+                scope == "parameters"
+                and scope in available
+                and self._candidate_has_per_dataset_values
+            ):
+                tooltip = (
+                    "Applies shared project parameter values only; "
+                    "per-dataset values stay Fit-local and are not applied "
+                    "to Run."
+                )
+            checkbox.setToolTip(tooltip)
         self._refresh_apply_button()
         self._run_results_tab.set_apply_availability(available, reasons)
 

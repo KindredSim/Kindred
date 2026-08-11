@@ -469,7 +469,8 @@ def build_ode_rhs_from_mechanism(
             out.fill(0.0)
             if np.any(np.isnan(log_f)) or np.any(np.isnan(log_r)):
                 raise SolverError(
-                    "Reversible rate logarithm is non-finite at the solver state."
+                    "Reversible rate logarithm is non-finite at the solver state.",
+                    details={"candidate_domain_eligible": True},
                 )
             max_lr = np.maximum(log_f, log_r)
             min_lr = np.minimum(log_f, log_r)
@@ -477,7 +478,8 @@ def build_ode_rhs_from_mechanism(
             unrepresentable = ~finite_max & (max_lr > 0.0)
             if np.any(unrepresentable):
                 raise SolverError(
-                    "Reversible rate difference is non-finite at the solver state."
+                    "Reversible rate difference is non-finite at the solver state.",
+                    details={"candidate_domain_eligible": True},
                 )
             if not np.any(finite_max):
                 # Both rates are exactly zero in log space (-inf - -inf).
@@ -489,7 +491,8 @@ def build_ode_rhs_from_mechanism(
             mag = np.exp(log_mag)
             if np.any(~np.isfinite(mag)):
                 raise SolverError(
-                    "Reversible rate difference is non-finite at the solver state."
+                    "Reversible rate difference is non-finite at the solver state.",
+                    details={"candidate_domain_eligible": True},
                 )
             sign = np.where(log_f[indices] >= log_r[indices], 1.0, -1.0)
             out[indices] = sign * mag

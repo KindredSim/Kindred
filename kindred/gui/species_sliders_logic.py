@@ -12,20 +12,9 @@ import sys
 from kindred.core.validation import try_parse_nonneg_finite_float
 
 __all__ = [
-    "try_nonneg_finite",
     "sanitize_nonneg_finite",
     "compute_slider_max_option_c",
 ]
-
-
-def try_nonneg_finite(value: object) -> tuple[float, bool]:
-    """
-    Parse a non-negative finite float with an explicit validity flag.
-
-    Returns (value, ok). When ok is False, value is 0.0 and callers can decide
-    whether to log, surface UI feedback, or block downstream actions.
-    """
-    return try_parse_nonneg_finite_float(value)
 
 
 def sanitize_nonneg_finite(value: object) -> float:
@@ -33,9 +22,10 @@ def sanitize_nonneg_finite(value: object) -> float:
     Convert `value` to a non-negative finite float.
 
     Any non-finite / non-numeric / negative value is treated as 0.0.
-    For callers that need to distinguish invalid inputs, use `try_nonneg_finite`.
+    For callers that need to distinguish invalid inputs, use
+    `try_parse_nonneg_finite_float` directly.
     """
-    v, ok = try_nonneg_finite(value)
+    v, ok = try_parse_nonneg_finite_float(value)
     return float(v) if ok else 0.0
 
 

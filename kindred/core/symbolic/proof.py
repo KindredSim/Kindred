@@ -8,7 +8,7 @@ from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, 
 from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
 from .identity import symbolic_fingerprint
-from .namespaces import SymbolicProductIdentityProofContext, make_product_identity_proof_context
+from .namespaces import SymbolicProductIdentityProofContext
 from .parameter_expression import translate_parameter_expression
 
 
@@ -16,17 +16,6 @@ from .parameter_expression import translate_parameter_expression
 class SymbolicProofResult:
     proven: bool
     fingerprint: str
-
-
-def _assignment_sources(assignments: Mapping[str, ParameterAssignment]) -> dict[str, dict[str, object]]:
-    return {
-        str(name): {
-            "expr_src": str(assignment.expr_src),
-            "line_number": int(getattr(assignment, "line_number", 0) or 0),
-            "line_content": str(getattr(assignment, "line_content", "") or ""),
-        }
-        for name, assignment in sorted(assignments.items())
-    }
 
 
 def prove_product_identity(
@@ -39,7 +28,10 @@ def prove_product_identity(
     if proof_context is None:
         if spec is None:
             raise UnsupportedSymbolicExpressionError("Symbolic proof requires a proof context.")
-        proof_context = make_product_identity_proof_context(target_factors=target_factors, spec=spec)
+        proof_context = SymbolicProductIdentityProofContext.from_spec(
+            target_factors=target_factors,
+            spec=spec,
+        )
     sympy = require_sympy()
     metadata = get_symbolic_backend_metadata()
     assignments = dict(proof_context.assignments)
@@ -87,9 +79,8 @@ def prove_product_identity(
         fingerprint = symbolic_fingerprint(
             {
                 "candidate": str(candidate.name),
-                "expr_src": str(candidate.expr_src),
                 "target_factors": dict(sorted(target_factors.items())),
-                "assignment_sources": _assignment_sources(assignments),
+                "assignment_fingerprints": dict(sorted(translation_fingerprints.items())),
                 "backend": metadata.to_payload(),
                 "reason": "unsupported",
                 "symbol_context": proof_context_payload,
@@ -112,7 +103,7 @@ def prove_product_identity(
                 "candidate": candidate_name,
                 "expr_fingerprint": translated.fingerprint,
                 "target_factors": dict(sorted((str(k), int(v)) for k, v in target_factors.items())),
-                "assignment_sources": _assignment_sources(assignments),
+                "assignment_fingerprints": dict(sorted(translation_fingerprints.items())),
                 "backend": metadata.to_payload(),
                 "reason": "unsupported",
                 "symbol_context": proof_context_payload,

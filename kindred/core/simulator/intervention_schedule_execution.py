@@ -1645,29 +1645,28 @@ def _trigger_callables(
         )
         for direction in directions:
             # Initial equality is neutral: it is neither side of a crossing.
-            # Keep this directional event inert until one strict side has
-            # actually been occupied.  The neutral sign is chosen so that
-            # the first departure can only look like the opposite direction,
-            # which SciPy ignores.  ``either`` is represented by one rising
-            # and one falling event so both genuine later crossings remain
-            # observable without perturbing the accepted initial state.
-            strict_side_occupied = [not starts_at_threshold]
+            # At the immutable segment start, report the target side's sign so
+            # the first departure can only be neutral or look like the
+            # opposite direction, which SciPy ignores.  Every later evaluation
+            # is the pure threshold function, so analytic-Jacobian retry and a
+            # fresh solve observe identical event semantics.  ``either`` uses
+            # one rising and one falling event so genuine later crossings in
+            # both directions remain observable.
             neutral_value = 1.0 if direction == "rising" else -1.0
 
             def event(
-                _time: float,
+                time: float,
                 state: np.ndarray,
                 *,
                 _species: int = species,
                 _threshold: float = threshold,
-                _strict_side_occupied: list[bool] = strict_side_occupied,
+                _segment_start: float = float(segment_start),
+                _starts_at_threshold: bool = starts_at_threshold,
                 _neutral_value: float = neutral_value,
             ) -> float:
                 value = float(state[_species]) - _threshold
-                if not _strict_side_occupied[0]:
-                    if value == 0.0:
-                        return _neutral_value
-                    _strict_side_occupied[0] = True
+                if _starts_at_threshold and float(time) == _segment_start:
+                    return _neutral_value
                 return value
 
             event.terminal = True  # type: ignore[attr-defined]
@@ -1939,7 +1938,10 @@ def _ensure_finite_nonnegative(
     array = np.asarray(values, dtype=float)
     if not np.all(np.isfinite(array)):
         raise create_solver_error(
-            solver, time, f"{context} contains non-finite concentration values."
+            solver,
+            time,
+            f"{context} contains non-finite concentration values.",
+            candidate_domain_eligible=True,
         )
     if np.any(array < 0.0):
         raise create_solver_error(

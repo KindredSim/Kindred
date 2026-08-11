@@ -1175,7 +1175,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 selected_targets=self._selected_targets(destination),
             )
             for destination in setup.datasets
-            if destination.included and destination.dataset_id != source.dataset_id
+            if destination.dataset_id != source.dataset_id
         )
         copied_selections, copied, skipped = copy_target_selection(
             source_selection,

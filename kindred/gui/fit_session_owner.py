@@ -29,6 +29,7 @@ from kindred.core.simulator.dsl_parse import (
 )
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.fitting.launch import (
+    FitDatasetLocalSettings,
     FitDatasetSetupEdit,
     FitDatasetWeightModeSetupEdit,
     FitDefaultsSetupEdit,
@@ -49,6 +50,7 @@ from kindred.gui.fitting.launch import (
     fit_local_observable_definitions,
     fit_origin_science_matches,
     revalidate_fit_request_inclusions,
+    selected_observations,
 )
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.fitting.worker import (
@@ -99,7 +101,7 @@ class FitSessionOwner(QtCore.QObject):
     canonical_applied = QtCore.Signal(str, object)
     status_changed = QtCore.Signal(str)
     detailed_balance_correction_requested = QtCore.Signal(object)
-    owned_qthreads_changed = QtCore.Signal()
+    application_close_settlement_changed = QtCore.Signal()
 
     def __init__(
         self,
@@ -159,18 +161,39 @@ class FitSessionOwner(QtCore.QObject):
         self._publication_fenced_generation: int | None = None
         self._closing = False
         self._application_close_fenced = False
+        self._application_close_settlement_pending = False
 
     @property
     def project_defaults(self) -> FitDefaults:
         return self._session.document.fit_defaults
 
-    def owned_qthreads(self) -> tuple[QtCore.QThread, ...]:
-        """Return the exact native Fit threads still retained by this owner."""
+    @property
+    def fit_active(self) -> bool:
+        """Return semantic Fit execution activity without exposing QThreads."""
 
-        worker = self._worker
-        if worker is None:
-            return ()
-        return (worker,)
+        return self._worker is not None
+
+    @property
+    def application_close_settled(self) -> bool:
+        """Return whether Close-facing Fit cleanup is fully owner-settled."""
+
+        return bool(
+            self._worker is None
+            and (
+                not (self._application_close_fenced or self._closing)
+                or self._window is None
+            )
+        )
+
+    def _notify_application_close_settled(self) -> None:
+        """Publish only the transition reached after complete owner cleanup."""
+
+        if (
+            self._application_close_settlement_pending
+            and self.application_close_settled
+        ):
+            self._application_close_settlement_pending = False
+            self.application_close_settlement_changed.emit()
 
     def open_or_focus(self, tab_id: str | None = None) -> FittingWindow | None:
         """Open one modal origin window, or focus the existing singleton."""
@@ -365,6 +388,7 @@ class FitSessionOwner(QtCore.QObject):
                 signal.connect(callback)
                 connected_signals.append((signal, callback))
             self._worker = worker
+            self._application_close_settlement_pending = True
             start_attempted = True
             worker.start()
         except Exception as exc:
@@ -391,6 +415,7 @@ class FitSessionOwner(QtCore.QObject):
                 self._publication_fenced_generation = generation
                 self._gate.release(self)
                 worker.deleteLater()
+                self._notify_application_close_settled()
                 window.set_executing(False)
                 self._set_status(
                     f"Fit dispatch failed before QThread start: {exc}"
@@ -414,7 +439,6 @@ class FitSessionOwner(QtCore.QObject):
                     window=window,
                 )
                 custody_state = "unknown"
-            self.owned_qthreads_changed.emit()
             self.execution_changed.emit(True)
             self._set_status(
                 "Fit QThread start raised; native state is "
@@ -427,7 +451,6 @@ class FitSessionOwner(QtCore.QObject):
             request=request,
             window=window,
         )
-        self.owned_qthreads_changed.emit()
         self.execution_changed.emit(True)
         self._set_status("Fit started.")
         return True
@@ -724,9 +747,11 @@ class FitSessionOwner(QtCore.QObject):
         self,
         setup: FitSetupSnapshot,
         observables: tuple[FitLocalObservable, ...],
+        *,
+        origin: FitOriginSnapshot | None = None,
     ) -> FitSetupSnapshot:
-        origin = self._origin
-        if origin is None:
+        base_origin = origin if origin is not None else self._origin
+        if base_origin is None:
             raise RuntimeError("Fit has no origin.")
         definitions = fit_local_observable_definitions(
             observables,
@@ -734,16 +759,16 @@ class FitSessionOwner(QtCore.QObject):
         )
         if definitions:
             exact_source, effective_prepared = derive_source_with_observables(
-                origin.mechanism_source.reactions_text,
-                origin.prepared_dsl,
+                base_origin.mechanism_source.reactions_text,
+                base_origin.prepared_dsl,
                 definitions,
             )
             effective_source = MechanismAuthoringSource.from_parts(
                 reactions_text=exact_source,
             )
         else:
-            effective_prepared = origin.prepared_dsl
-            effective_source = origin.mechanism_source
+            effective_prepared = base_origin.prepared_dsl
+            effective_source = base_origin.mechanism_source
         return replace(
             setup,
             mechanism_source=effective_source,
@@ -1378,9 +1403,14 @@ class FitSessionOwner(QtCore.QObject):
             current = self._local_setup_snapshot
             if current is None:
                 return False
+            retained = self._reset_snapshot_against_current_origin(
+                snapshot,
+                origin,
+            )
             restored_snapshot = self._parameters_reset_snapshot(
                 current=current,
-                retained=snapshot,
+                retained=retained,
+                origin=origin,
             )
             self._params_reset_projection()
             window.clear_candidate()
@@ -1404,13 +1434,40 @@ class FitSessionOwner(QtCore.QObject):
         if window is not None:
             window.clear_parameters_pending_edits()
 
-    @staticmethod
+    def _reset_snapshot_against_current_origin(
+        self,
+        snapshot: FitSetupSnapshot,
+        origin: FitOriginSnapshot,
+    ) -> FitSetupSnapshot:
+        """Rebase retained values onto canonical science without old promotions."""
+
+        canonical_observable_names = set(
+            origin.prepared_dsl.analysis.observable_names
+        )
+        promoted = tuple(
+            item
+            for item in snapshot.local_observables
+            if item.name in canonical_observable_names
+        )
+        retained = self._without_promoted_local_observables(
+            snapshot,
+            promoted,
+        )
+        return self._rebase_setup_after_apply(
+            retained,
+            origin,
+            frozenset(),
+            retained.local_observables,
+        )
+
     def _parameters_reset_snapshot(
+        self,
         *,
         current: FitSetupSnapshot,
         retained: FitSetupSnapshot,
+        origin: FitOriginSnapshot,
     ) -> FitSetupSnapshot:
-        """Overlay retained Parameters values onto current Data/Targets rows."""
+        """Restore setup values while retaining only executable target routes."""
 
         current_by_dataset = {
             item.dataset_id: item for item in current.datasets
@@ -1421,11 +1478,22 @@ class FitSessionOwner(QtCore.QObject):
             raise ValueError(
                 "Fit reset changed the stable dataset identities."
             )
-        datasets = tuple(
-            replace(
+        datasets = []
+        for retained_dataset in retained.datasets:
+            current_dataset = current_by_dataset[retained_dataset.dataset_id]
+            retain_current_route = self._dataset_target_route_is_executable(
+                origin=origin,
+                setup=retained,
+                dataset=current_dataset,
+            )
+            route_owner = (
+                current_dataset
+                if retain_current_route
+                else retained_dataset
+            )
+            restored_dataset = replace(
                 retained_dataset,
-                # Parameters reset must not overwrite a separately accepted
-                # dataset-local simulation start.
+                # These fields are authored by Data and survive Parameters Reset.
                 t_start=current_dataset.t_start,
                 included=current_dataset.included,
                 data_range_min=current_dataset.data_range_min,
@@ -1433,23 +1501,65 @@ class FitSessionOwner(QtCore.QObject):
                 maximum_observations_per_target=(
                     current_dataset.maximum_observations_per_target
                 ),
-                weight=current_dataset.weight,
-                target_species=current_dataset.target_species,
-                target_weights=current_dataset.target_weights,
-                observation_targets=current_dataset.observation_targets,
-                parametric=current_dataset.parametric,
+                # Target/weight/mapping state survives only as one executable route.
+                weight=route_owner.weight,
+                target_species=route_owner.target_species,
+                target_weights=route_owner.target_weights,
+                observation_targets=route_owner.observation_targets,
+                parametric=route_owner.parametric,
             )
-            for retained_dataset in retained.datasets
-            for current_dataset in (
-                current_by_dataset[retained_dataset.dataset_id],
-            )
-        )
+            if not self._dataset_target_route_is_executable(
+                origin=origin,
+                setup=retained,
+                dataset=restored_dataset,
+            ):
+                raise ValueError(
+                    "Fit reset cannot restore an executable target/mapping "
+                    f"for dataset {retained_dataset.dataset_id!r}."
+                )
+            datasets.append(restored_dataset)
         return replace(
             retained,
-            datasets=datasets,
+            datasets=tuple(datasets),
             solver=current.solver,
             dataset_weight_mode=current.dataset_weight_mode,
         )
+
+    @staticmethod
+    def _dataset_target_route_is_executable(
+        *,
+        origin: FitOriginSnapshot,
+        setup: FitSetupSnapshot,
+        dataset: FitDatasetLocalSettings,
+    ) -> bool:
+        """Check one target/mapping route against canonical plus local science."""
+
+        try:
+            if not isinstance(dataset, FitDatasetLocalSettings):
+                return False
+            mapped = next(
+                item
+                for item in origin.mapped_datasets
+                if item.dataset_id == dataset.dataset_id
+            )
+            captured_by_raw_id = {
+                item.raw_observation_id: item
+                for item in mapped.observations
+            }
+            allowed_observables = set(
+                setup.prepared_dsl.analysis.observable_names
+            )
+            for raw_id, target in dataset.observation_targets:
+                captured = captured_by_raw_id.get(raw_id)
+                if captured is None or (
+                    target != captured.model_species
+                    and target not in allowed_observables
+                ):
+                    return False
+            selected = selected_observations(mapped, dataset)
+            return bool(selected or not dataset.included)
+        except (AttributeError, StopIteration, TypeError, ValueError, KeyError):
+            return False
 
     @QtCore.Slot(object)
     def apply_candidate(self, scopes: object) -> bool:
@@ -1500,6 +1610,10 @@ class FitSessionOwner(QtCore.QObject):
             local_scalar_names = self._candidate_local_scalar_names(
                 candidate
             )
+            terminal_parameter_by_name = {
+                item.name: item
+                for item in candidate.setup_snapshot.parameters
+            }
             applied_canonical_parameter_names = tuple(
                 sorted(
                     name
@@ -1507,6 +1621,8 @@ class FitSessionOwner(QtCore.QObject):
                     if (
                         "parameters" in selected
                         and name not in local_scalar_names
+                        and terminal_parameter_by_name.get(name) is not None
+                        and terminal_parameter_by_name[name].scope == "shared"
                     )
                 )
             )
@@ -1522,11 +1638,23 @@ class FitSessionOwner(QtCore.QObject):
                     )
                 )
             )
+            per_dataset_not_applied = tuple(
+                sorted(
+                    item.name
+                    for item in candidate.setup_snapshot.parameters
+                    if item.selected_config.fit and item.scope == "per_dataset"
+                )
+            )
             applied_scopes = self._candidate_applied_scopes | selected
             preserved = self._preserved_setup_with_terminal_values(
                 preserved,
                 candidate,
             )
+            if "observable_definitions" in selected:
+                preserved = self._without_promoted_local_observables(
+                    preserved,
+                    candidate.local_observables,
+                )
             current_tab = previous_document.tab(origin.tab_id)
             next_tab = self._build_applied_tab(
                 current_tab,
@@ -1542,12 +1670,23 @@ class FitSessionOwner(QtCore.QObject):
                 preserved,
                 rebased,
                 selected,
-                candidate.local_observables,
+                preserved.local_observables,
+            )
+            refreshed_initial_snapshot = self._reset_owner_snapshot_after_apply(
+                self._initial_setup_snapshot,
+                origin=rebased,
+                canonicalized_scopes=selected,
+                promoted=candidate.local_observables,
+            )
+            refreshed_last_fit_snapshot = self._reset_owner_snapshot_after_apply(
+                self._last_fit_setup_snapshot,
+                origin=rebased,
+                canonicalized_scopes=selected,
+                promoted=candidate.local_observables,
             )
             rebased_apply_context = replace(
                 candidate,
                 origin=rebased,
-                local_observables=refreshed_snapshot.local_observables,
                 setup_snapshot=refreshed_snapshot,
             )
             available_scopes, unavailable_reasons = (
@@ -1651,7 +1790,8 @@ class FitSessionOwner(QtCore.QObject):
         # installed together before any fallible result/view projection.
         self._local_request = None
         self._origin = rebased
-        self._rebase_owner_snapshots(rebased)
+        self._initial_setup_snapshot = refreshed_initial_snapshot
+        self._last_fit_setup_snapshot = refreshed_last_fit_snapshot
         self._local_setup_snapshot = refreshed_snapshot
         # Keep the complete terminal candidate as the sole Summary/Copy
         # carrier.  The rebased context above was call-local Apply state only.
@@ -1704,21 +1844,33 @@ class FitSessionOwner(QtCore.QObject):
                 "plot is unavailable."
             )
             return True
-        if unapplied_local_items:
-            names = ", ".join(unapplied_local_items)
-            canonical_message = (
-                "Canonical Parameter values applied: "
+        parameter_disposition: list[str] = []
+        if "parameters" in selected:
+            parameter_disposition.append(
+                "Shared canonical Parameter values applied: "
                 + ", ".join(applied_canonical_parameter_names)
                 + "."
-                if applied_canonical_parameter_names
-                else "Parameters had no canonical authority to publish."
             )
-            self._set_status(
-                canonical_message
-                + " Fit-local terminal scalars were not applied: "
-                + names
+            if per_dataset_not_applied:
+                parameter_disposition.append(
+                    "Per-dataset values remain Fit-local and were not "
+                    "applied to Run: "
+                    + ", ".join(per_dataset_not_applied)
+                    + "."
+                )
+        if unapplied_local_items:
+            parameter_disposition.append(
+                "Fit-local observable scalars were not applied through "
+                "Parameters: "
+                + ", ".join(unapplied_local_items)
                 + ". Apply Observable Definitions to publish them."
             )
+        if parameter_disposition:
+            if available_scopes:
+                parameter_disposition.append(
+                    "Remaining terminal Fit scopes are still available."
+                )
+            self._set_status(" ".join(parameter_disposition))
         elif available_scopes:
             self._set_status(
                 "Selected Fit scopes applied; remaining terminal Fit "
@@ -1782,6 +1934,7 @@ class FitSessionOwner(QtCore.QObject):
         self._discard_local()
         if self._window is None:
             self._closing = False
+            self._notify_application_close_settled()
             return True
         return self._destroy_window_after_cleanup()
 
@@ -1793,15 +1946,16 @@ class FitSessionOwner(QtCore.QObject):
             return
         self._application_close_fenced = True
         self._publication_fenced_generation = self._worker_generation
+        if not self.application_close_settled:
+            self._application_close_settlement_pending = True
 
     def cancel_for_application_close(self) -> None:
         """Dispose Fit state and close through the existing owner lifecycle."""
 
         self._require_thread()
-        if self._application_close_fenced:
-            return
         was_closing = self._closing
-        self.fence_application_close_admission()
+        if not self._application_close_fenced:
+            self.fence_application_close_admission()
         self._closing = True
         window = self._window
         worker = self._worker
@@ -1856,6 +2010,7 @@ class FitSessionOwner(QtCore.QObject):
 
         window = self._window
         if window is None:
+            self._notify_application_close_settled()
             return True
         window.force_close_after_cleanup()
         QtCore.QCoreApplication.sendPostedEvents(
@@ -1868,7 +2023,10 @@ class FitSessionOwner(QtCore.QObject):
                 window,
                 QtCore.QEvent.Type.DeferredDelete,
             )
-        return self._window is None
+        destroyed = self._window is None
+        if destroyed:
+            self._notify_application_close_settled()
+        return destroyed
 
     def _settle_worker_for_project_replacement(self, deadline: float) -> bool:
         worker = self._worker
@@ -1917,6 +2075,7 @@ class FitSessionOwner(QtCore.QObject):
         worker = self._worker
         self._closing = worker is not None
         self.window_changed.emit(False)
+        self._notify_application_close_settled()
         self._set_status("Fit closed; all transient Fit state was discarded.")
 
     def _on_progress(self, generation: int, value: int, text: str) -> None:
@@ -2090,9 +2249,8 @@ class FitSessionOwner(QtCore.QObject):
         if self._closing:
             if not self._application_close_fenced:
                 self._discard_local()
-            self._finish_worker(worker, notify_owned_qthreads=False)
+            self._finish_worker(worker)
             self._destroy_window_after_cleanup()
-            self.owned_qthreads_changed.emit()
             return
         self._finish_worker(worker)
         if not publication_allowed or candidate is None:
@@ -2151,8 +2309,6 @@ class FitSessionOwner(QtCore.QObject):
     def _finish_worker(
         self,
         expected: GlobalFitWorker | None = None,
-        *,
-        notify_owned_qthreads: bool = True,
     ) -> None:
         worker = self._worker
         if expected is not None and worker is not expected:
@@ -2169,8 +2325,7 @@ class FitSessionOwner(QtCore.QObject):
         self.execution_changed.emit(False)
         if worker is not None:
             worker.deleteLater()
-            if notify_owned_qthreads:
-                self.owned_qthreads_changed.emit()
+        self._notify_application_close_settled()
 
     @staticmethod
     def _verify_detailed_balance_resolved(
@@ -2316,6 +2471,41 @@ class FitSessionOwner(QtCore.QObject):
             )
         return frozenset(names)
 
+    @staticmethod
+    def _without_promoted_local_observables(
+        setup: FitSetupSnapshot,
+        promoted: Iterable[FitLocalObservable],
+    ) -> FitSetupSnapshot:
+        """Remove definitions and scalar rows that now belong to canonical DSL."""
+
+        promoted_items = tuple(promoted)
+        promoted_names = {item.name for item in promoted_items}
+        promoted_scalar_names = {
+            scalar_name
+            for item in promoted_items
+            for scalar_name in item.scalar_names
+        }
+        remaining_observables = tuple(
+            item
+            for item in setup.local_observables
+            if item.name not in promoted_names
+        )
+        remaining_scalar_names = {
+            scalar_name
+            for item in remaining_observables
+            for scalar_name in item.scalar_names
+        }
+        retired_scalar_names = promoted_scalar_names - remaining_scalar_names
+        return replace(
+            setup,
+            local_observables=remaining_observables,
+            parameters=tuple(
+                item
+                for item in setup.parameters
+                if item.name not in retired_scalar_names
+            ),
+        )
+
     def _preserved_setup_with_terminal_values(
         self,
         preserved: FitSetupSnapshot,
@@ -2397,7 +2587,7 @@ class FitSessionOwner(QtCore.QObject):
                 global_initials=global_initials,
                 initial_scopes=preserved.initial_scopes,
             ),
-            candidate.setup_snapshot.local_observables,
+            preserved.local_observables,
         )
 
     def _rebase_setup_after_apply(
@@ -2530,6 +2720,36 @@ class FitSessionOwner(QtCore.QObject):
         return self._setup_with_local_observables(
             rebased,
             local_observables,
+            origin=origin,
+        )
+
+    def _reset_owner_snapshot_after_apply(
+        self,
+        snapshot: FitSetupSnapshot | None,
+        *,
+        origin: FitOriginSnapshot,
+        canonicalized_scopes: frozenset[str],
+        promoted: tuple[FitLocalObservable, ...],
+    ) -> FitSetupSnapshot | None:
+        """Rebase one Reset owner while retiring newly canonical locals."""
+
+        if snapshot is None:
+            return None
+        retained = replace(
+            snapshot,
+            origin_tab_id=origin.tab_id,
+            origin_capture_id=origin.capture_id,
+        )
+        if "observable_definitions" in canonicalized_scopes:
+            retained = self._without_promoted_local_observables(
+                retained,
+                promoted,
+            )
+        return self._rebase_setup_after_apply(
+            retained,
+            origin,
+            canonicalized_scopes,
+            retained.local_observables,
         )
 
     def _candidate_apply_feasibility(
@@ -2541,17 +2761,33 @@ class FitSessionOwner(QtCore.QObject):
         """Decide terminal Apply feasibility once in the sole Fit owner."""
 
         local_scalar_names = self._candidate_local_scalar_names(candidate)
+        terminal_parameters = {
+            item.name: item
+            for item in candidate.setup_snapshot.parameters
+        }
         available: set[str] = set()
         unavailable: dict[str, str] = {}
         if any(
             name not in local_scalar_names
+            and terminal_parameters.get(name) is not None
+            and terminal_parameters[name].scope == "shared"
             for name, _value in candidate.parameters
         ):
             available.add("parameters")
         else:
+            has_per_dataset_values = any(
+                item.selected_config.fit and item.scope == "per_dataset"
+                for item in candidate.setup_snapshot.parameters
+            )
             unavailable["parameters"] = (
                 "Parameters Apply is unavailable because the candidate "
-                "contains no fitted project parameters."
+                "contains no fitted shared project parameters."
+                + (
+                    " Per-dataset values remain Fit-local and are not "
+                    "applied to Run."
+                    if has_per_dataset_values
+                    else ""
+                )
             )
         if candidate.initial_values_by_set:
             available.add("initial_concentrations")
@@ -2604,25 +2840,51 @@ class FitSessionOwner(QtCore.QObject):
                         f"Fit-local scalar {scalar_name!r} has no terminal "
                         "parameter row."
                     )
-                config = parameter.selected_config
-                terminal_value = config.value
-                if config.fit and parameter.scope == "per_dataset":
-                    values = {
-                        float(value)
-                        for _dataset_id, value in config.dataset_values
-                    }
-                    if len(values) != 1:
-                        raise ValueError(
-                            "Observable Definitions Apply cannot publish "
-                            f"per-dataset fitted scalar {scalar_name!r}: "
-                            "its terminal dataset values differ."
-                        )
-                    terminal_value = values.pop()
-                if not math.isfinite(float(terminal_value)):
-                    raise ValueError(
-                        f"Fit-local scalar {scalar_name!r} has a non-finite "
-                        "terminal value."
-                    )
+                cls._terminal_observable_scalar_value(candidate, parameter)
+
+    @staticmethod
+    def _terminal_observable_scalar_value(
+        candidate: FitCandidate,
+        parameter: FitParameterVariable,
+    ) -> float:
+        """Resolve one promotable scalar over the included terminal roster."""
+
+        config = parameter.selected_config
+        terminal_value = float(config.value)
+        if parameter.scope == "per_dataset":
+            included_ids = {
+                item.dataset_id
+                for item in candidate.setup_snapshot.datasets
+                if item.included
+            }
+            values_by_id = {
+                dataset_id: float(value)
+                for dataset_id, value in config.dataset_values
+            }
+            missing = included_ids - set(values_by_id)
+            if missing:
+                raise ValueError(
+                    "Observable Definitions Apply cannot publish per-dataset "
+                    f"scalar {parameter.name!r}: included terminal values "
+                    f"are missing for {', '.join(sorted(missing))}."
+                )
+            included_values = {
+                values_by_id[dataset_id]
+                for dataset_id in included_ids
+            }
+            if len(included_values) != 1:
+                raise ValueError(
+                    "Observable Definitions Apply cannot publish per-dataset "
+                    f"scalar {parameter.name!r}: its included terminal "
+                    "dataset values differ."
+                )
+            terminal_value = included_values.pop()
+        if not math.isfinite(terminal_value):
+            raise ValueError(
+                f"Fit-local scalar {parameter.name!r} has a non-finite "
+                "terminal value."
+            )
+        return terminal_value
 
     @classmethod
     def _build_applied_tab(
@@ -2641,9 +2903,22 @@ class FitSessionOwner(QtCore.QObject):
             and candidate.local_observables
         ):
             cls._validate_terminal_observable_definitions(candidate)
+            local_scalar_names = cls._candidate_local_scalar_names(candidate)
+            promoted_parameters = tuple(
+                _replace_fit_parameter(
+                    parameter,
+                    initial=cls._terminal_observable_scalar_value(
+                        candidate,
+                        parameter,
+                    ),
+                )
+                if parameter.name in local_scalar_names
+                else parameter
+                for parameter in candidate.setup_snapshot.parameters
+            )
             definitions = fit_local_observable_definitions(
                 candidate.local_observables,
-                candidate.setup_snapshot.parameters,
+                promoted_parameters,
             )
             derived_source, prepared = derive_source_with_observables(
                 next_tab.mechanism_source.reactions_text,
@@ -2694,6 +2969,7 @@ class FitSessionOwner(QtCore.QObject):
                 captured = expected.get(name)
                 if (
                     captured is None
+                    or captured.scope != "shared"
                     or coordinate.family != captured.family
                     or coordinate.role != captured.role
                     or not coordinate.writable

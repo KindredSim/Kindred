@@ -19,9 +19,8 @@ import numpy as np
 from kindred.core.exceptions import (
     FitSimulationError,
     FittingCancelled,
-    InitialConditionError,
+    KindredError,
     SimulationCancelled,
-    SolverError,
 )
 from kindred.core.algebra.errors import (
     AlgebraDomainError,
@@ -35,7 +34,6 @@ from kindred.core.runtime_defaults import (
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
 )
-from kindred.core.intervention_schedule import InterventionScheduleError
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     SimulationExecutionRequest,
@@ -84,14 +82,6 @@ FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET = "optimizer_dataset"
 FITTING_PARAM_ORIGIN_CONFIGURED_DATASET = "configured_dataset"
 FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR = "configured_evaluator"
 
-_OPTIMIZER_PARAMETER_ORIGINS = frozenset(
-    {
-        FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
-        FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
-    }
-)
-
-
 def _parameter_origin_for(name: str, origins: Optional[Mapping[str, str]]) -> str:
     origin = str((origins or {}).get(name, FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR) or "").strip()
     return origin or FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
@@ -122,18 +112,21 @@ def _coerce_consumed_parameter_value(
         f"Non-finite parameter value for {name!r}: {raw_value!r}",
         failed_params=dict(failed_params or {}) or None,
         details={
-            "fatal": origin not in _OPTIMIZER_PARAMETER_ORIGINS,
-            "candidate_domain": origin in _OPTIMIZER_PARAMETER_ORIGINS,
+            "fatal": True,
+            "candidate_domain": False,
             "parameter_origin": origin,
         },
     )
 
 
-def _optimizer_origin_names(origins: Mapping[str, str]) -> frozenset[str]:
-    return frozenset(
-        str(name)
-        for name, origin in origins.items()
-        if str(name).strip() and origin in _OPTIMIZER_PARAMETER_ORIGINS
+def _raw_candidate_domain_eligible(exc: BaseException) -> bool:
+    """Consume only the A1 typed numerical-runtime marker."""
+
+    details = getattr(exc, "details", None)
+    return bool(
+        isinstance(exc, KindredError)
+        and isinstance(details, Mapping)
+        and details.get("candidate_domain_eligible") is True
     )
 
 
@@ -721,8 +714,6 @@ class SerialFittingEvaluator:
                 failed_params=failed_params,
                 details={"fatal": True, "stage": "parameter_binding"},
             ) from exc
-        candidate_authority_present = bool(_optimizer_origin_names(origin_map))
-
         try:
             # Every candidate, including the first, receives a fresh isolated
             # request and one canonical preparation.  A rejected candidate can
@@ -735,16 +726,42 @@ class SerialFittingEvaluator:
                 cancellation_control=self._cancellation_control,
             )
         except SimulationPreparationError as exc:
-            candidate_domain = bool(exc.candidate_domain_eligible)
+            preparation_cause = exc.__cause__ or exc
+            if _raw_candidate_domain_eligible(preparation_cause):
+                raise _candidate_domain_error(
+                    preparation_cause,
+                    stage=exc.stage,
+                    failed_params=failed_params,
+                ) from exc
+            algebra_details = _strict_algebra_failure_details(preparation_cause)
+            if algebra_details is not None:
+                raise _candidate_domain_error(
+                    exc,
+                    stage=exc.stage,
+                    failed_params=failed_params,
+                    extra_details=algebra_details,
+                ) from exc
             raise fit_simulation_error_from_preparation_error(
                 exc,
-                fatal=not candidate_domain,
-                candidate_domain=candidate_domain,
                 failed_params=failed_params,
             ) from exc
         except SimulationCancelled as exc:
             raise FittingCancelled() from exc
         except Exception as exc:
+            if _raw_candidate_domain_eligible(exc):
+                raise _candidate_domain_error(
+                    exc,
+                    stage="candidate_preparation",
+                    failed_params=failed_params,
+                ) from exc
+            algebra_details = _strict_algebra_failure_details(exc)
+            if algebra_details is not None:
+                raise _candidate_domain_error(
+                    exc,
+                    stage="candidate_preparation",
+                    failed_params=failed_params,
+                    extra_details=algebra_details,
+                ) from exc
             raise _fatal_evaluation_error(
                 exc,
                 message=f"Structured fitting candidate preparation failed: {exc}",
@@ -887,11 +904,8 @@ class SerialFittingEvaluator:
                     ),
                 )
             except SimulationPreparationError as exc:
-                candidate_schedule = bool(exc.candidate_domain_eligible)
                 raise fit_simulation_error_from_preparation_error(
                     exc,
-                    fatal=not candidate_schedule,
-                    candidate_domain=candidate_schedule,
                     failed_params=failed_params,
                 ) from exc
 
@@ -917,25 +931,8 @@ class SerialFittingEvaluator:
             raise
         except SimulationCancelled as exc:
             raise FittingCancelled() from exc
-        except InitialConditionError as exc:
-            candidate_initial = any(
-                name.startswith(self._context.initial_prefix)
-                for name in _optimizer_origin_names(origin_map)
-            )
-            if candidate_initial:
-                raise _candidate_domain_error(
-                    exc,
-                    stage="initial_conditions",
-                    failed_params=failed_params,
-                ) from exc
-            raise _fatal_evaluation_error(
-                exc,
-                message=f"Fitting simulation failed: {exc}",
-                stage="initial_conditions",
-                failed_params=failed_params,
-            ) from exc
-        except (SolverError, InterventionScheduleError) as exc:
-            if candidate_authority_present:
+        except KindredError as exc:
+            if _raw_candidate_domain_eligible(exc):
                 raise _candidate_domain_error(
                     exc,
                     stage="solver",
@@ -974,7 +971,7 @@ class SerialFittingEvaluator:
             if isinstance(exc, (FittingCancelled, SimulationCancelled)):
                 raise FittingCancelled() from exc
             algebra_details = _strict_algebra_failure_details(exc)
-            if algebra_details is not None and candidate_authority_present:
+            if algebra_details is not None:
                 raise _candidate_domain_error(
                     exc,
                     stage="result_finalization",

@@ -26,6 +26,32 @@ __all__ = [
 ]
 
 
+def _validate_canonical_document(document: ProjectDocument) -> ProjectDocument:
+    """Validate project truth and canonicalize initial-condition zero."""
+
+    candidate = validate_project_document(document)
+    tabs = tuple(
+        replace(
+            tab,
+            initial_condition_sets=tuple(
+                replace(
+                    initial_set,
+                    values=tuple(
+                        (
+                            species,
+                            0.0 if value == 0.0 else value,
+                        )
+                        for species, value in initial_set.values
+                    ),
+                )
+                for initial_set in tab.initial_condition_sets
+            ),
+        )
+        for tab in candidate.tabs
+    )
+    return replace(candidate, tabs=tabs)
+
+
 @dataclass(frozen=True, slots=True)
 class SavedArchiveBaseline:
     document: ProjectDocument
@@ -65,7 +91,7 @@ class ProjectSession:
         *,
         presentation: WorkspacePresentationState | None = None,
     ) -> None:
-        validated_document = validate_project_document(document)
+        validated_document = _validate_canonical_document(document)
         initial_presentation = (
             default_workspace_presentation_state(validated_document)
             if presentation is None
@@ -155,7 +181,7 @@ class ProjectSession:
         """Validate one proposed canonical document without publishing it."""
 
         return PreparedDocumentMutation(
-            document=validate_project_document(document),
+            document=_validate_canonical_document(document),
         )
 
     def commit_document_mutation(
@@ -218,8 +244,8 @@ class ProjectSession:
     ) -> PreparedProjectInstall:
         """Validate every incoming session value without mutating live state."""
 
-        candidate = validate_project_document(document)
-        candidate_presentation = reconcile_workspace_presentation_state(
+        candidate = _validate_canonical_document(document)
+        candidate_presentation = validate_workspace_presentation_state(
             candidate,
             presentation,
         )

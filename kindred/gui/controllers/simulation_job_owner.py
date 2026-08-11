@@ -848,10 +848,9 @@ class SimulationJobOwner(QtCore.QObject):
     """Owns one worker, immutable captures, and publication generations."""
 
     state_changed = QtCore.Signal()
-    owned_qthreads_changed = QtCore.Signal()
+    application_close_settlement_changed = QtCore.Signal()
     status_changed = QtCore.Signal(str)
     results_changed = QtCore.Signal(str)
-    preview_endpoints_retired = QtCore.Signal(object)
     run_dispatched = QtCore.Signal(str, object)
     detailed_balance_correction_requested = QtCore.Signal(object)
 
@@ -911,6 +910,7 @@ class SimulationJobOwner(QtCore.QObject):
             PreviewResultKey,
         ] = {}
         self._application_close_fenced = False
+        self._last_application_close_settled = True
         self._gate.changed.connect(self._on_gate_changed)
 
     @property
@@ -920,13 +920,31 @@ class SimulationJobOwner(QtCore.QObject):
             or self._pending_detailed_balance is not None
         )
 
-    def owned_qthreads(self) -> tuple[QtCore.QThread, ...]:
-        """Return the exact native threads still retained by this owner."""
+    @property
+    def application_close_settled(self) -> bool:
+        """Whether this owner has released all admitted work and gate custody."""
 
-        worker = self._worker
-        if worker is None:
-            return ()
-        return (worker,)
+        return bool(
+            self._worker is None
+            and self._pending_detailed_balance is None
+            and self._job_kind is None
+            and self._origin_tab_id is None
+            and not self._targets
+            and not self._outcomes
+            and not self._details
+            and not self._gate.is_owned_by(self)
+        )
+
+    def _mark_application_close_unsettled(self) -> None:
+        self._last_application_close_settled = False
+
+    def _emit_application_close_settlement_if_complete(self) -> None:
+        if (
+            not self._last_application_close_settled
+            and self.application_close_settled
+        ):
+            self._last_application_close_settled = True
+            self.application_close_settlement_changed.emit()
 
     @property
     def current_kind(self) -> str | None:
@@ -1103,31 +1121,20 @@ class SimulationJobOwner(QtCore.QObject):
         self,
         tab_id: str,
         set_ids: Iterable[str],
-    ) -> tuple[PreviewResultKey, ...]:
+    ) -> None:
         tid = _required_id(tab_id, "tab_id")
-        retired: list[PreviewResultKey] = []
         for set_id in set_ids:
             sid = _required_id(set_id, "set_id")
-            key = self._current_preview_key_by_target.pop(
+            self._current_preview_key_by_target.pop(
                 (tid, sid),
                 None,
             )
-            if key is not None:
-                retired.append(key)
-        if retired:
-            self.preview_endpoints_retired.emit(tuple(retired))
-        return tuple(retired)
 
     def _retire_all_preview_keys_for_tab(self, tab_id: str) -> None:
         tid = _required_id(tab_id, "tab_id")
-        retired: list[PreviewResultKey] = []
         for target in tuple(self._current_preview_key_by_target):
             if target[0] == tid:
-                key = self._current_preview_key_by_target.pop(target, None)
-                if key is not None:
-                    retired.append(key)
-        if retired:
-            self.preview_endpoints_retired.emit(tuple(retired))
+                self._current_preview_key_by_target.pop(target, None)
 
     def _preview_key_is_pending(self, key: PreviewResultKey) -> bool:
         pending = self._pending_preview
@@ -1243,6 +1250,8 @@ class SimulationJobOwner(QtCore.QObject):
             for identity in captured
         )
         repository = self._repository(tab_id)
+        for set_id in set_ids:
+            repository.retain_explicit_as_reference(set_id)
         self.deauthorize_targets(
             tab_id,
             set_ids,
@@ -1256,8 +1265,6 @@ class SimulationJobOwner(QtCore.QObject):
                 raise RuntimeError(
                     "Preview admission generation changed during its exact fence."
                 )
-            repository.capture_preview_reference(key)
-            repository.authorize_preview_display(key)
             self._current_preview_key_by_target[(key.tab_id, key.set_id)] = key
         self._cancel_generation_counter_retirement(tab_id, set_ids)
         self.results_changed.emit(tab_id)
@@ -1428,6 +1435,7 @@ class SimulationJobOwner(QtCore.QObject):
                     "Run rejected: another computation is active."
                 )
                 return False
+            self._mark_application_close_unsettled()
             self.drop_pending_preview(capture.tab_id)
             self._detailed_balance_generation += 1
             self._pending_detailed_balance = (
@@ -1657,6 +1665,7 @@ class SimulationJobOwner(QtCore.QObject):
                     )
                     return False
                 self._gate.release(self)
+                self._emit_application_close_settlement_if_complete()
                 raise RuntimeError("Corrected Run could not be dispatched.")
         except Exception as exc:
             if committed:
@@ -1664,6 +1673,7 @@ class SimulationJobOwner(QtCore.QObject):
                     self._pending_detailed_balance = None
                 if self._worker is None and self._gate.is_owned_by(self):
                     self._gate.release(self)
+                self._emit_application_close_settlement_if_complete()
                 self.status_changed.emit(
                     "Detailed-balance correction committed; Run aborted: "
                     f"{type(exc).__name__}: {exc}"
@@ -1811,6 +1821,7 @@ class SimulationJobOwner(QtCore.QObject):
         self._gate.release(self)
         self.status_changed.emit(str(detail))
         self.state_changed.emit()
+        self._emit_application_close_settlement_if_complete()
         return True
 
     def request_preview(self, intent: PreviewIntent) -> bool:
@@ -2021,6 +2032,7 @@ class SimulationJobOwner(QtCore.QObject):
                     return False
             elif not self._gate.try_acquire(self, kind):
                 return False
+            self._mark_application_close_unsettled()
             next_job_id = self._job_id + 1
             admitted_targets = tuple(targets)
             if kind == "run":
@@ -2076,7 +2088,6 @@ class SimulationJobOwner(QtCore.QObject):
                 except BaseException:  # noqa: BLE001
                     verified_unstarted = False
                 if not verified_unstarted:
-                    self.owned_qthreads_changed.emit()
                     self.state_changed.emit()
                     raise RuntimeError(
                         f"{kind.capitalize()} worker startup is uncertain; "
@@ -2104,10 +2115,9 @@ class SimulationJobOwner(QtCore.QObject):
             if worker is not None:
                 worker.deleteLater()
             if installed:
-                self.owned_qthreads_changed.emit()
                 self.state_changed.emit()
+            self._emit_application_close_settlement_if_complete()
             raise
-        self.owned_qthreads_changed.emit()
         self.state_changed.emit()
         return True
 
@@ -2161,13 +2171,6 @@ class SimulationJobOwner(QtCore.QObject):
                     "Run result discarded: its captured target is unavailable.",
                 )
                 return
-            if not self._explicit_completion_is_current(target):
-                self._record_discard(
-                    key,
-                    f"Run result discarded for {target.set_name}: "
-                    "the exact live target or publication generation changed.",
-                )
-                return
             try:
                 repository = self._repository(key.tab_id)
             except LookupError:
@@ -2182,6 +2185,13 @@ class SimulationJobOwner(QtCore.QObject):
                     key,
                     "cancelled",
                     f"Run result for {target.set_name} cancelled before publication.",
+                )
+                return
+            if not self._explicit_completion_is_current(target):
+                self._record_discard(
+                    key,
+                    f"Run result discarded for {target.set_name}: "
+                    "the exact live target or publication generation changed.",
                 )
                 return
             try:
@@ -2204,13 +2214,6 @@ class SimulationJobOwner(QtCore.QObject):
             return
         if isinstance(key, PreviewResultKey) and self._job_kind == "preview":
             target_name = self._target_display_name(key)
-            if not self.preview_key_is_current(key):
-                self._record_discard(
-                    key,
-                    f"Preview result discarded for {target_name}: "
-                    "the owner generation or exact live key changed.",
-                )
-                return
             try:
                 repository = self._repository(key.tab_id)
             except LookupError:
@@ -2225,6 +2228,13 @@ class SimulationJobOwner(QtCore.QObject):
                     key,
                     "cancelled",
                     f"Preview result for {target_name} cancelled before publication.",
+                )
+                return
+            if not self.preview_key_is_current(key):
+                self._record_discard(
+                    key,
+                    f"Preview result discarded for {target_name}: "
+                    "the owner generation or exact live key changed.",
                 )
                 return
             try:
@@ -2318,8 +2328,8 @@ class SimulationJobOwner(QtCore.QObject):
         self._gate.release(self)
         if worker is not None:
             worker.deleteLater()
-            self.owned_qthreads_changed.emit()
         self.state_changed.emit()
+        self._emit_application_close_settlement_if_complete()
 
     def _schedule_pending_preview(self) -> None:
         if self._pending_preview is not None:

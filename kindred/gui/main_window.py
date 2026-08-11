@@ -6,7 +6,6 @@ import logging
 import os
 import stat
 import tempfile
-import threading
 import time
 import webbrowser
 from dataclasses import dataclass, replace
@@ -41,7 +40,6 @@ from kindred.core.project_document import (
     FitDefaults,
     MechanismTabDocument,
     MechanismSourceCollision,
-    MechanismSourceFailure,
     MechanismSourceReconciliation,
     ProjectDocument,
     SimulationExecutionSettings,
@@ -61,9 +59,9 @@ from kindred.core.project_presentation_state import (
 )
 from kindred.core.result_repository import (
     ExplicitResultCurrentFacts,
-    PreviewResultKey,
     ResultRepository,
 )
+from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.dsl_parse import (
     PreparedDslRequestSet,
     prepare_dsl_request_set,
@@ -239,16 +237,16 @@ class _XlsxExportWorker(QtCore.QThread):
         self._generation = int(generation)
         self._projection = projection
         self._path = os.path.abspath(os.fspath(path))
-        self._finalize_lock = threading.Lock()
+        self._commit_started = False
         self._terminal_outcome: str | None = None
 
     def cancel(self) -> bool:
-        """Request cancellation unless this worker already committed."""
-        with self._finalize_lock:
-            if self._terminal_outcome is not None:
-                return False
-            self.requestInterruption()
-            return True
+        """Request cancellation without waiting on destination finalization."""
+
+        if self._commit_started or self._terminal_outcome is not None:
+            return False
+        self.requestInterruption()
+        return True
 
     def _check_cancelled(self) -> None:
         if self.isInterruptionRequested():
@@ -288,23 +286,23 @@ class _XlsxExportWorker(QtCore.QThread):
                 self._check_cancelled()
                 destination.flush()
                 self._check_cancelled()
-            with self._finalize_lock:
-                if self.isInterruptionRequested():
-                    self._terminal_outcome = "cancelled"
-                    raise _XlsxExportCancelled()
-                try:
-                    existing_mode = stat.S_IMODE(os.stat(self._path).st_mode)
-                except FileNotFoundError:
-                    existing_mode = None
-                if existing_mode is not None:
-                    os.chmod(temporary_path, existing_mode)
-                self._check_cancelled()
-                os.replace(temporary_path, self._path)
-                temporary_path = ""
-                self._terminal_outcome = "committed"
+            try:
+                existing_mode = stat.S_IMODE(os.stat(self._path).st_mode)
+            except FileNotFoundError:
+                existing_mode = None
+            if existing_mode is not None:
+                os.chmod(temporary_path, existing_mode)
+            self._check_cancelled()
+            # Enter the sole commit boundary before the final interruption
+            # check. Cancellation thereafter neither waits for nor interrupts
+            # a potentially blocking atomic replace; that commit may finish.
+            self._commit_started = True
+            self._check_cancelled()
+            os.replace(temporary_path, self._path)
+            temporary_path = ""
+            self._terminal_outcome = "committed"
         except _XlsxExportCancelled:
-            with self._finalize_lock:
-                self._terminal_outcome = "cancelled"
+            self._terminal_outcome = "cancelled"
             self.failed.emit(
                 _XlsxExportFailure(
                     generation=self._generation,
@@ -314,13 +312,11 @@ class _XlsxExportWorker(QtCore.QThread):
                 )
             )
         except Exception as exc:
-            with self._finalize_lock:
-                cancelled = (
-                    self._terminal_outcome is None
-                    and self.isInterruptionRequested()
-                )
-                if cancelled:
-                    self._terminal_outcome = "cancelled"
+            cancelled = bool(
+                not self._commit_started
+                and self.isInterruptionRequested()
+            )
+            self._terminal_outcome = "cancelled" if cancelled else "failed"
             self.failed.emit(
                 _XlsxExportFailure(
                     generation=self._generation,
@@ -365,17 +361,32 @@ class _XlsxExportOwner(QtCore.QObject):
 
     succeeded = QtCore.Signal(object)
     failed = QtCore.Signal(object)
-    owned_qthreads_changed = QtCore.Signal()
+    application_close_settlement_changed = QtCore.Signal()
 
     def __init__(self, *, parent: QtCore.QObject) -> None:
         super().__init__(parent)
         self._generation = 0
         self._active_worker: _XlsxExportWorker | None = None
         self._application_close_fenced = False
+        self._application_close_settled = True
 
     @property
     def is_exporting(self) -> bool:
         return self._active_worker is not None
+
+    @property
+    def application_close_settled(self) -> bool:
+        """Return whether the admitted export has completed full cleanup."""
+
+        return self._application_close_settled
+
+    def _publish_application_close_settlement(self) -> None:
+        if self._active_worker is not None:
+            return
+        if self._application_close_settled:
+            return
+        self._application_close_settled = True
+        self.application_close_settlement_changed.emit()
 
     def start(
         self,
@@ -413,6 +424,7 @@ class _XlsxExportOwner(QtCore.QObject):
             parent=self,
         )
         self._active_worker = worker
+        self._application_close_settled = False
         try:
             worker.succeeded.connect(self._publish_success)
             worker.failed.connect(self._publish_failure)
@@ -431,7 +443,6 @@ class _XlsxExportOwner(QtCore.QObject):
                     "XLSX worker startup raised and unstarted state could not "
                     "be verified; retaining worker custody"
                 )
-                self.owned_qthreads_changed.emit()
                 # Native launch may already have happened even though start()
                 # raised.  Keep the exact worker and generation authoritative;
                 # its existing success/failure/finished callbacks publish the
@@ -457,9 +468,8 @@ class _XlsxExportOwner(QtCore.QObject):
                     cancelled=False,
                 )
             )
-            self.owned_qthreads_changed.emit()
+            self._publish_application_close_settlement()
             return False
-        self.owned_qthreads_changed.emit()
         return True
 
     @QtCore.Slot(object)
@@ -485,7 +495,7 @@ class _XlsxExportOwner(QtCore.QObject):
             self._active_worker = None
         if isinstance(worker, QtCore.QThread):
             worker.deleteLater()
-        self.owned_qthreads_changed.emit()
+        self._publish_application_close_settlement()
 
     def _cancel_active(self) -> _XlsxExportWorker | None:
         worker = self._active_worker
@@ -517,16 +527,12 @@ class _XlsxExportOwner(QtCore.QObject):
                 self._generation += 1
             self._active_worker = None
             worker.deleteLater()
-            self.owned_qthreads_changed.emit()
+            self._publish_application_close_settlement()
         return True
 
     def cancel_for_application_close(self) -> None:
         self._application_close_fenced = True
         self._cancel_active()
-
-    def owned_qthreads(self) -> tuple[QtCore.QThread, ...]:
-        worker = self._active_worker
-        return () if worker is None else (worker,)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -622,7 +628,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._xlsx_export_owner.failed.connect(
             self._on_xlsx_export_failed
         )
-        self._xlsx_export_owner.owned_qthreads_changed.connect(
+        self._xlsx_export_owner.application_close_settlement_changed.connect(
             self._refresh_actions
         )
 
@@ -899,7 +905,9 @@ class MainWindow(QtWidgets.QMainWindow):
         panel.runSelectedRequested.connect(
             lambda captured=tab_id: self._start_selected_run(captured)
         )
-        panel.stopRequested.connect(self._simulation_jobs.cancel_current)
+        panel.stopRequested.connect(
+            lambda captured=tab_id: self._stop_simulation(captured)
+        )
         panel.workspaceRunDefaultsRequested.connect(
             lambda settings, captured=tab_id: self._set_workspace_run_defaults(
                 captured,
@@ -1105,9 +1113,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_run_dispatched
         )
         self._simulation_jobs.results_changed.connect(self._on_results_changed)
-        self._simulation_jobs.preview_endpoints_retired.connect(
-            self._retire_preview_endpoint_presentations
-        )
         self._simulation_jobs.status_changed.connect(self.set_status_text)
         self._simulation_jobs.detailed_balance_correction_requested.connect(
             self._present_detailed_balance_correction
@@ -1271,20 +1276,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for name in required_signals
         ):
             raise TypeError("Workspace plot must expose the plot intent signals.")
-        required_preview_methods = (
-            "capture_preview_transition_origins",
-            "authorize_preview_endpoint_presentation",
-            "retire_preview_endpoint_presentations",
-        )
-        if any(
-            not callable(getattr(plot, name, None))
-            for name in required_preview_methods
-        ):
-            raise TypeError(
-                "Workspace plot must expose exact Preview transition methods."
-            )
-        bundle = self._tab_surfaces.get(target)
-        if bundle is None:
+        if target not in self._tab_surfaces:
             raise RuntimeError(
                 f"Workspace plot {target!r} has no matching tab runtime bundle."
             )
@@ -1314,37 +1306,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 message,
             )
         )
-        bundle.slider_binding.previewTransitionOriginCaptureRequested.connect(
-            plot.capture_preview_transition_origins
-        )
-        bundle.slider_binding.previewEndpointPresentationRequested.connect(
-            plot.authorize_preview_endpoint_presentation
-        )
-
-    @QtCore.Slot(object)
-    def _retire_preview_endpoint_presentations(self, keys: object) -> None:
-        """Route exact retired Preview keys only to their owning tab panel."""
-
-        try:
-            captured = tuple(keys)  # type: ignore[arg-type]
-        except TypeError as exc:
-            raise TypeError(
-                "retired Preview endpoints must be an iterable of keys."
-            ) from exc
-        if any(not isinstance(key, PreviewResultKey) for key in captured):
-            raise TypeError(
-                "retired Preview endpoints must contain PreviewResultKey values."
-            )
-        grouped: dict[str, list[PreviewResultKey]] = {}
-        for key in captured:
-            grouped.setdefault(key.tab_id, []).append(key)
-        for tab_id, tab_keys in grouped.items():
-            try:
-                plot = self._workspace.plot_for_tab(tab_id)
-            except KeyError:
-                continue
-            plot.retire_preview_endpoint_presentations(tuple(tab_keys))
-
     def _refresh_workspace_document(self) -> None:
         """Refresh canonical/global projections without changing selected page state."""
 
@@ -1736,7 +1697,7 @@ class MainWindow(QtWidgets.QMainWindow):
             intervention_annotations_visible=(
                 presentation.intervention_annotations_visible
             ),
-            experimental_layers=experimental_layers,
+            active_overlay_layers=experimental_layers,
             color_by_axis_selection=color_by_axis_selection,
             experimental_point_size=(
                 self.config_controller.experimental_point_size()
@@ -2602,7 +2563,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._simulation_jobs.is_executing
                 or self._simulation_jobs.pending_preview_tab_id is not None
             ),
-            active_fit=bool(self._fit_session_owner.owned_qthreads()),
+            active_fit=self._fit_session_owner.fit_active,
             active_import=bool(self._dataset_import_staging.busy),
             active_xlsx_export=self._xlsx_export_owner.is_exporting,
         )
@@ -2951,7 +2912,16 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> MechanismSourceReconciliation | None:
         """Resolve Replace/Cancel while keeping the proposal mutation-free."""
 
-        proposal = reconcile_tab_mechanism_source(document, tab_id, visible)
+        try:
+            proposal = reconcile_tab_mechanism_source(document, tab_id, visible)
+        except DSLError as exc:
+            if report_error:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid Reactions",
+                    f"{description} cannot continue:\n\n{exc}",
+                )
+            return None
         if isinstance(proposal, MechanismSourceCollision):
             if not report_error:
                 return None
@@ -2973,14 +2943,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if dialog.clickedButton() is not replace_button:
                 return None
             proposal = proposal.replacement
-        if isinstance(proposal, MechanismSourceFailure):
-            if report_error:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Invalid Reactions",
-                    f"{description} cannot continue:\n\n{proposal.message}",
-                )
-            return None
         if not isinstance(proposal, MechanismSourceReconciliation):
             raise TypeError("Mechanism reconciliation returned an invalid result.")
         return proposal
@@ -2997,18 +2959,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("source must be MechanismAuthoringSource.")
         target = str(tab_id)
-        try:
-            document = self._project_session.document
-            expected_token = self._project_session.capture_content_token()
-            reconciliation = self._prepare_source_reconciliation(
-                document,
-                target,
-                source,
-                description="Prepare detailed-balance correction",
-                report_error=False,
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
+        document = self._project_session.document
+        expected_token = self._project_session.capture_content_token()
+        reconciliation = self._prepare_source_reconciliation(
+            document,
+            target,
+            source,
+            description="Prepare detailed-balance correction",
+            report_error=False,
+        )
         if not isinstance(reconciliation, MechanismSourceReconciliation):
             return None
         prepared_dsl = reconciliation.prepared_dsl
@@ -3016,18 +2975,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         if not reconciliation.detailed_balance.resolved:
             return None
-        try:
-            return DetailedBalanceCorrectionProposal(
-                tab_id=target,
-                source=reconciliation.proposed_document.tab(
-                    target
-                ).mechanism_source,
-                expected_token=expected_token,
-                proposed_document=reconciliation.proposed_document,
-                prepared_dsl=prepared_dsl,
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
+        return DetailedBalanceCorrectionProposal(
+            tab_id=target,
+            source=reconciliation.proposed_document.tab(
+                target
+            ).mechanism_source,
+            expected_token=expected_token,
+            proposed_document=reconciliation.proposed_document,
+            prepared_dsl=prepared_dsl,
+        )
 
     def _commit_detailed_balance_source(
         self,
@@ -4162,7 +4118,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_action = self._add_action(
             simulation,
             "Stop",
-            self._simulation_jobs.cancel_current,
+            lambda _checked=False: self._stop_simulation(),
             "Esc",
             "stopSimulationAction",
         )
@@ -4266,6 +4222,9 @@ class MainWindow(QtWidgets.QMainWindow):
             parameter_debounce, equilibrium_debounce = dialog.preview_debounce()
             run_maximum = dialog.run_user_maximum()
             cache_capacity = dialog.result_cache_capacity()
+            persist_scientific_defaults = (
+                dialog.persist_scientific_defaults_requested()
+            )
             bundle = self._tab_surfaces[tab_id]
             previous_settings = self._workspace_tab_registry.tab(
                 tab_id
@@ -4306,6 +4265,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if getattr(previous_settings, field)
                 != getattr(settings, field)
             )
+            self._refresh_tab_controls(
+                tab_id,
+                scientific_fields=changed_fields,
+            )
+        if persist_scientific_defaults:
             try:
                 self.config_controller.persist_scientific_defaults(settings)
             except Exception as exc:
@@ -4316,11 +4280,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.set_status_text(
                     f"Scientific settings persistence failed: {exc}"
                 )
-            finally:
-                self._refresh_tab_controls(
-                    tab_id,
-                    scientific_fields=changed_fields,
-                )
+
+    def _stop_simulation(self, tab_id: str | None = None) -> bool:
+        """Fence pending Slider Preview intent before active cancellation."""
+
+        target = (
+            self._workspace_tab_registry.active_tab_id
+            if tab_id is None
+            else str(tab_id)
+        )
+        bundle = self._tab_surfaces.get(target)
+        if bundle is not None:
+            bundle.slider_binding.cancel_pending_preview_intent()
+        return bool(self._simulation_jobs.cancel_current())
 
     def _run_global_fit(self) -> bool:
         if not self._mutation_input_admitted("Global Fit"):
@@ -4906,7 +4878,11 @@ class MainWindow(QtWidgets.QMainWindow):
             mutation_admitted and self._run_admitted(tab_id),
         )
         self._stop_action.setEnabled(
-            mutation_admitted and self._simulation_jobs.is_executing
+            mutation_admitted
+            and bool(
+                self._simulation_jobs.is_executing
+                or self._simulation_jobs.pending_preview_tab_id is not None
+            )
         )
         self._global_fit_action.setEnabled(
             mutation_admitted and self._computation_gate.is_idle

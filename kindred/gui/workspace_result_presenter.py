@@ -891,6 +891,7 @@ class WorkspaceResultProjection:
     copy_all_blocks: tuple[ResultDataBlock, ...]
     selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
     selected_y_series: tuple[AxisSeriesSelection, ...] = ()
+    derived_overlay_y_series: tuple[ExperimentalAxisSelection, ...] = ()
     selected_y_uses_default_all: bool = True
     x_label: str = "Time (s)"
     y_label: str = "Value"
@@ -1023,6 +1024,23 @@ class WorkspaceResultProjection:
         )
         if len(selected_y) != len(set(selected_y)):
             raise ValueError("selected_y_series must be unique.")
+        derived_overlay_y = tuple(
+            selection
+            for selection in self.derived_overlay_y_series
+            if isinstance(selection, ExperimentalAxisSelection)
+        )
+        if len(derived_overlay_y) != len(self.derived_overlay_y_series):
+            raise TypeError(
+                "derived_overlay_y_series must contain only experimental "
+                "axis selections."
+            )
+        if len(derived_overlay_y) != len(set(derived_overlay_y)):
+            raise ValueError("derived_overlay_y_series must be unique.")
+        if set(derived_overlay_y).intersection(selected_y):
+            raise ValueError(
+                "derived_overlay_y_series must be distinct from authored "
+                "selected_y_series."
+            )
         if type(self.x_label) is not str:
             raise TypeError("x_label must be an exact string.")
         if type(self.y_label) is not str:
@@ -1038,6 +1056,11 @@ class WorkspaceResultProjection:
         if selected_x not in candidate_ids:
             raise ValueError(
                 "selected_x_series must exist in the reconciled axis candidate roster."
+            )
+        if any(selection not in candidate_ids for selection in derived_overlay_y):
+            raise ValueError(
+                "derived_overlay_y_series must exist in the active axis "
+                "candidate roster."
             )
         annotations = tuple(self.intervention_annotations)
         if any(not isinstance(item, Mapping) for item in annotations):
@@ -1069,6 +1092,11 @@ class WorkspaceResultProjection:
             self,
             "selected_y_series",
             selected_y,
+        )
+        object.__setattr__(
+            self,
+            "derived_overlay_y_series",
+            derived_overlay_y,
         )
         object.__setattr__(
             self,
@@ -1535,7 +1563,7 @@ class WorkspaceResultPresenter:
         repository: ResultRepository,
         reference_lines_visible: bool,
         intervention_annotations_visible: bool,
-        experimental_layers: Sequence[ExperimentalLayerInput] = (),
+        active_overlay_layers: Sequence[ExperimentalLayerInput] = (),
         color_by_axis_selection: Mapping[
             AxisSeriesSelection,
             str,
@@ -1575,47 +1603,52 @@ class WorkspaceResultPresenter:
             raise ValueError("experimental_point_size must be positive.")
         if not np.isfinite(point_opacity) or not 0.0 <= point_opacity <= 1.0:
             raise ValueError("experimental_point_opacity must be between zero and one.")
-        experimental_inputs = tuple(experimental_layers)
+        active_overlay_inputs = tuple(active_overlay_layers)
         if any(
             not isinstance(candidate, ExperimentalLayerInput)
-            for candidate in experimental_inputs
+            for candidate in active_overlay_inputs
         ):
             raise TypeError(
-                "experimental_layers must contain ExperimentalLayerInput values."
+                "active_overlay_layers must contain ExperimentalLayerInput values."
             )
         experimental_by_axis = {
             ExperimentalAxisSelection(
                 candidate.dataset_id,
                 candidate.raw_observation_id,
             ): candidate
-            for candidate in experimental_inputs
+            for candidate in active_overlay_inputs
         }
-        if len(experimental_by_axis) != len(experimental_inputs):
+        if len(experimental_by_axis) != len(active_overlay_inputs):
             raise ValueError(
-                "Experimental layers duplicate a dataset/raw-observation identity."
+                "Active overlay layers duplicate a dataset/raw-observation identity."
             )
-        if not bool(selected_y_uses_default_all):
-            selected_model_y = {
-                selection.series_name
-                for selection in selected_y_ordered
-                if isinstance(selection, SimulationSeriesAxisSelection)
-            }
-            implicit_experimental_y = tuple(
-                ExperimentalAxisSelection(
-                    candidate.dataset_id,
-                    candidate.raw_observation_id,
-                )
-                for candidate in experimental_inputs
-                if candidate.model_species in selected_model_y
-                and ExperimentalAxisSelection(
-                    candidate.dataset_id,
-                    candidate.raw_observation_id,
-                )
-                not in selected_y_ordered
+        selected_model_y = {
+            selection.series_name
+            for selection in selected_y_ordered
+            if isinstance(selection, SimulationSeriesAxisSelection)
+        }
+        derived_overlay_y_values: list[ExperimentalAxisSelection] = []
+        for candidate in active_overlay_inputs:
+            if candidate.model_species is None or not (
+                bool(selected_y_uses_default_all)
+                or candidate.model_species in selected_model_y
+            ):
+                continue
+            selection = ExperimentalAxisSelection(
+                candidate.dataset_id,
+                candidate.raw_observation_id,
             )
-            selected_y_ordered += implicit_experimental_y
-        selected_y = set(selected_y_ordered)
-        wanted_y = None if bool(selected_y_uses_default_all) else selected_y
+            if selection not in selected_y_ordered:
+                derived_overlay_y_values.append(selection)
+        derived_overlay_y = tuple(derived_overlay_y_values)
+        effective_y_ordered = tuple(
+            dict.fromkeys((*selected_y_ordered, *derived_overlay_y))
+        )
+        wanted_y = (
+            None
+            if bool(selected_y_uses_default_all)
+            else set(effective_y_ordered)
+        )
         excluded_simulation_y: set[AxisSeriesSelection] = set()
         excluded_experimental_y: set[AxisSeriesSelection] = set()
         selected_x_source: ExperimentalLayerInput | None = None
@@ -1626,7 +1659,7 @@ class WorkspaceResultPresenter:
                     candidate.dataset_id,
                     candidate.raw_observation_id,
                 )
-                for candidate in experimental_inputs
+                for candidate in active_overlay_inputs
                 if candidate.model_species == selected_x.series_name
             )
         elif isinstance(selected_x, ExperimentalAxisSelection):
@@ -1764,29 +1797,44 @@ class WorkspaceResultPresenter:
                 annotations.extend(
                     _annotations_from_execution(foreground.result_entry.result)
                 )
-            if visible.set_id == current_id and foreground is not None:
-                if isinstance(foreground.result_entry, PreviewResultEntry):
-                    if reference_layer is not None:
-                        # Preview owns only the foreground curves.  The last
-                        # accepted Run retained as Reference remains analysis truth.
-                        primary_layer_id = reference_layer.layer_id
-                        primary_entry = reference_layer.result_entry
-                        primary_block = _statistics_block(
-                            reference_layer,
-                            y_axes=wanted_y,
-                            excluded_y_axes=excluded_simulation_y,
-                        )
-                else:
-                    primary_layer_id = foreground.layer_id
-                    primary_entry = foreground.result_entry
-                    assert primary_entry is not None
-                    primary_block = _statistics_block(
+            if visible.set_id == current_id:
+                foreground_block = (
+                    None
+                    if foreground is None
+                    or isinstance(foreground.result_entry, PreviewResultEntry)
+                    else _statistics_block(
                         foreground,
                         y_axes=wanted_y,
                         excluded_y_axes=excluded_simulation_y,
                     )
+                )
+                if (
+                    foreground is not None
+                    and not isinstance(
+                        foreground.result_entry,
+                        PreviewResultEntry,
+                    )
+                    and (
+                        foreground_block is not None
+                        or reference_layer is None
+                    )
+                ):
+                    primary_layer_id = foreground.layer_id
+                    primary_entry = foreground.result_entry
+                    primary_block = foreground_block
+                elif reference_layer is not None:
+                    # Pending, cancelled, or failed Preview has no replacement
+                    # statistics.  The retained accepted Reference remains the
+                    # analysis owner even when no foreground layer is present.
+                    primary_layer_id = reference_layer.layer_id
+                    primary_entry = reference_layer.result_entry
+                    primary_block = _statistics_block(
+                        reference_layer,
+                        y_axes=wanted_y,
+                        excluded_y_axes=excluded_simulation_y,
+                    )
 
-        for experimental in experimental_inputs:
+        for experimental in active_overlay_inputs:
             y_axis = ExperimentalAxisSelection(
                 experimental.dataset_id,
                 experimental.raw_observation_id,
@@ -1809,7 +1857,7 @@ class WorkspaceResultPresenter:
                     x_source = next(
                         (
                             candidate
-                            for candidate in experimental_inputs
+                            for candidate in active_overlay_inputs
                             if candidate.dataset_id == experimental.dataset_id
                             and candidate.model_species == selected_x.series_name
                         ),
@@ -1973,6 +2021,7 @@ class WorkspaceResultPresenter:
             copy_all_blocks=tuple(blocks),
             selected_x_series=selected_x,
             selected_y_series=selected_y_ordered,
+            derived_overlay_y_series=derived_overlay_y,
             selected_y_uses_default_all=bool(selected_y_uses_default_all),
             x_label=x_label,
             y_label=y_label,

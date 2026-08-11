@@ -58,7 +58,6 @@ class FitResult:
     nfev: int
     message: str
     identifiability_warning: Optional[str] = None
-    parameter_space: str = "optimizer"
 
 
 def fit_parameters(
@@ -88,43 +87,13 @@ def fit_parameters(
     else:
         scipy_bounds = (-np.inf, np.inf)
 
-    iteration_counter = [0]
     de_evaluation_budget: DifferentialEvolutionEvaluationBudget | None = None
     identifiability_warning: Optional[str] = None
-
-    def _vector_to_param_dict(vector: np.ndarray) -> Dict[str, float]:
-        return {name: float(vector[i]) for i, name in enumerate(param_names)}
-
-    def _build_failed_result(
-        message: str,
-        *,
-        failed_params: Optional[Dict[str, float]] = None,
-        parameter_space: str = "optimizer",
-    ) -> FitResult:
-        params = failed_params or _vector_to_param_dict(x0)
-        space = str(parameter_space or "optimizer").strip().lower()
-        if space not in {"optimizer", "physical"}:
-            raise ValueError(f"Unknown failed parameter space: {parameter_space!r}")
-        return FitResult(
-            success=False,
-            parameters=params,
-            residuals=np.array([]),
-            nfev=(
-                de_evaluation_budget.nfev
-                if de_evaluation_budget is not None
-                else iteration_counter[0]
-            ),
-            message=message,
-            identifiability_warning=None,
-            parameter_space=space,
-        )
 
     def wrapped_objective(params):
         if cancellation_check is not None and cancellation_check():
             raise FittingCancelled()
-        residuals = objective_func(params)
-        iteration_counter[0] += 1
-        return residuals
+        return objective_func(params)
 
     try:
         if method == "differential_evolution":
@@ -225,21 +194,6 @@ def fit_parameters(
                 residuals = evaluate_de_residuals(x_opt, reserve=0)
             except FittingCancelled:
                 raise
-            except FitSimulationError as exc:
-                if not _is_expected_candidate_domain_error(exc):
-                    raise
-                logger.error("Simulation failed when evaluating DE optimum: %s", exc)
-                if exc.failed_params:
-                    return _build_failed_result(
-                        str(exc),
-                        failed_params=exc.failed_params,
-                        parameter_space="physical",
-                    )
-                return _build_failed_result(
-                    str(exc),
-                    failed_params=_vector_to_param_dict(x_opt),
-                    parameter_space="optimizer",
-                )
             nfev = de_evaluation_budget.nfev
         else:
             least_squares, _de = scipy_loader()
@@ -305,5 +259,4 @@ def fit_parameters(
         nfev=nfev,
         message=message,
         identifiability_warning=identifiability_warning,
-        parameter_space="optimizer",
     )

@@ -496,7 +496,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
                 lines.append("")
             lines.append(f"{dataset_label}:")
             lines.extend(
-                f"  {name} = {value:.6g}"
+                f"  {name} = {value:.6g} — Fit-local; not applied to Run"
                 for name, value in sorted(pairs, key=lambda item: str(item[0]))
             )
             tooltip_lines.append(f"{dataset_label}: Dataset ID {dataset_id}")
@@ -747,7 +747,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
                 f"[{label.display}] "
                 + " | ".join(
                     f"{compact_text(name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
-                    f"{float(value):.6g}"
+                    f"{float(value):.6g} (Fit-local; not applied to Run)"
                     for name, value in values
                 )
             )
@@ -807,7 +807,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
                 f"[{label.display}] "
                 + " | ".join(
                     f"{compact_text(parameter_labels.get(name, name), max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
-                    f"{float(value):.6g}"
+                    f"{float(value):.6g} (Fit-local; not applied to Run)"
                     for name, value in values
                 )
             )
@@ -873,6 +873,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_dataset_metrics: tuple[DatasetMetricPresentation, ...] = ()
         self._available_apply_scopes: frozenset[str] = frozenset()
         self._unavailable_apply_reasons: Mapping[str, str] = MappingProxyType({})
+        self._has_per_dataset_values = False
         self._summary_dialog: ResultsSummaryDialog | None = None
         self._dark_mode = False
         self._view_autorange_locked = False
@@ -1011,6 +1012,10 @@ class RunResultsTab(QtWidgets.QWidget):
 
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be FitCandidate.")
+        self._has_per_dataset_values = any(
+            bool(values)
+            for _dataset_id, values in candidate.scalar_values_by_dataset
+        )
         self.set_apply_availability(available_scopes, unavailable_reasons)
         self.set_run_identity(candidate.run_identity)
         self._candidate = candidate
@@ -1039,6 +1044,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_dataset_metrics = ()
         self._available_apply_scopes = frozenset()
         self._unavailable_apply_reasons = MappingProxyType({})
+        self._has_per_dataset_values = False
         self._apply_group.hide()
         self._run_identity_label.setText("Run: —")
         self._run_identity_label.setToolTip("")
@@ -1146,8 +1152,16 @@ class RunResultsTab(QtWidgets.QWidget):
         self._apply_group.setVisible(has_owner_projection)
         for scope, label in self._apply_scope_labels.items():
             if scope in self._available_apply_scopes:
-                label.setText("Available")
-                label.setToolTip("")
+                if scope == "parameters" and self._has_per_dataset_values:
+                    disposition = (
+                        "Available for shared project values only; per-dataset "
+                        "values stay Fit-local and are not applied to Run."
+                    )
+                    label.setText(disposition)
+                    label.setToolTip(disposition)
+                else:
+                    label.setText("Available")
+                    label.setToolTip("")
                 continue
             reason = self._unavailable_apply_reasons.get(scope, "")
             compact = compact_diagnostic_text(

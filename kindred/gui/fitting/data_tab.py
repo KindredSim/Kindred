@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -58,10 +58,6 @@ class DataTab(QtWidgets.QWidget):
         self._panel = self._build_panel()
         layout.addWidget(self._panel, stretch=1)
 
-    @property
-    def invalid_editor_keys(self) -> tuple[tuple[str, str], ...]:
-        return tuple(sorted(self._invalid_raw))
-
     def select_dataset(self, dataset_id: str, display_name: str | None = None) -> None:
         dataset_id = str(dataset_id or "").strip()
         if display_name is not None:
@@ -69,13 +65,29 @@ class DataTab(QtWidgets.QWidget):
         self._current_dataset_id = dataset_id
         self._project_controls()
 
-    def data_range_validation_error(
+    def active_validation_errors(
         self,
-        *,
-        dataset_id: str,
-        config: Mapping[str, object],
-    ) -> str | None:
-        return self._validation_error(dataset_id, config)
+        included_dataset_ids: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Return validation errors for the normalized active dataset roster."""
+
+        active_dataset_ids = {
+            dataset_id
+            for item in included_dataset_ids
+            if (dataset_id := str(item or "").strip())
+        }
+        errors: list[str] = []
+        for dataset_id in sorted(active_dataset_ids):
+            pending = self._pending.get(dataset_id)
+            config = self._owned_settings(
+                pending
+                if pending is not None
+                else self._settings_getter(dataset_id)
+            )
+            error = self._validation_error(dataset_id, config)
+            if error:
+                errors.append(error)
+        return tuple(errors)
 
     def _build_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget(self)

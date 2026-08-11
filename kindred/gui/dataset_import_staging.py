@@ -611,7 +611,7 @@ class DatasetImportStaging(QtCore.QObject):
 
     completionAvailable = QtCore.Signal(object)
     busyChanged = QtCore.Signal(bool)
-    owned_qthreads_changed = QtCore.Signal()
+    application_close_settlement_changed = QtCore.Signal()
     workerProgressed = QtCore.Signal(object)
     workerFailed = QtCore.Signal(object)
     workerCanceled = QtCore.Signal(object)
@@ -625,6 +625,7 @@ class DatasetImportStaging(QtCore.QObject):
         self._next_import_id = 1
         self._next_worker_id = 1
         self._active: _ActiveImport | None = None
+        self._application_close_settled = True
         self._project_replacement_admission_fenced = False
         self._application_close_fenced = False
 
@@ -691,6 +692,7 @@ class DatasetImportStaging(QtCore.QObject):
                 for worker_request in worker_requests_tuple
             },
         )
+        self._application_close_settled = False
         self.busyChanged.emit(True)
         return request
 
@@ -838,7 +840,6 @@ class DatasetImportStaging(QtCore.QObject):
             )
         )
         active.workers[request.worker_id] = registration
-        self.owned_qthreads_changed.emit()
         return registration
 
     @staticmethod
@@ -851,16 +852,19 @@ class DatasetImportStaging(QtCore.QObject):
         except RuntimeError:
             return False
 
-    def owned_qthreads(self) -> tuple[QtCore.QThread, ...]:
-        """Return the exact native threads still retained by this owner."""
+    @property
+    def application_close_settled(self) -> bool:
+        """Return whether this owner has completed all admitted import work."""
 
-        active = self._active
-        if active is None:
-            return ()
-        return tuple(
-            registration.worker
-            for registration in active.workers.values()
-        )
+        return self._application_close_settled
+
+    def _publish_application_close_settlement(self) -> None:
+        if self._active is not None:
+            return
+        if self._application_close_settled:
+            return
+        self._application_close_settled = True
+        self.application_close_settlement_changed.emit()
 
     def _worker_loaded(
         self,
@@ -1059,7 +1063,6 @@ class DatasetImportStaging(QtCore.QObject):
         if failure is not None:
             self.workerFailed.emit(failure)
         self._finish_if_ready()
-        self.owned_qthreads_changed.emit()
 
     def cancel_active(self, *, outcome: str = "user_canceled") -> bool:
         active = self._active
@@ -1126,6 +1129,7 @@ class DatasetImportStaging(QtCore.QObject):
         if active.terminal_outcome is not None:
             self._active = None
             self.busyChanged.emit(False)
+            self._publish_application_close_settlement()
             return
         if active.completed_units < active.request.expected_units:
             return
@@ -1146,6 +1150,7 @@ class DatasetImportStaging(QtCore.QObject):
         self._active = None
         self.busyChanged.emit(False)
         self.completionAvailable.emit(completion)
+        self._publish_application_close_settlement()
 
     def _require_active(self, import_id: int) -> _ActiveImport:
         active = self._active

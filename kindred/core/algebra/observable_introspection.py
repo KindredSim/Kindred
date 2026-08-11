@@ -20,11 +20,11 @@ from kindred.core.algebra.parser import (
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra_spec import (
-    is_protected_indexed_parameter_identifier,
     is_protected_step_key_identifier,
 )
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
+    is_protected_indexed_identifier,
 )
 
 __all__ = [
@@ -144,7 +144,7 @@ def validate_fit_local_observable(
     }
     if (
         observable_name.casefold() in occupied_casefold
-        or is_protected_indexed_parameter_identifier(observable_name)
+        or is_protected_indexed_identifier(observable_name)
         or is_protected_step_key_identifier(observable_name)
     ):
         raise ValueError(
@@ -182,7 +182,7 @@ def validate_fit_local_observable(
     unknown_identifiers = _identifiers(expr) - allowed
     for unknown in unknown_identifiers:
         if (
-            is_protected_indexed_parameter_identifier(unknown)
+            is_protected_indexed_identifier(unknown)
             or is_protected_step_key_identifier(unknown)
         ):
             raise ValueError(

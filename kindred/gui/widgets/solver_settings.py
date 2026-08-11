@@ -167,11 +167,17 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "Enforce Wegscheider cyclicity",
             science_box,
         )
+        self.scientific_defaults_check = QtWidgets.QCheckBox(
+            "Use these settings as defaults for new projects and tabs.",
+            science_box,
+        )
+        self.scientific_defaults_check.setChecked(False)
         science_form.addRow("Temperature (K)", self.temperature_spin)
         science_form.addRow("Relative tolerance", self.rtol_edit)
         science_form.addRow("Absolute tolerance", self.atol_edit)
         science_form.addRow("", self.analytic_jacobian_check)
         science_form.addRow("", self.wegscheider_check)
+        science_form.addRow("", self.scientific_defaults_check)
         layout.addWidget(science_box)
 
         preview_box = QtWidgets.QGroupBox("Preview", self)
@@ -289,6 +295,11 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             wegscheider_policy=bool(self.wegscheider_check.isChecked()),
         )
         return validate_tab_scientific_settings(candidate)
+
+    def persist_scientific_defaults_requested(self) -> bool:
+        """Return the passive application-default persistence intent."""
+
+        return bool(self.scientific_defaults_check.isChecked())
 
     def set_preview_debounce(self, parameter: int, equilibrium: int) -> None:
         self.parameter_debounce_spin.setValue(int(parameter))

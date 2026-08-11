@@ -274,28 +274,21 @@ class ImportConfigDialog(QtWidgets.QDialog):
     def _load_csv_preview(self) -> None:
         self._previewed_sheet_name = None
         self._clear_preview_error()
+        self._columns, rows = read_csv_rows_from_bytes(
+            self._source.exact_source_bytes,
+            source_label=self._source.original_filename,
+        )
+        row_iter = iter(rows)
         try:
-            self._columns, rows = read_csv_rows_from_bytes(
-                self._source.exact_source_bytes,
-                source_label=self._source.original_filename,
-            )
-            row_iter = iter(rows)
-            try:
-                self._preview_rows = [
-                    [
-                        str(row.values.get(column, "")).strip()
-                        for column in self._columns
-                    ]
-                    for row in itertools.islice(row_iter, _MAX_PREVIEW_ROWS)
+            self._preview_rows = [
+                [
+                    str(row.values.get(column, "")).strip()
+                    for column in self._columns
                 ]
-            finally:
-                row_iter.close()
-        except UnicodeError:
-            self._columns = []
-            self._preview_rows = []
-            self._detect_and_populate()
-            self._set_preview_error("Cannot read file: encoding error. Expected UTF-8.")
-            return
+                for row in itertools.islice(row_iter, _MAX_PREVIEW_ROWS)
+            ]
+        finally:
+            row_iter.close()
         self._detect_and_populate()
         self._save_current_sheet_state(None)
 

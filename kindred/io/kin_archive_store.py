@@ -23,6 +23,7 @@ from kindred.core.project_document import (
     ProjectDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
+    validate_project_document,
 )
 from kindred.core.datasets.foundation import (
     ImportedSource,
@@ -383,7 +384,10 @@ def _encode_document(
                         "set_id": initial_set.set_id,
                         "name": initial_set.name,
                         "values": [
-                            [species, value]
+                            [
+                                species,
+                                0.0 if value == 0.0 else value,
+                            ]
                             for species, value in initial_set.values
                         ],
                     }
@@ -887,17 +891,18 @@ def _decode_document(
                     f"{set_label}.values[{pair_index}][0]",
                     nonblank=True,
                 )
+                concentration = _finite(
+                    pair[1],
+                    "initial concentration for "
+                    f"tab {tab_id!r} ({tab_name!r}), "
+                    f"set {set_id!r} ({set_name!r}), "
+                    f"species {species!r}",
+                    nonnegative=True,
+                )
                 value_pairs.append(
                     (
                         species,
-                        _finite(
-                            pair[1],
-                            "initial concentration for "
-                            f"tab {tab_id!r} ({tab_name!r}), "
-                            f"set {set_id!r} ({set_name!r}), "
-                            f"species {species!r}",
-                            nonnegative=True,
-                        ),
+                        0.0 if concentration == 0.0 else concentration,
                     )
                 )
             initial_sets.append(
@@ -1317,9 +1322,11 @@ def _decode_project(
             f"Unsupported project format {project_format!r}; "
             f"expected {CURRENT_PROJECT_FORMAT!r}."
         )
-    document = _decode_document(
-        root["document"],
-        source_bytes_by_member,
+    document = validate_project_document(
+        _decode_document(
+            root["document"],
+            source_bytes_by_member,
+        )
     )
     workspace = _exact_fields(
         root["workspace"],
@@ -1362,6 +1369,15 @@ def _decode_project(
         ),
         presentation_by_tab_id=tuple(presentations),
     )
+    try:
+        workspace_presentation = validate_workspace_presentation_state(
+            document,
+            workspace_presentation,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Current project archive presentation is invalid: {exc}"
+        ) from exc
     return ArchiveProject(
         document=document,
         presentation=workspace_presentation,

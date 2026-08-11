@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import ast
+import math
 from typing import Any
 
 from kindred.core.algebra.parser import (
@@ -10,16 +10,13 @@ from kindred.core.algebra.parser import (
     NumberNode,
     UnaryNode,
 )
+from kindred.core.algebra.symbols import PROTECTED_NAMES as ALGEBRA_PROTECTED_NAMES
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, ParameterAssignment
 
 from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
 from .identity import symbolic_fingerprint
-from .namespaces import (
-    SymbolicParameterNamespaceContext,
-    make_parameter_namespace_context,
-    reject_unsupported_parameter_symbol_source,
-)
+from .namespaces import SymbolicParameterNamespaceContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,98 +39,110 @@ def _coerce_parameter_namespace(
         return namespace
     if spec is None:
         raise _unsupported("Symbolic parameter expression requires a parameter namespace context.")
-    return make_parameter_namespace_context(spec)
+    return SymbolicParameterNamespaceContext.from_spec(spec)
 
 
-def _normalize_source(expr_src: str, namespace: SymbolicParameterNamespaceContext) -> str:
-    source = str(expr_src or "").strip()
-    reject_unsupported_parameter_symbol_source(source)
-    source = source.replace("^", "**")
-    try:
-        tree = ast.parse(source, mode="eval")
-    except SyntaxError as exc:
-        raise _unsupported(f"Invalid symbolic expression syntax: {expr_src!r}.") from exc
-    _validate_ast(tree)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            node.id = namespace.resolve_identifier(node.id)
-    return ast.unparse(tree)
+def _append_identifier(names: list[str], name: str) -> None:
+    if name not in names:
+        names.append(name)
 
 
-def _validate_ast(node: ast.AST) -> None:
-    if isinstance(node, ast.Expression):
-        _validate_ast(node.body)
-        return
-    if isinstance(node, ast.Constant):
-        if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
-            raise _unsupported("Only numeric literals are supported in symbolic proof.")
-        return
-    if isinstance(node, ast.Name):
-        return
-    if isinstance(node, ast.UnaryOp):
-        if not isinstance(node.op, (ast.UAdd, ast.USub)):
+def _translate_retained_node(
+    node: object,
+    *,
+    namespace: SymbolicParameterNamespaceContext,
+    identifiers: list[str],
+    sympy: Any,
+) -> tuple[Any, dict[str, object]]:
+    """Translate the strict retained-AST proof subset and describe its shape."""
+
+    if isinstance(node, NumberNode):
+        value = float(node.value)
+        if not math.isfinite(value):
+            raise _unsupported("Only finite retained numeric literals are supported.")
+        numerator, denominator = value.as_integer_ratio()
+        return (
+            sympy.Rational(numerator, denominator),
+            {"kind": "number", "binary64": value.hex()},
+        )
+    if isinstance(node, IdentNode):
+        raw_name = str(node.name)
+        if raw_name in ALGEBRA_PROTECTED_NAMES:
+            if raw_name == "T":
+                raise _unsupported(
+                    "Protected runtime symbol 'T' is not supported in symbolic proof."
+                )
+            canonical_name = raw_name
+        else:
+            canonical_name = namespace.resolve_identifier(raw_name)
+        _append_identifier(identifiers, canonical_name)
+        return (
+            sympy.Symbol(canonical_name),
+            {"kind": "identifier", "canonical_name": canonical_name},
+        )
+    if isinstance(node, UnaryNode):
+        if node.op not in {"+", "-"}:
             raise _unsupported("Only unary plus/minus are supported in symbolic proof.")
-        _validate_ast(node.operand)
-        return
-    if isinstance(node, ast.BinOp):
-        if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
-            raise _unsupported("Only arithmetic operators are supported in symbolic proof.")
-        _validate_ast(node.left)
-        _validate_ast(node.right)
-        return
-    raise _unsupported(f"Unsupported symbolic expression node: {type(node).__name__}.")
-
-
-def _validate_retained_proof_arithmetic(assignment: ParameterAssignment) -> None:
-    """Admit only arithmetic whose symbolic proof preserves Algebra meaning.
-
-    Algebra evaluates every numeric operation as binary64 in retained AST
-    order.  SymPy may reassociate additive trees and eliminate cancellation,
-    so an additive parameter expression cannot safely establish a scientific
-    identity.  Multiplicative detailed-balance relations remain supported;
-    everything else fails closed instead of proving a different program.
-    """
-
-    def visit(node: object) -> None:
-        if isinstance(node, (NumberNode, IdentNode)):
-            return
-        if isinstance(node, UnaryNode):
-            if node.op not in {"+", "-"}:
-                raise _unsupported(
-                    "Only unary plus/minus are supported in symbolic proof."
-                )
-            visit(node.rhs)
-            return
-        if isinstance(node, BinaryNode):
-            if node.op in {"+", "-"}:
-                raise _unsupported(
-                    "Additive binary64 parameter arithmetic cannot establish "
-                    "an exact symbolic identity."
-                )
-            if node.op not in {"*", "/", "**", "^"}:
-                raise _unsupported(
-                    f"Unsupported retained Algebra operator: {node.op!r}."
-                )
-            visit(node.lhs)
-            visit(node.rhs)
-            return
-        raise _unsupported(
-            "Symbolic proof requires the retained admitted Algebra AST."
+        rhs, rhs_payload = _translate_retained_node(
+            node.rhs,
+            namespace=namespace,
+            identifiers=identifiers,
+            sympy=sympy,
         )
-
-    if assignment.expr_ast is None:
-        raise _unsupported(
-            "Symbolic proof requires the retained admitted Algebra AST."
+        return (
+            rhs if node.op == "+" else -rhs,
+            {"kind": "unary", "operator": str(node.op), "rhs": rhs_payload},
         )
-    visit(assignment.expr_ast)
-
-
-def _identifier_order(node: ast.AST) -> tuple[str, ...]:
-    names: list[str] = []
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name) and child.id not in names:
-            names.append(child.id)
-    return tuple(names)
+    if isinstance(node, BinaryNode):
+        operator = str(node.op)
+        if operator in {"+", "-"}:
+            raise _unsupported(
+                "Additive binary64 parameter arithmetic cannot establish "
+                "an exact symbolic identity."
+            )
+        operation = {
+            "*": "multiply",
+            "/": "divide",
+            "**": "power",
+            "^": "power",
+        }.get(operator)
+        if operation is None:
+            raise _unsupported(
+                f"Unsupported retained Algebra operator: {operator!r}."
+            )
+        lhs, lhs_payload = _translate_retained_node(
+            node.lhs,
+            namespace=namespace,
+            identifiers=identifiers,
+            sympy=sympy,
+        )
+        rhs, rhs_payload = _translate_retained_node(
+            node.rhs,
+            namespace=namespace,
+            identifiers=identifiers,
+            sympy=sympy,
+        )
+        if operation == "multiply":
+            expression = lhs * rhs
+        elif operation == "divide":
+            expression = lhs / rhs
+        else:
+            expression = lhs ** rhs
+        if expression.has(sympy.zoo, sympy.oo, -sympy.oo, sympy.nan):
+            raise _unsupported("Retained symbolic expression produced a non-finite result.")
+        return (
+            expression,
+            {
+                "kind": "binary",
+                "operation": operation,
+                "lhs": lhs_payload,
+                "rhs": rhs_payload,
+            },
+        )
+    raise _unsupported(
+        "Symbolic proof requires supported nodes from the retained admitted Algebra AST; "
+        f"got {type(node).__name__}."
+    )
 
 
 def translate_parameter_expression(
@@ -142,27 +151,25 @@ def translate_parameter_expression(
     spec: ParameterAlgebraSpec | None = None,
     namespace: SymbolicParameterNamespaceContext | None = None,
 ) -> SymbolicExpression:
-    _validate_retained_proof_arithmetic(assignment)
     parameter_namespace = _coerce_parameter_namespace(spec=spec, namespace=namespace)
-    normalized = _normalize_source(assignment.expr_src, parameter_namespace)
-    try:
-        tree = ast.parse(normalized, mode="eval")
-    except SyntaxError as exc:
-        raise _unsupported(f"Invalid symbolic expression syntax: {assignment.expr_src!r}.") from exc
-    _validate_ast(tree)
+    retained_node = assignment.expr_ast
+    if retained_node is None:
+        raise _unsupported("Symbolic proof requires the retained admitted Algebra AST.")
     sympy = require_sympy()
-    identifiers = _identifier_order(tree)
+    identifier_order: list[str] = []
+    expression, retained_structure = _translate_retained_node(
+        retained_node,
+        namespace=parameter_namespace,
+        identifiers=identifier_order,
+        sympy=sympy,
+    )
+    identifiers = tuple(identifier_order)
     symbol_context = parameter_namespace.to_expression_payload(identifiers)
-    locals_map = {name: sympy.Symbol(name) for name in identifiers}
-    try:
-        expression = sympy.sympify(normalized, locals=locals_map, rational=True)
-    except Exception as exc:
-        raise _unsupported(f"Could not translate symbolic expression {assignment.expr_src!r}.") from exc
     metadata = get_symbolic_backend_metadata()
     fingerprint = symbolic_fingerprint(
         {
             "name": str(assignment.name),
-            "normalized_source": str(expression),
+            "retained_structure": retained_structure,
             "identifiers": identifiers,
             "symbol_context": symbol_context,
             "backend": metadata.to_payload(),

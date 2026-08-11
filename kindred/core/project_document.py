@@ -33,7 +33,6 @@ __all__ = [
     "FitDefaults",
     "InitialConditionSet",
     "MechanismSourceCollision",
-    "MechanismSourceFailure",
     "MechanismSourceReconciliation",
     "MechanismTabDocument",
     "ProjectDocument",
@@ -687,11 +686,6 @@ class MechanismSourceCollision:
             )
 
 
-@dataclass(frozen=True, slots=True)
-class MechanismSourceFailure:
-    message: str
-
-
 def default_simulation_execution_settings() -> SimulationExecutionSettings:
     return SimulationExecutionSettings()
 
@@ -1039,278 +1033,274 @@ def reconcile_tab_mechanism_source(
 ) -> (
     MechanismSourceReconciliation
     | MechanismSourceCollision
-    | MechanismSourceFailure
 ):
     """Purely validate and reconcile visible source into one atomic proposal."""
     if not isinstance(document, ProjectDocument):
         raise TypeError("document must be a ProjectDocument.")
     if not isinstance(visible_source, MechanismAuthoringSource):
         raise TypeError("visible_source must be MechanismAuthoringSource.")
-    try:
-        tab = document.tab(tab_id)
-        admitted_dsl = _prepare_source_dsl(
-            visible_source,
-            tab.scientific_settings,
+    tab = document.tab(tab_id)
+    admitted_dsl = _prepare_source_dsl(
+        visible_source,
+        tab.scientific_settings,
+    )
+    admission = (
+        DslInitialConditionAdmission(
+            materialized_source=visible_source.reactions_text
         )
-        admission = (
-            DslInitialConditionAdmission(
-                materialized_source=visible_source.reactions_text
-            )
-            if admitted_dsl is None
-            else admitted_dsl.analysis.inline_initial_conditions
-        )
-        new_species = (
-            ()
-            if admitted_dsl is None
-            else admitted_dsl.analysis.species_names
-        )
-        old_species = (
-            ()
-            if tab.dsl_analysis is None
-            else tab.dsl_analysis.species_names
-        )
-        new_species_set = set(new_species)
-        old_species_set = set(old_species)
-        introduced = tuple(
-            species
-            for species in new_species
-            if species not in old_species_set
-        )
-        reconciled_sets: list[InitialConditionSet] = []
-        for initial_set in tab.initial_condition_sets:
-            values = {
-                species: value
-                for species, value in initial_set.values
-                if species in new_species_set
-            }
-            for species in introduced:
-                values[species] = 0.0
-            reconciled_sets.append(
-                replace(initial_set, values=tuple(values.items()))
-            )
-        existing_by_name = {
-            item.name.casefold(): item for item in reconciled_sets
+        if admitted_dsl is None
+        else admitted_dsl.analysis.inline_initial_conditions
+    )
+    new_species = (
+        ()
+        if admitted_dsl is None
+        else admitted_dsl.analysis.species_names
+    )
+    old_species = (
+        ()
+        if tab.dsl_analysis is None
+        else tab.dsl_analysis.species_names
+    )
+    new_species_set = set(new_species)
+    old_species_set = set(old_species)
+    introduced = tuple(
+        species
+        for species in new_species
+        if species not in old_species_set
+    )
+    reconciled_sets: list[InitialConditionSet] = []
+    for initial_set in tab.initial_condition_sets:
+        values = {
+            species: value
+            for species, value in initial_set.values
+            if species in new_species_set
         }
-        declared_named = tuple(admission.named_declarations)
-        collisions = tuple(
-            existing_by_name[declaration.source_name.casefold()].name
+        for species in introduced:
+            values[species] = 0.0
+        reconciled_sets.append(
+            replace(initial_set, values=tuple(values.items()))
+        )
+    existing_by_name = {
+        item.name.casefold(): item for item in reconciled_sets
+    }
+    declared_named = tuple(admission.named_declarations)
+    collisions = tuple(
+        existing_by_name[declaration.source_name.casefold()].name
+        for declaration in declared_named
+        if declaration.source_name is not None
+        and declaration.source_name.casefold() in existing_by_name
+    )
+
+    anonymous_declarations = tuple(
+        declaration
+        for declaration in admission.declarations
+        if declaration.source_kind == "anonymous"
+    )
+    anonymous_name: str | None = None
+    anonymous_existing_id: str | None = None
+    if anonymous_declarations:
+        declared_name_keys = {
+            declaration.source_name.casefold()
             for declaration in declared_named
             if declaration.source_name is not None
-            and declaration.source_name.casefold() in existing_by_name
-        )
-
-        anonymous_declarations = tuple(
-            declaration
-            for declaration in admission.declarations
-            if declaration.source_kind == "anonymous"
-        )
-        anonymous_name: str | None = None
-        anonymous_existing_id: str | None = None
-        if anonymous_declarations:
-            declared_name_keys = {
-                declaration.source_name.casefold()
-                for declaration in declared_named
-                if declaration.source_name is not None
-            }
-            pristine_set1 = next(
-                (
-                    item
-                    for item in reconciled_sets
-                    if item.name == "set1"
-                    and not any(value != 0.0 for _species, value in item.values)
-                    and not any(
-                        set_id == item.set_id
-                        for set_id, _settings in tab.run_overrides_by_set_id
-                    )
-                    and not any(
-                        link.set_id == item.set_id
-                        for _dataset_id, link in tab.dataset_links
-                    )
-                ),
-                None,
-            )
-            if pristine_set1 is not None and "set1" not in declared_name_keys:
-                anonymous_name = pristine_set1.name
-                anonymous_existing_id = pristine_set1.set_id
-            else:
-                occupied = {
-                    item.name.casefold() for item in reconciled_sets
-                } | declared_name_keys
-                suffix = 1
-                while f"set{suffix}".casefold() in occupied:
-                    suffix += 1
-                anonymous_name = f"set{suffix}"
-
-        for declaration in admission.declarations:
-            context_name = (
-                declaration.source_name
-                if declaration.source_kind == "named"
-                else anonymous_name
-            )
-            if context_name is None:
-                raise ValueError(
-                    "Anonymous initial conditions have no materialization "
-                    "target."
-                )
-            for assignment in declaration.assignments:
-                if assignment.species not in new_species_set:
-                    raise ValueError(
-                        f"Inline initial-condition set {context_name!r} "
-                        f"references species {assignment.species!r} absent "
-                        "from the complete Reactions model."
-                    )
-
-        mutable_sets = list(reconciled_sets)
-        index_by_name = {
-            item.name.casefold(): index
-            for index, item in enumerate(mutable_sets)
         }
-        materialized_ids: list[str] = []
-        anonymous_target: InitialConditionSet | None = None
-        for declaration in admission.declarations:
-            if declaration.source_kind == "named":
-                target_name = str(declaration.source_name)
-                target_index = index_by_name.get(target_name.casefold())
-                values = {species: 0.0 for species in new_species}
-                values.update(
-                    {
-                        assignment.species: assignment.value
-                        for assignment in declaration.assignments
-                    }
+        pristine_set1 = next(
+            (
+                item
+                for item in reconciled_sets
+                if item.name == "set1"
+                and not any(value != 0.0 for _species, value in item.values)
+                and not any(
+                    set_id == item.set_id
+                    for set_id, _settings in tab.run_overrides_by_set_id
                 )
-                if target_index is None:
-                    target = InitialConditionSet(
-                        set_id=new_set_id(),
-                        name=target_name,
-                        values=tuple(values.items()),
-                    )
-                    index_by_name[target_name.casefold()] = len(mutable_sets)
-                    mutable_sets.append(target)
-                else:
-                    existing = mutable_sets[target_index]
-                    target = replace(existing, values=tuple(values.items()))
-                    mutable_sets[target_index] = target
-                materialized_ids.append(target.set_id)
-                continue
-
-            if anonymous_name is None:
-                raise ValueError(
-                    "Anonymous initial conditions have no allocated set."
+                and not any(
+                    link.set_id == item.set_id
+                    for _dataset_id, link in tab.dataset_links
                 )
-            if anonymous_target is None:
-                target_index = index_by_name.get(anonymous_name.casefold())
-                if target_index is None:
-                    anonymous_target = InitialConditionSet(
-                        set_id=new_set_id(),
-                        name=anonymous_name,
-                        values=tuple(
-                            (species, 0.0) for species in new_species
-                        ),
-                    )
-                    index_by_name[anonymous_name.casefold()] = len(mutable_sets)
-                    mutable_sets.append(anonymous_target)
-                else:
-                    anonymous_target = mutable_sets[target_index]
-                    if (
-                        anonymous_existing_id is not None
-                        and anonymous_target.set_id != anonymous_existing_id
-                    ):
-                        raise ValueError(
-                            "Anonymous initial-condition allocation changed "
-                            "during admission."
-                        )
-                materialized_ids.append(anonymous_target.set_id)
-            values = {
-                species: float(
-                    anonymous_target.values_dict().get(species, 0.0)
-                )
-                for species in new_species
-            }
-            for assignment in declaration.assignments:
-                values[assignment.species] = assignment.value
-            anonymous_target = replace(
-                anonymous_target,
-                values=tuple(values.items()),
-            )
-            mutable_sets[index_by_name[anonymous_name.casefold()]] = (
-                anonymous_target
-            )
-
-        accepted_source = (
-            visible_source
-            if not admission.has_declarations
-            else MechanismAuthoringSource.from_parts(
-                reactions_text=admission.materialized_source
-            )
+            ),
+            None,
         )
-        prepared_dsl = (
-            _prepare_source_dsl(
-                accepted_source,
-                tab.scientific_settings,
-            )
-            if admission.has_declarations
-            else admitted_dsl
+        if pristine_set1 is not None and "set1" not in declared_name_keys:
+            anonymous_name = pristine_set1.name
+            anonymous_existing_id = pristine_set1.set_id
+        else:
+            occupied = {
+                item.name.casefold() for item in reconciled_sets
+            } | declared_name_keys
+            suffix = 1
+            while f"set{suffix}".casefold() in occupied:
+                suffix += 1
+            anonymous_name = f"set{suffix}"
+
+    for declaration in admission.declarations:
+        context_name = (
+            declaration.source_name
+            if declaration.source_kind == "named"
+            else anonymous_name
         )
-        if (
-            prepared_dsl is not None
-            and prepared_dsl.analysis.inline_initial_conditions.has_declarations
-        ):
+        if context_name is None:
             raise ValueError(
-                "Accepted source still contains executable inline initial "
-                "conditions after materialization."
+                "Anonymous initial conditions have no materialization "
+                "target."
             )
-        reconciled_links: list[tuple[str, DatasetLink]] = []
-        for dataset_id, link in tab.dataset_links:
-            observation_mapping = tuple(
-                (raw_observation_id, model_species)
-                for raw_observation_id, model_species
-                in link.observation_mapping
-                if model_species in new_species_set
+        for assignment in declaration.assignments:
+            if assignment.species not in new_species_set:
+                raise ValueError(
+                    f"Inline initial-condition set {context_name!r} "
+                    f"references species {assignment.species!r} absent "
+                    "from the complete Reactions model."
+                )
+
+    mutable_sets = list(reconciled_sets)
+    index_by_name = {
+        item.name.casefold(): index
+        for index, item in enumerate(mutable_sets)
+    }
+    materialized_ids: list[str] = []
+    anonymous_target: InitialConditionSet | None = None
+    for declaration in admission.declarations:
+        if declaration.source_kind == "named":
+            target_name = str(declaration.source_name)
+            target_index = index_by_name.get(target_name.casefold())
+            values = {species: 0.0 for species in new_species}
+            values.update(
+                {
+                    assignment.species: assignment.value
+                    for assignment in declaration.assignments
+                }
             )
-            reconciled_links.append(
-                (
-                    dataset_id,
-                    replace(
-                        link,
-                        observation_mapping=observation_mapping,
-                        include_in_fit=(
-                            link.include_in_fit
-                            and bool(observation_mapping)
-                        ),
+            if target_index is None:
+                target = InitialConditionSet(
+                    set_id=new_set_id(),
+                    name=target_name,
+                    values=tuple(values.items()),
+                )
+                index_by_name[target_name.casefold()] = len(mutable_sets)
+                mutable_sets.append(target)
+            else:
+                existing = mutable_sets[target_index]
+                target = replace(existing, values=tuple(values.items()))
+                mutable_sets[target_index] = target
+            materialized_ids.append(target.set_id)
+            continue
+
+        if anonymous_name is None:
+            raise ValueError(
+                "Anonymous initial conditions have no allocated set."
+            )
+        if anonymous_target is None:
+            target_index = index_by_name.get(anonymous_name.casefold())
+            if target_index is None:
+                anonymous_target = InitialConditionSet(
+                    set_id=new_set_id(),
+                    name=anonymous_name,
+                    values=tuple(
+                        (species, 0.0) for species in new_species
                     ),
                 )
+                index_by_name[anonymous_name.casefold()] = len(mutable_sets)
+                mutable_sets.append(anonymous_target)
+            else:
+                anonymous_target = mutable_sets[target_index]
+                if (
+                    anonymous_existing_id is not None
+                    and anonymous_target.set_id != anonymous_existing_id
+                ):
+                    raise ValueError(
+                        "Anonymous initial-condition allocation changed "
+                        "during admission."
+                    )
+            materialized_ids.append(anonymous_target.set_id)
+        values = {
+            species: float(
+                anonymous_target.values_dict().get(species, 0.0)
             )
-        proposed_tab = replace(
-            tab.with_initial_condition_sets(tuple(mutable_sets)),
-            mechanism_source=accepted_source,
-            dataset_links=tuple(reconciled_links),
-            prepared_dsl=prepared_dsl,
+            for species in new_species
+        }
+        for assignment in declaration.assignments:
+            values[assignment.species] = assignment.value
+        anonymous_target = replace(
+            anonymous_target,
+            values=tuple(values.items()),
         )
-        proposed_document = replace(
-            document,
-            tabs=tuple(
-                proposed_tab if item.tab_id == tab.tab_id else item
-                for item in document.tabs
-            ),
+        mutable_sets[index_by_name[anonymous_name.casefold()]] = (
+            anonymous_target
         )
-        reconciliation = MechanismSourceReconciliation(
-            proposed_document=proposed_document,
-            inline_initial_conditions=admission,
-            prepared_dsl=prepared_dsl,
-            detailed_balance=_detailed_balance_admission(
-                prepared_dsl,
-                policy_enabled=tab.scientific_settings.wegscheider_policy,
-            ),
-            materialized_set_ids=tuple(dict.fromkeys(materialized_ids)),
+
+    accepted_source = (
+        visible_source
+        if not admission.has_declarations
+        else MechanismAuthoringSource.from_parts(
+            reactions_text=admission.materialized_source
         )
-        if collisions:
-            return MechanismSourceCollision(
-                existing_names=tuple(dict.fromkeys(collisions)),
-                replacement=reconciliation,
+    )
+    prepared_dsl = (
+        _prepare_source_dsl(
+            accepted_source,
+            tab.scientific_settings,
+        )
+        if admission.has_declarations
+        else admitted_dsl
+    )
+    if (
+        prepared_dsl is not None
+        and prepared_dsl.analysis.inline_initial_conditions.has_declarations
+    ):
+        raise ValueError(
+            "Accepted source still contains executable inline initial "
+            "conditions after materialization."
+        )
+    reconciled_links: list[tuple[str, DatasetLink]] = []
+    for dataset_id, link in tab.dataset_links:
+        observation_mapping = tuple(
+            (raw_observation_id, model_species)
+            for raw_observation_id, model_species
+            in link.observation_mapping
+            if model_species in new_species_set
+        )
+        reconciled_links.append(
+            (
+                dataset_id,
+                replace(
+                    link,
+                    observation_mapping=observation_mapping,
+                    include_in_fit=(
+                        link.include_in_fit
+                        and bool(observation_mapping)
+                    ),
+                ),
             )
-        return reconciliation
-    except (DSLError, KeyError, TypeError, ValueError) as exc:
-        return MechanismSourceFailure(message=str(exc))
+        )
+    proposed_tab = replace(
+        tab.with_initial_condition_sets(tuple(mutable_sets)),
+        mechanism_source=accepted_source,
+        dataset_links=tuple(reconciled_links),
+        prepared_dsl=prepared_dsl,
+    )
+    proposed_document = replace(
+        document,
+        tabs=tuple(
+            proposed_tab if item.tab_id == tab.tab_id else item
+            for item in document.tabs
+        ),
+    )
+    reconciliation = MechanismSourceReconciliation(
+        proposed_document=proposed_document,
+        inline_initial_conditions=admission,
+        prepared_dsl=prepared_dsl,
+        detailed_balance=_detailed_balance_admission(
+            prepared_dsl,
+            policy_enabled=tab.scientific_settings.wegscheider_policy,
+        ),
+        materialized_set_ids=tuple(dict.fromkeys(materialized_ids)),
+    )
+    if collisions:
+        return MechanismSourceCollision(
+            existing_names=tuple(dict.fromkeys(collisions)),
+            replacement=reconciliation,
+        )
+    return reconciliation
 
 
 def validate_project_document(document: ProjectDocument) -> ProjectDocument:

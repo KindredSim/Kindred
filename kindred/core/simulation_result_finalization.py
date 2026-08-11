@@ -34,6 +34,21 @@ __all__ = [
     "finalize_simulation_result",
 ]
 
+
+def _immutable_exact_float_matrix(value: object) -> np.ndarray:
+    if (
+        isinstance(value, np.ndarray)
+        and value.dtype == np.dtype(float)
+        and value.ndim == 2
+        and not value.flags.writeable
+        and value.flags.owndata
+    ):
+        return value
+    array = np.array(value, dtype=float, copy=True)
+    array.setflags(write=False)
+    return array
+
+
 @dataclass(frozen=True)
 class FinalizedSimulationResult:
     y: np.ndarray
@@ -43,7 +58,10 @@ class FinalizedSimulationResult:
     algebra_errors: list[dict[str, Any]]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "y", self.y.copy())
+        y = _immutable_exact_float_matrix(self.y)
+        if y.ndim != 2:
+            raise ValueError("finalized simulation matrix must be two-dimensional.")
+        object.__setattr__(self, "y", y)
         object.__setattr__(self, "species_names", list(self.species_names))
         object.__setattr__(self, "algebra_scalars", deepcopy(dict(self.algebra_scalars)))
         object.__setattr__(self, "algebra_errors", [deepcopy(dict(error)) for error in self.algebra_errors])
@@ -238,7 +256,7 @@ def evaluate_simulation_result_algebra(
         or len(set(base_species_names)) != len(base_species_names)
     ):
         raise ValueError("base simulation species names must be nonblank and unique.")
-    result_y = np.asarray(getattr(result, "Y"), dtype=float)
+    result_y = _immutable_exact_float_matrix(getattr(result, "Y"))
     result_t = np.asarray(getattr(result, "t"), dtype=float)
     if result_t.ndim != 1 or result_t.size == 0:
         raise ValueError("solver result time must be a nonempty 1D array.")
@@ -372,9 +390,18 @@ def evaluate_simulation_result_algebra(
         )
 
     algebra_names = [str(name) for name in evaluation.series.keys()]
-    algebra_matrix = np.vstack([np.asarray(evaluation.series[name], dtype=float) for name in algebra_names])
+    expanded_y = np.vstack(
+        [
+            result_y,
+            *(
+                np.asarray(evaluation.series[name], dtype=float)
+                for name in algebra_names
+            ),
+        ]
+    )
+    expanded_y.setflags(write=False)
     return FinalizedSimulationResult(
-        y=np.vstack([result_y, algebra_matrix]),
+        y=expanded_y,
         species_names=base_species_names + algebra_names,
         base_species_count=len(base_species_names),
         algebra_scalars=algebra_scalars,

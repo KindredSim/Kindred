@@ -68,7 +68,10 @@ def project_nonnegative_trajectory(
     if Y2.size == 0:
         return Y2, NonnegativeProjection()
     if not np.all(np.isfinite(Y2)):
-        raise SolverError(f"{context} trajectory contains non-finite concentration values.")
+        raise SolverError(
+            f"{context} trajectory contains non-finite concentration values.",
+            details={"candidate_domain_eligible": True},
+        )
     negative_mask = Y2 < 0.0
     count = int(np.count_nonzero(negative_mask))
     max_negative_magnitude = 0.0

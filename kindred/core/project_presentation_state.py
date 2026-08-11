@@ -73,6 +73,8 @@ AxisSeriesSelection: TypeAlias = (
 
 @dataclass(frozen=True, slots=True)
 class ProjectPresentationState:
+    """Persisted authored choices; active-overlay Y derivation is not stored."""
+
     current_set_id: str | None = None
     plot_set_ids: tuple[str, ...] = ()
     pinned_slider_set_ids: tuple[str, ...] = ()

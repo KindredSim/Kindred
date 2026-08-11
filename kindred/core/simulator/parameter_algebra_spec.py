@@ -65,10 +65,6 @@ def _raise_invalid_protected_indexed_identifier_error(
     )
 
 
-def is_protected_indexed_parameter_identifier(raw_name: str) -> bool:
-    return is_protected_indexed_identifier(raw_name)
-
-
 def invalid_parameter_algebra_identifier_reference_message(
     raw_name: str,
     *,
@@ -97,7 +93,7 @@ def invalid_parameter_algebra_identifier_reference_message(
             )
             return f"{name!r} is not a valid indexed parameter identifier.{suggestion_clause}"
         return None
-    if reject_unresolved_protected_indexed and is_protected_indexed_parameter_identifier(name):
+    if reject_unresolved_protected_indexed and is_protected_indexed_identifier(name):
         return (
             f"{name!r} is a protected indexed parameter identifier. "
             "Exact protected indexed names must resolve through the mechanism namespace."
@@ -455,7 +451,7 @@ def _canonicalize_parameter_expr(
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
-        if resolution.canonical_name is None and is_protected_indexed_parameter_identifier(raw_name):
+        if resolution.canonical_name is None and is_protected_indexed_identifier(raw_name):
             _raise_invalid_protected_indexed_identifier_error(
                 raw_name,
                 suggested_names=(),
@@ -1127,7 +1123,7 @@ def extract_parameter_assignments_from_algebra_lines(
                     line_number=line_no,
                     line_content=original,
                 )
-            if is_protected_indexed_parameter_identifier(target_raw):
+            if is_protected_indexed_identifier(target_raw):
                 _raise_protected_observable_identifier_error(
                     target_raw,
                     line_number=line_no,
@@ -1158,7 +1154,7 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
         if classification.kind == "param":
             continue
         if classification.kind == "let":
-            if is_protected_indexed_parameter_identifier(classification.raw_name):
+            if is_protected_indexed_identifier(classification.raw_name):
                 _raise_protected_observable_identifier_error(
                     classification.raw_name,
                     line_number=_line_no,

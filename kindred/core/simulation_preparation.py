@@ -414,10 +414,7 @@ class SimulationPreparationError(RuntimeError):
         message: str,
         *,
         parameter_names: Iterable[str] = (),
-        candidate_domain_eligible: bool = False,
     ) -> None:
-        if type(candidate_domain_eligible) is not bool:
-            raise TypeError("candidate_domain_eligible must be a bool.")
         super().__init__(str(message))
         self.stage = str(stage or "unknown")
         self.parameter_names = frozenset(
@@ -425,7 +422,6 @@ class SimulationPreparationError(RuntimeError):
             for name in parameter_names
             if str(name).strip()
         )
-        self.candidate_domain_eligible = candidate_domain_eligible
 
 
 def _raise_if_cancelled(
@@ -532,7 +528,6 @@ def resolve_prepared_run_intervention_execution(
             "intervention_schedule",
             str(exc),
             parameter_names=parameter_partition.schedule_parameter_names,
-            candidate_domain_eligible=True,
         ) from exc
 
 
@@ -876,7 +871,6 @@ def _resolve_intervention_schedule_for_request(
             "intervention_schedule",
             str(exc),
             parameter_names=intervention_schedule_parameter_names(schedule),
-            candidate_domain_eligible=True,
         ) from exc
 
 
@@ -1171,7 +1165,6 @@ def _preparation_failure_payload(exc: SimulationPreparationError) -> Dict[str, A
         details={
             "stage": str(exc.stage or "unknown"),
             "parameter_names": tuple(sorted(exc.parameter_names)),
-            "candidate_domain_eligible": exc.candidate_domain_eligible,
         },
         exc_type=exc.__class__.__name__,
     )
@@ -1180,24 +1173,14 @@ def _preparation_failure_payload(exc: SimulationPreparationError) -> Dict[str, A
 def fit_simulation_error_from_preparation_error(
     exc: SimulationPreparationError,
     *,
-    fatal: bool = True,
-    candidate_domain: bool = False,
     failed_params: Optional[Dict[str, float]] = None,
 ) -> FitSimulationError:
-    if type(fatal) is not bool:
-        raise TypeError("fatal must be a bool.")
-    if type(candidate_domain) is not bool:
-        raise TypeError("candidate_domain must be a bool.")
-    if fatal == candidate_domain:
-        raise ValueError(
-            "A preparation failure must be exactly fatal or candidate-domain."
-        )
     return FitSimulationError(
         str(exc),
         failed_params=failed_params,
         details={
-            "fatal": fatal,
-            "candidate_domain": candidate_domain,
+            "fatal": True,
+            "candidate_domain": False,
             "stage": exc.stage,
             "failure": _preparation_failure_payload(exc),
         },
@@ -1223,14 +1206,12 @@ def _coerce_parameter_override_items(
                 "parameter_overrides",
                 f"Parameter override {name!r} must be numeric.",
                 parameter_names=(name,),
-                candidate_domain_eligible=True,
             ) from exc
         if bool(require_finite) and not np.isfinite(value):
             raise SimulationPreparationError(
                 "parameter_overrides",
                 f"Parameter override {name!r} must be finite.",
                 parameter_names=(name,),
-                candidate_domain_eligible=True,
             )
         items.append((name, value))
     return items
@@ -1491,7 +1472,6 @@ def _apply_parameter_overrides_to_prepared_mechanism(
                 "parameter_overrides",
                 f"mechanism parameter {target_name!r} must be positive and finite.",
                 parameter_names=(name,),
-                candidate_domain_eligible=True,
             )
         candidate = None
         if kind == "reaction" and role == "k":
@@ -1527,21 +1507,11 @@ def _apply_parameter_overrides_to_prepared_mechanism(
             apply_parameter_algebra_spec_to_mechanism,
         )
 
-        try:
-            apply_parameter_algebra_spec_to_mechanism(
-                parameter_algebra_spec,
-                mechanism=mechanism,
-                require_mutable=True,
-            )
-        except SimulationPreparationError:
-            raise
-        except Exception as exc:
-            raise SimulationPreparationError(
-                "parameter_overrides",
-                str(exc),
-                parameter_names=tuple(name for name, _value in mechanism_override_items),
-                candidate_domain_eligible=True,
-            ) from exc
+        apply_parameter_algebra_spec_to_mechanism(
+            parameter_algebra_spec,
+            mechanism=mechanism,
+            require_mutable=True,
+        )
     return None
 
 
@@ -1645,7 +1615,6 @@ def _reject_conflicting_equilibrium_reverse_overrides(
                 "parameter_overrides",
                 f"equilibrium parameter {keq_name} must be positive.",
                 parameter_names=(keq_name,),
-                candidate_domain_eligible=True,
             )
         expected_kr = float(effective_reverse_rate_from_keq(kf_value, keq_value, reverse_std_ratio))
         actual_kr = float(requested[kr_name])
@@ -1658,7 +1627,6 @@ def _reject_conflicting_equilibrium_reverse_overrides(
                     f"{keq_name}={keq_value:.17g} and {kf_name}={float(kf_value):.17g}."
                 ),
                 parameter_names=(kf_name, kr_name, keq_name),
-                candidate_domain_eligible=True,
             )
 
 
@@ -1729,8 +1697,6 @@ def _apply_execution_parameter_algebra_and_cyclicity(
         )
     except UnresolvedWegscheiderCyclicityError as exc:
         raise SimulationPreparationError("wegscheider_cyclicity", str(exc)) from exc
-    except Exception as exc:
-        raise SimulationPreparationError("parameter_algebra", str(exc)) from exc
 
     if prepared_solver_config.wegscheider_cyclicity_enabled and bool(
         getattr(mechanism, "equilibria", []) or []
@@ -1739,8 +1705,6 @@ def _apply_execution_parameter_algebra_and_cyclicity(
             report = validate_wegscheider_cyclicity_resolved(mechanism)
         except UnresolvedWegscheiderCyclicityError as exc:
             raise SimulationPreparationError("wegscheider_cyclicity", str(exc)) from exc
-        except Exception as exc:
-            raise SimulationPreparationError("parameter_algebra", str(exc)) from exc
         if report.cycles:
             meta = getattr(mechanism, "metadata", None)
             if isinstance(meta, dict):
@@ -1820,14 +1784,6 @@ def prepare_simulation_worker_run(
             )
         except SimulationPreparationError:
             raise
-        except Exception as exc:
-            raise SimulationPreparationError(
-                "parameter_overrides",
-                str(exc),
-                parameter_names=tuple(
-                    (execution_request.parameter_overrides or {}).keys()
-                ),
-            ) from exc
     _raise_if_cancelled(cancellation_control)
 
     intervention_execution = snapshot.intervention_execution
@@ -1870,7 +1826,6 @@ def prepare_simulation_worker_run(
                         if parameter_partition is None
                         else parameter_partition.schedule_parameter_names
                     ),
-                    candidate_domain_eligible=True,
                 ) from exc
 
     if rhs is None:

@@ -138,26 +138,21 @@ def _normal_event_states(raw_states: object, *, count: int, species_count: int) 
     return output
 
 
-def _scipy_method_for(name: object) -> str:
-    """Map solver name to SciPy method name with correct capitalization."""
-    n = str(name or "").strip().upper()
-    scipy_methods = {
-        "RADAU": "Radau",
-        "BDF": "BDF",
-    }
-    if n in scipy_methods:
-        return scipy_methods[n]
-    allowed = ", ".join(sorted(scipy_methods.values()))
-    raise SolverError(f"Unsupported solver name {name!r}; expected one of: {allowed}.")
-
-
 def normalize_solver_name(name: object) -> str:
     """
     Normalize a user-specified solver name to a SciPy `solve_ivp` method name.
 
     Unknown names raise `SolverError`.
     """
-    return _scipy_method_for(name)
+    normalized = str(name or "").strip().upper()
+    scipy_methods = {
+        "RADAU": "Radau",
+        "BDF": "BDF",
+    }
+    if normalized in scipy_methods:
+        return scipy_methods[normalized]
+    allowed = ", ".join(sorted(scipy_methods.values()))
+    raise SolverError(f"Unsupported solver name {name!r}; expected one of: {allowed}.")
 
 
 class _TemperatureInjectedRhs:
@@ -502,7 +497,12 @@ def _execute_scipy(
     if not sol.success:
         prov["solver_failure"] = str(sol.message)
         t_fail = float(sol.t[-1]) if getattr(sol, "t", None) is not None and len(sol.t) > 0 else float(t0)
-        raise create_solver_error(req.solver, t_fail, str(sol.message))
+        raise create_solver_error(
+            req.solver,
+            t_fail,
+            str(sol.message),
+            candidate_domain_eligible=True,
+        )
 
     prov["solver_used"] = method
     t_out = np.asarray(sol.t, float)
@@ -647,7 +647,7 @@ def solve_ode(req: _SimulationRequest) -> _SimulationOutput:
     rhs = _prepare_rhs(req, t0=t0, t1=t1)
     prov = _build_provenance(req, t_eval=t_eval)
 
-    method = _scipy_method_for(req.solver)
+    method = normalize_solver_name(req.solver)
     _scrub_unused_jacobian_provenance(prov, method=method)
     return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
         ScheduleExecutionRequest(

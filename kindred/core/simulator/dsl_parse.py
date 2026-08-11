@@ -178,7 +178,6 @@ def _dsl_identity_payload(
 @dataclass(frozen=True, slots=True)
 class DslSourceOrigin:
     authored_ordinal: int
-    line_number: int
     source_text: str
 
     def __post_init__(self) -> None:
@@ -187,8 +186,6 @@ class DslSourceOrigin:
             or self.authored_ordinal < 0
         ):
             raise ValueError("DSL origin ordinal must be a non-negative int.")
-        if type(self.line_number) is not int or self.line_number <= 0:
-            raise ValueError("DSL origin line number must be a positive int.")
         if type(self.source_text) is not str:
             raise TypeError("DSL origin source text must be an exact string.")
 
@@ -222,13 +219,10 @@ _DSL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 @dataclass(frozen=True, slots=True)
 class DslInitialConditionAssignment:
-    """One validated, origin-stamped inline concentration assignment."""
+    """One validated inline concentration assignment."""
 
     species: str
     value: float
-    authored_ordinal: int
-    line_number: int
-    source_text: str
 
     def __post_init__(self) -> None:
         if (
@@ -248,22 +242,6 @@ class DslInitialConditionAssignment:
                 "Inline initial-condition values must be finite and "
                 "nonnegative."
             )
-        if (
-            type(self.authored_ordinal) is not int
-            or self.authored_ordinal < 0
-        ):
-            raise ValueError(
-                "Inline initial-condition assignment ordinal must be "
-                "non-negative."
-            )
-        if type(self.line_number) is not int or self.line_number <= 0:
-            raise ValueError(
-                "Inline initial-condition assignment line must be positive."
-            )
-        if type(self.source_text) is not str:
-            raise TypeError(
-                "Inline initial-condition assignment source must be text."
-            )
         object.__setattr__(self, "value", value)
 
 
@@ -274,9 +252,6 @@ class DslInitialConditionDeclaration:
     source_kind: str
     source_name: str | None
     assignments: tuple[DslInitialConditionAssignment, ...]
-    start_line: int
-    end_line: int
-    source_lines: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if self.source_kind not in {"named", "anonymous"}:
@@ -301,23 +276,6 @@ class DslInitialConditionDeclaration:
         ):
             raise TypeError(
                 "Inline initial-condition assignments must be an exact tuple."
-            )
-        if (
-            type(self.start_line) is not int
-            or type(self.end_line) is not int
-            or self.start_line <= 0
-            or self.end_line < self.start_line
-        ):
-            raise ValueError(
-                "Inline initial-condition source span must be ordered."
-            )
-        if (
-            type(self.source_lines) is not tuple
-            or len(self.source_lines) != self.end_line - self.start_line + 1
-            or any(type(line) is not str for line in self.source_lines)
-        ):
-            raise TypeError(
-                "Inline initial-condition source lines must match the span."
             )
 
 
@@ -440,7 +398,7 @@ class DslDerivedObservableDefinition:
 
 @dataclass(frozen=True, slots=True)
 class DslAnalysis:
-    """Deeply immutable, origin-stamped public DSL admission evidence."""
+    """Deeply immutable, source-backed public DSL admission evidence."""
 
     identity: str
     normalized_text: str
@@ -966,7 +924,6 @@ def _inline_initial_assignments(
     set_name: str | None,
     line_number: int,
     line_content: str,
-    first_ordinal: int,
 ) -> tuple[DslInitialConditionAssignment, ...]:
     stripped = str(code).strip()
     lowered = stripped.lower()
@@ -1034,11 +991,8 @@ def _inline_initial_assignments(
                 line_number=line_number,
                 line_content=line_content,
             ),
-            authored_ordinal=first_ordinal + index,
-            line_number=line_number,
-            source_text=line_content,
         )
-        for index, (species, value_token) in enumerate(pairs)
+        for species, value_token in pairs
     )
 
 
@@ -1068,7 +1022,6 @@ def _admit_inline_initial_conditions(
     declarations: list[DslInitialConditionDeclaration] = []
     claimed_indexes: set[int] = set()
     named_keys: set[str] = set()
-    assignment_ordinal = 0
     index = 0
     while index < len(lines):
         raw = lines[index]
@@ -1111,10 +1064,8 @@ def _admit_inline_initial_conditions(
                         set_name=set_name,
                         line_number=index + 1,
                         line_content=raw,
-                        first_ordinal=assignment_ordinal,
                     )
                     assignments.extend(parsed)
-                    assignment_ordinal += len(parsed)
                 one_line_closed = True
             elif body.strip():
                 parsed = _inline_initial_assignments(
@@ -1122,10 +1073,8 @@ def _admit_inline_initial_conditions(
                     set_name=set_name,
                     line_number=index + 1,
                     line_content=raw,
-                    first_ordinal=assignment_ordinal,
                 )
                 assignments.extend(parsed)
-                assignment_ordinal += len(parsed)
             if one_line_closed:
                 end = index
             else:
@@ -1155,20 +1104,16 @@ def _admit_inline_initial_conditions(
                                 set_name=set_name,
                                 line_number=cursor + 1,
                                 line_content=block_raw,
-                                first_ordinal=assignment_ordinal,
                             )
                             assignments.extend(parsed)
-                            assignment_ordinal += len(parsed)
                         break
                     parsed = _inline_initial_assignments(
                         block_code,
                         set_name=set_name,
                         line_number=cursor + 1,
                         line_content=block_raw,
-                        first_ordinal=assignment_ordinal,
                     )
                     assignments.extend(parsed)
-                    assignment_ordinal += len(parsed)
                     cursor += 1
                 if cursor >= len(lines):
                     raise _DSLError(
@@ -1184,9 +1129,6 @@ def _admit_inline_initial_conditions(
                     source_kind="named",
                     source_name=set_name,
                     assignments=tuple(assignments),
-                    start_line=start + 1,
-                    end_line=end + 1,
-                    source_lines=tuple(lines[start : end + 1]),
                 )
             )
             index = end + 1
@@ -1198,18 +1140,13 @@ def _admit_inline_initial_conditions(
                 set_name=None,
                 line_number=index + 1,
                 line_content=raw,
-                first_ordinal=assignment_ordinal,
             )
-            assignment_ordinal += len(parsed)
             claimed_indexes.add(index)
             declarations.append(
                 DslInitialConditionDeclaration(
                     source_kind="anonymous",
                     source_name=None,
                     assignments=parsed,
-                    start_line=index + 1,
-                    end_line=index + 1,
-                    source_lines=(raw,),
                 )
             )
         index += 1
@@ -2021,14 +1958,13 @@ def _parse_equilibrium_step(
 
 def _source_origins(text: str) -> tuple[DslSourceOrigin, ...]:
     origins: list[DslSourceOrigin] = []
-    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+    for raw_line in text.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         origins.append(
             DslSourceOrigin(
                 authored_ordinal=len(origins),
-                line_number=line_number,
                 source_text=raw_line,
             )
         )
@@ -2885,11 +2821,9 @@ def derive_source_with_observables(
         ).encode("utf-8")
     ).hexdigest()
     derived_identity = f"dsl-analysis-derived:{identity}"
-    first_line = len(base_text.splitlines()) + 1
     derived_origins = tuple(
         DslSourceOrigin(
             authored_ordinal=len(base.analysis.origins) + index,
-            line_number=first_line + index,
             source_text=line,
         )
         for index, line in enumerate(derived_lines)

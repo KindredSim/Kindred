@@ -338,17 +338,27 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         if not filenames:
             return
-        try:
-            sources = tuple(
-                capture_import_source(filepath)
-                for filepath in filenames
+        sources: List[ImportSourceSnapshot] = []
+        rejected_sources: List[Tuple[str, str]] = []
+        for filepath in filenames:
+            try:
+                sources.append(capture_import_source(filepath))
+            except ValueError as exc:
+                rejected_sources.append((str(filepath), str(exc)))
+
+        if rejected_sources:
+            rejection_details = "\n\n".join(
+                f"{filename}:\n{diagnostic}"
+                for filename, diagnostic in rejected_sources
             )
-        except ValueError as exc:
             self._show_message(
                 QtWidgets.QMessageBox.Icon.Critical,
                 "Unsupported Dataset Source",
-                str(exc),
+                "The following selected files were rejected:\n\n"
+                f"{rejection_details}",
             )
+
+        if not sources:
             return
 
         configs: List[ImportConfig] = []
@@ -381,7 +391,7 @@ class DataManagerPanel(QtWidgets.QWidget):
                             source_intent,
                             source_sheet_names=source_sheet_names,
                         )
-                    except (ValueError, OSError, UnicodeDecodeError) as exc:
+                    except (ValueError, OSError) as exc:
                         self._show_message(
                             QtWidgets.QMessageBox.Icon.Critical,
                             "Import Error",

@@ -179,8 +179,6 @@ class TabSliderBinding(QtCore.QObject):
     previewDetailedBalanceCorrectionRequired = QtCore.Signal(object)
     previewDetailedBalanceCommitRequested = QtCore.Signal(object)
     previewDetailedBalanceBlockCleared = QtCore.Signal(str)
-    previewTransitionOriginCaptureRequested = QtCore.Signal(object, bool)
-    previewEndpointPresentationRequested = QtCore.Signal(object, bool)
     errorRaised = QtCore.Signal(str)
 
     def __init__(
@@ -388,7 +386,6 @@ class TabSliderBinding(QtCore.QObject):
                 float(value),
                 defer_rejected_restore=True,
                 gesture_capture=capture,
-                animate_preview=True,
             )
         else:
             self._queue_rejected_slider_restore()
@@ -414,7 +411,6 @@ class TabSliderBinding(QtCore.QObject):
                 float(value),
                 defer_rejected_restore=True,
                 gesture_capture=capture,
-                animate_preview=True,
             )
         else:
             self._queue_rejected_slider_restore()
@@ -458,7 +454,6 @@ class TabSliderBinding(QtCore.QObject):
                 name,
                 value_f,
                 gesture_capture=capture,
-                animate_preview=True,
             )
             if accepted:
                 self._gesture_admitted = True
@@ -544,7 +539,6 @@ class TabSliderBinding(QtCore.QObject):
         *,
         defer_rejected_restore: bool = False,
         gesture_capture: _GestureCapture | None = None,
-        animate_preview: bool = False,
     ) -> bool:
         self._cancel_deferred_restore()
         previous_capture = self._preview_capture
@@ -555,14 +549,12 @@ class TabSliderBinding(QtCore.QObject):
                     name,
                     value,
                     _gesture_capture=gesture_capture,
-                    _animate_preview=animate_preview,
                 )
                 if str(kind) == "parameter"
                 else self.stage_species(
                     name,
                     value,
                     _gesture_capture=gesture_capture,
-                    _animate_preview=animate_preview,
                 )
             )
         finally:
@@ -900,7 +892,6 @@ class TabSliderBinding(QtCore.QObject):
         value: float,
         *,
         _gesture_capture: _GestureCapture | None = None,
-        _animate_preview: bool = False,
     ) -> bool:
         if (
             self._rendering
@@ -959,7 +950,6 @@ class TabSliderBinding(QtCore.QObject):
                     "equilibrium" if str(coordinate_metadata.get("role") or "") == "Keq"
                     else "parameter"
                 ),
-                animate_preview=_animate_preview,
             )
             return True
         target_ids = set(targets)
@@ -1001,7 +991,6 @@ class TabSliderBinding(QtCore.QObject):
                 debounce_kind=(
                     "equilibrium" if role == "Keq" else "parameter"
                 ),
-                animate_preview=_animate_preview,
             )
         self._emit_draft_state()
         return preview_admitted
@@ -1023,7 +1012,6 @@ class TabSliderBinding(QtCore.QObject):
         value: float,
         *,
         _gesture_capture: _GestureCapture | None = None,
-        _animate_preview: bool = False,
     ) -> bool:
         if (
             self._rendering
@@ -1089,14 +1077,12 @@ class TabSliderBinding(QtCore.QObject):
                 projection,
                 targets,
                 debounce_kind="species",
-                animate_preview=_animate_preview,
             )
             return True
         preview_admitted = self._begin_preview_cycle(
             (tab, projection),
             targets,
             debounce_kind="species",
-            animate_preview=_animate_preview,
         )
         self._emit_draft_state()
         return preview_admitted
@@ -1213,7 +1199,6 @@ class TabSliderBinding(QtCore.QObject):
         targets: tuple[str, ...],
         *,
         debounce_kind: str,
-        animate_preview: bool = False,
     ) -> bool:
         if self._suspended_preview_disposition is not None:
             return False
@@ -1290,10 +1275,6 @@ class TabSliderBinding(QtCore.QObject):
         previous_capture = self._preview_capture
         previous_timer_active = self._throttle_timer.isActive()
         self._stop_preview_timers()
-        self.previewTransitionOriginCaptureRequested.emit(
-            dirty_targets,
-            bool(animate_preview),
-        )
         keys = self._simulation_jobs.admit_preview_edits(
             identity for identity, _set_name, _request in constructed
         )
@@ -1336,10 +1317,6 @@ class TabSliderBinding(QtCore.QObject):
             targets=captured,
             debounce_kind=str(debounce_kind),
         )
-        self.previewEndpointPresentationRequested.emit(
-            tuple(key for key, _set_name, _request in captured),
-            bool(animate_preview),
-        )
         self._start_throttle_if_inactive(debounce_kind)
         return True
 
@@ -1350,7 +1327,6 @@ class TabSliderBinding(QtCore.QObject):
         targets: tuple[str, ...],
         *,
         debounce_kind: str,
-        animate_preview: bool = False,
     ) -> None:
         """Recapture an exact accepted draft when no current key remains.
 
@@ -1380,7 +1356,6 @@ class TabSliderBinding(QtCore.QObject):
             (tab, projection),
             targets,
             debounce_kind=debounce_kind,
-            animate_preview=animate_preview,
         )
 
     def _preview_timer(self, debounce_kind: str) -> QtCore.QTimer:
@@ -1528,7 +1503,6 @@ class TabSliderBinding(QtCore.QObject):
                 pending.name,
                 pending.value,
                 gesture_capture=self._gesture_capture,
-                animate_preview=True,
             )
             if accepted:
                 self._gesture_admitted = True
@@ -1665,10 +1639,11 @@ class TabSliderBinding(QtCore.QObject):
         return changed
 
     def cancel_pending_preview_intent(self) -> None:
-        capture = self._preview_capture
-        self._stop_preview_timers()
-        if capture is not None:
-            self._preview_capture = None
+        """Fence every not-yet-running binding and owner Preview intent."""
+
+        self._cancel_deferred_restore()
+        self._clear_gesture_state()
+        self._preview_capture = None
         self._simulation_jobs.drop_pending_preview(self._tab_id)
 
     def apply(self) -> bool:
