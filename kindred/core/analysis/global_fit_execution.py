@@ -66,6 +66,52 @@ __all__ = [
     "assemble_global_fit_result",
 ]
 
+
+def _decode_log10_physical(raw_value: object, *, coordinate: str) -> float:
+    """Decode one optimizer Log10 coordinate without clipping or fabrication."""
+
+    try:
+        value = float(raw_value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FitSimulationError(
+            f"Invalid Log10 optimizer coordinate for {coordinate!r}.",
+            details={
+                "fatal": False,
+                "candidate_domain": True,
+                "stage": "log10_decode",
+            },
+        ) from exc
+    if not math.isfinite(value):
+        raise FitSimulationError(
+            f"Non-finite Log10 optimizer coordinate for {coordinate!r}.",
+            details={
+                "fatal": False,
+                "candidate_domain": True,
+                "stage": "log10_decode",
+            },
+        )
+    try:
+        decoded = math.pow(10.0, value)
+    except (OverflowError, ValueError) as exc:
+        raise FitSimulationError(
+            f"Log10 optimizer coordinate for {coordinate!r} overflowed.",
+            details={
+                "fatal": False,
+                "candidate_domain": True,
+                "stage": "log10_decode",
+            },
+        ) from exc
+    if not math.isfinite(decoded):
+        raise FitSimulationError(
+            f"Log10 optimizer coordinate for {coordinate!r} decoded non-finitely.",
+            details={
+                "fatal": False,
+                "candidate_domain": True,
+                "stage": "log10_decode",
+            },
+        )
+    return float(decoded)
+
 def _raise_if_fitting_cancelled(cancellation_check: Optional[Callable[[], bool]]) -> None:
     if cancellation_check is not None and cancellation_check():
         raise FittingCancelled()
@@ -894,7 +940,10 @@ class FitParameterLayout:
         for idx, name in enumerate(self.param_names):
             raw_val = float(vector[idx])
             if self.shared_log10.get(name):
-                out[name] = float(10.0 ** raw_val)
+                out[name] = _decode_log10_physical(
+                    raw_val,
+                    coordinate=name,
+                )
             else:
                 out[name] = raw_val
         return out
@@ -907,7 +956,10 @@ class FitParameterLayout:
         for var_name, idx in var_map.items():
             raw_val = float(vector[idx])
             if self.dataset_var_log10.get((ds_id, var_name)):
-                out[var_name] = float(10.0 ** raw_val)
+                out[var_name] = _decode_log10_physical(
+                    raw_val,
+                    coordinate=f"{ds_id}::{var_name}",
+                )
             else:
                 out[var_name] = raw_val
         return out
@@ -924,7 +976,12 @@ class FitParameterLayout:
             index = self.coupled_var_index[spec.variable_id]
             raw_value = float(vector[index])
             out[spec.parameter_name] = (
-                float(10.0**raw_value) if spec.log10 else raw_value
+                _decode_log10_physical(
+                    raw_value,
+                    coordinate=spec.variable_id,
+                )
+                if spec.log10
+                else raw_value
             )
         return out
 
@@ -1344,7 +1401,85 @@ class GlobalFitObjective:
         _raise_if_fitting_cancelled(self._cancellation_check)
         self._ctx.clear()
 
-        param_dict = self._layout.shared_param_dict_from_vector(params)
+        def candidate_penalty_residuals() -> np.ndarray:
+            blocks: list[np.ndarray] = []
+            for payload in self._payloads:
+                target_multipliers = _normalized_target_weight_multipliers(
+                    species_list=payload.species_list,
+                    target_weights=dict(payload.target_weights),
+                )
+                dataset_weight = _objective_dataset_weight_multiplier(
+                    self._weights.get(payload.dataset_id, 1.0)
+                )
+                observations = _payload_observations(payload)
+                for species_name in payload.species_list:
+                    y_exp = np.asarray(
+                        observations[species_name]["y"], dtype=float
+                    ).reshape(-1)
+                    blocks.append(
+                        np.full_like(
+                            y_exp,
+                            float(dataset_weight)
+                            * float(target_multipliers.get(species_name, 1.0))
+                            * self._penalty_value,
+                        )
+                    )
+            return (
+                np.concatenate(blocks).astype(float, copy=False)
+                if blocks
+                else np.asarray([], dtype=float)
+            )
+
+        def finalize_candidate(
+            *,
+            parameters: Mapping[str, float],
+            cost: float,
+            improved: bool,
+            best_results: Mapping[str, SimulationResultValue],
+            publish_every_call: bool = False,
+        ) -> None:
+            self._objective_calls += 1
+            if improved:
+                self._best_cost = float(cost)
+            if self._progress_callback is None:
+                return
+            if not (publish_every_call or improved or self._objective_calls % 10 == 0):
+                return
+            self._progress_callback(
+                FitProgress(
+                    objective_calls=self._objective_calls,
+                    cost=float(cost),
+                    parameters=parameters,
+                    improved=bool(improved),
+                    best_simulation_results_by_dataset=best_results,
+                )
+            )
+
+        def reject_candidate(
+            exc: BaseException,
+            provenance: object,
+            *,
+            parameters: Mapping[str, float] | None = None,
+        ) -> np.ndarray:
+            self._ctx.set_error(exc, provenance)
+            key = ("__candidate__", "__simulation__", str(exc).splitlines()[0])
+            if key not in self._warned_objective_keys:
+                self._warned_objective_keys.add(key)
+                logger.warning("Fit candidate rejected: %s", exc)
+            penalty = candidate_penalty_residuals()
+            finalize_candidate(
+                parameters=dict(parameters or {}),
+                cost=float(np.sum(penalty**2)),
+                improved=False,
+                best_results={},
+                publish_every_call=True,
+            )
+            return penalty
+
+        try:
+            param_dict = self._layout.shared_param_dict_from_vector(params)
+        except FitSimulationError as exc:
+            return reject_candidate(exc, {"stage": "log10_decode"})
         all_residuals: List[float] = []
         dataset_inputs: List[ObjectiveDatasetInput] = []
 
@@ -1352,11 +1487,13 @@ class GlobalFitObjective:
             _raise_if_fitting_cancel_requested(self._cancellation_control)
 
             ds_id = payload.dataset_id
-            optimizer_dataset_params = self._layout.dataset_var_params_for_dataset(ds_id, params)
-            coupled_dataset_params = self._layout.coupled_params_for_dataset(
-                ds_id,
-                params,
-            )
+            try:
+                optimizer_dataset_params = (
+                    self._layout.dataset_var_params_for_dataset(ds_id, params)
+                )
+                coupled_dataset_params = self._layout.coupled_params_for_dataset(ds_id, params)
+            except FitSimulationError as exc:
+                return reject_candidate(exc, {"dataset": ds_id}, parameters=param_dict)
             raw_full_params: Dict[str, float] = {}
             parameter_origins: Dict[str, str] = {}
             for values, origin in (
@@ -1415,47 +1552,6 @@ class GlobalFitObjective:
             for origin in item.parameter_origins.values()
         )
 
-        def candidate_penalty_residuals() -> np.ndarray:
-            """Return one complete penalty vector for this parameter vector."""
-
-            blocks: list[np.ndarray] = []
-            for item in dataset_inputs:
-                payload = item.payload
-                target_multipliers = _normalized_target_weight_multipliers(
-                    species_list=payload.species_list,
-                    target_weights=dict(payload.target_weights),
-                )
-                dataset_weight = _objective_dataset_weight_multiplier(
-                    self._weights.get(payload.dataset_id, 1.0)
-                )
-                observations = _payload_observations(payload)
-                for species_name in payload.species_list:
-                    y_exp = np.asarray(
-                        observations[species_name]["y"], dtype=float
-                    ).reshape(-1)
-                    blocks.append(
-                        np.full_like(
-                            y_exp,
-                            float(dataset_weight)
-                            * float(target_multipliers.get(species_name, 1.0))
-                            * self._penalty_value,
-                        )
-                    )
-            return (
-                np.concatenate(blocks).astype(float, copy=False)
-                if blocks
-                else np.asarray([], dtype=float)
-            )
-
-        def reject_candidate(exc: BaseException, provenance: object) -> np.ndarray:
-            self._ctx.set_error(exc, provenance)
-            self._objective_calls += 1
-            key = ("__candidate__", "__simulation__", str(exc).splitlines()[0])
-            if key not in self._warned_objective_keys:
-                self._warned_objective_keys.add(key)
-                logger.warning("Fit candidate rejected: %s", exc)
-            return candidate_penalty_residuals()
-
         for evaluation in simulation_evaluations.values():
             if not dataset_evaluation_is_fatal(evaluation):
                 continue
@@ -1467,7 +1563,11 @@ class GlobalFitObjective:
         for evaluation in simulation_evaluations.values():
             exc = evaluation.error
             if exc is not None and is_candidate_domain_failure(exc):
-                return reject_candidate(exc, evaluation.error_provenance)
+                return reject_candidate(
+                    exc,
+                    evaluation.error_provenance,
+                    parameters=param_dict,
+                )
 
         for item in dataset_inputs:
             _raise_if_fitting_cancel_requested(self._cancellation_control)
@@ -1504,7 +1604,11 @@ class GlobalFitObjective:
                 self._ctx.set_error(exc, evaluation.error_provenance)
                 if not is_candidate_domain_failure(exc):
                     raise exc
-                return reject_candidate(exc, evaluation.error_provenance)
+                return reject_candidate(
+                    exc,
+                    evaluation.error_provenance,
+                    parameters=param_dict,
+                )
 
             simulation = evaluation.result
             if simulation is None:
@@ -1578,7 +1682,11 @@ class GlobalFitObjective:
                     self._ctx.set_error(err, {"dataset": ds_id})
                     if not is_candidate_domain_failure(err):
                         raise err
-                    return reject_candidate(err, {"dataset": ds_id})
+                    return reject_candidate(
+                        err,
+                        {"dataset": ds_id},
+                        parameters=param_dict,
+                    )
                 except Exception as exc:
                     if isinstance(exc, (FittingCancelled, SimulationCancelled)):
                         raise FittingCancelled() from exc
@@ -1604,6 +1712,7 @@ class GlobalFitObjective:
                                 stage="objective_nonfinite",
                             ),
                             {"dataset": ds_id},
+                            parameters=param_dict,
                         )
                     raise err
 
@@ -1623,56 +1732,51 @@ class GlobalFitObjective:
                                 stage="objective_nonfinite",
                             ),
                             {"dataset": ds_id},
+                            parameters=param_dict,
                         )
                     raise err
                 all_residuals.extend(np.asarray(residual_vector, dtype=float).reshape(-1))
 
         residuals = np.asarray(all_residuals, dtype=float).ravel()
 
-        self._objective_calls += 1
-        if self._progress_callback is not None:
-            cost = float(np.sum(residuals**2))
-            candidate_evaluations = {
-                item.payload.dataset_id: evaluation.result
-                for item in dataset_inputs
-                if (
-                    (evaluation := simulation_evaluations.get(int(item.index)))
-                    is not None
-                    and evaluation.error is None
-                    and evaluation.result is not None
+        cost = float(np.sum(residuals**2))
+        callback_params = dict(param_dict)
+        for ds_id, var_map in self._layout.dataset_var_index.items():
+            for var_name, idx in var_map.items():
+                raw_val = float(params[idx])
+                callback_params[f"{ds_id}::{var_name}"] = (
+                    _decode_log10_physical(
+                        raw_val,
+                        coordinate=f"{ds_id}::{var_name}",
+                    )
+                    if self._layout.dataset_var_log10.get((ds_id, var_name))
+                    else raw_val
                 )
-            }
-            complete_evaluations = len(candidate_evaluations) == len(dataset_inputs)
-            improved = complete_evaluations and cost < self._best_cost
-            if improved:
-                self._best_cost = cost
-            best_evaluations: Mapping[str, SimulationResultValue] = (
-                candidate_evaluations if improved else {}
+        for spec in self._layout.coupled_var_order:
+            raw_val = float(params[self._layout.coupled_var_index[spec.variable_id]])
+            callback_params[spec.variable_id] = (
+                _decode_log10_physical(raw_val, coordinate=spec.variable_id)
+                if spec.log10
+                else raw_val
             )
-            if improved or self._objective_calls % 10 == 0:
-                callback_params = dict(param_dict)
-                if self._layout.dataset_var_index:
-                    for ds_id, var_map in self._layout.dataset_var_index.items():
-                        for var_name, idx in var_map.items():
-                            raw_val = float(params[idx])
-                            if self._layout.dataset_var_log10.get((ds_id, var_name)):
-                                callback_params[f"{ds_id}::{var_name}"] = float(10.0 ** raw_val)
-                            else:
-                                callback_params[f"{ds_id}::{var_name}"] = raw_val
-                for spec in self._layout.coupled_var_order:
-                    raw_val = float(params[self._layout.coupled_var_index[spec.variable_id]])
-                    callback_params[spec.variable_id] = (
-                        float(10.0**raw_val) if spec.log10 else raw_val
-                    )
-                self._progress_callback(
-                    FitProgress(
-                        objective_calls=self._objective_calls,
-                        cost=cost,
-                        parameters=callback_params,
-                        improved=improved,
-                        best_simulation_results_by_dataset=best_evaluations,
-                    )
-                )
+        candidate_evaluations = {
+            item.payload.dataset_id: evaluation.result
+            for item in dataset_inputs
+            if (
+                (evaluation := simulation_evaluations.get(int(item.index)))
+                is not None
+                and evaluation.error is None
+                and evaluation.result is not None
+            )
+        }
+        complete_evaluations = len(candidate_evaluations) == len(dataset_inputs)
+        improved = complete_evaluations and cost < self._best_cost
+        finalize_candidate(
+            parameters=callback_params,
+            cost=cost,
+            improved=improved,
+            best_results=candidate_evaluations if improved else {},
+        )
         _raise_if_fitting_cancelled(self._cancellation_check)
 
         return residuals

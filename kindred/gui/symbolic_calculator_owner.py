@@ -4,6 +4,10 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
+from kindred.core.mechanism_source import (
+    MechanismAuthoringSource,
+    source_matches_analysis,
+)
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra import (
@@ -50,10 +54,14 @@ class SymbolicCalculatorOwner:
         self,
         *,
         canonical_prepared_dsl: Callable[[], PreparedDslRequestSet | None],
+        canonical_source: Callable[[], MechanismAuthoringSource],
     ) -> None:
         if not callable(canonical_prepared_dsl):
             raise TypeError("canonical_prepared_dsl must be callable.")
+        if not callable(canonical_source):
+            raise TypeError("canonical_source must be callable.")
         self._canonical_prepared_dsl = canonical_prepared_dsl
+        self._canonical_source = canonical_source
         self._snapshot: SymbolicCalculatorSnapshot | None = None
         self._history: list[SymbolicCalculatorHistoryEntry] = []
         self._available = False
@@ -115,7 +123,7 @@ class SymbolicCalculatorOwner:
                 context_text=str(result.full_context_copy_text()),
                 is_error=False,
             )
-        self._history.append(entry)
+        self._retain_latest_entry(entry)
         return self.view_state()
 
     def copy_compact_text(self) -> str:
@@ -164,6 +172,15 @@ class SymbolicCalculatorOwner:
                 return entry
         return None
 
+    def _retain_latest_entry(self, entry: SymbolicCalculatorHistoryEntry) -> None:
+        """Keep one latest evaluation for each exact accepted source."""
+        self._history[:] = [
+            retained
+            for retained in self._history
+            if retained.snapshot_source != entry.snapshot_source
+        ]
+        self._history.append(entry)
+
     def _build_snapshot(self) -> tuple[SymbolicCalculatorSnapshot | None, bool, str]:
         prepared_dsl = self._canonical_prepared_dsl()
         if prepared_dsl is None:
@@ -172,7 +189,15 @@ class SymbolicCalculatorOwner:
             raise TypeError(
                 "Canonical symbolic input must be PreparedDslRequestSet or None."
             )
-        source = prepared_dsl.analysis.normalized_text
+        source = self._canonical_source()
+        if not isinstance(source, MechanismAuthoringSource):
+            raise TypeError("canonical_source must return MechanismAuthoringSource.")
+        if not source_matches_analysis(source, prepared_dsl.analysis):
+            return (
+                None,
+                False,
+                "Canonical mechanism source and analysis no longer match.",
+            )
         try:
             parameterized_interventions = (
                 prepared_dsl.parameterized_intervention_schedule_for_binding()
@@ -205,7 +230,7 @@ class SymbolicCalculatorOwner:
         if not bool(available):
             return None, False, str(reason or "Symbolic calculator unavailable.")
         snapshot = SymbolicCalculatorSnapshot(
-            source=source,
+            source=source.reactions_text,
             mechanism=mechanism,
         )
         return snapshot, True, ""

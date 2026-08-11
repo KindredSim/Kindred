@@ -12,6 +12,7 @@ from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
 )
 from kindred.core.results import integrate_ctc
+from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 
 __all__ = ["SpeciesStatisticsTable"]
 
@@ -87,6 +88,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         species_data: Mapping[str, np.ndarray],
         *,
         intervention_execution: InterventionExecutionContract,
+        presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = (),
         accepted_result_key: object | None = None,
     ) -> None:
         """
@@ -102,6 +104,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         intervention_execution : InterventionExecutionContract
             Accepted Run intervention truth. Any intervention makes CTC
             inapplicable for the complete result.
+        presentation_boundaries : tuple, optional
+            Exact intervention pre/post values retained by the primary result;
+            these contribute to Max and t@Max without becoming table rows.
         accepted_result_key : object, optional
             Accepted-result identity used with the projected species roster
             for the single-entry statistics cache.
@@ -113,6 +118,15 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             raise TypeError(
                 "intervention_execution must be an "
                 "InterventionExecutionContract."
+            )
+        boundaries = tuple(presentation_boundaries)
+        if any(
+            not isinstance(boundary, SimulationPresentationBoundary)
+            for boundary in boundaries
+        ):
+            raise TypeError(
+                "presentation_boundaries must contain only "
+                "SimulationPresentationBoundary values."
             )
         ctc_applicable = intervention_execution.is_empty
         time = np.asarray(canonical_time, dtype=float)
@@ -163,6 +177,13 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                 final_conc = concentrations[-1]
                 max_conc = np.max(concentrations)
                 idx_max = np.argmax(concentrations)
+                max_time = time[idx_max]
+                for boundary in boundaries:
+                    for boundary_values in (boundary.pre_state, boundary.post_state):
+                        boundary_value = dict(boundary_values).get(species_name)
+                        if boundary_value is not None and boundary_value > max_conc:
+                            max_conc = boundary_value
+                            max_time = boundary.time
                 ctc_text = "—"
                 if ctc_applicable:
                     threshold = max(
@@ -186,7 +207,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                         species_name,
                         f"{final_conc:.6g}",
                         f"{max_conc:.6g}",
-                        f"{time[idx_max]:.6g}",
+                        f"{max_time:.6g}",
                         ctc_text,
                     )
                 )

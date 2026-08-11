@@ -7,15 +7,21 @@ import math
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import (
+    TEMPERATURE_RANGE_K,
+    SIMULATION_POINT_RANGE,
     SimulationExecutionSettings,
     SUPPORTED_SOLVERS,
     TabScientificSettings,
     validate_simulation_execution_settings,
     validate_tab_scientific_settings,
 )
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.gui.ui_helpers import setup_scientific_validator
 
-__all__ = ["SolverSettingsDialog", "TabScientificSettingsDialog"]
+__all__ = [
+    "SimulationSettingsDialog",
+    "SolverSettingsDialog",
+]
 
 
 class SolverSettingsDialog(QtWidgets.QDialog):
@@ -44,7 +50,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
             "Absolute Run end time",
         )
         self.integration_points_spin = QtWidgets.QSpinBox(self)
-        self.integration_points_spin.setRange(10, 100_000)
+        self.integration_points_spin.setRange(*SIMULATION_POINT_RANGE)
         self.integration_points_spin.setSingleStep(10)
         for label, widget in (
             ("Solver", self.solver_combo),
@@ -123,43 +129,107 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         self.accept()
 
 
-class TabScientificSettingsDialog(QtWidgets.QDialog):
-    """Edit tab-wide science separately from per-set execution overrides."""
+class SimulationSettingsDialog(QtWidgets.QDialog):
+    """Passive editor for the supported application and tab settings.
+
+    The dialog stores only widget draft state.  MainWindow publishes the
+    accepted values through the existing tab-action and ConfigController
+    owners after the modal returns.
+    """
 
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Tab Scientific Settings")
+        self.setObjectName("simulationSettingsDialog")
+        self.setWindowTitle("Simulation Settings")
         self.setModal(True)
 
         layout = QtWidgets.QVBoxLayout(self)
-        form = QtWidgets.QFormLayout()
+        science_box = QtWidgets.QGroupBox("Tab scientific", self)
+        science_form = QtWidgets.QFormLayout(science_box)
         self.temperature_spin = self._positive_spin(
-            minimum=0.1,
-            maximum=10_000.0,
+            minimum=TEMPERATURE_RANGE_K[0],
+            maximum=TEMPERATURE_RANGE_K[1],
             value=298.15,
             decimals=8,
         )
-        self.rtol_edit = QtWidgets.QLineEdit("1e-6", self)
-        self.atol_edit = QtWidgets.QLineEdit("1e-12", self)
+        self.rtol_edit = QtWidgets.QLineEdit("1e-6", science_box)
+        self.atol_edit = QtWidgets.QLineEdit("1e-12", science_box)
         setup_scientific_validator(self.rtol_edit)
         setup_scientific_validator(self.atol_edit)
         self.analytic_jacobian_check = QtWidgets.QCheckBox(
             "Use analytic Jacobian",
-            self,
+            science_box,
         )
         self.wegscheider_check = QtWidgets.QCheckBox(
             "Enforce Wegscheider cyclicity",
-            self,
+            science_box,
         )
-        form.addRow("Temperature (K)", self.temperature_spin)
-        form.addRow("Relative tolerance", self.rtol_edit)
-        form.addRow("Absolute tolerance", self.atol_edit)
-        form.addRow("", self.analytic_jacobian_check)
-        form.addRow("", self.wegscheider_check)
-        layout.addLayout(form)
+        science_form.addRow("Temperature (K)", self.temperature_spin)
+        science_form.addRow("Relative tolerance", self.rtol_edit)
+        science_form.addRow("Absolute tolerance", self.atol_edit)
+        science_form.addRow("", self.analytic_jacobian_check)
+        science_form.addRow("", self.wegscheider_check)
+        layout.addWidget(science_box)
+
+        preview_box = QtWidgets.QGroupBox("Preview", self)
+        preview_form = QtWidgets.QFormLayout(preview_box)
+        self.parameter_debounce_spin = self._integer_spin(
+            0,
+            1000,
+            80,
+            preview_box,
+        )
+        self.equilibrium_debounce_spin = self._integer_spin(
+            0,
+            1000,
+            150,
+            preview_box,
+        )
+        preview_form.addRow(
+            "Parameter debounce (ms)",
+            self.parameter_debounce_spin,
+        )
+        preview_form.addRow(
+            "Equilibrium debounce (ms)",
+            self.equilibrium_debounce_spin,
+        )
+        layout.addWidget(preview_box)
+
+        parallel_box = QtWidgets.QGroupBox("Parallel execution", self)
+        parallel_form = QtWidgets.QFormLayout(parallel_box)
+        self.run_maximum_automatic_check = QtWidgets.QCheckBox(
+            "Automatic (CPU fallback)",
+            parallel_box,
+        )
+        self.run_maximum_spin = self._integer_spin(
+            1,
+            MAX_PARALLEL_WORKERS_CEILING,
+            1,
+            parallel_box,
+        )
+        self.run_maximum_automatic_check.toggled.connect(
+            self.run_maximum_spin.setDisabled
+        )
+        parallel_form.addRow("Run user maximum", self.run_maximum_automatic_check)
+        parallel_form.addRow("Explicit maximum", self.run_maximum_spin)
+        layout.addWidget(parallel_box)
+
+        cache_box = QtWidgets.QGroupBox("Result cache", self)
+        cache_form = QtWidgets.QFormLayout(cache_box)
+        self.cache_capacity_spin = self._integer_spin(
+            1,
+            (1 << 31) - 1,
+            32,
+            cache_box,
+        )
+        cache_form.addRow(
+            "Explicit-result cache capacity",
+            self.cache_capacity_spin,
+        )
+        layout.addWidget(cache_box)
 
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
@@ -170,16 +240,27 @@ class TabScientificSettingsDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    @staticmethod
+    def _integer_spin(
+        minimum: int,
+        maximum: int,
+        value: int,
+        parent: QtWidgets.QWidget,
+    ) -> QtWidgets.QSpinBox:
+        spin = QtWidgets.QSpinBox(parent)
+        spin.setRange(int(minimum), int(maximum))
+        spin.setValue(int(value))
+        return spin
+
+    @staticmethod
     def _positive_spin(
-        self,
         *,
         minimum: float,
         maximum: float,
         value: float,
         decimals: int,
     ) -> QtWidgets.QDoubleSpinBox:
-        spin = QtWidgets.QDoubleSpinBox(self)
-        # Never let a display precision choice rewrite the accepted value.
+        spin = QtWidgets.QDoubleSpinBox()
         spin.setDecimals(max(17, int(decimals)))
         spin.setRange(float(minimum), float(maximum))
         spin.setValue(float(value))
@@ -188,53 +269,73 @@ class TabScientificSettingsDialog(QtWidgets.QDialog):
 
     def set_scientific_settings(self, settings: TabScientificSettings) -> None:
         validate_tab_scientific_settings(settings)
-        blockers = tuple(
-            QtCore.QSignalBlocker(widget)
-            for widget in (self.temperature_spin, self.rtol_edit, self.atol_edit)
-        )
-        try:
-            self.temperature_spin.setValue(settings.temperature)
-            self.rtol_edit.setText(repr(float(settings.rtol)))
-            self.atol_edit.setText(repr(float(settings.atol)))
-        finally:
-            del blockers
+        self.temperature_spin.setValue(settings.temperature)
+        self.rtol_edit.setText(repr(float(settings.rtol)))
+        self.atol_edit.setText(repr(float(settings.atol)))
         self.analytic_jacobian_check.setChecked(settings.analytic_jacobian_policy)
         self.wegscheider_check.setChecked(settings.wegscheider_policy)
 
     def scientific_settings(self) -> TabScientificSettings:
+        try:
+            rtol = float(self.rtol_edit.text())
+            atol = float(self.atol_edit.text())
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("rtol and atol must be numbers.") from exc
         candidate = TabScientificSettings(
             temperature=float(self.temperature_spin.value()),
-            rtol=self._positive_scientific_text(self.rtol_edit, "rtol"),
-            atol=self._positive_scientific_text(self.atol_edit, "atol"),
-            analytic_jacobian_policy=bool(
-                self.analytic_jacobian_check.isChecked()
-            ),
+            rtol=rtol,
+            atol=atol,
+            analytic_jacobian_policy=bool(self.analytic_jacobian_check.isChecked()),
             wegscheider_policy=bool(self.wegscheider_check.isChecked()),
         )
-        validate_tab_scientific_settings(candidate)
-        return candidate
+        return validate_tab_scientific_settings(candidate)
 
-    @staticmethod
-    def _positive_scientific_text(
-        edit: QtWidgets.QLineEdit,
-        field: str,
-    ) -> float:
+    def set_preview_debounce(self, parameter: int, equilibrium: int) -> None:
+        self.parameter_debounce_spin.setValue(int(parameter))
+        self.equilibrium_debounce_spin.setValue(int(equilibrium))
+
+    def preview_debounce(self) -> tuple[int, int]:
+        return (
+            int(self.parameter_debounce_spin.value()),
+            int(self.equilibrium_debounce_spin.value()),
+        )
+
+    def set_run_user_maximum(self, value: int | None) -> None:
+        self.run_maximum_spin.setRange(1, MAX_PARALLEL_WORKERS_CEILING)
+        automatic = value is None
+        if not automatic and type(value) is not int:
+            raise TypeError("Run user maximum must be an integer or None.")
+        blocker = QtCore.QSignalBlocker(self.run_maximum_automatic_check)
         try:
-            value = float(edit.text())
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"{field} must be a number.") from exc
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError(f"{field} must be finite and positive.")
-        return value
+            self.run_maximum_automatic_check.setChecked(automatic)
+        finally:
+            del blocker
+        self.run_maximum_spin.setDisabled(automatic)
+        if not automatic:
+            self.run_maximum_spin.setValue(int(value))
+
+    def run_user_maximum(self) -> int | None:
+        if self.run_maximum_automatic_check.isChecked():
+            return None
+        return int(self.run_maximum_spin.value())
+
+    def set_result_cache_capacity(self, value: int) -> None:
+        self.cache_capacity_spin.setValue(int(value))
+
+    def result_cache_capacity(self) -> int:
+        return int(self.cache_capacity_spin.value())
 
     @QtCore.Slot()
     def _accept_candidate(self) -> None:
         try:
             self.scientific_settings()
-        except (TypeError, ValueError) as exc:
+            self.preview_debounce()
+            self.run_user_maximum()
+            self.result_cache_capacity()
+        except (TypeError, ValueError, OverflowError) as exc:
             QtWidgets.QMessageBox.warning(
                 self,
-                "Invalid Scientific Settings",
+                "Invalid Simulation Settings",
                 str(exc),
             )
             return

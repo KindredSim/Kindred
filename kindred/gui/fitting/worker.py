@@ -39,6 +39,8 @@ from kindred.core.analysis.parametric_alignment import (
 from kindred.core.exceptions import FitSimulationError, FittingCancelled
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
+    FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
+    FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
     SerialFittingEvaluator,
     is_candidate_domain_failure,
     prepare_fitting_execution_context,
@@ -2274,9 +2276,10 @@ class GlobalFitWorker(QtCore.QThread):
                             temperature_K=float(science.temperature),
                             report=WegscheiderCyclicityReport(tuple(unresolved.cycles)),
                             source_energy_unit=str(
-                                request.prepared_dsl.analysis.energy_unit
+                                request.origin.prepared_dsl.analysis.energy_unit
                             ),
-                    )
+                            accepted_analysis=request.origin.prepared_dsl.analysis,
+                        )
                     ) from exc
                 if isinstance(exc, FitSimulationError):
                     exc.details.setdefault("fit_solver", request.solver)
@@ -2308,6 +2311,18 @@ class GlobalFitWorker(QtCore.QThread):
         effective_local: dict[str, FitDatasetLocalSettings] = {}
         resolved_mode_items: list[tuple[str, str]] = []
         starting_evaluations = {}
+        starting_projection_failed = False
+        fitted_shared_names = {
+            item.name for item in coordinates.shared_variables
+        }
+        fitted_dataset_names = {
+            item.name
+            for values in coordinates.overrides
+            for item in values.variable_params
+        }
+        fitted_dataset_names.update(
+            item.parameter_name for item in coordinates.coupled_variables
+        )
         for local in included:
             chosen = local
             dataset_id = local.dataset_id
@@ -2340,74 +2355,101 @@ class GlobalFitWorker(QtCore.QThread):
                     }
                 ):
                     starting_values[f"{INITIAL_PREFIX}{initial.species}"] = initial.initial
-            evaluation = evaluators[
-                dataset_id
-            ].evaluate_series_with_parameter_origins(
-                starting_values,
-                {
-                    name: FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
-                    for name in starting_values
-                },
-            )
-            if not isinstance(evaluation, SimulationResultValue):
-                raise TypeError("Fit evaluator did not return its canonical result.")
-            starting_evaluations[dataset_id] = evaluation
-            prepared_ids[dataset_id]["validated_executable_schedule"] = (
-                evaluation.intervention_execution.provenance_projection()
-            )
+            starting_origins = {
+                name: (
+                    FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED
+                    if name in fitted_shared_names
+                    else FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET
+                    if name in fitted_dataset_names
+                    else FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
+                )
+                for name in starting_values
+            }
+            try:
+                evaluation = evaluators[
+                    dataset_id
+                ].evaluate_series_with_parameter_origins(
+                    starting_values,
+                    starting_origins,
+                )
+            except FitSimulationError as exc:
+                # The initial curve is optional presentation. A candidate
+                # domain failure at a fitted starting point must not prevent
+                # fit_global() from exploring the optimizer domain.
+                if not is_candidate_domain_failure(exc):
+                    raise
+                evaluation = None
+                starting_projection_failed = True
+            if evaluation is not None:
+                if not isinstance(evaluation, SimulationResultValue):
+                    raise TypeError("Fit evaluator did not return its canonical result.")
+                starting_evaluations[dataset_id] = evaluation
+                prepared_ids[dataset_id]["validated_executable_schedule"] = (
+                    evaluation.intervention_execution.provenance_projection()
+                )
             if (
                 local.parametric is not None
                 and local.parametric.requested_mode == "auto"
             ):
-                provisional = _compile_dataset_spec(
-                    mapped,
-                    replace(
+                if evaluation is None:
+                    # A candidate-domain failure removes the starting
+                    # trajectory, so Auto must choose the deterministic
+                    # Time-guided admission for subsequent candidates.
+                    resolved_mode = "time_guided"
+                    chosen = replace(
                         local,
                         parametric=replace(
                             local.parametric,
-                            resolved_mode="monotone",
+                            resolved_mode=resolved_mode,
                         ),
-                    ),
-                )
-                series = evaluation
-                try:
-                    for target_name, observation in provisional.observations.items():
-                        align_y_on_x_obs(
-                            t_obs=np.asarray(
-                                observation.t,
-                                dtype=float,
-                            ),
-                            x_obs=np.asarray(
-                                provisional.x_obs_by_species[target_name],
-                                dtype=float,
-                            ),
-                            t_sim=series.t,
-                            x_model=fit_result_target_values(
-                                series,
-                                provisional.x_name,
-                            ),
-                            y_model=fit_result_target_values(
-                                series,
-                                target_name,
-                            ),
-                            segment_ids=series.segment_ids,
-                            segment_keys=series.segment_keys,
-                            discontinuity_ids=series.discontinuity_ids,
-                            dataset_label=dataset_id,
-                            x_name=provisional.x_name,
-                            y_name=target_name,
-                        )
-                except DeterministicParametricResolutionError:
-                    resolved_mode = "time_guided"
+                    )
                 else:
-                    resolved_mode = "monotone"
-                chosen = replace(
-                    local,
-                    parametric=replace(
-                        local.parametric,
-                        resolved_mode=resolved_mode,
-                    ),
-                )
+                    provisional = _compile_dataset_spec(
+                        mapped,
+                        replace(
+                            local,
+                            parametric=replace(
+                                local.parametric,
+                                resolved_mode="monotone",
+                            ),
+                        ),
+                    )
+                    series = evaluation
+                    try:
+                        for target_name, observation in provisional.observations.items():
+                            align_y_on_x_obs(
+                                t_obs=np.asarray(observation.t, dtype=float),
+                                x_obs=np.asarray(
+                                    provisional.x_obs_by_species[target_name],
+                                    dtype=float,
+                                ),
+                                t_sim=series.t,
+                                x_model=fit_result_target_values(
+                                    series,
+                                    provisional.x_name,
+                                ),
+                                y_model=fit_result_target_values(
+                                    series,
+                                    target_name,
+                                ),
+                                segment_ids=series.segment_ids,
+                                segment_keys=series.segment_keys,
+                                discontinuity_ids=series.discontinuity_ids,
+                                dataset_label=dataset_id,
+                                x_name=provisional.x_name,
+                                y_name=target_name,
+                            )
+                    except DeterministicParametricResolutionError:
+                        resolved_mode = "time_guided"
+                    else:
+                        resolved_mode = "monotone"
+                    chosen = replace(
+                        local,
+                        parametric=replace(
+                            local.parametric,
+                            resolved_mode=resolved_mode,
+                        ),
+                    )
             if (
                 chosen.parametric is not None
                 and chosen.parametric.requested_mode == "auto"
@@ -2441,10 +2483,14 @@ class GlobalFitWorker(QtCore.QThread):
         if self._checkpoint():
             raise FittingCancelled()
         try:
-            initial_curves = _curves_from_evaluations(
-                request,
-                starting_evaluations,
-                effective_local,
+            initial_curves = (
+                ()
+                if starting_projection_failed
+                else _curves_from_evaluations(
+                    request,
+                    starting_evaluations,
+                    effective_local,
+                )
             )
         except FitSimulationError as exc:
             # The starting evaluation is scientific input to Auto-mode

@@ -24,8 +24,8 @@ from kindred.core.project_session import ProjectSession
 from kindred.core.simulator.dsl_parse import (
     DslParameterCoordinateUpdate,
     PreparedDslRequestSet,
-    derive_prepared_dsl_with_observables,
-    derive_prepared_dsl_with_parameter_updates,
+    derive_source_with_observables,
+    derive_source_with_parameter_updates,
 )
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.fitting.launch import (
@@ -405,8 +405,15 @@ class FitSessionOwner(QtCore.QObject):
                 )
                 custody_state = "running" if running is True else "finished"
             else:
-                custody_state = "unknown"
+                # Native state is ambiguous: retain the exact request/setup
+                # before any queued worker callback can publish against the
+                # old local state.  Worker and gate custody remains retained.
                 window.set_executing(True)
+                self._install_started_request_state(
+                    request=request,
+                    window=window,
+                )
+                custody_state = "unknown"
             self.owned_qthreads_changed.emit()
             self.execution_changed.emit(True)
             self._set_status(
@@ -725,19 +732,21 @@ class FitSessionOwner(QtCore.QObject):
             observables,
             setup.parameters,
         )
-        effective_prepared = (
-            origin.prepared_dsl
-            if not definitions
-            else derive_prepared_dsl_with_observables(
+        if definitions:
+            exact_source, effective_prepared = derive_source_with_observables(
+                origin.mechanism_source.reactions_text,
                 origin.prepared_dsl,
                 definitions,
             )
-        )
+            effective_source = MechanismAuthoringSource.from_parts(
+                reactions_text=exact_source,
+            )
+        else:
+            effective_prepared = origin.prepared_dsl
+            effective_source = origin.mechanism_source
         return replace(
             setup,
-            mechanism_source=MechanismAuthoringSource.from_parts(
-                reactions_text=effective_prepared.analysis.normalized_text
-            ),
+            mechanism_source=effective_source,
             prepared_dsl=effective_prepared,
             local_observables=observables,
         )
@@ -882,17 +891,20 @@ class FitSessionOwner(QtCore.QObject):
                 pending.execution_request.local_observables,
                 pending.execution_request.parameters,
             )
-            corrected_prepared = (
-                rebased.prepared_dsl
-                if not definitions
-                else derive_prepared_dsl_with_observables(
-                    rebased.prepared_dsl,
-                    definitions,
+            if definitions:
+                corrected_source, corrected_prepared = (
+                    derive_source_with_observables(
+                        rebased.mechanism_source.reactions_text,
+                        rebased.prepared_dsl,
+                        definitions,
+                    )
                 )
-            )
-            corrected_effective = MechanismAuthoringSource.from_parts(
-                reactions_text=corrected_prepared.analysis.normalized_text
-            )
+                corrected_effective = MechanismAuthoringSource.from_parts(
+                    reactions_text=corrected_source,
+                )
+            else:
+                corrected_prepared = rebased.prepared_dsl
+                corrected_effective = rebased.mechanism_source
             self._verify_detailed_balance_resolved(corrected_prepared)
             writable_coordinates = {
                 coordinate.name: coordinate
@@ -1178,14 +1190,14 @@ class FitSessionOwner(QtCore.QObject):
                 setup.local_observables,
                 setup.parameters,
             )
-            prior_prepared = (
-                origin.prepared_dsl
-                if not prior_definitions
-                else derive_prepared_dsl_with_observables(
+            if prior_definitions:
+                _prior_source, prior_prepared = derive_source_with_observables(
+                    origin.mechanism_source.reactions_text,
                     origin.prepared_dsl,
                     prior_definitions,
                 )
-            )
+            else:
+                prior_prepared = origin.prepared_dsl
             if scalar_scope not in {"shared", "per_dataset"}:
                 raise ValueError(
                     "Unknown scalar scope must be shared or per_dataset."
@@ -1671,9 +1683,11 @@ class FitSessionOwner(QtCore.QObject):
             except Exception:
                 pass
             try:
-                window.set_candidate_apply_availability(
-                    available_scopes,
-                    unavailable_reasons,
+                window.restore_terminal_candidate_semantics(
+                    candidate,
+                    available_scopes=available_scopes,
+                    unavailable_reasons=unavailable_reasons,
+                    projection_error=exc,
                 )
             except Exception as recovery_exc:
                 exc = RuntimeError(f"{exc}; Apply recovery failed: {recovery_exc}")
@@ -2006,6 +2020,10 @@ class FitSessionOwner(QtCore.QObject):
             or not bool(
                 execution_request.origin.scientific_settings.wegscheider_policy
             )
+            or correction.accepted_analysis
+            is not execution_request.origin.prepared_dsl.analysis
+            or correction.source_energy_unit
+            != str(execution_request.origin.prepared_dsl.analysis.energy_unit)
         ):
             self._worker.submit_detailed_balance_correction(
                 correction.request_id,
@@ -2627,14 +2645,15 @@ class FitSessionOwner(QtCore.QObject):
                 candidate.local_observables,
                 candidate.setup_snapshot.parameters,
             )
-            prepared = derive_prepared_dsl_with_observables(
+            derived_source, prepared = derive_source_with_observables(
+                next_tab.mechanism_source.reactions_text,
                 prepared,
                 definitions,
             )
             next_tab = replace(
                 next_tab,
                 mechanism_source=MechanismAuthoringSource.from_parts(
-                    reactions_text=prepared.analysis.normalized_text
+                    reactions_text=derived_source,
                 ),
                 prepared_dsl=prepared,
             )
@@ -2692,13 +2711,14 @@ class FitSessionOwner(QtCore.QObject):
                 for name, value in sorted(writable_values.items())
             )
             if updates:
-                prepared = derive_prepared_dsl_with_parameter_updates(
+                derived_source, prepared = derive_source_with_parameter_updates(
+                    next_tab.mechanism_source.reactions_text,
                     prepared,
                     updates,
                     wegscheider_cyclicity_enabled=wegscheider_policy,
                 )
                 derived_source = MechanismAuthoringSource.from_parts(
-                    reactions_text=prepared.analysis.normalized_text
+                    reactions_text=derived_source,
                 )
                 next_tab = replace(
                     next_tab,

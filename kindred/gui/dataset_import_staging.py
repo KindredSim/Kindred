@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import csv
 from contextlib import closing
 from dataclasses import dataclass, field
-import io
 import itertools
 import logging
 import time
@@ -14,17 +12,15 @@ from PySide6 import QtCore
 
 from kindred.core.datasets.csv_import import (
     CsvImportInterrupted,
-    PhysicalRow,
     parse_physical_rows,
+    read_csv_rows_from_bytes,
 )
-from kindred.core.datasets.source_rules import (
-    identify_physical_columns,
-)
-from kindred.core.datasets.excel_import import read_excel_sheet_rows_from_bytes
+from kindred.core.datasets.excel_import import ExcelWorkbookPair
 from kindred.core.datasets.observation_payload import DatasetObservationPayload
 from kindred.core.datasets.foundation import (
     ImportedSource,
     RawDatasetRecord,
+    validate_imported_source,
     validate_raw_dataset_record,
 )
 from kindred.gui.controllers.dataset_errors import (
@@ -367,56 +363,18 @@ class _CSVLoaderWorker(DatasetImportWorker):
         self._plan = plan
 
     def _load_payload(self) -> DatasetObservationPayload:
-        with io.TextIOWrapper(
-            io.BytesIO(self.source.exact_source_bytes),
-            encoding="utf-8-sig",
-            newline="",
-        ) as handle:
-            reader = csv.reader(handle)
-            header = next(reader, None)
-            if header is None:
-                raise ValueError("CSV file is empty")
-            columns = identify_physical_columns(header)
-            header_end_row = reader.line_num
-            first_row = next(reader, None)
+        columns, rows = read_csv_rows_from_bytes(
+            self.source.exact_source_bytes,
+            source_label=self.source.original_filename,
+        )
+        with closing(rows):
+            row_iter = iter(rows)
+            first_row = next(row_iter, None)
             if first_row is None:
                 raise ValueError("CSV file is empty")
-
-            def _physical_rows():
-                previous_end_row = header_end_row
-                if not self._plan.skip_unit_row:
-                    first_end_row = reader.line_num
-                    yield PhysicalRow(
-                        source_row=previous_end_row + 1,
-                        values={
-                            column: (
-                                first_row[column.source_index]
-                                if column.source_index < len(first_row)
-                                else ""
-                            )
-                            for column in columns
-                        },
-                    )
-                    previous_end_row = first_end_row
-                else:
-                    previous_end_row = reader.line_num
-                for row in reader:
-                    row_end_row = reader.line_num
-                    yield PhysicalRow(
-                        source_row=previous_end_row + 1,
-                        values={
-                            column: (
-                                row[column.source_index]
-                                if column.source_index < len(row)
-                                else ""
-                            )
-                            for column in columns
-                        },
-                    )
-                    previous_end_row = row_end_row
-
+            rows_to_parse = row_iter if self._plan.skip_unit_row else itertools.chain((first_row,), row_iter)
             payload = parse_physical_rows(
-                _physical_rows(),
+                rows_to_parse,
                 columns=columns,
                 time_column=self._plan.time_column,
                 species_columns=self._plan.species_columns,
@@ -430,6 +388,7 @@ class _CSVLoaderWorker(DatasetImportWorker):
                     "original_concentration_units": dict(
                         self._plan.original_conc_units
                     ),
+                    "skip_unit_row": self._plan.skip_unit_row,
                 },
             )
         return payload
@@ -476,17 +435,13 @@ class _ExcelLoaderWorker(DatasetImportWorker):
     def _load_sheet_payload(
         self,
         plan: ResolvedSheetPlan,
+        workbooks: ExcelWorkbookPair,
     ) -> tuple[str, DatasetObservationPayload]:
         sheet_name = plan.sheet_name
         if sheet_name is None:
             raise ValueError("Excel worker plan is missing a worksheet name.")
-        with closing(
-            read_excel_sheet_rows_from_bytes(
-                self.source.exact_source_bytes,
-                sheet_name,
-                source_label=self.source.original_filename,
-            )
-        ) as rows:
+        rows = workbooks.read_sheet_rows(sheet_name)
+        with closing(rows):
             row_iter = iter(rows)
             first_row = next(row_iter, None)
             if first_row is None:
@@ -511,6 +466,7 @@ class _ExcelLoaderWorker(DatasetImportWorker):
                 metadata_extras={
                     "original_time_unit": plan.original_time_unit,
                     "original_concentration_units": dict(plan.original_conc_units),
+                    "skip_unit_row": plan.skip_unit_row,
                 },
             )
         return f"{self.source.original_filename}::{sheet_name}", payload
@@ -519,30 +475,37 @@ class _ExcelLoaderWorker(DatasetImportWorker):
         dataset_name = self.source.original_filename
         try:
             self.progress.emit(0)
-            for index, plan in enumerate(self._plans, start=1):
-                if self.isInterruptionRequested():
-                    self.cancelled.emit(dataset_name)
-                    return
-                try:
-                    loaded_name, payload = self._load_sheet_payload(plan)
-                except CsvImportInterrupted:
-                    self.cancelled.emit(dataset_name)
-                    return
-                except Exception as exc:
-                    logger.exception(
-                        "Excel import failed: %s sheet %s",
-                        dataset_name,
-                        plan.sheet_name,
-                    )
-                    self.error.emit(
-                        f"Sheet {plan.sheet_name!r}: {type(exc).__name__}: {exc}"
-                    )
-                else:
-                    self.loaded.emit(loaded_name, payload)
-                self.progress.emit(int((index / len(self._plans)) * 100))
-                if self.isInterruptionRequested():
-                    self.cancelled.emit(dataset_name)
-                    return
+            with ExcelWorkbookPair(
+                self.source.exact_source_bytes,
+                source_label=self.source.original_filename,
+            ) as workbooks:
+                for index, plan in enumerate(self._plans, start=1):
+                    if self.isInterruptionRequested():
+                        self.cancelled.emit(dataset_name)
+                        return
+                    try:
+                        loaded_name, payload = self._load_sheet_payload(
+                            plan,
+                            workbooks,
+                        )
+                    except CsvImportInterrupted:
+                        self.cancelled.emit(dataset_name)
+                        return
+                    except Exception as exc:
+                        logger.exception(
+                            "Excel import failed: %s sheet %s",
+                            dataset_name,
+                            plan.sheet_name,
+                        )
+                        self.error.emit(
+                            f"Sheet {plan.sheet_name!r}: {type(exc).__name__}: {exc}"
+                        )
+                    else:
+                        self.loaded.emit(loaded_name, payload)
+                    self.progress.emit(int((index / len(self._plans)) * 100))
+                    if self.isInterruptionRequested():
+                        self.cancelled.emit(dataset_name)
+                        return
         except Exception as exc:
             logger.exception("Excel import failed: %s", dataset_name)
             self.error.emit(f"{type(exc).__name__}: {exc}")
@@ -590,6 +553,7 @@ def build_raw_record_batch_proposal(
             original_format=unit.source.archive_format,
             exact_source_bytes=unit.source.exact_source_bytes,
         )
+        validate_imported_source(source)
         previous_source = sources_by_id.get(source.source_id)
         if previous_source is not None and previous_source != source:
             raise ValueError(

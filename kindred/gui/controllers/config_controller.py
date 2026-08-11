@@ -121,13 +121,6 @@ class ConfigController(QtCore.QObject):
         super().__init__(ui.parent)
         self._ui = ui
         self._species_palette = self._build_species_palette()
-        self._result_cache_capacity_action = QtGui.QAction(
-            "Result Cache Capacity…",
-            self,
-        )
-        self._result_cache_capacity_action.triggered.connect(
-            self._configure_result_cache_capacity
-        )
 
     def _settings(self) -> QtCore.QSettings:
         settings = self._ui.settings()
@@ -159,9 +152,18 @@ class ConfigController(QtCore.QObject):
             return None
         return min(MAX_PARALLEL_WORKERS_CEILING, max(1, parsed))
 
-    def set_run_user_maximum(self, value: int) -> int:
+    def set_run_user_maximum(self, value: int | None) -> int | None:
+        if value is None:
+            settings = self._settings()
+            settings.remove(_RUN_USER_MAXIMUM_KEY)
+            self._sync_or_report(
+                settings,
+                "Run user maximum",
+                success_message="Run parallel maximum reset to Automatic.",
+            )
+            return None
         if type(value) is not int:
-            raise TypeError("Run user maximum must be an integer.")
+            raise TypeError("Run user maximum must be an integer or None.")
         accepted = min(MAX_PARALLEL_WORKERS_CEILING, max(1, value))
         settings = self._settings()
         settings.setValue(_RUN_USER_MAXIMUM_KEY, accepted)
@@ -171,12 +173,6 @@ class ConfigController(QtCore.QObject):
             success_message=f"Run parallel maximum set to {accepted}.",
         )
         return accepted
-
-    @property
-    def result_cache_capacity_action(self) -> QtGui.QAction:
-        """Return the controller-owned Preferences action."""
-
-        return self._result_cache_capacity_action
 
     def result_cache_capacity(self) -> int:
         """Return the validated per-tab explicit-result cache capacity."""
@@ -216,26 +212,6 @@ class ConfigController(QtCore.QObject):
         if previous != value:
             self.resultCacheCapacityChanged.emit(value)
         return value
-
-    @QtCore.Slot(bool)
-    def _configure_result_cache_capacity(self, _checked: bool = False) -> None:
-        parent = (
-            self._ui.parent
-            if isinstance(self._ui.parent, QtWidgets.QWidget)
-            else None
-        )
-        value, accepted = QtWidgets.QInputDialog.getInt(
-            parent,
-            "Result Cache Capacity",
-            "Maximum retained explicit results per mechanism tab:",
-            self.result_cache_capacity(),
-            1,
-            _QT_POSITIVE_INT_MAX,
-            1,
-        )
-        if not accepted:
-            return
-        self.set_result_cache_capacity(int(value))
 
     def mechanism_parameter_debounce_ms(self) -> int:
         return self._debounce_setting(
@@ -351,7 +327,10 @@ class ConfigController(QtCore.QObject):
                     )
                 ),
             )
-            return self.validate_run_defaults_candidate(candidate)
+            return validate_simulation_execution_settings(
+                candidate,
+                "application Run defaults",
+            )
         except (TypeError, ValueError, OverflowError) as exc:
             logger.warning(
                 "Ignoring invalid persisted application Run defaults: %s", exc
@@ -405,7 +384,10 @@ class ConfigController(QtCore.QObject):
                     )
                 ),
             )
-            return self.validate_scientific_defaults_candidate(candidate)
+            return validate_tab_scientific_settings(
+                candidate,
+                "application tab-scientific defaults",
+            )
         except (TypeError, ValueError, OverflowError) as exc:
             logger.warning(
                 "Ignoring invalid persisted tab-scientific defaults: %s", exc
@@ -484,29 +466,14 @@ class ConfigController(QtCore.QObject):
             fit_defaults=self.application_fit_defaults(),
         )
 
-    @staticmethod
-    def validate_run_defaults_candidate(
-        candidate: SimulationExecutionSettings,
-    ) -> SimulationExecutionSettings:
-        return validate_simulation_execution_settings(
-            candidate,
-            "application Run defaults",
-        )
-
-    @staticmethod
-    def validate_scientific_defaults_candidate(
-        candidate: TabScientificSettings,
-    ) -> TabScientificSettings:
-        return validate_tab_scientific_settings(
-            candidate,
-            "application tab-scientific defaults",
-        )
-
     def persist_scientific_defaults(
         self,
         candidate: TabScientificSettings,
     ) -> TabScientificSettings:
-        accepted = self.validate_scientific_defaults_candidate(candidate)
+        accepted = validate_tab_scientific_settings(
+            candidate,
+            "application tab-scientific defaults",
+        )
         settings = self._settings()
         for field_name, key in _SCIENTIFIC_SETTINGS_KEYS.items():
             settings.setValue(key, getattr(accepted, field_name))

@@ -183,10 +183,10 @@ def resolve_export_start_dir(last_folder: Optional[str]) -> str:
     """Return an existing directory for a request-time export dialog.
 
     Explicit output configuration is validated first and never falls back.  An
-    existing remembered last-export directory remains authoritative once that
-    configuration is valid.  Without either, the default outputs directory is
-    created lazily; if creation fails, its finite parent chain is searched for
-    the nearest existing directory.
+    existing, resolvable remembered last-export directory remains
+    authoritative once that configuration is valid.  Without either, the
+    default outputs directory is created lazily; if creation fails, its finite
+    parent chain is searched for the nearest existing directory.
     """
 
     explicit_output = _explicit_output_dir()
@@ -194,8 +194,11 @@ def resolve_export_start_dir(last_folder: Optional[str]) -> str:
         _prepare_explicit_output_dir(explicit_output)
 
     if _is_dirlike(last_folder):
-        remembered = Path(last_folder).expanduser().resolve()
-        if remembered.is_dir():
+        try:
+            remembered = Path(last_folder).expanduser().resolve()
+        except (OSError, RuntimeError):
+            remembered = None
+        if remembered is not None and remembered.is_dir():
             return str(remembered)
 
     if explicit_output is not None:

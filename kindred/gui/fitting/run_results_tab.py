@@ -985,19 +985,11 @@ class RunResultsTab(QtWidgets.QWidget):
 
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be a FitCandidate.")
-        self.set_apply_availability(
-            available_scopes,
-            unavailable_reasons,
+        self.restore_terminal_semantics(
+            candidate,
+            available_scopes=available_scopes,
+            unavailable_reasons=unavailable_reasons,
         )
-        self.set_run_identity(candidate.run_identity)
-        self._candidate = candidate
-        self._last_fitted_params = tuple(candidate.parameters)
-        self._last_dataset_fitted_params = self._dataset_parameter_entries(candidate)
-        self._last_set_initial_values = self._set_initial_entries(candidate)
-        self._last_dataset_metrics = self._dataset_metric_entries(candidate)
-        self._last_stats = self._candidate_stats(candidate)
-        self._tracker_panel.update_final(candidate, set_labels=self._set_labels)
-        self._refresh_summary_dialog()
         self._clear_render_failures()
         try:
             curves = project_fit_candidate_curves(candidate)
@@ -1007,6 +999,33 @@ class RunResultsTab(QtWidgets.QWidget):
             self._reject_terminal_projection(exc)
             return False
         return bool(curves and rendered)
+
+    def restore_terminal_semantics(
+        self,
+        candidate: FitCandidate,
+        *,
+        available_scopes: frozenset[str] | None = None,
+        unavailable_reasons: Mapping[str, str] | None = None,
+    ) -> None:
+        """Restore Summary/Run/Apply truth without touching physical plots."""
+
+        if not isinstance(candidate, FitCandidate):
+            raise TypeError("candidate must be FitCandidate.")
+        self.set_apply_availability(available_scopes, unavailable_reasons)
+        self.set_run_identity(candidate.run_identity)
+        self._candidate = candidate
+        self._last_fitted_params = tuple(candidate.parameters)
+        self._last_dataset_fitted_params = self._dataset_parameter_entries(candidate)
+        self._last_set_initial_values = self._set_initial_entries(candidate)
+        self._last_dataset_metrics = self._dataset_metric_entries(candidate)
+        self._last_stats = self._candidate_stats(candidate)
+        self._tracker_panel.update_final(candidate, set_labels=self._set_labels)
+        self._refresh_summary_dialog()
+
+    def mark_terminal_projection_unavailable(self, error: BaseException) -> None:
+        """Disable physical plot/Copy authority while retaining terminal data."""
+
+        self._reject_terminal_projection(error)
 
     def clear_candidate(self) -> None:
         """Clear all terminal/live result presentation without touching ownership."""

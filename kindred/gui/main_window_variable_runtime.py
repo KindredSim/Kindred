@@ -9,7 +9,6 @@ from typing import Callable, Iterable
 
 from PySide6 import QtCore
 
-from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
     MechanismSourceReconciliation,
     MechanismTabDocument,
@@ -28,7 +27,7 @@ from kindred.core.simulation_preparation import (
 from kindred.core.simulator.dsl_parse import (
     DslParameterCoordinateUpdate,
     PreparedDslRequestSet,
-    derive_prepared_dsl_with_parameter_updates,
+    derive_source_with_parameter_updates,
 )
 from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
 from kindred.gui.parameter_enumeration import (
@@ -44,6 +43,7 @@ from kindred.gui.workflow_contracts import (
     DetailedBalanceCorrectionOutcome,
     DetailedBalanceCorrectionRequest,
 )
+from kindred.gui.controllers.simulation_job_owner import PreviewIntent
 from kindred.gui.widgets.mechanism_editor import MechanismEditorTabbed
 
 __all__ = [
@@ -110,6 +110,7 @@ class _GestureCapture:
 @dataclass(frozen=True, slots=True)
 class _SuspendedPreviewDisposition:
     capture: _PreviewCapture | None
+    pending_intent: PreviewIntent | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1133,7 +1134,6 @@ class TabSliderBinding(QtCore.QObject):
 
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
-        visible_source = runtime.reactions_draft or tab.mechanism_source
         visible_prepared: PreparedDslRequestSet | None = tab.prepared_dsl
         callback_result: object = True
         callback = self._preview_preflight
@@ -1142,7 +1142,6 @@ class TabSliderBinding(QtCore.QObject):
             callback_result = callback(targets)
             if isinstance(callback_result, MechanismSourceReconciliation):
                 tab = self._registry.tab(self._tab_id)
-                visible_source = tab.mechanism_source
                 visible_prepared = callback_result.prepared_dsl
                 if callback_result.materialized_set_ids:
                     admitted_targets = (
@@ -1151,11 +1150,16 @@ class TabSliderBinding(QtCore.QObject):
                 else:
                     admitted_targets = self.resolve_target_set_ids()
                 if callback_result.detailed_balance.requires_correction:
+                    prospective_tab = callback_result.proposed_document.tab(
+                        self._tab_id
+                    )
                     request = self._preview_detailed_balance_request(
-                        tab,
+                        prospective_tab,
                         callback_result.detailed_balance.report,
                         prepared_dsl=visible_prepared,
-                        reactions_text=visible_source.reactions_text,
+                        reactions_text=(
+                            prospective_tab.mechanism_source.reactions_text
+                        ),
                     )
                     self._pending_detailed_balance_request = request
                     self.previewDetailedBalanceCorrectionRequired.emit(request)
@@ -1427,6 +1431,7 @@ class TabSliderBinding(QtCore.QObject):
             issue=issue,
             temperature_K=float(tab.scientific_settings.temperature),
             report=report,
+            accepted_analysis=prepared_dsl.analysis,
             source_energy_unit=str(source_energy_unit),
         )
 
@@ -1588,10 +1593,12 @@ class TabSliderBinding(QtCore.QObject):
         self._clear_gesture_state()
         transaction = _SuspendedPreviewDisposition(
             capture=self._preview_capture,
+            pending_intent=self._simulation_jobs.take_pending_preview(
+                self._tab_id
+            ),
         )
         self._preview_capture = None
         self._suspended_preview_disposition = transaction
-        self._simulation_jobs.drop_pending_preview(self._tab_id)
         return transaction
 
     def resume_preview_disposition(
@@ -1606,6 +1613,10 @@ class TabSliderBinding(QtCore.QObject):
         self._preview_capture = transaction.capture
         if transaction.capture is not None:
             self._start_throttle_if_inactive(transaction.capture.debounce_kind)
+        if transaction.pending_intent is not None:
+            self._simulation_jobs.restore_pending_preview(
+                transaction.pending_intent
+            )
 
     def discard_preview_disposition(
         self,
@@ -1617,7 +1628,6 @@ class TabSliderBinding(QtCore.QObject):
             raise ValueError("Slider Preview disposition is not current.")
         self._suspended_preview_disposition = None
         self._preview_capture = None
-        self._simulation_jobs.drop_pending_preview(self._tab_id)
 
     def discard_slider_draft(self, *, render: bool = True) -> bool:
         if self._suspended_preview_disposition is not None:
@@ -1705,8 +1715,9 @@ class TabSliderBinding(QtCore.QObject):
                     raise TypeError(
                         "Slider Apply requires retained DSL analysis."
                     )
-                candidate_prepared_dsl = (
-                    derive_prepared_dsl_with_parameter_updates(
+                derived_source, candidate_prepared_dsl = (
+                    derive_source_with_parameter_updates(
+                        source.reactions_text,
                         prepared_dsl,
                         tuple(
                             DslParameterCoordinateUpdate(
@@ -1720,12 +1731,9 @@ class TabSliderBinding(QtCore.QObject):
                         ),
                     )
                 )
+                source = source.with_reactions_text(derived_source)
             except (LookupError, TypeError, ValueError) as exc:
                 return self._reject(f"Slider Apply failed ({exc}).")
-            source = MechanismAuthoringSource.from_parts(
-                reactions_text=candidate_prepared_dsl.analysis.normalized_text
-            )
-
         candidate_sets = []
         for initial_set in tab.initial_condition_sets:
             updates = species_updates.get(initial_set.set_id)

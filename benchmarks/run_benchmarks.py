@@ -101,8 +101,12 @@ def load_mechanism_from_file(filepath: Path) -> LoadedBenchmarkMechanism:
             )
         mechanism = prepared.mechanism_for_execution()
         initial_condition = declarations[0]
+        initial_values = {
+            assignment.species: assignment.value
+            for assignment in initial_condition.assignments
+        }
         unknown_species = sorted(
-            set(initial_condition.values) - set(mechanism.species_names())
+            set(initial_values) - set(mechanism.species_names())
         )
         if unknown_species:
             raise ValueError(
@@ -162,7 +166,10 @@ def benchmark_simulation(
     # Build ODE system
     rhs = build_ode_rhs_from_mechanism(mechanism)
     species_names = mechanism.species_names()
-    initial_values = loaded.initial_condition.values
+    initial_values = {
+        assignment.species: assignment.value
+        for assignment in loaded.initial_condition.assignments
+    }
     y0 = np.array(
         [float(initial_values.get(species, 0.0)) for species in species_names],
         dtype=float,

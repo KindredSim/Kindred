@@ -86,16 +86,25 @@ def identify_physical_columns(
 ) -> tuple[PhysicalColumn, ...]:
     """Allocate exact-case collision-safe names by physical source position."""
 
-    authored = tuple(str(value).strip() for value in headers)
-    if not authored:
-        raise ValueError("The source has no columns.")
-    if any(not name for name in authored):
-        raise ValueError("Source column names must be nonblank after trimming.")
-    reserved = set(authored)
+    authored = tuple(
+        "" if value is None else str(value).strip()
+        for value in headers
+    )
+    # Blank physical positions have no import identity.  Keep their original
+    # positions out of the retained catalog; callers still use each retained
+    # column's source_index to read the physical row.
+    named = tuple(
+        (source_index, name)
+        for source_index, name in enumerate(authored)
+        if name
+    )
+    if not named:
+        return ()
+    reserved = {name for _source_index, name in named}
     assigned: set[str] = set()
     occurrences: dict[str, int] = {}
     columns: list[PhysicalColumn] = []
-    for source_index, name in enumerate(authored):
+    for source_index, name in named:
         occurrence = occurrences.get(name, 0)
         if occurrence == 0 and name not in assigned:
             candidate = name

@@ -35,7 +35,6 @@ class DslBuildStep:
     standard_conc_M: float | None = None
     dG_eq_J_per_mol: float | None = None
     Keq_input: float | None = None
-    explicit_rates: tuple[float, ...] = ()
     user_kf_explicit: bool = False
     user_kr_explicit: bool = False
     degeneracy: int = 1
@@ -53,9 +52,6 @@ class DslBuildStep:
                     raise TypeError(
                         f"{field} must contain exact (str, float) tuples."
                     )
-        rates = _require_exact_tuple(self.explicit_rates, "explicit_rates")
-        if any(type(rate) is not float for rate in rates):
-            raise TypeError("explicit_rates must contain exact floats.")
         if type(self.kf) is not float or not math.isfinite(self.kf) or self.kf <= 0.0:
             raise ValueError("kf must be positive and finite.")
         for field in (

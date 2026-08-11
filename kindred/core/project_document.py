@@ -9,7 +9,10 @@ from numbers import Real
 from typing import Callable, Iterable, Mapping, Sequence
 
 from kindred.core.datasets import foundation as dataset_foundation
-from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.mechanism_source import (
+    MechanismAuthoringSource,
+    source_matches_analysis,
+)
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.dsl_parse import (
     DslAnalysis,
@@ -42,6 +45,8 @@ __all__ = [
     "default_tab_scientific_settings",
     "FIT_MAX_NFEV_RANGE",
     "FIT_SEED_RANGE",
+    "SIMULATION_POINT_RANGE",
+    "TEMPERATURE_RANGE_K",
     "SUPPORTED_FIT_METHODS",
     "SUPPORTED_SOLVERS",
     "validate_fit_solver",
@@ -77,6 +82,8 @@ SUPPORTED_SOLVERS = _SOLVERS
 SUPPORTED_FIT_METHODS = _FITTING_METHODS
 FIT_MAX_NFEV_RANGE = _FITTING_MAX_NFEV_RANGE
 FIT_SEED_RANGE = _FITTING_SEED_RANGE
+SIMULATION_POINT_RANGE = _SIMULATION_POINT_RANGE
+TEMPERATURE_RANGE_K = _TEMPERATURE_RANGE_K
 
 
 def _new_id(prefix: str) -> str:
@@ -887,18 +894,6 @@ def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
     return defaults
 
 
-def _normalized_dsl_text(text: str) -> str:
-    return "\n".join(line.rstrip() for line in text.splitlines()).strip()
-
-
-def _normalized_mechanism_source(
-    source: MechanismAuthoringSource,
-) -> MechanismAuthoringSource:
-    return MechanismAuthoringSource.from_parts(
-        reactions_text=_normalized_dsl_text(source.reactions_text),
-    )
-
-
 def _prepare_source_dsl(
     source: MechanismAuthoringSource,
     scientific_settings: TabScientificSettings,
@@ -996,9 +991,7 @@ def _prepared_dsl_matches_tab(tab: MechanismTabDocument) -> bool:
     if type(prepared) is not PreparedDslRequestSet:
         return False
     analysis = prepared.analysis
-    if analysis.normalized_text != _normalized_dsl_text(
-        tab.mechanism_source.reactions_text
-    ):
+    if not source_matches_analysis(tab.mechanism_source, analysis):
         return False
     analysis_temperature = analysis.temperature_K
     return (
@@ -1055,14 +1048,13 @@ def reconcile_tab_mechanism_source(
         raise TypeError("visible_source must be MechanismAuthoringSource.")
     try:
         tab = document.tab(tab_id)
-        normalized_visible = _normalized_mechanism_source(visible_source)
         admitted_dsl = _prepare_source_dsl(
-            normalized_visible,
+            visible_source,
             tab.scientific_settings,
         )
         admission = (
             DslInitialConditionAdmission(
-                materialized_source=normalized_visible.reactions_text
+                materialized_source=visible_source.reactions_text
             )
             if admitted_dsl is None
             else admitted_dsl.analysis.inline_initial_conditions
@@ -1245,12 +1237,10 @@ def reconcile_tab_mechanism_source(
             )
 
         accepted_source = (
-            normalized_visible
+            visible_source
             if not admission.has_declarations
-            else _normalized_mechanism_source(
-                MechanismAuthoringSource.from_parts(
-                    reactions_text=admission.materialized_source
-                )
+            else MechanismAuthoringSource.from_parts(
+                reactions_text=admission.materialized_source
             )
         )
         prepared_dsl = (

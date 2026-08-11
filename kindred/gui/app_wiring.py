@@ -14,11 +14,6 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class PanelDockComponents:
-    dock: QDockWidget
-
-
-@dataclass(frozen=True)
 class DockShellSpec:
     identity_key: str
     title: str
@@ -112,7 +107,7 @@ def build_module_dock(
     *,
     spec: DockShellSpec,
     panel: QWidget,
-) -> PanelDockComponents:
+) -> QDockWidget:
     from kindred.gui.widgets.floating_dock_container import FloatingDockContainer
 
     dock = build_shell_dock(main_window, spec)
@@ -125,4 +120,4 @@ def build_module_dock(
     )
     dock.setWidget(container)
     main_window.addDockWidget(spec.default_area, dock)
-    return PanelDockComponents(dock=dock)
+    return dock

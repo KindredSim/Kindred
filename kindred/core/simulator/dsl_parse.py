@@ -43,6 +43,11 @@ from ..equilibrium_rate_authority import (
     effective_reverse_rate_from_keq,
     validate_equilibrium_rate_authority_flags,
 )
+from ..mechanism_source import (
+    MechanismAuthoringSource,
+    normalize_source_for_analysis,
+    source_matches_analysis,
+)
 from ..units import UnitsModel
 from .errors import (
     DSLError as _DSLError,
@@ -58,11 +63,11 @@ from .dsl_build_input import DslBuildStep
 from .dsl_parameter_scan import DslParameterAnalysis
 from .dsl_derivation import (
     authored_step_origin,
-    coordinate_source_line,
     coordinate_source_parts,
     origin_line_positions,
+    rewrite_coordinate_source_line,
+    rewrite_scalar_source_line,
     scalar_origin,
-    set_coordinate_source_token,
 )
 
 if TYPE_CHECKING:
@@ -83,8 +88,8 @@ __all__ = [
     "DslParameterCoordinateUpdate",
     "DslSourceOrigin",
     "PreparedDslRequestSet",
-    "derive_prepared_dsl_with_observables",
-    "derive_prepared_dsl_with_parameter_updates",
+    "derive_source_with_observables",
+    "derive_source_with_parameter_updates",
     "prepare_dsl_request_set",
 ]
 
@@ -163,7 +168,7 @@ def _dsl_identity_payload(
         raise TypeError("DSL units must be UnitsModel or None.")
     effective = UnitsModel() if units is None else units
     return {
-        "dsl": "\n".join(line.rstrip() for line in text.splitlines()).strip(),
+        "dsl": normalize_source_for_analysis(text),
         "energy_unit": effective.energy_unit,
         "temperature_K": effective.temperature_K,
         "standard_conc_M": effective.standard_conc_M,
@@ -174,7 +179,6 @@ def _dsl_identity_payload(
 class DslSourceOrigin:
     authored_ordinal: int
     line_number: int
-    kind: str
     source_text: str
 
     def __post_init__(self) -> None:
@@ -185,8 +189,6 @@ class DslSourceOrigin:
             raise ValueError("DSL origin ordinal must be a non-negative int.")
         if type(self.line_number) is not int or self.line_number <= 0:
             raise ValueError("DSL origin line number must be a positive int.")
-        if type(self.kind) is not str or not self.kind:
-            raise ValueError("DSL origin kind must be nonempty text.")
         if type(self.source_text) is not str:
             raise TypeError("DSL origin source text must be an exact string.")
 
@@ -317,6 +319,7 @@ class DslInitialConditionDeclaration:
             raise TypeError(
                 "Inline initial-condition source lines must match the span."
             )
+
 
 @dataclass(frozen=True, slots=True)
 class DslInitialConditionAdmission:
@@ -1678,7 +1681,6 @@ def _parse_reaction_like_step(
     eyring_dGJ = None
     dG_eqJ_for_step = None
     Keq_input = None
-    explicit_rates: List[float] = []
 
     if model == "Arrhenius":
         A = _float_or_none(params.get("A"))
@@ -1707,7 +1709,6 @@ def _parse_reaction_like_step(
                 "Arrhenius rate computation overflowed (A and Ea produce an unrepresentable rate)",
                 line_number=line_number, line_content=line_content,
             ) from exc
-        explicit_rates.append(kf)
         if reversible and kr is None:
             if "Keq" in params or "dG_eq" in params:
                 Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
@@ -1760,7 +1761,6 @@ def _parse_reaction_like_step(
                     "Eyring rate computation overflowed (dG_act too large for given T)",
                     line_number=line_number, line_content=line_content,
                 ) from exc
-            explicit_rates.append(kf)
         if reversible and kr is None:
             if "Keq" in params or "dG_eq" in params:
                 Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
@@ -1782,7 +1782,6 @@ def _parse_reaction_like_step(
                 line_number=line_number,
                 line_content=line_content,
             )
-        explicit_rates.append(kf)
         if reversible and kr is None:
             Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
                 params,
@@ -1799,9 +1798,6 @@ def _parse_reaction_like_step(
                 line_content=line_content,
             )
             Keq_input = Keq if "Keq" in params else None
-
-    if kr is not None:
-        explicit_rates.append(kr)
 
     return DslBuildStep(
         reactants=tuple(
@@ -1822,7 +1818,6 @@ def _parse_reaction_like_step(
         standard_conc_M=C0,
         dG_eq_J_per_mol=dG_eqJ_for_step,
         Keq_input=Keq_input,
-        explicit_rates=tuple(float(value) for value in explicit_rates),
         user_kf_explicit=any(
             key in params for key in ("kf", "k", "A", "Ea", "dG_act")
         ),
@@ -2018,7 +2013,6 @@ def _parse_equilibrium_step(
         standard_conc_M=C0,
         dG_eq_J_per_mol=dG_eqJ,
         Keq_input=(Keq if has_explicit_Keq else None),
-        explicit_rates=tuple(float(value) for value in exp_rates),
         user_kf_explicit=("kf" in params),
         user_kr_explicit=("kr" in params),
         degeneracy=1,
@@ -2031,17 +2025,10 @@ def _source_origins(text: str) -> tuple[DslSourceOrigin, ...]:
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if ":" in stripped:
-            kind = stripped.split(":", 1)[0].strip().lower()
-        elif "=" in stripped:
-            kind = stripped.split("=", 1)[0].strip().lower()
-        else:
-            kind = "statement"
         origins.append(
             DslSourceOrigin(
                 authored_ordinal=len(origins),
                 line_number=line_number,
-                kind=kind or "statement",
                 source_text=raw_line,
             )
         )
@@ -2236,15 +2223,6 @@ def prepare_dsl_request_set(
     )
     metadata = getattr(mechanism, "metadata", None)
     if isinstance(metadata, dict):
-        metadata["dsl_analysis_identity"] = analysis.identity
-        metadata["dsl_source_origins"] = tuple(
-            {
-                "authored_ordinal": origin.authored_ordinal,
-                "line_number": origin.line_number,
-                "kind": origin.kind,
-            }
-            for origin in analysis.origins
-        )
         metadata["parameter_algebra_spec"] = parameter_algebra_spec
     return PreparedDslRequestSet(
         analysis=analysis,
@@ -2288,13 +2266,14 @@ def _reaction_model_overrides(model: object) -> dict[str, object]:
     return {"model": family, **payload}
 
 
-def derive_prepared_dsl_with_parameter_updates(
+def derive_source_with_parameter_updates(
+    source_text: str,
     base: PreparedDslRequestSet,
     updates: tuple[DslParameterCoordinateUpdate, ...],
     *,
     wegscheider_cyclicity_enabled: bool,
-) -> PreparedDslRequestSet:
-    """Apply typed updates, render source, and return its final admission."""
+) -> tuple[str, PreparedDslRequestSet]:
+    """Apply typed updates to exact source and return both authorities."""
 
     from kindred.core.equilibrium_rate_authority import (
         EquilibriumRateAuthorityKind,
@@ -2321,6 +2300,8 @@ def derive_prepared_dsl_with_parameter_updates(
 
     if type(base) is not PreparedDslRequestSet:
         raise TypeError("base must be exact PreparedDslRequestSet.")
+    if type(source_text) is not str:
+        raise TypeError("source_text must be an exact str.")
     if base.analysis.inline_initial_conditions.has_declarations:
         raise ValueError(
             "Typed parameter derivation requires canonical materialized "
@@ -2340,6 +2321,11 @@ def derive_prepared_dsl_with_parameter_updates(
         )
     if not updates:
         raise ValueError("Typed DSL parameter derivation requires updates.")
+    source = MechanismAuthoringSource.from_parts(reactions_text=source_text)
+    if not source_matches_analysis(source, base.analysis):
+        raise ValueError(
+            "Typed parameter derivation source does not match its retained analysis."
+        )
     names = tuple(item.name for item in updates)
     if len(names) != len(set(names)):
         raise ValueError("DSL parameter update names must be unique.")
@@ -2372,8 +2358,18 @@ def derive_prepared_dsl_with_parameter_updates(
         for statement in spec.param_statements
         if lookup_step_param_target(mechanism, str(statement.name)) is not None
     }
-    source_lines = base.analysis.normalized_text.splitlines()
-    origin_positions = origin_line_positions(base.analysis)
+    authored_source = source_text
+    raw_lines = authored_source.splitlines(keepends=True)
+    line_contents = [line.rstrip("\r\n") for line in raw_lines]
+    line_endings = [
+        line[len(content):]
+        for line, content in zip(raw_lines, line_contents)
+    ]
+    if not raw_lines and authored_source:
+        line_contents = [authored_source]
+        line_endings = [""]
+    source_lines = line_contents
+    origin_positions = origin_line_positions(base.analysis, authored_source)
     updated_origin_lines: dict[int, str] = {}
     scalar_values = metadata.get("scalar_params")
     if not isinstance(scalar_values, dict):
@@ -2436,19 +2432,10 @@ def derive_prepared_dsl_with_parameter_updates(
                 origin.authored_ordinal,
                 source_lines[origin_positions[origin.authored_ordinal]],
             )
-            before_comment, marker, comment = old_line.partition("#")
-            match = re.match(
-                rf"^(\s*param\s+{re.escape(update.name)}\s*=\s*)(.*?)\s*$",
-                before_comment,
-                flags=re.IGNORECASE,
-            )
-            if match is None:
-                raise ValueError(
-                    f"Scalar parameter {update.name!r} origin is invalid."
-                )
-            new_line = (
-                f"{match.group(1)}{repr(float(update.value))}"
-                + (f" {marker}{comment}".rstrip() if marker else "")
+            new_line = rewrite_scalar_source_line(
+                old_line,
+                name=update.name,
+                expression=repr(float(update.value)),
             )
             updated_origin_lines[origin.authored_ordinal] = new_line
             statement = statements[statement_index]
@@ -2501,7 +2488,7 @@ def derive_prepared_dsl_with_parameter_updates(
             origin.authored_ordinal,
             source_lines[origin_positions[origin.authored_ordinal]],
         )
-        prefix, tokens, comment = coordinate_source_parts(old_line)
+        _prefix, tokens, _comment = coordinate_source_parts(old_line)
         source_token = role
         source_value = update.value
 
@@ -2653,18 +2640,19 @@ def derive_prepared_dsl_with_parameter_updates(
                 f"Unsupported mechanism coordinate kind {kind!r}."
             )
 
-        set_coordinate_source_token(
-            tokens,
+        new_line = rewrite_coordinate_source_line(
+            old_line,
             token=source_token,
             value=float(source_value),
         )
-        updated_origin_lines[origin.authored_ordinal] = (
-            coordinate_source_line(prefix, tokens, comment)
-        )
+        updated_origin_lines[origin.authored_ordinal] = new_line
 
     for ordinal, line in updated_origin_lines.items():
         source_lines[origin_positions[ordinal]] = line
-    updated_text = "\n".join(source_lines)
+    updated_text = "".join(
+        content + ending
+        for content, ending in zip(source_lines, line_endings)
+    )
     # Publish only the typed state admitted from the exact rendered source.
     # The in-loop mechanism is deliberately not returned: its calculated
     # values may retain precision that the source token cannot represent.
@@ -2683,7 +2671,7 @@ def derive_prepared_dsl_with_parameter_updates(
         admitted_metadata[
             MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED
         ] = wegscheider_cyclicity_enabled
-    return PreparedDslRequestSet(
+    result = PreparedDslRequestSet(
         analysis=prepared.analysis,
         mechanism=admitted_mechanism,
         intervention_schedule=(
@@ -2692,16 +2680,25 @@ def derive_prepared_dsl_with_parameter_updates(
         intervention_execution=prepared.intervention_execution_contract(),
         parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
     )
+    return updated_text, result
 
 
-def derive_prepared_dsl_with_observables(
+def derive_source_with_observables(
+    source_text: str,
     base: PreparedDslRequestSet,
     definitions: tuple[DslDerivedObservableDefinition, ...],
-) -> PreparedDslRequestSet:
-    """Derive one typed Fit-local observable authority from a retained base."""
+) -> tuple[str, PreparedDslRequestSet]:
+    """Derive Fit-local observables from exact source and return both authorities."""
 
     if not isinstance(base, PreparedDslRequestSet):
         raise TypeError("base must be a PreparedDslRequestSet.")
+    if type(source_text) is not str:
+        raise TypeError("source_text must be an exact str.")
+    source = MechanismAuthoringSource.from_parts(reactions_text=source_text)
+    if not source_matches_analysis(source, base.analysis):
+        raise ValueError(
+            "Observable derivation source does not match its retained analysis."
+        )
     if base.analysis.inline_initial_conditions.has_declarations:
         raise ValueError(
             "Derived observables require canonical materialized initial "
@@ -2849,7 +2846,7 @@ def derive_prepared_dsl_with_observables(
         raise _DSLError(str(exc)) from exc
     setattr(mechanism, "_compiled_algebra_series", compiled_algebra_series)
 
-    base_text = base.analysis.normalized_text.rstrip()
+    base_text = source_text
 
     def _bound_identity(value: float) -> float | str:
         if value == float("-inf"):
@@ -2893,18 +2890,18 @@ def derive_prepared_dsl_with_observables(
         DslSourceOrigin(
             authored_ordinal=len(base.analysis.origins) + index,
             line_number=first_line + index,
-            kind=(
-                "derived-scalar"
-                if index < len(scalar_lines)
-                else "derived-observable"
-            ),
             source_text=line,
         )
         for index, line in enumerate(derived_lines)
     )
+    derived_source = base_text + (
+        ""
+        if base_text.endswith(("\n", "\r"))
+        else ("\r\n" if "\r\n" in base_text else "\n")
+    ) + ("\r\n" if "\r\n" in base_text else "\n").join(derived_lines)
     analysis = DslAnalysis(
         identity=derived_identity,
-        normalized_text="\n".join((base_text, *derived_lines)),
+        normalized_text=normalize_source_for_analysis(derived_source),
         origins=base.analysis.origins + derived_origins,
         species_names=base.analysis.species_names,
         observable_names=tuple(
@@ -2915,18 +2912,7 @@ def derive_prepared_dsl_with_observables(
         temperature_K=base.analysis.temperature_K,
         energy_unit=base.analysis.energy_unit,
     )
-    metadata = getattr(mechanism, "metadata", None)
-    if isinstance(metadata, dict):
-        metadata["dsl_analysis_identity"] = analysis.identity
-        metadata["dsl_source_origins"] = tuple(
-            {
-                "authored_ordinal": origin.authored_ordinal,
-                "line_number": origin.line_number,
-                "kind": origin.kind,
-            }
-            for origin in analysis.origins
-        )
-    return PreparedDslRequestSet(
+    result = PreparedDslRequestSet(
         analysis=analysis,
         mechanism=mechanism,
         intervention_schedule=(
@@ -2935,3 +2921,4 @@ def derive_prepared_dsl_with_observables(
         intervention_execution=base.intervention_execution_contract(),
         parameter_algebra_spec=retained_spec,
     )
+    return derived_source, result

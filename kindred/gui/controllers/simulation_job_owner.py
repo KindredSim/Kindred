@@ -18,7 +18,10 @@ from kindred.core.exceptions import SimulationCancelled
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
 )
-from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.mechanism_source import (
+    MechanismAuthoringSource,
+    source_matches_analysis,
+)
 from kindred.core.project_document import (
     SimulationExecutionSettings,
     TabScientificSettings,
@@ -170,10 +173,7 @@ def _validate_request_against_result_key(
     if not isinstance(prepared_dsl, PreparedDslRequestSet):
         raise TypeError("prepared_dsl must be PreparedDslRequestSet.")
     analysis = request.snapshot.analysis
-    if (
-        getattr(analysis, "normalized_text", None)
-        != key.mechanism_source.reactions_text.strip()
-    ):
+    if not source_matches_analysis(key.mechanism_source, analysis):
         raise ValueError(
             "execution request analysis does not match result source."
         )
@@ -669,6 +669,7 @@ def _detailed_balance_correction_for_capture(
         temperature_K=temperature,
         report=report,
         source_energy_unit=source_energy_unit,
+        accepted_analysis=capture.targets[0].prepared_dsl.analysis,
     )
 
 
@@ -1476,6 +1477,19 @@ class SimulationJobOwner(QtCore.QObject):
                 gate_already_owned=gate_already_owned,
             )
         except Exception as exc:
+            if self._worker is not None and self._job_kind == "run":
+                # _start_worker() retains custody when native startup cannot
+                # be disproved.  This is a dispatched Run with terminal
+                # delivery still pending, not a completed dispatch failure.
+                self.run_dispatched.emit(
+                    capture.tab_id,
+                    tuple(target.key.set_id for target in capture.targets),
+                )
+                self.status_changed.emit(
+                    "Run startup remains uncertain; worker and computation "
+                    "gate are retained until the terminal callback."
+                )
+                return True
             self.status_changed.emit(
                 f"Run dispatch failed: {type(exc).__name__}: {exc}"
             )
@@ -1853,6 +1867,37 @@ class SimulationJobOwner(QtCore.QObject):
             return
         self._pending_preview = None
         self.state_changed.emit()
+
+    def take_pending_preview(self, tab_id: str) -> PreviewIntent | None:
+        """Take one tab's owner-held Preview intent for modal suspension."""
+
+        tid = _required_id(tab_id, "tab_id")
+        pending = self._pending_preview
+        if pending is None or pending.tab_id != tid:
+            return None
+        self._pending_preview = None
+        self.state_changed.emit()
+        return pending
+
+    def restore_pending_preview(self, intent: PreviewIntent) -> bool:
+        """Restore one exact suspended intent and queue its single redrive."""
+
+        if not isinstance(intent, PreviewIntent):
+            raise TypeError("intent must be a PreviewIntent.")
+        if self._application_close_fenced:
+            self._retire_unsuccessful_preview_intent(intent)
+            self.status_changed.emit(
+                "Pending Preview discarded: simulation owner is closing."
+            )
+            return False
+        # A newer owner-held intent wins the same one-slot pending position.
+        if self._pending_preview is not None:
+            self._schedule_pending_preview()
+            return False
+        self._pending_preview = intent
+        self.state_changed.emit()
+        self._schedule_pending_preview()
+        return True
 
     def _drop_pending_preview_for_targets(
         self,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -93,7 +94,6 @@ from kindred.gui.controllers.simulation_job_owner import (
     ExplicitRunCapture,
     SimulationJobOwner,
     build_explicit_target,
-    resolve_run_parallel_capacity,
 )
 from kindred.gui.dataset_import_staging import (
     DatasetImportCompletion,
@@ -146,7 +146,7 @@ from kindred.gui.widgets.mechanism_workspace import MechanismWorkspaceView
 from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
 from kindred.gui.widgets.right_panel import RightPanelTabbed
 from kindred.gui.widgets.simulation_panel import SimulationPanel
-from kindred.gui.widgets.solver_settings import TabScientificSettingsDialog
+from kindred.gui.widgets.solver_settings import SimulationSettingsDialog
 from kindred.gui.widgets.symbolic_calculator_panel import SymbolicCalculatorPanel
 from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.workspace_result_presenter import (
@@ -292,6 +292,13 @@ class _XlsxExportWorker(QtCore.QThread):
                 if self.isInterruptionRequested():
                     self._terminal_outcome = "cancelled"
                     raise _XlsxExportCancelled()
+                try:
+                    existing_mode = stat.S_IMODE(os.stat(self._path).st_mode)
+                except FileNotFoundError:
+                    existing_mode = None
+                if existing_mode is not None:
+                    os.chmod(temporary_path, existing_mode)
+                self._check_cancelled()
                 os.replace(temporary_path, self._path)
                 temporary_path = ""
                 self._terminal_outcome = "committed"
@@ -422,18 +429,14 @@ class _XlsxExportOwner(QtCore.QObject):
             if not verified_unstarted:
                 logger.exception(
                     "XLSX worker startup raised and unstarted state could not "
-                    "be verified"
-                )
-                self.failed.emit(
-                    _XlsxExportFailure(
-                        generation=generation,
-                        path=absolute_path,
-                        message=f"Could not confirm XLSX export startup: {exc}",
-                        cancelled=False,
-                    )
+                    "be verified; retaining worker custody"
                 )
                 self.owned_qthreads_changed.emit()
-                return False
+                # Native launch may already have happened even though start()
+                # raised.  Keep the exact worker and generation authoritative;
+                # its existing success/failure/finished callbacks publish the
+                # sole terminal outcome.
+                return True
             self._active_worker = None
             for signal, slot in (
                 (worker.succeeded, self._publish_success),
@@ -715,7 +718,7 @@ class MainWindow(QtWidgets.QMainWindow):
             spec=MECHANISM_DOCK_SPEC,
             panel=self._mechanism_stack,
         )
-        self._mechanism_dock = mechanism.dock
+        self._mechanism_dock = mechanism
         self._slider_stack = QtWidgets.QStackedWidget(self)
         self._slider_stack.setObjectName("sliderSurfaceStack")
         sliders = build_module_dock(
@@ -723,7 +726,7 @@ class MainWindow(QtWidgets.QMainWindow):
             spec=SLIDERS_DOCK_SPEC,
             panel=self._slider_stack,
         )
-        self._sliders_dock = sliders.dock
+        self._sliders_dock = sliders
 
         self._initial_conditions_stack = QtWidgets.QStackedWidget(self)
         self._initial_conditions_stack.setObjectName(
@@ -734,7 +737,7 @@ class MainWindow(QtWidgets.QMainWindow):
             spec=BATCH_DOCK_SPEC,
             panel=self._initial_conditions_stack,
         )
-        self._batch_dock = initials.dock
+        self._batch_dock = initials
 
         self._data_stack = QtWidgets.QStackedWidget(self)
         self._data_stack.setObjectName("dataSurfaceStack")
@@ -743,14 +746,14 @@ class MainWindow(QtWidgets.QMainWindow):
             spec=RIGHT_DOCK_SPEC,
             panel=self._data_stack,
         )
-        self._right_dock = data.dock
+        self._right_dock = data
 
         analysis = build_module_dock(
             self,
             spec=ANALYSIS_DOCK_SPEC,
             panel=self._workspace.main_plot_analysis_widget(),
         )
-        self._analysis_dock = analysis.dock
+        self._analysis_dock = analysis
 
         self._calculator_stack = QtWidgets.QStackedWidget(self)
         self._calculator_stack.setObjectName("symbolicCalculatorSurfaceStack")
@@ -759,7 +762,7 @@ class MainWindow(QtWidgets.QMainWindow):
             spec=SYMBOLIC_CALCULATOR_DOCK_SPEC,
             panel=self._calculator_stack,
         )
-        self._symbolic_calculator_dock = symbolic.dock
+        self._symbolic_calculator_dock = symbolic
 
     def _create_tab_surface(self, tab_id: str) -> _TabSurfaceBundle:
         """Construct and retain one tab's complete non-plot physical surface."""
@@ -800,6 +803,9 @@ class MainWindow(QtWidgets.QMainWindow):
         calculator_owner = SymbolicCalculatorOwner(
             canonical_prepared_dsl=lambda captured=target: (
                 self._workspace_tab_registry.tab(captured).prepared_dsl
+            ),
+            canonical_source=lambda captured=target: (
+                self._workspace_tab_registry.tab(captured).mechanism_source
             ),
         )
         calculator_panel = SymbolicCalculatorPanel(
@@ -1194,7 +1200,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "_file_menu",
             "_edit_menu",
             "_view_menu",
-            "_preferences_menu",
             "_examples_menu",
             "_simulation_menu",
             "_fitting_menu",
@@ -1659,7 +1664,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_persisted_plot_state(self, tab_id: str) -> None:
         state = self._workspace_tab_registry.presentation(tab_id)
         self._workspace.plot_for_tab(tab_id).set_persisted_plot_state(
-            tab_id,
             log_x=state.log_x,
             log_y=state.log_y,
             legend_visible=state.legend_visible,
@@ -2338,27 +2342,138 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         tab_id: str,
         target_ids: tuple[str, ...],
-    ) -> MechanismSourceReconciliation | None:
-        if not self._settle_execution_candidate(tab_id):
+    ) -> MechanismSourceReconciliation | bool | None:
+        if not self._mutation_input_admitted("Preview"):
             return None
-        proposal = self._accept_visible_source_result(
-            tab_id,
+        target = str(tab_id)
+        # Preview is an action boundary: settle the active execution and IC
+        # editors before capturing any source, target, or token truth.  The
+        # proposal below is therefore always based on the post-settlement
+        # document rather than a stale pre-focus-loss snapshot.
+        settled_token = self._settle_execution_candidate(target)
+        if settled_token is None:
+            return None
+        document = self._project_session.document
+        runtime = self._workspace_tab_registry.tab_runtime(target)
+        visible_draft = runtime.reactions_draft
+        if visible_draft is None:
+            if self._tab_surfaces[target].initial_actions.has_invalid_cells(
+                target_ids
+            ):
+                self.set_status_text(
+                    "Preview blocked by invalid visible Initial Conditions."
+                )
+                return None
+            try:
+                retained = retained_tab_mechanism_source(document, target)
+            except (KeyError, TypeError, ValueError) as exc:
+                self.set_status_text(
+                    "Preview requires retained accepted Reactions and DSL: "
+                    f"{exc}"
+                )
+                return None
+            if retained.detailed_balance.requires_correction:
+                # Return the retained, mutation-free proposal so the existing
+                # Slider owner can construct its exact correction request.
+                return retained
+            # Accepted source and Prepared DSL are already retained by the
+            # canonical tab.  Do not reparse, commit an equal document, or
+            # refresh the editor when Preview has no Reactions Draft.
+            return True
+        visible = visible_draft
+        proposal = self._prepare_source_reconciliation(
+            document,
+            target,
+            visible,
             description="Preview",
+            report_error=True,
         )
         if proposal is None:
             return None
-        # Source admission may replace the selected row with an inline
-        # materialized set.  Validate the post-admission target roster, not
-        # the gesture's pre-admission snapshot.
-        live_targets = self._tab_surfaces[tab_id].slider_binding.resolve_target_set_ids()
-        if self._tab_surfaces[tab_id].initial_actions.has_invalid_cells(
-            live_targets
-        ):
+        prospective_tab = proposal.proposed_document.tab(target)
+        prospective_targets = tuple(
+            str(set_id)
+            for set_id in (
+                proposal.materialized_set_ids or tuple(target_ids)
+            )
+        )
+        prospective_species = set(canonical_species_names(prospective_tab))
+        invalid = tuple(
+            (set_id, species, raw)
+            for set_id, values
+            in runtime.invalid_initial_text_by_set_id.items()
+            if set_id in prospective_targets
+            for species, raw in values.items()
+            if species in prospective_species
+        )
+        if invalid:
             self.set_status_text(
                 "Preview blocked by invalid visible Initial Conditions."
             )
             return None
+        if proposal.detailed_balance.requires_correction:
+            return proposal
+        if self._commit_preview_source_proposal(
+            target,
+            visible,
+            proposal,
+            expected_token=settled_token,
+        ) is None:
+            return None
         return proposal
+
+    def _commit_preview_source_proposal(
+        self,
+        tab_id: str,
+        visible: MechanismAuthoringSource,
+        proposal: MechanismSourceReconciliation,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        """Commit one fully admitted Preview source proposal exactly once."""
+
+        target = str(tab_id)
+        if not self._mutation_input_admitted("Preview"):
+            return None
+        result = self._workspace_tab_registry.replace_document(
+            proposal.proposed_document,
+            expected_token=expected_token,
+        )
+        if result is None:
+            return None
+        self._consume_canonical_mutation(result)
+        token = result.token
+        if proposal.materialized_set_ids:
+            token = self._activate_materialized_set(
+                target,
+                proposal.materialized_set_ids[0],
+                expected_token=token,
+            )
+            if token is None:
+                raise RuntimeError(
+                    "Materialized Initial Conditions could not become active."
+                )
+        runtime = self._workspace_tab_registry.tab_runtime(target)
+        bundle = self._tab_surfaces[target]
+        proposed_tab = proposal.proposed_document.tab(target)
+        bundle.editor_binding.apply_accepted_source_rewrite(
+            visible,
+            proposed_tab.mechanism_source,
+        )
+        runtime.reactions_draft = None
+        valid_species = set(canonical_species_names(proposed_tab))
+        runtime.invalid_initial_text_by_set_id = {
+            set_id: {
+                species: raw
+                for species, raw in values.items()
+                if species in valid_species
+            }
+            for set_id, values in runtime.invalid_initial_text_by_set_id.items()
+            if any(species in valid_species for species in values)
+        }
+        bundle.editor_binding.render()
+        self._refresh_tab_controls(target, preserve_reactions_editor=True)
+        return token
 
     def _confirm_discard_slider_preview(
         self,
@@ -3868,7 +3983,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if token is None:
             return
         self._workspace.plot_for_tab(tab_id).set_persisted_plot_state(
-            tab_id,
             log_x=next_state.log_x,
             log_y=next_state.log_y,
             legend_visible=next_state.legend_visible,
@@ -3958,8 +4072,6 @@ class MainWindow(QtWidgets.QMainWindow):
         view_menu = bar.addMenu("&View")
         self._view_menu = view_menu
         panels = view_menu.addMenu("Panels")
-        self._panels_menu = panels
-        self._dock_toggle_actions: dict[str, QtGui.QAction] = {}
         for spec, dock in zip(
             dock_shell_specs(),
             self._shell_docks(),
@@ -3969,7 +4081,6 @@ class MainWindow(QtWidgets.QMainWindow):
             action.setText(spec.title)
             action.setObjectName(f"{spec.identity_key}DockToggleAction")
             panels.addAction(action)
-            self._dock_toggle_actions[spec.identity_key] = action
         analysis_menu = view_menu.addMenu("Analysis Surfaces")
         for surface in self._workspace.available_analysis_surfaces():
             self._add_action(
@@ -3996,37 +4107,9 @@ class MainWindow(QtWidgets.QMainWindow):
             checkable=True,
         )
 
-        preferences = bar.addMenu("&Preferences")
-        self._preferences_menu = preferences
-        self._add_action(
-            preferences,
-            "Run Parallel Maximum...",
-            self._configure_run_parallel_maximum,
-            None,
-            "runParallelMaximumPreferenceAction",
-        )
-        self._add_action(
-            preferences,
-            "Parameter Preview Debounce...",
-            self._configure_parameter_debounce,
-            None,
-            "parameterDebouncePreferenceAction",
-        )
-        self._add_action(
-            preferences,
-            "Equilibrium Preview Debounce...",
-            self._configure_equilibrium_debounce,
-            None,
-            "equilibriumDebouncePreferenceAction",
-        )
-        preferences.addAction(
-            self.config_controller.result_cache_capacity_action
-        )
-
         examples = bar.addMenu("&Examples")
         self._examples_menu = examples
         presets = examples.addMenu("Preset Mechanisms")
-        self._preset_examples_menu = presets
         for index in range(1, 10):
             preset_id = f"M{index}"
             action = presets.addAction(preset_id)
@@ -4038,7 +4121,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
         interventions = examples.addMenu("Intervention Examples")
-        self._intervention_examples_menu = interventions
         try:
             intervention_specs = get_all_intervention_example_specs()
         except InterventionExampleCatalogError as exc:
@@ -4096,10 +4178,10 @@ class MainWindow(QtWidgets.QMainWindow):
         simulation.addSeparator()
         self._add_action(
             simulation,
-            "Tab Scientific Settings...",
-            self._open_scientific_settings,
+            "Simulation Settings...",
+            self._open_simulation_settings,
             None,
-            "tabScientificSettingsAction",
+            "simulationSettingsAction",
         )
 
         fitting = bar.addMenu("&Fitting")
@@ -4120,7 +4202,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         help_menu = bar.addMenu("&Help")
-        self._help_menu = help_menu
         self._add_action(
             help_menu,
             "Documentation",
@@ -4162,100 +4243,53 @@ class MainWindow(QtWidgets.QMainWindow):
         action.triggered.connect(callback)
         return action
 
-    def _configure_run_parallel_maximum(self) -> None:
-        if not self._mutation_input_admitted("Configure Run Parallel Maximum"):
-            return
-        current = resolve_run_parallel_capacity(
-            cpu_count=os.cpu_count(),
-            user_max=self.config_controller.run_user_maximum_preference(),
-            target_count=60,
-        ).resolved_user_max
-        value, accepted = QtWidgets.QInputDialog.getInt(
-            self,
-            "Run Parallel Maximum",
-            "Maximum concurrent Run targets:",
-            current,
-            1,
-            60,
-            1,
-        )
-        if not accepted:
-            return
-        self.config_controller.set_run_user_maximum(int(value))
-
-    def _configure_parameter_debounce(self) -> None:
-        if not self._mutation_input_admitted("Configure Parameter Preview"):
-            return
-        value, accepted = QtWidgets.QInputDialog.getInt(
-            self,
-            "Parameter Preview Debounce",
-            "Debounce interval (milliseconds):",
-            self.config_controller.mechanism_parameter_debounce_ms(),
-            0,
-            1000,
-            10,
-        )
-        if not accepted:
-            return
-        self.config_controller.set_mechanism_parameter_debounce_ms(int(value))
-
-    def _configure_equilibrium_debounce(self) -> None:
-        if not self._mutation_input_admitted("Configure Equilibrium Preview"):
-            return
-        value, accepted = QtWidgets.QInputDialog.getInt(
-            self,
-            "Equilibrium Preview Debounce",
-            "Debounce interval (milliseconds):",
-            self.config_controller.equilibrium_k_debounce_ms(),
-            0,
-            1000,
-            10,
-        )
-        if not accepted:
-            return
-        self.config_controller.set_equilibrium_k_debounce_ms(int(value))
-
-    def _open_scientific_settings(self) -> None:
-        if not self._mutation_input_admitted("Configure Scientific Settings"):
+    def _open_simulation_settings(self) -> None:
+        if not self._mutation_input_admitted("Configure Simulation Settings"):
             return
         tab_id = self._workspace_tab_registry.active_tab_id
-        if not self._settle_execution_candidate(tab_id):
-            return
-        previous_settings = self._workspace_tab_registry.tab(
-            tab_id
-        ).scientific_settings
-        dialog = TabScientificSettingsDialog(self)
-        dialog.set_scientific_settings(
-            self._workspace_tab_registry.tab(tab_id).scientific_settings
+        tab = self._workspace_tab_registry.tab(tab_id)
+        dialog = SimulationSettingsDialog(self)
+        dialog.set_scientific_settings(tab.scientific_settings)
+        dialog.set_preview_debounce(
+            self.config_controller.mechanism_parameter_debounce_ms(),
+            self.config_controller.equilibrium_k_debounce_ms(),
+        )
+        current_max = self.config_controller.run_user_maximum_preference()
+        dialog.set_run_user_maximum(current_max)
+        dialog.set_result_cache_capacity(
+            self.config_controller.result_cache_capacity()
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
-        settings = dialog.scientific_settings()
-        bundle = self._tab_surfaces[tab_id]
         try:
-            # Canonical publication may re-admit a temperature-dependent DSL
-            # and reject the entire candidate.  The action owner publishes
-            # atomically, so a raised validation error leaves the document
-            # unchanged.
+            settings = dialog.scientific_settings()
+            parameter_debounce, equilibrium_debounce = dialog.preview_debounce()
+            run_maximum = dialog.run_user_maximum()
+            cache_capacity = dialog.result_cache_capacity()
+            bundle = self._tab_surfaces[tab_id]
+            previous_settings = self._workspace_tab_registry.tab(
+                tab_id
+            ).scientific_settings
             changed = bundle.initial_actions.set_tab_scientific_settings(settings)
+            if not changed and settings != previous_settings:
+                raise ValueError(
+                    "Scientific settings rejected: canonical project content "
+                    "changed before publication."
+                )
+            self.config_controller.set_mechanism_parameter_debounce_ms(
+                parameter_debounce
+            )
+            self.config_controller.set_equilibrium_k_debounce_ms(
+                equilibrium_debounce
+            )
+            self.config_controller.set_run_user_maximum(run_maximum)
+            self.config_controller.set_result_cache_capacity(cache_capacity)
         except (TypeError, ValueError, KeyError, OverflowError) as exc:
             message = str(exc)
             self.set_status_text(message)
             QtWidgets.QMessageBox.warning(
                 self,
-                "Scientific Settings Rejected",
-                message,
-            )
-            return
-        if not changed and settings != previous_settings:
-            message = (
-                "Scientific settings rejected: canonical project content "
-                "changed before publication."
-            )
-            self.set_status_text(message)
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Scientific Settings Rejected",
+                "Simulation Settings Rejected",
                 message,
             )
             return

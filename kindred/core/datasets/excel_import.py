@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
-from contextlib import ExitStack
 from io import BytesIO
-from typing import Iterable, Iterator, List, Mapping
+from typing import Iterator, List, Mapping
 from zipfile import BadZipFile, ZipFile
 
 from openpyxl import load_workbook
@@ -18,74 +17,85 @@ from kindred.core.datasets.source_rules import (
 )
 
 __all__ = [
-    "list_sheets_from_bytes",
-    "read_excel_sheet_rows_from_bytes",
+    "ExcelWorkbookPair",
 ]
 
-def list_sheets_from_bytes(
-    source_bytes: bytes,
-    *,
-    source_label: str,
-) -> List[str]:
-    """Return worksheet names from the one immutable import snapshot."""
 
-    workbook = _open_workbook_bytes(
-        source_bytes,
-        source_label=source_label,
-        data_only=True,
-    )
-    try:
-        sheet_names = list(workbook.sheetnames)
-    finally:
-        workbook.close()
-    if not sheet_names:
-        raise ValueError(f"Excel workbook {source_label!r} has no sheets.")
-    return sheet_names
+class ExcelWorkbookPair:
+    """One explicitly owned read-only data/formula workbook pair.
 
+    A pair is deliberately scoped to one preview, worker, or source-plan
+    operation.  It is not a cache: callers must enter and close it, and sheet
+    row iterators must be consumed before the pair is closed.
+    """
 
-def read_excel_sheet_rows_from_bytes(
-    source_bytes: bytes,
-    sheet_name: str,
-    *,
-    source_label: str,
-) -> Iterable[Mapping[PhysicalColumn, object]]:
-    """Yield rows from the exact workbook bytes retained by an import worker."""
-    owned_bytes = bytes(source_bytes)
-    label = str(source_label).strip() or "<workbook>"
+    def __init__(self, source_bytes: bytes, *, source_label: str) -> None:
+        self._source_bytes = bytes(source_bytes)
+        self._source_label = str(source_label).strip() or "<workbook>"
+        self._workbook = None
+        self._authored_workbook = None
 
-    def _iter_rows() -> Iterator[Mapping[PhysicalColumn, str]]:
-        with ExitStack() as cleanup:
-            workbook = _open_workbook_bytes(
-                owned_bytes,
-                source_label=label,
+    def __enter__(self) -> "ExcelWorkbookPair":
+        if self._workbook is not None:
+            raise RuntimeError("Excel workbook pair is already open.")
+        try:
+            self._workbook = _open_workbook_bytes(
+                self._source_bytes,
+                source_label=self._source_label,
                 data_only=True,
             )
-            cleanup.callback(workbook.close)
-            authored_workbook = _open_workbook_bytes(
-                owned_bytes,
-                source_label=label,
+            self._authored_workbook = _open_workbook_bytes(
+                self._source_bytes,
+                source_label=self._source_label,
                 data_only=False,
             )
-            cleanup.callback(authored_workbook.close)
-            if sheet_name not in workbook.sheetnames:
-                raise ValueError(
-                    f"Sheet {sheet_name!r} not found in workbook {label!r}."
-                )
-            worksheet = workbook[sheet_name]
-            if sheet_name not in authored_workbook.sheetnames:
-                raise ValueError(
-                    f"Sheet {sheet_name!r} not found in workbook {label!r}."
-                )
-            authored_worksheet = authored_workbook[sheet_name]
-            yield from _read_worksheet_rows(
-                worksheet,
-                authored_worksheet=authored_worksheet,
-                filepath=label,
-                sheet_name=sheet_name,
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        workbook, authored = self._workbook, self._authored_workbook
+        self._workbook = None
+        self._authored_workbook = None
+        for item in (authored, workbook):
+            if item is not None:
+                item.close()
+
+    def _require_open(self):  # noqa: ANN202
+        if self._workbook is None or self._authored_workbook is None:
+            raise RuntimeError("Excel workbook pair is closed.")
+        return self._workbook, self._authored_workbook
+
+    @property
+    def sheet_names(self) -> List[str]:
+        workbook, _authored = self._require_open()
+        return list(workbook.sheetnames)
+
+    def read_sheet_rows(
+        self,
+        sheet_name: str,
+    ) -> Iterator[Mapping[PhysicalColumn, object]]:
+        workbook, authored_workbook = self._require_open()
+        if sheet_name not in workbook.sheetnames:
+            raise ValueError(
+                f"Sheet {sheet_name!r} not found in workbook "
+                f"{self._source_label!r}."
             )
-
-    return _iter_rows()
-
+        if sheet_name not in authored_workbook.sheetnames:
+            raise ValueError(
+                f"Sheet {sheet_name!r} not found in workbook "
+                f"{self._source_label!r}."
+            )
+        yield from _read_worksheet_rows(
+            workbook[sheet_name],
+            authored_worksheet=authored_workbook[sheet_name],
+            filepath=self._source_label,
+            sheet_name=sheet_name,
+        )
 
 def _exact_worksheet_width(worksheet) -> int:  # noqa: ANN001
     """Return the declared width or exhaustively discover it from real rows."""
@@ -135,51 +145,13 @@ def _read_worksheet_rows(
     header_values = tuple(
         _stringify_cell_value(cell.value) for cell in header_cells
     )
-    named_indexes = tuple(
-        index for index, value in enumerate(header_values) if value.strip()
-    )
-    retained_width = len(header_values)
-    if named_indexes:
-        first_trailing_index = named_indexes[-1] + 1
-        if first_trailing_index < retained_width:
-            trailing_indexes = tuple(
-                range(first_trailing_index, retained_width)
-            )
-            style_seen = {
-                index: bool(
-                    header_cells[index].has_style
-                    or authored_header_cells[index].has_style
-                )
-                for index in trailing_indexes
-            }
-            value_seen = {index: False for index in trailing_indexes}
-            for cells, authored_cells in zip(
-                cell_rows,
-                authored_rows,
-                strict=True,
-            ):
-                for index in trailing_indexes:
-                    if index >= len(cells) or index >= len(authored_cells):
-                        continue
-                    cell = cells[index]
-                    authored_cell = authored_cells[index]
-                    if (
-                        cell.value is not None
-                        or authored_cell.value is not None
-                    ):
-                        value_seen[index] = True
-                    if (
-                        cell.has_style
-                        or authored_cell.has_style
-                    ):
-                        style_seen[index] = True
-            if not any(value_seen.values()) and all(style_seen.values()):
-                retained_width = first_trailing_index
-
-    header_row = header_values[:retained_width]
-    columns = identify_physical_columns(
-        header_row
-    )
+    columns = identify_physical_columns(header_values)
+    # A worksheet with no named physical headers is a valid, non-importable
+    # sheet.  Returning an empty iterator lets the dialog cache that state
+    # without making the entire workbook fatal.
+    if not columns:
+        return
+    retained_width = max(column.source_index for column in columns) + 1
     row_iter = worksheet.iter_rows(
         min_row=2,
         max_col=retained_width,
@@ -209,6 +181,7 @@ def _read_worksheet_rows(
             else ""
             for column in columns
         }
+
 
 def _open_workbook_bytes(
     source_bytes: bytes,

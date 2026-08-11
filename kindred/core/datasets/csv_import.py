@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import itertools
 import math
+import io
+import csv
 from typing import Callable, Iterable, Mapping, Sequence
 
 from kindred.core.datasets.observation_payload import (
@@ -12,12 +14,17 @@ from kindred.core.datasets.observation_payload import (
     immutable_dataset_payload,
     new_raw_observation_id,
 )
-from kindred.core.datasets.source_rules import PhysicalColumn
+from kindred.core.datasets.source_rules import (
+    PhysicalColumn,
+    validate_tabular_source_bytes,
+    identify_physical_columns,
+)
 
 __all__ = [
     "CsvImportInterrupted",
     "PhysicalRow",
     "UncachedFormulaCell",
+    "read_csv_rows_from_bytes",
     "parse_physical_rows",
 ]
 
@@ -55,6 +62,66 @@ class PhysicalRow:
             raise ValueError("Physical row source_row must be a positive integer.")
         if not isinstance(self.values, Mapping):
             raise TypeError("Physical row values must be a column mapping.")
+
+
+def read_csv_rows_from_bytes(
+    source_bytes: bytes,
+    *,
+    source_label: str,
+) -> tuple[tuple[PhysicalColumn, ...], Iterable[PhysicalRow]]:
+    """Read one immutable CSV snapshot into canonical physical rows.
+
+    The returned iterator owns its UTF-8 reader and closes it when exhausted
+    or explicitly closed.  Header positions remain physical, including blank
+    and sparse positions, for the shared ``parse_physical_rows`` boundary.
+    """
+    validate_tabular_source_bytes(
+        source_bytes,
+        source_format="csv",
+        source_label=source_label,
+    )
+    owned_bytes = bytes(source_bytes)
+    label = str(source_label).strip() or "<csv>"
+    handle = io.TextIOWrapper(
+        io.BytesIO(owned_bytes),
+        encoding="utf-8-sig",
+        newline="",
+    )
+    reader = csv.reader(handle)
+    try:
+        header = next(reader, None)
+    except BaseException:
+        handle.close()
+        raise
+    if header is None:
+        handle.close()
+        raise ValueError(f"CSV file {label!r} is empty.")
+    columns = tuple(identify_physical_columns(header))
+    if not columns:
+        handle.close()
+        raise ValueError(f"CSV file {label!r} has no named columns.")
+
+    def _iter_rows() -> Iterable[PhysicalRow]:
+        try:
+            previous_end_row = reader.line_num
+            for row in reader:
+                row_end_row = reader.line_num
+                yield PhysicalRow(
+                    source_row=previous_end_row + 1,
+                    values={
+                        column: (
+                            row[column.source_index]
+                            if column.source_index < len(row)
+                            else ""
+                        )
+                        for column in columns
+                    },
+                )
+                previous_end_row = row_end_row
+        finally:
+            handle.close()
+
+    return columns, _iter_rows()
 
 
 def parse_physical_rows(

@@ -48,8 +48,14 @@ kindred = "kindred.__main__:main"
 kindred-gui = "kindred.__main__:main"
 
 [tool.setuptools]
-packages = { find = {} }
-license-files = ["LICENSE", "NOTICE.txt", "THIRD_PARTY_LICENSES.txt"]
+packages = { find = { include = ["kindred*"] } }
+license-files = [
+    "LICENSE",
+    "NOTICE.txt",
+    "THIRD_PARTY_LICENSES.txt",
+    "COPYING",
+    "COPYING.LESSER",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "kindred._version.__version__" }

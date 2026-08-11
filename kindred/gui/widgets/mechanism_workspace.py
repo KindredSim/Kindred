@@ -236,7 +236,7 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         plot = self._plot_by_tab_id.pop(target, None)
         if plot is None:
             return
-        plot.drop_tab_session_state(target)
+        plot.drop_tab_session_state()
         analysis = plot.analysis_tabs_for_workspace(detached=False)
         self._plot_stack.removeWidget(plot)
         self._analysis_stack.removeWidget(analysis)

@@ -120,6 +120,7 @@ class _DetailedBalanceCorrectionDialog(QtWidgets.QDialog):
                 self._request.source,
                 updates,
                 units=self._request.accepted_parse_units,
+                admitted_analysis=self._request.accepted_analysis,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(

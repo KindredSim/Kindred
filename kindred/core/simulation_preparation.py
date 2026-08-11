@@ -1016,7 +1016,10 @@ def build_simulation_execution_request(
 ) -> SimulationExecutionRequest:
     """Capture, isolate, bind, and compile one direct Run/Preview target."""
 
-    from kindred.core.mechanism_source import MechanismAuthoringSource
+    from kindred.core.mechanism_source import (
+        MechanismAuthoringSource,
+        source_matches_analysis,
+    )
 
     if not isinstance(prepared_dsl, PreparedDslRequestSet):
         raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
@@ -1060,7 +1063,7 @@ def build_simulation_execution_request(
             normalized_parameters[name] = value
     t_start = float(execution_settings.t_start)
     t_end = float(execution_settings.t_end)
-    if prepared_dsl.analysis.normalized_text != mechanism_source.reactions_text.strip():
+    if not source_matches_analysis(mechanism_source, prepared_dsl.analysis):
         raise ValueError(
             "prepared DSL source does not match the captured mechanism source."
         )

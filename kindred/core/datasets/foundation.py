@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-import os
 from numbers import Real
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Mapping, Sequence, TypeAlias
 
 from kindred.core.datasets.source_rules import (
@@ -30,6 +30,7 @@ __all__ = [
     "RawDatasetValidationError",
     "freeze_json_value",
     "thaw_json_value",
+    "validate_original_basename",
     "validate_fit_inclusion",
     "validate_imported_source",
     "validate_raw_dataset_record",
@@ -125,6 +126,45 @@ class ImportedSource:
     original_filename: str
     original_format: str
     exact_source_bytes: bytes
+
+
+def validate_original_basename(value: object, *, label: str = "original filename") -> str:
+    """Validate one exact filename with no POSIX or Windows path semantics."""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string.")
+    if not value or value != value.strip():
+        raise ValueError(f"{label} must be a nonblank edge-normalized basename.")
+    if (
+        value in {".", ".."}
+        or "\x00" in value
+        or "/" in value
+        or "\\" in value
+        or ":" in value
+        or value.endswith((".", " "))
+    ):
+        raise ValueError(f"{label} must be an exact basename without path semantics.")
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or windows.root
+        or any(part in {".", ".."} for part in (*posix.parts, *windows.parts))
+    ):
+        raise ValueError(f"{label} must be an exact basename without path semantics.")
+    windows_reserved = {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
+    windows_stem = value.rstrip(" .").split(".", 1)[0].casefold()
+    if windows_stem in windows_reserved:
+        raise ValueError(f"{label} uses a reserved Windows device name.")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,7 +302,7 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
         assigned_name = raw_physical["assigned_name"]
         if (
             type(source_index) is not int
-            or source_index != index
+            or source_index < 0
             or not isinstance(authored_name, str)
             or not authored_name
             or authored_name != authored_name.strip()
@@ -272,12 +312,15 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
         ):
             fail(f"Raw dataset {record.dataset_id!r} physical column {index} does not retain exact ordered source identity.")
         physical_rows.append((source_index, authored_name, assigned_name))
+    source_indexes = tuple(source_index for source_index, _authored, _assigned in physical_rows)
+    if source_indexes != tuple(sorted(source_indexes)) or len(set(source_indexes)) != len(source_indexes):
+        fail(f"Raw dataset {record.dataset_id!r} physical source indexes must be unique and strictly increasing.")
     expected_columns = identify_physical_columns(
         [authored_name for _index, authored_name, _assigned in physical_rows]
     )
     expected_rows = tuple(
-        (column.source_index, column.authored_name, column.assigned_name)
-        for column in expected_columns
+        (source_index, column.authored_name, column.assigned_name)
+        for source_index, column in zip(source_indexes, expected_columns, strict=True)
     )
     if tuple(physical_rows) != expected_rows:
         fail(f"Raw dataset {record.dataset_id!r} physical column names do not match the canonical case-sensitive duplicate allocation.")
@@ -348,13 +391,10 @@ def validate_imported_source(source: ImportedSource) -> ImportedSource:
         raise RawDatasetValidationError("Imported source ID must be nonblank and edge-normalized.")
     if source.original_format not in {"csv", "xlsx"}:
         raise RawDatasetValidationError("Imported source format must be exactly 'csv' or 'xlsx'.")
-    if (
-        not isinstance(source.original_filename, str)
-        or not source.original_filename
-        or source.original_filename != source.original_filename.strip()
-        or os.path.basename(source.original_filename) != source.original_filename
-    ):
-        raise RawDatasetValidationError("Imported source filename must be a nonblank basename.")
+    try:
+        validate_original_basename(source.original_filename)
+    except ValueError as exc:
+        raise RawDatasetValidationError(str(exc)) from exc
     expected_suffix = f".{source.original_format}"
     if Path(source.original_filename).suffix.lower() != expected_suffix:
         raise RawDatasetValidationError(

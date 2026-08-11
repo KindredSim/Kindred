@@ -1247,6 +1247,23 @@ def _data_block(
     )
 
 
+def _has_selected_y_series(
+    layer: WorkspacePlotLayer,
+    *,
+    y_axes: set[AxisSeriesSelection] | None,
+    excluded_y_axes: set[AxisSeriesSelection] | None,
+) -> bool:
+    """Whether a semantic layer would contribute at least one selected Y."""
+
+    series_names = {name for name, _values in layer.series}
+    return any(
+        excluded_y_axes is None or selection not in excluded_y_axes
+        for name, selection in layer.series_axes
+        if name in series_names
+        and (y_axes is None or selection in y_axes)
+    )
+
+
 def _statistics_block(
     layer: WorkspacePlotLayer,
     *,
@@ -1337,6 +1354,7 @@ def _export_column_header(
             "dataset_name",
             "raw_column",
             "model_species",
+            "set_id",
         )
         if provenance.get(key) not in {None, ""}
     }
@@ -1432,7 +1450,7 @@ def _planned_xlsx_worksheet_dimensions(
                     used,
                 ),
                 lineage_row_count + 1,
-                7,
+                8,
             )
         )
     if result_entry_count:
@@ -1460,6 +1478,8 @@ def _observation_provenance(
     }
     if source.model_species is not None:
         payload["model_species"] = source.model_species
+    if source.set_id is not None:
+        payload["set_id"] = source.set_id
     return MappingProxyType(payload)
 
 
@@ -1549,9 +1569,6 @@ class WorkspaceResultPresenter:
         )
         if len(selected_y_ordered) != len(set(selected_y_ordered)):
             raise ValueError("selected_y_series must be unique.")
-        selected_y = set(selected_y_ordered)
-        wanted_y = None if bool(selected_y_uses_default_all) else selected_y
-
         point_size = float(experimental_point_size)
         point_opacity = float(experimental_point_opacity)
         if not np.isfinite(point_size) or point_size <= 0.0:
@@ -1577,6 +1594,28 @@ class WorkspaceResultPresenter:
             raise ValueError(
                 "Experimental layers duplicate a dataset/raw-observation identity."
             )
+        if not bool(selected_y_uses_default_all):
+            selected_model_y = {
+                selection.series_name
+                for selection in selected_y_ordered
+                if isinstance(selection, SimulationSeriesAxisSelection)
+            }
+            implicit_experimental_y = tuple(
+                ExperimentalAxisSelection(
+                    candidate.dataset_id,
+                    candidate.raw_observation_id,
+                )
+                for candidate in experimental_inputs
+                if candidate.model_species in selected_model_y
+                and ExperimentalAxisSelection(
+                    candidate.dataset_id,
+                    candidate.raw_observation_id,
+                )
+                not in selected_y_ordered
+            )
+            selected_y_ordered += implicit_experimental_y
+        selected_y = set(selected_y_ordered)
+        wanted_y = None if bool(selected_y_uses_default_all) else selected_y
         excluded_simulation_y: set[AxisSeriesSelection] = set()
         excluded_experimental_y: set[AxisSeriesSelection] = set()
         selected_x_source: ExperimentalLayerInput | None = None
@@ -1671,6 +1710,11 @@ class WorkspaceResultPresenter:
                     blocks.append(block)
                 elif (
                     simulation_x_axis not in dict(foreground.series_axes).values()
+                    and _has_selected_y_series(
+                        foreground,
+                        y_axes=wanted_y,
+                        excluded_y_axes=excluded_simulation_y,
+                    )
                 ):
                     unavailable_layers.append(foreground)
             else:
@@ -1699,6 +1743,20 @@ class WorkspaceResultPresenter:
                     )
                     if block is not None:
                         blocks.append(block)
+                    elif (
+                        simulation_x_axis
+                        not in dict(reference_layer.series_axes).values()
+                        and _has_selected_y_series(
+                            reference_layer,
+                            y_axes=wanted_y,
+                            excluded_y_axes=excluded_simulation_y,
+                        )
+                    ):
+                        # Reference is semantic analysis truth even when its
+                        # selected-X physical rows cannot be projected. Keep
+                        # the layer visible and account for it in the single
+                        # deterministic unavailable-X diagnostic.
+                        unavailable_layers.append(reference_layer)
                     annotations.extend(_annotations_from_execution(reference.result))
 
             if foreground is not None:
@@ -2217,6 +2275,7 @@ class WorkspaceResultPresenter:
                         "dataset_name",
                         "raw_column",
                         "model_species",
+                        "set_id",
                     ),
                 )
                 for title, name, provenance in lineage_rows:
@@ -2232,6 +2291,7 @@ class WorkspaceResultPresenter:
                             str(provenance.get("dataset_name") or ""),
                             str(provenance.get("raw_column") or ""),
                             str(provenance.get("model_species") or ""),
+                            str(provenance.get("set_id") or ""),
                         ),
                     )
                 lineage_sheet.sheet_state = "hidden"

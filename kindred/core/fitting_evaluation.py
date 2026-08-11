@@ -660,21 +660,6 @@ class SerialFittingEvaluator:
                     details={"fatal": True, "stage": "parameter_binding"},
                 )
 
-    def __call__(self, params: Dict[str, float]) -> SimulationResultValue:
-        return self.evaluate_series(params)
-
-    def evaluate_series(self, params: Mapping[str, float]) -> SimulationResultValue:
-        configured_origins = {
-            str(name): FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
-            for name in dict(params or {})
-            if str(name).strip()
-        }
-        return self.evaluate_series_with_parameter_origins(
-            params,
-            configured_origins,
-            failed_params=None,
-        )
-
     def evaluate_series_with_parameter_origins(
         self,
         params: Mapping[str, float],

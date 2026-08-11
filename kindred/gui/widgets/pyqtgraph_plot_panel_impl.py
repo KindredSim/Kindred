@@ -111,20 +111,23 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
         self._applied_projection: WorkspaceResultProjection | None = None
-        self._analysis_set_id: str | None = None
         self._rendered_blocks: tuple[ResultDataBlock, ...] = ()
-        self._sampling_limit_by_tab: dict[str, int | None] = {}
+        # A panel is created and destroyed with exactly one mechanism tab by
+        # MechanismWorkspaceView.  These presentation/session values are
+        # therefore panel-local; retaining tab-keyed maps here only creates a
+        # second, stale routing surface inside the tab-owned widget.
+        self._sampling_limit: int | None = None
         self._curve_items: list[object] = []
         self._plot_items_by_key: dict[tuple[object, ...], object] = {}
         self._physical_items_by_axis: dict[
             tuple[AxisSeriesSelection, bool], list[object]
         ] = {}
         self._annotation_items: list[object] = []
-        self._manual_annotations_by_tab: dict[str, list[tuple[str, float, float]]] = {}
-        self._scalar_guides_by_tab: dict[str, list[str]] = {}
-        self._interaction_mode_by_tab: dict[str, str] = {}
-        self._presentation_by_tab: dict[str, _PlotPresentation] = {}
-        self._axis_range_by_tab: dict[str, _AxisRangeSession] = {}
+        self._manual_annotations: list[tuple[str, float, float]] = []
+        self._scalar_guides: list[str] = []
+        self._interaction_mode = "pan"
+        self._presentation = _PlotPresentation()
+        self._axis_range = _AxisRangeSession()
         self._preview_endpoint_keys: set[PreviewResultKey] = set()
         self._preview_origin_snapshots: tuple[_PreviewCurveSnapshot, ...] = ()
         self._preview_origin_range: (
@@ -237,7 +240,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         projection = self._applied_projection
         if projection is None:
             return None
-        if projection.copy_all_blocks or projection.unavailable_x_diagnostic:
+        if (
+            projection.copy_all_blocks
+            and projection.unavailable_x_diagnostic is None
+        ):
             return projection
         return None
 
@@ -268,10 +274,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         projection = self._applied_projection
         self._preview_origin_auto_range = bool(
             projection is not None
-            and self._axis_range_by_tab.get(
-                projection.tab_id,
-                _AxisRangeSession(),
-            ).auto
+            and self._axis_range.auto
         )
         self._preview_origin_range = (
             self._current_view_range() if self._preview_origin_auto_range else None
@@ -715,10 +718,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         projection = self._applied_projection
         if (
             projection is not None
-            and self._axis_range_by_tab.get(
-                projection.tab_id,
-                _AxisRangeSession(),
-            ).auto
+            and self._axis_range.auto
         ):
             self._plot_widget.getPlotItem().getViewBox().enableAutoRange()
 
@@ -804,7 +804,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def set_persisted_plot_state(
         self,
-        tab_id: str,
         *,
         log_x: bool,
         log_y: bool,
@@ -812,11 +811,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         x_inverted: bool,
         y_inverted: bool,
     ) -> None:
-        """Apply one Integration-owned, per-tab persisted Plot projection."""
+        """Apply one Integration-owned persisted Plot projection."""
 
-        target = str(tab_id or "").strip()
-        if not target:
-            raise ValueError("tab_id must be nonblank.")
         state = _PlotPresentation(
             log_x=bool(log_x),
             log_y=bool(log_y),
@@ -824,39 +820,31 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             x_inverted=bool(x_inverted),
             y_inverted=bool(y_inverted),
         )
-        self._presentation_by_tab[target] = state
-        if (
-            self._applied_projection is not None
-            and self._applied_projection.tab_id == target
-        ):
+        self._presentation = state
+        if self._applied_projection is not None:
             self._apply_plot_presentation(state)
 
-    def drop_tab_session_state(self, tab_id: str) -> None:
-        target = str(tab_id)
-        if any(key.tab_id == target for key in self._preview_endpoint_keys) or (
-            self._applied_projection is not None
-            and self._applied_projection.tab_id == target
-        ):
-            self._preview_endpoint_keys.clear()
-            self._clear_preview_transition_pixels()
-        self._manual_annotations_by_tab.pop(target, None)
-        self._scalar_guides_by_tab.pop(target, None)
-        self._interaction_mode_by_tab.pop(target, None)
-        self._presentation_by_tab.pop(target, None)
-        self._sampling_limit_by_tab.pop(target, None)
-        self._axis_range_by_tab.pop(target, None)
+    def drop_tab_session_state(self) -> None:
+        self._preview_endpoint_keys.clear()
+        self._clear_preview_transition_pixels()
+        self._manual_annotations.clear()
+        self._scalar_guides.clear()
+        self._interaction_mode = "pan"
+        self._presentation = _PlotPresentation()
+        self._sampling_limit = None
+        self._axis_range = _AxisRangeSession()
 
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
 
         self._preview_endpoint_keys.clear()
         self._clear_preview_transition_pixels()
-        self._manual_annotations_by_tab.clear()
-        self._scalar_guides_by_tab.clear()
-        self._interaction_mode_by_tab.clear()
-        self._presentation_by_tab.clear()
-        self._sampling_limit_by_tab.clear()
-        self._axis_range_by_tab.clear()
+        self._manual_annotations.clear()
+        self._scalar_guides.clear()
+        self._interaction_mode = "pan"
+        self._presentation = _PlotPresentation()
+        self._sampling_limit = None
+        self._axis_range = _AxisRangeSession()
         self._axis_toolbar.set_interaction_mode("pan")
         self._axis_toolbar.set_coarse_sampling(False)
         self._axis_toolbar.set_manual_ranges(None, None, None, None)
@@ -886,7 +874,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 pass
         self._applied_projection = None
         self._rendered_blocks = ()
-        self._analysis_set_id = None
 
     def _clear_completion_warning(self) -> None:
         self._completion_warning_badge.setText("Completed with warnings")
@@ -915,7 +902,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             rendered = self._render_layer(
                 layer,
                 block,
-                sampling_limit=self._sampling_limit_by_tab.get(projection.tab_id),
+                sampling_limit=self._sampling_limit,
                 existing_items=existing_items,
                 rendered_items=rendered_items,
                 physical_items=physical_items,
@@ -956,26 +943,17 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             ]
         )
         self._axis_toolbar.set_coarse_sampling(
-            self._sampling_limit_by_tab.get(projection.tab_id) is not None
+            self._sampling_limit is not None
         )
-        interaction = self._interaction_mode_by_tab.setdefault(
-            projection.tab_id,
-            "pan",
-        )
+        interaction = self._interaction_mode
         self._axis_toolbar.set_interaction_mode(interaction)
         self._apply_interaction_mode(interaction)
-        presentation = self._presentation_by_tab.get(
-            projection.tab_id,
-            _PlotPresentation(),
-        )
+        presentation = self._presentation
         self._render_annotations(projection, presentation)
-        self._render_manual_annotations(projection.tab_id, presentation)
+        self._render_manual_annotations(presentation)
         self._render_scalar_guides(projection, presentation)
         self._render_analysis(projection)
-        axis_range = self._axis_range_by_tab.setdefault(
-            projection.tab_id,
-            _AxisRangeSession(),
-        )
+        axis_range = self._axis_range
         self._axis_toolbar.set_manual_ranges(
             axis_range.x_min,
             axis_range.x_max,
@@ -1281,11 +1259,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         block = projection.primary_statistics
         if block is None:
             self._species_table.setRowCount(0)
-            self._analysis_set_id = (
-                projection.current_set_id
-                if projection.primary_layer_id is not None
-                else None
-            )
             return
         self._species_table.update_results(
             canonical_time=block.t,
@@ -1293,14 +1266,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             intervention_execution=(
                 block.result_entry.result.intervention_execution
             ),
+            presentation_boundaries=(
+                block.result_entry.result.presentation_boundaries
+            ),
             accepted_result_key=(
                 getattr(block.result_entry, "key", None)
                 if block.result_entry is not None
                 else None
             ),
         )
-        self._analysis_set_id = projection.current_set_id
-
     def _project_completion_warning(
         self,
         projection: WorkspaceResultProjection,
@@ -1414,13 +1388,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _render_manual_annotations(
         self,
-        tab_id: str,
         presentation: _PlotPresentation,
     ) -> None:
         foreground = "#f3f3f3" if self._dark_mode else "#202020"
         background = "#303030cc" if self._dark_mode else "#ffffffe6"
         border = "#bbbbbb" if self._dark_mode else "#555555"
-        for text, x, y in self._manual_annotations_by_tab.get(tab_id, ()):
+        for text, x, y in self._manual_annotations:
             view_x = self._raw_to_view_coordinate(
                 x,
                 log_enabled=presentation.log_x,
@@ -1448,7 +1421,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         presentation: _PlotPresentation,
     ) -> None:
         scalars = dict(projection.scalar_values)
-        for name in self._scalar_guides_by_tab.get(projection.tab_id, ()):
+        for name in self._scalar_guides:
             if name not in scalars:
                 continue
             position = self._raw_to_view_coordinate(
@@ -1551,12 +1524,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
             if not accepted:
                 return
-        guides = self._scalar_guides_by_tab.setdefault(
-            projection.tab_id,
-            [],
-        )
-        if name not in guides:
-            guides.append(name)
+        if name not in self._scalar_guides:
+            self._scalar_guides.append(name)
         self.apply_workspace_result_projection(projection)
 
     def _clear_plot_items(self) -> None:
@@ -1604,20 +1573,19 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if normalized == "clear_scalar_guides":
             if projection is None:
                 return
-            self._scalar_guides_by_tab.pop(projection.tab_id, None)
+            self._scalar_guides.clear()
             self.apply_workspace_result_projection(projection)
             return
         if normalized != "sampling":
             return
         if projection is None:
             return
-        tab_id = projection.tab_id
-        previous_limit = self._sampling_limit_by_tab.get(tab_id)
-        self._sampling_limit_by_tab[tab_id] = 1000 if str(value) == "coarse" else None
+        previous_limit = self._sampling_limit
+        self._sampling_limit = 1000 if str(value) == "coarse" else None
         try:
             self.apply_workspace_result_projection(projection)
         except Exception:
-            self._sampling_limit_by_tab[tab_id] = previous_limit
+            self._sampling_limit = previous_limit
             raise
 
     @QtCore.Slot()
@@ -1625,10 +1593,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         projection = self._applied_projection
         if projection is None:
             return
-        presentation = self._presentation_by_tab.get(
-            projection.tab_id,
-            _PlotPresentation(),
-        )
+        presentation = self._presentation
         x_min, x_max, y_min, y_max = self._axis_toolbar.get_manual_ranges()
         auto = self._axis_toolbar.is_auto_range()
         if not auto:
@@ -1660,7 +1625,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             y_min=y_min,
             y_max=y_max,
         )
-        self._axis_range_by_tab[projection.tab_id] = state
+        self._axis_range = state
         if not auto:
             self._axis_toolbar.set_manual_ranges(
                 state.x_min,
@@ -1715,10 +1680,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         projection = self._applied_projection
         if self._enable_copy_visible_data_action:
             copy_all = menu.addAction("Copy All")
-            copy_all.setEnabled(projection is not None)
+            copy_all.setEnabled(self._copy_projection_is_eligible(projection))
             copy_all.triggered.connect(self._copy_all_to_clipboard)
             copy_rendered = menu.addAction("Copy Rendered Points")
-            copy_rendered.setEnabled(bool(self._rendered_blocks))
+            copy_rendered.setEnabled(
+                self._copy_projection_is_eligible(projection)
+                and bool(self._rendered_blocks)
+            )
             copy_rendered.triggered.connect(self._copy_rendered_to_clipboard)
             menu.addSeparator()
         if self._enable_reference_layer_toggle_action:
@@ -1740,14 +1708,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         add_annotation.triggered.connect(self._add_manual_annotation)
         clear_annotations = menu.addAction("Clear All Annotations")
         clear_annotations.setEnabled(
-            bool(projection and self._manual_annotations_by_tab.get(projection.tab_id))
+            bool(projection and self._manual_annotations)
         )
         clear_annotations.triggered.connect(self._clear_manual_annotations)
-        state = (
-            self._presentation_by_tab.get(projection.tab_id, _PlotPresentation())
-            if projection is not None
-            else _PlotPresentation()
-        )
+        state = self._presentation if projection is not None else _PlotPresentation()
         menu.addSeparator()
         for text, option, checked in (
             ("Log X", "log_x", state.log_x),
@@ -1786,10 +1750,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if not accepted or not annotation_text.strip():
             return
         x_range, y_range = self._plot_widget.getPlotItem().viewRange()
-        presentation = self._presentation_by_tab.get(
-            projection.tab_id,
-            _PlotPresentation(),
-        )
+        presentation = self._presentation
         x_view = (float(x_range[0]) + float(x_range[1])) / 2.0
         y_view = (float(y_range[0]) + float(y_range[1])) / 2.0
         x = self._view_to_raw_coordinate(
@@ -1802,11 +1763,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         if x is None or y is None:
             return
-        annotations = self._manual_annotations_by_tab.setdefault(
-            projection.tab_id,
-            [],
-        )
-        annotations.append((annotation_text, x, y))
+        self._manual_annotations.append((annotation_text, x, y))
         self.apply_workspace_result_projection(projection)
 
     @QtCore.Slot()
@@ -1814,10 +1771,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         projection = self._applied_projection
         if projection is None:
             return
-        annotations = self._manual_annotations_by_tab.get(projection.tab_id)
-        if not annotations:
+        if not self._manual_annotations:
             return
-        annotations.clear()
+        self._manual_annotations.clear()
         self.apply_workspace_result_projection(projection)
 
     @QtCore.Slot(str)
@@ -1827,7 +1783,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             raise ValueError("Plot interaction mode must be Pan or Rectangle Zoom.")
         projection = self._applied_projection
         if projection is not None:
-            self._interaction_mode_by_tab[projection.tab_id] = normalized
+            self._interaction_mode = normalized
         self._axis_toolbar.set_interaction_mode(normalized)
         self._apply_interaction_mode(normalized)
 
@@ -1872,10 +1828,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if refresh_geometry and projection is not None:
             self._clear_annotation_items()
             self._render_annotations(projection, state)
-            self._render_manual_annotations(projection.tab_id, state)
+            self._render_manual_annotations(state)
             self._render_scalar_guides(projection, state)
         if axis_range is None and projection is not None:
-            axis_range = self._axis_range_by_tab.get(projection.tab_id)
+            axis_range = self._axis_range
         if axis_range is not None:
             self._apply_axis_range_state(axis_range, state)
 
@@ -1902,19 +1858,37 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     @QtCore.Slot()
     def _copy_rendered_to_clipboard(self) -> None:
         projection = self._applied_projection
-        if projection is not None:
-            try:
-                WorkspaceResultPresenter.validate_copy(projection)
-            except Exception as exc:
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Copy Rendered Points",
-                    str(exc),
-                )
-                return
+        if projection is None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Copy Rendered Points",
+                "No current result data is available to copy.",
+            )
+            return
+        try:
+            WorkspaceResultPresenter.validate_copy(projection)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Copy Rendered Points",
+                str(exc),
+            )
+            return
+        if not self._rendered_blocks:
+            return
         self._start_responsive_copy(
             self._rendered_blocks,
             title="Copy Rendered Points",
+        )
+
+    @staticmethod
+    def _copy_projection_is_eligible(
+        projection: WorkspaceResultProjection | None,
+    ) -> bool:
+        return bool(
+            projection is not None
+            and projection.copy_all_blocks
+            and projection.unavailable_x_diagnostic is None
         )
 
     def _start_responsive_copy(

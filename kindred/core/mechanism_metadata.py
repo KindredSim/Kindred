@@ -37,43 +37,6 @@ class EquilibriumMetadataKeys:
     STANDARD_CONC_M = "standard_conc_M"
 
 
-def _as_float(value: object, *, default: float) -> float:
-    try:
-        out = float(value)
-    except Exception:
-        return float(default)
-    if not math.isfinite(out):
-        return float(default)
-    return float(out)
-
-
-def _as_bool(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        try:
-            return bool(int(value))
-        except Exception:
-            return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"", "0", "false", "no", "off", "none", "null"}:
-            return False
-        if normalized in {"1", "true", "yes", "on"}:
-            return True
-    return bool(value)
-
-
-def _optional_finite_float(value: object) -> Optional[float]:
-    try:
-        out = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if not math.isfinite(out):
-        return None
-    return float(out)
-
-
 @dataclass(frozen=True)
 class MechanismMetadataView:
     temperature_K: float = 298.15
@@ -139,39 +102,6 @@ class EquilibriumMetadataView:
     Keq_input: Optional[object] = None
     forward_model: Optional[dict[str, object]] = None
     standard_conc_M: Optional[float] = None
-
-    @classmethod
-    def from_metadata(
-        cls,
-        meta: Mapping[str, Any] | None,
-        *,
-        default_fast: bool = False,
-    ) -> "EquilibriumMetadataView":
-        if not isinstance(meta, Mapping):
-            meta = {}
-        forward_model = meta.get(EquilibriumMetadataKeys.FORWARD_MODEL)
-        if isinstance(forward_model, Mapping):
-            forward_model = dict(forward_model)
-        else:
-            forward_model = None
-
-        dG = meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL)
-        dG_f = _optional_finite_float(dG) if dG is not None else None
-
-        std = meta.get(EquilibriumMetadataKeys.STANDARD_CONC_M)
-        std_f = _optional_finite_float(std) if std is not None else None
-
-        return cls(
-            fast_equilibrium=_as_bool(
-                meta.get(EquilibriumMetadataKeys.FAST_EQUILIBRIUM, default_fast)
-            ),
-            user_provided_kf=_as_bool(meta.get(EquilibriumMetadataKeys.USER_PROVIDED_KF)),
-            user_provided_kr=_as_bool(meta.get(EquilibriumMetadataKeys.USER_PROVIDED_KR)),
-            dG_eq_J_per_mol=dG_f,
-            Keq_input=meta.get(EquilibriumMetadataKeys.KEQ_INPUT),
-            forward_model=forward_model,
-            standard_conc_M=std_f,
-        )
 
     def to_metadata(self) -> dict[str, object]:
         out: dict[str, object] = {

@@ -1672,7 +1672,6 @@ def _trigger_callables(
 
             event.terminal = True  # type: ignore[attr-defined]
             event.direction = _trigger_direction(direction)  # type: ignore[attr-defined]
-            event._kindred_intervention_trigger_index = index  # type: ignore[attr-defined]
             callables.append(event)
             mapping.append(index)
     return tuple(callables), tuple(mapping)

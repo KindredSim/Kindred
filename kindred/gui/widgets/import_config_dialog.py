@@ -8,21 +8,16 @@ configuration only.
 
 from __future__ import annotations
 
-import csv
-import io
-from contextlib import closing
+import itertools
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.core.datasets.source_rules import (
-    PhysicalColumn,
-    identify_physical_columns,
-)
+from kindred.core.datasets.source_rules import PhysicalColumn
+from kindred.core.datasets.csv_import import read_csv_rows_from_bytes
 from kindred.core.datasets.excel_import import (
-    list_sheets_from_bytes,
-    read_excel_sheet_rows_from_bytes,
+    ExcelWorkbookPair,
 )
 from kindred.core.datasets.units import (
     CONCENTRATION_UNIT_DISPLAY,
@@ -86,7 +81,6 @@ class ImportConfigDialog(QtWidgets.QDialog):
         # Excel-specific
         self._sheet_names: List[str] = []
         self._previewed_sheet_name: Optional[str] = None
-
         self.setWindowTitle(f"Import: {source.original_filename}")
         self.setModal(True)
         self.resize(700, 550)
@@ -281,23 +275,21 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._previewed_sheet_name = None
         self._clear_preview_error()
         try:
-            with io.TextIOWrapper(
-                io.BytesIO(self._source.exact_source_bytes),
-                encoding="utf-8-sig",
-                newline="",
-            ) as f:
-                reader = csv.reader(f)
-                header = next(reader, None)
-                if header is None:
-                    self._columns = []
-                    self._preview_rows = []
-                    self._detect_and_populate()
-                    return
-                self._columns = list(identify_physical_columns(header))
-                rows: List[List[str]] = []
-                for _, row in zip(range(_MAX_PREVIEW_ROWS), reader):
-                    rows.append([c.strip() if c else "" for c in row])
-                self._preview_rows = rows
+            self._columns, rows = read_csv_rows_from_bytes(
+                self._source.exact_source_bytes,
+                source_label=self._source.original_filename,
+            )
+            row_iter = iter(rows)
+            try:
+                self._preview_rows = [
+                    [
+                        str(row.values.get(column, "")).strip()
+                        for column in self._columns
+                    ]
+                    for row in itertools.islice(row_iter, _MAX_PREVIEW_ROWS)
+                ]
+            finally:
+                row_iter.close()
         except UnicodeError:
             self._columns = []
             self._preview_rows = []
@@ -308,41 +300,71 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._save_current_sheet_state(None)
 
     def _load_excel_preview(self) -> None:
-        self._sheet_names = list_sheets_from_bytes(
+        with ExcelWorkbookPair(
             self._source.exact_source_bytes,
             source_label=self._source.original_filename,
-        )
-        self._sheet_list.blockSignals(True)
-        self._sheet_list.clear()
-        for name in self._sheet_names:
-            item = QtWidgets.QListWidgetItem(name)
-            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.CheckState.Checked)
-            self._sheet_list.addItem(item)
-        self._sheet_list.blockSignals(False)
-        if self._sheet_names:
+        ) as workbooks:
+            self._sheet_names = workbooks.sheet_names
+            self._sheet_list.blockSignals(True)
+            self._sheet_list.clear()
+            first_importable: str | None = None
+            for name in self._sheet_names:
+                try:
+                    state = self._load_sheet_state_from_file(name, workbooks)
+                except Exception as exc:
+                    state = self._build_default_sheet_state([], [])
+                    state["load_error"] = str(exc)
+                state["materialized"] = True
+                state["importable"] = bool(state.get("columns"))
+                self._sheet_states[name] = self._clone_sheet_state(state)
+                if state["importable"] and first_importable is None:
+                    first_importable = name
+                item = QtWidgets.QListWidgetItem(name)
+                if state["importable"]:
+                    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                else:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    QtCore.Qt.CheckState.Checked
+                    if state["importable"]
+                    else QtCore.Qt.CheckState.Unchecked
+                )
+                if state.get("load_error"):
+                    item.setToolTip(f"Cannot preview this sheet: {state['load_error']}")
+                elif not state["importable"]:
+                    item.setToolTip("This sheet has no usable named columns.")
+                self._sheet_list.addItem(item)
+            self._sheet_list.blockSignals(False)
+        if first_importable is not None:
+            self._sheet_list.setCurrentRow(self._sheet_names.index(first_importable))
+            self._restore_sheet_state(
+                first_importable,
+                self._sheet_states[first_importable],
+            )
+        elif self._sheet_names:
             self._sheet_list.setCurrentRow(0)
-            self._load_excel_sheet_preview(self._sheet_names[0])
+            self._restore_sheet_state(
+                self._sheet_names[0],
+                self._sheet_states[self._sheet_names[0]],
+            )
 
     def _read_excel_sheet_preview(
         self,
         sheet_name: str,
+        workbooks: ExcelWorkbookPair,
     ) -> tuple[list[PhysicalColumn], list[list[str]]]:
         rows_raw: List[Dict[PhysicalColumn, str]] = []
         columns: List[PhysicalColumn] = []
-        with closing(
-            read_excel_sheet_rows_from_bytes(
-                self._source.exact_source_bytes,
-                sheet_name,
-                source_label=self._source.original_filename,
-            )
-        ) as row_iter:
+        row_iter = workbooks.read_sheet_rows(sheet_name)
+        try:
             for i, row_dict in enumerate(row_iter):
                 if i == 0:
                     columns = list(row_dict.keys())
                 if i >= _MAX_PREVIEW_ROWS:
                     break
                 rows_raw.append(row_dict)
+        finally:
+            row_iter.close()
         preview_rows = [
             [str(row_dict.get(column, "")) for column in columns]
             for row_dict in rows_raw
@@ -406,8 +428,12 @@ class ImportConfigDialog(QtWidgets.QDialog):
             "preview_rows": [list(row) for row in preview_rows],
         }
 
-    def _load_sheet_state_from_file(self, sheet_name: str) -> dict:
-        columns, preview_rows = self._read_excel_sheet_preview(sheet_name)
+    def _load_sheet_state_from_file(
+        self,
+        sheet_name: str,
+        workbooks: ExcelWorkbookPair,
+    ) -> dict:
+        columns, preview_rows = self._read_excel_sheet_preview(sheet_name, workbooks)
         return self._build_default_sheet_state(columns, preview_rows)
 
     def _clone_sheet_state(self, state: dict) -> dict:
@@ -424,6 +450,9 @@ class ImportConfigDialog(QtWidgets.QDialog):
             "detected_conc_unit_by_column": dict(state.get("detected_conc_unit_by_column", {})),
             "columns": list(state.get("columns", [])),
             "preview_rows": [list(row) for row in state.get("preview_rows", [])],
+            "materialized": bool(state.get("materialized", False)),
+            "importable": bool(state.get("importable", bool(state.get("columns")))),
+            "load_error": state.get("load_error"),
         }
 
     def _current_state_from_widgets(self) -> dict:
@@ -454,6 +483,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
             "detected_conc_unit_by_column": dict(self._detected_conc_unit_by_column),
             "columns": list(self._columns),
             "preview_rows": [list(row) for row in self._preview_rows],
+            "materialized": True,
+            "importable": bool(self._columns),
         }
 
     def _save_current_sheet_state(self, sheet_name: Optional[str] = None) -> Optional[dict]:
@@ -463,6 +494,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
         if key is None and self._file_type == "excel":
             return None
         state = self._current_state_from_widgets()
+        previous = self._sheet_states.get(key, {})
+        state["load_error"] = previous.get("load_error")
         self._sheet_states[key] = self._clone_sheet_state(state)
         return self._sheet_states[key]
 
@@ -493,19 +526,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
     def _ensure_sheet_state(self, sheet_name: str) -> dict:
         state = self._sheet_states.get(sheet_name)
         if state is None:
-            state = self._load_sheet_state_from_file(sheet_name)
-            self._sheet_states[sheet_name] = self._clone_sheet_state(state)
-            return self._sheet_states[sheet_name]
-        if not state.get("columns") or "preview_rows" not in state:
-            loaded_state = self._load_sheet_state_from_file(sheet_name)
-            state = self._merge_editable_sheet_state(loaded_state, state)
-            self._sheet_states[sheet_name] = self._clone_sheet_state(state)
-        return self._sheet_states[sheet_name]
-
-    def _load_excel_sheet_preview(self, sheet_name: str) -> None:
-        state = self._load_sheet_state_from_file(sheet_name)
-        self._sheet_states[sheet_name] = self._clone_sheet_state(state)
-        self._restore_sheet_state(sheet_name, state)
+            raise RuntimeError(f"Worksheet {sheet_name!r} has no materialized state.")
+        if not state.get("materialized"):
+            raise RuntimeError(f"Worksheet {sheet_name!r} state is not materialized.")
+        return state
 
     # ------------------------------------------------------------------
     # Detection and population
@@ -536,6 +560,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     def _restore_sheet_state(self, sheet_name: Optional[str], state: dict) -> None:
         self._previewed_sheet_name = sheet_name
+        self._clear_preview_error()
         self._time_combo.blockSignals(True)
         self._no_unit_row_cb.blockSignals(True)
         self._conc_unit_combo.blockSignals(True)
@@ -562,6 +587,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._no_unit_row_cb.blockSignals(False)
         self._conc_unit_combo.blockSignals(False)
         self._save_current_sheet_state(sheet_name)
+        if state.get("load_error"):
+            self._set_preview_error(
+                f"Cannot preview sheet {sheet_name!r}: {state['load_error']}"
+            )
         self._update_import_enabled()
 
     def _populate_preview_table(self) -> None:
@@ -772,16 +801,14 @@ class ImportConfigDialog(QtWidgets.QDialog):
     def _on_sheet_clicked(self, item: QtWidgets.QListWidgetItem) -> None:
         self._save_current_sheet_state()
         sheet_name = item.text()
-        state = self._sheet_states.get(sheet_name)
-        if state is None:
-            self._load_excel_sheet_preview(sheet_name)
-            return
-        if not state.get("columns"):
-            state = self._ensure_sheet_state(sheet_name)
+        state = self._ensure_sheet_state(sheet_name)
         self._restore_sheet_state(sheet_name, state)
 
     def _select_all_sheets(self) -> None:
-        self._set_checked_sheets(set(self._sheet_names))
+        self._set_checked_sheets({
+            name for name in self._sheet_names
+            if self._sheet_states.get(name, {}).get("importable", False)
+        })
 
     def _invert_sheet_selection(self) -> None:
         checked_names = set(self._get_checked_sheet_names())
@@ -789,6 +816,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._sheet_list.item(index).text()
             for index in range(self._sheet_list.count())
             if self._sheet_list.item(index).text() not in checked_names
+            and self._sheet_states.get(self._sheet_list.item(index).text(), {}).get("importable", False)
         }
         self._set_checked_sheets(inverted)
 

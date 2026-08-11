@@ -16,12 +16,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "authored_step_origin",
-    "coordinate_source_line",
     "coordinate_source_parts",
     "coordinate_token_matches",
     "origin_line_positions",
+    "rewrite_coordinate_source_line",
+    "rewrite_scalar_source_line",
     "scalar_origin",
-    "set_coordinate_source_token",
 ]
 
 
@@ -68,24 +68,6 @@ def coordinate_source_parts(
     return prefix.rstrip(), tokens, f"{marker}{comment}" if marker else ""
 
 
-def coordinate_source_line(
-    prefix: str,
-    tokens: list[list[str]],
-    comment: str,
-) -> str:
-    """Render one source line after a typed coordinate rewrite."""
-
-    body = prefix.rstrip()
-    if tokens:
-        body += " ; " + ", ".join(
-            f"{key}={value}" if value else f"{key}="
-            for key, value in tokens
-        )
-    if comment:
-        body += f" {comment.strip()}"
-    return body
-
-
 def coordinate_token_matches(candidate: str, target: str) -> bool:
     """Return whether a source token denotes one canonical coordinate."""
 
@@ -101,38 +83,95 @@ def coordinate_token_matches(candidate: str, target: str) -> bool:
     )
 
 
-def set_coordinate_source_token(
-    tokens: list[list[str]],
+def rewrite_coordinate_source_line(
+    source_line: str,
     *,
     token: str,
     value: float,
-) -> None:
-    """Replace one coordinate token and remove duplicate authored spellings."""
+) -> str:
+    """Replace one admitted coordinate value without normalizing its line.
 
-    # ``repr`` is Python's shortest decimal representation that round-trips
-    # the binary64 value exactly.  A fixed significant-digit format silently
-    # changes slider coordinates during source publication.
-    rendered = repr(float(value))
+    The coordinate rewrite is intentionally local: key spelling, separators,
+    comments, and all whitespace outside the numeric value remain authored
+    source.  The parser has already established that the target coordinate is
+    writable, so a missing or duplicate target is a fail-closed error here.
+    """
+
+    if type(source_line) is not str:
+        raise TypeError("source_line must be an exact str.")
+    before_comment, marker, comment = source_line.partition("#")
     matches = [
-        index
-        for index, pair in enumerate(tokens)
-        if coordinate_token_matches(pair[0], token)
+        match
+        for match in re.finditer(
+            r"(?P<key>[^=;,#]+)=(?P<value>[^;,#]*)",
+            before_comment,
+        )
+        if coordinate_token_matches(match.group("key"), token)
     ]
-    if matches:
-        target = matches[0]
-        tokens[target] = [token, rendered]
-        for duplicate in reversed(matches[1:]):
-            tokens.pop(duplicate)
-        return
-    tokens.append([token, rendered])
+    if len(matches) != 1:
+        raise ValueError(
+            f"Source does not contain exactly one authored coordinate {token!r}."
+        )
+    match = matches[0]
+    raw_value = match.group("value")
+    left_space = raw_value[: len(raw_value) - len(raw_value.lstrip())]
+    right_space = raw_value[len(raw_value.rstrip()) :]
+    replacement = left_space + repr(float(value)) + right_space
+    return (
+        before_comment[: match.start("value")]
+        + replacement
+        + before_comment[match.end("value") :]
+        + (f"{marker}{comment}" if marker else "")
+    )
+
+
+def rewrite_scalar_source_line(
+    source_line: str,
+    *,
+    name: str,
+    expression: str,
+) -> str:
+    """Replace one scalar ``param`` RHS while retaining authored layout."""
+
+    if type(source_line) is not str:
+        raise TypeError("source_line must be an exact str.")
+    if type(expression) is not str or not expression.strip():
+        raise TypeError("expression must be nonblank exact text.")
+    if "\n" in expression or "\r" in expression:
+        raise ValueError("expression must be single-line text.")
+    before_comment, marker, comment = source_line.partition("#")
+    match = re.match(
+        rf"^(?P<prefix>\s*param\s+{re.escape(name)}\s*=\s*)"
+        rf"(?P<rhs>.*)$",
+        before_comment,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        raise ValueError(f"Scalar parameter {name!r} origin is invalid.")
+    rhs = match.group("rhs")
+    if not rhs.strip():
+        raise ValueError(f"Scalar parameter {name!r} origin is invalid.")
+    leading = rhs[: len(rhs) - len(rhs.lstrip())]
+    trailing = rhs[len(rhs.rstrip()) :]
+    return (
+        match.group("prefix")
+        + leading
+        + expression
+        + trailing
+        + (f"{marker}{comment}" if marker else "")
+    )
 
 
 def origin_line_positions(
     analysis: "DslAnalysis",
+    source_text: str,
 ) -> dict[int, int]:
-    """Resolve immutable origin ordinals onto canonical source line indexes."""
+    """Resolve immutable origin ordinals onto the exact source line indexes."""
 
-    lines = analysis.normalized_text.splitlines()
+    if type(source_text) is not str:
+        raise TypeError("source_text must be an exact str.")
+    raw_lines = source_text.splitlines(keepends=True)
+    lines = [line.rstrip("\r\n") for line in raw_lines]
     positions: dict[int, int] = {}
     cursor = 0
     for origin in analysis.origins:
@@ -140,7 +179,7 @@ def origin_line_positions(
             (
                 index
                 for index in range(cursor, len(lines))
-                if lines[index] == origin.source_text
+                if lines[index].rstrip() == origin.source_text.rstrip()
             ),
             None,
         )
@@ -160,26 +199,14 @@ def authored_step_origin(
 ) -> "DslSourceOrigin":
     """Return the exact retained source origin for one authored step."""
 
-    authored_steps: list[DslSourceOrigin] = []
-    for line in analysis.normalized_text.splitlines():
-        origin = next(
-            (
-                item
-                for item in analysis.origins
-                if item.source_text == line
-                and item.authored_ordinal
-                not in {
-                    candidate.authored_ordinal
-                    for candidate in authored_steps
-                }
-            ),
-            None,
+    authored_steps = [
+        origin
+        for origin in analysis.origins
+        if any(
+            arrow in origin.source_text.split("#", 1)[0]
+            for arrow in ("->", "=>", "<=>")
         )
-        if origin is None:
-            continue
-        code = line.split("#", 1)[0].strip()
-        if any(arrow in code for arrow in ("->", "=>", "<=>")):
-            authored_steps.append(origin)
+    ]
     if not 1 <= step_index <= len(authored_steps):
         raise LookupError(
             f"Mechanism step {step_index} has no exact source origin."

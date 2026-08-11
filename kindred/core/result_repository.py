@@ -162,8 +162,6 @@ def scientific_identity(
                 str(key): canonical(item)
                 for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
                 if str(key) not in {
-                    "dsl_analysis_identity",
-                    "dsl_source_origins",
                     "algebra_text",
                     "parameter_algebra_spec",
                 }

@@ -17,6 +17,7 @@ from types import MappingProxyType
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import uuid
 
+from kindred.core.datasets.foundation import validate_original_basename
 from kindred.core.datasets.source_rules import PhysicalColumn, validate_tabular_source_bytes
 from kindred.core.datasets.units import (
     looks_like_unit_row,
@@ -52,14 +53,10 @@ class ImportSourceSnapshot:
         source_type = str(self.file_type)
         source_bytes = self.exact_source_bytes
         source_id = str(self.source_id)
-        if (
-            not filename
-            or filename != filename.strip()
-            or os.path.basename(filename) != filename
-        ):
-            raise ValueError(
-                "Dataset import source filename must be a nonblank basename."
-            )
+        try:
+            validate_original_basename(filename, label="dataset import source filename")
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         suffix = Path(filename).suffix.lower()
         expected_type = "excel" if suffix == ".xlsx" else "csv" if suffix == ".csv" else ""
         if source_type != expected_type:

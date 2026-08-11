@@ -70,6 +70,7 @@ class ExperimentalLayerInput:
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
+    set_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.layer_id, ExperimentalLayerIdentity):
@@ -105,6 +106,15 @@ class ExperimentalLayerInput:
         ):
             raise ValueError(
                 "Experimental mapped-model identity must be None or a "
+                "nonblank edge-normalized string."
+            )
+        if self.set_id is not None and (
+            not isinstance(self.set_id, str)
+            or not self.set_id
+            or self.set_id != self.set_id.strip()
+        ):
+            raise ValueError(
+                "Experimental mapped set identity must be None or a "
                 "nonblank edge-normalized string."
             )
         if (
@@ -226,6 +236,7 @@ def build_experimental_layer_inputs(
                     dataset_name=record.display_name,
                     raw_column=raw_column,
                     model_species=mapping.get(raw_observation_id),
+                    set_id=(link.set_id if link is not None else None),
                     t=series.t,
                     y=series.y,
                     source_rows=series.source_rows,

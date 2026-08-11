@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.mechanism_source import (
+    MechanismAuthoringSource,
+    source_matches_analysis,
+)
 from kindred.core.project_document import ProjectDocument
 from kindred.core.project_session import ProjectContentToken
-from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
 from kindred.core.units import UnitsModel
 
@@ -52,8 +55,7 @@ class DetailedBalanceCorrectionProposal:
                 "proposal prepared DSL must be the proposed document's retained DSL."
             )
         if (
-            self.prepared_dsl.analysis.normalized_text
-            != self.source.reactions_text.strip()
+            not source_matches_analysis(self.source, self.prepared_dsl.analysis)
         ):
             raise ValueError(
                 "proposal prepared DSL must match the accepted source text."
@@ -98,6 +100,7 @@ class DetailedBalanceCorrectionRequest:
     tab_id: str
     source: str
     issue: str
+    accepted_analysis: DslAnalysis
     temperature_K: float = 298.15
     report: WegscheiderCyclicityReport | None = None
     source_energy_unit: str = "kJ/mol"
@@ -110,6 +113,8 @@ class DetailedBalanceCorrectionRequest:
             raise ValueError("origin must be Run, Fit, or Preview.")
         if not str(self.source or "").strip():
             raise ValueError("source must be nonblank.")
+        if not isinstance(self.accepted_analysis, DslAnalysis):
+            raise TypeError("accepted_analysis must be DslAnalysis.")
         if not isinstance(self.report, WegscheiderCyclicityReport):
             raise TypeError(
                 "Detailed-balance correction requires the accepted cyclicity report."
@@ -124,6 +129,13 @@ class DetailedBalanceCorrectionRequest:
             raise ValueError("source_energy_unit must be nonblank.")
         object.__setattr__(self, "temperature_K", temperature)
         object.__setattr__(self, "source_energy_unit", source_energy_unit)
+        if not source_matches_analysis(
+            MechanismAuthoringSource.from_parts(reactions_text=self.source),
+            self.accepted_analysis,
+        ):
+            raise ValueError(
+                "accepted_analysis must correspond to the exact correction source."
+            )
 
     @property
     def accepted_parse_units(self) -> UnitsModel:

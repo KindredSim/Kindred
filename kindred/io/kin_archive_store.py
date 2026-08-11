@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import itertools
 import math
 import os
 import stat
 import uuid
 import zipfile
+from contextlib import nullcontext
 from dataclasses import dataclass
 from numbers import Real
 from typing import Mapping, Sequence
@@ -28,7 +30,17 @@ from kindred.core.datasets.foundation import (
     RawDatasetRecord,
     freeze_json_value,
     thaw_json_value,
+    validate_imported_source,
+    validate_original_basename,
+    validate_raw_dataset_record,
 )
+from kindred.core.datasets.csv_import import (
+    parse_physical_rows,
+    read_csv_rows_from_bytes,
+)
+from kindred.core.datasets.excel_import import ExcelWorkbookPair
+from kindred.core.datasets.source_rules import PhysicalColumn
+from kindred.core.datasets.units import parse_concentration_unit, parse_time_unit
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
     ExperimentalAxisSelection,
@@ -50,6 +62,16 @@ _SOURCE_MEMBER_PREFIX = "sources/"
 _CANONICAL_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _CANONICAL_ZIP_CREATE_SYSTEM = 3
 _CANONICAL_ZIP_FILE_MODE = stat.S_IFREG | 0o644
+_REPLAY_METADATA_FIELDS = frozenset(
+    {
+        "physical_columns",
+        "time_column",
+        "observation_columns",
+        "original_time_unit",
+        "original_concentration_units",
+        "skip_unit_row",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,7 +319,10 @@ def _encode_document(
     source_members: list[tuple[str, bytes]] = []
     source_payloads: list[dict[str, object]] = []
     for index, source in enumerate(document.imported_sources):
-        source_member = f"{_SOURCE_MEMBER_PREFIX}{index:08d}.bin"
+        validate_imported_source(source)
+        source_member = (
+            f"{_SOURCE_MEMBER_PREFIX}{index:08d}/{source.original_filename}"
+        )
         source_members.append((source_member, source.exact_source_bytes))
         source_payloads.append(
             {
@@ -309,6 +334,20 @@ def _encode_document(
         )
     datasets: list[dict[str, object]] = []
     for dataset in document.datasets:
+        source = next(
+            (
+                candidate
+                for candidate in document.imported_sources
+                if candidate.source_id == dataset.source_id
+            ),
+            None,
+        )
+        if source is None:
+            raise ValueError(
+                f"Dataset {dataset.dataset_id!r} references an unknown source."
+            )
+        validate_raw_dataset_record(dataset)
+        _require_replay_metadata(dataset, source, label=f"dataset {dataset.dataset_id!r}")
         datasets.append(
             {
                 "dataset_id": dataset.dataset_id,
@@ -411,6 +450,197 @@ def _decode_pair_array(
     return tuple(pairs)
 
 
+def _replay_imported_dataset(
+    dataset: RawDatasetRecord,
+    source: ImportedSource,
+    *,
+    label: str,
+    workbooks: ExcelWorkbookPair | None = None,
+) -> None:
+    """Reparse retained source bytes and require exact observation replay."""
+    metadata = _require_replay_metadata(dataset, source, label=label)
+    raw_columns = metadata["physical_columns"]
+    if not isinstance(raw_columns, list):
+        raise ValueError(f"{label}.source_metadata.physical_columns must be an array.")
+    columns = tuple(
+        PhysicalColumn(
+            source_index=_integer(item.get("source_index"), f"{label}.physical_columns[{index}].source_index"),
+            authored_name=_string(item.get("authored_name"), f"{label}.physical_columns[{index}].authored_name", nonblank=True),
+            assigned_name=_string(item.get("assigned_name"), f"{label}.physical_columns[{index}].assigned_name", nonblank=True),
+        )
+        for index, item in enumerate(raw_columns)
+        if isinstance(item, Mapping)
+    )
+    if len(columns) != len(raw_columns):
+        raise ValueError(f"{label}.source_metadata.physical_columns contains invalid entries.")
+    observation_names = metadata["observation_columns"]
+    if (
+        not isinstance(observation_names, list)
+        or any(not isinstance(name, str) or not name.strip() for name in observation_names)
+    ):
+        raise ValueError(f"{label}.source_metadata.observation_columns must be an array of names.")
+    by_name = {column.assigned_name: column for column in columns}
+    try:
+        time_column = by_name[str(metadata["time_column"])]
+        species_columns = tuple(by_name[str(name)] for name in observation_names)
+    except KeyError as exc:
+        raise ValueError(f"{label}.source_metadata references an unknown physical column.") from exc
+    original_time_unit = _string(
+        metadata["original_time_unit"],
+        f"{label}.source_metadata.original_time_unit",
+        nonblank=True,
+    )
+    raw_concentration_units = metadata["original_concentration_units"]
+    if not isinstance(raw_concentration_units, Mapping):
+        raise ValueError(
+            f"{label}.source_metadata.original_concentration_units must be an object."
+        )
+    if any(name not in raw_concentration_units for name in observation_names):
+        raise ValueError(
+            f"{label}.source_metadata.original_concentration_units must include every observation."
+        )
+    concentration_units = {
+        name: _string(
+            raw_concentration_units.get(name),
+            f"{label}.source_metadata.original_concentration_units.{name}",
+            nonblank=True,
+        )
+        for name in observation_names
+    }
+    skip_unit_row = _boolean(
+        metadata["skip_unit_row"],
+        f"{label}.source_metadata.skip_unit_row",
+    )
+    time_factor = parse_time_unit(original_time_unit)
+    observation_factors = {
+        name: parse_concentration_unit(unit)
+        for name, unit in concentration_units.items()
+    }
+
+    def _compare(payload) -> None:  # noqa: ANN001
+        expected = tuple(
+            (series.column_name, series.t, series.y, series.source_rows)
+            for series in dataset.observations
+        )
+        actual = tuple(
+            (series.column_name, series.t, series.y, series.source_rows)
+            for series in payload.observations
+        )
+        if actual != expected:
+            raise ValueError(
+                f"{label} observations do not replay exactly from retained source bytes."
+            )
+
+    if source.original_format == "csv":
+        columns_from_source, rows = read_csv_rows_from_bytes(
+            source.exact_source_bytes,
+            source_label=source.original_filename,
+        )
+        try:
+            if columns_from_source != columns:
+                raise ValueError(f"{label} physical columns do not replay exactly.")
+            row_iter = iter(rows)
+            first_row = next(row_iter, None)
+            if first_row is None:
+                raise ValueError(f"{label} source contains no data rows.")
+            rows_to_parse = (
+                row_iter
+                if skip_unit_row
+                else itertools.chain((first_row,), row_iter)
+            )
+            payload = parse_physical_rows(
+                rows_to_parse,
+                columns=columns,
+                time_column=time_column,
+                species_columns=species_columns,
+                source_label=source.original_filename,
+                source_row_start=3 if skip_unit_row else 2,
+                time_factor=time_factor,
+                observation_factors=observation_factors,
+                metadata_extras={
+                    "original_time_unit": original_time_unit,
+                    "original_concentration_units": concentration_units,
+                    "skip_unit_row": skip_unit_row,
+                },
+            )
+            _compare(payload)
+        finally:
+            rows.close()
+        return
+
+    if source.original_format != "xlsx":
+        raise ValueError(f"{label} has unsupported source format {source.original_format!r}.")
+    sheet_name = metadata.get("sheet_name")
+    if not isinstance(sheet_name, str) or not sheet_name.strip():
+        raise ValueError(f"{label}.source_metadata.sheet_name is required for XLSX replay.")
+    workbook_context = (
+        nullcontext(workbooks)
+        if workbooks is not None
+        else ExcelWorkbookPair(
+            source.exact_source_bytes,
+            source_label=source.original_filename,
+        )
+    )
+    with workbook_context as active_workbooks:
+        rows = active_workbooks.read_sheet_rows(sheet_name)
+        try:
+            row_iter = iter(rows)
+            first_row = next(row_iter, None)
+            if first_row is None:
+                raise ValueError(f"{label} worksheet contains no data rows.")
+            columns_from_source = tuple(first_row)
+            if columns_from_source != columns:
+                raise ValueError(f"{label} physical columns do not replay exactly.")
+            rows_to_parse = (
+                row_iter
+                if skip_unit_row
+                else itertools.chain((first_row,), row_iter)
+            )
+            payload = parse_physical_rows(
+                rows_to_parse,
+                columns=columns,
+                time_column=time_column,
+                species_columns=species_columns,
+                source_label=source.original_filename,
+                sheet_name=sheet_name,
+                source_row_start=3 if skip_unit_row else 2,
+                time_factor=time_factor,
+                observation_factors=observation_factors,
+                metadata_extras={
+                    "original_time_unit": original_time_unit,
+                    "original_concentration_units": concentration_units,
+                    "skip_unit_row": skip_unit_row,
+                },
+            )
+            _compare(payload)
+        finally:
+            rows.close()
+
+
+def _require_replay_metadata(
+    dataset: RawDatasetRecord,
+    source: ImportedSource,
+    *,
+    label: str,
+) -> Mapping[str, object]:
+    metadata = thaw_json_value(dataset.source_metadata)
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"{label}.source_metadata must be a JSON object.")
+    missing = sorted(_REPLAY_METADATA_FIELDS - set(metadata))
+    if missing:
+        raise ValueError(
+            f"{label}.source_metadata is missing replay field(s): "
+            f"{', '.join(missing)}."
+        )
+    if source.original_format == "xlsx":
+        sheet_name = metadata.get("sheet_name")
+        if not isinstance(sheet_name, str) or not sheet_name.strip():
+            raise ValueError(
+                f"{label}.source_metadata.sheet_name is required for XLSX replay."
+            )
+    return metadata
+
+
 def _decode_document(
     value: object,
     source_bytes_by_member: Mapping[str, bytes],
@@ -422,6 +652,7 @@ def _decode_document(
     )
     sources: list[ImportedSource] = []
     source_ids: set[str] = set()
+    sources_by_id: dict[str, ImportedSource] = {}
     source_members: set[str] = set()
     for index, raw_source in enumerate(_array(data["sources"], "document.sources")):
         label = f"document.sources[{index}]"
@@ -430,8 +661,20 @@ def _decode_document(
             label,
             {"source_id", "original_filename", "original_format", "source_member"},
         )
+        original_filename = _string(
+            item["original_filename"], f"{label}.original_filename", nonblank=True
+        )
+        try:
+            validate_original_basename(original_filename, label=f"{label}.original_filename")
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        original_format = _string(
+            item["original_format"], f"{label}.original_format", nonblank=True
+        )
+        expected_member = (
+            f"{_SOURCE_MEMBER_PREFIX}{index:08d}/{original_filename}"
+        )
         source_member = _string(item["source_member"], f"{label}.source_member", nonblank=True)
-        expected_member = f"{_SOURCE_MEMBER_PREFIX}{index:08d}.bin"
         if source_member != expected_member:
             raise ValueError(f"{label}.source_member must be {expected_member!r}.")
         if source_member not in source_bytes_by_member:
@@ -444,12 +687,15 @@ def _decode_document(
         sources.append(
             ImportedSource(
                 source_id=source_id,
-                original_filename=_string(item["original_filename"], f"{label}.original_filename", nonblank=True),
-                original_format=_string(item["original_format"], f"{label}.original_format", nonblank=True),
+                original_filename=original_filename,
+                original_format=original_format,
                 exact_source_bytes=source_bytes_by_member[source_member],
             )
         )
+        validate_imported_source(sources[-1])
+        sources_by_id[source_id] = sources[-1]
     datasets: list[RawDatasetRecord] = []
+    datasets_by_source: dict[str, list[tuple[RawDatasetRecord, str]]] = {}
     referenced_source_ids: set[str] = set()
     for index, raw_dataset in enumerate(
         _array(data["datasets"], "document.datasets")
@@ -530,23 +776,41 @@ def _decode_document(
                     ),
                 )
             )
-        datasets.append(
-            RawDatasetRecord(
-                dataset_id=_string(
-                    item["dataset_id"],
-                    f"{label}.dataset_id",
-                    nonblank=True,
-                ),
-                display_name=_string(
-                    item["display_name"],
-                    f"{label}.display_name",
-                    nonblank=True,
-                ),
-                source_id=source_id,
-                source_metadata=freeze_json_value(item["source_metadata"]),
-                observations=tuple(observations),
-            )
+        dataset = RawDatasetRecord(
+            dataset_id=_string(
+                item["dataset_id"],
+                f"{label}.dataset_id",
+                nonblank=True,
+            ),
+            display_name=_string(
+                item["display_name"],
+                f"{label}.display_name",
+                nonblank=True,
+            ),
+            source_id=source_id,
+            source_metadata=freeze_json_value(item["source_metadata"]),
+            observations=tuple(observations),
         )
+        validate_raw_dataset_record(dataset)
+        datasets.append(dataset)
+        datasets_by_source.setdefault(source_id, []).append((dataset, label))
+    for source_id, source_datasets in datasets_by_source.items():
+        source = sources_by_id[source_id]
+        if source.original_format == "xlsx":
+            with ExcelWorkbookPair(
+                source.exact_source_bytes,
+                source_label=source.original_filename,
+            ) as workbooks:
+                for dataset, label in source_datasets:
+                    _replay_imported_dataset(
+                        dataset,
+                        source,
+                        label=label,
+                        workbooks=workbooks,
+                    )
+        else:
+            for dataset, label in source_datasets:
+                _replay_imported_dataset(dataset, source, label=label)
     if referenced_source_ids != source_ids:
         raise ValueError("Archive contains an unreferenced imported source.")
     if source_members != set(source_bytes_by_member):

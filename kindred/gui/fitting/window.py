@@ -1110,6 +1110,37 @@ class FittingWindow(QtWidgets.QDialog):
         self._tabs.setCurrentIndex(2)
         return bool(rendered)
 
+    def restore_terminal_candidate_semantics(
+        self,
+        candidate: FitCandidate,
+        *,
+        available_scopes: frozenset[str],
+        unavailable_reasons: Mapping[str, str],
+        projection_error: BaseException,
+    ) -> None:
+        """Recover terminal semantic presentation after a fallible Apply view."""
+
+        if not isinstance(candidate, FitCandidate):
+            raise TypeError("candidate must be FitCandidate.")
+        available = frozenset(str(scope) for scope in available_scopes)
+        reasons = {
+            str(scope): str(reason or "")
+            for scope, reason in unavailable_reasons.items()
+        }
+        self.set_candidate_apply_availability(available, reasons)
+        self._run_identity = candidate.run_identity
+        self.set_resolved_auto_modes(candidate.resolved_auto_modes)
+        self._copy_run_json.setEnabled(True)
+        self._results_summary_button.setEnabled(True)
+        self._run_results_tab.restore_terminal_semantics(
+            candidate,
+            available_scopes=available,
+            unavailable_reasons=reasons,
+        )
+        self._run_results_tab.mark_terminal_projection_unavailable(projection_error)
+        self._set_copy_available(False)
+        self._tabs.setCurrentIndex(2)
+
     def clear_candidate(self) -> None:
         # Clear actionable Copy/view authority first.  A physical plot teardown
         # is fallible and must never leave stale controls enabled.

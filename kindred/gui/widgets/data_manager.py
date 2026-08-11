@@ -3,10 +3,7 @@
 
 from __future__ import annotations
 
-import csv
-from contextlib import closing
 import html
-import io
 import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
@@ -16,11 +13,10 @@ from PySide6.QtCore import Qt
 
 from kindred.core.datasets.source_rules import (
     PhysicalColumn,
-    identify_physical_columns,
 )
+from kindred.core.datasets.csv_import import read_csv_rows_from_bytes
 from kindred.core.datasets.excel_import import (
-    list_sheets_from_bytes,
-    read_excel_sheet_rows_from_bytes,
+    ExcelWorkbookPair,
 )
 from kindred.gui.import_workflow import (
     ImportConfig,
@@ -489,29 +485,18 @@ class DataManagerPanel(QtWidgets.QWidget):
             selected_keys.add(source_intent.time_column)
 
         if file_type == "csv":
-            with io.TextIOWrapper(
-                io.BytesIO(source.exact_source_bytes),
-                encoding="utf-8-sig",
-                newline="",
-            ) as f:
-                reader = csv.reader(f)
-                header = next(reader, None)
-                if header is None:
-                    raise ValueError("CSV file is empty")
-                columns = list(identify_physical_columns(header))
-                first_row_raw = next(reader, None)
-            if first_row_raw is not None:
-                row_values = [c.strip() if c else "" for c in first_row_raw]
-                row_mapping = {
-                    column: (
-                        row_values[column.source_index]
-                        if column.source_index < len(row_values)
-                        else ""
-                    )
-                    for column in columns
-                }
+            columns_tuple, rows = read_csv_rows_from_bytes(
+                source.exact_source_bytes,
+                source_label=source.original_filename,
+            )
+            try:
+                first_row = next(iter(rows), None)
+            finally:
+                rows.close()
+            columns = list(columns_tuple)
+            if first_row is not None:
                 det = detect_units_from_physical_row(
-                    row_mapping, list(selected_keys)
+                    first_row.values, list(selected_keys)
                 )
             else:
                 det = UnitDetection.empty()
@@ -521,39 +506,37 @@ class DataManagerPanel(QtWidgets.QWidget):
             per_sheet_detections[None] = det
             per_sheet_columns[None] = columns
         else:
-            sheets = list_sheets_from_bytes(
+            with ExcelWorkbookPair(
                 source.exact_source_bytes,
                 source_label=source.original_filename,
-            )
-            if not sheets:
-                raise ValueError("Excel file has no sheets")
-            # Filter sheets by source's checked set
-            if source_sheet_names:
-                source_set = set(source_sheet_names)
-                sheets = [s for s in sheets if s in source_set]
+            ) as workbooks:
+                sheets = workbooks.sheet_names
                 if not sheets:
-                    raise ValueError("No matching sheets found")
-            for sheet_name in sheets:
-                with closing(
-                    read_excel_sheet_rows_from_bytes(
-                        source.exact_source_bytes,
-                        sheet_name,
-                        source_label=source.original_filename,
+                    raise ValueError("Excel file has no sheets")
+                # Filter sheets by source's checked set
+                if source_sheet_names:
+                    source_set = set(source_sheet_names)
+                    sheets = [s for s in sheets if s in source_set]
+                    if not sheets:
+                        raise ValueError("No matching sheets found")
+                for sheet_name in sheets:
+                    rows = workbooks.read_sheet_rows(sheet_name)
+                    try:
+                        first_row = next(iter(rows), None)
+                    finally:
+                        rows.close()
+                    if first_row is None:
+                        per_sheet_columns[sheet_name] = []
+                        per_sheet_detections[sheet_name] = UnitDetection.empty()
+                    else:
+                        per_sheet_columns[sheet_name] = list(first_row.keys())
+                        per_sheet_detections[sheet_name] = detect_units_from_physical_row(
+                            dict(first_row), list(selected_keys)
+                        )
+                    per_sheet_intents[sheet_name] = rebuild_intent_for_target(
+                        source_intent, per_sheet_detections[sheet_name],
                     )
-                ) as rows:
-                    first_row = next(iter(rows), None)
-                if first_row is None:
-                    per_sheet_columns[sheet_name] = []
-                    per_sheet_detections[sheet_name] = UnitDetection.empty()
-                else:
-                    per_sheet_columns[sheet_name] = list(first_row.keys())
-                    per_sheet_detections[sheet_name] = detect_units_from_physical_row(
-                        dict(first_row), list(selected_keys)
-                    )
-                per_sheet_intents[sheet_name] = rebuild_intent_for_target(
-                    source_intent, per_sheet_detections[sheet_name],
-                )
-            target_sheet_names = tuple(sheets)
+                target_sheet_names = tuple(sheets)
 
         plans = resolve_import_plans(
             source,

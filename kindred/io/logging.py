@@ -66,7 +66,7 @@ def _get_log_level_from_env() -> str:
     return _DEFAULT_LOG_LEVEL
 
 
-def setup_logging(level: str | None = None) -> None:
+def setup_logging() -> None:
     """Configure bounded rotating-file logging and usable terminal diagnostics.
 
     Calling this function replaces and closes all existing root handlers. The
@@ -74,7 +74,7 @@ def setup_logging(level: str | None = None) -> None:
     temporary-directory file when the normal location cannot be opened.
     """
 
-    resolved_level = (level or _get_log_level_from_env()).upper()
+    resolved_level = _get_log_level_from_env()
     if resolved_level not in _VALID_LOG_LEVELS:
         resolved_level = _DEFAULT_LOG_LEVEL
     numeric_level = getattr(logging, resolved_level)

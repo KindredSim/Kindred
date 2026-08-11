@@ -17,7 +17,10 @@ from kindred.core.dataset_mapping import (
     resolve_fit_t_start,
 )
 from kindred.core.datasets import foundation as dataset_foundation
-from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.mechanism_source import (
+    MechanismAuthoringSource,
+    source_matches_analysis,
+)
 from kindred.core.project_document import (
     FitDefaults,
     MechanismTabDocument,
@@ -575,9 +578,9 @@ class FitOriginSnapshot:
             raise TypeError("mechanism_source must be MechanismAuthoringSource.")
         if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
             raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-        if (
-            self.prepared_dsl.analysis.normalized_text
-            != self.mechanism_source.reactions_text.strip()
+        if not source_matches_analysis(
+            self.mechanism_source,
+            self.prepared_dsl.analysis,
         ):
             raise ValueError(
                 "Fit origin prepared DSL must be the retained analysis for "
@@ -698,9 +701,9 @@ class FitExecutionRequest:
             raise TypeError("mechanism_source must be MechanismAuthoringSource.")
         if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
             raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-        if (
-            self.prepared_dsl.analysis.normalized_text
-            != self.mechanism_source.reactions_text.strip()
+        if not source_matches_analysis(
+            self.mechanism_source,
+            self.prepared_dsl.analysis,
         ):
             raise ValueError(
                 "Fit request prepared DSL must exactly match its effective source."
@@ -841,9 +844,9 @@ class FitSetupSnapshot:
             raise TypeError(
                 "snapshot prepared_dsl must be a PreparedDslRequestSet."
             )
-        if (
-            self.prepared_dsl.analysis.normalized_text
-            != self.mechanism_source.reactions_text.strip()
+        if not source_matches_analysis(
+            self.mechanism_source,
+            self.prepared_dsl.analysis,
         ):
             raise ValueError(
                 "Fit snapshot prepared DSL must exactly match its source."

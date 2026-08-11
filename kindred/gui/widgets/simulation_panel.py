@@ -8,6 +8,7 @@ from collections.abc import Callable
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import (
+    SIMULATION_POINT_RANGE,
     SimulationExecutionSettings,
     SUPPORTED_SOLVERS,
     validate_simulation_execution_settings,
@@ -46,7 +47,6 @@ class SimulationPanel(QtWidgets.QWidget):
             "integration_points": self._canonical_settings.integration_points,
         }
         self._candidate_changed_fields: set[str] = set()
-        self._candidate_invalid_raw: dict[str, str] = {}
         self._rendering = False
         self._candidate_dirty = False
         self._run_admitted = True
@@ -63,7 +63,7 @@ class SimulationPanel(QtWidgets.QWidget):
         self.t_start_edit = self._number_edit("0", "Absolute Run start time")
         self.t_end_edit = self._number_edit("10", "Absolute Run end time")
         self.num_points_spinbox = QtWidgets.QSpinBox(self)
-        self.num_points_spinbox.setRange(10, 100_000)
+        self.num_points_spinbox.setRange(*SIMULATION_POINT_RANGE)
         self.num_points_spinbox.setSingleStep(10)
         for label, widget in (
             ("Solver:", self.solver_method_combo),
@@ -179,7 +179,6 @@ class SimulationPanel(QtWidgets.QWidget):
                     "integration_points": settings.integration_points,
                 }
                 self._candidate_changed_fields.clear()
-                self._candidate_invalid_raw.clear()
             self._run_admitted = bool(run_admitted)
             self._simulation_job_kind = kind
             if not preserve_candidate:
@@ -220,16 +219,10 @@ class SimulationPanel(QtWidgets.QWidget):
             # canonical values here would make a focus-loss event silently
             # erase the invalid text before Run can observe it.
             self._candidate_dirty = True
-            self._candidate_invalid_raw = {
-                field: self._candidate_text(field)
-                for field in ("t_start", "t_end")
-                if field in self._candidate_changed_fields
-            }
             self._sync_controls()
             self.settingsValidationFailed.emit(str(exc))
             return False
         self._candidate_dirty = False
-        self._candidate_invalid_raw.clear()
         if candidate != self._canonical_settings:
             if publish_candidate is None:
                 self.workspaceRunDefaultsRequested.emit(candidate)
@@ -273,17 +266,6 @@ class SimulationPanel(QtWidgets.QWidget):
         validate_simulation_execution_settings(candidate)
         return candidate
 
-    def _candidate_text(self, field: str) -> str:
-        if field == "t_start":
-            return self.t_start_edit.text()
-        if field == "t_end":
-            return self.t_end_edit.text()
-        if field == "solver":
-            return self.solver_method_combo.currentText()
-        if field == "integration_points":
-            return str(self.num_points_spinbox.value())
-        raise KeyError(field)
-
     def _reproject_canonical(self) -> None:
         settings = self._canonical_settings
         self._candidate_values = {
@@ -293,7 +275,6 @@ class SimulationPanel(QtWidgets.QWidget):
             "integration_points": settings.integration_points,
         }
         self._candidate_changed_fields.clear()
-        self._candidate_invalid_raw.clear()
         previous_rendering = self._rendering
         self._rendering = True
         try:

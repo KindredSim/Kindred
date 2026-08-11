@@ -476,14 +476,25 @@ def apply_wegscheider_resolution_to_reactions_text(
     updates: Sequence[WegscheiderResolutionUpdate],
     *,
     units: UnitsModel,
+    admitted_analysis: object,
 ) -> str:
+    from kindred.core.simulator.dsl_derivation import rewrite_scalar_source_line
+
     if type(units) is not UnitsModel:
         raise TypeError("Detailed-balance correction units must be UnitsModel.")
     pending = {str(update.parameter_name).lower(): update for update in updates}
     if not pending:
         return str(dsl_text or "")
 
-    lines = str(dsl_text or "").splitlines()
+    raw_lines = str(dsl_text or "").splitlines(keepends=True)
+    line_contents = [line.rstrip("\r\n") for line in raw_lines]
+    line_endings = [
+        line[len(content):]
+        for line, content in zip(raw_lines, line_contents)
+    ]
+    if not raw_lines and dsl_text:
+        line_contents = [str(dsl_text)]
+        line_endings = [""]
 
     # dG_eq is a source-owned equilibrium coordinate, not an Algebra
     # parameter.  Materialize all selected dG corrections in this one
@@ -496,34 +507,55 @@ def apply_wegscheider_resolution_to_reactions_text(
         if re.fullmatch(r"dg_eq\d+", key, flags=re.IGNORECASE)
     }
     if dg_updates:
-        lines = _materialize_admitted_dG_source_updates(
+        materialized_lines = _materialize_admitted_dG_source_updates(
             str(dsl_text or ""),
             dg_updates,
             units=units,
+            admitted_analysis=admitted_analysis,
         )
+        line_contents = [line.rstrip("\r\n") for line in materialized_lines]
+        line_endings = [
+            line[len(content):]
+            for line, content in zip(materialized_lines, line_contents)
+        ]
         pending = {
             key: update
             for key, update in pending.items()
             if key not in dg_updates
         }
+        if not pending:
+            return "".join(
+                line + ending
+                for line, ending in zip(line_contents, line_endings)
+            )
 
     rewritten: list[str] = []
+    rewritten_endings: list[str] = []
     replaced: set[str] = set()
     param_re = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
-    for raw in lines:
+    for raw, line_ending in zip(line_contents, line_endings):
         code = strip_inline_comment(raw).strip()
         match = param_re.match(code)
         if match is None:
             rewritten.append(raw)
+            rewritten_endings.append(line_ending)
             continue
         key = str(match.group(1)).lower()
         update = pending.get(key)
         if update is None:
             rewritten.append(raw)
+            rewritten_endings.append(line_ending)
             continue
         if key in replaced:
             continue
-        rewritten.append(update.line)
+        rewritten.append(
+            rewrite_scalar_source_line(
+                raw,
+                name=match.group(1),
+                expression=update.expr_src,
+            )
+        )
+        rewritten_endings.append(line_ending)
         replaced.add(key)
 
     missing = [
@@ -531,9 +563,12 @@ def apply_wegscheider_resolution_to_reactions_text(
         for key, update in pending.items()
         if key not in replaced
     ]
-    rewritten_text = "\n".join(rewritten).rstrip("\n")
+    rewritten_text = "".join(
+        line + ending
+        for line, ending in zip(rewritten, rewritten_endings)
+    )
     if not missing:
-        return rewritten_text + "\n"
+        return rewritten_text
     return upsert_lines_into_algebra_section(rewritten_text, missing)
 
 
@@ -542,27 +577,86 @@ def _materialize_admitted_dG_source_updates(
     updates: Mapping[str, WegscheiderResolutionUpdate],
     *,
     units: UnitsModel,
+    admitted_analysis: object,
 ) -> list[str]:
-    """Materialize dG corrections through admitted origins and coordinates."""
+    """Rewrite admitted dG coordinates without reparsing or normalizing."""
 
-    # This is intentionally a call-local admission.  The source parser owns
-    # arrow recognition (including bare ``=>``), coordinate aliases, and the
-    # source-wide energy directive; this writer consumes only that typed
-    # admission and never scans reaction syntax itself.
     from kindred.core.simulator.dsl_derivation import (
-        authored_step_origin,
-        coordinate_source_line,
         coordinate_source_parts,
         coordinate_token_matches,
         origin_line_positions,
-        set_coordinate_source_token,
+        rewrite_coordinate_source_line,
     )
-    from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
+    from kindred.core.mechanism_source import (
+        MechanismAuthoringSource,
+        source_matches_analysis,
+    )
 
-    prepared = prepare_dsl_request_set(dsl_text, units=units)
-    analysis = prepared.analysis
-    lines = analysis.normalized_text.splitlines()
-    positions = origin_line_positions(analysis)
+    if not source_matches_analysis(
+        MechanismAuthoringSource.from_parts(reactions_text=dsl_text),
+        admitted_analysis,
+    ):
+        raise ValueError(
+            "Detailed-balance source does not match its admitted analysis."
+        )
+    analysis = admitted_analysis
+    if (
+        str(units.energy_unit) != str(analysis.energy_unit)
+        or float(units.temperature_K) != float(analysis.temperature_K)
+    ):
+        raise ValueError(
+            "Detailed-balance correction units do not match the admitted analysis."
+        )
+    raw_lines = str(dsl_text).splitlines(keepends=True)
+    line_contents = [line.rstrip("\r\n") for line in raw_lines]
+    line_endings = [line[len(content):] for line, content in zip(raw_lines, line_contents)]
+    if not raw_lines and dsl_text:
+        line_contents = [dsl_text]
+        line_endings = [""]
+    origin_positions = origin_line_positions(analysis, dsl_text)
+    authored_steps = tuple(
+        origin
+        for origin in analysis.origins
+        if any(
+            arrow in origin.source_text.split("#", 1)[0]
+            for arrow in ("->", "=>", "<=>")
+        )
+    )
+
+    def source_coordinate_location(name: str) -> tuple[int, float]:
+        match = re.fullmatch(r"dg_eq(\d+)", str(name).casefold())
+        if match is None:
+            raise ValueError(
+                f"Unsupported native detailed-balance coordinate {name!r}."
+            )
+        step_index = int(match.group(1))
+        if not 1 <= step_index <= len(authored_steps):
+            raise ValueError(f"Source has no authored coordinate {name!r}.")
+        origin = authored_steps[step_index - 1]
+        try:
+            line_index = origin_positions[origin.authored_ordinal]
+        except KeyError as exc:
+            raise ValueError(
+                f"Source has no exact origin for {name!r}."
+            ) from exc
+        if not 0 <= line_index < len(line_contents):
+            raise ValueError(f"Source origin for {name!r} is outside the exact source.")
+        _prefix, tokens, _comment = coordinate_source_parts(line_contents[line_index])
+        matches = [
+            pair for pair in tokens if coordinate_token_matches(pair[0], "dG_eq")
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Source does not contain exactly one authored coordinate {name!r}."
+            )
+        try:
+            value = float(matches[0][1])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Source {name} value is not numeric.") from exc
+        if not isfinite(value):
+            raise ValueError(f"Source {name} value is not finite.")
+        return line_index, value
+
     coordinate_names: set[str] = {
         str(key).casefold()
         for key in updates
@@ -573,40 +667,10 @@ def _materialize_admitted_dG_source_updates(
             for name, _factor in update.source_terms
         )
 
-    admitted_coordinates: dict[str, tuple[int, list[list[str]], str, float]] = {}
+    admitted_coordinates: dict[str, tuple[int, float]] = {}
     for coordinate_name in sorted(coordinate_names):
-        match = re.fullmatch(r"dg_eq(\d+)", coordinate_name)
-        if match is None:
-            raise ValueError(
-                f"Unsupported native detailed-balance coordinate {coordinate_name!r}."
-            )
-        step_index = int(match.group(1))
-        origin = authored_step_origin(analysis, step_index=step_index)
-        line_index = positions[origin.authored_ordinal]
-        prefix, tokens, comment = coordinate_source_parts(lines[line_index])
-        matches = [
-            pair
-            for pair in tokens
-            if coordinate_token_matches(pair[0], "dG_eq")
-        ]
-        if len(matches) != 1:
-            raise ValueError(
-                f"Source does not contain exactly one authored coordinate "
-                f"{coordinate_name!r}."
-            )
-        try:
-            value = float(matches[0][1])
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"Source {coordinate_name} value is not numeric."
-            ) from exc
-        if not isfinite(value):
-            raise ValueError(f"Source {coordinate_name} value is not finite.")
-        admitted_coordinates[coordinate_name] = (
-            line_index,
-            tokens,
-            comment,
-            value,
+        admitted_coordinates[coordinate_name] = source_coordinate_location(
+            coordinate_name
         )
 
     # All values are retained in the one admitted source energy unit.  Do not
@@ -635,20 +699,18 @@ def _materialize_admitted_dG_source_updates(
                 raise ValueError(
                     f"Source does not contain authored coordinate {source_name!r}."
                 )
-            materialized += float(factor) * source[3]
+            materialized += float(factor) * source[1]
         if not isfinite(materialized):
             raise ValueError(
                 f"Detailed-balance correction for {update.parameter_name!r} is not finite."
             )
-        line_index, tokens, comment, _value = coordinate
-        prefix = coordinate_source_parts(lines[line_index])[0]
-        set_coordinate_source_token(
-            tokens,
+        line_index, _value = coordinate
+        line_contents[line_index] = rewrite_coordinate_source_line(
+            line_contents[line_index],
             token="dG_eq",
             value=float(materialized),
         )
-        lines[line_index] = coordinate_source_line(prefix, tokens, comment)
-    return lines
+    return [content + ending for content, ending in zip(line_contents, line_endings)]
 
 
 def _assignment_by_name(spec: ParameterAlgebraSpec | None) -> dict[str, ParameterAssignment]:
