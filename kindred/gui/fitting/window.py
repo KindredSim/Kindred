@@ -8,7 +8,11 @@ from dataclasses import replace
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.gui.fitting.contracts import FitParametricSettings, FitRunIdentity
+from kindred.gui.fitting.contracts import (
+    FitParametricSettings,
+    FitRunIdentity,
+    FitWorkerFailure,
+)
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.launch import (
@@ -16,15 +20,23 @@ from kindred.gui.fitting.launch import (
     FitDatasetWeightModeSetupEdit,
     FitDefaultsSetupEdit,
     FitInitialSetupEdit,
+    FitApplySelection,
+    FitAdvancedAnalysisSetupEdit,
+    FitInitialApplyProposal,
     FitInitialScopeSetupEdit,
     FitOriginSnapshot,
     FitParameterSetupEdit,
     FitParameterScopeSetupEdit,
     FitSetupSnapshot,
     FitSolverSetupEdit,
+    FitPublicationClassification,
     selected_observations,
 )
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
+from kindred.gui.fitting.reporting import (
+    FitTerminalReportError,
+    build_fit_terminal_report,
+)
 from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 from kindred.gui.fitting.worker import FitCandidate, FitCurveDataset, FitLiveUpdate
@@ -48,6 +60,8 @@ class FittingWindow(QtWidgets.QDialog):
     pauseRequested = QtCore.Signal()
     resumeRequested = QtCore.Signal()
     applyRequested = QtCore.Signal(object)
+    # Results-owned typed request forwarded through the modal window owner port.
+    sharedRefitRequested = QtCore.Signal(object)
     addObservableRequested = QtCore.Signal(str, str, str, str, str)
     setupEditsRequested = QtCore.Signal(object)
     resetRequested = QtCore.Signal(str)
@@ -80,7 +94,9 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_identity: FitRunIdentity | None = None
         self._executing = False
         self._setup_projecting = False
-        self._candidate_has_per_dataset_values = False
+        self._candidate_publication_message = ""
+        self._available_apply_scopes: frozenset[str] = frozenset()
+        self._initial_apply_proposal: FitInitialApplyProposal | None = None
 
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
@@ -129,6 +145,12 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._project_result_identity_labels()
         self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
+        self._run_results_tab.initialSelectionChanged.connect(
+            self._refresh_apply_button
+        )
+        self._run_results_tab.sharedRefitRequested.connect(
+            self.sharedRefitRequested
+        )
 
         self._tabs = QtWidgets.QTabBar(self)
         self._tabs.setObjectName("global_fit_top_tabs")
@@ -487,6 +509,7 @@ class FittingWindow(QtWidgets.QDialog):
                     FitParameterScopeSetupEdit,
                     FitDefaultsSetupEdit,
                     FitSolverSetupEdit,
+                    FitAdvancedAnalysisSetupEdit,
                 ),
             )
         )
@@ -1077,13 +1100,14 @@ class FittingWindow(QtWidgets.QDialog):
         *,
         available_scopes: frozenset[str],
         unavailable_reasons: Mapping[str, str],
+        publication: Mapping[str, FitPublicationClassification]
+        | tuple[FitPublicationClassification, ...]
+        | None = None,
     ) -> bool:
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be FitCandidate.")
-        self._candidate_has_per_dataset_values = any(
-            bool(values)
-            for _dataset_id, values in candidate.scalar_values_by_dataset
-        )
+        report = build_fit_terminal_report(candidate, publication=publication)
+        self._candidate_publication_message = report.publication.message
         available = frozenset(str(scope) for scope in available_scopes)
         reasons = {
             str(scope): str(reason or "") for scope, reason in unavailable_reasons.items()
@@ -1095,6 +1119,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._results_summary_button.setEnabled(True)
         rendered = self._run_results_tab.set_candidate(
             candidate,
+            report=report,
             available_scopes=available,
             unavailable_reasons=reasons,
         )
@@ -1109,15 +1134,16 @@ class FittingWindow(QtWidgets.QDialog):
         available_scopes: frozenset[str],
         unavailable_reasons: Mapping[str, str],
         projection_error: BaseException,
+        publication: Mapping[str, FitPublicationClassification]
+        | tuple[FitPublicationClassification, ...]
+        | None = None,
     ) -> None:
         """Recover terminal semantic presentation after a fallible Apply view."""
 
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be FitCandidate.")
-        self._candidate_has_per_dataset_values = any(
-            bool(values)
-            for _dataset_id, values in candidate.scalar_values_by_dataset
-        )
+        report = build_fit_terminal_report(candidate, publication=publication)
+        self._candidate_publication_message = report.publication.message
         available = frozenset(str(scope) for scope in available_scopes)
         reasons = {
             str(scope): str(reason or "")
@@ -1130,6 +1156,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._results_summary_button.setEnabled(True)
         self._run_results_tab.restore_terminal_semantics(
             candidate,
+            report=report,
             available_scopes=available,
             unavailable_reasons=reasons,
         )
@@ -1141,7 +1168,9 @@ class FittingWindow(QtWidgets.QDialog):
         # Clear actionable Copy/view authority first.  A physical plot teardown
         # is fallible and must never leave stale controls enabled.
         self._run_identity = None
-        self._candidate_has_per_dataset_values = False
+        self._candidate_publication_message = ""
+        self._available_apply_scopes = frozenset()
+        self._initial_apply_proposal = None
         self._clear_resolved_auto_modes()
         for checkbox, _scope in self._apply_controls():
             checkbox.setChecked(False)
@@ -1153,6 +1182,69 @@ class FittingWindow(QtWidgets.QDialog):
         self._results_summary_button.setEnabled(False)
         self._run_results_tab.clear_candidate()
 
+    def set_initial_apply_proposal(
+        self,
+        proposal: FitInitialApplyProposal | None,
+    ) -> None:
+        """Project the owner's exact independently selectable IC mutations."""
+
+        if proposal is not None and not isinstance(
+            proposal,
+            FitInitialApplyProposal,
+        ):
+            raise TypeError("IC Apply proposal must be typed or None.")
+        if proposal is not None and (
+            proposal.origin_tab_id != self._origin.tab_id
+            or proposal.origin_capture_id != self._origin.capture_id
+        ):
+            raise ValueError("IC Apply proposal belongs to a stale Fit origin.")
+        self._initial_apply_proposal = proposal
+        self._run_results_tab.set_initial_apply_proposal(proposal)
+        available = (
+            "initial_concentrations" in self._available_apply_scopes
+            and proposal is not None
+            and bool(proposal.cells)
+        )
+        self._apply_initials.setEnabled(available)
+        self._apply_initials.setChecked(available)
+        self._refresh_apply_button()
+
+    def set_terminal_failure(self, failure: FitWorkerFailure) -> None:
+        """Present a worker failure while retaining its typed cause chain."""
+
+        if not isinstance(failure, FitWorkerFailure):
+            raise TypeError("Terminal Fit failure must be FitWorkerFailure.")
+        self._run_results_tab.set_terminal_failure(failure)
+        self.set_status(f"Fit failed: {failure.message}")
+        self._tabs.setCurrentIndex(2)
+
+    def set_shared_refit_source_candidate(self, candidate: FitCandidate) -> None:
+        """Restore retry controls without replacing Last Fit terminal truth."""
+
+        if not isinstance(candidate, FitCandidate):
+            raise TypeError("Shared-refit source must be a FitCandidate.")
+        report = build_fit_terminal_report(candidate)
+        self._run_results_tab.set_shared_refit_source_candidate(
+            candidate,
+            report=report,
+        )
+
+    def set_terminal_report_failure(self, error: BaseException) -> None:
+        """Present semantic terminal-report failure without plot wording."""
+
+        if not isinstance(error, FitTerminalReportError):
+            raise TypeError("Semantic terminal failure must be FitTerminalReportError.")
+        for checkbox, _scope in self._apply_controls():
+            checkbox.setChecked(False)
+            checkbox.setEnabled(False)
+        self._apply_button.setEnabled(False)
+        self._copy_button.setEnabled(False)
+        self._copy_run_json.setEnabled(False)
+        self._results_summary_button.setEnabled(False)
+        self._run_results_tab.set_terminal_report_failure(error)
+        self.set_status(f"Fit terminal report failed: {error}")
+        self._tabs.setCurrentIndex(2)
+
     def set_candidate_apply_availability(
         self,
         available_scopes: frozenset[str],
@@ -1161,24 +1253,28 @@ class FittingWindow(QtWidgets.QDialog):
         """Project retained owner Apply scopes without requiring a result view."""
 
         available = frozenset(str(scope) for scope in available_scopes)
+        self._available_apply_scopes = available
         reasons = {
             str(scope): str(reason or "")
             for scope, reason in unavailable_reasons.items()
         }
         for checkbox, scope in self._apply_controls():
-            checkbox.setEnabled(scope in available)
-            checkbox.setChecked(scope in available)
+            scope_available = scope in available
+            if scope == "initial_concentrations":
+                scope_available = bool(
+                    scope_available
+                    and self._initial_apply_proposal is not None
+                    and self._initial_apply_proposal.cells
+                )
+            checkbox.setEnabled(scope_available)
+            checkbox.setChecked(scope_available)
             tooltip = reasons.get(scope, "")
             if (
                 scope == "parameters"
                 and scope in available
-                and self._candidate_has_per_dataset_values
+                and self._candidate_publication_message
             ):
-                tooltip = (
-                    "Applies shared project parameter values only; "
-                    "per-dataset values stay Fit-local and are not applied "
-                    "to Run."
-                )
+                tooltip = self._candidate_publication_message
             checkbox.setToolTip(tooltip)
         self._refresh_apply_button()
         self._run_results_tab.set_apply_availability(available, reasons)
@@ -1193,20 +1289,44 @@ class FittingWindow(QtWidgets.QDialog):
     def _emit_apply(self) -> None:
         if self._closing:
             return
-        scopes = frozenset(
+        scopes = tuple(
             scope
             for checkbox, scope in self._apply_controls()
             if checkbox.isEnabled() and checkbox.isChecked()
         )
+        initial_keys = (
+            self._run_results_tab.selected_initial_keys()
+            if "initial_concentrations" in scopes
+            else ()
+        )
+        if "initial_concentrations" in scopes and not initial_keys:
+            scopes = tuple(
+                scope for scope in scopes if scope != "initial_concentrations"
+            )
         if not scopes:
-            self.set_status("Select at least one Apply scope.")
+            self.set_status(
+                "Select at least one Apply scope and at least one Initial "
+                "Conditions cell when that scope is selected."
+            )
             return
-        self.applyRequested.emit(scopes)
+        self.applyRequested.emit(
+            FitApplySelection(
+                origin_tab_id=self._origin.tab_id,
+                origin_capture_id=self._origin.capture_id,
+                scopes=scopes,
+                initial_keys=initial_keys,
+            )
+        )
 
     def _refresh_apply_button(self, *_args: object) -> None:
         selected_available = any(
-            checkbox.isEnabled() and checkbox.isChecked()
-            for checkbox, _scope in self._apply_controls()
+            checkbox.isEnabled()
+            and checkbox.isChecked()
+            and (
+                scope != "initial_concentrations"
+                or bool(self._run_results_tab.selected_initial_keys())
+            )
+            for checkbox, scope in self._apply_controls()
         )
         self._apply_button.setEnabled(
             selected_available

@@ -56,6 +56,11 @@ from kindred.core.simulator.dsl_parse import (
     DslAnalysis,
     PreparedDslRequestSet,
 )
+from kindred.core.simulator.executable_identity import (
+    BaseExecutableScienceIdentity,
+    TargetExecutableScienceIdentity,
+    compose_target_executable_identity,
+)
 from kindred.core.simulation_preparation_stages import (
     PreparedSolverConfig as _PreparedSolverConfig,
     build_prepared_run_context,
@@ -111,6 +116,7 @@ __all__ = [
     "metadata_view_for_mechanism",
     "prepare_bound_mechanism",
     "capture_simulation_execution_snapshot",
+    "compose_simulation_target_identity",
     "bind_simulation_execution_request_interventions",
     "build_simulation_execution_request",
     "solver_config_for_execution_settings",
@@ -396,6 +402,7 @@ class BoundMechanism:
     y0: np.ndarray
     dsl_analysis: DslAnalysis
     parameter_algebra_spec: Any
+    base_executable_identity: BaseExecutableScienceIdentity
     intervention_execution: InterventionExecutionContract | None = None
     unresolved_intervention_schedule: InterventionSchedule | None = None
 
@@ -414,6 +421,7 @@ class SimulationPreparationError(RuntimeError):
         message: str,
         *,
         parameter_names: Iterable[str] = (),
+        candidate_domain_eligible: bool = False,
     ) -> None:
         super().__init__(str(message))
         self.stage = str(stage or "unknown")
@@ -422,6 +430,7 @@ class SimulationPreparationError(RuntimeError):
             for name in parameter_names
             if str(name).strip()
         )
+        self.candidate_domain_eligible = bool(candidate_domain_eligible)
 
 
 def _raise_if_cancelled(
@@ -528,6 +537,7 @@ def resolve_prepared_run_intervention_execution(
             "intervention_schedule",
             str(exc),
             parameter_names=parameter_partition.schedule_parameter_names,
+            candidate_domain_eligible=True,
         ) from exc
 
 
@@ -687,6 +697,18 @@ class PreparedSimulationMetadata:
             )
         return payload
 
+def compose_simulation_target_identity(
+    base_identity: BaseExecutableScienceIdentity,
+    intervention_execution: InterventionExecutionContract,
+) -> TargetExecutableScienceIdentity:
+    """Compose identity at the direct target-binding authority."""
+
+    return compose_target_executable_identity(
+        base_identity,
+        intervention_execution,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SimulationExecutionSnapshot:
     """One isolated, typed scientific state captured for direct execution."""
@@ -698,6 +720,8 @@ class SimulationExecutionSnapshot:
     temperature_schedule: TemperatureScheduleProtocol | None
     parameter_algebra_spec: Any
     intervention_execution: InterventionExecutionContract | None
+    base_executable_identity: BaseExecutableScienceIdentity
+    target_executable_identity: TargetExecutableScienceIdentity | None
     parameterized_intervention_schedule: InterventionSchedule | None = None
     requested_parameter_names: tuple[str, ...] = ()
 
@@ -732,6 +756,17 @@ class SimulationExecutionSnapshot:
             raise TypeError(
                 "execution snapshot requires its retained parameter algebra spec."
             )
+        if not isinstance(
+            self.base_executable_identity,
+            BaseExecutableScienceIdentity,
+        ):
+            raise TypeError(
+                "execution snapshot requires admitted base executable identity."
+            )
+        if self.base_executable_identity.analysis_identity != self.analysis.identity:
+            raise ValueError(
+                "execution snapshot analysis and base executable identities conflict."
+            )
         schedule = self.parameterized_intervention_schedule
         contract = self.intervention_execution
         if schedule is not None:
@@ -745,11 +780,25 @@ class SimulationExecutionSnapshot:
                     "execution snapshot intervention state cannot be both "
                     "declarative and compiled."
                 )
+            if self.target_executable_identity is not None:
+                raise ValueError(
+                    "unbound execution snapshot cannot carry target identity."
+                )
         elif not isinstance(contract, InterventionExecutionContract):
             raise TypeError(
                 "bound execution snapshots require one compiled intervention "
                 "contract."
             )
+        else:
+            expected_identity = compose_simulation_target_identity(
+                self.base_executable_identity,
+                contract,
+            )
+            if self.target_executable_identity != expected_identity:
+                raise ValueError(
+                    "bound execution snapshot target identity conflicts with "
+                    "its admitted base and intervention contract."
+                )
         requested_names = tuple(
             str(name).strip() for name in self.requested_parameter_names
         )
@@ -871,6 +920,7 @@ def _resolve_intervention_schedule_for_request(
             "intervention_schedule",
             str(exc),
             parameter_names=intervention_schedule_parameter_names(schedule),
+            candidate_domain_eligible=True,
         ) from exc
 
 
@@ -956,6 +1006,10 @@ def bind_simulation_execution_request_interventions(
             snapshot,
             parameterized_intervention_schedule=None,
             intervention_execution=contract,
+            target_executable_identity=compose_simulation_target_identity(
+                snapshot.base_executable_identity,
+                contract,
+            ),
         ),
         t_span=request.t_span,
         solver_config=request.solver_config,
@@ -1126,6 +1180,8 @@ def capture_simulation_execution_snapshot(
     temperature_schedule = metadata_view_for_mechanism(
         mechanism
     ).temperature_schedule
+    base_identity = prepared_dsl.base_executable_identity()
+    intervention_execution = prepared_dsl.intervention_execution_contract()
     return SimulationExecutionSnapshot(
         analysis=prepared_dsl.analysis,
         mechanism=mechanism,
@@ -1135,8 +1191,15 @@ def capture_simulation_execution_snapshot(
         parameter_algebra_spec=(
             prepared_dsl.parameter_algebra_spec_for_execution()
         ),
-        intervention_execution=(
-            prepared_dsl.intervention_execution_contract()
+        intervention_execution=intervention_execution,
+        base_executable_identity=base_identity,
+        target_executable_identity=(
+            None
+            if intervention_execution is None
+            else compose_simulation_target_identity(
+                base_identity,
+                intervention_execution,
+            )
         ),
         parameterized_intervention_schedule=(
             prepared_dsl.parameterized_intervention_schedule_for_binding()
@@ -1686,7 +1749,6 @@ def _apply_execution_parameter_algebra_and_cyclicity(
     )
     from kindred.core.simulator.wegscheider_symbolic import (
         UnresolvedWegscheiderCyclicityError,
-        validate_wegscheider_cyclicity_resolved,
     )
 
     try:
@@ -1698,17 +1760,6 @@ def _apply_execution_parameter_algebra_and_cyclicity(
     except UnresolvedWegscheiderCyclicityError as exc:
         raise SimulationPreparationError("wegscheider_cyclicity", str(exc)) from exc
 
-    if prepared_solver_config.wegscheider_cyclicity_enabled and bool(
-        getattr(mechanism, "equilibria", []) or []
-    ):
-        try:
-            report = validate_wegscheider_cyclicity_resolved(mechanism)
-        except UnresolvedWegscheiderCyclicityError as exc:
-            raise SimulationPreparationError("wegscheider_cyclicity", str(exc)) from exc
-        if report.cycles:
-            meta = getattr(mechanism, "metadata", None)
-            if isinstance(meta, dict):
-                meta["symbolic_wegscheider_identity"] = dict(report.symbolic_identity)
 
 
 def prepare_simulation_worker_run(
@@ -1826,6 +1877,7 @@ def prepare_simulation_worker_run(
                         if parameter_partition is None
                         else parameter_partition.schedule_parameter_names
                     ),
+                    candidate_domain_eligible=True,
                 ) from exc
 
     if rhs is None:
@@ -2286,6 +2338,7 @@ def prepare_bound_mechanism(
         y0=y0,
         dsl_analysis=prepared_dsl.analysis,
         parameter_algebra_spec=spec,
+        base_executable_identity=prepared_dsl.base_executable_identity(),
         intervention_execution=(
             prepared_dsl.intervention_execution_contract()
         ),

@@ -20,6 +20,7 @@ import math
 import re
 from typing import List
 
+from .authored_source_errors import AuthoredSourceError
 from .temperature import TemperatureSchedule, TemperatureScheduleError
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["parse_temperature_schedule", "TemperatureDSLError"]
 
 
-class TemperatureDSLError(ValueError):
+class TemperatureDSLError(AuthoredSourceError):
     """
     Enhanced error for temperature schedule DSL parsing.
 

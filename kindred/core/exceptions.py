@@ -35,6 +35,8 @@ __all__ = [
     # Fitting
     "FittingError",
     "FitSimulationError",
+    "FitCandidateDomainError",
+    "FitFinalReplayError",
     "FittingCancelled",
     "OptimizationError",
 ]
@@ -244,6 +246,87 @@ class FitSimulationError(FittingError):
         details = dict(kwargs.pop("details", {}) or {})
         super().__init__(message, details=details, **kwargs)
         self.failed_params = failed_params
+
+
+class FitCandidateDomainError(FitSimulationError):
+    """Typed, nonfatal rejection of one admitted optimizer candidate.
+
+    This type is reserved for numerical outcomes that can change with the
+    optimizer coordinates after the Fit capture/configuration has already
+    been admitted.  Identity, ownership, malformed configuration, cancellation,
+    and programming failures must not use it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        failed_params: Optional[Dict[str, float]] = None,
+        **kwargs: Any,
+    ) -> None:
+        details = dict(kwargs.pop("details", {}) or {})
+        details.update(
+            {
+                "fatal": False,
+                "candidate_domain": True,
+                "stage": str(stage or "candidate_evaluation"),
+            }
+        )
+        super().__init__(
+            message,
+            failed_params=failed_params,
+            details=details,
+            **kwargs,
+        )
+
+
+class FitFinalReplayError(FitSimulationError):
+    """Fatal terminal conversion of a candidate-domain replay failure.
+
+    ``typed_cause`` deliberately retains the original typed exception in
+    addition to normal Python exception chaining.  Worker/report boundaries
+    can therefore transport its structured details without guessing from a
+    flattened message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        typed_cause: FitSimulationError,
+        stage: str,
+        failed_params: Optional[Dict[str, float]] = None,
+        **kwargs: Any,
+    ) -> None:
+        if not isinstance(typed_cause, FitSimulationError):
+            raise TypeError("FitFinalReplayError requires a FitSimulationError cause.")
+        details = dict(kwargs.pop("details", {}) or {})
+        cause_details = dict(getattr(typed_cause, "details", {}) or {})
+        details.update(
+            {
+                "fatal": True,
+                "candidate_domain": False,
+                "stage": str(stage or "final_replay"),
+                "typed_cause": {
+                    "type": type(typed_cause).__name__,
+                    "code": str(getattr(typed_cause, "code", "") or ""),
+                    "message": str(getattr(typed_cause, "message", None) or typed_cause),
+                    "details": cause_details,
+                },
+            }
+        )
+        super().__init__(
+            message,
+            failed_params=(
+                failed_params
+                if failed_params is not None
+                else getattr(typed_cause, "failed_params", None)
+            ),
+            details=details,
+            **kwargs,
+        )
+        self.typed_cause = typed_cause
 
 
 class FittingCancelled(FittingError):

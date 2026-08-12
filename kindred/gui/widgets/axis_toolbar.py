@@ -77,6 +77,7 @@ class AxisToolbar(QtWidgets.QWidget):
         if orientation not in {"horizontal", "vertical"}:
             raise ValueError("orientation must be 'horizontal' or 'vertical'")
         self._orientation = orientation
+        self._interactive_gesture_active = False
 
         self._x_combo = QtWidgets.QComboBox(self)
         self._x_combo.setMinimumContentsLength(10)
@@ -498,6 +499,14 @@ class AxisToolbar(QtWidgets.QWidget):
         finally:
             del blocker
 
+    def set_interactive_gesture_active(self, active: bool) -> None:
+        """Freeze range-authoring controls for one slider display gesture."""
+
+        self._interactive_gesture_active = bool(active)
+        enabled = not self._interactive_gesture_active
+        self._auto_range.setEnabled(enabled)
+        self._sync_manual_range_controls(self._auto_range.isChecked())
+
     def get_manual_ranges(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         """
         Get manual axis ranges.
@@ -687,7 +696,7 @@ class AxisToolbar(QtWidgets.QWidget):
         self.ySelectionChanged.emit(self.selected_y())
 
     def _sync_manual_range_controls(self, auto_checked: bool) -> None:
-        enabled = not bool(auto_checked)
+        enabled = not bool(auto_checked) and not self._interactive_gesture_active
         self._x_min.setEnabled(enabled)
         self._x_max.setEnabled(enabled)
         self._y_min.setEnabled(enabled)

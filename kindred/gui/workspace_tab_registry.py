@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import math
 from typing import TYPE_CHECKING, Callable, Iterable, Protocol, runtime_checkable
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -21,11 +22,16 @@ from kindred.core.project_presentation_state import (
     validate_project_presentation_state,
     validate_workspace_presentation_state,
 )
+from kindred.gui.parameter_enumeration import (
+    GuiParameterCoordinate,
+    enumerate_parameter_coordinates,
+)
 
 if TYPE_CHECKING:
     from kindred.core.result_repository import ResultRepository
 
 __all__ = [
+    "CanonicalResultFence",
     "CanonicalMutationResult",
     "DocumentDeletionResultFence",
     "PreparedWorkspaceInstall",
@@ -50,6 +56,9 @@ class DocumentDeletionResultFence(Protocol):
         tab_id: str,
         set_ids: Iterable[str],
     ) -> tuple[tuple[str, int], ...]: ...
+
+
+CanonicalResultFence = Callable[["ScientificDocumentDelta"], None]
 
 
 @dataclass(slots=True)
@@ -100,14 +109,11 @@ class CanonicalMutationResult:
     """One accepted exact-revision document mutation and its result fence."""
 
     token: ProjectContentToken
-    delta: ScientificDocumentDelta
     changed: bool
 
     def __post_init__(self) -> None:
         if not isinstance(self.token, ProjectContentToken):
             raise TypeError("token must be ProjectContentToken.")
-        if not isinstance(self.delta, ScientificDocumentDelta):
-            raise TypeError("delta must be ScientificDocumentDelta.")
         if type(self.changed) is not bool:
             raise TypeError("changed must be bool.")
 
@@ -120,6 +126,7 @@ class WorkspaceTabRegistry:
         session: ProjectSession,
         *,
         deletion_result_fence: DocumentDeletionResultFence,
+        canonical_result_fence: CanonicalResultFence,
         runtime_factory: Callable[[str], TabRuntimeState] | None = None,
     ) -> None:
         if not isinstance(session, ProjectSession):
@@ -128,8 +135,11 @@ class WorkspaceTabRegistry:
             raise TypeError(
                 "deletion_result_fence must implement DocumentDeletionResultFence."
             )
+        if not callable(canonical_result_fence):
+            raise TypeError("canonical_result_fence must be callable.")
         self._session = session
         self._deletion_result_fence = deletion_result_fence
+        self._canonical_result_fence = canonical_result_fence
         self._runtime_factory = runtime_factory or (lambda _tab_id: TabRuntimeState())
         self._installed = self.prepare_install(
             document=session.document,
@@ -251,6 +261,49 @@ class WorkspaceTabRegistry:
             result_repository=runtime.result_repository,
         )
 
+    @staticmethod
+    def _slider_coordinates(
+        tab: MechanismTabDocument | None,
+    ) -> dict[str, GuiParameterCoordinate]:
+        """Return typed writable Slider identity, including retained scalars."""
+
+        if tab is None or tab.prepared_dsl is None:
+            return {}
+        coordinates = enumerate_parameter_coordinates(
+            tab.prepared_dsl,
+            wegscheider_cyclicity_enabled=bool(
+                tab.scientific_settings.wegscheider_policy
+            ),
+        )
+        return {
+            item.name: item
+            for item in coordinates
+            if item.writable and not item.derived
+        }
+
+    @staticmethod
+    def _same_slider_coordinate(
+        previous: GuiParameterCoordinate,
+        current: GuiParameterCoordinate,
+    ) -> bool:
+        """Compare stable coordinate ownership, not incidental source/value."""
+
+        return (
+            previous.name,
+            previous.family,
+            previous.role,
+            previous.writable,
+            previous.derived,
+            previous.unit,
+        ) == (
+            current.name,
+            current.family,
+            current.role,
+            current.writable,
+            current.derived,
+            current.unit,
+        )
+
     def _prepare_reconciled_install(
         self,
         *,
@@ -277,6 +330,7 @@ class WorkspaceTabRegistry:
         previous_tabs = {
             tab.tab_id: tab for tab in previous_document.tabs
         }
+        invalidated_slider_targets: dict[str, set[str]] = {}
         for tab in document.tabs:
             state = next_presentation.get(
                 tab.tab_id,
@@ -334,6 +388,11 @@ class WorkspaceTabRegistry:
                 initial_set.set_id: initial_set.values_dict()
                 for initial_set in tab.initial_condition_sets
             }
+            previous_species_drafts = {
+                set_id: dict(values)
+                for set_id, values
+                in runtime.slider_species_drafts_by_set_id.items()
+            }
             runtime.slider_species_drafts_by_set_id = {
                 set_id: {
                     species: value
@@ -355,27 +414,33 @@ class WorkspaceTabRegistry:
                 in runtime.slider_species_drafts_by_set_id.items()
                 if values
             }
-            previous_parameters = (
-                {}
-                if previous_tab is None or previous_tab.dsl_analysis is None
-                else {
-                    item.name: item
-                    for item in previous_tab.dsl_analysis.parameters
-                }
-            )
-            current_parameters = (
-                {}
-                if tab.dsl_analysis is None
-                else {
-                    item.name: item for item in tab.dsl_analysis.parameters
-                }
-            )
+            previous_parameters = self._slider_coordinates(previous_tab)
+            current_parameters = self._slider_coordinates(tab)
+            previous_parameter_drafts = dict(runtime.slider_parameter_draft)
             runtime.slider_parameter_draft = {
                 name: value
                 for name, value in runtime.slider_parameter_draft.items()
-                if name in previous_parameters
-                and current_parameters.get(name) == previous_parameters[name]
+                if (
+                    (previous_coordinate := previous_parameters.get(name))
+                    is not None
+                    and (current_coordinate := current_parameters.get(name))
+                    is not None
+                    and self._same_slider_coordinate(
+                        previous_coordinate,
+                        current_coordinate,
+                    )
+                    and math.isfinite(float(value))
+                    and float(value) != float(current_coordinate.value)
+                )
             }
+            affected = invalidated_slider_targets.setdefault(tab.tab_id, set())
+            if set(previous_parameter_drafts) != set(runtime.slider_parameter_draft):
+                affected.update(set_ids)
+            for set_id, values in previous_species_drafts.items():
+                if set(values) != set(
+                    runtime.slider_species_drafts_by_set_id.get(set_id, {})
+                ) and set_id in set_ids:
+                    affected.add(set_id)
         active_tab_id = self.active_tab_id
         if active_tab_id not in tab_ids:
             active_tab_id = document.tabs[0].tab_id
@@ -390,6 +455,29 @@ class WorkspaceTabRegistry:
                 for tab in document.tabs
             ),
         )
+        if any(invalidated_slider_targets.values()):
+            affected_by_tab = {
+                tab_id: list(set_ids)
+                for tab_id, set_ids in scientific_delta.affected_targets_by_tab
+            }
+            for tab in document.tabs:
+                additions = invalidated_slider_targets.get(tab.tab_id, set())
+                if not additions:
+                    continue
+                existing = affected_by_tab.setdefault(tab.tab_id, [])
+                existing.extend(
+                    initial_set.set_id
+                    for initial_set in tab.initial_condition_sets
+                    if initial_set.set_id in additions
+                    and initial_set.set_id not in existing
+                )
+            scientific_delta = ScientificDocumentDelta(
+                affected_targets_by_tab=tuple(
+                    (tab.tab_id, tuple(affected_by_tab[tab.tab_id]))
+                    for tab in document.tabs
+                    if affected_by_tab.get(tab.tab_id)
+                )
+            )
         return prepared, scientific_delta
 
     def replace_document(
@@ -412,6 +500,14 @@ class WorkspaceTabRegistry:
         else:
             prepared_workspace = self._installed
             delta = ScientificDocumentDelta()
+        if changed:
+            if not self._session.is_content_token_current(expected_token):
+                return None
+            # Fence the already-computed non-deletion target delta before the
+            # session publishes the candidate document.  The callback is the
+            # one exact result-owner boundary; callers must not deauthorize
+            # this delta after replace_document returns.
+            self._canonical_result_fence(delta)
         token = self._session.commit_document_mutation(
             prepared_document,
             expected_token=expected_token,
@@ -421,7 +517,7 @@ class WorkspaceTabRegistry:
             return None
         if changed:
             self._installed = prepared_workspace
-        return CanonicalMutationResult(token=token, delta=delta, changed=changed)
+        return CanonicalMutationResult(token=token, changed=changed)
 
     def _fence_document_deletions(
         self,
@@ -713,7 +809,6 @@ class WorkspaceTabRegistry:
                 return None
             return CanonicalMutationResult(
                 token=self._session.capture_content_token(),
-                delta=ScientificDocumentDelta(),
                 changed=False,
             )
         tab = self.tab(tab_id)

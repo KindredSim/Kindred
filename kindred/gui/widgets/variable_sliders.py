@@ -16,6 +16,8 @@ from typing import Dict, Iterable, Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
 
+from kindred.gui.interactive_preview import SliderInteractionKind
+
 from ..ui_helpers import (
     apply_slider_name_label_layout_policy,
     make_bounded_label,
@@ -164,13 +166,11 @@ class VariableSliders(QtWidgets.QWidget):
 
     Signals
     -------
-    variableChanged : Signal(str, float)
-        Emitted when a variable value changes (name, new_value)
+    interactionRequested : Signal(str, float, object)
+        Emitted with one ``SliderInteractionKind`` for every accepted event.
     """
 
-    variableChanged = Signal(str, float)  # (variable_name, new_value)
-    sliderDragStarted = Signal(str)  # name
-    sliderDragFinished = Signal(str)  # name
+    interactionRequested = Signal(str, float, object)
     fineModeReset = Signal(bool)
 
     def __init__(
@@ -513,11 +513,17 @@ class VariableSliders(QtWidgets.QWidget):
 
     def _on_slider_pressed(self, name: str) -> None:
         self._active_drag_names.add(str(name))
-        self.sliderDragStarted.emit(name)
 
     def _on_slider_released(self, name: str) -> None:
-        self.sliderDragFinished.emit(name)
-        self._active_drag_names.discard(str(name))
+        name_s = str(name)
+        self._active_drag_names.discard(name_s)
+        value = self._variables.get(name_s)
+        if value is not None:
+            self.interactionRequested.emit(
+                name_s,
+                float(value),
+                SliderInteractionKind.EXACT_DRAG_RELEASE,
+            )
 
     def _format_label_text(self, name: str) -> str:
         meta = self._metadata.get(name)
@@ -587,7 +593,18 @@ class VariableSliders(QtWidgets.QWidget):
             )
             return
 
-        self._set_value_projection(name, value, editor_text=None, emit=True)
+        interaction = (
+            SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE
+            if str(name) in self._active_drag_names
+            else SliderInteractionKind.EXACT_DRAG_RELEASE
+        )
+        self._set_value_projection(
+            name,
+            value,
+            editor_text=None,
+            emit=True,
+            interaction=interaction,
+        )
 
     def _format_value(self, value: float) -> str:
         """
@@ -1078,7 +1095,11 @@ class VariableSliders(QtWidgets.QWidget):
             return
         self._last_committed_editor_text[name_s] = raw
         self._set_value_projection(
-            name_s, value, editor_text=raw, emit=True
+            name_s,
+            value,
+            editor_text=raw,
+            emit=True,
+            interaction=SliderInteractionKind.EXACT_TYPED_COMMIT,
         )
 
     def _set_value_projection(
@@ -1088,6 +1109,7 @@ class VariableSliders(QtWidgets.QWidget):
         *,
         editor_text: str | None,
         emit: bool,
+        interaction: SliderInteractionKind | None = None,
     ) -> None:
         name_s = str(name)
         if name_s not in self._sliders:
@@ -1114,7 +1136,9 @@ class VariableSliders(QtWidgets.QWidget):
             value_label.setText(self._format_value(value_f))
         logger.debug("Variable projected: %s = %.12g", name_s, value_f)
         if emit:
-            self.variableChanged.emit(name_s, value_f)
+            if not isinstance(interaction, SliderInteractionKind):
+                raise TypeError("emitted Slider values require an interaction kind.")
+            self.interactionRequested.emit(name_s, value_f, interaction)
 
     @staticmethod
     def _set_editor_text(editor: QtWidgets.QLineEdit, text: str) -> None:

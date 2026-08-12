@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from numbers import Real
 from typing import Callable, Iterable, Mapping, Sequence
 
+from kindred.core.authored_source_errors import AuthoredSourceError
 from kindred.core.datasets import foundation as dataset_foundation
 from kindred.core.mechanism_source import (
     MechanismAuthoringSource,
@@ -47,6 +48,9 @@ __all__ = [
     "SIMULATION_POINT_RANGE",
     "TEMPERATURE_RANGE_K",
     "SUPPORTED_FIT_METHODS",
+    "FIT_METHOD_LABELS",
+    "fit_method_label",
+    "validate_fit_method",
     "SUPPORTED_SOLVERS",
     "validate_fit_solver",
     "fresh_mechanism_tab",
@@ -72,6 +76,11 @@ _SIMULATION_POINT_RANGE = (10, 100_000)
 _TEMPERATURE_RANGE_K = (0.1, 10_000.0)
 _SOLVERS = ("Radau", "BDF")
 _FITTING_METHODS = ("trf", "dogbox", "differential_evolution")
+_FITTING_METHOD_LABELS = {
+    "trf": "Trust Region Reflective",
+    "dogbox": "Dogbox",
+    "differential_evolution": "Differential Evolution",
+}
 _FITTING_MAX_NFEV_RANGE = (10, 10_000)
 _FITTING_SEED_RANGE = (0, 999_999)
 
@@ -79,6 +88,7 @@ _FITTING_SEED_RANGE = (0, 999_999)
 # project these immutable values; they must not restate or narrow them.
 SUPPORTED_SOLVERS = _SOLVERS
 SUPPORTED_FIT_METHODS = _FITTING_METHODS
+FIT_METHOD_LABELS = dict(_FITTING_METHOD_LABELS)
 FIT_MAX_NFEV_RANGE = _FITTING_MAX_NFEV_RANGE
 FIT_SEED_RANGE = _FITTING_SEED_RANGE
 SIMULATION_POINT_RANGE = _SIMULATION_POINT_RANGE
@@ -172,6 +182,30 @@ def validate_fit_solver(value: object) -> str:
             f"Fit solver must be one of {SUPPORTED_SOLVERS!r}."
         )
     return normalized
+
+
+def validate_fit_method(value: object) -> str:
+    """Validate and return one canonical optimizer identifier.
+
+    Method IDs are deliberately separate from their ordinary-facing labels;
+    persisted/run identities use only this stable roster.
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("Fit optimization method must be a string identifier.")
+    normalized = value.strip()
+    if normalized not in SUPPORTED_FIT_METHODS:
+        raise ValueError(
+            "Fit optimization method must be one of "
+            f"{SUPPORTED_FIT_METHODS!r}."
+        )
+    return normalized
+
+
+def fit_method_label(value: object) -> str:
+    """Return the readable label for a canonical optimizer identifier."""
+
+    return FIT_METHOD_LABELS[validate_fit_method(value)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -864,10 +898,9 @@ def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
 
     if not isinstance(defaults, FitDefaults):
         raise TypeError("fit_defaults must be FitDefaults.")
-    if defaults.method not in SUPPORTED_FIT_METHODS:
-        raise ValueError(
-            f"fit_defaults.method must be one of {SUPPORTED_FIT_METHODS!r}."
-        )
+    validate_fit_method(defaults.method)
+    if defaults.method != str(defaults.method).strip():
+        raise ValueError("fit_defaults.method must use canonical supported spelling.")
     _require_int(
         defaults.max_nfev,
         "fit_defaults.max_nfev",
@@ -888,19 +921,33 @@ def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
     return defaults
 
 
-def _prepare_source_dsl(
+def _prepare_authored_source_admission(
     source: MechanismAuthoringSource,
     scientific_settings: TabScientificSettings,
-) -> PreparedDslRequestSet | None:
-    if not source.reactions_text.strip():
-        return None
-    return prepare_dsl_request_set(
-        source.reactions_text,
-        initials={},
-        units=UnitsModel(
-            temperature_K=scientific_settings.temperature,
+) -> tuple[PreparedDslRequestSet | None, DetailedBalanceAdmission]:
+    """Admit user source through parsing and complete executable validation."""
+
+    try:
+        prepared_dsl = (
+            None
+            if not source.reactions_text.strip()
+            else prepare_dsl_request_set(
+                source.reactions_text,
+                initials={},
+                units=UnitsModel(
+                    temperature_K=scientific_settings.temperature,
+                ),
+            )
         )
-    )
+        detailed_balance = _detailed_balance_admission(
+            prepared_dsl,
+            policy_enabled=scientific_settings.wegscheider_policy,
+        )
+    except AuthoredSourceError:
+        raise
+    except (DSLError, ValueError, OverflowError) as exc:
+        raise AuthoredSourceError(str(exc)) from exc
+    return prepared_dsl, detailed_balance
 
 
 def canonical_species_names(tab: MechanismTabDocument) -> tuple[str, ...]:
@@ -1040,9 +1087,11 @@ def reconcile_tab_mechanism_source(
     if not isinstance(visible_source, MechanismAuthoringSource):
         raise TypeError("visible_source must be MechanismAuthoringSource.")
     tab = document.tab(tab_id)
-    admitted_dsl = _prepare_source_dsl(
-        visible_source,
-        tab.scientific_settings,
+    admitted_dsl, admitted_detailed_balance = (
+        _prepare_authored_source_admission(
+            visible_source,
+            tab.scientific_settings,
+        )
     )
     admission = (
         DslInitialConditionAdmission(
@@ -1146,7 +1195,7 @@ def reconcile_tab_mechanism_source(
             )
         for assignment in declaration.assignments:
             if assignment.species not in new_species_set:
-                raise ValueError(
+                raise AuthoredSourceError(
                     f"Inline initial-condition set {context_name!r} "
                     f"references species {assignment.species!r} absent "
                     "from the complete Reactions model."
@@ -1235,14 +1284,14 @@ def reconcile_tab_mechanism_source(
             reactions_text=admission.materialized_source
         )
     )
-    prepared_dsl = (
-        _prepare_source_dsl(
+    if admission.has_declarations:
+        prepared_dsl, detailed_balance = _prepare_authored_source_admission(
             accepted_source,
             tab.scientific_settings,
         )
-        if admission.has_declarations
-        else admitted_dsl
-    )
+    else:
+        prepared_dsl = admitted_dsl
+        detailed_balance = admitted_detailed_balance
     if (
         prepared_dsl is not None
         and prepared_dsl.analysis.inline_initial_conditions.has_declarations
@@ -1289,10 +1338,7 @@ def reconcile_tab_mechanism_source(
         proposed_document=proposed_document,
         inline_initial_conditions=admission,
         prepared_dsl=prepared_dsl,
-        detailed_balance=_detailed_balance_admission(
-            prepared_dsl,
-            policy_enabled=tab.scientific_settings.wegscheider_policy,
-        ),
+        detailed_balance=detailed_balance,
         materialized_set_ids=tuple(dict.fromkeys(materialized_ids)),
     )
     if collisions:
@@ -1437,12 +1483,23 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
             )
         try:
             if not _prepared_dsl_matches_tab(tab):
-                tab = replace(
-                    tab,
-                    prepared_dsl=_prepare_source_dsl(
+                prepared_dsl, _detailed_balance = (
+                    _prepare_authored_source_admission(
                         tab.mechanism_source,
                         tab.scientific_settings,
-                    ),
+                    )
+                )
+                tab = replace(
+                    tab,
+                    prepared_dsl=prepared_dsl,
+                )
+            else:
+                # Matching retained state is no longer user-authored input.
+                # Validate it without translating structural/programming
+                # failures into AuthoredSourceError.
+                _detailed_balance_admission(
+                    tab.prepared_dsl,
+                    policy_enabled=tab.scientific_settings.wegscheider_policy,
                 )
             analysis = tab.dsl_analysis
             if (
@@ -1458,6 +1515,11 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 if analysis is None
                 else analysis.species_names
             )
+        except AuthoredSourceError as exc:
+            raise AuthoredSourceError(
+                f"Tab {tab.tab_id!r} ({tab.name!r}) contains invalid "
+                f"authored Reactions: {exc}"
+            ) from exc
         except (DSLError, KeyError, TypeError, ValueError) as exc:
             raise ValueError(
                 f"Tab {tab.tab_id!r} ({tab.name!r}) contains an invalid "

@@ -693,26 +693,20 @@ class ProjectController(QtCore.QObject):
             action="Open Project",
         ):
             return False
-        operative_token = self._settle_execution_candidate(entry_token)
-        if operative_token is None:
-            return False
         return self._open_project_candidate(
             path,
             remove_missing_recent=False,
-            expected_token=operative_token,
+            expected_token=entry_token,
         )
 
     def load_recent_project(self, path: str) -> bool:
         if self._reject_mutation_during_close("Open Recent Project"):
             return False
         entry_token = self._session.capture_content_token()
-        operative_token = self._settle_execution_candidate(entry_token)
-        if operative_token is None:
-            return False
         return self._open_project_candidate(
             path,
             remove_missing_recent=True,
-            expected_token=operative_token,
+            expected_token=entry_token,
         )
 
     def _open_project_candidate(
@@ -762,9 +756,17 @@ class ProjectController(QtCore.QObject):
                 f"Failed to prepare project installation:\n\n{exc}",
             )
             return False
+        if not self._content_token_is_current(
+            expected_token,
+            action="Open Project",
+        ):
+            return False
+        operative_token = self._settle_execution_candidate(expected_token)
+        if operative_token is None:
+            return False
         disposition = self._resolve_disposition(
             "opening another project",
-            expected_token=expected_token,
+            expected_token=operative_token,
         )
         if disposition is None:
             return False

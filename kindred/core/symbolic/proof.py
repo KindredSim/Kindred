@@ -9,7 +9,10 @@ from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
 from .identity import symbolic_fingerprint
 from .namespaces import SymbolicProductIdentityProofContext
-from .parameter_expression import translate_parameter_expression
+from .parameter_expression import (
+    PRODUCT_IDENTITY_PROOF_POLICY,
+    translate_parameter_expression,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,7 @@ def prove_product_identity(
             return sympy.Symbol(str(name))
         translated_assignment = translate_parameter_expression(
             assignment,
+            policy=PRODUCT_IDENTITY_PROOF_POLICY,
             namespace=proof_context.parameter_namespace,
         )
         translation_fingerprints[str(name)] = translated_assignment.fingerprint
@@ -65,6 +69,7 @@ def prove_product_identity(
     try:
         translated = translate_parameter_expression(
             candidate,
+            policy=PRODUCT_IDENTITY_PROOF_POLICY,
             namespace=proof_context.parameter_namespace,
         )
         translation_fingerprints[str(candidate.name)] = translated.fingerprint

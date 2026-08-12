@@ -34,7 +34,10 @@ from .jacobian import (
     classify_symbolic_jacobian_support,
 )
 from .namespaces import SymbolicParameterNamespaceContext
-from .parameter_expression import translate_parameter_expression
+from .parameter_expression import (
+    CALCULATOR_EXPANSION_POLICY,
+    translate_parameter_expression,
+)
 
 _NUMERIC_LITERAL_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:\d[\d_]*\.\d[\d_]*|\d[\d_]*\.|\.\d[\d_]*|\d[\d_]*)(?:[eE][+\-]?\d[\d_]*)?(?![A-Za-z0-9_])"
@@ -770,6 +773,7 @@ def _translated_parameter_definitions(
         try:
             translated = translate_parameter_expression(
                 assignment,
+                policy=CALCULATOR_EXPANSION_POLICY,
                 namespace=parameter_namespace,
             )
         except UnsupportedSymbolicExpressionError as exc:

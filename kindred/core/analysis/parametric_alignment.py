@@ -5,16 +5,24 @@ from __future__ import annotations
 from collections.abc import Sequence
 import numpy as np
 
-from kindred.core.exceptions import FitSimulationError
+from kindred.core.exceptions import FitCandidateDomainError, FitSimulationError
 
 __all__ = [
+    "CandidateParametricAlignmentError",
     "DeterministicParametricResolutionError",
     "align_y_on_x_obs",
     "align_y_on_x_obs_time_guided",
 ]
 
 
-class DeterministicParametricResolutionError(FitSimulationError):
+class CandidateParametricAlignmentError(FitCandidateDomainError):
+    """An admitted candidate cannot map the captured parametric-X rows."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, stage="parametric_x_alignment")
+
+
+class DeterministicParametricResolutionError(CandidateParametricAlignmentError):
     """Monotone mapping is validly formed but cannot resolve one exact branch."""
 
 
@@ -468,7 +476,7 @@ def align_y_on_x_obs_time_guided(
                 continue
             candidates.append((t_star, left, right, float(fraction)))
         if not candidates:
-            raise FitSimulationError(
+            raise CandidateParametricAlignmentError(
                 f"Dataset {dataset_label!r}: no uninterrupted crossing exists "
                 f"for X={x_name!r} at {float(observation_x):.6g}."
             )
@@ -488,7 +496,7 @@ def align_y_on_x_obs_time_guided(
             discontinuities=discontinuities,
         )
         if not np.isfinite(chosen_t) or not np.isfinite(point[1]):
-            raise FitSimulationError(
+            raise CandidateParametricAlignmentError(
                 f"Dataset {dataset_label!r}: parametric-X alignment produced "
                 "a non-finite value."
             )

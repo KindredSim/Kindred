@@ -13,10 +13,111 @@ FitResolvedXMode = Literal["monotone", "time_guided"]
 
 __all__ = [
     "FitParametricSettings",
+    "FitWorkerFailure",
     "FitRunIdentity",
     "FitTargetSelection",
     "copy_target_selection",
 ]
+
+
+def _freeze_failure_value(value: object) -> object:
+    """Retain structured failure details without carrying mutable objects."""
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else "non-finite numeric value"
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                str(key): _freeze_failure_value(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_failure_value(item) for item in value)
+    return str(value)
+
+
+def _plain_failure_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_failure_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_plain_failure_value(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class FitWorkerFailure:
+    """Immutable typed failure transported from the worker to presentation."""
+
+    exception_type: str
+    code: str
+    message: str
+    details: Mapping[str, object]
+    typed_cause: "FitWorkerFailure | None" = None
+
+    def __post_init__(self) -> None:
+        exception_type = _name(self.exception_type, "failure exception type")
+        message = _name(self.message, "failure message")
+        code = str(self.code or "").strip()
+        if self.typed_cause is not None and not isinstance(
+            self.typed_cause,
+            FitWorkerFailure,
+        ):
+            raise TypeError("Fit worker typed cause must be FitWorkerFailure.")
+        object.__setattr__(self, "exception_type", exception_type)
+        object.__setattr__(self, "code", code)
+        object.__setattr__(self, "message", message)
+        object.__setattr__(
+            self,
+            "details",
+            _freeze_failure_value(dict(self.details or {})),
+        )
+
+    @classmethod
+    def from_exception(cls, error: BaseException) -> "FitWorkerFailure":
+        if not isinstance(error, BaseException):
+            raise TypeError("Fit worker failure source must be an exception.")
+
+        def build(current: BaseException, seen: frozenset[int]) -> "FitWorkerFailure":
+            identity = id(current)
+            typed_cause = getattr(current, "typed_cause", None)
+            if not isinstance(typed_cause, BaseException):
+                typed_cause = current.__cause__
+            nested = (
+                build(typed_cause, seen | {identity})
+                if isinstance(typed_cause, BaseException)
+                and id(typed_cause) not in seen
+                and id(typed_cause) != identity
+                else None
+            )
+            message = str(getattr(current, "message", None) or current).strip()
+            return cls(
+                exception_type=type(current).__name__,
+                code=str(getattr(current, "code", "") or ""),
+                message=message or type(current).__name__,
+                details=dict(getattr(current, "details", {}) or {}),
+                typed_cause=nested,
+            )
+
+        return build(error, frozenset())
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "exception_type": self.exception_type,
+            "code": self.code or None,
+            "message": self.message,
+            "details": _plain_failure_value(self.details),
+            "typed_cause": (
+                self.typed_cause.to_payload()
+                if self.typed_cause is not None
+                else None
+            ),
+        }
 
 
 def _name(value: object, field: str) -> str:

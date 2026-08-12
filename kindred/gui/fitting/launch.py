@@ -8,6 +8,12 @@ from typing import Iterable, Literal
 
 import numpy as np
 
+from kindred.core.analysis.fit_uncertainty import (
+    ProfileLikelihoodConfig,
+    ResidualBootstrapConfig,
+)
+from kindred.core.analysis.global_fitting import SharedRefitPromotion
+from kindred.core.analysis.hierarchical_fit import HierarchicalFitConfig
 from kindred.core.algebra.observable_introspection import (
     FitLocalObservable,
     fit_observable_names,
@@ -36,11 +42,9 @@ from kindred.core.simulator.dsl_parse import (
     DslDerivedScalarDefinition,
     PreparedDslRequestSet,
 )
-from kindred.core.simulator.wegscheider_symbolic import (
-    UnresolvedWegscheiderCyclicityError,
-)
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.fitting.contracts import FitParametricSettings, FitRunIdentity
+from kindred.gui.fitting.ic_tolerance import FitInitialTolerance
 
 __all__ = [
     "FitParameterConfiguration",
@@ -51,6 +55,11 @@ __all__ = [
     "FitDatasetWeightModeSetupEdit",
     "FitDefaultsSetupEdit",
     "FitExecutionRequest",
+    "FitSharedRefitIntent",
+    "FitApplySelection",
+    "FitAdvancedAnalysisSetupEdit",
+    "FitInitialApplyCellProposal",
+    "FitInitialApplyProposal",
     "FitInitialSetupEdit",
     "FitInitialGlobalVariable",
     "FitInitialScopeSetupEdit",
@@ -71,10 +80,19 @@ __all__ = [
     "revalidate_fit_request_inclusions",
     "selected_observations",
     "fit_local_observable_definitions",
+    "fit_uncertainty_coordinate_names",
+    "FitLocalScalarProvenance",
+    "FitPublicationClassification",
+    "build_fit_publication_classifications",
 ]
 
 FitDatasetWeightMode = Literal["implicit", "user"]
 FitSolver = Literal["BDF", "Radau"]
+FitPublicationRoute = Literal[
+    "parameters",
+    "observable_definitions",
+    "fit_local_only",
+]
 
 
 def fit_local_observable_definitions(
@@ -135,6 +153,153 @@ def _validated_dataset_weight_mode(
     if value == "user":
         return "user"
     raise ValueError("Dataset weight mode must be implicit or user.")
+
+
+@dataclass(frozen=True, slots=True)
+class FitLocalScalarProvenance:
+    """Immutable admission/start provenance for a Fit-local scalar.
+
+    The scalar is born inside one Fit capture, not in project Parameters.
+    Keeping that fact on the typed parameter row prevents later reporting or
+    Apply code from fabricating a project-captured default for it.
+    """
+
+    origin_tab_id: str
+    origin_capture_id: str
+    observable_name: str
+    dataset_id: str
+    raw_observation_id: str
+    admission_scope: Literal["shared", "per_dataset"]
+    admitted_value: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "Fit-local origin tab ID"))
+        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "Fit-local origin capture ID"))
+        object.__setattr__(self, "observable_name", _required(self.observable_name, "Fit-local observable name"))
+        object.__setattr__(self, "dataset_id", _required(self.dataset_id, "Fit-local dataset ID"))
+        object.__setattr__(self, "raw_observation_id", _required(self.raw_observation_id, "Fit-local raw observation ID"))
+        scope = str(self.admission_scope or "").strip().lower()
+        if scope not in {"shared", "per_dataset"}:
+            raise ValueError("Fit-local scalar admission scope must be Shared or Per-dataset.")
+        object.__setattr__(self, "admission_scope", scope)
+        object.__setattr__(self, "admitted_value", _finite(self.admitted_value, "Fit-local admitted value"))
+
+
+@dataclass(frozen=True, slots=True)
+class FitPublicationClassification:
+    """Owner-provided publication route for one terminal Fit scalar."""
+
+    parameter_name: str
+    scope: Literal["shared", "per_dataset", "hierarchical"]
+    route: FitPublicationRoute
+    eligible: bool
+    requires_shared_refit: bool
+    fit_local: bool
+    provenance: FitLocalScalarProvenance | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameter_name", _required(self.parameter_name, "publication parameter name"))
+        scope = str(self.scope or "").strip().lower()
+        if scope not in {"shared", "per_dataset", "hierarchical"}:
+            raise ValueError("Publication classification scope is invalid.")
+        object.__setattr__(self, "scope", scope)
+        route = str(self.route or "").strip().lower()
+        if route not in {"parameters", "observable_definitions", "fit_local_only"}:
+            raise ValueError("Publication classification route is invalid.")
+        object.__setattr__(self, "route", route)
+        object.__setattr__(self, "eligible", bool(self.eligible))
+        object.__setattr__(self, "requires_shared_refit", bool(self.requires_shared_refit))
+        object.__setattr__(self, "fit_local", bool(self.fit_local))
+        if self.fit_local and self.provenance is None:
+            raise ValueError("Fit-local publication classification requires provenance.")
+        if not self.fit_local and self.provenance is not None:
+            raise ValueError("Canonical publication classification cannot carry Fit-local provenance.")
+        if self.route == "parameters" and (not self.eligible or self.fit_local):
+            raise ValueError("Parameters publication route must be eligible and canonical.")
+        if self.route == "observable_definitions" and (not self.eligible or not self.fit_local):
+            raise ValueError("Observable Definitions route must be eligible and Fit-local.")
+        if self.route == "fit_local_only" and self.eligible:
+            raise ValueError("Fit-local-only route cannot be publication-eligible.")
+
+
+def build_fit_publication_classifications(
+    parameters: Iterable[FitParameterVariable],
+    local_observables: Iterable[FitLocalObservable],
+) -> tuple[FitPublicationClassification, ...]:
+    """Create the sole typed publication truth from the admitted Fit setup."""
+
+    rows = tuple(parameters)
+    if any(not isinstance(item, FitParameterVariable) for item in rows):
+        raise TypeError("Publication classification requires Fit parameter rows.")
+    local_names = {
+        scalar_name
+        for observable in tuple(local_observables)
+        for scalar_name in observable.scalar_names
+    }
+    classifications: list[FitPublicationClassification] = []
+    for parameter in rows:
+        is_local = parameter.name in local_names
+        if not is_local and parameter.fit_local_provenance is not None:
+            raise ValueError(
+                f"Canonical Fit parameter {parameter.name!r} cannot carry "
+                "Fit-local provenance."
+            )
+        if is_local:
+            if parameter.scope == "shared":
+                route: FitPublicationRoute = "observable_definitions"
+                eligible = True
+                requires_refit = False
+            else:
+                route = "fit_local_only"
+                eligible = False
+                requires_refit = parameter.scope == "per_dataset"
+        elif parameter.scope == "shared":
+            route = "parameters"
+            eligible = True
+            requires_refit = False
+        else:
+            route = "fit_local_only"
+            eligible = False
+            requires_refit = parameter.scope in {"per_dataset", "hierarchical"}
+        classifications.append(
+            FitPublicationClassification(
+                parameter_name=parameter.name,
+                scope=parameter.scope,
+                route=route,
+                eligible=eligible,
+                requires_shared_refit=requires_refit,
+                fit_local=is_local,
+                provenance=parameter.fit_local_provenance if is_local else None,
+            )
+        )
+    return tuple(classifications)
+
+
+@dataclass(frozen=True, slots=True)
+class FitSharedRefitIntent:
+    """Results-owned request for one new Shared refit.
+
+    Results supplies only a typed selection and the identity of the terminal
+    source it displayed.  The owner still validates currentness, source
+    custody, promotion bounds, and dispatch admission before accepting it.
+    """
+
+    origin_tab_id: str
+    origin_capture_id: str
+    source_run_hash: str
+    promotions: tuple[SharedRefitPromotion, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "Shared-refit origin tab ID"))
+        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "Shared-refit origin capture ID"))
+        object.__setattr__(self, "source_run_hash", _required(self.source_run_hash, "Shared-refit source run hash"))
+        promotions = tuple(self.promotions)
+        if not promotions or any(not isinstance(item, SharedRefitPromotion) for item in promotions):
+            raise ValueError("Shared-refit intent requires typed promotions.")
+        names = tuple(item.parameter_name for item in promotions)
+        if len(names) != len(set(names)):
+            raise ValueError("Shared-refit intent repeats a parameter.")
+        object.__setattr__(self, "promotions", promotions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,10 +411,8 @@ class FitParameterConfiguration:
 
     def __post_init__(self) -> None:
         value = _finite(self.value, "parameter value")
-        minimum = float(self.minimum)
-        maximum = float(self.maximum)
-        if math.isnan(minimum) or math.isnan(maximum):
-            raise ValueError("Parameter bounds must not be NaN.")
+        minimum = _finite(self.minimum, "parameter minimum")
+        maximum = _finite(self.maximum, "parameter maximum")
         if minimum >= maximum or not minimum <= value <= maximum:
             raise ValueError("Parameter requires minimum <= value <= maximum.")
         if self.log10 and (minimum <= 0.0 or value <= 0.0):
@@ -283,6 +446,7 @@ class FitParameterVariable:
     family: str = ""
     role: str = ""
     unit: str = "1"
+    fit_local_provenance: FitLocalScalarProvenance | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _required(self.name, "parameter name"))
@@ -292,12 +456,19 @@ class FitParameterVariable:
             _required(self.display_name, "parameter display name"),
         )
         scope = str(self.scope or "").strip().lower()
-        if scope not in {"shared", "per_dataset"}:
-            raise ValueError("Scalar Fit scope must be Shared or Per-dataset.")
+        if scope not in {"shared", "per_dataset", "hierarchical"}:
+            raise ValueError(
+                "Scalar Fit scope must be Shared, Per-dataset, or Hierarchical."
+            )
         if not isinstance(self.shared_config, FitParameterConfiguration):
             raise TypeError("Shared scalar configuration must be typed.")
         if not isinstance(self.per_dataset_config, FitParameterConfiguration):
             raise TypeError("Per-dataset scalar configuration must be typed.")
+        if self.fit_local_provenance is not None and not isinstance(
+            self.fit_local_provenance,
+            FitLocalScalarProvenance,
+        ):
+            raise TypeError("Fit-local scalar provenance must be typed.")
         object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "family", str(self.family or "").strip())
         object.__setattr__(self, "role", str(self.role or "").strip())
@@ -346,8 +517,10 @@ def _replace_fit_parameter(
     if unknown:
         raise TypeError("Unsupported Fit parameter replacement fields: " + ", ".join(sorted(unknown)))
     target_scope = str(changes.get("scope", parameter.scope)).strip().lower()
-    if target_scope not in {"shared", "per_dataset"}:
-        raise ValueError("Scalar Fit scope must be Shared or Per-dataset.")
+    if target_scope not in {"shared", "per_dataset", "hierarchical"}:
+        raise ValueError(
+            "Scalar Fit scope must be Shared, Per-dataset, or Hierarchical."
+        )
     selected = (
         parameter.shared_config
         if target_scope == "shared"
@@ -373,7 +546,9 @@ def _replace_fit_parameter(
         "shared_config": parameter.shared_config,
         "per_dataset_config": parameter.per_dataset_config,
     }
-    configs["shared_config" if target_scope == "shared" else "per_dataset_config"] = active
+    configs[
+        "shared_config" if target_scope == "shared" else "per_dataset_config"
+    ] = active
     presentation = {
         key: value
         for key, value in changes.items()
@@ -418,26 +593,136 @@ class FitInitialVariable:
     set_id: str
     species: str
     initial: float
-    minimum: float
-    maximum: float
-    fit: bool = False
+    tolerance: FitInitialTolerance = FitInitialTolerance()
     log10: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "set_id", _required(self.set_id, "set ID"))
         object.__setattr__(self, "species", _required(self.species, "species"))
         initial = _finite(self.initial, f"{self.species} initial")
-        minimum = _finite(self.minimum, f"{self.species} minimum")
-        maximum = _finite(self.maximum, f"{self.species} maximum")
-        if minimum >= maximum or not minimum <= initial <= maximum:
-            raise ValueError(f"{self.species} requires minimum <= initial <= maximum.")
+        if initial < 0.0:
+            raise ValueError("Initial concentration must be nonnegative.")
+        if not isinstance(self.tolerance, FitInitialTolerance):
+            raise TypeError("Initial tolerance must be FitInitialTolerance.")
+        minimum, _maximum = self.tolerance.bounds_for(initial)
+        if self.log10 and not self.tolerance.enabled:
+            raise ValueError("Log10 IC fitting requires an enabled tolerance.")
         if self.log10 and (minimum <= 0.0 or initial <= 0.0):
             raise ValueError(f"{self.species} log10 fitting requires positive values.")
         object.__setattr__(self, "initial", initial)
-        object.__setattr__(self, "minimum", minimum)
-        object.__setattr__(self, "maximum", maximum)
-        if minimum < 0.0:
-            raise ValueError("Initial concentration minimum must be nonnegative.")
+        object.__setattr__(self, "log10", bool(self.log10))
+
+    @property
+    def fit(self) -> bool:
+        return self.tolerance.enabled
+
+    @property
+    def minimum(self) -> float:
+        return self.tolerance.bounds_for(self.initial)[0]
+
+    @property
+    def maximum(self) -> float:
+        return self.tolerance.bounds_for(self.initial)[1]
+
+
+@dataclass(frozen=True, slots=True)
+class FitInitialApplyCellProposal:
+    """One independently selectable canonical IC mutation."""
+
+    set_id: str
+    species: str
+    dataset_ids: tuple[str, ...]
+    captured_value: float
+    nominal_value: float
+    fitted_value: float
+    minimum: float
+    maximum: float
+    log10: bool
+    unit: str = "model concentration"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "set_id", _required(self.set_id, "set ID"))
+        object.__setattr__(self, "species", _required(self.species, "species"))
+        dataset_ids = tuple(_required(item, "dataset ID") for item in self.dataset_ids)
+        if len(dataset_ids) != len(set(dataset_ids)):
+            raise ValueError("IC Apply proposal repeats a dataset ID.")
+        object.__setattr__(self, "dataset_ids", dataset_ids)
+        for field in (
+            "captured_value",
+            "nominal_value",
+            "fitted_value",
+            "minimum",
+            "maximum",
+        ):
+            object.__setattr__(self, field, _finite(getattr(self, field), field))
+        if (
+            self.captured_value < 0.0
+            or self.nominal_value < 0.0
+            or self.fitted_value < 0.0
+            or self.minimum < 0.0
+            or self.minimum >= self.maximum
+            or not self.minimum <= self.nominal_value <= self.maximum
+        ):
+            raise ValueError("IC Apply proposal values or bounds are invalid.")
+        object.__setattr__(self, "log10", bool(self.log10))
+        object.__setattr__(self, "unit", _required(self.unit, "IC unit"))
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.set_id, self.species
+
+
+@dataclass(frozen=True, slots=True)
+class FitInitialApplyProposal:
+    origin_tab_id: str
+    origin_capture_id: str
+    cells: tuple[FitInitialApplyCellProposal, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "origin tab ID"))
+        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "origin capture ID"))
+        cells = tuple(self.cells)
+        if any(not isinstance(item, FitInitialApplyCellProposal) for item in cells):
+            raise TypeError("IC Apply proposal cells must be typed.")
+        if len({item.key for item in cells}) != len(cells):
+            raise ValueError("IC Apply proposal repeats a set/species identity.")
+        object.__setattr__(self, "cells", cells)
+
+    @property
+    def selected_keys(self) -> tuple[tuple[str, str], ...]:
+        """Initial UI selection: every valid fitted cell."""
+
+        return tuple(item.key for item in self.cells)
+
+
+@dataclass(frozen=True, slots=True)
+class FitApplySelection:
+    """One atomic Apply request including independently selected IC cells."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    scopes: tuple[str, ...]
+    initial_keys: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "origin tab ID"))
+        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "origin capture ID"))
+        scopes = tuple(str(item or "").strip() for item in self.scopes)
+        allowed = {"parameters", "initial_concentrations", "observable_definitions"}
+        if not scopes or len(scopes) != len(set(scopes)) or not set(scopes) <= allowed:
+            raise ValueError("Apply selection contains invalid or repeated scopes.")
+        keys = tuple(
+            (_required(set_id, "set ID"), _required(species, "species"))
+            for set_id, species in self.initial_keys
+        )
+        if len(keys) != len(set(keys)):
+            raise ValueError("Apply selection repeats an IC cell.")
+        if "initial_concentrations" in scopes and not keys:
+            raise ValueError("Initial Conditions Apply requires selected cells.")
+        if "initial_concentrations" not in scopes and keys:
+            raise ValueError("IC cells require the Initial Conditions Apply scope.")
+        object.__setattr__(self, "scopes", scopes)
+        object.__setattr__(self, "initial_keys", keys)
 
 
 @dataclass(frozen=True, slots=True)
@@ -679,6 +964,97 @@ class FitOriginSnapshot:
         object.__setattr__(self, "capture_id", capture_id)
 
 
+def _validate_advanced_analysis_setup(
+    *,
+    datasets: tuple[FitDatasetLocalSettings, ...],
+    parameters: tuple[FitParameterVariable, ...],
+    profile_likelihood: ProfileLikelihoodConfig | None,
+    residual_bootstrap: ResidualBootstrapConfig | None,
+    hierarchical: Iterable[HierarchicalFitConfig],
+    shared_refit_promotions: Iterable[SharedRefitPromotion],
+) -> None:
+    if profile_likelihood is not None and not isinstance(
+        profile_likelihood,
+        ProfileLikelihoodConfig,
+    ):
+        raise TypeError("Profile likelihood configuration must be typed.")
+    if residual_bootstrap is not None and not isinstance(
+        residual_bootstrap,
+        ResidualBootstrapConfig,
+    ):
+        raise TypeError("Residual bootstrap configuration must be typed.")
+    hierarchy = tuple(hierarchical)
+    promotions = tuple(shared_refit_promotions)
+    if any(not isinstance(item, HierarchicalFitConfig) for item in hierarchy):
+        raise TypeError("Hierarchical Fit configuration must be typed.")
+    if any(not isinstance(item, SharedRefitPromotion) for item in promotions):
+        raise TypeError("Shared-refit promotions must be typed.")
+    if promotions and (
+        profile_likelihood is not None
+        or residual_bootstrap is not None
+        or hierarchy
+    ):
+        raise ValueError(
+            "Shared refit must complete before uncertainty or Hierarchical setup."
+        )
+    by_name = {item.name: item for item in parameters}
+    fitted_names = set(fit_uncertainty_coordinate_names(parameters, datasets))
+    for config in (profile_likelihood, residual_bootstrap):
+        if config is not None and not set(config.parameter_names) <= fitted_names:
+            raise ValueError(
+                "Uncertainty configuration references an unavailable fitted parameter."
+            )
+    hierarchical_names = [item.parameter_name for item in hierarchy]
+    if len(hierarchical_names) != len(set(hierarchical_names)):
+        raise ValueError("Hierarchical configuration repeats a parameter.")
+    declared_hierarchical = {
+        item.name for item in parameters if item.scope == "hierarchical"
+    }
+    if set(hierarchical_names) != declared_hierarchical:
+        raise ValueError(
+            "Hierarchical configuration must exactly match declared parameters."
+        )
+    if any(not by_name[name].selected_config.fit for name in declared_hierarchical):
+        raise ValueError("Hierarchical parameters must be selected for fitting.")
+    promotion_names = [item.parameter_name for item in promotions]
+    if len(promotion_names) != len(set(promotion_names)):
+        raise ValueError("Shared-refit setup repeats a promotion.")
+    if any(
+        name not in by_name
+        or by_name[name].scope != "per_dataset"
+        or not by_name[name].selected_config.fit
+        for name in promotion_names
+    ):
+        raise ValueError(
+            "Shared-refit promotions require fitted Per-dataset parameters."
+        )
+
+
+def fit_uncertainty_coordinate_names(
+    parameters: Iterable[FitParameterVariable],
+    datasets: Iterable[FitDatasetLocalSettings],
+) -> tuple[str, ...]:
+    """Return exact optimizer keys selectable by uncertainty methods."""
+
+    included_ids = tuple(
+        sorted(item.dataset_id for item in datasets if item.included)
+    )
+    names: list[str] = []
+    for parameter in parameters:
+        if not parameter.selected_config.fit:
+            continue
+        if parameter.scope == "shared":
+            names.append(parameter.name)
+        else:
+            values = dict(parameter.selected_config.dataset_values)
+            names.extend(
+                f"{dataset_id}::{parameter.name}"
+                for dataset_id in included_ids
+                if dataset_id in values
+            )
+    return tuple(names)
+
+
 @dataclass(frozen=True, slots=True)
 class FitExecutionRequest:
     origin: FitOriginSnapshot
@@ -693,6 +1069,10 @@ class FitExecutionRequest:
     initial_scopes: tuple[tuple[str, str], ...]
     defaults: FitDefaults
     dataset_weight_mode: FitDatasetWeightMode
+    profile_likelihood: ProfileLikelihoodConfig | None = None
+    residual_bootstrap: ResidualBootstrapConfig | None = None
+    hierarchical: tuple[HierarchicalFitConfig, ...] = ()
+    shared_refit_promotions: tuple[SharedRefitPromotion, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.origin, FitOriginSnapshot):
@@ -805,6 +1185,32 @@ class FitExecutionRequest:
         object.__setattr__(self, "initials", initials)
         object.__setattr__(self, "global_initials", global_initials)
         object.__setattr__(self, "initial_scopes", initial_scopes)
+        local_scalar_names = {
+            scalar_name
+            for observable in local_observables
+            for scalar_name in observable.scalar_names
+        }
+        if any(
+            item.name in local_scalar_names and item.scope == "hierarchical"
+            for item in parameters
+        ):
+            raise ValueError(
+                "Fit-local observable scalars are not eligible for Hierarchical scope."
+            )
+        _validate_advanced_analysis_setup(
+            datasets=datasets,
+            parameters=parameters,
+            profile_likelihood=self.profile_likelihood,
+            residual_bootstrap=self.residual_bootstrap,
+            hierarchical=self.hierarchical,
+            shared_refit_promotions=self.shared_refit_promotions,
+        )
+        object.__setattr__(self, "hierarchical", tuple(self.hierarchical))
+        object.__setattr__(
+            self,
+            "shared_refit_promotions",
+            tuple(self.shared_refit_promotions),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -824,6 +1230,11 @@ class FitSetupSnapshot:
     defaults: FitDefaults
     local_observables: tuple[FitLocalObservable, ...]
     dataset_weight_mode: FitDatasetWeightMode
+    profile_likelihood: ProfileLikelihoodConfig | None = None
+    residual_bootstrap: ResidualBootstrapConfig | None = None
+    hierarchical: tuple[HierarchicalFitConfig, ...] = ()
+    shared_refit_promotions: tuple[SharedRefitPromotion, ...] = ()
+    publication_classifications: tuple[FitPublicationClassification, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -941,7 +1352,7 @@ class FitSetupSnapshot:
         incomplete_parameter_maps = sorted(
             item.name
             for item in parameters
-            if item.scope == "per_dataset"
+            if item.scope in {"per_dataset", "hierarchical"}
             and {
                 dataset_id
                 for dataset_id, _value in item.selected_config.dataset_values
@@ -961,6 +1372,37 @@ class FitSetupSnapshot:
         object.__setattr__(self, "global_initials", global_initials)
         object.__setattr__(self, "initial_scopes", initial_scopes)
         object.__setattr__(self, "local_observables", local_observables)
+        local_scalar_names = {
+            scalar_name
+            for observable in local_observables
+            for scalar_name in observable.scalar_names
+        }
+        if any(
+            item.name in local_scalar_names and item.scope == "hierarchical"
+            for item in parameters
+        ):
+            raise ValueError(
+                "Fit-local observable scalars are not eligible for Hierarchical scope."
+            )
+        classifications = build_fit_publication_classifications(
+            parameters,
+            local_observables,
+        )
+        object.__setattr__(self, "publication_classifications", classifications)
+        _validate_advanced_analysis_setup(
+            datasets=datasets,
+            parameters=parameters,
+            profile_likelihood=self.profile_likelihood,
+            residual_bootstrap=self.residual_bootstrap,
+            hierarchical=self.hierarchical,
+            shared_refit_promotions=self.shared_refit_promotions,
+        )
+        object.__setattr__(self, "hierarchical", tuple(self.hierarchical))
+        object.__setattr__(
+            self,
+            "shared_refit_promotions",
+            tuple(self.shared_refit_promotions),
+        )
 
     @classmethod
     def from_request(
@@ -983,6 +1425,10 @@ class FitSetupSnapshot:
             defaults=request.defaults,
             local_observables=request.local_observables,
             dataset_weight_mode=request.dataset_weight_mode,
+            profile_likelihood=request.profile_likelihood,
+            residual_bootstrap=request.residual_bootstrap,
+            hierarchical=request.hierarchical,
+            shared_refit_promotions=request.shared_refit_promotions,
         )
 
 
@@ -1061,19 +1507,68 @@ class FitParameterSetupEdit:
 
 @dataclass(frozen=True, slots=True)
 class FitParameterScopeSetupEdit:
-    """Selection-only owner intent for a scalar scope transition."""
+    """Atomic owner intent for a scalar scope change or Hierarchical edit."""
 
     origin_tab_id: str
     origin_capture_id: str
     parameter_name: str
-    scope: Literal["shared", "per_dataset"]
+    scope: Literal["shared", "per_dataset", "hierarchical"]
+    hierarchical_config: HierarchicalFitConfig | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "origin tab ID"))
         object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "origin capture ID"))
         object.__setattr__(self, "parameter_name", _required(self.parameter_name, "parameter name"))
-        if self.scope not in {"shared", "per_dataset"}:
-            raise ValueError("Scalar scope transition must target Shared or Per-dataset.")
+        if self.scope not in {"shared", "per_dataset", "hierarchical"}:
+            raise ValueError(
+                "Scalar scope transition must target Shared, Per-dataset, or "
+                "Hierarchical."
+            )
+        if self.scope == "hierarchical":
+            if not isinstance(self.hierarchical_config, HierarchicalFitConfig):
+                raise ValueError(
+                    "Hierarchical scope requires an explicit typed configuration."
+                )
+            if self.hierarchical_config.parameter_name != self.parameter_name:
+                raise ValueError(
+                    "Hierarchical scope configuration changed parameter identity."
+                )
+        elif self.hierarchical_config is not None:
+            raise ValueError(
+                "Non-Hierarchical scope cannot carry Hierarchical configuration."
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class FitAdvancedAnalysisSetupEdit:
+    """Atomic owner intent for uncertainty, hierarchy, and Shared refit."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    profile_likelihood: ProfileLikelihoodConfig | None
+    residual_bootstrap: ResidualBootstrapConfig | None
+    hierarchical: tuple[HierarchicalFitConfig, ...]
+    shared_refit_promotions: tuple[SharedRefitPromotion, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "origin tab ID"))
+        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "origin capture ID"))
+        if self.profile_likelihood is not None and not isinstance(
+            self.profile_likelihood, ProfileLikelihoodConfig
+        ):
+            raise TypeError("Profile likelihood configuration must be typed.")
+        if self.residual_bootstrap is not None and not isinstance(
+            self.residual_bootstrap, ResidualBootstrapConfig
+        ):
+            raise TypeError("Residual bootstrap configuration must be typed.")
+        hierarchy = tuple(self.hierarchical)
+        promotions = tuple(self.shared_refit_promotions)
+        if any(not isinstance(item, HierarchicalFitConfig) for item in hierarchy):
+            raise TypeError("Hierarchical configuration must be typed.")
+        if any(not isinstance(item, SharedRefitPromotion) for item in promotions):
+            raise TypeError("Shared-refit promotions must be typed.")
+        object.__setattr__(self, "hierarchical", hierarchy)
+        object.__setattr__(self, "shared_refit_promotions", promotions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1166,39 +1661,24 @@ def _parameter_bounds(value: float) -> tuple[float, float]:
     return value - span, value + span
 
 
-def _initial_bounds(value: float) -> tuple[float, float]:
-    if value > 0.0:
-        return 0.0, max(value * 10.0, value + 1.0)
-    return 0.0, 1.0
-
-
 def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, ...]:
     if not tab.mechanism_source.reactions_text.strip():
         return ()
     variables: list[FitParameterVariable] = []
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
         raise ValueError("Fit requires an accepted prepared mechanism.")
-    try:
-        coordinates = enumerate_parameter_coordinates(
-            tab.prepared_dsl,
-            wegscheider_cyclicity_enabled=bool(
-                tab.scientific_settings.wegscheider_policy
-            ),
-        )
-    except UnresolvedWegscheiderCyclicityError:
-        # Fit's worker owns the guided correction handshake.  Keep the
-        # accepted source and captured policy unchanged, but allow only this
-        # typed unresolved-cycle admission to reach that existing path.
-        coordinates = enumerate_parameter_coordinates(
-            tab.prepared_dsl,
-            wegscheider_cyclicity_enabled=False,
-        )
+    coordinates = enumerate_parameter_coordinates(
+        tab.prepared_dsl,
+        wegscheider_cyclicity_enabled=bool(
+            tab.scientific_settings.wegscheider_policy
+        ),
+    )
     for coordinate in coordinates:
         name = _required(coordinate.name, "parameter name")
         value = _finite(coordinate.value, f"parameter {name}")
         low = float(coordinate.minimum)
         high = float(coordinate.maximum)
-        if math.isnan(low) or math.isnan(high) or low >= high:
+        if not math.isfinite(low) or not math.isfinite(high) or low >= high:
             low, high = _parameter_bounds(value)
         variables.append(
             FitParameterVariable(
@@ -1289,9 +1769,7 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
             set_id=set_id,
             species=species,
             initial=value,
-            minimum=_initial_bounds(value)[0],
-            maximum=_initial_bounds(value)[1],
-            fit=False,
+            tolerance=FitInitialTolerance(),
             log10=False,
         )
         for (set_id, species), value in values_by_key.items()
@@ -1736,6 +2214,10 @@ def build_fit_execution_request(
     initial_scopes: Iterable[tuple[str, str]],
     dataset_weight_mode: FitDatasetWeightMode,
     defaults: FitDefaults | None = None,
+    profile_likelihood: ProfileLikelihoodConfig | None = None,
+    residual_bootstrap: ResidualBootstrapConfig | None = None,
+    hierarchical: Iterable[HierarchicalFitConfig] = (),
+    shared_refit_promotions: Iterable[SharedRefitPromotion] = (),
 ) -> FitExecutionRequest:
     """Validate a complete owner-built Fit request at the execution boundary."""
     request = FitExecutionRequest(
@@ -1751,6 +2233,10 @@ def build_fit_execution_request(
         initial_scopes=tuple(initial_scopes),
         defaults=defaults or origin.fit_defaults,
         dataset_weight_mode=dataset_weight_mode,
+        profile_likelihood=profile_likelihood,
+        residual_bootstrap=residual_bootstrap,
+        hierarchical=tuple(hierarchical),
+        shared_refit_promotions=tuple(shared_refit_promotions),
     )
     mapped_by_id = {item.dataset_id: item for item in origin.mapped_datasets}
     requested_ids = [item.dataset_id for item in request.datasets]
@@ -1785,7 +2271,7 @@ def build_fit_execution_request(
         local_ids = {
         dataset_id for dataset_id, _value in parameter.selected_config.dataset_values
         }
-        if parameter.scope == "per_dataset" and local_ids != retained_dataset_ids:
+        if parameter.scope in {"per_dataset", "hierarchical"} and local_ids != retained_dataset_ids:
             raise ValueError(
                 f"Parameter {parameter.name!r} requires one retained value "
                 "for every captured dataset."
@@ -1833,6 +2319,11 @@ def build_fit_execution_request(
             global_by_species[species]  # accessed to enforce identity above
     for local in request.datasets:
         if local.included:
+            if not local.target_species:
+                raise ValueError(
+                    f"Dataset {mapped_by_id[local.dataset_id].display_name!r} "
+                    "must select at least one target or be excluded."
+                )
             observations = selected_observations(
                 mapped_by_id[local.dataset_id],
                 local,

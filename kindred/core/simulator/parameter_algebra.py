@@ -547,10 +547,14 @@ def apply_parameter_algebra_spec_to_mechanism(
     if enabled:
         from kindred.core.simulator.wegscheider_symbolic import validate_wegscheider_cyclicity_resolved
 
-        validate_wegscheider_cyclicity_resolved(
+        report = validate_wegscheider_cyclicity_resolved(
             mechanism,
             parameter_algebra_spec=spec,
         )
+        if isinstance(meta, dict) and report.cycles:
+            meta["symbolic_wegscheider_identity"] = dict(
+                report.symbolic_identity
+            )
     return derived
 
 

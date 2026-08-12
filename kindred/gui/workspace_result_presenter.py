@@ -37,6 +37,8 @@ from kindred.gui.dataset_payload_snapshot import (
 from kindred.gui.plot_config import AxisSelectionCandidate
 
 __all__ = [
+    "InteractiveDisplayCurve",
+    "InteractiveDisplayProjection",
     "ResultDataBlock",
     "ResultLayerKind",
     "SimulationResultLayerIdentity",
@@ -55,6 +57,152 @@ _MAX_COPY_CHARACTERS = 64 * 1024 * 1024
 _MAX_XLSX_STRING_LENGTH = 32_767
 _EXCEL_MAX_ROWS = 1_048_576
 _EXCEL_MAX_COLUMNS = 16_384
+
+
+@dataclass(frozen=True, slots=True)
+class InteractiveDisplayCurve:
+    """One immutable, transient physical curve; never Copy/export authority."""
+
+    key: tuple[str, ...]
+    label: str
+    x: np.ndarray
+    y: np.ndarray
+    color: str
+    dashed: bool = False
+    markers: bool = False
+    point_size: float = 6.0
+    opacity: float = 1.0
+    # These arrays are display topology, not result authority.  Keeping them
+    # with the transient curve prevents the preview renderer from connecting
+    # points across an intervention/discontinuity while it is cross-fading.
+    segment_ids: np.ndarray | None = None
+    segment_keys: tuple[str, ...] | None = None
+    discontinuity_ids: np.ndarray | None = None
+    intervention_connectors: tuple[tuple[int, float, float, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        key = tuple(_required_id(value, "interactive curve key") for value in self.key)
+        if not key:
+            raise ValueError("interactive curve key must not be empty.")
+        x = _owned_vector(self.x, field="interactive curve X")
+        y = _owned_vector(self.y, field="interactive curve Y")
+        if x.size != y.size:
+            raise ValueError("interactive curve X and Y must have equal length.")
+        point_size = float(self.point_size)
+        opacity = float(self.opacity)
+        if not np.isfinite(point_size) or point_size <= 0.0:
+            raise ValueError("interactive curve point size must be positive.")
+        if not np.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
+            raise ValueError("interactive curve opacity must be between zero and one.")
+        segment_ids = None
+        segment_keys = None
+        discontinuity_ids = None
+        if self.segment_ids is not None:
+            segment_ids = _owned_identity_vector(
+                self.segment_ids,
+                field="interactive curve segment identity",
+                size=x.size,
+            )
+            if self.segment_keys is None or self.discontinuity_ids is None:
+                raise ValueError(
+                    "interactive curve topology requires segment keys and "
+                    "discontinuity identity."
+                )
+            segment_keys = tuple(
+                _required_id(value, "interactive curve segment key")
+                for value in self.segment_keys
+            )
+            if len(segment_keys) != x.size:
+                raise ValueError(
+                    "interactive curve segment keys must align with X values."
+                )
+            discontinuity_ids = _owned_identity_vector(
+                self.discontinuity_ids,
+                field="interactive curve discontinuity identity",
+                size=x.size,
+            )
+        elif self.segment_keys is not None or self.discontinuity_ids is not None:
+            raise ValueError(
+                "interactive curve topology must provide segment IDs, keys, "
+                "and discontinuity IDs together."
+            )
+        connectors = tuple(
+            (
+                int(boundary_index),
+                float(boundary_time),
+                float(pre_value),
+                float(post_value),
+            )
+            for boundary_index, boundary_time, pre_value, post_value in
+            self.intervention_connectors
+        )
+        if any(
+            not np.all(np.isfinite(values[1:]))
+            for values in connectors
+        ):
+            raise ValueError("interactive intervention connectors must be finite.")
+        color = _required_id(self.color, "interactive curve color")
+        object.__setattr__(self, "key", key)
+        object.__setattr__(
+            self, "label", _required_id(self.label, "interactive curve label")
+        )
+        object.__setattr__(self, "x", x)
+        object.__setattr__(self, "y", y)
+        object.__setattr__(self, "color", color)
+        object.__setattr__(self, "dashed", bool(self.dashed))
+        object.__setattr__(self, "markers", bool(self.markers))
+        object.__setattr__(self, "point_size", point_size)
+        object.__setattr__(self, "opacity", opacity)
+        object.__setattr__(self, "segment_ids", segment_ids)
+        object.__setattr__(self, "segment_keys", segment_keys)
+        object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
+        object.__setattr__(self, "intervention_connectors", connectors)
+
+
+@dataclass(frozen=True, slots=True)
+class InteractiveDisplayProjection:
+    """Transient physical roster composed independently of result authority."""
+
+    tab_id: str
+    set_id: str
+    generation: int
+    x_label: str
+    y_label: str
+    curves: tuple[InteractiveDisplayCurve, ...]
+    target_set_ids: tuple[str, ...] = ()
+    batch_id: str = ""
+
+    def __post_init__(self) -> None:
+        generation = int(self.generation)
+        if generation < 0:
+            raise ValueError("interactive display generation must be nonnegative.")
+        curves = tuple(self.curves)
+        if any(not isinstance(curve, InteractiveDisplayCurve) for curve in curves):
+            raise TypeError("curves must contain InteractiveDisplayCurve values.")
+        keys = tuple(curve.key for curve in curves)
+        if len(keys) != len(set(keys)):
+            raise ValueError("interactive display curve keys must be unique.")
+        set_id = _required_id(self.set_id, "set_id")
+        target_set_ids = tuple(
+            _required_id(value, "target_set_id") for value in self.target_set_ids
+        )
+        if not target_set_ids:
+            target_set_ids = (set_id,)
+        if len(set(target_set_ids)) != len(target_set_ids):
+            raise ValueError("interactive display target roster must be unique.")
+        if set_id not in target_set_ids:
+            raise ValueError("set_id must belong to the interactive target roster.")
+        batch_id = str(self.batch_id or "").strip()
+        if not batch_id:
+            batch_id = f"{self.tab_id}:{generation}:{','.join(target_set_ids)}"
+        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
+        object.__setattr__(self, "set_id", set_id)
+        object.__setattr__(self, "generation", generation)
+        object.__setattr__(self, "x_label", _required_id(self.x_label, "x_label"))
+        object.__setattr__(self, "y_label", _required_id(self.y_label, "y_label"))
+        object.__setattr__(self, "curves", curves)
+        object.__setattr__(self, "target_set_ids", target_set_ids)
+        object.__setattr__(self, "batch_id", _required_id(batch_id, "batch_id"))
 
 
 class _XlsxDestination:
@@ -1551,8 +1699,287 @@ def _annotations_from_execution(
     )
 
 
+def _frame_topology(
+    frame: object,
+    *,
+    size: int,
+) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
+    """Read executor-issued topology carried by the transient frame.
+
+    The protocol owner is required to populate all three fields for an admitted
+    preview result.  Silently treating a missing topology as one continuous
+    curve would reintroduce the old boundary-loss failure.
+    """
+
+    segment_ids = getattr(frame, "segment_ids", None)
+    segment_keys = getattr(frame, "segment_keys", None)
+    discontinuity_ids = getattr(frame, "discontinuity_ids", None)
+    if segment_ids is None:
+        raise ValueError(
+            "Interactive Preview frame is missing executor-issued topology."
+        )
+    if segment_keys is None or discontinuity_ids is None:
+        raise ValueError(
+            "Interactive Preview topology must include segment IDs, keys, "
+            "and discontinuity IDs."
+        )
+    segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
+    discontinuities = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1)
+    keys = tuple(_required_id(value, "interactive frame segment key") for value in segment_keys)
+    if segments.size != size or discontinuities.size != size or len(keys) != size:
+        raise ValueError("Interactive Preview topology must align with frame values.")
+    return segments, keys, discontinuities
+
+
+def _frame_batch_id(frame: object) -> str:
+    batch_id = str(getattr(frame, "batch_id", "") or "").strip()
+    if not batch_id:
+        raise ValueError("Interactive Preview frame requires an explicit batch_id.")
+    return _required_id(batch_id, "interactive frame batch_id")
+
+
+def _frame_connectors(
+    frame: object,
+    *,
+    selected_x: AxisSeriesSelection,
+    series_names: set[str],
+) -> tuple[tuple[int, float, float, float, str], ...]:
+    """Project optional worker-issued intervention endpoint facts."""
+
+    if not (
+        isinstance(selected_x, SimulationSeriesAxisSelection)
+        and selected_x.series_name == "t"
+    ):
+        return ()
+    if not hasattr(frame, "presentation_boundaries"):
+        raise ValueError(
+            "Interactive Preview frame is missing presentation boundaries."
+        )
+    boundaries = getattr(frame, "presentation_boundaries")
+    entries: list[tuple[int, float, float, float, str]] = []
+    for boundary_index, boundary in enumerate(tuple(boundaries or ())):
+        pre_by_name = dict(getattr(boundary, "pre_state", ()))
+        post_by_name = dict(getattr(boundary, "post_state", ()))
+        for name, pre_value in pre_by_name.items():
+            if name not in series_names:
+                continue
+            post_value = float(post_by_name[name])
+            pre_value = float(pre_value)
+            if pre_value == post_value:
+                continue
+            entries.append(
+                (
+                    boundary_index,
+                    float(boundary.time),
+                    pre_value,
+                    post_value,
+                    str(name),
+                )
+            )
+    return tuple(entries)
+
+
 class WorkspaceResultPresenter:
     """Pure composition plus the two Copy payloads and generated XLSX."""
+
+    @staticmethod
+    def compose_interactive_display(
+        frame: object,
+        *,
+        projection: WorkspaceResultProjection,
+    ) -> InteractiveDisplayProjection:
+        """Replace one foreground visually while retaining completed authority.
+
+        ``InteractivePreviewFrame`` stays owned by the execution protocol.  This
+        method consumes it only to form a physical roster; the returned value has
+        no repository entry, statistics, Copy blocks, or export route.
+        """
+
+        from kindred.gui.interactive_preview import InteractivePreviewFrame
+
+        if not isinstance(frame, InteractivePreviewFrame):
+            raise TypeError("frame must be an InteractivePreviewFrame.")
+        if not isinstance(projection, WorkspaceResultProjection):
+            raise TypeError("projection must be a WorkspaceResultProjection.")
+        if frame.tab_id != projection.tab_id:
+            raise ValueError("interactive frame belongs to a different tab.")
+
+        frame_series = {series.series_id: series for series in frame.series}
+        selected_x = projection.selected_x_series
+        if isinstance(selected_x, ExperimentalAxisSelection):
+            # A transient simulation has no raw-observation row identity.  Keep
+            # the completed experimental-X scene visible and publish no overlay.
+            return InteractiveDisplayProjection(
+                tab_id=frame.tab_id,
+                set_id=frame.set_id,
+                generation=frame.generation,
+                x_label=projection.x_label,
+                y_label=projection.y_label,
+                curves=(),
+                target_set_ids=frame.target_set_ids,
+                batch_id=_frame_batch_id(frame),
+            )
+        if selected_x.series_name == "t":
+            x_values = np.asarray(frame.x_values, dtype=float)
+        else:
+            try:
+                x_values = np.asarray(
+                    frame_series[selected_x.series_name].values,
+                    dtype=float,
+                )
+            except KeyError:
+                return InteractiveDisplayProjection(
+                    tab_id=frame.tab_id,
+                    set_id=frame.set_id,
+                    generation=frame.generation,
+                    x_label=projection.x_label,
+                    y_label=projection.y_label,
+                    curves=(),
+                    target_set_ids=frame.target_set_ids,
+                    batch_id=_frame_batch_id(frame),
+                )
+
+        if projection.selected_y_uses_default_all:
+            wanted_y = tuple(
+                name for name in frame_series if name != selected_x.series_name
+            )
+        else:
+            wanted_y = tuple(
+                selection.series_name
+                for selection in projection.selected_y_series
+                if isinstance(selection, SimulationSeriesAxisSelection)
+                and selection.series_name != selected_x.series_name
+            )
+
+        base_layer = next(
+            (
+                layer
+                for layer in projection.plot_layers
+                if isinstance(layer.layer_id, SimulationResultLayerIdentity)
+                and layer.layer_id.set_id == frame.set_id
+                and layer.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
+            ),
+            None,
+        )
+        if base_layer is None or not base_layer.visible:
+            return InteractiveDisplayProjection(
+                tab_id=frame.tab_id,
+                set_id=frame.set_id,
+                generation=frame.generation,
+                x_label=projection.x_label,
+                y_label=projection.y_label,
+                curves=(),
+                target_set_ids=frame.target_set_ids,
+                batch_id=_frame_batch_id(frame),
+            )
+        base_colors = dict(base_layer.color_by_series) if base_layer is not None else {}
+        base_label = base_layer.label if base_layer is not None else frame.set_id
+        plotted_series = {name for name, _values in base_layer.series}
+        topology = _frame_topology(frame, size=x_values.size)
+        connectors = _frame_connectors(
+            frame,
+            selected_x=selected_x,
+            series_names=set(frame_series),
+        )
+        curves: list[InteractiveDisplayCurve] = []
+        for series_id in wanted_y:
+            if series_id not in plotted_series:
+                continue
+            series = frame_series.get(series_id)
+            if series is None:
+                continue
+            curves.append(
+                InteractiveDisplayCurve(
+                    key=(
+                        "simulation",
+                        "foreground",
+                        frame.set_id,
+                        series_id,
+                    ),
+                    label=f"{base_label}: {series.label}",
+                    x=x_values,
+                    y=np.asarray(series.values, dtype=float),
+                    color=(
+                        series.color
+                        or base_colors.get(series_id)
+                        or "#3b82f6"
+                    ),
+                    segment_ids=topology[0],
+                    segment_keys=topology[1],
+                    discontinuity_ids=topology[2],
+                    intervention_connectors=tuple(
+                        (item[0], item[1], item[2], item[3])
+                        for item in connectors
+                        if item[4] == series_id
+                    ),
+                )
+            )
+        return InteractiveDisplayProjection(
+            tab_id=frame.tab_id,
+            set_id=frame.set_id,
+            generation=frame.generation,
+            x_label=projection.x_label,
+            y_label=projection.y_label,
+            curves=tuple(curves),
+            target_set_ids=frame.target_set_ids,
+            batch_id=_frame_batch_id(frame),
+        )
+
+    @staticmethod
+    def compose_interactive_display_batch(
+        frames: Sequence[object],
+        *,
+        projection: WorkspaceResultProjection,
+    ) -> InteractiveDisplayProjection:
+        """Compose the latest transient frame for each target into one roster.
+
+        The returned projection remains physical-only.  Completed curves come
+        from the supplied workspace projection; only foreground curves for a
+        target with a successful transient frame are replaced.  This lets a
+        later frame update one target without restoring an earlier target's
+        completed baseline.
+        """
+
+        captured = tuple(frames)
+        if not captured:
+            raise ValueError("interactive display batch requires at least one frame.")
+        composed = tuple(
+            WorkspaceResultPresenter.compose_interactive_display(
+                frame,
+                projection=projection,
+            )
+            for frame in captured
+        )
+        roster = composed[0].target_set_ids
+        generation = composed[0].generation
+        batch_id = composed[0].batch_id
+        if any(
+            item.target_set_ids != roster
+            or item.generation != generation
+            or item.batch_id != batch_id
+            for item in composed[1:]
+        ):
+            raise ValueError(
+                "interactive display batch frames must share generation and roster."
+            )
+        # This projection is an overlay only.  The completed renderer keeps all
+        # unchanged explicit/reference/experimental items visible and owns the
+        # legend, range, Copy, and XLSX scene.  Re-composing those blocks here
+        # would duplicate large unchanged rosters at preview cadence.
+        curves: list[InteractiveDisplayCurve] = []
+        for item in composed:
+            curves.extend(item.curves)
+
+        return InteractiveDisplayProjection(
+            tab_id=composed[-1].tab_id,
+            set_id=composed[-1].set_id,
+            generation=generation,
+            x_label=composed[-1].x_label,
+            y_label=composed[-1].y_label,
+            curves=tuple(curves),
+            target_set_ids=roster,
+            batch_id=batch_id,
+        )
 
     @staticmethod
     def compose(

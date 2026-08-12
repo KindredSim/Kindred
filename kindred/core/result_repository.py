@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-import hashlib
-import json
-import math
 from numbers import Real
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, TypeAlias
@@ -15,6 +12,9 @@ import numpy as np
 
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
 from kindred.core.simulator.solver_types import SimulationPresentationBoundary
+from kindred.core.simulator.executable_identity import (
+    TargetExecutableScienceIdentity,
+)
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
@@ -42,8 +42,6 @@ __all__ = [
     "ResultRepository",
     "SimulationResultProvenance",
     "SimulationResultValue",
-    "scientific_identity",
-    "standard_concentration_identity",
 ]
 
 
@@ -54,239 +52,16 @@ def _required_id(value: object, field: str) -> str:
     return normalized
 
 
-def standard_concentration_identity(prepared_dsl: object) -> str:
-    """Return the C0 contribution to executable science, not source provenance.
-
-    ``MechanismAuthoringSource`` remains on every result key so an exact source
-    capture is retained for provenance.  C0 is additionally represented by its
-    executable contribution: changing it is scientific only where an Eyring
-    molecularity or an auto-derived equilibrium reverse rate consumes it.
-    """
-
-    mechanism_for_execution = getattr(prepared_dsl, "mechanism_for_execution", None)
-    if not callable(mechanism_for_execution):
-        raise TypeError("prepared_dsl must provide mechanism_for_execution().")
-    mechanism = mechanism_for_execution()
-    metadata = getattr(mechanism, "metadata", {})
-    if not isinstance(metadata, Mapping):
-        raise TypeError("prepared DSL mechanism metadata must be a mapping.")
-
-    from kindred.core.kinetics import (
-        EyringRateModel,
-        forward_rate_model_for_equilibrium,
-        forward_rate_model_for_reaction,
-    )
-    from kindred.core.equilibrium_rate_authority import (
-        EquilibriumRateAuthorityKind,
-        normalize_existing_equilibrium_rate_authority,
-    )
-    from kindred.core.mechanism_metadata import MechanismMetadataView
-
-    view = MechanismMetadataView.from_metadata(metadata)
-    consumes_c0 = False
-    for reaction in tuple(getattr(mechanism, "reactions", ()) or ()):
-        model = forward_rate_model_for_reaction(
-            reaction,
-            default_standard_conc_M=view.standard_conc_M,
-        )
-        if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
-            consumes_c0 = True
-            break
-    if not consumes_c0:
-        for equilibrium in tuple(getattr(mechanism, "equilibria", ()) or ()):
-            model = forward_rate_model_for_equilibrium(
-                equilibrium,
-                temperature_K=view.temperature_K,
-                default_standard_conc_M=view.standard_conc_M,
-            )
-            if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
-                consumes_c0 = True
-                break
-            authority = normalize_existing_equilibrium_rate_authority(
-                equilibrium
-            )
-            forward_order = math.fsum(
-                float(value)
-                for value in dict(getattr(equilibrium, "stoich_forward", {})).values()
-            )
-            reverse_order = math.fsum(
-                float(value)
-                for value in dict(getattr(equilibrium, "stoich_back", {})).values()
-            )
-            standard_state_exponent = math.fsum((forward_order, -reverse_order))
-            if (
-                authority.kind == EquilibriumRateAuthorityKind.KEQ
-                and standard_state_exponent != 0.0
-            ):
-                consumes_c0 = True
-                break
-    if not consumes_c0:
-        return "C0:inert"
-    return f"C0:consumed:{float(view.standard_conc_M).hex()}"
-
-
-def scientific_identity(
-    prepared_dsl: object,
-    *,
-    intervention_execution: InterventionExecutionContract,
-) -> str:
-    """Return a deterministic identity for accepted executable science.
-
-    Authoring text and provenance remain on the result key, but comments and
-    formatting never enter this digest.  The payload is assembled from the
-    accepted mechanism, retained ASTs, and executable schedule objects.  An
-    inert standard concentration is removed recursively; a consumed value is
-    retained by :func:`standard_concentration_identity`.
-    """
-
-    mechanism_for_execution = getattr(prepared_dsl, "mechanism_for_execution", None)
-    if not callable(mechanism_for_execution):
-        raise TypeError("prepared_dsl must provide mechanism_for_execution().")
-    mechanism = mechanism_for_execution()
-    c0_identity = standard_concentration_identity(prepared_dsl)
-    metadata = getattr(mechanism, "metadata", {})
-    if not isinstance(metadata, Mapping):
-        raise TypeError("prepared DSL mechanism metadata must be a mapping.")
-    from kindred.core.temperature import temperature_schedule_execution_identity
-
-    schedule = metadata.get("temperature_schedule")
-    schedule_identity = temperature_schedule_execution_identity(schedule)
-    if schedule is not None and schedule_identity is None:
-        raise TypeError(
-            "scientific identity requires a serializable temperature schedule."
-        )
-
-    def canonical(value: object) -> object:
-        if isinstance(value, Mapping):
-            return {
-                str(key): canonical(item)
-                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-                if str(key) not in {
-                    "algebra_text",
-                    "parameter_algebra_spec",
-                }
-            }
-        if isinstance(value, (tuple, list)):
-            return [canonical(item) for item in value]
-        if isinstance(value, bool) or value is None or isinstance(value, str):
-            return value
-        if isinstance(value, Real):
-            return {"float_hex": float(value).hex()}
-        raise TypeError(
-            "scientific identity cannot encode executable value "
-            f"{value.__class__.__qualname__}."
-        )
-
-    from kindred.core.ode_builder import (
-        build_effective_rate_coefficient_evaluator,
-    )
-
-    coefficient_authority = build_effective_rate_coefficient_evaluator(
-        mechanism
-    )
-    reactions = []
-    for reaction in tuple(getattr(mechanism, "reactions", ()) or ()):
-        reactions.append(
-            {
-                "reactants": canonical(getattr(reaction, "reactants", {})),
-                "products": canonical(getattr(reaction, "products", {})),
-                "rate_orders": canonical(getattr(reaction, "rate_orders", {})),
-            }
-        )
-    equilibria = []
-    for equilibrium in tuple(getattr(mechanism, "equilibria", ()) or ()):
-        equilibria.append(
-            {
-                "stoich_forward": canonical(getattr(equilibrium, "stoich_forward", {})),
-                "stoich_back": canonical(getattr(equilibrium, "stoich_back", {})),
-            }
-        )
-    if not isinstance(
-        intervention_execution,
-        InterventionExecutionContract,
-    ):
-        raise TypeError(
-            "scientific identity requires an InterventionExecutionContract."
-        )
-    intervention_declarative_fingerprint = (
-        intervention_execution.declarative_fingerprint
-    )
-    intervention_executable_fingerprint = (
-        intervention_execution.executable_fingerprint
-    )
-    payload: dict[str, object] = {
-        "species": tuple(str(name) for name in getattr(mechanism, "species_names", lambda: ())()),
-        "reactions": reactions,
-        "equilibria": equilibria,
-        "coefficient_authority": canonical(
-            coefficient_authority.authority_snapshot
-        ),
-        "temperature_K": canonical(metadata.get("temperature_K", 298.15)),
-        "temperature_schedule": canonical(schedule_identity),
-        "intervention_schedule": {
-            "declarative_fingerprint": intervention_declarative_fingerprint,
-            "executable_fingerprint": intervention_executable_fingerprint,
-        },
-        "c0": c0_identity,
-    }
-    from kindred.core.algebra.printer import algebra_block_to_source
-
-    compiled = getattr(mechanism, "_compiled_algebra_series", None)
-    payload["observable_program"] = (
-        None
-        if compiled is None
-        else algebra_block_to_source(compiled.block)
-    )
-    parameter_spec_for_execution = getattr(
-        prepared_dsl,
-        "parameter_algebra_spec_for_execution",
-        None,
-    )
-    if not callable(parameter_spec_for_execution):
-        raise TypeError(
-            "prepared_dsl must provide parameter_algebra_spec_for_execution()."
-        )
-    spec = parameter_spec_for_execution()
-    block = getattr(spec, "parameter_block", None)
-    payload["parameter_program"] = (
-        None if block is None else algebra_block_to_source(block)
-    )
-    if c0_identity == "C0:inert":
-        def strip_c0(value: object) -> object:
-            if isinstance(value, Mapping):
-                return {
-                    key: strip_c0(item)
-                    for key, item in value.items()
-                    if str(key).lower() not in {"standard_conc_m", "std_ratio", "c0"}
-                }
-            if isinstance(value, list):
-                return [strip_c0(item) for item in value]
-            if isinstance(value, tuple):
-                return [strip_c0(item) for item in value]
-            return value
-
-        payload = strip_c0(payload)  # type: ignore[assignment]
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    return f"science:{digest}"
-
-
 def explicit_result_key_from_values(
     *,
     tab_id: str,
     set_id: str,
     mechanism_source: MechanismAuthoringSource,
-    prepared_dsl: object,
     analysis_identity: str,
     initial_values: Iterable[tuple[str, float]],
     execution_settings: SimulationExecutionSettings,
     scientific_settings: TabScientificSettings,
-    intervention_execution: InterventionExecutionContract,
+    executable_identity: TargetExecutableScienceIdentity,
 ) -> "ExplicitResultKey":
     """Construct one explicit key from one retained typed source identity."""
 
@@ -295,13 +70,7 @@ def explicit_result_key_from_values(
         set_id=set_id,
         mechanism_source=mechanism_source,
         analysis_identity=analysis_identity,
-        standard_concentration_identity=standard_concentration_identity(
-            prepared_dsl
-        ),
-        scientific_identity=scientific_identity(
-            prepared_dsl,
-            intervention_execution=intervention_execution,
-        ),
+        executable_identity=executable_identity,
         initial_values=tuple(initial_values),
         execution_settings=execution_settings,
         scientific_settings=scientific_settings,
@@ -314,30 +83,20 @@ def preview_result_identity_for_tab(
     *,
     parameter_values: Iterable[tuple[str, float]],
     initial_values: Iterable[tuple[str, float]] | None = None,
-    intervention_execution: InterventionExecutionContract,
+    executable_identity: TargetExecutableScienceIdentity,
 ) -> "PreviewResultIdentity":
     """Construct Preview identity from the same accepted tab projection."""
 
     if not isinstance(tab, MechanismTabDocument):
         raise TypeError("tab must be a MechanismTabDocument.")
-    prepared_dsl = tab.prepared_dsl
-    if prepared_dsl is None:
-        raise ValueError(f"Mechanism tab {tab.tab_id!r} has no accepted DSL.")
-    if not isinstance(
-        intervention_execution,
-        InterventionExecutionContract,
-    ):
-        raise TypeError(
-            "Preview identity requires an InterventionExecutionContract."
-        )
+    if not isinstance(executable_identity, TargetExecutableScienceIdentity):
+        raise TypeError("Preview identity requires typed target executable science.")
     return PreviewResultIdentity(
         tab_id=tab.tab_id,
         set_id=set_id,
         mechanism_source=tab.mechanism_source,
         analysis_identity=canonical_analysis_identity(tab),
-        standard_concentration_identity=standard_concentration_identity(
-            prepared_dsl
-        ),
+        executable_identity=executable_identity,
         parameter_values=tuple(parameter_values),
         initial_values=(
             canonical_initial_values(tab, set_id)
@@ -346,12 +105,6 @@ def preview_result_identity_for_tab(
         ),
         execution_settings=tab.resolved_execution_settings(set_id),
         scientific_settings=tab.scientific_settings,
-        intervention_declarative_fingerprint=(
-            intervention_execution.declarative_fingerprint
-        ),
-        intervention_executable_fingerprint=(
-            intervention_execution.executable_fingerprint
-        ),
     )
 
 
@@ -697,8 +450,7 @@ class ExplicitResultKey:
     set_id: str
     mechanism_source: MechanismAuthoringSource
     analysis_identity: str
-    standard_concentration_identity: str
-    scientific_identity: str
+    executable_identity: TargetExecutableScienceIdentity
     initial_values: tuple[tuple[str, float], ...]
     execution_settings: SimulationExecutionSettings
     scientific_settings: TabScientificSettings
@@ -713,19 +465,17 @@ class ExplicitResultKey:
             "analysis_identity",
             _required_id(self.analysis_identity, "analysis_identity"),
         )
-        object.__setattr__(
-            self,
-            "standard_concentration_identity",
-            _required_id(
-                self.standard_concentration_identity,
-                "standard_concentration_identity",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "scientific_identity",
-            _required_id(self.scientific_identity, "scientific_identity"),
-        )
+        if not isinstance(
+            self.executable_identity,
+            TargetExecutableScienceIdentity,
+        ):
+            raise TypeError(
+                "Explicit result key requires typed target executable identity."
+            )
+        if self.executable_identity.base.analysis_identity != self.analysis_identity:
+            raise ValueError(
+                "Explicit result analysis and executable identities conflict."
+            )
         object.__setattr__(
             self,
             "initial_values",
@@ -754,12 +504,11 @@ class ExplicitResultCurrentFacts:
     tab_id: str
     set_id: str
     mechanism_source: MechanismAuthoringSource
-    prepared_dsl: object
     analysis_identity: str
     initial_values: tuple[tuple[str, float], ...]
     execution_settings: SimulationExecutionSettings
     scientific_settings: TabScientificSettings
-    intervention_execution: InterventionExecutionContract
+    executable_identity: TargetExecutableScienceIdentity
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
@@ -792,12 +541,11 @@ class ExplicitResultCurrentFacts:
         validate_simulation_execution_settings(self.execution_settings)
         validate_tab_scientific_settings(self.scientific_settings)
         if not isinstance(
-            self.intervention_execution,
-            InterventionExecutionContract,
+            self.executable_identity,
+            TargetExecutableScienceIdentity,
         ):
             raise TypeError(
-                "intervention_execution must be an "
-                "InterventionExecutionContract."
+                "current facts require typed target executable identity."
             )
 
 
@@ -814,12 +562,11 @@ def explicit_result_key_from_current_facts(
         tab_id=facts.tab_id,
         set_id=facts.set_id,
         mechanism_source=facts.mechanism_source,
-        prepared_dsl=facts.prepared_dsl,
         analysis_identity=facts.analysis_identity,
         initial_values=facts.initial_values,
         execution_settings=facts.execution_settings,
         scientific_settings=facts.scientific_settings,
-        intervention_execution=facts.intervention_execution,
+        executable_identity=facts.executable_identity,
     )
 
 
@@ -844,13 +591,11 @@ class PreviewResultIdentity:
     set_id: str
     mechanism_source: MechanismAuthoringSource
     analysis_identity: str
-    standard_concentration_identity: str
+    executable_identity: TargetExecutableScienceIdentity
     parameter_values: tuple[tuple[str, float], ...]
     initial_values: tuple[tuple[str, float], ...]
     execution_settings: SimulationExecutionSettings
     scientific_settings: TabScientificSettings
-    intervention_declarative_fingerprint: str
-    intervention_executable_fingerprint: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
@@ -862,14 +607,17 @@ class PreviewResultIdentity:
             "analysis_identity",
             _required_id(self.analysis_identity, "analysis_identity"),
         )
-        object.__setattr__(
-            self,
-            "standard_concentration_identity",
-            _required_id(
-                self.standard_concentration_identity,
-                "standard_concentration_identity",
-            ),
-        )
+        if not isinstance(
+            self.executable_identity,
+            TargetExecutableScienceIdentity,
+        ):
+            raise TypeError(
+                "Preview identity requires typed target executable identity."
+            )
+        if self.executable_identity.base.analysis_identity != self.analysis_identity:
+            raise ValueError(
+                "Preview analysis and executable identities conflict."
+            )
         object.__setattr__(
             self,
             "parameter_values",
@@ -890,15 +638,6 @@ class PreviewResultIdentity:
             )
         validate_simulation_execution_settings(self.execution_settings)
         validate_tab_scientific_settings(self.scientific_settings)
-        for field_name in (
-            "intervention_declarative_fingerprint",
-            "intervention_executable_fingerprint",
-        ):
-            value = getattr(self, field_name)
-            if type(value) is not str or value != value.strip():
-                raise ValueError(
-                    f"{field_name} must be an edge-normalized string."
-                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -909,14 +648,12 @@ class PreviewResultKey:
     set_id: str
     mechanism_source: MechanismAuthoringSource
     analysis_identity: str
-    standard_concentration_identity: str
+    executable_identity: TargetExecutableScienceIdentity
     parameter_values: tuple[tuple[str, float], ...]
     initial_values: tuple[tuple[str, float], ...]
     execution_settings: SimulationExecutionSettings
     scientific_settings: TabScientificSettings
     generation: int
-    intervention_declarative_fingerprint: str
-    intervention_executable_fingerprint: str
     kind: str = "preview"
 
     def __post_init__(self) -> None:
@@ -925,17 +662,11 @@ class PreviewResultKey:
             set_id=self.set_id,
             mechanism_source=self.mechanism_source,
             analysis_identity=self.analysis_identity,
-            standard_concentration_identity=self.standard_concentration_identity,
+            executable_identity=self.executable_identity,
             parameter_values=self.parameter_values,
             initial_values=self.initial_values,
             execution_settings=self.execution_settings,
             scientific_settings=self.scientific_settings,
-            intervention_declarative_fingerprint=(
-                self.intervention_declarative_fingerprint
-            ),
-            intervention_executable_fingerprint=(
-                self.intervention_executable_fingerprint
-            ),
         )
         object.__setattr__(self, "tab_id", identity.tab_id)
         object.__setattr__(self, "set_id", identity.set_id)
@@ -943,8 +674,8 @@ class PreviewResultKey:
         object.__setattr__(self, "analysis_identity", identity.analysis_identity)
         object.__setattr__(
             self,
-            "standard_concentration_identity",
-            identity.standard_concentration_identity,
+            "executable_identity",
+            identity.executable_identity,
         )
         object.__setattr__(self, "parameter_values", identity.parameter_values)
         object.__setattr__(self, "initial_values", identity.initial_values)
@@ -957,16 +688,6 @@ class PreviewResultKey:
             self,
             "scientific_settings",
             identity.scientific_settings,
-        )
-        object.__setattr__(
-            self,
-            "intervention_declarative_fingerprint",
-            identity.intervention_declarative_fingerprint,
-        )
-        object.__setattr__(
-            self,
-            "intervention_executable_fingerprint",
-            identity.intervention_executable_fingerprint,
         )
         if self.kind != "preview":
             raise ValueError("PreviewResultKey kind must be exactly 'preview'.")
@@ -991,17 +712,11 @@ class PreviewResultKey:
             set_id=identity.set_id,
             mechanism_source=identity.mechanism_source,
             analysis_identity=identity.analysis_identity,
-            standard_concentration_identity=identity.standard_concentration_identity,
+            executable_identity=identity.executable_identity,
             parameter_values=identity.parameter_values,
             initial_values=identity.initial_values,
             execution_settings=identity.execution_settings,
             scientific_settings=identity.scientific_settings,
-            intervention_declarative_fingerprint=(
-                identity.intervention_declarative_fingerprint
-            ),
-            intervention_executable_fingerprint=(
-                identity.intervention_executable_fingerprint
-            ),
             generation=generation,
         )
 
@@ -1012,17 +727,11 @@ class PreviewResultKey:
             set_id=self.set_id,
             mechanism_source=self.mechanism_source,
             analysis_identity=self.analysis_identity,
-            standard_concentration_identity=self.standard_concentration_identity,
+            executable_identity=self.executable_identity,
             parameter_values=self.parameter_values,
             initial_values=self.initial_values,
             execution_settings=self.execution_settings,
             scientific_settings=self.scientific_settings,
-            intervention_declarative_fingerprint=(
-                self.intervention_declarative_fingerprint
-            ),
-            intervention_executable_fingerprint=(
-                self.intervention_executable_fingerprint
-            ),
         )
 
 

@@ -31,6 +31,7 @@ from kindred.gui.fitting.launch import (
     FitOriginSnapshot,
     FitSetupSnapshot,
 )
+from kindred.gui.fitting.ic_tolerance import FitInitialTolerance
 from kindred.gui.ui_helpers import setup_scientific_validator
 
 
@@ -41,21 +42,58 @@ class _Col:
     WEIGHT = 1
     SPECIES = 2
     INITIAL = 3
-    FIT = 4
+    TOLERANCE_MODE = 4
     LOG10 = 5
-    MINIMUM = 6
-    MAXIMUM = 7
+    LOWER = 6
+    UPPER = 7
     COUNT = 8
     HEADERS = [
-        "Include in Fit",
+        "Include",
         "Weight",
         "Species",
-        "Initial Value",
-        "Fit IC",
-        "Log10",
-        "Min",
-        "Max",
+        "Starting IC",
+        "Vary IC",
+        "Log scale",
+        "Lower",
+        "Upper",
     ]
+
+
+_VARY_IC_CHOICES: tuple[tuple[str, str, str], ...] = (
+    (
+        "No",
+        "disabled",
+        "Keep this initial concentration fixed during fitting.",
+    ),
+    (
+        "± X% (Symmetric)",
+        "symmetric_percent",
+        "Vary equally below and above the Starting IC. Example: 5 permits "
+        "values from 95% to 105% of the Starting IC.",
+    ),
+    (
+        "− X1% / + X2% (Separate)",
+        "asymmetric_percent",
+        "Enter separate decreases and increases relative to the Starting IC. "
+        "Example: 10 and 5 permit values from 90% to 105% of the Starting IC.",
+    ),
+    (
+        "Absolute Minimum / Maximum (in M)",
+        "absolute",
+        "Enter the actual minimum and maximum concentrations in molar units.",
+    ),
+)
+
+_ZERO_IC_PERCENT_MESSAGE = (
+    "A zero Starting IC cannot use a percentage Vary IC mode; choose "
+    "Absolute Minimum / Maximum (in M)."
+)
+
+_COPY_SPECIES_WEIGHTS_VARY_IC_TOOLTIP = (
+    "Copies species weights, Vary IC mode and range, and log-scale choices "
+    "from the selected dataset to compatible species in other datasets. "
+    "Starting IC values and dataset-level settings are not copied."
+)
 
 
 _INVALID_BG = QBrush(QColor(255, 200, 200))
@@ -254,11 +292,25 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._copy_targets_button.clicked.connect(
             self._copy_targets_to_compatible_datasets
         )
+        self._copy_species_weights_vary_ic_button = QtWidgets.QPushButton(
+            "Copy Species Weights and Vary IC to Compatible",
+            group,
+        )
+        self._copy_species_weights_vary_ic_button.setObjectName(
+            "global_fit_copy_species_weights_vary_ic_compatible"
+        )
+        self._copy_species_weights_vary_ic_button.setToolTip(
+            _COPY_SPECIES_WEIGHTS_VARY_IC_TOOLTIP
+        )
+        self._copy_species_weights_vary_ic_button.clicked.connect(
+            self._copy_species_weights_and_vary_ic_to_compatible
+        )
         for button in (
             self._bulk_all_button,
             self._bulk_none_button,
             self._bulk_invert_button,
             self._copy_targets_button,
+            self._copy_species_weights_vary_ic_button,
         ):
             bulk_row.addWidget(button)
         bulk_row.addStretch(1)
@@ -271,16 +323,16 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._table.setHorizontalHeaderLabels(_Col.HEADERS)
         header = self._table.horizontalHeader()
         header.setStretchLastSection(False)
+        # The presentation contract is a stable table, not a content-driven
+        # layout.  Fixed section modes also keep automation and screenshots
+        # independent of the current species name or numeric value.
+        fixed_widths = (72, 72, 140, 100, 220, 82, 82, 82)
         for column in range(_Col.COUNT):
             header.setSectionResizeMode(
                 column,
-                QtWidgets.QHeaderView.ResizeMode.ResizeToContents,
+                QtWidgets.QHeaderView.ResizeMode.Fixed,
             )
-        header.setSectionResizeMode(
-            _Col.SPECIES,
-            QtWidgets.QHeaderView.ResizeMode.Interactive,
-        )
-        self._table.setColumnWidth(_Col.SPECIES, 140)
+            self._table.setColumnWidth(column, fixed_widths[column])
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
         self._table.setMinimumHeight(200)
@@ -394,6 +446,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._bulk_none_button,
             self._bulk_invert_button,
             self._copy_targets_button,
+            self._copy_species_weights_vary_ic_button,
         ):
             button.setEnabled(not self._running)
 
@@ -518,9 +571,17 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def _initial_raw(initial: FitInitialVariable) -> dict[str, object]:
         return {
             "initial": UnifiedSpeciesTable._float_text(initial.initial),
-            "minimum": UnifiedSpeciesTable._float_text(initial.minimum),
-            "maximum": UnifiedSpeciesTable._float_text(initial.maximum),
-            "fit": bool(initial.fit),
+            "mode": initial.tolerance.mode,
+            "lower": (
+                ""
+                if initial.tolerance.lower is None
+                else UnifiedSpeciesTable._float_text(initial.tolerance.lower)
+            ),
+            "upper": (
+                ""
+                if initial.tolerance.upper is None
+                else UnifiedSpeciesTable._float_text(initial.tolerance.upper)
+            ),
             "log10": bool(initial.log10),
         }
 
@@ -659,8 +720,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
             for column, field in (
                 (_Col.INITIAL, "initial"),
-                (_Col.MINIMUM, "minimum"),
-                (_Col.MAXIMUM, "maximum"),
+                (_Col.LOWER, "lower"),
+                (_Col.UPPER, "upper"),
             ):
                 invalid_key = (mapped.set_id, species, field)
                 initial_item = QtWidgets.QTableWidgetItem(
@@ -669,36 +730,180 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                         str(raw_initial.get(field, "")),
                     )
                 )
-                self._set_editable(initial_item, local is not None)
+                tolerance_mode = str(raw_initial.get("mode", "disabled"))
+                self._set_editable(
+                    initial_item,
+                    local is not None
+                    and (
+                        field == "initial"
+                        or (field == "lower" and tolerance_mode != "disabled")
+                        or (
+                            field == "upper"
+                            and tolerance_mode in {"asymmetric_percent", "absolute"}
+                        )
+                    ),
+                )
                 initial_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 initial_item.setData(_DATASET_ROLE, dataset.dataset_id)
                 initial_item.setData(_SET_ROLE, mapped.set_id)
                 initial_item.setData(_SPECIES_ROLE, species)
                 if local is not None:
-                    initial_item.setData(_EXACT_VALUE_ROLE, getattr(local, field))
+                    initial_item.setData(
+                        _EXACT_VALUE_ROLE,
+                        (
+                            local.initial
+                            if field == "initial"
+                            else getattr(local.tolerance, field)
+                        ),
+                    )
                 if invalid_key in self._invalid_initial_raw:
                     initial_item.setBackground(_INVALID_BG)
                     initial_item.setForeground(_INVALID_FG)
                     initial_item.setToolTip(self._invalid_initial_raw[invalid_key])
                 self._table.setItem(row, column, initial_item)
 
-            for column, field in ((_Col.FIT, "fit"), (_Col.LOG10, "log10")):
-                check_item = QtWidgets.QTableWidgetItem()
-                self._set_checkable(
-                    check_item,
-                    bool(raw_initial.get(field, False)),
-                    local is not None and (field == "fit" or bool(raw_initial.get("fit", False))),
+            mode = QtWidgets.QComboBox(self._table)
+            mode.setObjectName("global_fit_vary_ic_combo")
+            for label, value, tooltip in _VARY_IC_CHOICES:
+                mode.addItem(label, value)
+                item_index = mode.model().index(mode.count() - 1, 0)
+                mode.model().setData(
+                    item_index,
+                    tooltip,
+                    Qt.ItemDataRole.ToolTipRole,
                 )
-                check_item.setData(_DATASET_ROLE, dataset.dataset_id)
-                check_item.setData(_SET_ROLE, mapped.set_id)
-                check_item.setData(_SPECIES_ROLE, species)
-                if local is not None:
-                    check_item.setData(
-                        _EXACT_VALUE_ROLE,
-                        getattr(local, field),
-                    )
-                self._table.setItem(row, column, check_item)
+            mode.setEnabled(local is not None)
+            mode.setCurrentIndex(
+                max(0, mode.findData(str(raw_initial.get("mode", "disabled"))))
+            )
+            self._set_vary_ic_combo_tooltip(mode)
+            mode.currentIndexChanged.connect(
+                lambda _index, table_row=row, combo=mode:
+                self._on_vary_ic_mode_changed(table_row, combo)
+            )
+            self._table.setCellWidget(row, _Col.TOLERANCE_MODE, mode)
 
+            check_item = QtWidgets.QTableWidgetItem()
+            self._set_checkable(
+                check_item,
+                bool(raw_initial.get("log10", False)),
+                local is not None and raw_initial.get("mode") != "disabled",
+            )
+            check_item.setData(_DATASET_ROLE, dataset.dataset_id)
+            check_item.setData(_SET_ROLE, mapped.set_id)
+            check_item.setData(_SPECIES_ROLE, species)
+            if local is not None:
+                check_item.setData(_EXACT_VALUE_ROLE, local.log10)
+            self._table.setItem(row, _Col.LOG10, check_item)
+
+    @staticmethod
+    def _set_vary_ic_combo_tooltip(combo: QtWidgets.QComboBox) -> None:
+        """Keep the closed combo tooltip equal to its selected popup item."""
+
+        index = combo.currentIndex()
+        tooltip = "" if index < 0 else str(
+            combo.itemData(index, Qt.ItemDataRole.ToolTipRole) or ""
+        )
+        combo.setToolTip(tooltip)
+
+    def _on_vary_ic_mode_changed(
+        self,
+        row: int,
+        combo: QtWidgets.QComboBox,
+    ) -> None:
+        """Author one complete fresh range for a Vary IC mode transition."""
+
+        self._set_vary_ic_combo_tooltip(combo)
+        if self._refreshing or self._running:
+            return
+        mode = str(combo.currentData() or "disabled")
+        initial_item = self._table.item(row, _Col.INITIAL)
+        if initial_item is None:
+            return
+        try:
+            initial = float(initial_item.text())
+            if not math.isfinite(initial) or initial < 0.0:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            # The ordinary initial-value editor owns its own error.  Keep the
+            # mode selection visible and let the row validator explain the
+            # incomplete Starting IC when it runs.
+            self._stage_initial_row_at(row)
+            return
+
+        if mode in {"symmetric_percent", "asymmetric_percent"} and initial == 0.0:
+            # A percentage range around zero is undefined.  Reject the
+            # transition itself so no invalid percentage draft can be applied.
+            identity = self._table.item(row, _Col.INITIAL)
+            previous_mode = "disabled"
+            if identity is not None:
+                set_id = str(identity.data(_SET_ROLE) or "").strip()
+                species = str(identity.data(_SPECIES_ROLE) or "").strip()
+                accepted = self._accepted_initial(set_id, species)
+                previous_mode = (
+                    str(self._pending_initial_rows.get((set_id, species), {}).get("mode"))
+                    if (set_id, species) in self._pending_initial_rows
+                    else (accepted.tolerance.mode if accepted is not None else "disabled")
+                )
+                if previous_mode not in {value for _label, value, _tip in _VARY_IC_CHOICES}:
+                    previous_mode = "disabled"
+            blocker = QtCore.QSignalBlocker(combo)
+            combo.setCurrentIndex(max(0, combo.findData(previous_mode)))
+            del blocker
+            self._set_vary_ic_combo_tooltip(combo)
+            self._set_footer_error(_ZERO_IC_PERCENT_MESSAGE)
+            self.statusMessage.emit(_ZERO_IC_PERCENT_MESSAGE)
+            self.validityChanged.emit()
+            return
+
+        lower_item = self._table.item(row, _Col.LOWER)
+        upper_item = self._table.item(row, _Col.UPPER)
+        if lower_item is None or upper_item is None:
+            return
+        if mode == "disabled":
+            lower, upper, disable_log = "", "", True
+        elif mode == "symmetric_percent":
+            lower, upper, disable_log = "5", "", False
+        elif mode == "asymmetric_percent":
+            lower, upper, disable_log = "5", "5", False
+        else:
+            lower = "0"
+            upper = self._float_text(10.0 * initial) if initial > 0.0 else ""
+            disable_log = True
+
+        # Signals from the two cleared cells must not create half-written
+        # drafts. The single explicit stage below sees the complete row.
+        table_blocker = QtCore.QSignalBlocker(self._table)
+        lower_item.setText(lower)
+        upper_item.setText(upper)
+        if disable_log:
+            log_item = self._table.item(row, _Col.LOG10)
+            if log_item is not None:
+                self._set_checkable(log_item, False, mode != "disabled")
+        del table_blocker
+        identity = self._table.item(row, _Col.INITIAL)
+        if identity is not None:
+            self._clear_initial_row_errors(
+                str(identity.data(_SET_ROLE) or ""),
+                str(identity.data(_SPECIES_ROLE) or ""),
+                row,
+            )
+        self._stage_initial_row_at(row)
+
+    def _accepted_initial(
+        self,
+        set_id: str,
+        species: str,
+    ) -> FitInitialVariable | None:
+        setup = self._current_setup()
+        return next(
+            (
+                item
+                for item in (setup.initials if setup is not None else ())
+                if item.set_id == set_id and item.species == species
+            ),
+            None,
+        )
 
     def _refresh_visible_presentation(self) -> None:
         self._refreshing = True
@@ -751,10 +956,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
         if item.column() in {
             _Col.INITIAL,
-            _Col.FIT,
             _Col.LOG10,
-            _Col.MINIMUM,
-            _Col.MAXIMUM,
+            _Col.LOWER,
+            _Col.UPPER,
         }:
             self._stage_initial_row(item)
             return
@@ -793,20 +997,28 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def _stage_initial_row(self, item: QtWidgets.QTableWidgetItem) -> None:
         """Reconstruct and validate one complete Local-IC row Draft."""
 
-        set_id = str(item.data(_SET_ROLE) or "").strip()
-        species = str(item.data(_SPECIES_ROLE) or "").strip()
+        self._stage_initial_row_at(item.row())
+
+    def _stage_initial_row_at(self, row: int) -> None:
+        """Reconstruct one row after either item or tolerance-mode edits."""
+
+        identity_item = self._table.item(row, _Col.INITIAL)
+        if identity_item is None:
+            return
+        set_id = str(identity_item.data(_SET_ROLE) or "").strip()
+        species = str(identity_item.data(_SPECIES_ROLE) or "").strip()
         if not set_id or not species:
             return
         items = {
-            "initial": self._table.item(item.row(), _Col.INITIAL),
-            "minimum": self._table.item(item.row(), _Col.MINIMUM),
-            "maximum": self._table.item(item.row(), _Col.MAXIMUM),
+            "initial": self._table.item(row, _Col.INITIAL),
+            "lower": self._table.item(row, _Col.LOWER),
+            "upper": self._table.item(row, _Col.UPPER),
         }
-        fit_item = self._table.item(item.row(), _Col.FIT)
-        log_item = self._table.item(item.row(), _Col.LOG10)
+        mode_widget = self._table.cellWidget(row, _Col.TOLERANCE_MODE)
+        log_item = self._table.item(row, _Col.LOG10)
         if (
             any(value is None for value in items.values())
-            or fit_item is None
+            or not isinstance(mode_widget, QtWidgets.QComboBox)
             or log_item is None
         ):
             return
@@ -822,25 +1034,47 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if accepted is None:
             return
         key = (set_id, species)
-        fit = fit_item.checkState() == Qt.CheckState.Checked
+        mode = str(mode_widget.currentData() or "disabled")
         log10 = log_item.checkState() == Qt.CheckState.Checked
-        if not fit and log10:
-            blocker = QtCore.QSignalBlocker(self._table)
-            log_item.setCheckState(Qt.CheckState.Unchecked)
-            del blocker
+        blocker = QtCore.QSignalBlocker(self._table)
+        self._set_checkable(
+            log_item,
+            log10 if mode != "disabled" else False,
+            mode != "disabled",
+        )
+        for field, field_item in items.items():
+            assert field_item is not None
+            self._set_editable(
+                field_item,
+                field == "initial"
+                or (field == "lower" and mode != "disabled")
+                or (
+                    field == "upper"
+                    and mode in {"asymmetric_percent", "absolute"}
+                ),
+            )
+        del blocker
+        if mode == "disabled":
             log10 = False
         raw = {
             field: str(value.text())
             for field, value in items.items()
             if value is not None
         }
-        raw.update({"fit": fit, "log10": log10})
+        raw.update({"mode": mode, "log10": log10})
         self._pending_initial_rows[key] = raw
 
-        typed: dict[str, object] = {"fit": fit, "log10": log10}
+        typed: dict[str, object] = {"mode": mode, "log10": log10}
         parse_errors: dict[str, str] = {}
+        required_fields = {"initial"}
+        if mode == "symmetric_percent":
+            required_fields.add("lower")
+        elif mode in {"asymmetric_percent", "absolute"}:
+            required_fields.update({"lower", "upper"})
         for field, field_item in items.items():
             assert field_item is not None
+            if field not in required_fields:
+                continue
             try:
                 parsed = float(field_item.text())
                 if not math.isfinite(parsed):
@@ -849,18 +1083,18 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 parse_errors[field] = str(exc)
             else:
                 typed[field] = parsed
-        self._clear_initial_row_errors(set_id, species, item.row())
+        self._clear_initial_row_errors(set_id, species, row)
         if parse_errors:
             self._pending_initial_values.pop(key, None)
             for field, message in parse_errors.items():
                 field_key = (set_id, species, field)
                 self._invalid_initial_raw[field_key] = str(raw[field])
                 self._decorate_initial_field(
-                    item.row(),
+                    row,
                     {
                         "initial": _Col.INITIAL,
-                        "minimum": _Col.MINIMUM,
-                        "maximum": _Col.MAXIMUM,
+                        "lower": _Col.LOWER,
+                        "upper": _Col.UPPER,
                     }[field],
                     message,
                 )
@@ -868,31 +1102,48 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._refresh_footer_validity()
             return
         try:
+            if mode == "disabled":
+                tolerance = FitInitialTolerance()
+            elif mode == "symmetric_percent":
+                tolerance = FitInitialTolerance.symmetric_percent(typed["lower"])
+            elif mode == "asymmetric_percent":
+                tolerance = FitInitialTolerance.asymmetric_percent(
+                    typed["lower"], typed["upper"]
+                )
+            else:
+                tolerance = FitInitialTolerance.absolute(
+                    typed["lower"], typed["upper"]
+                )
             initial = FitInitialVariable(
                 set_id=set_id,
                 species=species,
                 initial=float(typed["initial"]),
-                minimum=float(typed["minimum"]),
-                maximum=float(typed["maximum"]),
-                fit=bool(typed["fit"]),
+                tolerance=tolerance,
                 log10=bool(typed["log10"]),
             )
-        except (TypeError, ValueError, OverflowError) as exc:
+        except (TypeError, ValueError, OverflowError) as caught_error:
             self._pending_initial_values.pop(key, None)
-            for field, column in (
-                ("initial", _Col.INITIAL),
-                ("minimum", _Col.MINIMUM),
-                ("maximum", _Col.MAXIMUM),
+            error_message = str(caught_error)
+            columns = {
+                "initial": _Col.INITIAL,
+                "lower": _Col.LOWER,
+                "upper": _Col.UPPER,
+            }
+            if (
+                mode in {"symmetric_percent", "asymmetric_percent"}
+                and typed.get("initial") == 0.0
             ):
+                error_message = _ZERO_IC_PERCENT_MESSAGE
+                self._set_footer_error(_ZERO_IC_PERCENT_MESSAGE)
+                self.statusMessage.emit(_ZERO_IC_PERCENT_MESSAGE)
+            for field in required_fields:
                 self._invalid_initial_raw[(set_id, species, field)] = str(raw[field])
-                self._decorate_initial_field(item.row(), column, str(exc))
+                self._decorate_initial_field(row, columns[field], error_message)
         else:
-            self._clear_initial_row_errors(set_id, species, item.row())
+            self._clear_initial_row_errors(set_id, species, row)
             self._pending_initial_values[key] = {
                 "initial": initial.initial,
-                "minimum": initial.minimum,
-                "maximum": initial.maximum,
-                "fit": initial.fit,
+                "tolerance": initial.tolerance,
                 "log10": initial.log10,
             }
             if accepted is not None and initial == accepted:
@@ -909,8 +1160,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     ) -> None:
         for field, column in (
             ("initial", _Col.INITIAL),
-            ("minimum", _Col.MINIMUM),
-            ("maximum", _Col.MAXIMUM),
+            ("lower", _Col.LOWER),
+            ("upper", _Col.UPPER),
         ):
             self._invalid_initial_raw.pop((set_id, species, field), None)
             self._decorate_initial_field(row, column, None)
@@ -946,6 +1197,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._pending_target_selections.pop(dataset_id, None)
         else:
             self._pending_target_selections[dataset_id] = selected
+        # A weight has meaning only for a selected target.  Drop drafts for
+        # rows just deselected so this surface never retains dormant weights.
+        for key in tuple(self._pending_target_weights):
+            if key[0] == dataset_id and key[1] not in selected:
+                self._pending_target_weights.pop(key, None)
         self._refresh_footer_dirty()
         self._refresh_footer_validity()
 
@@ -1100,9 +1356,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 initial=replace(
                     current_initials[key],
                     initial=float(self._pending_initial_values[key]["initial"]),
-                    minimum=float(self._pending_initial_values[key]["minimum"]),
-                    maximum=float(self._pending_initial_values[key]["maximum"]),
-                    fit=bool(self._pending_initial_values[key]["fit"]),
+                    tolerance=self._pending_initial_values[key]["tolerance"],
                     log10=bool(self._pending_initial_values[key]["log10"]),
                 ),
             )
@@ -1193,6 +1447,145 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 ] = selection.selected_targets
         self._refresh_visible_presentation()
         self.set_status(f"Copy Targets: {copied} copied, {skipped} skipped.")
+
+    def _copy_species_weights_and_vary_ic_to_compatible(self) -> None:
+        """Copy only row-local Vary IC/weight projections across datasets.
+
+        Destination target selection, Starting IC values, dataset settings,
+        and accepted owner state remain untouched.  A target weight is
+        projected only when that destination already selects the species.
+        """
+
+        setup = self._current_setup()
+        source = self._current_dataset()
+        if setup is None or source is None:
+            return
+
+        source_mapped = self._mapped_dataset(source.dataset_id)
+        if source_mapped is None:
+            return
+        source_weights = dict(source.target_weights)
+        source_selected = set(self._selected_targets(source))
+        copied_ranges = 0
+        copied_weights = 0
+        skipped = 0
+        source_initials = {
+            item.species: item
+            for item in setup.initials
+            if item.set_id == source_mapped.set_id
+        }
+        for destination in setup.datasets:
+            if destination.dataset_id == source.dataset_id:
+                continue
+            destination_mapped = self._mapped_dataset(destination.dataset_id)
+            if destination_mapped is None:
+                continue
+            destination_initials = {
+                item.species: item
+                for item in setup.initials
+                if item.set_id == destination_mapped.set_id
+            }
+            destination_selected = set(self._selected_targets(destination))
+            for species, source_initial in source_initials.items():
+                destination_initial = destination_initials.get(species)
+                if destination_initial is None:
+                    skipped += 1
+                    continue
+                source_key = (source_mapped.set_id, species)
+                pending_source = self._pending_initial_values.get(source_key)
+                if pending_source is None:
+                    source_tolerance = source_initial.tolerance
+                    source_log10 = source_initial.log10
+                else:
+                    source_tolerance = pending_source["tolerance"]
+                    source_log10 = bool(pending_source["log10"])
+                if not isinstance(source_tolerance, FitInitialTolerance):
+                    skipped += 1
+                    continue
+                destination_key = (destination_mapped.set_id, species)
+                destination_raw = self._initial_raw(destination_initial)
+                destination_raw.update(
+                    {
+                        "mode": source_tolerance.mode,
+                        "lower": (
+                            ""
+                            if source_tolerance.lower is None
+                            else self._float_text(source_tolerance.lower)
+                        ),
+                        "upper": (
+                            ""
+                            if source_tolerance.upper is None
+                            else self._float_text(source_tolerance.upper)
+                        ),
+                        "log10": bool(source_log10),
+                    }
+                )
+                try:
+                    copied_initial = FitInitialVariable(
+                        set_id=destination_mapped.set_id,
+                        species=species,
+                        initial=destination_initial.initial,
+                        tolerance=source_tolerance,
+                        log10=source_log10,
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    # Preserve the copied range as an invalid draft when the
+                    # destination Starting IC is outside it (or zero for a
+                    # percentage mode).  The destination value remains
+                    # authoritative and Apply stays blocked until the user
+                    # repairs the row.
+                    destination_key = (destination_mapped.set_id, species)
+                    self._pending_initial_rows[destination_key] = destination_raw
+                    self._pending_initial_values.pop(destination_key, None)
+                    for field in ("lower", "upper"):
+                        self._invalid_initial_raw[
+                            (destination_mapped.set_id, species, field)
+                        ] = str(destination_raw[field])
+                    skipped += 1
+                else:
+                    for field in ("initial", "lower", "upper"):
+                        self._invalid_initial_raw.pop(
+                            (destination_mapped.set_id, species, field),
+                            None,
+                        )
+                    if copied_initial == destination_initial:
+                        self._pending_initial_rows.pop(destination_key, None)
+                        self._pending_initial_values.pop(destination_key, None)
+                    else:
+                        self._pending_initial_rows[destination_key] = destination_raw
+                        self._pending_initial_values[destination_key] = {
+                            "initial": destination_initial.initial,
+                            "tolerance": copied_initial.tolerance,
+                            "log10": copied_initial.log10,
+                        }
+                    copied_ranges += 1
+
+                # Weight is copied independently of the Vary IC projection,
+                # and only for an already selected destination target.
+                weight_key = (destination.dataset_id, species)
+                if species in destination_selected and species in source_selected:
+                    source_weight = self._pending_target_weights.get(
+                        (source.dataset_id, species),
+                        source_weights.get(species, 1.0),
+                    )
+                    destination_weight = dict(destination.target_weights).get(
+                        species,
+                        1.0,
+                    )
+                    if source_weight == destination_weight:
+                        self._pending_target_weights.pop(weight_key, None)
+                    else:
+                        self._pending_target_weights[weight_key] = source_weight
+                    copied_weights += 1
+                else:
+                    self._pending_target_weights.pop(weight_key, None)
+
+        self._refresh_visible_presentation()
+        self.set_status(
+            "Copy Species Weights and Vary IC: "
+            f"{copied_ranges} ranges, {copied_weights} weights copied, "
+            f"{skipped} skipped."
+        )
 
     def _acknowledge_applied_intents(self, intents: tuple[object, ...]) -> bool:
         setup = self._current_setup()

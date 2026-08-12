@@ -61,6 +61,10 @@ from .parameter_algebra_spec import classify_parameter_algebra_declaration
 from .parameter_namespace import build_namespace_from_mechanism
 from .dsl_build_input import DslBuildStep
 from .dsl_parameter_scan import DslParameterAnalysis
+from .executable_identity import (
+    BaseExecutableScienceIdentity,
+    fingerprint_executable_payload,
+)
 from .dsl_derivation import (
     authored_step_origin,
     coordinate_source_parts,
@@ -324,8 +328,8 @@ class DslInitialConditionAdmission:
 class DslDerivedScalarDefinition:
     name: str
     value: float
-    minimum: float = float("-inf")
-    maximum: float = float("inf")
+    minimum: float = -1.0e12
+    maximum: float = 1.0e12
     scope: str = "shared"
 
     def __post_init__(self) -> None:
@@ -340,8 +344,8 @@ class DslDerivedScalarDefinition:
             )
         if (
             not math.isfinite(value)
-            or math.isnan(minimum)
-            or math.isnan(maximum)
+            or not math.isfinite(minimum)
+            or not math.isfinite(maximum)
             or minimum >= maximum
             or not minimum <= value <= maximum
         ):
@@ -486,6 +490,166 @@ class DslAnalysis:
                 f"DSL analysis energy_unit is invalid: {self.energy_unit!r}."
             ) from exc
         object.__setattr__(self, "energy_unit", energy_unit)
+
+
+def _mint_base_executable_science_identity(
+    mechanism: object,
+    parameter_algebra_spec: object,
+    *,
+    analysis_identity: str,
+) -> BaseExecutableScienceIdentity:
+    """Mint admitted executable science once from parser-owned structures."""
+
+    from kindred.core.algebra.printer import algebra_block_to_source
+    from kindred.core.equilibrium_rate_authority import (
+        EquilibriumRateAuthorityKind,
+        normalize_existing_equilibrium_rate_authority,
+    )
+    from kindred.core.kinetics import (
+        EyringRateModel,
+        forward_rate_model_for_equilibrium,
+        forward_rate_model_for_reaction,
+    )
+    from kindred.core.mechanism_metadata import MechanismMetadataView
+    from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
+    from kindred.core.temperature import temperature_schedule_execution_identity
+
+    metadata = getattr(mechanism, "metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise TypeError("admitted mechanism metadata must be a mapping.")
+    view = MechanismMetadataView.from_metadata(metadata)
+    consumes_c0 = False
+    for reaction in tuple(getattr(mechanism, "reactions", ()) or ()):
+        model = forward_rate_model_for_reaction(
+            reaction,
+            default_standard_conc_M=view.standard_conc_M,
+        )
+        if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
+            consumes_c0 = True
+            break
+    if not consumes_c0:
+        for equilibrium in tuple(getattr(mechanism, "equilibria", ()) or ()):
+            model = forward_rate_model_for_equilibrium(
+                equilibrium,
+                temperature_K=view.temperature_K,
+                default_standard_conc_M=view.standard_conc_M,
+            )
+            if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
+                consumes_c0 = True
+                break
+            authority = normalize_existing_equilibrium_rate_authority(equilibrium)
+            forward_order = math.fsum(
+                float(value)
+                for value in dict(
+                    getattr(equilibrium, "stoich_forward", {})
+                ).values()
+            )
+            reverse_order = math.fsum(
+                float(value)
+                for value in dict(
+                    getattr(equilibrium, "stoich_back", {})
+                ).values()
+            )
+            if (
+                authority.kind == EquilibriumRateAuthorityKind.KEQ
+                and math.fsum((forward_order, -reverse_order)) != 0.0
+            ):
+                consumes_c0 = True
+                break
+    c0_identity = (
+        f"C0:consumed:{float(view.standard_conc_M).hex()}"
+        if consumes_c0
+        else "C0:inert"
+    )
+
+    def canonical(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {
+                str(key): canonical(item)
+                for key, item in sorted(
+                    value.items(), key=lambda pair: str(pair[0])
+                )
+                if str(key) not in {"algebra_text", "parameter_algebra_spec"}
+            }
+        if isinstance(value, (tuple, list)):
+            return [canonical(item) for item in value]
+        if isinstance(value, bool) or value is None or isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)):
+            return {"float_hex": float(value).hex()}
+        raise TypeError(
+            "base executable identity cannot encode value "
+            f"{value.__class__.__qualname__}."
+        )
+
+    schedule = metadata.get("temperature_schedule")
+    schedule_identity = temperature_schedule_execution_identity(schedule)
+    if schedule is not None and schedule_identity is None:
+        raise TypeError(
+            "base executable identity requires a serializable temperature schedule."
+        )
+    coefficient_authority = build_effective_rate_coefficient_evaluator(mechanism)
+    payload: dict[str, object] = {
+        "species": tuple(
+            str(name)
+            for name in getattr(mechanism, "species_names", lambda: ())()
+        ),
+        "reactions": tuple(
+            {
+                "reactants": canonical(getattr(item, "reactants", {})),
+                "products": canonical(getattr(item, "products", {})),
+                "rate_orders": canonical(getattr(item, "rate_orders", {})),
+            }
+            for item in tuple(getattr(mechanism, "reactions", ()) or ())
+        ),
+        "equilibria": tuple(
+            {
+                "stoich_forward": canonical(
+                    getattr(item, "stoich_forward", {})
+                ),
+                "stoich_back": canonical(getattr(item, "stoich_back", {})),
+            }
+            for item in tuple(getattr(mechanism, "equilibria", ()) or ())
+        ),
+        "coefficient_authority": canonical(
+            coefficient_authority.authority_snapshot
+        ),
+        "temperature_K": canonical(metadata.get("temperature_K", 298.15)),
+        "temperature_schedule": canonical(schedule_identity),
+        "c0": c0_identity,
+    }
+    compiled = getattr(mechanism, "_compiled_algebra_series", None)
+    payload["observable_program"] = (
+        None if compiled is None else algebra_block_to_source(compiled.block)
+    )
+    block = getattr(parameter_algebra_spec, "parameter_block", None)
+    payload["parameter_program"] = (
+        None if block is None else algebra_block_to_source(block)
+    )
+    if c0_identity == "C0:inert":
+        def strip_c0(value: object) -> object:
+            if isinstance(value, Mapping):
+                return {
+                    key: strip_c0(item)
+                    for key, item in value.items()
+                    if str(key).lower()
+                    not in {"standard_conc_m", "std_ratio", "c0"}
+                }
+            if isinstance(value, (tuple, list)):
+                return [strip_c0(item) for item in value]
+            return value
+
+        payload = strip_c0(payload)  # type: ignore[assignment]
+    return BaseExecutableScienceIdentity(
+        fingerprint=fingerprint_executable_payload(
+            payload,
+            prefix="science-base:",
+        ),
+        analysis_identity=analysis_identity,
+        standard_concentration_identity=c0_identity,
+    )
+
+
 class PreparedDslRequestSet:
     """Single-parse owner of one immutable analysis and execution structure."""
 
@@ -495,6 +659,7 @@ class PreparedDslRequestSet:
         "__intervention_schedule",
         "__intervention_execution",
         "__parameter_algebra_spec",
+        "__base_executable_identity",
     )
 
     def __init__(
@@ -505,6 +670,7 @@ class PreparedDslRequestSet:
         intervention_schedule: InterventionSchedule | None,
         intervention_execution: InterventionExecutionContract | None,
         parameter_algebra_spec: object,
+        base_executable_identity: BaseExecutableScienceIdentity,
     ) -> None:
         from kindred.core.intervention_schedule import InterventionSchedule
         from kindred.core.intervention_schedule_compiler import (
@@ -544,11 +710,19 @@ class PreparedDslRequestSet:
                 "Literal prepared DSL state requires its compiled intervention "
                 "contract."
             )
+        if not isinstance(
+            base_executable_identity,
+            BaseExecutableScienceIdentity,
+        ):
+            raise TypeError(
+                "prepared DSL requires parser-minted base executable identity."
+            )
         self.analysis = analysis
         self.__mechanism = mechanism
         self.__intervention_schedule = intervention_schedule
         self.__intervention_execution = intervention_execution
         self.__parameter_algebra_spec = parameter_algebra_spec
+        self.__base_executable_identity = base_executable_identity
 
     def mechanism_for_execution(self) -> object:
         return copy.deepcopy(self.__mechanism)
@@ -565,6 +739,9 @@ class PreparedDslRequestSet:
 
     def parameter_algebra_spec_for_execution(self) -> object:
         return copy.deepcopy(self.__parameter_algebra_spec)
+
+    def base_executable_identity(self) -> BaseExecutableScienceIdentity:
+        return self.__base_executable_identity
 
 # ------------------------------ helpers --------------------------------------
 
@@ -2166,6 +2343,11 @@ def prepare_dsl_request_set(
         intervention_schedule=parameterized_intervention_schedule,
         intervention_execution=intervention_execution,
         parameter_algebra_spec=parameter_algebra_spec,
+        base_executable_identity=_mint_base_executable_science_identity(
+            mechanism,
+            parameter_algebra_spec,
+            analysis_identity=analysis.identity,
+        ),
     )
 
 
@@ -2615,6 +2797,7 @@ def derive_source_with_parameter_updates(
         ),
         intervention_execution=prepared.intervention_execution_contract(),
         parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
+        base_executable_identity=prepared.base_executable_identity(),
     )
     return updated_text, result
 
@@ -2784,13 +2967,6 @@ def derive_source_with_observables(
 
     base_text = source_text
 
-    def _bound_identity(value: float) -> float | str:
-        if value == float("-inf"):
-            return "-infinity"
-        if value == float("inf"):
-            return "infinity"
-        return float(value)
-
     definition_payload = tuple(
         {
             "name": item.name,
@@ -2799,9 +2975,6 @@ def derive_source_with_observables(
                 {
                     "name": scalar.name,
                     "value": scalar.value,
-                    "minimum": _bound_identity(scalar.minimum),
-                    "maximum": _bound_identity(scalar.maximum),
-                    "scope": scalar.scope,
                 }
                 for scalar in item.scalar_parameters
             ),
@@ -2854,5 +3027,10 @@ def derive_source_with_observables(
         ),
         intervention_execution=base.intervention_execution_contract(),
         parameter_algebra_spec=retained_spec,
+        base_executable_identity=_mint_base_executable_science_identity(
+            mechanism,
+            retained_spec,
+            analysis_identity=analysis.identity,
+        ),
     )
     return derived_source, result

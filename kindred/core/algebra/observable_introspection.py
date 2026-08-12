@@ -30,6 +30,7 @@ from kindred.core.simulator.parameter_namespace import (
 __all__ = [
     "FitLocalObservable",
     "fit_observable_names",
+    "fit_scalar_names",
     "validate_fit_local_observable",
 ]
 
@@ -106,6 +107,17 @@ def fit_observable_names(
     return tuple(sorted(str(name) for name in prepared_dsl.analysis.observable_names))
 
 
+def fit_scalar_names(
+    prepared_dsl: PreparedDslRequestSet,
+) -> tuple[str, ...]:
+    """Return retained canonical scalar assignments in the Fit namespace."""
+
+    if not isinstance(prepared_dsl, PreparedDslRequestSet):
+        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
+    spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    return tuple(sorted(str(name) for name in spec.param_assignment_names()))
+
+
 def validate_fit_local_observable(
     *,
     name: str,
@@ -128,6 +140,7 @@ def validate_fit_local_observable(
     mechanism = prepared_dsl.mechanism_for_execution()
     namespace = build_namespace_from_mechanism(mechanism)
     species = set(prepared_dsl.analysis.species_names)
+    retained_scalars = set(fit_scalar_names(prepared_dsl))
     existing = set(prepared_dsl.analysis.observable_names) | {
         str(item) for item in additional_known_observables
     }
@@ -137,6 +150,7 @@ def validate_fit_local_observable(
         for item in (
             species
             | existing
+            | retained_scalars
             | namespace.flat_names()
             | set(symbols.protected_names())
             | set(symbols.functions())
@@ -175,6 +189,7 @@ def validate_fit_local_observable(
         )
     allowed = (
         namespace.flat_names()
+        | retained_scalars
         | existing
         | set(symbols.protected_names())
         | set(symbols.functions())

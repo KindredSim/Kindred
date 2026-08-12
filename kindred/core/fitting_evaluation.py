@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
 import numpy as np
 
 from kindred.core.exceptions import (
+    FitCandidateDomainError,
     FitSimulationError,
     FittingCancelled,
     KindredError,
@@ -45,6 +46,7 @@ from kindred.core.simulation_preparation import (
     bind_simulation_execution_request_interventions,
     build_simulation_request_from_prepared_run,
     canonicalize_request_parameter_names,
+    compose_simulation_target_identity,
     partition_simulation_parameter_values,
     metadata_view_for_mechanism,
     prepare_bound_mechanism,
@@ -124,10 +126,29 @@ def _raw_candidate_domain_eligible(exc: BaseException) -> bool:
 
     details = getattr(exc, "details", None)
     return bool(
-        isinstance(exc, KindredError)
-        and isinstance(details, Mapping)
-        and details.get("candidate_domain_eligible") is True
+        getattr(exc, "candidate_domain_eligible", False) is True
+        or (
+            isinstance(exc, KindredError)
+            and isinstance(details, Mapping)
+            and details.get("candidate_domain_eligible") is True
+        )
     )
+
+
+def _candidate_preparation_domain_eligible(
+    exc: BaseException,
+    candidate_parameter_names: set[str],
+) -> bool:
+    """Require a typed marker and a candidate-owned referenced parameter."""
+
+    if not _raw_candidate_domain_eligible(exc):
+        return False
+    referenced = {
+        str(name)
+        for name in getattr(exc, "parameter_names", ())
+        if str(name).strip()
+    }
+    return bool(referenced and referenced.intersection(candidate_parameter_names))
 
 
 def is_candidate_domain_failure(exc: BaseException) -> bool:
@@ -156,6 +177,15 @@ def _candidate_domain_error(
     extra_details: Mapping[str, object] | None = None,
 ) -> FitSimulationError:
     details = dict(getattr(exc, "details", None) or {})
+    parameter_names = tuple(
+        sorted(
+            str(name)
+            for name in getattr(exc, "parameter_names", ())
+            if str(name).strip()
+        )
+    )
+    if parameter_names:
+        details["parameter_names"] = parameter_names
     details.update(dict(extra_details or {}))
     details.update(
         {
@@ -164,8 +194,9 @@ def _candidate_domain_error(
             "stage": str(stage),
         }
     )
-    return FitSimulationError(
+    return FitCandidateDomainError(
         str(getattr(exc, "message", None) or str(exc)),
+        stage=stage,
         failed_params=failed_params,
         details=details,
         context=getattr(exc, "context", None),
@@ -505,6 +536,15 @@ def prepare_fitting_execution_context(
             ).temperature_schedule,
             parameter_algebra_spec=bound.parameter_algebra_spec,
             intervention_execution=intervention_execution,
+            base_executable_identity=bound.base_executable_identity,
+            target_executable_identity=(
+                None
+                if intervention_execution is None
+                else compose_simulation_target_identity(
+                    bound.base_executable_identity,
+                    intervention_execution,
+                )
+            ),
             parameterized_intervention_schedule=intervention_schedule,
             requested_parameter_names=tuple(
                 canonical_requested_param_names
@@ -727,9 +767,12 @@ class SerialFittingEvaluator:
             )
         except SimulationPreparationError as exc:
             preparation_cause = exc.__cause__ or exc
-            if _raw_candidate_domain_eligible(preparation_cause):
+            if _candidate_preparation_domain_eligible(
+                exc,
+                candidate_parameter_names,
+            ) or _raw_candidate_domain_eligible(preparation_cause):
                 raise _candidate_domain_error(
-                    preparation_cause,
+                    exc,
                     stage=exc.stage,
                     failed_params=failed_params,
                 ) from exc
@@ -904,6 +947,15 @@ class SerialFittingEvaluator:
                     ),
                 )
             except SimulationPreparationError as exc:
+                if _candidate_preparation_domain_eligible(
+                    exc,
+                    candidate_parameter_names,
+                ):
+                    raise _candidate_domain_error(
+                        exc,
+                        stage=exc.stage,
+                        failed_params=failed_params,
+                    ) from exc
                 raise fit_simulation_error_from_preparation_error(
                     exc,
                     failed_params=failed_params,

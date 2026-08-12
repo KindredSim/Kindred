@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 from collections.abc import Callable, Mapping
+from typing import Any
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -16,11 +17,16 @@ from kindred.core.project_presentation_state import (
 )
 from kindred.gui.plot_config import PlotPresentationIntent, require_pyqtgraph
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
+from kindred.gui.widgets.interactive_plot_transition import (
+    InteractiveDisplayController,
+    InteractiveDisplayState,
+)
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.workspace_result_presenter import (
     ResultDataBlock,
     ResultLayerKind,
+    InteractiveDisplayProjection,
     SimulationResultLayerIdentity,
     WorkspacePlotLayer,
     WorkspaceResultPresenter,
@@ -104,6 +110,28 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._copy_timer = QtCore.QTimer(self)
         self._copy_timer.setInterval(0)
         self._copy_timer.timeout.connect(self._continue_copy)
+        self._interactive_timer = QtCore.QTimer(self)
+        self._interactive_timer.setSingleShot(True)
+        self._interactive_timer.timeout.connect(self._advance_interactive_display)
+        self._interactive_items: dict[tuple[object, ...], Any] = {}
+        self._interactive_foreground_items_by_set: dict[str, tuple[object, ...]] = {}
+        self._interactive_masked_items: dict[int, tuple[object, float, str]] = {}
+        self._interactive_visible_overlay_set_ids: set[str] = set()
+        self._interactive_generation: int | None = None
+        self._interactive_batch_id: str | None = None
+        self._interactive_target_set_ids: tuple[str, ...] | None = None
+        self._interactive_frames_by_set: dict[str, object] = {}
+        self._interactive_terminal_states: dict[str, str] = {}
+        self._interactive_retired = False
+        self._interactive_stopped = False
+        self._interactive_locked_view: (
+            tuple[tuple[float, float], tuple[float, float]] | None
+        ) = None
+        self._interactive_display = InteractiveDisplayController(
+            render=self._render_interactive_display,
+            request_tick=self._request_interactive_tick,
+            cancel_tick=self._interactive_timer.stop,
+        )
 
         self._plot_widget = pg.PlotWidget(self)
         self._plot_widget.setObjectName("plotViewport")
@@ -216,6 +244,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 "apply_workspace_result_projection requires WorkspaceResultProjection."
             )
         self._cancel_copy()
+        interactive_active = bool(
+            self._interactive_display.has_visible_frame
+            and self._interactive_target_set_ids is not None
+        )
+        locked_view = self._interactive_locked_view
         try:
             rendered = self._render_projection(projection)
         except Exception as exc:
@@ -226,8 +259,218 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             raise
         self._applied_projection = projection
         self._rendered_blocks = rendered
+        if interactive_active:
+            if locked_view is not None:
+                self._restore_interactive_view(locked_view)
+            roster = self._interactive_target_set_ids
+            if roster is None:
+                raise RuntimeError("interactive display batch roster disappeared.")
+            settled_targets = tuple(
+                set_id
+                for set_id in roster
+                if self._interactive_terminal_states.get(set_id) == "success"
+            )
+            for set_id in settled_targets:
+                self._interactive_frames_by_set.pop(set_id, None)
+                self._interactive_terminal_states.pop(set_id, None)
+            if settled_targets:
+                if self._interactive_frames_by_set:
+                    self._interactive_display.offer(
+                        self._compose_interactive_batch(projection)
+                    )
+                else:
+                    # The completed projection is already the exact physical
+                    # endpoint.  Remove the approximation atomically instead
+                    # of cross-fading an empty transient layer over the newly
+                    # visible completed item.
+                    self._finish_interactive_exact_settle()
+            # Rebuilds restore completed items before the transient renderer has
+            # another timer tick.  Repaint the current overlay immediately so
+            # affected foreground items stay masked during that interval.
+            self._interactive_display.refresh()
         if projection.unavailable_x_diagnostic is not None:
             self.resultDiagnostic.emit(projection.unavailable_x_diagnostic)
+
+    def apply_interactive_preview_frame(self, frame: object) -> bool:
+        """Admit one current transient frame to this panel's display clock."""
+
+        projection = self._applied_projection
+        if projection is None:
+            return False
+        from kindred.gui.interactive_preview import InteractivePreviewFrame
+
+        if not isinstance(frame, InteractivePreviewFrame):
+            raise TypeError("interactive frame must be an InteractivePreviewFrame.")
+        roster = tuple(frame.target_set_ids)
+        generation = self._interactive_generation
+        frame_generation = getattr(frame, "generation", None)
+        if (
+            generation is not None
+            and type(frame_generation) is int
+            and frame_generation < generation
+        ):
+            return False
+        target = WorkspaceResultPresenter.compose_interactive_display(
+            frame,
+            projection=projection,
+        )
+        previous_roster = self._interactive_target_set_ids
+        newer_batch = bool(
+            generation is not None
+            and (
+                target.generation > generation
+                or target.batch_id != self._interactive_batch_id
+                or (previous_roster is not None and roster != previous_roster)
+            )
+        )
+        rearm = bool(self._interactive_stopped or self._interactive_retired)
+        if rearm:
+            if not newer_batch:
+                return False
+            self._interactive_frames_by_set.clear()
+            self._interactive_terminal_states.clear()
+            self._interactive_target_set_ids = None
+            self._interactive_stopped = False
+            self._interactive_retired = False
+            # Stop/retirement leaves the last physical frame frozen.  A newer
+            # admitted gesture is the explicit range-session rearm boundary;
+            # capture the current view again before accepting its first frame.
+            self._begin_interactive_range_session()
+        if newer_batch:
+            self._interactive_frames_by_set.clear()
+            self._interactive_terminal_states.clear()
+            self._interactive_target_set_ids = None
+        if not self._interactive_display.has_visible_frame:
+            self._begin_interactive_range_session()
+            # Completed physical items remain visible and owned by the normal
+            # renderer.  The transition controller starts from an empty
+            # overlay instead of cloning that potentially huge scene.
+            baseline = InteractiveDisplayProjection(
+                tab_id=projection.tab_id,
+                set_id=target.set_id,
+                generation=target.generation,
+                x_label=projection.x_label,
+                y_label=projection.y_label,
+                curves=(),
+                target_set_ids=roster,
+                batch_id=target.batch_id,
+            )
+            self._interactive_display.synchronize(baseline)
+        if self._interactive_target_set_ids is None:
+            self._interactive_batch_id = target.batch_id
+            self._interactive_target_set_ids = roster
+        elif (
+            self._interactive_target_set_ids != roster
+            or self._interactive_batch_id != target.batch_id
+        ):
+            return False
+        if target.set_id in self._interactive_terminal_states:
+            return False
+        self._interactive_generation = target.generation
+        self._interactive_stopped = False
+        self._interactive_retired = False
+        self._interactive_frames_by_set[target.set_id] = frame
+        self._interactive_display.offer(self._compose_interactive_batch(projection))
+        return True
+
+    def apply_interactive_preview_terminal_outcome(self, outcome: object) -> bool:
+        """Consume one explicit worker terminal outcome.
+
+        The protocol owner supplies an ``InteractivePreviewTerminalOutcome``
+        with a batch identity, target identity, and terminal state.  No
+        repository entry or repository identity is inspected here.  Successful
+        outcomes are held until the completed projection owner publishes the
+        corresponding exact scene; failures and cancellations immediately retire
+        only that target's overlay.
+        """
+
+        projection = self._applied_projection
+        batch = getattr(outcome, "batch", None)
+        state_value = getattr(outcome, "state", None)
+        state = getattr(state_value, "value", state_value)
+        state = str(state or "").strip().lower()
+        if projection is None or batch is None:
+            return False
+        tab_id = str(getattr(batch, "tab_id", ""))
+        generation = getattr(batch, "generation", None)
+        batch_id = str(getattr(batch, "batch_id", "")).strip()
+        roster = tuple(getattr(batch, "target_set_ids", ()))
+        set_id = str(getattr(outcome, "target_set_id", ""))
+        if (
+            tab_id != projection.tab_id
+            or type(generation) is not int
+            or generation <= 0
+            or not batch_id
+            or not roster
+            or set_id not in roster
+            or state
+            not in {"success", "failure", "cancelled", "stopped", "obsolete"}
+            or self._interactive_generation not in {None, generation}
+            or self._interactive_target_set_ids not in {None, roster}
+        ):
+            return False
+        if self._interactive_stopped:
+            return False
+        if state == "stopped":
+            self.stop_interactive_display()
+            return True
+        if set_id in self._interactive_terminal_states:
+            return False
+        if not bool(getattr(outcome, "settles_display", True)):
+            # Computational obsolescence is not physical retirement.  The last
+            # stable overlay remains visible until a newer frame or a terminal
+            # bound to the displayed batch settles it.
+            return True
+        self._interactive_generation = generation
+        if self._interactive_batch_id not in {None, batch_id}:
+            return False
+        self._interactive_batch_id = batch_id
+        if self._interactive_target_set_ids is None:
+            self._interactive_target_set_ids = roster
+        if state == "success":
+            self._interactive_terminal_states[set_id] = "success"
+            return True
+
+        self._interactive_terminal_states[set_id] = state
+        self._interactive_frames_by_set.pop(set_id, None)
+        self._restore_interactive_foreground_items(
+            keep_set_ids=set(self._interactive_frames_by_set)
+        )
+        if self._interactive_frames_by_set:
+            self._interactive_display.offer(self._compose_interactive_batch(projection))
+            self._interactive_display.refresh()
+        else:
+            # A failed target must not leave its approximate curve looking like
+            # accepted science.  Clearing only transient items leaves the
+            # completed scene, legend, export authority, and range untouched.
+            self._finish_interactive_terminal_cleanup()
+        return True
+
+    def retire_interactive_preview(self, tab_id: str, generation: int) -> bool:
+        """Retire cadence/currentness while retaining the last visible frame."""
+
+        projection = self._applied_projection
+        if projection is None or str(tab_id) != projection.tab_id:
+            return False
+        active_generation = self._interactive_generation
+        if active_generation is None or int(generation) < active_generation:
+            return False
+        self._interactive_generation = int(generation)
+        self._interactive_retired = True
+        self._interactive_display.stop()
+        return True
+
+    def stop_interactive_display(self) -> bool:
+        """Cancel visual work and freeze the last physically stable display."""
+
+        if not self._interactive_display.has_visible_frame:
+            return False
+        self._interactive_stopped = True
+        self._interactive_frames_by_set.clear()
+        self._interactive_terminal_states.clear()
+        self._interactive_display.stop()
+        self._axis_toolbar.set_interactive_gesture_active(False)
+        return True
 
     def apply_application_plot_preferences(
         self,
@@ -304,6 +547,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 # bounds update, so prepareForPaint cannot recompose this view.
                 view_box.state["autoRange"] = list(previous_auto_range)
                 view_box._autoRangeNeedsUpdate = False
+            if self._interactive_display.has_visible_frame:
+                if self._interactive_locked_view is not None:
+                    self._restore_interactive_view(self._interactive_locked_view)
+                self._mask_interactive_foreground_items(
+                    self._interactive_overlay_set_ids()
+                )
         except Exception as exc:
             self._clear_rejected_result_scene()
             self.renderFailed.emit(str(exc))
@@ -330,8 +579,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._presentation = state
         if self._applied_projection is not None:
             self._apply_plot_presentation(state)
+            if self._interactive_locked_view is not None:
+                self._restore_interactive_view(self._interactive_locked_view)
 
     def drop_tab_session_state(self) -> None:
+        self._discard_interactive_display()
         self._manual_annotations.clear()
         self._scalar_guides.clear()
         self._interaction_mode = "pan"
@@ -342,6 +594,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
 
+        self._discard_interactive_display()
         self._manual_annotations.clear()
         self._scalar_guides.clear()
         self._interaction_mode = "pan"
@@ -363,6 +616,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Revoke only this physical page's applied result authority."""
 
         self._cancel_copy()
+        self._discard_interactive_display()
         for clear in (
             self._clear_plot_items,
             lambda: self._parameter_table.setRowCount(0),
@@ -376,6 +630,317 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._applied_projection = None
         self._rendered_blocks = ()
 
+    def _compose_interactive_batch(
+        self,
+        projection: WorkspaceResultProjection,
+    ) -> InteractiveDisplayProjection:
+        roster = self._interactive_target_set_ids
+        if not roster:
+            raise RuntimeError("interactive display batch has no target roster.")
+        frames = tuple(
+            self._interactive_frames_by_set[set_id]
+            for set_id in roster
+            if set_id in self._interactive_frames_by_set
+        )
+        if not frames:
+            raise RuntimeError("interactive display batch has no transient frames.")
+        return WorkspaceResultPresenter.compose_interactive_display_batch(
+            frames,
+            projection=projection,
+        )
+
+    def _request_interactive_tick(self, delay_seconds: float) -> None:
+        milliseconds = max(0, int(np.ceil(float(delay_seconds) * 1000.0)))
+        self._interactive_timer.start(milliseconds)
+
+    @QtCore.Slot()
+    def _advance_interactive_display(self) -> None:
+        self._interactive_display.tick()
+
+    def _begin_interactive_range_session(self) -> None:
+        view_box = self._plot_widget.getPlotItem().getViewBox()
+        x_range, y_range = view_box.viewRange()
+        self._interactive_locked_view = (
+            (float(x_range[0]), float(x_range[1])),
+            (float(y_range[0]), float(y_range[1])),
+        )
+        self._axis_toolbar.set_interactive_gesture_active(True)
+        self._restore_interactive_view(self._interactive_locked_view)
+
+    def _restore_interactive_view(
+        self,
+        view: tuple[tuple[float, float], tuple[float, float]],
+    ) -> None:
+        view_box = self._plot_widget.getPlotItem().getViewBox()
+        view_box.disableAutoRange()
+        self._plot_widget.setXRange(view[0][0], view[0][1], padding=0)
+        self._plot_widget.setYRange(view[1][0], view[1][1], padding=0)
+
+    def _render_interactive_display(
+        self,
+        state: InteractiveDisplayState,
+    ) -> None:
+        overlay_sets = {
+            str(curve.key[2])
+            for layer in state.layers
+            for curve in layer.projection.curves
+            if len(curve.key) >= 3
+            and curve.key[0] == "simulation"
+            and curve.key[1] == "foreground"
+        }
+        self._interactive_visible_overlay_set_ids = set(overlay_sets)
+        self._mask_interactive_foreground_items(overlay_sets)
+        existing = dict(self._interactive_items)
+        rendered: dict[tuple[object, ...], Any] = {}
+        for layer_index, layer in enumerate(state.layers):
+            for curve in layer.projection.curves:
+                style = "marker" if curve.markers else "line"
+                color = QtGui.QColor(curve.color)
+                if not color.isValid():
+                    raise ValueError(
+                        f"Interactive curve {curve.label!r} has an invalid color."
+                    )
+                for chunk_index, (start, end) in enumerate(
+                    self._interactive_curve_chunks(curve)
+                ):
+                    item_key = (
+                        layer_index,
+                        *curve.key,
+                        "segment",
+                        chunk_index,
+                        style,
+                    )
+                    item = existing.get(item_key)
+                    if item is None:
+                        if curve.markers:
+                            item = self._plot_widget.plot(
+                                curve.x[start:end],
+                                curve.y[start:end],
+                                pen=None,
+                                symbol="o",
+                                symbolSize=curve.point_size,
+                                symbolBrush=pg.mkBrush(color),
+                                symbolPen=pg.mkPen(color),
+                                name=None,
+                            )
+                        else:
+                            item = self._plot_widget.plot(
+                                curve.x[start:end],
+                                curve.y[start:end],
+                                pen=pg.mkPen(
+                                    color=color,
+                                    width=2,
+                                    style=(
+                                        QtCore.Qt.PenStyle.DashLine
+                                        if curve.dashed
+                                        else QtCore.Qt.PenStyle.SolidLine
+                                    ),
+                                ),
+                                name=None,
+                            )
+                    else:
+                        item.setData(curve.x[start:end], curve.y[start:end])
+                        if curve.markers:
+                            item.setSymbolSize(curve.point_size)
+                            item.setSymbolBrush(pg.mkBrush(color))
+                            item.setSymbolPen(pg.mkPen(color))
+                        else:
+                            item.setPen(
+                                pg.mkPen(
+                                    color=color,
+                                    width=2,
+                                    style=(
+                                        QtCore.Qt.PenStyle.DashLine
+                                        if curve.dashed
+                                        else QtCore.Qt.PenStyle.SolidLine
+                                    ),
+                                )
+                            )
+                    item.setOpacity(layer.opacity * curve.opacity)
+                    rendered[item_key] = item
+                for connector in curve.intervention_connectors:
+                    boundary_index, boundary_time, pre_value, post_value = connector
+                    item_key = (
+                        layer_index,
+                        *curve.key,
+                        "intervention-boundary",
+                        boundary_index,
+                    )
+                    item = existing.get(item_key)
+                    pen = pg.mkPen(
+                        color=color,
+                        width=2,
+                        style=(
+                            QtCore.Qt.PenStyle.DashLine
+                            if curve.dashed
+                            else QtCore.Qt.PenStyle.SolidLine
+                        ),
+                    )
+                    if item is None:
+                        item = self._plot_widget.plot(
+                            [boundary_time, boundary_time],
+                            [pre_value, post_value],
+                            pen=pen,
+                            name=None,
+                        )
+                    else:
+                        item.setData(
+                            [boundary_time, boundary_time],
+                            [pre_value, post_value],
+                        )
+                        item.setPen(pen)
+                    item.setOpacity(layer.opacity * curve.opacity)
+                    rendered[item_key] = item
+        for item_key, item in existing.items():
+            if item_key not in rendered:
+                self._remove_plot_item(item)
+        self._interactive_items = rendered
+        locked_view = self._interactive_locked_view
+        if locked_view is not None:
+            self._restore_interactive_view(locked_view)
+        if state.exact:
+            self._finish_interactive_exact_settle()
+
+    def _interactive_overlay_set_ids(self) -> set[str]:
+        return set(self._interactive_visible_overlay_set_ids)
+
+    @staticmethod
+    def _interactive_curve_chunks(
+        curve: object,
+    ) -> tuple[tuple[int, int], ...]:
+        """Split a transient curve at every executor-issued topology change."""
+
+        x = getattr(curve, "x")
+        count = int(x.size)
+        if count == 0:
+            return ()
+        segment_ids = getattr(curve, "segment_ids", None)
+        segment_keys = getattr(curve, "segment_keys", None)
+        discontinuities = getattr(curve, "discontinuity_ids", None)
+        if segment_ids is None or segment_keys is None or discontinuities is None:
+            return ((0, count),)
+        starts = [0]
+        starts.extend(
+            index
+            for index in range(1, count)
+            if (
+                int(segment_ids[index]) != int(segment_ids[index - 1])
+                or segment_keys[index] != segment_keys[index - 1]
+                or int(discontinuities[index])
+                != int(discontinuities[index - 1])
+            )
+        )
+        return tuple(
+            (
+                start,
+                starts[position + 1] if position + 1 < len(starts) else count,
+            )
+            for position, start in enumerate(starts)
+        )
+
+    def _clear_interactive_items(self) -> None:
+        for item in tuple(self._interactive_items.values()):
+            self._remove_plot_item(item)
+        self._interactive_items.clear()
+
+    def _mask_interactive_foreground_items(self, set_ids: set[str]) -> None:
+        """Reconcile completed foreground opacity to the exact overlay roster."""
+
+        active = {str(set_id) for set_id in set_ids}
+        for item_key, (item, opacity, set_id) in tuple(
+            self._interactive_masked_items.items()
+        ):
+            if set_id in active:
+                continue
+            self._interactive_masked_items.pop(item_key, None)
+            try:
+                item.setOpacity(opacity)
+            except (RuntimeError, TypeError, ValueError):
+                pass
+
+        for set_id in active:
+            for item in self._interactive_foreground_items_by_set.get(set_id, ()):
+                item_key = id(item)
+                if item_key in self._interactive_masked_items:
+                    continue
+                opacity = getattr(item, "opacity", None)
+                if not callable(opacity):
+                    continue
+                current = float(opacity())
+                self._interactive_masked_items[item_key] = (
+                    item,
+                    current,
+                    set_id,
+                )
+                item.setOpacity(0.0)
+
+    def _restore_interactive_foreground_items(
+        self,
+        *,
+        keep_set_ids: set[str] | None = None,
+    ) -> None:
+        """Restore completed foreground opacity outside an active overlay roster."""
+
+        keep = None if keep_set_ids is None else {str(value) for value in keep_set_ids}
+        masked = tuple(self._interactive_masked_items.items())
+        for item_key, (item, opacity, set_id) in masked:
+            if keep is not None and set_id in keep:
+                continue
+            self._interactive_masked_items.pop(item_key, None)
+            try:
+                item.setOpacity(opacity)
+            except (RuntimeError, TypeError, ValueError):
+                pass
+
+    def _finish_interactive_terminal_cleanup(self) -> None:
+        """Clear transient custody after failure, cancellation, or rejection."""
+
+        self._restore_interactive_foreground_items()
+        self._clear_interactive_items()
+        self._interactive_display.clear()
+        self._interactive_generation = None
+        self._interactive_batch_id = None
+        self._interactive_target_set_ids = None
+        self._interactive_frames_by_set.clear()
+        self._interactive_terminal_states.clear()
+        self._interactive_visible_overlay_set_ids.clear()
+        self._interactive_retired = False
+        self._interactive_stopped = False
+        self._interactive_locked_view = None
+        self._axis_toolbar.set_interactive_gesture_active(False)
+        self._apply_axis_range_state(self._axis_range, self._presentation)
+
+    def _finish_interactive_exact_settle(self) -> None:
+        self._restore_interactive_foreground_items()
+        self._clear_interactive_items()
+        self._interactive_display.clear()
+        self._interactive_generation = None
+        self._interactive_batch_id = None
+        self._interactive_target_set_ids = None
+        self._interactive_frames_by_set.clear()
+        self._interactive_terminal_states.clear()
+        self._interactive_visible_overlay_set_ids.clear()
+        self._interactive_retired = False
+        self._interactive_stopped = False
+        self._interactive_locked_view = None
+        self._axis_toolbar.set_interactive_gesture_active(False)
+        self._apply_axis_range_state(self._axis_range, self._presentation)
+
+    def _discard_interactive_display(self) -> None:
+        self._restore_interactive_foreground_items()
+        self._interactive_display.clear()
+        self._clear_interactive_items()
+        self._interactive_generation = None
+        self._interactive_batch_id = None
+        self._interactive_target_set_ids = None
+        self._interactive_frames_by_set.clear()
+        self._interactive_terminal_states.clear()
+        self._interactive_visible_overlay_set_ids.clear()
+        self._interactive_retired = False
+        self._interactive_stopped = False
+        self._interactive_locked_view = None
+        self._axis_toolbar.set_interactive_gesture_active(False)
+
     def _clear_completion_warning(self) -> None:
         self._completion_warning_badge.setText("Completed with warnings")
         self._completion_warning_badge.setToolTip("")
@@ -385,6 +950,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self,
         projection: WorkspaceResultProjection,
     ) -> tuple[ResultDataBlock, ...]:
+        self._restore_interactive_foreground_items()
         existing_items = dict(self._plot_items_by_key)
         self._clear_annotation_items()
         self._plot_widget.setLabel("bottom", projection.x_label)
@@ -393,6 +959,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         rendered_blocks: list[ResultDataBlock] = []
         rendered_items: dict[tuple[object, ...], object] = {}
         physical_items: dict[tuple[AxisSeriesSelection, bool], list[object]] = {}
+        foreground_items: dict[str, list[object]] = {}
+        reference_items: list[object] = []
         self._curve_items = []
         for layer in projection.plot_layers:
             if not layer.visible:
@@ -407,6 +975,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 existing_items=existing_items,
                 rendered_items=rendered_items,
                 physical_items=physical_items,
+                foreground_items=foreground_items,
+                reference_items=reference_items,
             )
             if rendered is not None:
                 rendered_blocks.append(rendered)
@@ -418,6 +988,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         self._plot_items_by_key = rendered_items
         self._physical_items_by_axis = physical_items
+        reference_ids = {id(item) for item in reference_items}
+        self._interactive_foreground_items_by_set = {
+            set_id: tuple(item for item in items if id(item) not in reference_ids)
+            for set_id, items in foreground_items.items()
+        }
         self._axis_toolbar.set_x_candidates(
             projection.axis_candidates,
             selected=projection.selected_x_series,
@@ -553,6 +1128,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         rendered_items: dict[tuple[object, ...], object] | None = None,
         physical_items: dict[tuple[AxisSeriesSelection, bool], list[object]]
         | None = None,
+        foreground_items: dict[str, list[object]] | None = None,
+        reference_items: list[object] | None = None,
     ) -> ResultDataBlock | None:
         if layer.kind is not block.kind:
             raise ValueError("plot layer and data block kinds must match.")
@@ -582,6 +1159,19 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         item_store = rendered_items if rendered_items is not None else {}
         physical_store = physical_items if physical_items is not None else {}
         existing_store = existing_items if existing_items is not None else {}
+        foreground_store = (
+            foreground_items if foreground_items is not None else {}
+        )
+        foreground_set_id = (
+            layer.layer_id.set_id
+            if isinstance(layer.layer_id, SimulationResultLayerIdentity)
+            else None
+        )
+        foreground_layer = layer.kind in {
+            ResultLayerKind.EXPLICIT,
+            ResultLayerKind.PREVIEW,
+        }
+        reference_store = reference_items if reference_items is not None else []
         physical_layer_identity = self._physical_layer_identity(layer)
         for series_name, values in block.series:
             y = values[sample]
@@ -652,6 +1242,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 item.setOpacity(layer.opacity)
                 item_store[item_key] = item
                 self._curve_items.append(item)
+                if foreground_layer and foreground_set_id is not None:
+                    foreground_store.setdefault(foreground_set_id, []).append(item)
+                if layer.kind is ResultLayerKind.REFERENCE:
+                    reference_store.append(item)
                 physical_store.setdefault(
                     (axis_selection, is_experimental_marker),
                     [],
@@ -697,6 +1291,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             item.setOpacity(layer.opacity)
             item_store[item_key] = item
             self._curve_items.append(item)
+            if foreground_layer and foreground_set_id is not None:
+                foreground_store.setdefault(foreground_set_id, []).append(item)
+            if layer.kind is ResultLayerKind.REFERENCE:
+                reference_store.append(item)
             physical_store.setdefault(
                 (SimulationSeriesAxisSelection(species_name), False),
                 [],
@@ -1061,10 +1659,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self.apply_workspace_result_projection(projection)
 
     def _clear_plot_items(self) -> None:
+        self._restore_interactive_foreground_items()
         self._plot_widget.clear()
         self._curve_items.clear()
         self._plot_items_by_key.clear()
         self._physical_items_by_axis.clear()
+        self._interactive_foreground_items_by_set.clear()
         self._annotation_items.clear()
         self._legend = self._plot_widget.addLegend()
 

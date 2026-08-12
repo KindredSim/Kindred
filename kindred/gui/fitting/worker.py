@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from threading import Condition, Event
@@ -25,7 +25,10 @@ from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetSpec,
     FitObservationSeries,
 )
-from kindred.core.analysis.global_fitting import fit_global
+from kindred.core.analysis.global_fitting import (
+    fit_global,
+    fit_global_shared_refit,
+)
 from kindred.core.analysis.global_fit_execution import (
     FitProgress,
     GlobalFitResult,
@@ -37,6 +40,7 @@ from kindred.core.analysis.parametric_alignment import (
     align_y_on_x_obs,
 )
 from kindred.core.exceptions import FitSimulationError, FittingCancelled
+from kindred.core.fitting_completion import FitTerminalExtension
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
@@ -55,6 +59,7 @@ from kindred.core.simulator.wegscheider_symbolic import (
 from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.gui.fitting.contracts import (
     FitRunIdentity,
+    FitWorkerFailure,
 )
 from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
@@ -447,6 +452,7 @@ class FitCandidate:
     local_observables: tuple[FitLocalObservable, ...]
     result: GlobalFitResult
     run_identity: FitRunIdentity
+    nominal_setup_snapshot: FitSetupSnapshot
     setup_snapshot: FitSetupSnapshot
     resolved_auto_modes: tuple[tuple[str, str], ...]
 
@@ -455,9 +461,13 @@ class FitCandidate:
             raise TypeError("Fit candidate origin must be retained.")
         if not isinstance(self.result, GlobalFitResult):
             raise TypeError("Fit candidate result must be canonical.")
+        if not isinstance(self.nominal_setup_snapshot, FitSetupSnapshot):
+            raise TypeError("Fit candidate nominal setup must be retained.")
         if (
             self.setup_snapshot.origin_tab_id != self.origin.tab_id
             or self.setup_snapshot.origin_capture_id != self.origin.capture_id
+            or self.nominal_setup_snapshot.origin_tab_id != self.origin.tab_id
+            or self.nominal_setup_snapshot.origin_capture_id != self.origin.capture_id
         ):
             raise ValueError(
                 "Fit candidate origin and terminal setup identities must match."
@@ -523,21 +533,38 @@ class FitWorkerTerminal:
     """The one result retained by a worker until native ``finished``."""
 
     candidate: FitCandidate | None
-    message: str
+    failure: FitWorkerFailure | None = None
     cancelled: bool = False
 
     def __post_init__(self) -> None:
-        message = str(self.message or "").strip()
         if self.candidate is not None:
             if not isinstance(self.candidate, FitCandidate):
                 raise TypeError("Fit worker candidate must be FitCandidate.")
-            if message or self.cancelled:
+            if self.failure is not None or self.cancelled:
                 raise ValueError(
                     "A successful Fit terminal cannot also be failed or cancelled."
                 )
-        elif not message:
-            raise ValueError("A non-success Fit terminal requires a message.")
-        object.__setattr__(self, "message", message)
+        elif self.cancelled:
+            if self.failure is not None:
+                raise ValueError("A cancelled Fit terminal cannot also fail.")
+        elif not isinstance(self.failure, FitWorkerFailure):
+            raise ValueError("A failed Fit terminal requires a typed failure.")
+
+    @property
+    def message(self) -> str:
+        """Compact status text; structured provenance remains in ``failure``."""
+
+        if self.failure is not None:
+            return self.failure.message
+        return "Fit cancelled." if self.cancelled else ""
+
+    @property
+    def terminal_extensions(self) -> tuple[FitTerminalExtension, ...]:
+        """Expose the canonical result extensions without copying authority."""
+
+        if self.candidate is None:
+            return ()
+        return tuple(self.candidate.result.completion.terminal_extensions)
 
 
 def _observed_curve_parts(
@@ -737,7 +764,7 @@ def _compile_optimizer_coordinates(
                         log10=config.log10,
                     )
                 )
-        elif parameter.scope == "per_dataset":
+        elif parameter.scope in {"per_dataset", "hierarchical"}:
             for dataset_id in included_ids:
                 fixed_by_dataset[dataset_id][parameter.name] = float(
                     dataset_values[dataset_id]
@@ -1026,6 +1053,10 @@ def _terminal_setup_snapshot(
         parameter.name: parameter
         for parameter in request.parameters
     }
+    promotions = {
+        item.parameter_name: item
+        for item in request.shared_refit_promotions
+    }
     parameters = []
     for parameter in setup_snapshot.parameters:
         requested = request_parameters.get(parameter.name)
@@ -1039,6 +1070,35 @@ def _terminal_setup_snapshot(
         if not requested_config.fit:
             parameters.append(
                 _replace_fit_parameter(parameter, dataset_values=dataset_values)
+            )
+            continue
+        promotion = promotions.get(parameter.name)
+        if promotion is not None:
+            if requested.scope != "per_dataset":
+                raise ValueError(
+                    "Shared-refit promotion source must remain Per-dataset."
+                )
+            if parameter.name not in shared_results:
+                raise ValueError(
+                    f"Shared refit omitted promoted parameter {parameter.name!r}."
+                )
+            value = shared_results[parameter.name]
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Shared refit contains non-finite promoted parameter "
+                    f"{parameter.name!r}."
+                )
+            parameters.append(
+                _replace_fit_parameter(
+                    parameter,
+                    scope="shared",
+                    initial=value,
+                    minimum=promotion.minimum,
+                    maximum=promotion.maximum,
+                    fit=True,
+                    log10=promotion.log10,
+                    dataset_values=(),
+                )
             )
             continue
         if requested.scope == "shared":
@@ -1066,7 +1126,7 @@ def _terminal_setup_snapshot(
         }
         if not included_ids.issubset(expected_ids):
             raise ValueError(
-                f"Per-dataset parameter {parameter.name!r} no longer "
+                f"Dataset-scoped parameter {parameter.name!r} no longer "
                 "matches the included dataset identities."
             )
         fitted_by_id = dict(requested_config.dataset_values)
@@ -1076,7 +1136,7 @@ def _terminal_setup_snapshot(
             values = dataset_results.get(dataset_id)
             if values is None or parameter.name not in values:
                 raise ValueError(
-                    f"Fit result omitted per-dataset parameter "
+                    f"Fit result omitted dataset-scoped parameter "
                     f"{parameter.name!r} for {dataset_id!r}."
                 )
             value = values[parameter.name]
@@ -1165,6 +1225,7 @@ def _terminal_setup_snapshot(
         global_initials=global_initials,
         initial_scopes=setup_snapshot.initial_scopes,
         local_observables=setup_snapshot.local_observables,
+        shared_refit_promotions=(),
     )
 
 
@@ -1617,6 +1678,12 @@ def _compact_metadata(value: object) -> object:
         return _array_identity(value)
     if isinstance(value, np.generic):
         return _compact_metadata(value.item())
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(
+                "Fit terminal metadata cannot transport a non-finite number."
+            )
+        return value
     if isinstance(value, Mapping):
         return {
             str(key): _compact_metadata(item)
@@ -1828,8 +1895,6 @@ def _compile_fit_run_identity_payload(
     return {
         "kind": "global_fit_run",
         "schema_version": 2,
-        "origin_tab_id": request.origin.tab_id,
-        "origin_capture_id": request.origin.capture_id,
         "mechanism_text": request.mechanism_source.reactions_text,
         "fit_solver": request.solver,
         "dataset_weight_mode": request.dataset_weight_mode,
@@ -1841,9 +1906,9 @@ def _compile_fit_run_identity_payload(
                     {
                         "name": scalar.name,
                         "value": float(scalar.value),
-                        "minimum": _stamp_bound(scalar.minimum),
-                        "maximum": _stamp_bound(scalar.maximum),
-                        "scope": scalar.scope,
+                        # Bounds and scope are Fit setup policy, not
+                        # executable DSL identity.  The admitted scalar value
+                        # and expression are present in the derived source.
                     }
                     for scalar in definition.scalar_parameters
                 ],
@@ -1909,6 +1974,58 @@ def _compile_fit_run_identity_payload(
             "xtol": request.defaults.xtol,
             "use_seed": request.defaults.use_seed,
             "seed": request.defaults.seed if request.defaults.use_seed else None,
+        },
+        "advanced_analysis": {
+            "profile_likelihood": (
+                {
+                    "parameter_names": request.profile_likelihood.parameter_names,
+                    "confidence_level": request.profile_likelihood.confidence_level,
+                    "points_per_side": request.profile_likelihood.points_per_side,
+                    "max_nfev_per_point": request.profile_likelihood.max_nfev_per_point,
+                    "optimizer_method": request.profile_likelihood.optimizer_method,
+                    "likelihood_ratio_threshold": request.profile_likelihood.likelihood_ratio_threshold,
+                }
+                if request.profile_likelihood is not None
+                else None
+            ),
+            "residual_bootstrap": (
+                {
+                    "parameter_names": request.residual_bootstrap.parameter_names,
+                    "seed": request.residual_bootstrap.seed,
+                    "replicates": request.residual_bootstrap.replicates,
+                    "confidence_level": request.residual_bootstrap.confidence_level,
+                    "minimum_successful_replicates": request.residual_bootstrap.minimum_successful_replicates,
+                    "minimum_success_fraction": request.residual_bootstrap.minimum_success_fraction,
+                }
+                if request.residual_bootstrap is not None
+                else None
+            ),
+            "hierarchical": [
+                {
+                    "parameter_name": item.parameter_name,
+                    "initial_population": item.initial_population,
+                    "minimum": item.minimum,
+                    "maximum": item.maximum,
+                    "log10": item.log10,
+                    "initial_dispersion": item.initial_dispersion,
+                    "minimum_dispersion": item.minimum_dispersion,
+                    "maximum_dispersion": item.maximum_dispersion,
+                    "optimizer_method": item.optimizer_method,
+                    "max_nfev": item.max_nfev,
+                    "inner_max_nfev": item.inner_max_nfev,
+                }
+                for item in request.hierarchical
+            ],
+            "shared_refit_promotions": [
+                {
+                    "parameter_name": item.parameter_name,
+                    "minimum": item.minimum,
+                    "maximum": item.maximum,
+                    "log10": item.log10,
+                    "seed_statistic": item.seed_statistic,
+                }
+                for item in request.shared_refit_promotions
+            ],
         },
         "scientific_settings": {
             "temperature": float(request.origin.scientific_settings.temperature),
@@ -2022,8 +2139,15 @@ def _assemble_fit_terminal(
         "optimizer_converged": bool(result.completion.optimizer_converged),
         "message": str(result.message),
         "nfev": int(result.nfev),
-        "weighted_residual_sse": float(result.weighted_residual_sse),
-        "weighted_residual_mse": float(result.weighted_residual_mse),
+        "scipy_nfev": int(result.scipy_nfev),
+        "terminal_replay_count": int(result.terminal_replay_count),
+        "objective_call_count": (
+            None
+            if result.objective_call_count is None
+            else int(result.objective_call_count)
+        ),
+        "weighted_residual_sse": result.weighted_residual_sse.to_payload(),
+        "weighted_residual_mse": result.weighted_residual_mse.to_payload(),
         "effective_dataset_weights": {
             dataset_id: effective_dataset_weights[dataset_id]
             for dataset_id in sorted(effective_dataset_weights)
@@ -2048,6 +2172,20 @@ def _assemble_fit_terminal(
             for dataset_id, values in sorted(result.dataset_params.items())
             if dataset_id in included_id_set
         },
+        "shared_refit_provenance": _compact_metadata(
+            result.shared_refit_provenance
+        ),
+        "terminal_extensions": [
+            {
+                "kind": item.kind,
+                "status": item.status,
+                "method": item.method,
+                "provenance": _compact_metadata(item.provenance),
+                "details": _compact_metadata(item.details),
+                "unavailable_reason": item.unavailable_reason,
+            }
+            for item in result.completion.terminal_extensions
+        ],
         "result_array_identity": _result_array_identity(result),
         "simulation_result_array_identity": (
             _simulation_result_array_identity(result)
@@ -2062,10 +2200,89 @@ def _assemble_fit_terminal(
         local_observables=terminal_snapshot.local_observables,
         result=result,
         run_identity=run_identity,
+        nominal_setup_snapshot=setup_snapshot,
         setup_snapshot=terminal_snapshot,
         resolved_auto_modes=resolved_modes,
     )
     return candidate
+
+
+def _execute_global_fit_model(
+    *,
+    request: FitExecutionRequest,
+    previous_candidate: FitCandidate | None,
+    evaluators: Mapping[str, object],
+    datasets: Sequence[FitDatasetSpec],
+    shared_variables: Sequence[FitSharedVariableParamSpec],
+    overrides: Sequence[FitDatasetParameterOverrides],
+    coupled_variables: Sequence[FitCoupledVariableParamSpec],
+    weights: Mapping[str, float] | None,
+    progress_callback: Callable[[FitProgress], None],
+    cancellation_check: Callable[[], bool],
+    cancellation_control: SimulationCancellationControl,
+) -> GlobalFitResult:
+    """Dispatch one exact normal, advanced, or promotion Fit execution."""
+
+    common = {
+        "fit_evaluators": evaluators,
+        "datasets": datasets,
+        "weights": weights,
+        "method": request.defaults.method,
+        "max_nfev": int(request.defaults.max_nfev),
+        "ftol": float(request.defaults.ftol),
+        "xtol": float(request.defaults.xtol),
+        "seed": (
+            int(request.defaults.seed)
+            if request.defaults.use_seed
+            else None
+        ),
+        "progress_callback": progress_callback,
+        "cancellation_check": cancellation_check,
+        "cancellation_control": cancellation_control,
+        "profile_likelihood": request.profile_likelihood,
+        "residual_bootstrap": request.residual_bootstrap,
+    }
+    promotions = tuple(request.shared_refit_promotions)
+    if not promotions:
+        return fit_global(
+            shared_variables=shared_variables,
+            dataset_overrides=overrides,
+            coupled_variables=coupled_variables,
+            hierarchical=request.hierarchical,
+            **common,
+        )
+    if previous_candidate is None:
+        raise RuntimeError("Shared refit lost its previous candidate.")
+    promoted_names = {item.parameter_name for item in promotions}
+    refit_overrides = tuple(
+        replace(
+            override,
+            variable_params=tuple(
+                item
+                for item in override.variable_params
+                if item.name not in promoted_names
+            ),
+            fixed_params=tuple(
+                item
+                for item in override.fixed_params
+                if item[0] not in promoted_names
+            ),
+        )
+        for override in overrides
+    )
+    refit_coupled = tuple(
+        item
+        for item in coupled_variables
+        if item.parameter_name not in promoted_names
+    )
+    return fit_global_shared_refit(
+        previous_result=previous_candidate.result,
+        promotions=promotions,
+        existing_shared_variables=shared_variables,
+        dataset_overrides=refit_overrides,
+        coupled_variables=refit_coupled,
+        **common,
+    )
 
 
 class GlobalFitWorker(QtCore.QThread):
@@ -2081,12 +2298,53 @@ class GlobalFitWorker(QtCore.QThread):
         self,
         request: FitExecutionRequest,
         *,
+        previous_candidate: FitCandidate | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
         if not isinstance(request, FitExecutionRequest):
             raise TypeError("request must be FitExecutionRequest.")
+        promotions = tuple(request.shared_refit_promotions)
+        if promotions:
+            if (
+                request.profile_likelihood is not None
+                or request.residual_bootstrap is not None
+                or request.hierarchical
+            ):
+                raise ValueError(
+                    "Shared refit must complete before configuring uncertainty "
+                    "or Hierarchical methods on its new Shared setup."
+                )
+            if not isinstance(previous_candidate, FitCandidate):
+                raise TypeError(
+                    "Shared refit execution requires its previous Fit candidate."
+                )
+            if (
+                previous_candidate.origin.tab_id != request.origin.tab_id
+                or previous_candidate.origin.capture_id
+                != request.origin.capture_id
+            ):
+                raise ValueError(
+                    "Shared refit previous candidate belongs to a stale Fit origin."
+                )
+            previous_roster = {
+                item.dataset_id
+                for item in previous_candidate.setup_snapshot.datasets
+                if item.included
+            }
+            request_roster = {
+                item.dataset_id for item in request.datasets if item.included
+            }
+            if previous_roster != request_roster:
+                raise ValueError(
+                    "Shared refit requires the previous executed included roster."
+                )
+        elif previous_candidate is not None:
+            raise ValueError(
+                "A previous Fit candidate is accepted only for Shared refit."
+            )
         self._request = request
+        self._previous_candidate = previous_candidate
         self._setup_snapshot = FitSetupSnapshot.from_request(request)
         self._cancelled = Event()
         self._cancellation_control = SimulationCancellationControl(
@@ -2232,25 +2490,22 @@ class GlobalFitWorker(QtCore.QThread):
         except FittingCancelled:
             terminal = FitWorkerTerminal(
                 candidate=None,
-                message="Fit cancelled.",
                 cancelled=True,
             )
         except BaseException as exc:  # noqa: BLE001
             terminal = FitWorkerTerminal(
                 candidate=None,
-                message=str(exc) or type(exc).__name__,
+                failure=FitWorkerFailure.from_exception(exc),
             )
         else:
             if self._checkpoint():
                 terminal = FitWorkerTerminal(
                     candidate=None,
-                    message="Fit cancelled.",
                     cancelled=True,
                 )
             else:
                 terminal = FitWorkerTerminal(
                     candidate=candidate,
-                    message="",
                 )
         self._terminal_result = terminal
 
@@ -2393,7 +2648,7 @@ class GlobalFitWorker(QtCore.QThread):
             starting_values = {
                 parameter.name: (
                     dict(parameter.selected_config.dataset_values)[dataset_id]
-                    if parameter.scope == "per_dataset"
+                    if parameter.scope in {"per_dataset", "hierarchical"}
                     else parameter.selected_config.value
                 )
                 for parameter in request.parameters
@@ -2601,7 +2856,7 @@ class GlobalFitWorker(QtCore.QThread):
                         ),
                     ),
                 ),
-                f"Objective calls {objective_calls}: objective SSQ={cost:.4g}",
+                f"Objective calls {objective_calls}: weighted objective SSQ={cost:.4g}",
             )
             if self._checkpoint():
                 raise FittingCancelled()
@@ -2636,26 +2891,20 @@ class GlobalFitWorker(QtCore.QThread):
                             raise FittingCancelled()
                     self._last_curve_emit = now
 
-        method = request.defaults.method
-        result = fit_global(
-            fit_evaluators=evaluators,
+        weights = (
+            {item.dataset_id: item.weight for item in included}
+            if request.dataset_weight_mode == "user"
+            else None
+        )
+        result = _execute_global_fit_model(
+            request=request,
+            previous_candidate=self._previous_candidate,
+            evaluators=evaluators,
             datasets=datasets,
             shared_variables=shared_variables,
-            dataset_overrides=overrides,
+            overrides=overrides,
             coupled_variables=coupled_variables,
-            weights=(
-                {
-                    item.dataset_id: item.weight
-                    for item in included
-                }
-                if request.dataset_weight_mode == "user"
-                else None
-            ),
-            method=method,
-            max_nfev=int(request.defaults.max_nfev),
-            ftol=float(request.defaults.ftol),
-            xtol=float(request.defaults.xtol),
-            seed=int(request.defaults.seed) if request.defaults.use_seed else None,
+            weights=weights,
             progress_callback=progress,
             cancellation_check=fitting_checkpoint,
             cancellation_control=self._cancellation_control,
@@ -2753,7 +3002,7 @@ class GlobalFitWorker(QtCore.QThread):
                             for parameter in self._request.parameters
                             if (
                                 parameter.selected_config.fit
-                                and parameter.scope == "per_dataset"
+                                and parameter.scope in {"per_dataset", "hierarchical"}
                                 and dataset_id
                                 in dict(parameter.selected_config.dataset_values)
                             )

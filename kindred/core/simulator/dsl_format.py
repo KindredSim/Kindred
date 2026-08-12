@@ -16,7 +16,8 @@ def format_stoichiometry_side(side: Dict[str, float]) -> str:
         if abs(coeff - 1.0) < 1e-12:
             parts.append(f"{name}")
             continue
-        s = f"{coeff:.12g}".rstrip("0").rstrip(".")
+        s = f"{coeff:.12g}"
+        if "." in s and "e" not in s.lower():
+            s = s.rstrip("0").rstrip(".")
         parts.append(f"{s}{name}")
     return " + ".join(parts)
-

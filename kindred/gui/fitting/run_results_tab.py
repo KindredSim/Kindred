@@ -8,12 +8,14 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal, TypeAlias
+from typing import Literal
 
 import numpy as np
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
+from kindred.core.analysis.fit_statistics import FitMetric
+from kindred.core.analysis.global_fitting import SharedRefitPromotion
 from kindred.gui.display_name_policy import (
     DIAGNOSTIC_LABEL_MAX_CHARS,
     PLOT_TITLE_LABEL_MAX_CHARS,
@@ -25,7 +27,20 @@ from kindred.gui.display_name_policy import (
     compact_text,
     dataset_alias,
 )
-from kindred.gui.fitting.contracts import FitRunIdentity
+from kindred.gui.fitting.contracts import FitRunIdentity, FitWorkerFailure
+from kindred.gui.fitting.launch import (
+    FitInitialApplyProposal,
+    FitSharedRefitIntent,
+)
+from kindred.gui.fitting.reporting import (
+    FitEstimateReportRow,
+    FitTerminalReportError,
+    FitTerminalReport,
+    fit_bound_state,
+    fit_metric_text,
+    fit_terminal_extension_lines,
+    fit_terminal_report_payload,
+)
 from kindred.gui.fitting.worker import (
     FitCandidate,
     FitCurveDataset,
@@ -42,18 +57,6 @@ __all__ = ["FitTrackerPanel", "ResultsSummaryDialog", "RunResultsTab"]
 logger = logging.getLogger(__name__)
 
 ColorResolver = Callable[[str], object]
-DatasetParameterPresentation: TypeAlias = tuple[str, str, Mapping[str, float]]
-SetInitialPresentation: TypeAlias = tuple[str, str, Mapping[str, float]]
-DatasetMetricPresentation: TypeAlias = tuple[
-    str,
-    str,
-    float,
-    float,
-    float,
-    float,
-    int,
-    tuple[tuple[str, float], ...],
-]
 _APPLY_SCOPE_LABELS = {
     "parameters": "Parameters",
     "initial_concentrations": "Initial Conditions",
@@ -95,35 +98,13 @@ def _get_clipboard():
 
 
 def _format_metric(value: object) -> str:
+    if isinstance(value, FitMetric):
+        return fit_metric_text(value, precision=2)
     try:
-        return f"{float(value):.2e}"
+        number = float(value)
+        return f"{number:.2e}" if math.isfinite(number) else "unavailable"
     except Exception:
-        return "nan"
-
-
-def _objective_cost(result: object) -> float:
-    residuals = getattr(result, "objective_residuals", None)
-    try:
-        values = np.asarray(residuals, dtype=float).reshape(-1)
-    except Exception:
-        values = np.asarray([], dtype=float)
-    if values.size:
-        return float(np.sum(values**2))
-    try:
-        return float(getattr(result, "weighted_residual_sse"))
-    except Exception:
-        return float("nan")
-
-
-def _parameter_pairs(values: object) -> tuple[tuple[str, float], ...]:
-    if isinstance(values, Mapping):
-        items = values.items()
-    else:
-        items = values or ()
-    normalized: list[tuple[str, float]] = []
-    for name, value in items:
-        normalized.append((str(name), float(value)))
-    return tuple(normalized)
+        return "unavailable"
 
 
 def _plain_json_data(value: object) -> object:
@@ -158,104 +139,24 @@ def _export_array(value: object) -> list[object]:
     return np.asarray(value).reshape(-1).tolist()
 
 
-def _fit_run_identity_export_payload(candidate: FitCandidate) -> dict[str, object]:
+def _fit_run_identity_export_payload(
+    candidate: FitCandidate,
+    report: FitTerminalReport,
+) -> dict[str, object]:
     """Build the complete Copy Run JSON view without retaining it."""
 
     if not isinstance(candidate, FitCandidate):
         raise TypeError("candidate must be FitCandidate.")
+    if not isinstance(report, FitTerminalReport):
+        raise TypeError("Fit export requires FitTerminalReport.")
     identity_payload = candidate.run_identity.payload
     if not isinstance(identity_payload, Mapping):
         raise TypeError("Fit run identity payload must be a JSON object.")
-    result = candidate.result
     curves = project_fit_candidate_curves(candidate)
-    terminal_replay: dict[str, object] = {
-        "fit_solver": identity_payload.get("fit_solver"),
-        "status": result.completion.status,
-        "optimizer_converged": bool(result.completion.optimizer_converged),
-        "message": str(result.message),
-        "nfev": int(result.nfev),
-        "weighted_residual_sse": float(result.weighted_residual_sse),
-        "weighted_residual_mse": float(result.weighted_residual_mse),
-        "shared_parameters": {
-            str(name): float(value)
-            for name, value in sorted(result.shared_params.items())
-        },
-        "dataset_parameters": {
-            str(dataset_id): {
-                str(name): float(value)
-                for name, value in sorted(values.items())
-            }
-            for dataset_id, values in sorted(result.dataset_params.items())
-        },
-        "objective_rows": [],
-    }
-    dataset_info = {str(info.dataset_id): info for info in result.dataset_info}
-    terminal_replay["effective_dataset_weights"] = {
-        dataset_id: float(info.weight)
-        for dataset_id, info in dataset_info.items()
-    }
-    terminal_replay["solver_provenance_by_dataset"] = {
-        str(dataset_id): simulation.provenance.solver
-        for dataset_id, simulation in result.simulation_results_by_dataset.items()
-    }
-    for curve in sorted(curves, key=lambda item: item.dataset_id):
-        objective_model_x = dict(curve.objective_model_x)
-        objective_model_y = dict(curve.objective_model_y)
-        objective_segment_ids = dict(curve.objective_model_segment_ids)
-        objective_segment_keys = dict(curve.objective_model_segment_keys)
-        objective_discontinuities = dict(curve.objective_model_discontinuity_ids)
-        objective_rows = []
-        for series_name, _values in curve.objective_model_y:
-            objective_rows.append(
-                {
-                    "model_target": series_name,
-                    "model_x": _export_array(objective_model_x[series_name]),
-                    "model_y": _export_array(objective_model_y[series_name]),
-                    "segment_ids": _export_array(
-                        objective_segment_ids[series_name]
-                    ),
-                    "segment_keys": _export_array(
-                        objective_segment_keys[series_name]
-                    ),
-                    "discontinuity_ids": _export_array(
-                        objective_discontinuities[series_name]
-                    ),
-                    "selection_provenance": _export_array(
-                        dict(curve.objective_selection_provenance)[series_name]
-                    ),
-                    "raw_observation_ids": _export_array(
-                        dict(curve.objective_observation_ids)[series_name]
-                    ),
-                    "raw_columns": _export_array(
-                        dict(curve.objective_raw_columns)[series_name]
-                    ),
-                    "source_rows": _export_array(
-                        dict(curve.objective_source_rows)[series_name]
-                    ),
-                }
-            )
-        terminal_replay["objective_rows"].append(
-            {"dataset_id": curve.dataset_id, "series": objective_rows}
-        )
     export = dict(identity_payload)
     export["schema_version"] = 2
     export["export_kind"] = "verbose_fit_run"
-    export["candidate"] = {
-        "origin_tab_id": candidate.origin.tab_id,
-        "origin_capture_id": candidate.origin.capture_id,
-        "parameters": dict(candidate.parameters),
-        "scalar_values_by_dataset": {
-            dataset_id: dict(values)
-            for dataset_id, values in candidate.scalar_values_by_dataset
-        },
-        "initial_values_by_set": {
-            set_id: dict(values)
-            for set_id, values in candidate.initial_values_by_set
-        },
-        "mechanism_text": candidate.setup_snapshot.mechanism_source.reactions_text,
-        "prepared_analysis_identity": candidate.setup_snapshot.prepared_dsl.analysis.identity,
-    }
-    export["terminal_replay"] = terminal_replay
+    export["fit_report"] = fit_terminal_report_payload(report)
     export["curves"] = [
         {
             "dataset_id": curve.dataset_id,
@@ -316,11 +217,14 @@ def _fit_run_identity_export_payload(candidate: FitCandidate) -> dict[str, objec
     return export
 
 
-def _fit_run_identity_export_json(candidate: FitCandidate) -> str:
+def _fit_run_identity_export_json(
+    candidate: FitCandidate,
+    report: FitTerminalReport,
+) -> str:
     """Serialize the complete Fit export at its single final plain-data boundary."""
 
     return json.dumps(
-        _plain_json_data(_fit_run_identity_export_payload(candidate)),
+        _plain_json_data(_fit_run_identity_export_payload(candidate, report)),
         sort_keys=True,
         indent=2,
         ensure_ascii=True,
@@ -337,11 +241,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         self,
         identity: FitRunIdentity,
         candidate: FitCandidate | None = None,
-        stats: Mapping[str, object] | None = None,
-        fitted_params: Sequence[tuple[str, float]] | Mapping[str, float] | None = None,
-        dataset_fitted_params: Sequence[DatasetParameterPresentation] | None = None,
-        set_initial_values: Sequence[SetInitialPresentation] | None = None,
-        dataset_metrics: Sequence[DatasetMetricPresentation] | None = None,
+        report: FitTerminalReport | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         if not isinstance(identity, FitRunIdentity):
@@ -355,6 +255,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
 
         self._identity = identity
         self._candidate = candidate
+        self._report = report
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -407,13 +308,15 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             "Parameters",
             "DF",
             "Completion",
-            "Optimizer converged",
-            "Optimizer diagnostic",
+            "Joint optimizer convergence",
+            "Joint optimizer diagnostic",
             "Weighted SSE",
             "Weighted MSE",
-            "Optimizer evaluations",
+            "SciPy nfev",
+            "Terminal replay count",
+            "Objective calls",
             "Message",
-            "Objective SSQ",
+            "Weighted objective SSQ",
         ):
             field_label = QtWidgets.QLabel(f"{label_text}:")
             field_label.setTextInteractionFlags(
@@ -456,26 +359,70 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         )
         metrics_layout.addWidget(self._dataset_metrics_label)
         body_layout.addWidget(metrics_group)
+
+        estimates_group = QtWidgets.QGroupBox("SI-ready Estimate Tables")
+        estimates_layout = QtWidgets.QVBoxLayout(estimates_group)
+        self._estimate_tables_label = QtWidgets.QLabel(estimates_group)
+        self._estimate_tables_label.setWordWrap(True)
+        self._estimate_tables_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._estimate_tables_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        estimates_layout.addWidget(self._estimate_tables_label)
+        body_layout.addWidget(estimates_group)
+
+        aggregates_group = QtWidgets.QGroupBox("Per-dataset Aggregates")
+        aggregates_layout = QtWidgets.QVBoxLayout(aggregates_group)
+        self._aggregates_label = QtWidgets.QLabel(aggregates_group)
+        self._aggregates_label.setWordWrap(True)
+        self._aggregates_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._aggregates_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        aggregates_layout.addWidget(self._aggregates_label)
+        body_layout.addWidget(aggregates_group)
+
+        validity_group = QtWidgets.QGroupBox("Validity and Terminal Methods")
+        validity_layout = QtWidgets.QVBoxLayout(validity_group)
+        self._validity_label = QtWidgets.QLabel(validity_group)
+        self._validity_label.setWordWrap(True)
+        self._validity_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._validity_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        validity_layout.addWidget(self._validity_label)
+        body_layout.addWidget(validity_group)
         body_layout.addStretch(1)
 
         self.refresh(
             identity,
-            stats=stats,
-            fitted_params=fitted_params,
-            dataset_fitted_params=dataset_fitted_params,
-            set_initial_values=set_initial_values,
-            dataset_metrics=dataset_metrics,
+            report=report,
         )
 
-    def _update_fitted_params(
-        self,
-        fitted_params: Sequence[tuple[str, float]] | Mapping[str, float] | None,
-        dataset_fitted_params: Sequence[DatasetParameterPresentation] | None,
-        set_initial_values: Sequence[SetInitialPresentation] | None,
-    ) -> None:
-        shared = _parameter_pairs(fitted_params)
-        dataset_values = list(dataset_fitted_params or ())
-        initial_values = list(set_initial_values or ())
+    def _update_fitted_params(self, report: FitTerminalReport | None) -> None:
+        if report is None:
+            self._params_content_label.setText("No fitted parameters available.")
+            self._params_content_label.setToolTip("")
+            self._params_content_label.setStyleSheet("font-size: 11px; color: #888;")
+            return
+        shared = tuple(
+            (row.display_name, row.fitted_value)
+            for row in report.shared_estimates
+        )
+        dataset_values: dict[str, list[FitEstimateReportRow]] = {}
+        for row in report.per_dataset_estimates:
+            if row.dataset_id is not None:
+                dataset_values.setdefault(row.dataset_id, []).append(row)
+        initial_values: dict[str, list[FitEstimateReportRow]] = {}
+        for row in report.initial_estimates:
+            if row.set_id is not None:
+                initial_values.setdefault(row.set_id, []).append(row)
         if not shared and not dataset_values and not initial_values:
             self._params_content_label.setText("No fitted parameters available.")
             self._params_content_label.setToolTip("")
@@ -488,69 +435,184 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             for name, value in sorted(shared, key=lambda item: str(item[0]))
         ]
         tooltip_lines: list[str] = []
-        for dataset_label, dataset_id, values in dataset_values:
-            pairs = _parameter_pairs(values)
-            if not pairs:
+        for dataset_id, rows in sorted(dataset_values.items()):
+            if not rows:
                 continue
             if lines:
                 lines.append("")
-            lines.append(f"{dataset_label}:")
+            lines.append(f"{rows[0].dataset_display_name or dataset_id}:")
             lines.extend(
-                f"  {name} = {value:.6g} — Fit-local; not applied to Run"
-                for name, value in sorted(pairs, key=lambda item: str(item[0]))
+                f"  {row.display_name} = {row.fitted_value:.6g} — "
+                "Fit-local; not applied to Run"
+                for row in sorted(rows, key=lambda item: item.display_name)
             )
-            tooltip_lines.append(f"{dataset_label}: Dataset ID {dataset_id}")
-        for set_label, set_id, values in initial_values:
-            pairs = _parameter_pairs(values)
-            if not pairs:
+            tooltip_lines.append(
+                f"{rows[0].dataset_display_name or dataset_id}: Dataset ID {dataset_id}"
+            )
+        for set_id, rows in sorted(initial_values.items()):
+            if not rows:
                 continue
             if lines:
                 lines.append("")
-            lines.append(f"{set_label} initial concentrations:")
-            lines.extend(
-                f"  {name} = {value:.6g}"
-                for name, value in sorted(pairs, key=lambda item: str(item[0]))
+            lines.append(
+                f"{rows[0].set_display_name or set_id} initial concentrations:"
             )
-            tooltip_lines.append(f"{set_label}: Set ID {set_id}")
+            lines.extend(
+                f"  {row.display_name} = {row.fitted_value:.6g}"
+                for row in sorted(rows, key=lambda item: item.display_name)
+            )
+            tooltip_lines.append(f"{rows[0].set_display_name or set_id}: Set ID {set_id}")
         self._params_content_label.setText("\n".join(lines))
         self._params_content_label.setToolTip("\n".join(tooltip_lines))
 
-    def _update_dataset_metrics(
-        self,
-        dataset_metrics: Sequence[DatasetMetricPresentation] | None,
-    ) -> None:
-        if not dataset_metrics:
+    def _update_dataset_metrics(self, report: FitTerminalReport | None) -> None:
+        if report is None or not report.metrics_by_dataset:
             self._dataset_metrics_label.setText("No per-dataset metrics available.")
             self._dataset_metrics_label.setToolTip("")
             return
         lines: list[str] = []
         tooltip_lines: list[str] = []
-        for (
-            display_name,
-            dataset_id,
-            weighted_mse,
-            weighted_rmse,
-            weighted_mae,
-            effective_weight,
-            n_points,
-            r_squared,
-        ) in dataset_metrics:
+        for row in report.metrics_by_dataset:
             lines.append(
-                f"{display_name}: weighted MSE = {weighted_mse:.6g}; "
-                f"RMSE = {weighted_rmse:.6g}; MAE = {weighted_mae:.6g}; "
-                f"effective weight = {effective_weight:.6g}; points = {n_points}"
+                f"{row.dataset_display_name}: weighted SSE = "
+                f"{fit_metric_text(row.weighted_sse)}; weighted MSE = "
+                f"{fit_metric_text(row.weighted_mse)}; weighted RMSE = "
+                f"{fit_metric_text(row.weighted_rmse)}; weighted MAE = "
+                f"{fit_metric_text(row.weighted_mae)}; effective weight = "
+                f"{row.effective_weight:.6g}; points = {row.n_points}"
             )
             lines.extend(
                 f"  {compact_text(series, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}: "
-                f"R² = {value:.6g}"
-                for series, value in r_squared
+                f"R² = {fit_metric_text(value)}"
+                for series, value in row.r_squared_by_series
             )
-            tooltip_lines.append(f"{display_name}: Dataset ID {dataset_id}")
+            tooltip_lines.append(
+                f"{row.dataset_display_name}: Dataset ID {row.dataset_id}"
+            )
         self._dataset_metrics_label.setText("\n".join(lines))
         self._dataset_metrics_label.setToolTip("\n".join(tooltip_lines))
 
-    def _update_stats(self, stats: Mapping[str, object] | None) -> None:
-        values = stats or {}
+    @staticmethod
+    def _estimate_line(row: FitEstimateReportRow) -> str:
+        identity = row.dataset_id or row.set_id or "joint"
+        percentage = (
+            f"{row.percentage_change:.6g}%"
+            if row.percentage_change is not None
+            else f"unavailable ({row.percentage_unavailable_reason})"
+        )
+        minimum = "−∞" if not math.isfinite(row.minimum) else f"{row.minimum:.6g}"
+        maximum = "∞" if not math.isfinite(row.maximum) else f"{row.maximum:.6g}"
+        return (
+            f"{row.scope} | {identity} | {row.display_name} [{row.unit}] | "
+            f"captured={row.captured_value:.6g}; nominal={row.nominal_value:.6g}; "
+            f"fitted={row.fitted_value:.6g}; change={row.absolute_change:.6g}; "
+            f"change%={percentage}; bounds=[{minimum}, {maximum}]; "
+            f"bound state={row.bound_state}; valid={str(row.valid).lower()} "
+            f"({row.validity_diagnostic}); captured source={row.captured_value_source}; "
+            f"nominal source={row.nominal_value_source}"
+        )
+
+    def _update_terminal_report(self, report: FitTerminalReport | None) -> None:
+        if report is None:
+            self._estimate_tables_label.setText("No terminal estimate report available.")
+            self._aggregates_label.setText("No per-dataset aggregates available.")
+            self._validity_label.setText("No terminal validity report available.")
+            self._validity_label.setToolTip("")
+            return
+        estimate_rows = (
+            *report.shared_estimates,
+            *report.per_dataset_estimates,
+            *report.initial_estimates,
+        )
+        self._estimate_tables_label.setText(
+            "\n".join(self._estimate_line(row) for row in estimate_rows)
+            if estimate_rows
+            else "No fitted estimates available."
+        )
+        aggregate_lines: list[str] = []
+        for row in report.aggregates:
+            sample_sd = "—" if row.sample_sd is None else f"{row.sample_sd:.6g}"
+            standard_error = (
+                "—" if row.standard_error is None else f"{row.standard_error:.6g}"
+            )
+            geometric_mean = (
+                "—" if row.geometric_mean is None else f"{row.geometric_mean:.6g}"
+            )
+            geometric_dispersion = (
+                "—"
+                if row.geometric_dispersion is None
+                else f"{row.geometric_dispersion:.6g}"
+            )
+            geometric_note = (
+                f" ({row.geometric_unavailable_reason})"
+                if row.geometric_unavailable_reason
+                else ""
+            )
+            aggregate_lines.append(
+                f"{row.display_name} [{row.unit}]: n={row.n}; mean={row.arithmetic_mean:.6g}; "
+                f"sample SD={sample_sd}; SE={standard_error}; median={row.median:.6g}; "
+                f"IQR={row.iqr:.6g}; min={row.minimum:.6g}; max={row.maximum:.6g}; "
+                f"geometric mean={geometric_mean}; geometric dispersion={geometric_dispersion}"
+                f"{geometric_note}"
+            )
+        self._aggregates_label.setText(
+            "\n".join(aggregate_lines)
+            if aggregate_lines
+            else "No Per-dataset fitted scalar aggregates available."
+        )
+        method_lines = [
+            f"Overall Fit status: {report.status}",
+            "Joint optimizer convergence: "
+            + ("converged" if report.joint_optimizer_converged else "did not converge"),
+            f"Joint optimizer diagnostic: {report.joint_optimizer_diagnostic}",
+            report.publication.message,
+        ]
+        method_lines.extend(report.validity_diagnostics or ("No validity warnings.",))
+        if report.shared_refit_provenance:
+            method_lines.append(
+                "Shared refit provenance: "
+                + json.dumps(
+                    _plain_json_data(report.shared_refit_provenance),
+                    sort_keys=True,
+                )
+            )
+        for item in report.terminal_extensions:
+            method_lines.extend(fit_terminal_extension_lines(item))
+        self._validity_label.setText("\n".join(method_lines))
+        self._validity_label.setToolTip(
+            json.dumps(
+                _plain_json_data(report.structured_diagnostics),
+                sort_keys=True,
+                indent=2,
+            )
+            if report.structured_diagnostics
+            else ""
+        )
+
+    def _update_stats(self, report: FitTerminalReport | None) -> None:
+        values: Mapping[str, object] = {}
+        if report is not None:
+            values = {
+                "Datasets": report.dataset_count,
+                "Series": report.series_count,
+                "Points": report.point_count,
+                "Parameters": report.parameter_count,
+                "DF": report.degrees_of_freedom,
+                "Completion": report.status,
+                "Joint optimizer convergence": (
+                    "converged"
+                    if report.joint_optimizer_converged
+                    else "did not converge"
+                ),
+                "Joint optimizer diagnostic": report.joint_optimizer_diagnostic,
+                "Weighted SSE": fit_metric_text(report.weighted_sse),
+                "Weighted MSE": fit_metric_text(report.weighted_mse),
+                "SciPy nfev": report.scipy_nfev,
+                "Terminal replay count": report.terminal_replay_count,
+                "Objective calls": report.objective_call_count,
+                "Message": report.message,
+                "Weighted objective SSQ": fit_metric_text(report.weighted_sse),
+            }
         for key, label in self._stats_labels.items():
             value = values.get(key)
             if value is None:
@@ -572,11 +634,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         identity: FitRunIdentity,
         *,
         candidate: FitCandidate | None = None,
-        stats: Mapping[str, object] | None = None,
-        fitted_params: Sequence[tuple[str, float]] | Mapping[str, float] | None = None,
-        dataset_fitted_params: Sequence[DatasetParameterPresentation] | None = None,
-        set_initial_values: Sequence[SetInitialPresentation] | None = None,
-        dataset_metrics: Sequence[DatasetMetricPresentation] | None = None,
+        report: FitTerminalReport | None = None,
     ) -> None:
         if not isinstance(identity, FitRunIdentity):
             raise TypeError("Results summary requires a FitRunIdentity.")
@@ -585,14 +643,14 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             if not isinstance(candidate, FitCandidate):
                 raise TypeError("candidate must be FitCandidate.")
             self._candidate = candidate
+        self._report = report
         self._run_identity_label.setText(f"Run: {identity.short_hash}")
-        self._update_stats(stats)
-        self._update_fitted_params(
-            fitted_params,
-            dataset_fitted_params,
-            set_initial_values,
-        )
-        self._update_dataset_metrics(dataset_metrics)
+        if report is not None and not isinstance(report, FitTerminalReport):
+            raise TypeError("Results summary report must be FitTerminalReport.")
+        self._update_stats(report)
+        self._update_fitted_params(report)
+        self._update_dataset_metrics(report)
+        self._update_terminal_report(report)
 
     def _on_copy_identity_short(self) -> None:
         clipboard = _get_clipboard()
@@ -615,7 +673,11 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             if self._candidate is None:
                 clipboard.setText(self._identity.readable_json())
             else:
-                clipboard.setText(_fit_run_identity_export_json(self._candidate))
+                if self._report is None:
+                    raise ValueError("Fit terminal report is unavailable.")
+                clipboard.setText(
+                    _fit_run_identity_export_json(self._candidate, self._report)
+                )
         except Exception as exc:
             logger.exception(
                 "Failed to copy run identity JSON (%s): %s",
@@ -693,7 +755,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
             set_labels=set_labels,
         )
         self._set_live_text(
-            f"Objective calls {int(update.iteration)} | Objective SSQ "
+            f"Objective calls {int(update.iteration)} | Weighted objective SSQ "
             f"{_format_metric(cost)}{delta_text}",
             lines,
             tooltips,
@@ -701,22 +763,24 @@ class FitTrackerPanel(QtWidgets.QWidget):
 
     def update_final(
         self,
-        candidate: FitCandidate,
-        *,
-        set_labels: Mapping[str, str] | None = None,
+        report: FitTerminalReport,
     ) -> None:
-        if not isinstance(candidate, FitCandidate):
-            raise TypeError("Fit tracker requires a FitCandidate.")
-        cost = _objective_cost(candidate.result)
-        if math.isfinite(cost):
-            self._previous_cost = cost
-        lines, tooltips = self._candidate_parameter_lines(
-            candidate,
-            set_labels=set_labels,
+        if not isinstance(report, FitTerminalReport):
+            raise TypeError("Fit tracker requires a FitTerminalReport.")
+        cost = report.weighted_sse
+        if cost.available:
+            self._previous_cost = cost.value
+        lines, tooltips = self._report_parameter_lines(report)
+        objective_calls = (
+            "unavailable"
+            if report.objective_call_count is None
+            else str(report.objective_call_count)
         )
         self._set_live_text(
-            "Optimizer evaluations "
-            f"{int(candidate.result.nfev)} | Objective SSQ {_format_metric(cost)}",
+            f"SciPy nfev {report.scipy_nfev} | "
+            f"Terminal replay count {report.terminal_replay_count} | "
+            f"Objective calls {objective_calls} | "
+            f"Weighted objective SSQ {_format_metric(cost)}",
             lines,
             tooltips,
         )
@@ -771,60 +835,53 @@ class FitTrackerPanel(QtWidgets.QWidget):
         return lines, tooltips
 
     @staticmethod
-    def _candidate_parameter_lines(
-        candidate: FitCandidate,
-        *,
-        set_labels: Mapping[str, str] | None = None,
+    def _report_parameter_lines(
+        report: FitTerminalReport,
     ) -> tuple[list[str], list[str]]:
-        parameter_labels = {
-            parameter.name: parameter.display_name
-            for parameter in candidate.setup_snapshot.parameters
-        }
-        dataset_labels = {
-            mapped.dataset_id: mapped.display_name
-            for mapped in candidate.origin.mapped_datasets
-        }
-        initial_labels = dict(set_labels or {})
+        if not isinstance(report, FitTerminalReport):
+            raise TypeError("Fit tracker requires a FitTerminalReport.")
         lines = [
-            f"{compact_text(parameter_labels.get(name, name), max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
-            f"{float(value):.6g}"
-            for name, value in candidate.parameters
+            f"{compact_text(row.display_name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
+            f"{row.fitted_value:.6g}"
+            for row in report.shared_estimates
         ]
         tooltips = [
-            f"{parameter_labels.get(name, name)}: Parameter ID {name}"
-            for name, _value in candidate.parameters
+            f"{row.display_name}: Parameter ID {row.name}"
+            for row in report.shared_estimates
         ]
-        for index, (dataset_id, values) in enumerate(
-            candidate.scalar_values_by_dataset
-        ):
-            if not values:
-                continue
+        dataset_rows: dict[str, list[FitEstimateReportRow]] = {}
+        for row in report.per_dataset_estimates:
+            if row.dataset_id is not None:
+                dataset_rows.setdefault(row.dataset_id, []).append(row)
+        for index, (dataset_id, rows) in enumerate(sorted(dataset_rows.items())):
             label = compact_dataset_label(
-                dataset_labels.get(dataset_id, dataset_alias(index)),
+                rows[0].dataset_display_name or dataset_alias(index),
                 max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
             )
             lines.append(
                 f"[{label.display}] "
                 + " | ".join(
-                    f"{compact_text(parameter_labels.get(name, name), max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
-                    f"{float(value):.6g} (Fit-local; not applied to Run)"
-                    for name, value in values
+                    f"{compact_text(row.display_name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
+                    f"{row.fitted_value:.6g} (Fit-local; not applied to Run)"
+                    for row in sorted(rows, key=lambda item: item.display_name)
                 )
             )
             tooltips.append(f"{label.full}: Dataset ID {dataset_id}")
-        for index, (set_id, values) in enumerate(candidate.initial_values_by_set):
-            if not values:
-                continue
+        initial_rows: dict[str, list[FitEstimateReportRow]] = {}
+        for row in report.initial_estimates:
+            if row.set_id is not None:
+                initial_rows.setdefault(row.set_id, []).append(row)
+        for index, (set_id, rows) in enumerate(sorted(initial_rows.items())):
             alias = compact_text(
-                initial_labels.get(set_id, f"Initial set {index + 1}"),
+                rows[0].set_display_name or f"Initial set {index + 1}",
                 max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
             )
             lines.append(
                 f"[{alias.display}] "
                 + " | ".join(
-                    f"{compact_text(name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
-                    f"{float(value):.6g}"
-                    for name, value in values
+                    f"{compact_text(row.display_name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
+                    f"{row.fitted_value:.6g}"
+                    for row in sorted(rows, key=lambda item: item.display_name)
                 )
             )
             tooltips.append(f"{alias.full}: Set ID {set_id}")
@@ -854,6 +911,8 @@ class RunResultsTab(QtWidgets.QWidget):
 
     statusMessage = Signal(str)
     copyAvailableChanged = Signal(bool)
+    initialSelectionChanged = Signal()
+    sharedRefitRequested = Signal(object)
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
@@ -866,14 +925,17 @@ class RunResultsTab(QtWidgets.QWidget):
         self._color_resolver = color_resolver
         self._run_identity: FitRunIdentity | None = None
         self._candidate: FitCandidate | None = None
-        self._last_stats: dict[str, object] = {}
-        self._last_fitted_params: tuple[tuple[str, float], ...] = ()
-        self._last_dataset_fitted_params: tuple[DatasetParameterPresentation, ...] = ()
-        self._last_set_initial_values: tuple[SetInitialPresentation, ...] = ()
-        self._last_dataset_metrics: tuple[DatasetMetricPresentation, ...] = ()
+        self._last_report: FitTerminalReport | None = None
+        self._initial_apply_checkboxes: dict[
+            tuple[str, str], QtWidgets.QCheckBox
+        ] = {}
+        self._shared_refit_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
+        self._shared_refit_rows: dict[str, tuple[FitEstimateReportRow, ...]] = {}
+        self._shared_refit_source_run_hash: str | None = None
+        self._shared_refit_source_origin: tuple[str, str] | None = None
+        self._shared_refit_seed_data = "arithmetic_mean"
         self._available_apply_scopes: frozenset[str] = frozenset()
         self._unavailable_apply_reasons: Mapping[str, str] = MappingProxyType({})
-        self._has_per_dataset_values = False
         self._summary_dialog: ResultsSummaryDialog | None = None
         self._dark_mode = False
         self._view_autorange_locked = False
@@ -913,6 +975,15 @@ class RunResultsTab(QtWidgets.QWidget):
         self._render_diagnostic_label.hide()
         layout.addWidget(self._render_diagnostic_label, stretch=0)
 
+        self._terminal_failure_label = QtWidgets.QLabel(self)
+        self._terminal_failure_label.setObjectName("global_fit_terminal_failure_label")
+        self._terminal_failure_label.setWordWrap(True)
+        self._terminal_failure_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._terminal_failure_label.hide()
+        layout.addWidget(self._terminal_failure_label, stretch=0)
+
         self._apply_group = QtWidgets.QGroupBox("Apply to Project", self)
         apply_form = QtWidgets.QFormLayout(self._apply_group)
         self._apply_scope_labels: dict[str, QtWidgets.QLabel] = {}
@@ -923,6 +994,62 @@ class RunResultsTab(QtWidgets.QWidget):
             self._apply_scope_labels[scope] = value_label
         self._apply_group.hide()
         layout.addWidget(self._apply_group, stretch=0)
+
+        self._initial_apply_group = QtWidgets.QGroupBox(
+            "Apply Initial Conditions — selected cells",
+            self,
+        )
+        self._initial_apply_layout = QtWidgets.QVBoxLayout(
+            self._initial_apply_group
+        )
+        self._initial_apply_group.hide()
+        layout.addWidget(self._initial_apply_group, stretch=0)
+
+        self._shared_refit_group = QtWidgets.QGroupBox(
+            "Create shared values from this per-dataset fit",
+            self,
+        )
+        shared_refit_layout = QtWidgets.QVBoxLayout(self._shared_refit_group)
+        self._shared_refit_warning_label = QtWidgets.QLabel(
+            self._shared_refit_group
+        )
+        self._shared_refit_warning_label.setWordWrap(True)
+        self._shared_refit_warning_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        shared_refit_layout.addWidget(self._shared_refit_warning_label)
+        self._shared_refit_explanation_label = QtWidgets.QLabel(
+            "The starting estimate only initializes a new fit. Nothing is "
+            "applied to the project until that Shared fit completes successfully.",
+            self._shared_refit_group,
+        )
+        self._shared_refit_explanation_label.setWordWrap(True)
+        self._shared_refit_explanation_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        shared_refit_layout.addWidget(self._shared_refit_explanation_label)
+        self._shared_refit_parameter_layout = QtWidgets.QVBoxLayout()
+        shared_refit_layout.addLayout(self._shared_refit_parameter_layout)
+        seed_row = QtWidgets.QHBoxLayout()
+        seed_row.addWidget(QtWidgets.QLabel("Starting estimate", self._shared_refit_group))
+        self._shared_refit_seed_combo = QtWidgets.QComboBox(
+            self._shared_refit_group
+        )
+        self._shared_refit_seed_combo.setObjectName("fit_shared_refit_seed_combo")
+        self._shared_refit_seed_combo.currentIndexChanged.connect(
+            self._on_shared_refit_seed_changed
+        )
+        seed_row.addWidget(self._shared_refit_seed_combo, stretch=1)
+        shared_refit_layout.addLayout(seed_row)
+        self._shared_refit_button = QtWidgets.QPushButton(
+            "Configure and Run New Fit",
+            self._shared_refit_group,
+        )
+        self._shared_refit_button.setObjectName("fit_configure_shared_refit_button")
+        self._shared_refit_button.clicked.connect(self._request_shared_refit)
+        shared_refit_layout.addWidget(self._shared_refit_button)
+        self._shared_refit_group.hide()
+        layout.addWidget(self._shared_refit_group, stretch=0)
 
         self._subtabs = QtWidgets.QTabBar(self)
         self._subtabs.setObjectName("global_fit_results_subtabs")
@@ -975,10 +1102,249 @@ class RunResultsTab(QtWidgets.QWidget):
         self._copy_run_hash_button.setEnabled(True)
         self._refresh_summary_dialog()
 
+    def _clear_shared_refit_controls(self) -> None:
+        """Discard only the Results draft projection for Shared refit."""
+
+        while self._shared_refit_parameter_layout.count():
+            item = self._shared_refit_parameter_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._shared_refit_checkboxes = {}
+        self._shared_refit_rows = {}
+        self._shared_refit_source_run_hash = None
+        self._shared_refit_source_origin = None
+        self._shared_refit_seed_combo.blockSignals(True)
+        self._shared_refit_seed_combo.clear()
+        self._shared_refit_seed_combo.blockSignals(False)
+        self._shared_refit_seed_data = "arithmetic_mean"
+        self._shared_refit_group.hide()
+        self._shared_refit_button.setEnabled(False)
+
+    def _shared_refit_source_rows(
+        self,
+        candidate: FitCandidate,
+        report: FitTerminalReport,
+    ) -> dict[str, tuple[FitEstimateReportRow, ...]]:
+        """Return complete fitted Per-dataset coordinates for the source Fit."""
+
+        per_dataset_names = {
+            parameter.name
+            for parameter in candidate.setup_snapshot.parameters
+            if parameter.scope == "per_dataset" and parameter.selected_config.fit
+        }
+        local_scalar_names = {
+            scalar_name
+            for observable in getattr(candidate, "local_observables", ())
+            for scalar_name in observable.scalar_names
+        }
+        grouped: dict[str, list[FitEstimateReportRow]] = {}
+        for row in report.per_dataset_estimates:
+            if row.name in per_dataset_names and row.name not in local_scalar_names:
+                grouped.setdefault(row.name, []).append(row)
+        return {
+            name: tuple(sorted(rows, key=lambda row: row.dataset_id or ""))
+            for name, rows in grouped.items()
+            if rows
+        }
+
+    def _shared_refit_statistic_is_valid(self, statistic: str) -> bool:
+        if statistic not in {"arithmetic_mean", "geometric_mean"}:
+            return False
+        selected = tuple(
+            name
+            for name, checkbox in self._shared_refit_checkboxes.items()
+            if checkbox.isChecked()
+        )
+        if not selected:
+            return False
+        for name in selected:
+            rows = self._shared_refit_rows.get(name, ())
+            values = tuple(row.fitted_value for row in rows)
+            if not values:
+                return False
+            if statistic == "geometric_mean" and any(value <= 0.0 for value in values):
+                return False
+            try:
+                seed = (
+                    math.exp(sum(math.log(value) for value in values) / len(values))
+                    if statistic == "geometric_mean"
+                    else sum(values) / len(values)
+                )
+            except (OverflowError, ValueError):
+                return False
+            minimum = max(row.minimum for row in rows)
+            maximum = min(row.maximum for row in rows)
+            if not math.isfinite(seed) or minimum >= maximum or not minimum <= seed <= maximum:
+                return False
+        return True
+
+    def _refresh_shared_refit_seed_options(self) -> None:
+        selected_names = tuple(
+            name
+            for name, checkbox in self._shared_refit_checkboxes.items()
+            if checkbox.isChecked()
+        )
+        geometric_valid = bool(selected_names) and self._shared_refit_statistic_is_valid(
+            "geometric_mean"
+        )
+        desired = self._shared_refit_seed_data
+        if desired == "geometric_mean" and not geometric_valid:
+            desired = "arithmetic_mean"
+        self._shared_refit_seed_combo.blockSignals(True)
+        self._shared_refit_seed_combo.clear()
+        self._shared_refit_seed_combo.addItem(
+            "Arithmetic mean",
+            "arithmetic_mean",
+        )
+        if geometric_valid:
+            self._shared_refit_seed_combo.addItem(
+                "Geometric mean",
+                "geometric_mean",
+            )
+        index = self._shared_refit_seed_combo.findData(desired)
+        self._shared_refit_seed_combo.setCurrentIndex(max(0, index))
+        self._shared_refit_seed_data = str(
+            self._shared_refit_seed_combo.currentData() or "arithmetic_mean"
+        )
+        self._shared_refit_seed_combo.blockSignals(False)
+        self._refresh_shared_refit_button()
+
+    def _refresh_shared_refit_button(self) -> None:
+        selected = tuple(
+            name
+            for name, checkbox in self._shared_refit_checkboxes.items()
+            if checkbox.isChecked() and checkbox.isEnabled()
+        )
+        self._shared_refit_button.setEnabled(
+            bool(
+                self._shared_refit_source_run_hash
+                and self._shared_refit_source_origin
+                and self._last_report
+                and selected
+            )
+            and self._shared_refit_statistic_is_valid(self._shared_refit_seed_data)
+        )
+
+    def _on_shared_refit_seed_changed(self, _index: int) -> None:
+        data = self._shared_refit_seed_combo.currentData()
+        self._shared_refit_seed_data = str(data or "arithmetic_mean")
+        self._refresh_shared_refit_button()
+
+    def _project_shared_refit_context(
+        self,
+        candidate: FitCandidate,
+        report: FitTerminalReport,
+    ) -> None:
+        """Project one Results-owned Shared-refit draft from terminal truth."""
+
+        self._clear_shared_refit_controls()
+        self._shared_refit_source_run_hash = candidate.run_identity.short_hash
+        self._shared_refit_source_origin = (
+            candidate.origin.tab_id,
+            candidate.origin.capture_id,
+        )
+        rows_by_name = self._shared_refit_source_rows(candidate, report)
+        if not rows_by_name:
+            return
+        self._shared_refit_rows = rows_by_name
+        for name, rows in rows_by_name.items():
+            display_name = rows[0].display_name
+            checkbox = QtWidgets.QCheckBox(
+                display_name,
+                self._shared_refit_group,
+            )
+            checkbox.setObjectName(f"fit_shared_refit_parameter_{name}")
+            checkbox.setChecked(True)
+            checkbox.setToolTip(
+                f"Use the Per-dataset estimates for {display_name} "
+                "as diagnostic seed material for a new Shared Fit."
+            )
+            checkbox.toggled.connect(self._refresh_shared_refit_seed_options)
+            self._shared_refit_checkboxes[name] = checkbox
+            self._shared_refit_parameter_layout.addWidget(checkbox)
+
+        if report.joint_optimizer_converged:
+            warning = (
+                "This completed Per-dataset Fit supplies starting values only. "
+                "Only a newly completed, converged Shared Fit is the publication "
+                "authority."
+            )
+            self._shared_refit_warning_label.setStyleSheet("font-weight: 600;")
+        else:
+            warning = (
+                "Diagnostic seed material: this Per-dataset Fit did not converge. "
+                "Its finite estimates may initialize a new Fit, but they are not "
+                "evidence and cannot be applied or published. Only a newly "
+                "completed, converged Shared Fit is the publication authority."
+            )
+            self._shared_refit_warning_label.setStyleSheet(
+                "font-weight: 700; color: #a33;"
+            )
+        self._shared_refit_warning_label.setText(warning)
+        self._shared_refit_group.show()
+        self._refresh_shared_refit_seed_options()
+
+    def _request_shared_refit(self) -> None:
+        report = self._last_report
+        source_run_hash = self._shared_refit_source_run_hash
+        source_origin = self._shared_refit_source_origin
+        if source_run_hash is None or source_origin is None or report is None:
+            self.statusMessage.emit("Shared refit requires a terminal Per-dataset Fit.")
+            return
+        selected_names = tuple(
+            name
+            for name, checkbox in self._shared_refit_checkboxes.items()
+            if checkbox.isChecked() and checkbox.isEnabled()
+        )
+        statistic = str(
+            self._shared_refit_seed_combo.currentData() or "arithmetic_mean"
+        )
+        if not selected_names or not self._shared_refit_statistic_is_valid(statistic):
+            self.statusMessage.emit(
+                "Select an eligible parameter and a scientifically valid starting estimate."
+            )
+            return
+        promotions: list[SharedRefitPromotion] = []
+        try:
+            for name in selected_names:
+                rows = self._shared_refit_rows[name]
+                minimum = max(row.minimum for row in rows)
+                maximum = min(row.maximum for row in rows)
+                if minimum >= maximum:
+                    raise ValueError(
+                        f"{rows[0].display_name} has no common finite bounds."
+                    )
+                log_scale = all(row.log_scale for row in rows)
+                if log_scale and minimum <= 0.0:
+                    raise ValueError(
+                        f"{rows[0].display_name} requires positive logarithmic bounds."
+                    )
+                promotions.append(
+                    SharedRefitPromotion(
+                        parameter_name=name,
+                        minimum=minimum,
+                        maximum=maximum,
+                        log10=log_scale,
+                        seed_statistic=statistic,
+                    )
+                )
+        except (TypeError, ValueError) as exc:
+            self.statusMessage.emit(f"Shared refit request rejected: {exc}")
+            return
+        intent = FitSharedRefitIntent(
+            origin_tab_id=source_origin[0],
+            origin_capture_id=source_origin[1],
+            source_run_hash=source_run_hash,
+            promotions=tuple(promotions),
+        )
+        self.sharedRefitRequested.emit(intent)
+
     def set_candidate(
         self,
         candidate: FitCandidate,
         *,
+        report: FitTerminalReport,
         available_scopes: frozenset[str] | None = None,
         unavailable_reasons: Mapping[str, str] | None = None,
     ) -> bool:
@@ -986,8 +1352,11 @@ class RunResultsTab(QtWidgets.QWidget):
 
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be a FitCandidate.")
+        if not isinstance(report, FitTerminalReport):
+            raise TypeError("report must be a FitTerminalReport.")
         self.restore_terminal_semantics(
             candidate,
+            report=report,
             available_scopes=available_scopes,
             unavailable_reasons=unavailable_reasons,
         )
@@ -1005,6 +1374,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self,
         candidate: FitCandidate,
         *,
+        report: FitTerminalReport,
         available_scopes: frozenset[str] | None = None,
         unavailable_reasons: Mapping[str, str] | None = None,
     ) -> None:
@@ -1012,44 +1382,168 @@ class RunResultsTab(QtWidgets.QWidget):
 
         if not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be FitCandidate.")
-        self._has_per_dataset_values = any(
-            bool(values)
-            for _dataset_id, values in candidate.scalar_values_by_dataset
-        )
+        if not isinstance(report, FitTerminalReport):
+            raise TypeError("report must be a FitTerminalReport.")
         self.set_apply_availability(available_scopes, unavailable_reasons)
         self.set_run_identity(candidate.run_identity)
         self._candidate = candidate
-        self._last_fitted_params = tuple(candidate.parameters)
-        self._last_dataset_fitted_params = self._dataset_parameter_entries(candidate)
-        self._last_set_initial_values = self._set_initial_entries(candidate)
-        self._last_dataset_metrics = self._dataset_metric_entries(candidate)
-        self._last_stats = self._candidate_stats(candidate)
-        self._tracker_panel.update_final(candidate, set_labels=self._set_labels)
+        self._terminal_failure_label.hide()
+        self._last_report = report
+        self._project_apply_availability()
+        self._tracker_panel.update_final(report)
+        self._project_shared_refit_context(candidate, report)
         self._refresh_summary_dialog()
+
+    def set_shared_refit_source_candidate(
+        self,
+        candidate: FitCandidate,
+        *,
+        report: FitTerminalReport,
+    ) -> None:
+        """Project retry controls from the retained Per-dataset source.
+
+        The visible terminal candidate/report remains the Last Fit truth; this
+        separate projection only restores the Results draft used to author a
+        retry after an unsuccessful Shared terminal.
+        """
+
+        if not isinstance(candidate, FitCandidate):
+            raise TypeError("Shared-refit source must be a FitCandidate.")
+        if not isinstance(report, FitTerminalReport):
+            raise TypeError("Shared-refit source report must be a FitTerminalReport.")
+        self._project_shared_refit_context(candidate, report)
 
     def mark_terminal_projection_unavailable(self, error: BaseException) -> None:
         """Disable physical plot/Copy authority while retaining terminal data."""
 
         self._reject_terminal_projection(error)
 
+    def set_terminal_report_failure(self, error: BaseException) -> None:
+        """Present semantic-report failure distinctly from physical plotting."""
+
+        if not isinstance(error, FitTerminalReportError):
+            raise TypeError("Semantic terminal failure must be FitTerminalReportError.")
+        self._last_report = None
+        self._tracker_panel.clear()
+        payload = {
+            "failure_type": type(error).__name__,
+            "message": str(error),
+        }
+        self._terminal_failure_label.setText(
+            "Fit terminal report failed — " + str(error)
+        )
+        self._terminal_failure_label.setToolTip(
+            json.dumps(payload, sort_keys=True, indent=2)
+        )
+        self._terminal_failure_label.show()
+        self.statusMessage.emit(str(error))
+        self.copyAvailableChanged.emit(False)
+
+    def set_terminal_failure(self, failure: FitWorkerFailure) -> None:
+        """Present a typed worker failure without flattening its provenance."""
+
+        if not isinstance(failure, FitWorkerFailure):
+            raise TypeError("Terminal Fit failure must be FitWorkerFailure.")
+        chain: list[str] = []
+        current: FitWorkerFailure | None = failure
+        while current is not None:
+            code = f" [{current.code}]" if current.code else ""
+            chain.append(
+                f"{current.exception_type}{code}: {current.message}"
+            )
+            current = current.typed_cause
+        text = "Fit failed — " + " Caused by: ".join(chain)
+        self._terminal_failure_label.setText(text)
+        self._terminal_failure_label.setToolTip(
+            json.dumps(failure.to_payload(), sort_keys=True, indent=2)
+        )
+        self._terminal_failure_label.show()
+
+    def set_initial_apply_proposal(
+        self,
+        proposal: FitInitialApplyProposal | None,
+    ) -> None:
+        """Display every owner-approved IC mutation as an independent choice."""
+
+        if proposal is not None and not isinstance(
+            proposal,
+            FitInitialApplyProposal,
+        ):
+            raise TypeError("IC Apply proposal must be typed or None.")
+        while self._initial_apply_layout.count():
+            item = self._initial_apply_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._initial_apply_checkboxes = {}
+        if proposal is None or not proposal.cells:
+            self._initial_apply_group.hide()
+            self.initialSelectionChanged.emit()
+            return
+        for cell in proposal.cells:
+            change = cell.fitted_value - cell.nominal_value
+            change_percent = (
+                f"{(change / abs(cell.nominal_value)) * 100.0:.6g}%"
+                if cell.nominal_value != 0.0
+                else "unavailable (nominal value is zero)"
+            )
+            state = fit_bound_state(
+                cell.fitted_value,
+                cell.minimum,
+                cell.maximum,
+            )
+            set_label = self._set_labels.get(cell.set_id, cell.set_id)
+            datasets = ", ".join(
+                self._dataset_labels.get(dataset_id, dataset_id)
+                for dataset_id in cell.dataset_ids
+            ) or "no dataset label"
+            checkbox = QtWidgets.QCheckBox(
+                f"{set_label} / {cell.species} [{cell.unit}] — datasets {datasets}; "
+                f"captured={cell.captured_value:.6g}; nominal={cell.nominal_value:.6g}; "
+                f"fitted={cell.fitted_value:.6g}; change={change:.6g}; "
+                f"change%={change_percent}; bounds=[{cell.minimum:.6g}, "
+                f"{cell.maximum:.6g}]; bound state={state}",
+                self._initial_apply_group,
+            )
+            checkbox.setToolTip(
+                f"Set ID: {cell.set_id}\n"
+                f"Dataset IDs: {', '.join(cell.dataset_ids) or 'none'}"
+            )
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(
+                lambda _checked: self.initialSelectionChanged.emit()
+            )
+            self._initial_apply_checkboxes[cell.key] = checkbox
+            self._initial_apply_layout.addWidget(checkbox)
+        self._initial_apply_group.show()
+        self.initialSelectionChanged.emit()
+
+    def selected_initial_keys(self) -> tuple[tuple[str, str], ...]:
+        """Return only independently checked owner-proposed IC cells."""
+
+        return tuple(
+            key
+            for key, checkbox in self._initial_apply_checkboxes.items()
+            if checkbox.isChecked()
+        )
+
     def clear_candidate(self) -> None:
         """Clear all terminal/live result presentation without touching ownership."""
 
         self._run_identity = None
         self._candidate = None
-        self._last_stats = {}
-        self._last_fitted_params = ()
-        self._last_dataset_fitted_params = ()
-        self._last_set_initial_values = ()
-        self._last_dataset_metrics = ()
+        self._last_report = None
         self._available_apply_scopes = frozenset()
         self._unavailable_apply_reasons = MappingProxyType({})
-        self._has_per_dataset_values = False
         self._apply_group.hide()
         self._run_identity_label.setText("Run: —")
         self._run_identity_label.setToolTip("")
         self._copy_run_hash_button.setEnabled(False)
         self._tracker_panel.clear()
+        self._terminal_failure_label.clear()
+        self._terminal_failure_label.hide()
+        self.set_initial_apply_proposal(None)
+        self._clear_shared_refit_controls()
         self._clear_render_failures()
         self._install_plot_projection((), {})
         self.copyAvailableChanged.emit(False)
@@ -1079,11 +1573,7 @@ class RunResultsTab(QtWidgets.QWidget):
         dialog = ResultsSummaryDialog(
             identity,
             candidate=self._candidate,
-            stats=self._last_stats or None,
-            fitted_params=self._last_fitted_params or None,
-            dataset_fitted_params=self._last_dataset_fitted_params or None,
-            set_initial_values=self._last_set_initial_values or None,
-            dataset_metrics=self._last_dataset_metrics or None,
+            report=self._last_report,
             parent=self,
         )
         dialog.statusMessage.connect(self.statusMessage)
@@ -1101,7 +1591,11 @@ class RunResultsTab(QtWidgets.QWidget):
         if self._candidate is None:
             clipboard.setText(identity.readable_json())
         else:
-            clipboard.setText(_fit_run_identity_export_json(self._candidate))
+            if self._last_report is None:
+                raise ValueError("Fit terminal report is unavailable.")
+            clipboard.setText(
+                _fit_run_identity_export_json(self._candidate, self._last_report)
+            )
 
     def _copy_short_hash(self) -> None:
         identity = self._run_identity
@@ -1152,11 +1646,8 @@ class RunResultsTab(QtWidgets.QWidget):
         self._apply_group.setVisible(has_owner_projection)
         for scope, label in self._apply_scope_labels.items():
             if scope in self._available_apply_scopes:
-                if scope == "parameters" and self._has_per_dataset_values:
-                    disposition = (
-                        "Available for shared project values only; per-dataset "
-                        "values stay Fit-local and are not applied to Run."
-                    )
+                if scope == "parameters" and self._last_report is not None:
+                    disposition = self._last_report.publication.message
                     label.setText(disposition)
                     label.setToolTip(disposition)
                 else:
@@ -1164,6 +1655,15 @@ class RunResultsTab(QtWidgets.QWidget):
                     label.setToolTip("")
                 continue
             reason = self._unavailable_apply_reasons.get(scope, "")
+            if scope == "parameters" and self._last_report is not None:
+                reason = " ".join(
+                    item
+                    for item in (
+                        reason,
+                        self._last_report.publication.message,
+                    )
+                    if item
+                )
             compact = compact_diagnostic_text(
                 reason,
                 max_chars=DIAGNOSTIC_LABEL_MAX_CHARS,
@@ -1465,7 +1965,10 @@ class RunResultsTab(QtWidgets.QWidget):
             if info is None:
                 continue
             try:
-                mse_text = f"MSE = {float(info.weighted_residual_mse):.3e}"
+                mse_text = (
+                    "Weighted MSE = "
+                    + fit_metric_text(info.weighted_residual_mse, precision=3)
+                )
             except (AttributeError, TypeError, ValueError):
                 continue
             compact_name = compact_plot_title_label(
@@ -1481,7 +1984,7 @@ class RunResultsTab(QtWidgets.QWidget):
             if isinstance(r_squared_by_series, Mapping):
                 for series_name, value in r_squared_by_series.items():
                     try:
-                        r_squared_text = f"{float(value):.6g}"
+                        r_squared_text = fit_metric_text(value)
                     except (TypeError, ValueError):
                         continue
                     tooltip_parts.append(f"{str(series_name)}: R² = {r_squared_text}")
@@ -1501,172 +2004,6 @@ class RunResultsTab(QtWidgets.QWidget):
             widget.deleteLater()
         self._subtabs.hide()
 
-    def _dataset_parameter_entries(
-        self,
-        candidate: FitCandidate,
-    ) -> tuple[DatasetParameterPresentation, ...]:
-        raw_values = {
-            dataset_id: dict(values)
-            for dataset_id, values in candidate.scalar_values_by_dataset
-        }
-        labels = {
-            mapped.dataset_id: mapped.display_name
-            for mapped in candidate.origin.mapped_datasets
-        }
-        counts: dict[str, int] = {}
-        for label in labels.values():
-            counts[label] = counts.get(label, 0) + 1
-        entries: list[DatasetParameterPresentation] = []
-        for dataset_id in sorted(raw_values, key=str):
-            values = raw_values[dataset_id]
-            if not isinstance(values, Mapping) or not values:
-                continue
-            normalized_id = str(dataset_id)
-            label = labels.get(normalized_id, normalized_id)
-            if counts.get(label, 0) > 1:
-                label = f"{label} ({normalized_id})"
-            compact_label = compact_dataset_label(
-                label,
-                max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
-            )
-            entries.append((compact_label.display, normalized_id, values))
-        return tuple(entries)
-
-    def _dataset_metric_entries(
-        self,
-        candidate: FitCandidate,
-    ) -> tuple[DatasetMetricPresentation, ...]:
-        labels = {
-            mapped.dataset_id: mapped.display_name
-            for mapped in candidate.origin.mapped_datasets
-        }
-        counts: dict[str, int] = {}
-        for label in labels.values():
-            counts[label] = counts.get(label, 0) + 1
-        entries: list[DatasetMetricPresentation] = []
-        for info in candidate.result.dataset_info:
-            dataset_id = str(info.dataset_id)
-            label = labels.get(dataset_id, dataset_id)
-            if counts.get(label, 0) > 1:
-                label = f"{label} ({dataset_id})"
-            compact_label = compact_dataset_label(
-                label,
-                max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
-            )
-            entries.append(
-                (
-                    compact_label.display,
-                    dataset_id,
-                    float(info.weighted_residual_mse),
-                    float(info.weighted_rmse),
-                    float(info.weighted_mae),
-                    float(info.weight),
-                    int(info.n_points),
-                    tuple(
-                        sorted(
-                            (
-                                str(series_name),
-                                float(value),
-                            )
-                            for series_name, value in info.r_squared_by_series.items()
-                        )
-                    ),
-                )
-            )
-        return tuple(entries)
-
-    def _set_initial_entries(
-        self,
-        candidate: FitCandidate,
-    ) -> tuple[SetInitialPresentation, ...]:
-        entries: list[SetInitialPresentation] = []
-        for index, (set_id, values) in enumerate(candidate.initial_values_by_set):
-            if not values:
-                continue
-            compact = compact_dataset_label(
-                self._set_labels.get(set_id, f"Initial set {index + 1}"),
-                max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
-            )
-            entries.append((compact.display, set_id, dict(values)))
-        return tuple(entries)
-
-    @staticmethod
-    def _optimizer_coordinate_count(candidate: FitCandidate) -> int:
-        setup = candidate.setup_snapshot
-        included_dataset_count = sum(
-            1 for dataset in setup.datasets if dataset.included
-        )
-        parameter_coordinates = sum(
-            1 if parameter.scope == "shared" else included_dataset_count
-            for parameter in setup.parameters
-            if parameter.selected_config.fit
-        )
-        fitted_initial_keys = {
-            (set_id, species)
-            for set_id, values in candidate.initial_values_by_set
-            for species, _value in values
-        }
-        initial_scopes = dict(setup.initial_scopes)
-        global_initial_species = {
-            initial.species
-            for initial in setup.global_initials
-            if (
-                initial.fit
-                and initial_scopes.get(initial.species) == "global"
-                and any(
-                    (set_id, initial.species) in fitted_initial_keys
-                    for set_id, _value in candidate.initial_values_by_set
-                )
-            )
-        }
-        local_initial_coordinates = sum(
-            1
-            for initial in setup.initials
-            if (
-                initial.fit
-                and initial_scopes.get(initial.species) == "local"
-                and (initial.set_id, initial.species) in fitted_initial_keys
-            )
-        )
-        return (
-            parameter_coordinates
-            + len(global_initial_species)
-            + local_initial_coordinates
-        )
-
-    @staticmethod
-    def _optimizer_diagnostic_text(candidate: FitCandidate) -> str:
-        diagnostic = candidate.result.completion.optimizer_diagnostic
-        if diagnostic is None:
-            return "None"
-        failure = diagnostic.failure
-        message = str(failure.get("message") or "Optimizer diagnostic")
-        dataset_text = f" [{diagnostic.dataset_id}]" if diagnostic.dataset_id else ""
-        return f"{diagnostic.phase}{dataset_text}: {message}"
-
-    def _candidate_stats(self, candidate: FitCandidate) -> dict[str, object]:
-        result = candidate.result
-        infos = tuple(result.dataset_info)
-        points = sum(int(info.n_points) for info in infos)
-        series = sum(len(values) for values in result.model_series.values())
-        coordinate_count = self._optimizer_coordinate_count(candidate)
-        completion = result.completion
-        return {
-            "Datasets": len(result.simulation_results_by_dataset),
-            "Series": series,
-            "Points": points,
-            "Parameters": coordinate_count,
-            "DF": points - coordinate_count,
-            "Completion": completion.status,
-            "Optimizer converged": completion.optimizer_converged,
-            "Optimizer diagnostic": self._optimizer_diagnostic_text(candidate),
-            "Weighted SSE": float(result.weighted_residual_sse),
-            "Weighted MSE": float(result.weighted_residual_mse),
-            "Optimizer evaluations": int(result.nfev),
-            "Message": str(result.message),
-            "Objective SSQ": _objective_cost(result),
-        }
-
     def _refresh_summary_dialog(self) -> None:
         if self._summary_dialog is None or not self._summary_dialog.isVisible():
             return
@@ -1677,9 +2014,5 @@ class RunResultsTab(QtWidgets.QWidget):
         self._summary_dialog.refresh(
             identity,
             candidate=self._candidate,
-            stats=self._last_stats or None,
-            fitted_params=self._last_fitted_params or None,
-            dataset_fitted_params=self._last_dataset_fitted_params or None,
-            set_initial_values=self._last_set_initial_values or None,
-            dataset_metrics=self._last_dataset_metrics or None,
+            report=self._last_report,
         )

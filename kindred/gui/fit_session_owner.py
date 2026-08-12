@@ -29,18 +29,25 @@ from kindred.core.simulator.dsl_parse import (
 )
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.fitting.launch import (
+    FitAdvancedAnalysisSetupEdit,
+    FitApplySelection,
     FitDatasetLocalSettings,
     FitDatasetSetupEdit,
     FitDatasetWeightModeSetupEdit,
     FitDefaultsSetupEdit,
     FitExecutionRequest,
     FitInitialSetupEdit,
+    FitInitialApplyCellProposal,
+    FitInitialApplyProposal,
     FitInitialScopeSetupEdit,
+    FitLocalScalarProvenance,
     FitOriginSnapshot,
     FitParameterConfiguration,
     FitParameterSetupEdit,
     FitParameterScopeSetupEdit,
     FitParameterVariable,
+    FitPublicationClassification,
+    FitSharedRefitIntent,
     FitSolverSetupEdit,
     FitSetupSnapshot,
     _replace_fit_parameter,
@@ -53,6 +60,7 @@ from kindred.gui.fitting.launch import (
     selected_observations,
 )
 from kindred.gui.fitting.window import FittingWindow
+from kindred.gui.fitting.reporting import FitTerminalReportError
 from kindred.gui.fitting.worker import (
     FitCandidate,
     FitLiveUpdate,
@@ -75,7 +83,6 @@ __all__ = [
 
 WindowFactory = Callable[..., FittingWindow]
 ColorResolver = Callable[[str, Sequence[str]], object]
-DeauthorizeTargets = Callable[[str, Iterable[str]], object]
 CanonicalDetailedBalanceSourceProposal = Callable[
     [str, MechanismAuthoringSource],
     DetailedBalanceCorrectionProposal | None,
@@ -109,7 +116,6 @@ class FitSessionOwner(QtCore.QObject):
         session: ProjectSession,
         registry: WorkspaceTabRegistry,
         gate: ComputationGate,
-        deauthorize_targets: DeauthorizeTargets,
         propose_detailed_balance_source: CanonicalDetailedBalanceSourceProposal,
         commit_detailed_balance_source: CanonicalDetailedBalanceSourceCommit,
         color_resolver: ColorResolver | None = None,
@@ -124,8 +130,6 @@ class FitSessionOwner(QtCore.QObject):
             raise TypeError("registry must be WorkspaceTabRegistry.")
         if not isinstance(gate, ComputationGate):
             raise TypeError("gate must be ComputationGate.")
-        if not callable(deauthorize_targets):
-            raise TypeError("deauthorize_targets must be callable.")
         if not callable(propose_detailed_balance_source):
             raise TypeError("propose_detailed_balance_source must be callable.")
         if not callable(commit_detailed_balance_source):
@@ -137,7 +141,6 @@ class FitSessionOwner(QtCore.QObject):
         self._session = session
         self._registry = registry
         self._gate = gate
-        self._deauthorize_targets = deauthorize_targets
         self._propose_detailed_balance_source = propose_detailed_balance_source
         self._commit_detailed_balance_source = commit_detailed_balance_source
         self._color_resolver = color_resolver
@@ -146,7 +149,11 @@ class FitSessionOwner(QtCore.QObject):
         self._window: FittingWindow | None = None
         self._worker: GlobalFitWorker | None = None
         self._candidate: FitCandidate | None = None
+        self._shared_refit_source_candidate: FitCandidate | None = None
         self._candidate_applied_scopes: frozenset[str] = frozenset()
+        self._candidate_applied_initial_keys: frozenset[
+            tuple[str, str]
+        ] = frozenset()
         self._candidate_available_scopes: frozenset[str] = frozenset()
         self._candidate_unavailable_reasons: dict[str, str] = {}
         self._origin: FitOriginSnapshot | None = None
@@ -261,11 +268,14 @@ class FitSessionOwner(QtCore.QObject):
         self._last_fit_setup_snapshot = None
         self._pending_detailed_balance = None
         self._candidate = None
+        self._shared_refit_source_candidate = None
         self._candidate_applied_scopes = frozenset()
+        self._candidate_applied_initial_keys = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         try:
             window.rebase(origin, setup=initial_setup)
+            self._project_initial_apply_proposal(window)
             window.set_initial_reset_available(initial_setup)
         except (TypeError, ValueError, KeyError) as exc:
             window.deleteLater()
@@ -309,6 +319,14 @@ class FitSessionOwner(QtCore.QObject):
             self._set_status("Fit rejected while the window is closing.")
             return False
         if not self._origin_is_current():
+            if self._shared_refit_source_candidate is not None:
+                self._shared_refit_source_candidate = None
+                self._candidate = None
+                if self._local_setup_snapshot is not None:
+                    self._local_setup_snapshot = replace(
+                        self._local_setup_snapshot,
+                        shared_refit_promotions=(),
+                    )
             self._set_status("Fit rejected: origin science is no longer current.")
             return False
         if not self._gate.is_idle:
@@ -331,16 +349,34 @@ class FitSessionOwner(QtCore.QObject):
         except (TypeError, ValueError, KeyError) as exc:
             self._set_status(f"Fit setup is invalid: {exc}")
             return False
+        previous_candidate = self._shared_refit_source_candidate
+        if bool(request.shared_refit_promotions) != (previous_candidate is not None):
+            self._set_status(
+                "Fit setup is invalid: Shared refit requires exactly one retained "
+                "current terminal candidate."
+            )
+            return False
+        if previous_candidate is not None and not self._candidate_origin_is_current(
+            previous_candidate
+        ):
+            self._set_status("Fit setup is invalid: Shared-refit source is stale.")
+            return False
         if not self._gate.try_acquire(self, "fit"):
             self._set_status("Fit rejected: another computation is active.")
             return False
         try:
             worker = GlobalFitWorker(
                 request,
+                previous_candidate=previous_candidate,
                 parent=self,
             )
         except Exception as exc:
             self._gate.release(self)
+            if previous_candidate is not None:
+                self._restore_shared_refit_source_presentation(
+                    previous_candidate,
+                    setup=FitSetupSnapshot.from_request(request),
+                )
             self._set_status(f"Fit preparation failed before dispatch: {exc}")
             return False
         self._worker_generation += 1
@@ -417,6 +453,11 @@ class FitSessionOwner(QtCore.QObject):
                 worker.deleteLater()
                 self._notify_application_close_settled()
                 window.set_executing(False)
+                if previous_candidate is not None:
+                    self._restore_shared_refit_source_presentation(
+                        previous_candidate,
+                        setup=FitSetupSnapshot.from_request(request),
+                    )
                 self._set_status(
                     f"Fit dispatch failed before QThread start: {exc}"
                 )
@@ -465,27 +506,73 @@ class FitSessionOwner(QtCore.QObject):
 
         self._local_request = request
         self._local_setup_snapshot = FitSetupSnapshot.from_request(request)
+        # Shared-refit source custody is call-local execution input.  It must
+        # survive dispatch failure, cancellation, and warning terminals; only
+        # a successfully accepted replacement retires it.
         self._pending_detailed_balance = None
         self._candidate = None
         self._candidate_applied_scopes = frozenset()
+        self._candidate_applied_initial_keys = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
-        window.clear_candidate()
+        self._clear_candidate_presentation(window)
+
+    def _restore_shared_refit_source_presentation(
+        self,
+        source: FitCandidate,
+        *,
+        setup: FitSetupSnapshot,
+        failure: object | None = None,
+    ) -> None:
+        """Restore the retained Per-dataset source after an unsuccessful dispatch."""
+
+        if not isinstance(source, FitCandidate):
+            raise TypeError("Shared-refit source must be a FitCandidate.")
+        if not isinstance(setup, FitSetupSnapshot):
+            raise TypeError("Shared-refit retry setup must be a FitSetupSnapshot.")
+        self._candidate = source
+        self._local_request = None
+        self._local_setup_snapshot = setup
+        self._candidate_applied_scopes = frozenset()
+        self._candidate_applied_initial_keys = frozenset()
+        (
+            self._candidate_available_scopes,
+            self._candidate_unavailable_reasons,
+        ) = self._candidate_apply_feasibility(source)
+        window = self._window
+        if window is None:
+            return
+        try:
+            window.project_setup_snapshot(setup)
+            window.set_candidate(
+                source,
+                available_scopes=self._candidate_available_scopes,
+                unavailable_reasons=self._candidate_unavailable_reasons,
+            )
+            self._project_initial_apply_proposal(window)
+            if failure is not None:
+                window.set_terminal_failure(failure)
+        except Exception as exc:
+            self._set_status(
+                "Shared refit failed before retry presentation was restored: "
+                f"{exc}"
+            )
 
     @QtCore.Slot(object)
-    def _on_setup_edits(self, intents: object) -> None:
+    def _on_setup_edits(self, intents: object) -> bool:
         """Fold one or more typed UI intents into the sole local setup owner."""
 
         if self._closing or self._application_close_fenced:
-            return
+            return False
         window = self._window
         origin = self._origin
         setup = self._local_setup_snapshot
         if window is None or origin is None or setup is None:
-            return
+            return False
         if not isinstance(intents, tuple) or not intents:
             window.set_status("Fit setup edits must be a nonempty tuple.")
-            return
+            return False
+        shared_refit_source_candidate = self._shared_refit_source_candidate
         try:
             if self._worker is not None:
                 raise ValueError("Fit setup is locked while execution is active.")
@@ -547,6 +634,11 @@ class FitSessionOwner(QtCore.QObject):
                                 if target in targets
                             ),
                         )
+                    if replacement.included and not replacement.target_species:
+                        raise ValueError(
+                            "Included datasets must select at least one target "
+                            "or be excluded."
+                        )
                     setup = replace(
                         setup,
                         datasets=tuple(
@@ -577,10 +669,7 @@ class FitSessionOwner(QtCore.QObject):
                         for dataset_id, _value
                         in replacement.selected_config.dataset_values
                     }
-                    if (
-                        replacement.scope == "per_dataset"
-                        and replacement_ids != retained_ids
-                    ):
+                    if replacement.scope != "shared" and replacement_ids != retained_ids:
                         raise ValueError(
                             "Per-dataset scalar state must cover every retained dataset."
                         )
@@ -601,8 +690,35 @@ class FitSessionOwner(QtCore.QObject):
                         item for item in setup.parameters
                         if item.name == intent.parameter_name
                     )
-                    if intent.scope == current.scope:
+                    if intent.scope == current.scope and intent.scope != "hierarchical":
                         raise ValueError("Scalar scope transition did not change scope.")
+                    local_scalar_names = {
+                        scalar_name
+                        for observable in setup.local_observables
+                        for scalar_name in observable.scalar_names
+                    }
+                    if intent.scope == "hierarchical" and current.name in local_scalar_names:
+                        raise ValueError(
+                            "Fit-local observable scalars are not eligible for "
+                            "Hierarchical scope."
+                        )
+                    hierarchy = {
+                        item.parameter_name: item for item in setup.hierarchical
+                    }
+                    existing_hierarchy = hierarchy.pop(current.name, None)
+                    if intent.scope == "hierarchical":
+                        config = intent.hierarchical_config
+                        if config is None:
+                            raise ValueError(
+                                "Hierarchical scope requires an explicit configuration."
+                            )
+                        if (
+                            intent.scope == current.scope
+                            and existing_hierarchy is None
+                        ):
+                            raise ValueError(
+                                "Hierarchical edit has no accepted configuration to replace."
+                            )
                     if intent.scope == "shared":
                         config = current.shared_config
                         if config is None:
@@ -612,14 +728,48 @@ class FitSessionOwner(QtCore.QObject):
                         config = current.per_dataset_config
                         if config is None:
                             raise ValueError("Per-dataset scalar configuration is missing.")
-                        replacement = replace(current, scope="per_dataset")
+                        replacement = replace(current, scope=intent.scope)
+                    if intent.scope == "hierarchical":
+                        assert intent.hierarchical_config is not None
+                        hierarchy[current.name] = intent.hierarchical_config
                     parameters = tuple(
                         replacement if item.name == replacement.name else item
                         for item in setup.parameters
                     )
                     setup = self._setup_with_local_observables(
-                        replace(setup, parameters=parameters),
+                        replace(
+                            setup,
+                            parameters=parameters,
+                            hierarchical=tuple(hierarchy.values()),
+                            shared_refit_promotions=(),
+                        ),
                         setup.local_observables,
+                    )
+                    shared_refit_source_candidate = None
+                elif isinstance(intent, FitAdvancedAnalysisSetupEdit):
+                    if intent.shared_refit_promotions:
+                        if intent.shared_refit_promotions != setup.shared_refit_promotions:
+                            candidate = (
+                                self._shared_refit_source_candidate
+                                or self._candidate
+                            )
+                            if (
+                                candidate is None
+                                or not self._candidate_origin_is_current(candidate)
+                            ):
+                                raise ValueError(
+                                    "Shared refit promotion requires one current "
+                                    "Per-dataset terminal candidate."
+                                )
+                            shared_refit_source_candidate = candidate
+                    else:
+                        shared_refit_source_candidate = None
+                    setup = replace(
+                        setup,
+                        profile_likelihood=intent.profile_likelihood,
+                        residual_bootstrap=intent.residual_bootstrap,
+                        hierarchical=intent.hierarchical,
+                        shared_refit_promotions=intent.shared_refit_promotions,
                     )
                 elif isinstance(intent, FitSolverSetupEdit):
                     setup = replace(setup, solver=intent.solver)
@@ -707,10 +857,96 @@ class FitSessionOwner(QtCore.QObject):
                 intents,
                 f"Fit setup edit rejected: {exc}",
             )
-            return
+            return False
+        if any(
+            isinstance(intent, (FitDatasetSetupEdit, FitDatasetWeightModeSetupEdit,
+                                FitParameterSetupEdit, FitParameterScopeSetupEdit,
+                                FitInitialSetupEdit, FitInitialScopeSetupEdit))
+            for intent in intents
+        ):
+            # These edits change the data or fitted coordinate identity that
+            # produced a Per-dataset source.  They are genuine invalidation;
+            # Fit-wide solver/method/budget/tolerance/seed edits are not.
+            setup = replace(setup, shared_refit_promotions=())
+            shared_refit_source_candidate = None
         self._local_setup_snapshot = setup
+        self._shared_refit_source_candidate = shared_refit_source_candidate
         self._local_request = None
+        had_candidate = self._candidate is not None
+        if shared_refit_source_candidate is None:
+            self._candidate = None
+            self._candidate_applied_scopes = frozenset()
+            self._candidate_applied_initial_keys = frozenset()
+            self._candidate_available_scopes = frozenset()
+            self._candidate_unavailable_reasons = {}
+            if had_candidate:
+                self._clear_candidate_presentation(window)
         window.accept_setup_edits(setup, intents)
+        if any(
+            isinstance(intent, FitParameterScopeSetupEdit)
+            and intent.scope == "shared"
+            for intent in intents
+        ):
+            self._set_status(
+                "Shared scope selected; run Fit to produce a publishable Shared value."
+            )
+        return True
+
+    @QtCore.Slot(object)
+    def accept_shared_refit_intent(self, intent: object) -> bool:
+        """Accept one Results-owned Shared-refit request through the owner.
+
+        This is the typed Results-to-owner boundary for G.  It deliberately
+        does not emit success from the requesting Results leaf; success is
+        observable only after the owner acknowledges the accepted setup.
+        """
+
+        self._require_thread()
+        if not isinstance(intent, FitSharedRefitIntent):
+            self._set_status("Shared refit rejected: intent is not typed.")
+            return False
+        setup = self._local_setup_snapshot
+        # After a nonconverged Shared terminal, the failed Shared candidate
+        # remains Last Fit truth while the retained Per-dataset candidate is
+        # the only valid source for the next promotion intent.
+        candidate = self._shared_refit_source_candidate or self._candidate
+        origin = self._origin
+        if setup is None or candidate is None or origin is None:
+            self._set_status("Shared refit rejected: no terminal Fit source is available.")
+            return False
+        if (
+            intent.origin_tab_id != origin.tab_id
+            or intent.origin_capture_id != origin.capture_id
+            or intent.source_run_hash != candidate.run_identity.short_hash
+        ):
+            self._set_status("Shared refit rejected: source identity is stale.")
+            return False
+        if not self._candidate_origin_is_current(candidate):
+            self._shared_refit_source_candidate = None
+            self._set_status("Shared refit rejected: source science is no longer current.")
+            return False
+        edit = FitAdvancedAnalysisSetupEdit(
+            origin_tab_id=origin.tab_id,
+            origin_capture_id=origin.capture_id,
+            profile_likelihood=None,
+            residual_bootstrap=None,
+            hierarchical=(),
+            shared_refit_promotions=intent.promotions,
+        )
+        if not self._on_setup_edits((edit,)):
+            return False
+        accepted = (
+            self._local_setup_snapshot is not None
+            and self._local_setup_snapshot.shared_refit_promotions == intent.promotions
+            and self._shared_refit_source_candidate is candidate
+        )
+        if not accepted:
+            self._set_status("Shared refit rejected: owner setup admission failed.")
+            return False
+        # Acceptance and execution are one owner transaction.  The existing
+        # execute path retains the source candidate until the new Shared Fit
+        # reaches its terminal outcome, including dispatch failures.
+        return self.execute()
 
     @staticmethod
     def _parameter_edit_with_scope_configs(
@@ -741,6 +977,7 @@ class FitSessionOwner(QtCore.QObject):
             replacement,
             shared_config=shared,
             per_dataset_config=per_dataset,
+            fit_local_provenance=current.fit_local_provenance,
         )
 
     def _setup_with_local_observables(
@@ -1043,6 +1280,12 @@ class FitSessionOwner(QtCore.QObject):
                     pending.execution_request.dataset_weight_mode
                 ),
                 defaults=pending.execution_request.defaults,
+                profile_likelihood=pending.execution_request.profile_likelihood,
+                residual_bootstrap=pending.execution_request.residual_bootstrap,
+                hierarchical=pending.execution_request.hierarchical,
+                shared_refit_promotions=(
+                    pending.execution_request.shared_refit_promotions
+                ),
             )
             revalidate_fit_request_inclusions(
                 document=proposal.proposed_document,
@@ -1112,6 +1355,7 @@ class FitSessionOwner(QtCore.QObject):
                     rebased,
                     setup=corrected_snapshot,
                 )
+                self._project_initial_apply_proposal(self._window)
                 self._window.set_initial_reset_available(corrected_snapshot)
                 self._window.set_executing(True)
         except Exception as exc:
@@ -1157,6 +1401,7 @@ class FitSessionOwner(QtCore.QObject):
             self._rebase_owner_snapshots(current)
             if self._window is not None:
                 self._window.rebase(current, setup=self._local_setup_snapshot)
+                self._project_initial_apply_proposal(self._window)
         except Exception:
             self._origin = None
             self._local_request = None
@@ -1303,8 +1548,8 @@ class FitSessionOwner(QtCore.QObject):
                     scope=scalar_scope,
                     shared_config=FitParameterConfiguration(
                         value=1.0,
-                        minimum=float("-inf"),
-                        maximum=float("inf"),
+                        minimum=1.0e-12,
+                        maximum=1.0e12,
                         fit=True,
                         log10=False,
                         dataset_values=tuple(
@@ -1314,8 +1559,8 @@ class FitSessionOwner(QtCore.QObject):
                     ),
                     per_dataset_config=FitParameterConfiguration(
                         value=1.0,
-                        minimum=float("-inf"),
-                        maximum=float("inf"),
+                        minimum=1.0e-12,
+                        maximum=1.0e12,
                         fit=True,
                         log10=False,
                         dataset_values=tuple(
@@ -1326,6 +1571,15 @@ class FitSessionOwner(QtCore.QObject):
                     family="scalar",
                     role="scalar",
                     unit="1",
+                    fit_local_provenance=FitLocalScalarProvenance(
+                        origin_tab_id=origin.tab_id,
+                        origin_capture_id=origin.capture_id,
+                        observable_name=observable.name,
+                        dataset_id=mapped.dataset_id,
+                        raw_observation_id=raw_observation_id,
+                        admission_scope=scalar_scope,
+                        admitted_value=1.0,
+                    ),
                 )
                 for scalar_name in observable.scalar_names
             )
@@ -1360,10 +1614,12 @@ class FitSessionOwner(QtCore.QObject):
             return False
         self._candidate = None
         self._candidate_applied_scopes = frozenset()
+        self._candidate_applied_initial_keys = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         self._local_request = None
-        window.clear_candidate()
+        self._shared_refit_source_candidate = None
+        self._clear_candidate_presentation(window)
         self._set_status(
             f"Observable {observable.name!r} is Fit-local until Apply."
         )
@@ -1413,7 +1669,7 @@ class FitSessionOwner(QtCore.QObject):
                 origin=origin,
             )
             self._params_reset_projection()
-            window.clear_candidate()
+            self._clear_candidate_presentation(window)
             window.project_setup_snapshot(restored_snapshot)
         except (TypeError, ValueError, KeyError) as exc:
             self._set_status(f"Fit setup reset failed: {exc}")
@@ -1421,7 +1677,9 @@ class FitSessionOwner(QtCore.QObject):
         self._local_request = None
         self._local_setup_snapshot = restored_snapshot
         self._candidate = None
+        self._shared_refit_source_candidate = None
         self._candidate_applied_scopes = frozenset()
+        self._candidate_applied_initial_keys = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         self._set_status(f"Fit setup {kind.replace('_', ' ')} snapshot restored.")
@@ -1433,6 +1691,25 @@ class FitSessionOwner(QtCore.QObject):
         window = self._window
         if window is not None:
             window.clear_parameters_pending_edits()
+
+    def _clear_candidate_presentation(self, window: FittingWindow) -> None:
+        """Clear terminal authority and its exact IC proposal together."""
+
+        if not isinstance(window, FittingWindow):
+            raise TypeError("Fit candidate presentation requires FittingWindow.")
+        window.clear_candidate()
+
+    def _project_initial_apply_proposal(
+        self,
+        window: FittingWindow,
+    ) -> FitInitialApplyProposal | None:
+        """Project the owner's current origin-bound proposal to the window."""
+
+        if not isinstance(window, FittingWindow):
+            raise TypeError("Fit IC proposal presentation requires FittingWindow.")
+        proposal = self.current_initial_apply_proposal()
+        window.set_initial_apply_proposal(proposal)
+        return proposal
 
     def _reset_snapshot_against_current_origin(
         self,
@@ -1556,13 +1833,16 @@ class FitSessionOwner(QtCore.QObject):
                     and target not in allowed_observables
                 ):
                     return False
+            # Exclusion suspends execution; it does not make an empty or stale
+            # target route valid.  Reset must preserve a route that can execute
+            # immediately if the dataset is re-included later.
             selected = selected_observations(mapped, dataset)
-            return bool(selected or not dataset.included)
+            return bool(selected)
         except (AttributeError, StopIteration, TypeError, ValueError, KeyError):
             return False
 
     @QtCore.Slot(object)
-    def apply_candidate(self, scopes: object) -> bool:
+    def apply_candidate(self, selection: object) -> bool:
         """Apply any selected independent scopes through one document replacement."""
         self._require_thread()
         if self._closing or self._application_close_fenced:
@@ -1573,9 +1853,16 @@ class FitSessionOwner(QtCore.QObject):
         if candidate is None or origin is None or window is None:
             self._set_status("There is no completed Fit candidate to Apply.")
             return False
-        selected = frozenset(str(item) for item in self._scope_items(scopes))
-        if not selected:
-            self._set_status("Apply contains an unavailable or empty scope selection.")
+        if not isinstance(selection, FitApplySelection):
+            self._set_status("Apply rejected: the selection is not origin-bound.")
+            return False
+        selected = frozenset(selection.scopes)
+        selected_initial_keys = frozenset(selection.initial_keys)
+        if (
+            selection.origin_tab_id != origin.tab_id
+            or selection.origin_capture_id != origin.capture_id
+        ):
+            self._set_status("Apply rejected: the selection belongs to a stale Fit origin.")
             return False
         if not self._candidate_origin_is_current(candidate):
             self._set_status("Apply rejected: origin science is no longer current.")
@@ -1607,6 +1894,18 @@ class FitSessionOwner(QtCore.QObject):
         expected_token = self._session.capture_content_token()
         previous_document = self._session.document
         try:
+            initial_proposal = self._initial_apply_proposal(candidate)
+            proposal_keys = frozenset(initial_proposal.selected_keys)
+            if "initial_concentrations" in selected:
+                unavailable_initial_keys = selected_initial_keys - proposal_keys
+                unavailable_initial_keys |= (
+                    selected_initial_keys & self._candidate_applied_initial_keys
+                )
+                if unavailable_initial_keys:
+                    raise ValueError(
+                        "Initial Conditions Apply contains unavailable cells: "
+                        + ", ".join(repr(item) for item in sorted(unavailable_initial_keys))
+                    )
             local_scalar_names = self._candidate_local_scalar_names(
                 candidate
             )
@@ -1614,6 +1913,7 @@ class FitSessionOwner(QtCore.QObject):
                 item.name: item
                 for item in candidate.setup_snapshot.parameters
             }
+            publication_by_name = self._candidate_publication_classifications(candidate)
             applied_canonical_parameter_names = tuple(
                 sorted(
                     name
@@ -1622,7 +1922,8 @@ class FitSessionOwner(QtCore.QObject):
                         "parameters" in selected
                         and name not in local_scalar_names
                         and terminal_parameter_by_name.get(name) is not None
-                        and terminal_parameter_by_name[name].scope == "shared"
+                        and publication_by_name[name].route == "parameters"
+                        and publication_by_name[name].eligible
                     )
                 )
             )
@@ -1642,10 +1943,17 @@ class FitSessionOwner(QtCore.QObject):
                 sorted(
                     item.name
                     for item in candidate.setup_snapshot.parameters
-                    if item.selected_config.fit and item.scope == "per_dataset"
+                    if item.selected_config.fit and item.scope != "shared"
                 )
             )
-            applied_scopes = self._candidate_applied_scopes | selected
+            applied_initial_keys = (
+                self._candidate_applied_initial_keys | selected_initial_keys
+            )
+            applied_scopes = self._candidate_applied_scopes | (
+                selected - {"initial_concentrations"}
+            )
+            if proposal_keys and proposal_keys <= applied_initial_keys:
+                applied_scopes = applied_scopes | {"initial_concentrations"}
             preserved = self._preserved_setup_with_terminal_values(
                 preserved,
                 candidate,
@@ -1661,6 +1969,7 @@ class FitSessionOwner(QtCore.QObject):
                 candidate,
                 selected,
                 origin,
+                selected_initial_keys=selected_initial_keys,
             )
             next_document = previous_document.replace_tab(next_tab)
             # Prepare the complete semantic rebase against the exact proposed
@@ -1671,18 +1980,21 @@ class FitSessionOwner(QtCore.QObject):
                 rebased,
                 selected,
                 preserved.local_observables,
+                selected_initial_keys=selected_initial_keys,
             )
             refreshed_initial_snapshot = self._reset_owner_snapshot_after_apply(
                 self._initial_setup_snapshot,
                 origin=rebased,
                 canonicalized_scopes=selected,
                 promoted=candidate.local_observables,
+                selected_initial_keys=selected_initial_keys,
             )
             refreshed_last_fit_snapshot = self._reset_owner_snapshot_after_apply(
                 self._last_fit_setup_snapshot,
                 origin=rebased,
                 canonicalized_scopes=selected,
                 promoted=candidate.local_observables,
+                selected_initial_keys=selected_initial_keys,
             )
             rebased_apply_context = replace(
                 candidate,
@@ -1693,38 +2005,11 @@ class FitSessionOwner(QtCore.QObject):
                 self._candidate_apply_feasibility(
                     rebased_apply_context,
                     applied_scopes=applied_scopes,
+                    applied_initial_keys=applied_initial_keys,
                 )
             )
         except Exception as exc:
             self._set_status(f"Apply rejected: {exc}")
-            return False
-
-        # Compute the complete affected target delta against the exact old
-        # and proposed documents before the canonical replacement.  This is
-        # the same registry-owned delta authority used by replace_document.
-        planned_delta = self._registry.scientific_document_delta(
-            previous_document,
-            next_document,
-        )
-        try:
-            for affected_tab_id, set_ids in planned_delta.affected_targets_by_tab:
-                self._deauthorize_targets(affected_tab_id, set_ids)
-        except Exception as exc:
-            # Deauthorization may have fenced only a prefix of the old
-            # targets.  Keep the old document, but clear all Fit view/result
-            # authority so no partially fenced old result can be reused.
-            self._candidate = None
-            self._candidate_applied_scopes = frozenset()
-            self._candidate_available_scopes = frozenset()
-            self._candidate_unavailable_reasons = {}
-            try:
-                window.clear_candidate()
-            except Exception:
-                pass
-            self._set_status(
-                "Apply rejected before document publication; affected Fit "
-                f"results were fenced and the view was cleared: {exc}"
-            )
             return False
 
         try:
@@ -1732,63 +2017,24 @@ class FitSessionOwner(QtCore.QObject):
                 next_document,
                 expected_token=expected_token,
             )
-            if result is None:
-                self._set_status(
-                    "Apply rejected after result fencing: project content "
-                    "changed before publication; affected results were cleared."
-                )
-                self._candidate = None
-                self._candidate_applied_scopes = frozenset()
-                self._candidate_available_scopes = frozenset()
-                self._candidate_unavailable_reasons = {}
-                try:
-                    window.clear_candidate()
-                except Exception:
-                    pass
-                return False
-            changed = result.changed
         except Exception as exc:
-            self._candidate = None
-            self._candidate_applied_scopes = frozenset()
-            self._candidate_available_scopes = frozenset()
-            self._candidate_unavailable_reasons = {}
-            try:
-                window.clear_candidate()
-            except Exception:
-                pass
             self._set_status(
-                "Apply failed after result fencing; old inputs remain and "
-                f"affected results were cleared: {exc}"
+                "Apply rejected before canonical publication; the Fit candidate "
+                f"remains available: {exc}"
             )
             return False
-
-        # replace_document uses the same registry delta helper above.  A
-        # mismatch would mean a new target escaped the pre-publication fence;
-        # fence the returned delta before any publication signal and fail
-        # closed if that defensive check ever trips.
-        if result.delta != planned_delta:
-            try:
-                for affected_tab_id, set_ids in result.delta.affected_targets_by_tab:
-                    self._deauthorize_targets(affected_tab_id, set_ids)
-            except Exception:
-                pass
-            self._candidate = None
-            self._candidate_applied_scopes = frozenset()
-            self._candidate_available_scopes = frozenset()
-            self._candidate_unavailable_reasons = {}
-            try:
-                window.clear_candidate()
-            except Exception:
-                pass
+        if result is None:
             self._set_status(
-                "Apply failed closed: canonical result delta changed during "
-                "publication and the Fit view was cleared."
+                "Apply rejected before canonical publication: project content "
+                "changed before the Fit candidate could be published."
             )
             return False
+        changed = result.changed
 
         # The accepted document and its complete semantic Fit rebase are now
         # installed together before any fallible result/view projection.
         self._local_request = None
+        self._shared_refit_source_candidate = None
         self._origin = rebased
         self._initial_setup_snapshot = refreshed_initial_snapshot
         self._last_fit_setup_snapshot = refreshed_last_fit_snapshot
@@ -1797,13 +2043,14 @@ class FitSessionOwner(QtCore.QObject):
         # carrier.  The rebased context above was call-local Apply state only.
         self._candidate = candidate
         self._candidate_applied_scopes = applied_scopes
+        self._candidate_applied_initial_keys = applied_initial_keys
         self._candidate_available_scopes = available_scopes
         self._candidate_unavailable_reasons = unavailable_reasons
         self.canonical_applied.emit(origin.tab_id, selected)
 
         try:
             # Clear old Apply/Copy authority before rebuilding the physical view.
-            window.clear_candidate()
+            self._clear_candidate_presentation(window)
             window.set_candidate_apply_availability(
                 available_scopes,
                 unavailable_reasons,
@@ -1817,9 +2064,24 @@ class FitSessionOwner(QtCore.QObject):
                 available_scopes=available_scopes,
                 unavailable_reasons=unavailable_reasons,
             )
+            self._project_initial_apply_proposal(window)
+        except FitTerminalReportError as exc:
+            try:
+                window.set_terminal_report_failure(exc)
+            except Exception as presentation_exc:
+                exc = FitTerminalReportError(
+                    f"{exc}; semantic failure presentation failed: "
+                    f"{presentation_exc}"
+                )
+            self._set_status(
+                "Selected Fit values were applied, but terminal report "
+                "construction failed; Apply and Copy are disabled: "
+                f"{exc}"
+            )
+            return True
         except Exception as exc:
             try:
-                window.clear_candidate()
+                self._clear_candidate_presentation(window)
             except Exception:
                 pass
             try:
@@ -1829,6 +2091,7 @@ class FitSessionOwner(QtCore.QObject):
                     unavailable_reasons=unavailable_reasons,
                     projection_error=exc,
                 )
+                self._project_initial_apply_proposal(window)
             except Exception as recovery_exc:
                 exc = RuntimeError(f"{exc}; Apply recovery failed: {recovery_exc}")
             self._set_status(
@@ -1903,13 +2166,6 @@ class FitSessionOwner(QtCore.QObject):
                     "changed before publication."
                 )
                 return False
-            for affected_tab_id, set_ids in (
-                result.delta.affected_targets_by_tab
-            ):
-                self._deauthorize_targets(
-                    affected_tab_id,
-                    set_ids,
-                )
         except Exception as exc:
             self._set_status(
                 f"Project Fit defaults update failed: {exc}"
@@ -2045,7 +2301,9 @@ class FitSessionOwner(QtCore.QObject):
 
     def _discard_local(self) -> None:
         self._candidate = None
+        self._shared_refit_source_candidate = None
         self._candidate_applied_scopes = frozenset()
+        self._candidate_applied_initial_keys = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         self._local_request = None
@@ -2055,15 +2313,17 @@ class FitSessionOwner(QtCore.QObject):
         self._origin = None
         self._pending_detailed_balance = None
         if self._window is not None:
-            self._window.clear_candidate()
+            self._clear_candidate_presentation(self._window)
 
     @QtCore.Slot()
     def _on_window_destroyed(self, *_args: object) -> None:
         if self._window is None:
             return
         self._window = None
+        self._shared_refit_source_candidate = None
         self._candidate = None
         self._candidate_applied_scopes = frozenset()
+        self._candidate_applied_initial_keys = frozenset()
         self._candidate_available_scopes = frozenset()
         self._candidate_unavailable_reasons = {}
         self._local_request = None
@@ -2219,6 +2479,12 @@ class FitSessionOwner(QtCore.QObject):
         ):
             return
         terminal = worker.terminal_result
+        shared_refit_source_candidate = self._shared_refit_source_candidate
+        shared_refit_run = bool(
+            self._local_request is not None
+            and self._local_request.shared_refit_promotions
+        )
+        launch_setup_snapshot = self._local_setup_snapshot
         publication_allowed = bool(
             not self._application_close_fenced
             and not self._closing
@@ -2255,6 +2521,36 @@ class FitSessionOwner(QtCore.QObject):
         self._finish_worker(worker)
         if not publication_allowed or candidate is None:
             if (
+                shared_refit_run
+                and shared_refit_source_candidate is not None
+                and launch_setup_snapshot is not None
+            ):
+                self._restore_shared_refit_source_presentation(
+                    shared_refit_source_candidate,
+                    setup=launch_setup_snapshot,
+                    failure=(
+                        terminal.failure
+                        if isinstance(terminal, FitWorkerTerminal)
+                        else None
+                    ),
+                )
+            if (
+                isinstance(terminal, FitWorkerTerminal)
+                and terminal.failure is not None
+                and not shared_refit_run
+                and self._window is not None
+                and not self._application_close_fenced
+                and not self._closing
+            ):
+                try:
+                    self._window.set_terminal_failure(terminal.failure)
+                except Exception as exc:
+                    self._set_status(
+                        "Fit failed and typed failure presentation failed: "
+                        f"{exc}"
+                    )
+                    return
+            if (
                 not self._application_close_fenced
                 and not self._closing
                 and failure_message
@@ -2262,21 +2558,60 @@ class FitSessionOwner(QtCore.QObject):
                 self._set_status(failure_message)
             return
         self._candidate = candidate
+        self._local_request = None
+        # A failed/cancelled/nonconverged Shared terminal does not retire the
+        # Per-dataset source.  It remains the immutable retry input until an
+        # actually successful converged Shared replacement is accepted.
+        shared_refit_replacement_succeeded = bool(
+            shared_refit_run
+            and candidate.result.completion.status == "ok"
+            and candidate.result.completion.optimizer_converged
+        )
+        self._shared_refit_source_candidate = (
+            None
+            if shared_refit_replacement_succeeded
+            else shared_refit_source_candidate
+        )
+        self._local_setup_snapshot = (
+            launch_setup_snapshot
+            if shared_refit_run
+            and not shared_refit_replacement_succeeded
+            and launch_setup_snapshot is not None
+            else candidate.setup_snapshot
+        )
+        if self._initial_setup_snapshot is not None:
+            self._initial_setup_snapshot = replace(
+                self._initial_setup_snapshot,
+                shared_refit_promotions=(),
+            )
         self._candidate_applied_scopes = frozenset()
+        self._candidate_applied_initial_keys = frozenset()
         self._last_fit_setup_snapshot = candidate.setup_snapshot
         (
             self._candidate_available_scopes,
             self._candidate_unavailable_reasons,
         ) = self._candidate_apply_feasibility(candidate)
         render_error: Exception | None = None
+        terminal_report_error: FitTerminalReportError | None = None
         rendered = False
         if self._window is not None:
             try:
+                self._window.project_setup_snapshot(candidate.setup_snapshot)
                 rendered = self._window.set_candidate(
                     candidate,
                     available_scopes=self._candidate_available_scopes,
                     unavailable_reasons=self._candidate_unavailable_reasons,
                 )
+                self._project_initial_apply_proposal(self._window)
+            except FitTerminalReportError as exc:
+                terminal_report_error = exc
+                try:
+                    self._window.set_terminal_report_failure(exc)
+                except Exception as presentation_exc:
+                    terminal_report_error = FitTerminalReportError(
+                        f"{exc}; semantic failure presentation failed: "
+                        f"{presentation_exc}"
+                    )
             except Exception as exc:
                 # Terminal rendering is optional physical presentation.  Keep
                 # the semantic candidate and reassert its independent Run and
@@ -2288,12 +2623,34 @@ class FitSessionOwner(QtCore.QObject):
                         self._candidate_available_scopes,
                         self._candidate_unavailable_reasons,
                     )
+                    self._project_initial_apply_proposal(self._window)
                 except Exception as recovery_exc:
                     render_error = RuntimeError(
                         f"{exc}; Fit presentation recovery failed: {recovery_exc}"
                     )
+        if terminal_report_error is not None:
+            self._set_status(
+                "Fit completed, but terminal report construction failed; "
+                "Apply and Copy are disabled: "
+                f"{terminal_report_error}"
+            )
+            return
         if self._window is not None:
             self._window.set_last_fit_reset_available(self._last_fit_setup_snapshot)
+            if (
+                shared_refit_run
+                and not shared_refit_replacement_succeeded
+                and shared_refit_source_candidate is not None
+            ):
+                self._window.set_shared_refit_source_candidate(
+                    shared_refit_source_candidate
+                )
+        if not bool(candidate.result.completion.optimizer_converged):
+            self._set_status(
+                "Fit completed with warning; finite values are diagnostic seed "
+                "material only and cannot be applied or published."
+            )
+            return
         if rendered:
             self._set_status("Fit completed; candidate is ready to Apply.")
         elif render_error is not None:
@@ -2338,16 +2695,13 @@ class FitSessionOwner(QtCore.QObject):
         from kindred.core.simulator.parameter_algebra import (
             apply_parameter_algebra_spec_to_mechanism,
         )
-        from kindred.core.simulator.wegscheider_symbolic import (
-            validate_wegscheider_cyclicity_resolved,
-        )
         mechanism = prepared_dsl.mechanism_for_execution()
+        parameter_algebra_spec = prepared_dsl.parameter_algebra_spec_for_execution()
         apply_parameter_algebra_spec_to_mechanism(
-            prepared_dsl.parameter_algebra_spec_for_execution(),
+            parameter_algebra_spec,
             mechanism=mechanism,
             require_mutable=False,
         )
-        validate_wegscheider_cyclicity_resolved(mechanism)
 
     def _origin_is_current(self) -> bool:
         origin = self._origin
@@ -2386,7 +2740,7 @@ class FitSessionOwner(QtCore.QObject):
             return False
         comparison_origin = (
             self._origin
-            if self._candidate_applied_scopes
+            if self._candidate_applied_scopes or self._candidate_applied_initial_keys
             else candidate.origin
         )
         if comparison_origin is None:
@@ -2443,18 +2797,16 @@ class FitSessionOwner(QtCore.QObject):
             initial_scopes=setup.initial_scopes,
             dataset_weight_mode=setup.dataset_weight_mode,
             defaults=setup.defaults,
+            profile_likelihood=setup.profile_likelihood,
+            residual_bootstrap=setup.residual_bootstrap,
+            hierarchical=setup.hierarchical,
+            shared_refit_promotions=setup.shared_refit_promotions,
         )
         revalidate_fit_request_inclusions(
             document=self._session.document,
             request=validated,
         )
         return validated
-
-    @staticmethod
-    def _scope_items(scopes: object) -> tuple[str, ...]:
-        if isinstance(scopes, (set, frozenset, tuple, list)):
-            return tuple(str(item) for item in scopes)
-        raise TypeError("Apply scopes must be a set of independent selectors.")
 
     @staticmethod
     def _candidate_local_scalar_names(
@@ -2470,6 +2822,26 @@ class FitSessionOwner(QtCore.QObject):
                 "Fit candidate repeats a Fit-local scalar identity."
             )
         return frozenset(names)
+
+    @staticmethod
+    def _candidate_publication_classifications(
+        candidate: FitCandidate,
+    ) -> dict[str, FitPublicationClassification]:
+        """Return the terminal setup's owner-provided publication truth."""
+
+        if not isinstance(candidate, FitCandidate):
+            raise TypeError("Publication classification requires FitCandidate.")
+        rows = tuple(candidate.setup_snapshot.publication_classifications)
+        by_name = {item.parameter_name: item for item in rows}
+        parameter_names = {
+            item.name for item in candidate.setup_snapshot.parameters
+        }
+        if len(by_name) != len(rows) or set(by_name) != parameter_names:
+            raise ValueError(
+                "Fit terminal publication classifications do not match its "
+                "parameter schema."
+            )
+        return by_name
 
     @staticmethod
     def _without_promoted_local_observables(
@@ -2511,7 +2883,14 @@ class FitSessionOwner(QtCore.QObject):
         preserved: FitSetupSnapshot,
         candidate: FitCandidate,
     ) -> FitSetupSnapshot:
-        """Overlay terminal values into the owner-held typed setup."""
+        """Overlay terminal values using terminal scope/schema as authority.
+
+        The pre-run setup is still authoritative for non-result controls, but
+        it is not allowed to supply the shape of a fitted scalar.  In
+        particular, a Shared-refit terminal row must not be reconstituted as
+        a stale Per-dataset row merely because the setup object held before
+        the refit used that scope.
+        """
 
         terminal_parameters = {
             item.name: item
@@ -2543,18 +2922,21 @@ class FitSessionOwner(QtCore.QObject):
             for item in candidate.setup_snapshot.global_initials
             if item.fit
         }
-        parameters = tuple(
-            (
-                _replace_fit_parameter(
-                    item,
-                    initial=terminal_parameters[item.name].selected_config.value,
-                    dataset_values=terminal_parameters[item.name].selected_config.dataset_values,
-                )
-                if item.name in terminal_parameters
-                else item
+        terminal_parameter_rows = tuple(candidate.setup_snapshot.parameters)
+        if len({item.name for item in terminal_parameter_rows}) != len(terminal_parameter_rows):
+            raise ValueError("Fit terminal setup repeats a parameter identity.")
+        terminal_names = {item.name for item in terminal_parameter_rows}
+        preserved_names = {item.name for item in preserved.parameters}
+        if terminal_names != preserved_names:
+            raise ValueError(
+                "Fit terminal parameter schema no longer matches the retained "
+                "Fit setup; Apply cannot construct a hybrid scope."
             )
-            for item in preserved.parameters
-        )
+        # Terminal rows carry the exact terminal scope, active configuration,
+        # and fitted values.  Preserve their inactive scope configuration too:
+        # it is part of the terminal schema and is needed by a later explicit
+        # scope transition.
+        parameters = terminal_parameter_rows
         initials = tuple(
             (
                 replace(
@@ -2596,6 +2978,8 @@ class FitSessionOwner(QtCore.QObject):
         origin: FitOriginSnapshot,
         canonicalized_scopes: frozenset[str],
         local_observables: tuple[FitLocalObservable, ...],
+        *,
+        selected_initial_keys: frozenset[tuple[str, str]] = frozenset(),
     ) -> FitSetupSnapshot:
         """Re-key retained setup without replacing inactive Local IC rows."""
 
@@ -2631,7 +3015,9 @@ class FitSessionOwner(QtCore.QObject):
                             for dataset_id, value
                             in prior.per_dataset_config.dataset_values
                             if dataset_id in retained_dataset_ids
-                        ),
+                        )
+                        if prior.scope != "shared"
+                        else (),
                     ),
                     display_name=fresh.display_name,
                     family=fresh.family,
@@ -2667,6 +3053,7 @@ class FitSessionOwner(QtCore.QObject):
                     fresh.initial
                     if (
                         "initial_concentrations" in canonicalized_scopes
+                        and (fresh.set_id, fresh.species) in selected_initial_keys
                         and dict(preserved.initial_scopes).get(
                             fresh.species,
                             "local",
@@ -2716,6 +3103,10 @@ class FitSessionOwner(QtCore.QObject):
             initial_scopes=initial_scopes,
             defaults=preserved.defaults,
             dataset_weight_mode=preserved.dataset_weight_mode,
+            profile_likelihood=preserved.profile_likelihood,
+            residual_bootstrap=preserved.residual_bootstrap,
+            hierarchical=preserved.hierarchical,
+            shared_refit_promotions=preserved.shared_refit_promotions,
         )
         return self._setup_with_local_observables(
             rebased,
@@ -2730,6 +3121,7 @@ class FitSessionOwner(QtCore.QObject):
         origin: FitOriginSnapshot,
         canonicalized_scopes: frozenset[str],
         promoted: tuple[FitLocalObservable, ...],
+        selected_initial_keys: frozenset[tuple[str, str]] = frozenset(),
     ) -> FitSetupSnapshot | None:
         """Rebase one Reset owner while retiring newly canonical locals."""
 
@@ -2750,6 +3142,161 @@ class FitSessionOwner(QtCore.QObject):
             origin,
             canonicalized_scopes,
             retained.local_observables,
+            selected_initial_keys=selected_initial_keys,
+        )
+
+    def current_initial_apply_proposal(self) -> FitInitialApplyProposal | None:
+        """Return the complete remaining, independently selectable IC proposal."""
+
+        candidate = self._candidate
+        if candidate is None:
+            return None
+        proposal = self._initial_apply_proposal(
+            candidate,
+            excluded_keys=self._candidate_applied_initial_keys,
+        )
+        origin = self._origin
+        if origin is None:
+            return None
+        return replace(
+            proposal,
+            origin_tab_id=origin.tab_id,
+            origin_capture_id=origin.capture_id,
+        )
+
+    @classmethod
+    def _candidate_initial_application(
+        cls,
+        candidate: FitCandidate,
+    ) -> tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], object],
+        dict[str, tuple[str, ...]],
+    ]:
+        """Validate terminal IC identity and return one canonical cell map."""
+
+        origin = candidate.origin
+        nominal_setup = candidate.nominal_setup_snapshot
+        included_dataset_ids = {
+            item.dataset_id
+            for item in nominal_setup.datasets
+            if item.included
+        }
+        included_mapped = tuple(
+            item
+            for item in origin.mapped_datasets
+            if item.dataset_id in included_dataset_ids
+        )
+        included_set_ids = {item.set_id for item in included_mapped}
+        datasets_by_set: dict[str, tuple[str, ...]] = {
+            mapped.set_id: tuple(
+                sorted(
+                    item.dataset_id
+                    for item in included_mapped
+                    if item.set_id == mapped.set_id
+                )
+            )
+            for mapped in included_mapped
+        }
+        selected_scopes = dict(nominal_setup.initial_scopes)
+        expected: dict[tuple[str, str], object] = {}
+        for item in nominal_setup.initials:
+            key = (item.set_id, item.species)
+            if (
+                item.fit
+                and item.set_id in included_set_ids
+                and selected_scopes.get(item.species) == "local"
+            ):
+                if key in expected:
+                    raise ValueError(
+                        "Fit terminal setup repeats a fitted initial identity."
+                    )
+                expected[key] = item
+        for item in nominal_setup.global_initials:
+            if not item.fit or selected_scopes.get(item.species) != "global":
+                continue
+            for mapped in included_mapped:
+                if item.species not in dict(mapped.initial_values):
+                    continue
+                key = (mapped.set_id, item.species)
+                if key in expected:
+                    raise ValueError(
+                        "Fit terminal setup repeats a fitted initial identity."
+                    )
+                expected[key] = item
+
+        actual: dict[tuple[str, str], float] = {}
+        seen_set_ids: set[str] = set()
+        for set_id, values in candidate.initial_values_by_set:
+            if set_id in seen_set_ids:
+                raise ValueError(f"Fit candidate repeats initial set {set_id!r}.")
+            seen_set_ids.add(set_id)
+            seen_species: set[str] = set()
+            for species, raw_value in values:
+                if species in seen_species:
+                    raise ValueError(
+                        f"Fit candidate repeats initial {(set_id, species)!r}."
+                    )
+                seen_species.add(species)
+                value = float(raw_value)
+                if not math.isfinite(value) or value < 0.0:
+                    raise ValueError(
+                        f"Fitted initial {(set_id, species)!r} must be finite "
+                        "and nonnegative."
+                    )
+                actual[(set_id, species)] = value
+        if set(actual) != set(expected):
+            missing = sorted(set(expected) - set(actual))
+            unexpected = sorted(set(actual) - set(expected))
+            details = []
+            if missing:
+                details.append(f"missing={missing!r}")
+            if unexpected:
+                details.append(f"unexpected={unexpected!r}")
+            raise ValueError(
+                "Fit candidate initial identities do not exactly match the "
+                "fitted terminal cells: " + "; ".join(details)
+            )
+        return actual, expected, datasets_by_set
+
+    @classmethod
+    def _initial_apply_proposal(
+        cls,
+        candidate: FitCandidate,
+        *,
+        excluded_keys: frozenset[tuple[str, str]] = frozenset(),
+    ) -> FitInitialApplyProposal:
+        actual, expected, datasets_by_set = cls._candidate_initial_application(
+            candidate
+        )
+        captured_by_key = {
+            (mapped.set_id, species): float(value)
+            for mapped in candidate.origin.mapped_datasets
+            for species, value in mapped.initial_values
+        }
+        cells: list[FitInitialApplyCellProposal] = []
+        for key in sorted(expected):
+            if key in excluded_keys:
+                continue
+            set_id, species = key
+            configuration = expected[key]
+            cells.append(
+                FitInitialApplyCellProposal(
+                    set_id=set_id,
+                    species=species,
+                    dataset_ids=datasets_by_set.get(set_id, ()),
+                    captured_value=captured_by_key[key],
+                    nominal_value=float(getattr(configuration, "initial")),
+                    fitted_value=actual[key],
+                    minimum=float(getattr(configuration, "minimum")),
+                    maximum=float(getattr(configuration, "maximum")),
+                    log10=bool(getattr(configuration, "log10")),
+                )
+            )
+        return FitInitialApplyProposal(
+            origin_tab_id=candidate.origin.tab_id,
+            origin_capture_id=candidate.origin.capture_id,
+            cells=tuple(cells),
         )
 
     def _candidate_apply_feasibility(
@@ -2757,26 +3304,43 @@ class FitSessionOwner(QtCore.QObject):
         candidate: FitCandidate,
         *,
         applied_scopes: frozenset[str] = frozenset(),
+        applied_initial_keys: frozenset[tuple[str, str]] = frozenset(),
     ) -> tuple[frozenset[str], dict[str, str]]:
         """Decide terminal Apply feasibility once in the sole Fit owner."""
 
         local_scalar_names = self._candidate_local_scalar_names(candidate)
+        publication_by_name = self._candidate_publication_classifications(candidate)
         terminal_parameters = {
             item.name: item
             for item in candidate.setup_snapshot.parameters
         }
         available: set[str] = set()
         unavailable: dict[str, str] = {}
+        converged = bool(candidate.result.completion.optimizer_converged)
+        if not converged:
+            reason = (
+                "Terminal optimizer did not converge; values are finite diagnostic "
+                "seed material only and cannot be published or applied."
+            )
+            unavailable.update(
+                {
+                    "parameters": reason,
+                    "initial_concentrations": reason,
+                    "observable_definitions": reason,
+                }
+            )
+            return frozenset(), unavailable
         if any(
             name not in local_scalar_names
             and terminal_parameters.get(name) is not None
-            and terminal_parameters[name].scope == "shared"
+            and publication_by_name[name].route == "parameters"
+            and publication_by_name[name].eligible
             for name, _value in candidate.parameters
         ):
             available.add("parameters")
         else:
             has_per_dataset_values = any(
-                item.selected_config.fit and item.scope == "per_dataset"
+                item.selected_config.fit and item.scope != "shared"
                 for item in candidate.setup_snapshot.parameters
             )
             unavailable["parameters"] = (
@@ -2789,14 +3353,25 @@ class FitSessionOwner(QtCore.QObject):
                     else ""
                 )
             )
-        if candidate.initial_values_by_set:
-            available.add("initial_concentrations")
-        else:
-            unavailable["initial_concentrations"] = (
-                "Initial Conditions Apply is unavailable because the "
-                "candidate contains no fitted initial values. Fit-local "
-                "simulation start is never published to Run settings."
+        try:
+            initial_proposal = self._initial_apply_proposal(
+                candidate,
+                excluded_keys=applied_initial_keys,
             )
+        except (KeyError, TypeError, ValueError) as exc:
+            unavailable["initial_concentrations"] = (
+                "Initial Conditions Apply is unavailable because the terminal "
+                f"cell proposal is invalid: {exc}"
+            )
+        else:
+            if initial_proposal.cells:
+                available.add("initial_concentrations")
+            else:
+                unavailable["initial_concentrations"] = (
+                    "Initial Conditions Apply is unavailable because the "
+                    "candidate contains no remaining fitted initial cells. "
+                    "Fit-local simulation start is never published to Run settings."
+                )
         if candidate.local_observables:
             try:
                 self._validate_terminal_observable_definitions(candidate)
@@ -2849,36 +3424,20 @@ class FitSessionOwner(QtCore.QObject):
     ) -> float:
         """Resolve one promotable scalar over the included terminal roster."""
 
+        publication = FitSessionOwner._candidate_publication_classifications(candidate).get(
+            parameter.name
+        )
+        if (
+            publication is None
+            or publication.route != "observable_definitions"
+            or not publication.eligible
+        ):
+            raise ValueError(
+                "Observable Definitions Apply cannot publish Per-dataset "
+                f"scalar {parameter.name!r}; run an explicit Shared refit."
+            )
         config = parameter.selected_config
         terminal_value = float(config.value)
-        if parameter.scope == "per_dataset":
-            included_ids = {
-                item.dataset_id
-                for item in candidate.setup_snapshot.datasets
-                if item.included
-            }
-            values_by_id = {
-                dataset_id: float(value)
-                for dataset_id, value in config.dataset_values
-            }
-            missing = included_ids - set(values_by_id)
-            if missing:
-                raise ValueError(
-                    "Observable Definitions Apply cannot publish per-dataset "
-                    f"scalar {parameter.name!r}: included terminal values "
-                    f"are missing for {', '.join(sorted(missing))}."
-                )
-            included_values = {
-                values_by_id[dataset_id]
-                for dataset_id in included_ids
-            }
-            if len(included_values) != 1:
-                raise ValueError(
-                    "Observable Definitions Apply cannot publish per-dataset "
-                    f"scalar {parameter.name!r}: its included terminal "
-                    "dataset values differ."
-                )
-            terminal_value = included_values.pop()
         if not math.isfinite(terminal_value):
             raise ValueError(
                 f"Fit-local scalar {parameter.name!r} has a non-finite "
@@ -2893,6 +3452,8 @@ class FitSessionOwner(QtCore.QObject):
         candidate: FitCandidate,
         scopes: frozenset[str],
         origin: FitOriginSnapshot,
+        *,
+        selected_initial_keys: frozenset[tuple[str, str]] = frozenset(),
     ) -> MechanismTabDocument:
         next_tab = tab
         prepared = next_tab.prepared_dsl
@@ -2944,9 +3505,18 @@ class FitSessionOwner(QtCore.QObject):
                 item.name: item
                 for item in setup_parameters
             }
+            publication_by_name = {
+                item.parameter_name: item
+                for item in candidate.setup_snapshot.publication_classifications
+            }
             if len(expected) != len(setup_parameters):
                 raise ValueError(
                     "Fit terminal setup repeats a parameter identity."
+                )
+            if set(publication_by_name) != set(expected):
+                raise ValueError(
+                    "Fit terminal publication classifications changed parameter "
+                    "identity."
                 )
             coordinates = {
                 item.name: item
@@ -2958,7 +3528,12 @@ class FitSessionOwner(QtCore.QObject):
             writable_values = {
                 name: float(value)
                 for name, value in candidate.parameters
-                if name not in local_scalar_names
+                if (
+                    name not in local_scalar_names
+                    and expected.get(name) is not None
+                    and publication_by_name[name].route == "parameters"
+                    and publication_by_name[name].eligible
+                )
             }
             for name in writable_values:
                 coordinate = coordinates.get(name)
@@ -2969,7 +3544,8 @@ class FitSessionOwner(QtCore.QObject):
                 captured = expected.get(name)
                 if (
                     captured is None
-                    or captured.scope != "shared"
+                    or publication_by_name[name].route != "parameters"
+                    or not publication_by_name[name].eligible
                     or coordinate.family != captured.family
                     or coordinate.role != captured.role
                     or not coordinate.writable
@@ -3000,94 +3576,28 @@ class FitSessionOwner(QtCore.QObject):
                     next_tab,
                     mechanism_source=derived_source,
                     prepared_dsl=prepared,
-                )
+        )
         if "initial_concentrations" in scopes:
-            included_dataset_ids = {
-                item.dataset_id
-                for item in candidate.setup_snapshot.datasets
-                if item.included
-            }
-            included_set_ids = {
-                mapped.set_id
-                for mapped in origin.mapped_datasets
-                if mapped.dataset_id in included_dataset_ids
-            }
-            selected_scopes = dict(candidate.setup_snapshot.initial_scopes)
-            global_species = {
-                item.species
-                for item in candidate.setup_snapshot.global_initials
-                if item.fit and selected_scopes.get(item.species) == "global"
-            }
-            expected_key_rows = [
-                (item.set_id, item.species)
-                for item in candidate.setup_snapshot.initials
-                if (
-                    item.fit
-                    and item.set_id in included_set_ids
-                    and selected_scopes.get(item.species) == "local"
-                )
-            ]
-            expected_key_rows.extend(
-                (set_id, species)
-                for set_id in included_set_ids
-                for species in sorted(global_species)
-                if any(
-                    mapped.set_id == set_id
-                    and any(
-                        mapped_species == species
-                        for mapped_species, _value in mapped.initial_values
-                    )
-                    for mapped in origin.mapped_datasets
-                )
+            # The terminal candidate remains immutable across partial Apply.
+            # Its capture ID therefore intentionally differs from the rebased
+            # current origin after an earlier selected-cell mutation.  The
+            # current origin owns the document mutation; the candidate owns
+            # the fitted cell values and immutable terminal identities.
+            if candidate.origin.tab_id != origin.tab_id:
+                raise ValueError("Fit candidate IC proposal changed tab origin.")
+            actual_values, expected, _datasets_by_set = (
+                cls._candidate_initial_application(candidate)
             )
-            expected_keys = set(expected_key_rows)
-            if len(expected_key_rows) != len(expected_keys):
+            expected_keys = set(expected)
+            if not selected_initial_keys or not selected_initial_keys <= expected_keys:
                 raise ValueError(
-                    "Fit terminal setup repeats an expected fitted initial "
-                    "identity."
-                )
-            actual_values: dict[tuple[str, str], float] = {}
-            seen_set_ids: set[str] = set()
-            for set_id, values in candidate.initial_values_by_set:
-                if set_id in seen_set_ids:
-                    raise ValueError(
-                        f"Fit candidate repeats initial set {set_id!r}."
-                    )
-                seen_set_ids.add(set_id)
-                seen_species: set[str] = set()
-                for species, raw_value in values:
-                    if species in seen_species:
-                        raise ValueError(
-                            f"Fit candidate repeats initial "
-                            f"{(set_id, species)!r}."
-                        )
-                    seen_species.add(species)
-                    value = float(raw_value)
-                    if not math.isfinite(value) or value < 0.0:
-                        raise ValueError(
-                            f"Fitted initial {(set_id, species)!r} must "
-                            "be finite and nonnegative."
-                        )
-                    actual_values[(set_id, species)] = value
-            actual_keys = set(actual_values)
-            if actual_keys != expected_keys:
-                missing = sorted(expected_keys - actual_keys)
-                unexpected = sorted(actual_keys - expected_keys)
-                details = []
-                if missing:
-                    details.append(f"missing={missing!r}")
-                if unexpected:
-                    details.append(f"unexpected={unexpected!r}")
-                raise ValueError(
-                    "Fit candidate initial identities do not exactly match "
-                    "the fitted terminal rows"
-                    + (": " + "; ".join(details) if details else ".")
+                    "Initial Conditions Apply must select available fitted cells."
                 )
             current_set_ids = {
                 item.set_id for item in next_tab.initial_condition_sets
             }
             missing_sets = sorted(
-                {set_id for set_id, _species in expected_keys}
+                {set_id for set_id, _species in selected_initial_keys}
                 - current_set_ids
             )
             if missing_sets:
@@ -3114,7 +3624,7 @@ class FitSessionOwner(QtCore.QObject):
                     )
                 fitted_names = {
                     species
-                    for set_id, species in expected_keys
+                    for set_id, species in selected_initial_keys
                     if set_id == initial_set.set_id
                 }
                 if not fitted_names:
@@ -3131,9 +3641,10 @@ class FitSessionOwner(QtCore.QObject):
                 merged = tuple(
                     (
                         name,
-                        actual_values.get(
-                            (initial_set.set_id, name),
-                            float(current_value),
+                        (
+                            actual_values[(initial_set.set_id, name)]
+                            if (initial_set.set_id, name) in selected_initial_keys
+                            else float(current_value)
                         ),
                     )
                     for name, current_value in initial_set.values

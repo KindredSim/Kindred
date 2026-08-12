@@ -1187,9 +1187,6 @@ class InitialConditionsTableActions(QtCore.QObject):
             return False
         if not isinstance(result, CanonicalMutationResult):
             raise TypeError("result must be CanonicalMutationResult.")
-        for tab_id, set_ids in result.delta.affected_targets_by_tab:
-            if set_ids:
-                self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
         self.activeSnapshotChanged.emit()
         return result.changed
 

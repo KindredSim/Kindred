@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence, TypeAlias
 
+from kindred.core.authored_source_errors import AuthoredSourceError
+
 __all__ = [
     "InterventionFlux",
     "InterventionHold",
@@ -22,7 +24,7 @@ __all__ = [
 ]
 
 
-class InterventionScheduleError(ValueError):
+class InterventionScheduleError(AuthoredSourceError):
     """The authored intervention source is outside the final public schema."""
 
 

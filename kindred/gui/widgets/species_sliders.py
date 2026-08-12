@@ -8,6 +8,7 @@ from typing import Mapping, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.gui.interactive_preview import SliderInteractionKind
 from kindred.gui.species_sliders_logic import (
     compute_slider_max_option_c,
     _scale_finite_gui_range,
@@ -99,9 +100,7 @@ class _NumericValueEdit(QtWidgets.QLineEdit):
 
 
 class BatchSpeciesSliders(QtWidgets.QWidget):
-    speciesEdited = QtCore.Signal(str, float)
-    speciesDragStarted = QtCore.Signal(str)
-    speciesDragFinished = QtCore.Signal(str)
+    interactionRequested = QtCore.Signal(str, float, object)
 
     def __init__(
         self,
@@ -344,15 +343,32 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         if row is None or not self._target_set_ids:
             return
         value = float(position) / 10_000.0 * row.maximum
-        self._set_value_projection(species, value, editor_text=None, emit=True)
+        interaction = (
+            SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE
+            if str(species) in self._active_drag_species
+            else SliderInteractionKind.EXACT_DRAG_RELEASE
+        )
+        self._set_value_projection(
+            species,
+            value,
+            editor_text=None,
+            emit=True,
+            interaction=interaction,
+        )
 
     def _on_slider_pressed(self, species: str) -> None:
         self._active_drag_species.add(str(species))
-        self.speciesDragStarted.emit(str(species))
 
     def _on_slider_released(self, species: str) -> None:
-        self.speciesDragFinished.emit(str(species))
-        self._active_drag_species.discard(str(species))
+        species_s = str(species)
+        self._active_drag_species.discard(species_s)
+        value = self._values.get(species_s)
+        if value is not None:
+            self.interactionRequested.emit(
+                species_s,
+                float(value),
+                SliderInteractionKind.EXACT_DRAG_RELEASE,
+            )
 
     def _sync_visibility(self) -> None:
         for species, row in self._rows.items():
@@ -422,6 +438,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         *,
         editor_text: str | None,
         emit: bool,
+        interaction: SliderInteractionKind | None = None,
     ) -> None:
         species_s = str(species)
         row = self._rows.get(species_s)
@@ -454,7 +471,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 )
             self._decorate_editor(species_s)
         if emit:
-            self.speciesEdited.emit(species_s, value_f)
+            if not isinstance(interaction, SliderInteractionKind):
+                raise TypeError("emitted Slider values require an interaction kind.")
+            self.interactionRequested.emit(species_s, value_f, interaction)
 
     def _editor_has_focus(self, species: str) -> bool:
         row = self._rows.get(str(species))
@@ -539,6 +558,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             value,
             editor_text=raw,
             emit=True,
+            interaction=SliderInteractionKind.EXACT_TYPED_COMMIT,
         )
 
     @staticmethod

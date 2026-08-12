@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from kindred.core.algebra.parser import (
     BinaryNode,
@@ -24,6 +25,50 @@ class SymbolicExpression:
     expression: Any
     canonical_identifiers: tuple[str, ...]
     fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedParameterExpressionPolicy:
+    """Accepted operations for one retained-AST symbolic consumer."""
+
+    name: str
+    binary_operations: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", str(self.name))
+        object.__setattr__(
+            self,
+            "binary_operations",
+            MappingProxyType(
+                {
+                    str(operator): str(operation)
+                    for operator, operation in dict(self.binary_operations).items()
+                }
+            ),
+        )
+
+
+CALCULATOR_EXPANSION_POLICY = RetainedParameterExpressionPolicy(
+    name="calculator-parameter-expansion",
+    binary_operations={
+        "+": "add",
+        "-": "subtract",
+        "*": "multiply",
+        "/": "divide",
+        "**": "power",
+        "^": "power",
+    },
+)
+
+PRODUCT_IDENTITY_PROOF_POLICY = RetainedParameterExpressionPolicy(
+    name="wegscheider-product-identity-proof",
+    binary_operations={
+        "*": "multiply",
+        "/": "divide",
+        "**": "power",
+        "^": "power",
+    },
+)
 
 
 def _unsupported(message: str) -> UnsupportedSymbolicExpressionError:
@@ -51,10 +96,11 @@ def _translate_retained_node(
     node: object,
     *,
     namespace: SymbolicParameterNamespaceContext,
+    policy: RetainedParameterExpressionPolicy,
     identifiers: list[str],
     sympy: Any,
 ) -> tuple[Any, dict[str, object]]:
-    """Translate the strict retained-AST proof subset and describe its shape."""
+    """Translate a retained typed node under the requesting consumer's policy."""
 
     if isinstance(node, NumberNode):
         value = float(node.value)
@@ -86,6 +132,7 @@ def _translate_retained_node(
         rhs, rhs_payload = _translate_retained_node(
             node.rhs,
             namespace=namespace,
+            policy=policy,
             identifiers=identifiers,
             sympy=sympy,
         )
@@ -95,34 +142,36 @@ def _translate_retained_node(
         )
     if isinstance(node, BinaryNode):
         operator = str(node.op)
-        if operator in {"+", "-"}:
+        operation = policy.binary_operations.get(operator)
+        if operation is None and policy == PRODUCT_IDENTITY_PROOF_POLICY and operator in {"+", "-"}:
             raise _unsupported(
                 "Additive binary64 parameter arithmetic cannot establish "
                 "an exact symbolic identity."
             )
-        operation = {
-            "*": "multiply",
-            "/": "divide",
-            "**": "power",
-            "^": "power",
-        }.get(operator)
         if operation is None:
             raise _unsupported(
-                f"Unsupported retained Algebra operator: {operator!r}."
+                f"Retained Algebra operator {operator!r} is unsupported by "
+                f"the {policy.name} policy."
             )
         lhs, lhs_payload = _translate_retained_node(
             node.lhs,
             namespace=namespace,
+            policy=policy,
             identifiers=identifiers,
             sympy=sympy,
         )
         rhs, rhs_payload = _translate_retained_node(
             node.rhs,
             namespace=namespace,
+            policy=policy,
             identifiers=identifiers,
             sympy=sympy,
         )
-        if operation == "multiply":
+        if operation == "add":
+            expression = lhs + rhs
+        elif operation == "subtract":
+            expression = lhs - rhs
+        elif operation == "multiply":
             expression = lhs * rhs
         elif operation == "divide":
             expression = lhs / rhs
@@ -148,9 +197,12 @@ def _translate_retained_node(
 def translate_parameter_expression(
     assignment: ParameterAssignment,
     *,
+    policy: RetainedParameterExpressionPolicy,
     spec: ParameterAlgebraSpec | None = None,
     namespace: SymbolicParameterNamespaceContext | None = None,
 ) -> SymbolicExpression:
+    if not isinstance(policy, RetainedParameterExpressionPolicy):
+        raise TypeError("policy must be a RetainedParameterExpressionPolicy.")
     parameter_namespace = _coerce_parameter_namespace(spec=spec, namespace=namespace)
     retained_node = assignment.expr_ast
     if retained_node is None:
@@ -160,6 +212,7 @@ def translate_parameter_expression(
     expression, retained_structure = _translate_retained_node(
         retained_node,
         namespace=parameter_namespace,
+        policy=policy,
         identifiers=identifier_order,
         sympy=sympy,
     )
@@ -170,6 +223,7 @@ def translate_parameter_expression(
         {
             "name": str(assignment.name),
             "retained_structure": retained_structure,
+            "policy": policy.name,
             "identifiers": identifiers,
             "symbol_context": symbol_context,
             "backend": metadata.to_payload(),

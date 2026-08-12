@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from kindred._version import __version__ as KINDRED_VERSION
+from kindred.core.authored_source_errors import AuthoredSourceError
 from kindred.core.dataset_mapping import (
     DatasetMappingError,
     DatasetMappingChoice,
@@ -46,6 +47,7 @@ from kindred.core.project_document import (
     canonical_species_names,
     canonical_initial_values,
     SUPPORTED_FIT_METHODS,
+    fit_method_label,
     new_set_id,
     reconcile_tab_mechanism_source,
     retained_tab_mechanism_source,
@@ -61,12 +63,9 @@ from kindred.core.result_repository import (
     ExplicitResultCurrentFacts,
     ResultRepository,
 )
-from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.dsl_parse import (
     PreparedDslRequestSet,
-    prepare_dsl_request_set,
 )
-from kindred.core.units import UnitsModel
 from kindred.gui.app_wiring import (
     ANALYSIS_DOCK_SPEC,
     BATCH_DOCK_SPEC,
@@ -160,6 +159,7 @@ from kindred.gui.workflow_contracts import (
 )
 from kindred.gui.workspace_tab_registry import (
     CanonicalMutationResult,
+    ScientificDocumentDelta,
     WorkspaceTabRegistry,
 )
 from kindred.io.kin_archive_store import KinArchiveStore
@@ -177,6 +177,15 @@ DOCUMENTATION_URL: str | None = None
 _REPLACEMENT_TIMEOUT_SECONDS = 4.0
 _ABOUT_DIALOG_MIN_WIDTH = 420
 _ABOUT_DIALOG_IMAGE_MAX_SIZE = 320
+
+
+def _normalize_xlsx_export_path(path: str) -> str:
+    """Return the exact absolute destination used by the XLSX worker."""
+
+    normalized = os.path.abspath(os.path.normpath(os.fspath(path)))
+    if not normalized.casefold().endswith(".xlsx"):
+        normalized = f"{normalized}.xlsx"
+    return normalized
 
 
 @dataclass(slots=True)
@@ -555,6 +564,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._xlsx_export_action: QtGui.QAction | None = None
         self._last_export_directory: str | None = None
         self._slider_apply_refreshing: set[str] = set()
+        self._fit_shared_refit_signal_window: QtCore.QObject | None = None
         self._prepared_save_materialized: tuple[
             ProjectDocument,
             tuple[tuple[str, tuple[str, ...]], ...],
@@ -602,6 +612,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._workspace_tab_registry = WorkspaceTabRegistry(
             self._project_session,
             deletion_result_fence=self._simulation_jobs,
+            canonical_result_fence=self._fence_canonical_result_delta,
             runtime_factory=self._new_tab_runtime,
         )
         self._dataset_import_staging = DatasetImportStaging(parent=self)
@@ -609,7 +620,6 @@ class MainWindow(QtWidgets.QMainWindow):
             session=self._project_session,
             registry=self._workspace_tab_registry,
             gate=self._computation_gate,
-            deauthorize_targets=self._simulation_jobs.deauthorize_targets,
             propose_detailed_balance_source=self._propose_detailed_balance_source,
             commit_detailed_balance_source=self._commit_detailed_balance_source,
             color_resolver=self.config_controller.species_color,
@@ -1113,6 +1123,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_run_dispatched
         )
         self._simulation_jobs.results_changed.connect(self._on_results_changed)
+        self._simulation_jobs.interactive_frame_ready.connect(
+            self._on_interactive_frame_ready
+        )
+        self._simulation_jobs.interactive_preview_terminal.connect(
+            self._on_interactive_preview_terminal
+        )
+        self._simulation_jobs.interactive_preview_retired.connect(
+            self._on_interactive_preview_retired
+        )
         self._simulation_jobs.status_changed.connect(self.set_status_text)
         self._simulation_jobs.detailed_balance_correction_requested.connect(
             self._present_detailed_balance_correction
@@ -1770,6 +1789,62 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._render_results_for_tab(target)
 
+    @QtCore.Slot(object)
+    def _on_interactive_frame_ready(self, frame: object) -> None:
+        """Project one transient frame only onto its still-active tab plot."""
+
+        from kindred.gui.interactive_preview import InteractivePreviewFrame
+
+        if not isinstance(frame, InteractivePreviewFrame):
+            raise TypeError("Interactive Preview must publish a typed frame.")
+        target = frame.tab_id
+        if (
+            target not in self._tab_surfaces
+            or target != self._workspace_tab_registry.active_tab_id
+        ):
+            return
+        try:
+            plot = self._workspace.active_plot()
+        except RuntimeError:
+            return
+        plot.apply_interactive_preview_frame(frame)
+
+    @QtCore.Slot(object)
+    def _on_interactive_preview_terminal(self, outcome: object) -> None:
+        """Route one explicit Preview terminal outcome by its bound tab."""
+
+        from kindred.gui.interactive_preview import InteractivePreviewTerminalOutcome
+
+        if not isinstance(outcome, InteractivePreviewTerminalOutcome):
+            raise TypeError(
+                "Interactive Preview terminal outcome must be typed."
+            )
+        target = outcome.batch.tab_id
+        if target not in self._tab_surfaces:
+            return
+        try:
+            plot = self._workspace.plot_for_tab(target)
+        except (KeyError, RuntimeError):
+            return
+        plot.apply_interactive_preview_terminal_outcome(outcome)
+
+    @QtCore.Slot(str, int)
+    def _on_interactive_preview_retired(
+        self,
+        tab_id: str,
+        generation: int,
+    ) -> None:
+        """Retire physical cadence without reviving a removed tab surface."""
+
+        target = str(tab_id)
+        if target not in self._tab_surfaces:
+            return
+        try:
+            plot = self._workspace.plot_for_tab(target)
+        except KeyError:
+            return
+        plot.retire_interactive_preview(target, int(generation))
+
     @QtCore.Slot(str, object)
     def _on_run_dispatched(self, tab_id: str, set_ids: object) -> None:
         target = str(tab_id)
@@ -1813,17 +1888,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         result: CanonicalMutationResult | None,
     ) -> bool:
-        """Fence only the existing Run targets affected by one registry mutation."""
+        """Consume one mutation already fenced by the registry boundary."""
         if result is None:
             return False
         if not isinstance(result, CanonicalMutationResult):
             raise TypeError(
                 "Registry mutations must return CanonicalMutationResult or None."
             )
-        for tab_id, set_ids in result.delta.affected_targets_by_tab:
+        return result.changed
+
+    def _fence_canonical_result_delta(
+        self,
+        delta: ScientificDocumentDelta,
+    ) -> None:
+        """Fence one registry-computed non-deletion delta before publication."""
+
+        if not isinstance(delta, ScientificDocumentDelta):
+            raise TypeError("canonical result fence requires ScientificDocumentDelta.")
+        for tab_id, set_ids in delta.affected_targets_by_tab:
             if set_ids:
                 self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
-        return result.changed
 
     def _capture_current_explicit_result_facts(
         self,
@@ -1832,29 +1916,28 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> ExplicitResultCurrentFacts | None:
         """Capture current typed facts for one exact result-key boundary."""
 
-        try:
-            tab = self._project_session.document.tab(str(tab_id))
-            target = self._build_explicit_target_for_tab(
-                tab,
-                str(set_id),
-                publication_generation=0,
+        tab = self._project_session.document.tab(str(tab_id))
+        target = self._build_explicit_target_for_tab(
+            tab,
+            str(set_id),
+            publication_generation=0,
+        )
+        key = target.key
+        executable_identity = target.execution_request.snapshot.target_executable_identity
+        if executable_identity is None:
+            raise RuntimeError(
+                f"Run target {target.set_name!r} has no bound executable identity."
             )
-            key = target.key
-            intervention_execution = target.execution_request.snapshot.intervention_execution
-            facts = ExplicitResultCurrentFacts(
-                tab_id=key.tab_id,
-                set_id=key.set_id,
-                mechanism_source=key.mechanism_source,
-                prepared_dsl=target.prepared_dsl,
-                analysis_identity=key.analysis_identity,
-                initial_values=key.initial_values,
-                execution_settings=key.execution_settings,
-                scientific_settings=key.scientific_settings,
-                intervention_execution=intervention_execution,
-            )
-            return facts
-        except (KeyError, TypeError, ValueError):
-            return None
+        return ExplicitResultCurrentFacts(
+            tab_id=key.tab_id,
+            set_id=key.set_id,
+            mechanism_source=key.mechanism_source,
+            analysis_identity=key.analysis_identity,
+            initial_values=key.initial_values,
+            execution_settings=key.execution_settings,
+            scientific_settings=key.scientific_settings,
+            executable_identity=executable_identity,
+        )
 
     def _build_explicit_target_for_tab(
         self,
@@ -2327,7 +2410,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return None
             try:
                 retained = retained_tab_mechanism_source(document, target)
-            except (KeyError, TypeError, ValueError) as exc:
+            except AuthoredSourceError as exc:
                 self.set_status_text(
                     "Preview requires retained accepted Reactions and DSL: "
                     f"{exc}"
@@ -2801,7 +2884,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if source is None and runtime.reactions_draft is None:
             try:
                 return retained_tab_mechanism_source(document, tab_id)
-            except (KeyError, TypeError, ValueError) as exc:
+            except AuthoredSourceError as exc:
                 if report_error:
                     QtWidgets.QMessageBox.warning(
                         self,
@@ -2914,7 +2997,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             proposal = reconcile_tab_mechanism_source(document, tab_id, visible)
-        except DSLError as exc:
+        except AuthoredSourceError as exc:
             if report_error:
                 QtWidgets.QMessageBox.warning(
                     self,
@@ -3236,13 +3319,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("template source must be MechanismAuthoringSource.")
-        source_tab = self._project_session.document.tab(str(source_tab_id))
-        prepare_dsl_request_set(
-            source.reactions_text,
-            initials={},
-            units=UnitsModel(
-                temperature_K=source_tab.scientific_settings.temperature,
-            ),
+        reconcile_tab_mechanism_source(
+            self._project_session.document,
+            str(source_tab_id),
+            source,
         )
         return source
 
@@ -4282,17 +4362,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
 
     def _stop_simulation(self, tab_id: str | None = None) -> bool:
-        """Fence pending Slider Preview intent before active cancellation."""
+        """Fence all latent and physical Preview work before cancellation."""
 
-        target = (
-            self._workspace_tab_registry.active_tab_id
-            if tab_id is None
-            else str(tab_id)
-        )
-        bundle = self._tab_surfaces.get(target)
-        if bundle is not None:
-            bundle.slider_binding.cancel_pending_preview_intent()
-        return bool(self._simulation_jobs.cancel_current())
+        del tab_id  # Stop is application-wide even when requested by one tab.
+        changed = False
+        for bundle in tuple(self._tab_surfaces.values()):
+            changed = bundle.slider_binding.fence_stop() or changed
+        for target in tuple(self._tab_surfaces):
+            try:
+                plot = self._workspace.plot_for_tab(target)
+            except KeyError:
+                continue
+            changed = plot.stop_interactive_display() or changed
+        return bool(self._simulation_jobs.cancel_current() or changed)
 
     def _run_global_fit(self) -> bool:
         if not self._mutation_input_admitted("Global Fit"):
@@ -4330,7 +4412,24 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return False
         bundle.slider_binding.cancel_pending_preview_intent()
-        return self._fit_session_owner.open_or_focus(tab.tab_id) is not None
+        window = self._fit_session_owner.open_or_focus(tab.tab_id)
+        if window is None:
+            return False
+        self._connect_fit_shared_refit_signal(window)
+        return True
+
+    def _connect_fit_shared_refit_signal(self, window: QtCore.QObject) -> None:
+        """Connect the Results Shared-refit intent to its sole Fit owner once."""
+
+        if not isinstance(window, QtCore.QObject):
+            raise TypeError("Fit window must be a QObject.")
+        if window is self._fit_shared_refit_signal_window:
+            return
+        signal = getattr(window, "sharedRefitRequested", None)
+        if signal is None:
+            raise TypeError("Fit window has no Shared-refit intent signal.")
+        signal.connect(self._fit_session_owner.accept_shared_refit_intent)
+        self._fit_shared_refit_signal_window = window
 
     def _configure_fitting(self) -> bool:
         if not self._mutation_input_admitted("Configure Fitting"):
@@ -4343,8 +4442,18 @@ class MainWindow(QtWidgets.QMainWindow):
         scope.addItem("Current project", "project")
         scope.addItem("New projects (application default)", "application")
         method = QtWidgets.QComboBox(dialog)
-        method.addItems(list(SUPPORTED_FIT_METHODS))
-        method.setCurrentText(defaults.method)
+        for method_id in SUPPORTED_FIT_METHODS:
+            method.addItem(fit_method_label(method_id), method_id)
+
+        def select_method(method_id: str) -> None:
+            index = method.findData(method_id)
+            if index < 0:
+                raise ValueError(
+                    f"Unknown canonical fitting method: {method_id!r}."
+                )
+            method.setCurrentIndex(index)
+
+        select_method(defaults.method)
         max_nfev = QtWidgets.QSpinBox(dialog)
         max_nfev.setRange(*FIT_MAX_NFEV_RANGE)
         max_nfev.setValue(defaults.max_nfev)
@@ -4373,7 +4482,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if scope.currentData() == "project"
                 else self.config_controller.application_fit_defaults()
             )
-            method.setCurrentText(selected.method)
+            select_method(selected.method)
             max_nfev.setValue(selected.max_nfev)
             project_tolerance(ftol, selected.ftol)
             project_tolerance(xtol, selected.xtol)
@@ -4381,8 +4490,8 @@ class MainWindow(QtWidgets.QMainWindow):
             seed.setValue(selected.seed)
             sync_method_controls()
 
-        def sync_method_controls(_method: str = "") -> None:
-            is_de = method.currentText() == DIFFERENTIAL_EVOLUTION_METHOD
+        def sync_method_controls(_index: int = -1) -> None:
+            is_de = method.currentData() == DIFFERENTIAL_EVOLUTION_METHOD
             ftol_label.setText(
                 DE_POPULATION_TOLERANCE_LABEL
                 if is_de
@@ -4393,7 +4502,7 @@ class MainWindow(QtWidgets.QMainWindow):
             xtol.setEnabled(not is_de)
 
         scope.currentIndexChanged.connect(load_selected_defaults)
-        method.currentTextChanged.connect(sync_method_controls)
+        method.currentIndexChanged.connect(sync_method_controls)
         form.addRow("Save to", scope)
         form.addRow("Method", method)
         form.addRow("Maximum evaluations", max_nfev)
@@ -4411,7 +4520,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 validate_fit_defaults(
                     FitDefaults(
-                        method=method.currentText().strip().lower(),
+                        method=method.currentData(),
                         max_nfev=int(max_nfev.value()),
                         ftol=float(ftol.text()),
                         xtol=float(xtol.text()),
@@ -4435,7 +4544,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return False
         candidate = FitDefaults(
-            method=method.currentText().strip().lower(),
+            method=method.currentData(),
             max_nfev=int(max_nfev.value()),
             ftol=float(ftol.text()),
             xtol=float(xtol.text()),
@@ -4488,8 +4597,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not path:
             return
-        if not path.casefold().endswith(".xlsx"):
-            path += ".xlsx"
+        path = _normalize_xlsx_export_path(path)
+        if os.path.lexists(path):
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Overwrite XLSX",
+                f"The XLSX destination already exists:\n{path}\n\n"
+                "Overwrite it?",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
         self._remember_export_directory(path)
         if self._xlsx_export_owner.start(projection, path):
             self.set_status_text(f"Exporting XLSX: {path}")
