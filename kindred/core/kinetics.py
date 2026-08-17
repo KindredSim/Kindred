@@ -13,6 +13,12 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, TypeAlias
 
 from .constants import R, h, k_B
+from .species import validate_c0, validate_temperature
+from .units import (
+    admit_arrhenius_prefactor,
+    admit_energy_j_per_mol,
+    admit_rate,
+)
 
 __all__ = [
     "arrhenius_rate",
@@ -35,11 +41,33 @@ __all__ = [
 class ConstantRateModel:
     k: float
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "k",
+            admit_rate(self.k, field="Constant k", allow_zero=True),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ArrheniusRateModel:
     A: float
     Ea_J_per_mol: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "A",
+            admit_arrhenius_prefactor(self.A, field="Arrhenius A"),
+        )
+        object.__setattr__(
+            self,
+            "Ea_J_per_mol",
+            admit_energy_j_per_mol(
+                self.Ea_J_per_mol,
+                field="Arrhenius Ea_J_per_mol",
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,10 +79,23 @@ class EyringRateModel:
     degeneracy: int = 1
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "dG_act_J_per_mol",
+            admit_energy_j_per_mol(
+                self.dG_act_J_per_mol,
+                field="Eyring dG_act_J_per_mol",
+            ),
+        )
         kappa = _numeric_float(self.kappa, field="Eyring kappa")
         if not math.isfinite(kappa) or kappa <= 0.0:
             raise ValueError("Eyring kappa must be positive and finite.")
         object.__setattr__(self, "kappa", kappa)
+        standard = validate_c0(
+            self.standard_conc_M,
+            field="Eyring standard_conc_M",
+        )
+        object.__setattr__(self, "standard_conc_M", standard)
         _positive_integer(self.degeneracy, field="Eyring degeneracy")
 
 
@@ -89,9 +130,10 @@ def _directional_order(value: object, *, field: str = "molecularity") -> float:
 
 
 def _finite_result(value: float, *, field: str) -> float:
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError(f"{field} must be positive and finite.")
-    return float(value)
+    try:
+        return admit_rate(value, field=field)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def forward_rate_family(model: ForwardRateModel) -> str:
@@ -199,25 +241,17 @@ def _decode_forward_rate_model(
     # temperature (extreme, otherwise-valid barriers can be temperature-safe
     # only over their declared execution range).
     if isinstance(model, ConstantRateModel):
-        if not math.isfinite(model.k) or model.k <= 0.0:
-            raise ValueError("Constant k must be positive and finite.")
+        admit_rate(model.k, field="Constant k", allow_zero=True)
     elif isinstance(model, ArrheniusRateModel):
-        if not math.isfinite(model.A) or model.A <= 0.0:
-            raise ValueError("Arrhenius A must be positive and finite.")
-        if not math.isfinite(model.Ea_J_per_mol):
-            raise ValueError("Arrhenius Ea_J_per_mol must be finite.")
+        admit_arrhenius_prefactor(model.A, field="Arrhenius A")
+        admit_energy_j_per_mol(model.Ea_J_per_mol, field="Arrhenius Ea_J_per_mol")
     elif isinstance(model, EyringRateModel):
-        if not math.isfinite(model.dG_act_J_per_mol):
-            raise ValueError("Eyring dG_act_J_per_mol must be finite.")
+        admit_energy_j_per_mol(
+            model.dG_act_J_per_mol,
+            field="Eyring dG_act_J_per_mol",
+        )
         if not math.isfinite(model.kappa) or model.kappa <= 0.0:
             raise ValueError("Eyring kappa must be positive and finite.")
-        if (
-            not math.isfinite(model.standard_conc_M)
-            or model.standard_conc_M <= 0.0
-        ):
-            raise ValueError(
-                "Eyring standard concentration must be positive and finite."
-            )
     return model
 
 
@@ -354,8 +388,7 @@ def forward_rate_at_temperature(
     """Evaluate exactly one typed forward-rate family."""
     if isinstance(model, ConstantRateModel):
         value = _numeric_float(model.k, field="Constant k")
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError("Constant k must be positive and finite.")
+        admit_rate(value, field="Constant k", allow_zero=True)
         return value
     if isinstance(model, ArrheniusRateModel):
         return arrhenius_rate(model.A, model.Ea_J_per_mol, temperature_K)
@@ -401,8 +434,7 @@ def forward_rate_symbolic_relation(
 
     if isinstance(model, ConstantRateModel):
         value = _numeric_float(model.k, field="Constant k")
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError("Constant k must be positive and finite.")
+        admit_rate(value, field="Constant k", allow_zero=True)
         return literal(float(value))
     if isinstance(model, ArrheniusRateModel):
         prefactor = _numeric_float(model.A, field="Arrhenius A")
@@ -410,10 +442,11 @@ def forward_rate_symbolic_relation(
             model.Ea_J_per_mol,
             field="Arrhenius Ea_J_per_mol",
         )
-        if not math.isfinite(prefactor) or prefactor <= 0.0:
-            raise ValueError("Arrhenius A must be positive and finite.")
-        if not math.isfinite(activation):
-            raise ValueError("Arrhenius Ea_J_per_mol must be finite.")
+        prefactor = admit_arrhenius_prefactor(prefactor, field="Arrhenius A")
+        activation = admit_energy_j_per_mol(
+            activation,
+            field="Arrhenius Ea_J_per_mol",
+        )
         return literal(float(prefactor)) * exponential(  # type: ignore[operator]
             -literal(float(activation))
             / (exact(R, field="R") * temperature)  # type: ignore[operator]
@@ -436,14 +469,13 @@ def forward_rate_symbolic_relation(
             model.degeneracy,
             field="Eyring degeneracy",
         )
-        if not math.isfinite(barrier):
-            raise ValueError("Eyring dG_act_J_per_mol must be finite.")
+        barrier = admit_energy_j_per_mol(
+            barrier,
+            field="Eyring dG_act_J_per_mol",
+        )
         if not math.isfinite(transmission) or transmission <= 0.0:
             raise ValueError("Eyring kappa must be positive and finite.")
-        if not math.isfinite(standard) or standard <= 0.0:
-            raise ValueError(
-                "Eyring standard concentration must be positive and finite."
-            )
+        standard = validate_c0(standard, field="Eyring standard_conc_M")
         relation = (
             literal(float(degeneracy))
             * literal(float(transmission))
@@ -476,18 +508,16 @@ def write_reference_rate(
         reference_temperature_K,
         field="reference_temperature_K",
     )
-    if not math.isfinite(rate) or rate <= 0.0:
-        raise ValueError("reference_rate must be positive and finite.")
-    if not math.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError(
-            "reference_temperature_K must be positive and finite."
-        )
+    rate = admit_rate(rate, field="reference_rate")
+    temperature = validate_temperature(
+        temperature,
+        field="reference_temperature_K",
+    )
     if isinstance(model, ConstantRateModel):
         return ConstantRateModel(k=rate)
     if isinstance(model, ArrheniusRateModel):
         A = _numeric_float(model.A, field="Arrhenius A")
-        if not math.isfinite(A) or A <= 0.0:
-            raise ValueError("Arrhenius A must be positive and finite.")
+        A = admit_arrhenius_prefactor(A, field="Arrhenius A")
         Ea = -R * temperature * (math.log(rate) - math.log(A))
         if not math.isfinite(Ea):
             raise ValueError("The requested Arrhenius k@Tref is not finite.")
@@ -508,10 +538,10 @@ def write_reference_rate(
         )
         if kappa <= 0.0 or not math.isfinite(kappa):
             raise ValueError("Eyring kappa must be positive and finite.")
-        if standard <= 0.0 or not math.isfinite(standard):
-            raise ValueError(
-                "Eyring standard concentration must be positive and finite."
-            )
+        standard = validate_c0(
+            standard,
+            field="Eyring standard_conc_M",
+        )
         log_ratio = (
             math.log(rate)
             - math.log(degeneracy)
@@ -534,9 +564,7 @@ def write_reference_rate(
 
 def eyring_prefactor(T: float) -> float:
     """(k_B T / h) in 1/s."""
-    temperature = _numeric_float(T, field="T")
-    if temperature <= 0.0 or not math.isfinite(temperature):
-        raise ValueError("T must be positive and finite")
+    temperature = validate_temperature(T, field="T")
     return _finite_result((k_B * temperature) / h, field="Eyring prefactor")
 
 
@@ -555,15 +583,12 @@ def eyring_rate(
     - Unimolecular: g * κ * (k_B T / h) * exp(-ΔG‡/(R T))  [1/s]
     - n-molecular (n >= 2): multiply by 1/(C°^(n-1))        [1/(M^(n-1)*s)]
     """
-    T = _numeric_float(T, field="T")
-    if T <= 0.0 or not math.isfinite(T):
-        raise ValueError("T must be positive and finite")
+    T = validate_temperature(T, field="T")
     standard = _numeric_float(
         standard_conc_M,
         field="standard_conc_M",
     )
-    if standard <= 0.0 or not math.isfinite(standard):
-        raise ValueError("standard_conc_M must be positive and finite")
+    standard = validate_c0(standard, field="standard_conc_M")
     n = _directional_order(molecularity)
     degeneracy = _positive_integer(degeneracy, field="Eyring degeneracy")
 
@@ -575,8 +600,7 @@ def eyring_rate(
         dG_act_J_per_mol,
         field="dG_act_J_per_mol",
     )
-    if not math.isfinite(dG):
-        raise ValueError("dG_act_J_per_mol must be finite")
+    dG = admit_energy_j_per_mol(dG, field="dG_act_J_per_mol")
     exponent = -dG / (R * T)
     try:
         k = (
@@ -602,15 +626,9 @@ def arrhenius_rate(A: float, Ea_J_per_mol: float, T: float) -> float:
     - A should already carry the correct order unit (1/s or 1/(M^(n-1)*s)).
     - This function does not attempt to infer molecularity from A.
     """
-    T = _numeric_float(T, field="T")
-    if T <= 0.0 or not math.isfinite(T):
-        raise ValueError("T must be positive and finite")
-    prefactor = _numeric_float(A, field="A")
-    activation = _numeric_float(Ea_J_per_mol, field="Ea_J_per_mol")
-    if not math.isfinite(prefactor) or prefactor <= 0.0:
-        raise ValueError("A must be positive and finite")
-    if not math.isfinite(activation):
-        raise ValueError("Ea_J_per_mol must be finite")
+    T = validate_temperature(T, field="T")
+    prefactor = admit_arrhenius_prefactor(A, field="A")
+    activation = admit_energy_j_per_mol(Ea_J_per_mol, field="Ea_J_per_mol")
     exponent = -activation / (R * T)
     try:
         rate = prefactor * math.exp(exponent)

@@ -32,11 +32,11 @@ __all__ = [
     "SimulationError",
     "SolverError",
     "TimeGridError",
+    "KineticRuntimeDomainError",
     # Fitting
     "FittingError",
     "FitSimulationError",
     "FitCandidateDomainError",
-    "FitFinalReplayError",
     "FittingCancelled",
     "OptimizationError",
 ]
@@ -222,6 +222,33 @@ class TimeGridError(SimulationError):
         super().__init__(message, **kwargs)
 
 
+class KineticRuntimeDomainError(SimulationError):
+    """Typed failure when an admitted model lowers to an unsupported rate."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str = "kinetic_lowering",
+        parameter_names: tuple[str, ...] | list[str] = (),
+        **kwargs: Any,
+    ):
+        details = dict(kwargs.pop("details", {}) or {})
+        normalized_names = tuple(
+            sorted({str(name).strip() for name in parameter_names if str(name).strip()})
+        )
+        details.update(
+            {
+                "stage": str(stage),
+                "parameter_names": normalized_names,
+                "value_dependencies": normalized_names,
+            }
+        )
+        kwargs.setdefault("code", "E304")
+        super().__init__(message, details=details, **kwargs)
+        self.parameter_names = normalized_names
+
+
 class SimulationCancelled(SimulationError):
     """Raised when a simulation is cancelled by user request."""
     def __init__(self, message: str = "Simulation cancelled by user", **kwargs):
@@ -281,54 +308,6 @@ class FitCandidateDomainError(FitSimulationError):
         )
 
 
-class FitFinalReplayError(FitSimulationError):
-    """Fatal terminal conversion of a candidate-domain replay failure.
-
-    ``typed_cause`` deliberately retains the original typed exception in
-    addition to normal Python exception chaining.  Worker/report boundaries
-    can therefore transport its structured details without guessing from a
-    flattened message.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        typed_cause: FitSimulationError,
-        stage: str,
-        failed_params: Optional[Dict[str, float]] = None,
-        **kwargs: Any,
-    ) -> None:
-        if not isinstance(typed_cause, FitSimulationError):
-            raise TypeError("FitFinalReplayError requires a FitSimulationError cause.")
-        details = dict(kwargs.pop("details", {}) or {})
-        cause_details = dict(getattr(typed_cause, "details", {}) or {})
-        details.update(
-            {
-                "fatal": True,
-                "candidate_domain": False,
-                "stage": str(stage or "final_replay"),
-                "typed_cause": {
-                    "type": type(typed_cause).__name__,
-                    "code": str(getattr(typed_cause, "code", "") or ""),
-                    "message": str(getattr(typed_cause, "message", None) or typed_cause),
-                    "details": cause_details,
-                },
-            }
-        )
-        super().__init__(
-            message,
-            failed_params=(
-                failed_params
-                if failed_params is not None
-                else getattr(typed_cause, "failed_params", None)
-            ),
-            details=details,
-            **kwargs,
-        )
-        self.typed_cause = typed_cause
-
-
 class FittingCancelled(FittingError):
     """Raised when a fitting run is cancelled by user request."""
 
@@ -351,8 +330,6 @@ def create_solver_error(
     solver_name: str,
     t_current: float,
     message: str,
-    *,
-    candidate_domain_eligible: bool = False,
 ) -> SolverError:
     """
     Factory for ODE solver errors.
@@ -365,8 +342,6 @@ def create_solver_error(
         Time at which error occurred
     message : str
         Error message from solver
-    candidate_domain_eligible : bool, optional
-        Whether this failure is a proven numerical candidate-domain failure.
 
     Returns
     -------
@@ -377,8 +352,6 @@ def create_solver_error(
         "time": t_current,
         "solver_message": message,
     }
-    if candidate_domain_eligible is True:
-        details["candidate_domain_eligible"] = True
     return SolverError(
         f"Solver '{solver_name}' failed at t={t_current:.4e}",
         suggestion="Try reducing tolerances (rtol, atol) or using a different solver method",

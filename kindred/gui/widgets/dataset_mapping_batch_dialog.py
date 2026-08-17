@@ -39,7 +39,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         *,
         records: tuple[RawDatasetRecord, ...],
         tab: MechanismTabDocument,
-        mechanism_species: tuple[str, ...],
+        model_targets: tuple[str, ...],
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -47,12 +47,12 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
             raise ValueError("Batch mapping review requires committed datasets.")
         if not isinstance(tab, MechanismTabDocument):
             raise TypeError("Batch mapping review requires one mechanism tab.")
-        species = tuple(str(item).strip() for item in mechanism_species)
-        if not species or any(not item for item in species):
-            raise ValueError("Batch mapping review requires mechanism species.")
+        targets = tuple(str(item).strip() for item in model_targets)
+        if not targets or any(not item for item in targets):
+            raise ValueError("Batch mapping review requires model targets.")
         self._records = records
         self._tab = tab
-        self._species = species
+        self._model_targets = targets
         self._rows: list[_DatasetMappingRow] = []
         self.setWindowTitle("Review Imported Dataset Mapping")
         self.setModal(True)
@@ -131,26 +131,26 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         observations = QtWidgets.QFormLayout()
         observation_combos: dict[str, QtWidgets.QComboBox] = {}
         suggestions = {
-            item.raw_observation_id: item.model_species
+            item.raw_observation_id: item.model_target
             for item in suggest_observation_mapping(
                 raw_observations=tuple(
                     (series.raw_observation_id, series.column_name)
                     for series in record.observations
                 ),
-                model_species=self._species,
+                model_targets=self._model_targets,
             )
         }
         for series in record.observations:
             combo = QtWidgets.QComboBox(group)
             combo.addItem("Unmapped", None)
-            for species in self._species:
-                combo.addItem(species, species)
+            for target_name in self._model_targets:
+                combo.addItem(target_name, target_name)
             suggested = suggestions.get(series.raw_observation_id)
             if suggested is not None:
                 combo.setCurrentIndex(combo.findData(suggested))
             observations.addRow(series.column_name, combo)
             observation_combos[series.raw_observation_id] = combo
-        group_layout.addWidget(QtWidgets.QLabel("Observation mappings (suggestions require OK confirmation):", group))
+        group_layout.addWidget(QtWidgets.QLabel("Observation target mappings (suggestions require OK confirmation):", group))
         group_layout.addLayout(observations)
 
         row = _DatasetMappingRow(

@@ -54,10 +54,10 @@ from kindred.core.simulator.step_indexing import (
     iter_canonical_parameters,
     lookup_step_param_target,
 )
+from kindred.core.units import admit_keq, admit_rate, rate_constant_unit
 logger = logging.getLogger(__name__)
 
 _MECH_PARAM_RE = mechanism_parameter_name_pattern()
-_WEGSCHEIDER_META_KEY = "wegscheider_cyclicity_enabled"
 _PARAMETER_ALGEBRA_SPEC_META_KEY = "parameter_algebra_spec"
 
 
@@ -180,6 +180,64 @@ def _written_forward_rate(
     return binding
 
 
+def _admit_mechanism_parameter_value(
+    mechanism: object,
+    name: str,
+    value: float,
+) -> float:
+    """Apply the canonical numeric envelope in the target's typed context."""
+
+    target = lookup_step_param_target(mechanism, name)
+    if target is None:
+        raise DSLError(f"Unsupported parameter name {name!r} for parameter algebra")
+    kind, idx, role, _entry = target
+    try:
+        if role == "Keq":
+            return admit_keq(value, field=name)
+
+        allow_zero = False
+        if kind == "reaction" and role == "k":
+            rxns = getattr(mechanism, "reactions", []) or []
+            if not (0 <= idx < len(rxns)):
+                raise DSLError(
+                    f"Unknown parameter {name!r} (reaction index out of range)"
+                )
+            metadata = MechanismMetadataView.from_metadata(
+                getattr(mechanism, "metadata", {}) or {}
+            )
+            model = forward_rate_model_for_reaction(
+                rxns[idx],
+                default_standard_conc_M=float(metadata.standard_conc_M),
+            )
+            allow_zero = isinstance(model, ConstantRateModel)
+        elif kind == "equilibrium" and role == "kf":
+            eqs = getattr(mechanism, "equilibria", []) or []
+            if not (0 <= idx < len(eqs)):
+                raise DSLError(
+                    f"Unknown parameter {name!r} (equilibrium index out of range)"
+                )
+            eq = eqs[idx]
+            metadata = MechanismMetadataView.from_metadata(
+                getattr(mechanism, "metadata", {}) or {}
+            )
+            model = forward_rate_model_for_equilibrium(
+                eq,
+                temperature_K=float(metadata.temperature_K),
+                default_standard_conc_M=float(metadata.standard_conc_M),
+            )
+            authority = normalize_existing_equilibrium_rate_authority(eq)
+            allow_zero = (
+                isinstance(model, ConstantRateModel)
+                and authority.kind == EquilibriumRateAuthorityKind.KEQ
+            )
+        elif kind != "equilibrium" or role != "kr":
+            raise DSLError(f"Unsupported parameter target for {name!r}")
+
+        return admit_rate(value, field=name, allow_zero=allow_zero)
+    except ValueError as exc:
+        raise DSLError(str(exc)) from exc
+
+
 def _set_mechanism_param(
     mechanism: object,
     name: str,
@@ -188,10 +246,6 @@ def _set_mechanism_param(
     require_mutable: bool,
 ) -> None:
     numeric_value = float(value)
-    if not math.isfinite(numeric_value) or numeric_value <= 0.0:
-        raise DSLError(
-            f"Mechanism parameter {name!r} must be a positive finite real."
-        )
     target = lookup_step_param_target(mechanism, name)
     if target is None:
         raise DSLError(f"Unsupported parameter name {name!r} for parameter algebra")
@@ -342,7 +396,6 @@ def _apply_equilibrium_Keq_constraints_to_values(
                 f"Equilibrium Keq-constraint step_index={entry.get('step_index')!r} is missing equilibrium_authority."
             )
         derive_rate = str(authority.get("derived_role") or "")
-        reverse_std_ratio = authority.get("reverse_std_ratio", 1.0)
         if derive_rate not in {"kf", "kr"}:
             derive_rate = "kr"
         kf_key = f"kf{n}"
@@ -353,13 +406,24 @@ def _apply_equilibrium_Keq_constraints_to_values(
         if keq_key not in base_values:
             raise ValueError(f"Active equilibrium constraint {keq_key!r} has no source value.")
         keq = float(base_values[keq_key])
-        if not math.isfinite(keq) or keq <= 0.0:
-            raise ValueError(f"Active equilibrium constraint {keq_key!r} has invalid value {keq!r}.")
+        try:
+            keq = admit_keq(keq, field=keq_key)
+        except ValueError as exc:
+            raise ValueError(
+                f"Active equilibrium constraint {keq_key!r} has invalid value {keq!r}."
+            ) from exc
         if derive_rate == "kf":
             if kr_key in base_values:
-                base_values[kf_key] = (
-                    float(base_values[kr_key]) * keq * float(reverse_std_ratio)
-                )
+                try:
+                    base_values[kf_key] = admit_rate(
+                        float(base_values[kr_key]) * keq,
+                        field=kf_key,
+                        allow_zero=True,
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Active equilibrium constraint {keq_key!r} derives unsupported {kf_key!r}."
+                    ) from exc
             else:
                 raise ValueError(f"Active equilibrium constraint {keq_key!r} cannot derive missing {kf_key!r}.")
         else:
@@ -368,7 +432,6 @@ def _apply_equilibrium_Keq_constraints_to_values(
                     effective_reverse_rate_from_keq(
                         base_values[kf_key],
                         keq,
-                        reverse_std_ratio,
                     )
                 )
             else:
@@ -427,15 +490,16 @@ def apply_parameter_algebra_spec_to_mechanism(
         # bindings before execution.
         derived = evaluate_parameter_algebra(spec, base_values=base_values)
 
+    for name, value in tuple(derived.items()):
+        if _MECH_PARAM_RE.match(name):
+            derived[name] = _admit_mechanism_parameter_value(
+                mechanism,
+                name,
+                value,
+            )
+
     proposed_values = dict(base_values)
     proposed_values.update(derived)
-    for name, value in derived.items():
-        if _MECH_PARAM_RE.match(name) and (
-            not math.isfinite(float(value)) or float(value) <= 0.0
-        ):
-            raise DSLError(
-                f"Mechanism parameter {name!r} must be a positive finite real."
-            )
     # Validate every thermodynamic consequence against the complete proposed
     # map before committing any scalar or mechanism binding.
     _apply_equilibrium_Keq_constraints_to_values(
@@ -542,19 +606,6 @@ def apply_parameter_algebra_spec_to_mechanism(
         derived = dict(derived)
         derived.update(eq_updates)
 
-    meta = getattr(mechanism, "metadata", {}) or {}
-    enabled = bool(meta.get(_WEGSCHEIDER_META_KEY, False)) if isinstance(meta, dict) else False
-    if enabled:
-        from kindred.core.simulator.wegscheider_symbolic import validate_wegscheider_cyclicity_resolved
-
-        report = validate_wegscheider_cyclicity_resolved(
-            mechanism,
-            parameter_algebra_spec=spec,
-        )
-        if isinstance(meta, dict) and report.cycles:
-            meta["symbolic_wegscheider_identity"] = dict(
-                report.symbolic_identity
-            )
     return derived
 
 
@@ -564,11 +615,9 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
 
     - k{i}: based on Reaction.order (mass-action), units M^(1-order)/s
     - kf{i}, kr{i}: based on equilibrium forward/back molecularity
-    - Keq{i}: dimensionless ("1")
+    - Keq{i}: concentration-form unit M^(nr-nf)
     - scalar params: dimensionless ("1") (if present in metadata)
     """
-    from kindred.core.simulator.parameter_units import rate_constant_unit
-
     units: Dict[str, str] = {}
     rxns = getattr(mechanism, "reactions", []) or []
     eqs = getattr(mechanism, "equilibria", []) or []
@@ -600,9 +649,16 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
                 )
             eq = eqs[idx]
             if role == "Keq":
-                authority = authority_fields_from_step_entry(entry)
-                if bool(authority.get("has_thermo_param")):
-                    units[name] = "1"
+                nf = math.fsum(
+                    float(v)
+                    for v in dict(getattr(eq, "stoich_forward", {}) or {}).values()
+                )
+                nr = math.fsum(
+                    float(v)
+                    for v in dict(getattr(eq, "stoich_back", {}) or {}).values()
+                )
+                from kindred.core.units import equilibrium_constant_unit
+                units[name] = equilibrium_constant_unit(nr - nf)
                 continue
             fwd_order = math.fsum(
                 float(value)

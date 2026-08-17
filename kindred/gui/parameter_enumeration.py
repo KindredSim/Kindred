@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Mapping
+from typing import Literal, Mapping
 
 from kindred.core.equilibrium_rate_authority import (
+    EquilibriumRateAuthorityKind,
     effective_equilibrium_keq,
     effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
@@ -37,11 +38,65 @@ from kindred.core.simulator.parameter_algebra import (
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
+from kindred.core.species import validate_temperature
+from kindred.core.units import (
+    KEQ_MIN,
+    KEQ_MAX,
+    RATE_MIN,
+    RATE_MAX,
+    admit_keq,
+    admit_rate,
+)
 
 __all__ = [
     "GuiParameterCoordinate",
+    "GuiParameterScientificCategory",
+    "admit_gui_parameter_value",
     "enumerate_parameter_coordinates",
 ]
+
+
+GuiParameterScientificCategory = Literal[
+    "rate",
+    "equilibrium_constant",
+    "finite_scalar",
+]
+
+
+def admit_gui_parameter_value(
+    value: object,
+    *,
+    scientific_category: GuiParameterScientificCategory,
+    allow_exact_zero: bool,
+    field: str,
+) -> float:
+    """Admit one GUI/Fit scalar through its accepted scientific authority."""
+
+    if type(allow_exact_zero) is not bool:
+        raise TypeError("allow_exact_zero must be a bool.")
+    if scientific_category == "rate":
+        return admit_rate(
+            value,
+            field=field,
+            allow_zero=allow_exact_zero,
+        )
+    if scientific_category == "equilibrium_constant":
+        if allow_exact_zero:
+            raise ValueError("Equilibrium constants cannot permit exact zero.")
+        return admit_keq(value, field=field)
+    if scientific_category == "finite_scalar":
+        if not allow_exact_zero:
+            raise ValueError("Finite scalar coordinates must permit exact zero.")
+        if type(value) is bool or isinstance(value, str):
+            raise TypeError(f"{field} must be numeric.")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise TypeError(f"{field} must be numeric.") from exc
+        if not math.isfinite(parsed):
+            raise ValueError(f"{field} must be finite.")
+        return float(parsed)
+    raise ValueError(f"Unknown GUI parameter scientific category: {scientific_category!r}.")
 
 
 def _finite(value: object) -> float | None:
@@ -49,18 +104,33 @@ def _finite(value: object) -> float | None:
     return float(parsed) if ok else None
 
 
-def _positive_bounds(value: float) -> tuple[float, float]:
+def _positive_bounds(value: float, *, minimum: float = RATE_MIN, maximum: float = RATE_MAX) -> tuple[float, float]:
     if value > 0.0:
-        low = max(value * 0.01, 1e-12)
-        high = min(value * 100.0, 1e300)
+        low = max(value * 0.01, minimum)
+        high = min(value * 100.0, maximum)
         if high > low:
             return float(low), float(high)
     return 0.0, max(1.0, abs(value) * 10.0)
 
 
 def _signed_bounds(value: float) -> tuple[float, float]:
-    span = max(1.0, abs(value) * 10.0)
-    return float(value - span), float(value + span)
+    span = max(1.0, abs(value) * 0.5)
+    low = value - span
+    high = value + span
+    if not math.isfinite(low) or low >= value:
+        low = value
+    if not math.isfinite(high) or high <= value:
+        high = value
+    if low == high:
+        low = math.nextafter(value, -math.inf)
+        high = math.nextafter(value, math.inf)
+    if not math.isfinite(low):
+        low = value
+    if not math.isfinite(high):
+        high = value
+    if not low < high:
+        raise ValueError("Finite scalar has no representable finite Fit interval.")
+    return float(low), float(high)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +147,44 @@ class GuiParameterCoordinate:
     role: str
     writable: bool
     derived: bool
+    scientific_category: GuiParameterScientificCategory
+    allow_exact_zero: bool
     unit: str = "1"
+
+    def __post_init__(self) -> None:
+        name = str(self.name or "").strip()
+        if not name:
+            raise ValueError("GUI parameter name must be nonblank.")
+        if type(self.allow_exact_zero) is not bool:
+            raise TypeError("GUI parameter exact-zero authority must be a bool.")
+        value = admit_gui_parameter_value(
+            self.value,
+            scientific_category=self.scientific_category,
+            allow_exact_zero=self.allow_exact_zero,
+            field=f"{name} value",
+        )
+        minimum = admit_gui_parameter_value(
+            self.minimum,
+            scientific_category=self.scientific_category,
+            allow_exact_zero=self.allow_exact_zero,
+            field=f"{name} minimum",
+        )
+        maximum = admit_gui_parameter_value(
+            self.maximum,
+            scientific_category=self.scientific_category,
+            allow_exact_zero=self.allow_exact_zero,
+            field=f"{name} maximum",
+        )
+        if minimum >= maximum or not minimum <= value <= maximum:
+            raise ValueError(
+                f"{name} requires minimum <= value <= maximum."
+            )
+        if self.log10_allowed and (minimum <= 0.0 or value <= 0.0):
+            raise ValueError(f"{name} cannot offer Log10 outside a positive domain.")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "minimum", minimum)
+        object.__setattr__(self, "maximum", maximum)
 
 
 def enumerate_parameter_coordinates(
@@ -90,10 +197,10 @@ def enumerate_parameter_coordinates(
     if not isinstance(prepared_dsl, PreparedDslRequestSet):
         raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
     temperature = float(prepared_dsl.analysis.temperature_K)
-    if not math.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError(
-            "Prepared DSL nominal temperature must be positive and finite."
-        )
+    temperature = validate_temperature(
+        temperature,
+        field="Prepared DSL nominal temperature",
+    )
     if type(wegscheider_cyclicity_enabled) is not bool:
         raise TypeError("wegscheider_cyclicity_enabled must be a bool.")
     mechanism = prepared_dsl.mechanism_for_execution()
@@ -138,6 +245,8 @@ def enumerate_parameter_coordinates(
         family = "Constant"
         derived = False
         writable = True
+        scientific_category: GuiParameterScientificCategory
+        allow_exact_zero = False
         model: ForwardRateModel | None = None
         value: float | None = None
 
@@ -151,6 +260,8 @@ def enumerate_parameter_coordinates(
             )
             family = forward_rate_family(model)
             value = forward_rate_at_temperature(model, temperature)
+            scientific_category = "rate"
+            allow_exact_zero = family == "Constant"
         elif kind == "equilibrium":
             raw_index, ok = try_parse_int(entry.get("equilibrium_index", -1))
             if not ok or not (0 <= raw_index < len(equilibria)):
@@ -177,18 +288,27 @@ def enumerate_parameter_coordinates(
                 )
                 family = forward_rate_family(model)
                 value = forward_rate_at_temperature(model, temperature)
+                scientific_category = "rate"
+                allow_exact_zero = (
+                    authority.kind == EquilibriumRateAuthorityKind.KEQ
+                    and family == "Constant"
+                )
             elif role == "kr":
                 family = "reverse"
                 value = effective_equilibrium_reverse_rate(
                     equilibrium,
                     temperature_K=temperature,
                 )
+                scientific_category = "rate"
+                allow_exact_zero = False
             elif role == "Keq":
                 family = "reverse"
                 value = effective_equilibrium_keq(
                     equilibrium,
                     temperature_K=temperature,
                 )
+                scientific_category = "equilibrium_constant"
+                allow_exact_zero = False
             else:
                 continue
         if value is None or not math.isfinite(float(value)):
@@ -197,8 +317,15 @@ def enumerate_parameter_coordinates(
         # enter their request parameter maps.
         if not writable or derived:
             continue
+        bound_minimum, bound_maximum = (
+            (KEQ_MIN, KEQ_MAX) if role == "Keq" else (RATE_MIN, RATE_MAX)
+        )
         low, high = (
-            _positive_bounds(float(value))
+            _positive_bounds(
+                float(value),
+                minimum=bound_minimum,
+                maximum=bound_maximum,
+            )
             if float(value) >= 0.0
             else _signed_bounds(float(value))
         )
@@ -220,6 +347,8 @@ def enumerate_parameter_coordinates(
                 role=role,
                 writable=True,
                 derived=False,
+                scientific_category=scientific_category,
+                allow_exact_zero=allow_exact_zero,
                 unit=str(units.get(name, "1")),
             )
         )
@@ -237,9 +366,7 @@ def enumerate_parameter_coordinates(
             or info.get("editable") is False
         ):
             continue
-        low, high = (
-            _positive_bounds(value) if value > 0.0 else _signed_bounds(value)
-        )
+        low, high = _signed_bounds(value)
         coordinates.append(
             GuiParameterCoordinate(
                 name=name,
@@ -252,6 +379,8 @@ def enumerate_parameter_coordinates(
                 role="scalar",
                 writable=True,
                 derived=False,
+                scientific_category="finite_scalar",
+                allow_exact_zero=True,
                 unit=str(units.get(name, "1")),
             )
         )

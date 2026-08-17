@@ -42,23 +42,19 @@ Design notes
 
 from __future__ import annotations
 
-import copy
 import math
 from collections import OrderedDict
 from collections.abc import Mapping as MappingABC
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Union, Protocol, Optional
 
 from .species import Species
 from .validation import validate_name
 from .equilibrium_rate_authority import (
-    EquilibriumRateAuthorityKind,
+    EquilibriumRateAuthority,
     EquilibriumRateInputContext,
-    effective_reverse_rate_from_keq,
     normalize_equilibrium_rate_authority,
-    plain_finite_float_or_none,
 )
-from .thermodynamics import K_from_deltaG_eq
 from .mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
 
 class StructuredRate(Protocol):
@@ -136,12 +132,6 @@ def _freeze_value(value: Any) -> Any:
         return tuple(_freeze_value(item) for item in value)
     if isinstance(value, (set, frozenset)):
         return frozenset(_freeze_value(item) for item in value)
-    return value
-
-
-def _clone_authority_slot(value: Any) -> Any:
-    if callable(getattr(value, "set", None)):
-        return copy.deepcopy(value)
     return value
 
 
@@ -409,43 +399,6 @@ class Mechanism:
         if hasattr(self, "metadata"):
             self._sync_metadata_order()
 
-    def clone(self) -> "Mechanism":
-        """
-        Fast, structured clone for process-isolated mutation.
-
-        Copies only Mechanism-owned mutable containers (and the dict payloads
-        they directly own), while keeping potentially-heavy immutable objects
-        (rate expressions, compiled callables, etc.) as shared references.
-        """
-        cloned = copy.copy(self)
-        cloned.species = _SpeciesMap(self.species)
-        cloned.reactions = [
-            replace(
-                r,
-                reactants=dict(r.reactants),
-                products=dict(r.products),
-                rate=_clone_authority_slot(r.rate),
-                rate_orders=dict(r.rate_orders),
-                overrides=dict(r.overrides),
-            )
-            for r in self.reactions
-        ]
-        cloned.equilibria = [
-            replace(
-                e,
-                stoich_forward=dict(e.stoich_forward),
-                stoich_back=dict(e.stoich_back),
-                kf=_clone_authority_slot(e.kf),
-                kr=_clone_authority_slot(e.kr),
-                Keq=_clone_authority_slot(e.Keq),
-                metadata=copy.deepcopy(dict(e.metadata)),
-            )
-            for e in self.equilibria
-        ]
-        cloned.metadata = copy.deepcopy(self.metadata)
-        cloned._sync_metadata_order()
-        return cloned
-
     # ---------- species management ----------
 
     def add_species(self, name: str, initial_conc: float = 0.0) -> Species:
@@ -506,7 +459,7 @@ class Mechanism:
         fast: bool = False,
         metadata: Optional[Mapping[str, Any]] = None,
         authority_context: EquilibriumRateInputContext | str | None = None,
-    ) -> Equilibrium:
+    ) -> tuple[Equilibrium, EquilibriumRateAuthority]:
         sf = _validate_positive_side(stoich_forward, label="stoich_forward")
         sb = _validate_positive_side(stoich_back, label="stoich_back")
         if not sf:
@@ -535,11 +488,8 @@ class Mechanism:
             raise ValueError(
                 "equilibrium standard concentration must be a positive finite real"
             )
-        # Resolve authored reverse-side authority before deriving any standard-
-        # state factor.  Explicit kf+kr owns both concentration-form rates and
-        # is therefore C0-inert; thermodynamic authority alone consumes the
-        # directional C0 exponent.
-        meta.pop("std_ratio", None)
+        # Public Keq is already concentration-form.  C0 is consumed only when
+        # lowering dG_eq; explicit Keq and explicit kf+kr are C0-inert.
         meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KF, bool(kf is not None))
         meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KR, bool(kr is not None))
         authority = normalize_equilibrium_rate_authority(
@@ -549,48 +499,6 @@ class Mechanism:
             metadata=meta,
             context=authority_context,
         )
-        if authority.kind == EquilibriumRateAuthorityKind.KEQ:
-            try:
-                directional_delta = math.fsum(sb.values()) - math.fsum(sf.values())
-                standard_ratio = math.pow(standard_conc_value, directional_delta)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError(
-                    "equilibrium directional standard-state ratio must be finite"
-                ) from exc
-            if not math.isfinite(standard_ratio) or standard_ratio <= 0.0:
-                raise ValueError(
-                    "equilibrium directional standard-state ratio must be positive and finite"
-                )
-            meta["std_ratio"] = standard_ratio
-            authority = normalize_equilibrium_rate_authority(
-                kf=kf,
-                kr=kr,
-                Keq=Keq,
-                metadata=meta,
-                context=authority_context,
-            )
-        if authority.kind == EquilibriumRateAuthorityKind.KEQ:
-            effective_keq = Keq
-            if effective_keq is None and meta.get(EquilibriumMetadataKeys.KEQ_INPUT) is not None:
-                effective_keq = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
-            if effective_keq is None and meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None:
-                temperature = plain_finite_float_or_none(self.metadata.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15))
-                dg_value = plain_finite_float_or_none(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
-                if temperature is not None and dg_value is not None:
-                    effective_keq = float(K_from_deltaG_eq(float(dg_value), float(temperature)))
-            scalar_keq = plain_finite_float_or_none(effective_keq)
-            if Keq is None and scalar_keq is not None:
-                Keq = scalar_keq
-            scalar_kf = plain_finite_float_or_none(kf)
-            scalar_std_ratio = plain_finite_float_or_none(authority.reverse_std_ratio)
-            if (
-                kr is None
-                and scalar_kf is not None
-                and scalar_keq is not None
-                and scalar_std_ratio is not None
-                and float(scalar_keq) > 0.0
-            ):
-                kr = effective_reverse_rate_from_keq(scalar_kf, scalar_keq, scalar_std_ratio)
 
         eq = Equilibrium(
             stoich_forward=sf,
@@ -602,4 +510,4 @@ class Mechanism:
             metadata=meta,
         )
         self.equilibria.append(eq)
-        return eq
+        return eq, authority

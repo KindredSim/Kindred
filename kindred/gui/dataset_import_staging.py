@@ -1097,11 +1097,21 @@ class DatasetImportStaging(QtCore.QObject):
 
         self._project_replacement_admission_fenced = False
 
-    def cancel_and_settle_for_project_replacement(self, deadline: float) -> bool:
-        """Blocking cleanup solely for an accepted project replacement."""
+    def request_project_replacement_cancellation(self) -> None:
+        """Fence admission and request cancellation without waiting.
+
+        Project replacement broadcasts this operation to every active owner
+        before it settles any one owner.  Keeping the request separate from
+        settlement prevents an import from being left running while another
+        owner's worker consumes the shared replacement deadline.
+        """
 
         self.fence_for_project_replacement()
         self.cancel_active(outcome="project_replacement")
+
+    def settle_project_replacement(self, deadline: float) -> bool:
+        """Settle the already-cancelled import by one common deadline."""
+
         active = self._active
         if active is None:
             return True

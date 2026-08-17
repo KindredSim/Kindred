@@ -2,17 +2,20 @@
 Canonical time-grid policies for Kindred.
 
 This module centralizes:
-- Time grid construction (dt / N policies)
+- N-only generated time-grid construction
 - Uniform-grid detection using a median-spacing relative-deviation check
 """
 
 from __future__ import annotations
 
-import math
 import numbers
 from typing import Any, Mapping
 
 import numpy as np
+from kindred.core.species import (
+    validate_row_count,
+    validate_time_seconds,
+)
 
 __all__ = ["build_time_grid", "is_uniform_time_grid", "normalize_time_grid_policy"]
 
@@ -23,30 +26,23 @@ def normalize_time_grid_policy(grid: Mapping[str, Any]) -> dict[str, float | int
     """
     Return the canonical requested time-grid policy.
 
-    A requested grid policy is either exactly {"dt": positive finite float} or
-    exactly {"N": int >= 2}. The two forms are intentionally not collapsed into
-    one another because they mean different things to callers and cache identity.
+    A requested generated grid policy is exactly {"N": int >= 2}.
+
+    The generated-row ceiling applies only to this N policy.  Explicit t_eval
+    arrays are admitted and validated at their request/output boundaries.
     """
     if not isinstance(grid, Mapping) or not grid:
-        raise ValueError("grid must be {'dt': float} or {'N': int}")
+        raise ValueError("grid must be {'N': int}")
     keys = set(grid.keys())
-    policy_keys = {key for key in ("dt", "N") if key in keys}
-    if len(policy_keys) != 1 or keys != policy_keys:
-        raise ValueError("grid must specify exactly one of 'dt' or 'N'")
-    if "dt" in policy_keys:
-        raw_dt = grid["dt"]
-        if isinstance(raw_dt, bool) or not isinstance(raw_dt, numbers.Real):
-            raise ValueError("grid['dt'] must be positive and finite")
-        value = float(raw_dt)
-        if value <= 0.0 or not math.isfinite(value):
-            raise ValueError("grid['dt'] must be positive and finite")
-        return {"dt": float(value)}
+    if keys != {"N"}:
+        raise ValueError("grid must specify exactly {'N': int}")
     raw_n = grid["N"]
     if isinstance(raw_n, bool) or not isinstance(raw_n, numbers.Integral):
         raise ValueError("grid['N'] must be an integer >= 2")
     n = int(raw_n)
     if n < 2:
         raise ValueError("grid['N'] must be >= 2")
+    validate_row_count(n, field="grid['N']")
     return {"N": int(n)}
 
 
@@ -54,30 +50,32 @@ def build_time_grid(t0: float, t1: float, grid: Mapping[str, float | int]) -> np
     """
     Build a deterministic, strictly increasing evaluation grid on [t0, t1].
 
-    Supported grid policies:
-      - {"dt": float}: use ceil((t1 - t0)/dt) intervals and adjust spacing to land exactly on t1.
-      - {"N": int}: use N points via linspace (N >= 2).
+    The sole supported generated-grid policy is {"N": int}, which realizes
+    exactly N finite binary64 values on [t0, t1].  A request is rejected when
+    the span is too small to represent all N points strictly increasingly.
     """
-    t0 = float(t0)
-    t1 = float(t1)
-    if not (math.isfinite(t0) and math.isfinite(t1)) or not (t1 > t0):
-        raise ValueError("t_span must be finite with t1 > t0")
+    t0 = validate_time_seconds(t0, field="t_span start")
+    t1 = validate_time_seconds(t1, field="t_span end")
+    if not t1 > t0:
+        raise ValueError("t_span must have end greater than start")
 
     grid_policy = normalize_time_grid_policy(grid)
 
-    if "dt" in grid_policy:
-        h = float(grid_policy["dt"])
-        n_int = max(1, int(math.ceil((t1 - t0) / h)))
-        h_adj = (t1 - t0) / n_int
-        t = t0 + h_adj * np.arange(n_int + 1, dtype=float)
-        t[-1] = t1
-        return t
-
-    if "N" in grid_policy:
-        n = int(grid_policy["N"])
-        return np.linspace(t0, t1, n, dtype=float)
-
-    raise ValueError("grid must be {'dt': float} or {'N': int}")
+    n = int(grid_policy["N"])
+    validate_row_count(n, field="generated time-grid rows")
+    t = np.linspace(t0, t1, n, dtype=float)
+    if (
+        t.size != n
+        or np.any(~np.isfinite(t))
+        or float(t[0]) != t0
+        or float(t[-1]) != t1
+        or np.any(np.diff(t) <= 0.0)
+    ):
+        raise ValueError(
+            "generated N time grid cannot realize exactly N finite, strictly "
+            "increasing binary64 values including both endpoints"
+        )
+    return t
 
 
 def is_uniform_time_grid(t: np.ndarray, eps: float) -> bool:

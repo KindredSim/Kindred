@@ -21,6 +21,7 @@ from kindred.core.project_document import (
     InitialConditionSet,
     MechanismTabDocument,
     ProjectDocument,
+    canonical_species_names,
     new_set_id,
 )
 
@@ -223,10 +224,15 @@ def create_set_from_exact_zero(
     dataset: dataset_foundation.RawDatasetRecord,
     set_id: str,
     set_name: str,
-    model_species: Sequence[str],
+    model_targets: Sequence[str],
     confirmed_mapping: Iterable[tuple[str, str]],
 ) -> MechanismTabDocument:
-    """Create and map one complete IC set from confirmed exact-zero values."""
+    """Create and map one complete IC set from confirmed exact-zero values.
+
+    model_targets is the accepted observation-target roster.  The mechanism
+    species roster remains canonical state owned by tab and is the only roster
+    materialized into the new initial-condition set.
+    """
     clean_set_id = str(set_id).strip()
     clean_name = str(set_name).strip()
     if not clean_set_id or not clean_name:
@@ -250,11 +256,12 @@ def create_set_from_exact_zero(
             (series.raw_observation_id, series.column_name)
             for series in dataset.observations
         ),
-        model_species=model_species,
+        model_targets=model_targets,
     )
     values = seed_species_values_at_exact_zero(
         observations=observations,
-        model_species=model_species,
+        mechanism_species=canonical_species_names(tab),
+        model_targets=model_targets,
         confirmed_mapping=normalized_mapping,
     )
     created_set = InitialConditionSet(
@@ -299,12 +306,14 @@ def apply_dataset_mapping_batch(
     document: ProjectDocument,
     tab: MechanismTabDocument,
     batch: DatasetMappingBatchProposal,
-    mechanism_species: Sequence[str],
+    model_targets: Sequence[str],
 ) -> MechanismTabDocument:
     """Validate and fold one complete mapping batch into one tab candidate.
 
     No ProjectDocument or live tab is mutated while the proposal is folded;
     callers publish the returned candidate exactly once through the registry.
+    model_targets admits raw observation mappings; the tab's canonical
+    mechanism species remain the sole initial-condition roster.
     """
     if not isinstance(document, ProjectDocument):
         raise TypeError("document must be a ProjectDocument.")
@@ -314,9 +323,17 @@ def apply_dataset_mapping_batch(
         raise TypeError("batch must be a DatasetMappingBatchProposal.")
     if batch.tab_id != tab.tab_id:
         raise DatasetMappingError("Mapping batch origin does not match its tab.")
-    species = tuple(str(item).strip() for item in mechanism_species)
+    mechanism_species = canonical_species_names(tab)
+    observation_targets = tuple(str(item).strip() for item in model_targets)
+    species = mechanism_species
     if not species or any(not item for item in species) or len(set(species)) != len(species):
         raise DatasetMappingError("Mapping requires a unique mechanism species roster.")
+    if (
+        not observation_targets
+        or any(not item for item in observation_targets)
+        or len(set(observation_targets)) != len(observation_targets)
+    ):
+        raise DatasetMappingError("Mapping requires a unique model target roster.")
     records = {record.dataset_id: record for record in document.datasets}
     if any(item.dataset_id not in records for item in batch.proposals):
         raise DatasetMappingError("Mapping batch references a dataset absent from the committed document.")
@@ -338,7 +355,7 @@ def apply_dataset_mapping_batch(
                 (series.raw_observation_id, series.column_name)
                 for series in dataset.observations
             ),
-            model_species=species,
+            model_targets=observation_targets,
         )
         if item.action is DatasetMappingChoice.LEAVE_UNMAPPED:
             if item.target_set_id is not None or item.occupied_choice is not None:
@@ -371,7 +388,8 @@ def apply_dataset_mapping_batch(
             }
             values = seed_species_values_at_exact_zero(
                 observations=observations,
-                model_species=species,
+                mechanism_species=species,
+                model_targets=observation_targets,
                 confirmed_mapping=normalized_mapping,
             )
             new_set = InitialConditionSet(
@@ -454,7 +472,7 @@ def apply_dataset_mapping_batch(
     return revalidate_fit_inclusions(
         document=document,
         tab=candidate,
-        mechanism_species=species,
+        model_targets=observation_targets,
     )
 
 
@@ -463,9 +481,13 @@ def apply_dataset_set_mapping_plan(
     document: ProjectDocument,
     tab: MechanismTabDocument,
     plan: DatasetSetMappingPlan,
-    mechanism_species: Sequence[str],
+    model_targets: Sequence[str],
 ) -> MechanismTabDocument:
-    """Materialize a mapping plan and drop every newly invalid Fit inclusion."""
+    """Materialize a mapping plan and drop every newly invalid Fit inclusion.
+
+    model_targets is the accepted observation-target roster; mechanism species
+    are resolved from the canonical tab for Fit admission.
+    """
     if plan.canceled:
         return tab
     sets = tab.initial_condition_sets
@@ -491,7 +513,7 @@ def apply_dataset_set_mapping_plan(
     return revalidate_fit_inclusions(
         document=document,
         tab=candidate,
-        mechanism_species=mechanism_species,
+        model_targets=model_targets,
     )
 
 
@@ -500,17 +522,17 @@ def with_confirmed_observation_mapping(
     document: ProjectDocument,
     tab: MechanismTabDocument,
     dataset: dataset_foundation.RawDatasetRecord,
-    model_species: Sequence[str],
+    model_targets: Sequence[str],
     confirmed_mapping: Iterable[tuple[str, str]],
 ) -> MechanismTabDocument:
-    """Replace only one active-tab explicit observation mapping."""
+    """Replace one active-tab mapping against the accepted target roster."""
     normalized = normalize_observation_mapping(
         confirmed_mapping,
         raw_observations=tuple(
             (series.raw_observation_id, series.column_name)
             for series in dataset.observations
         ),
-        model_species=model_species,
+        model_targets=model_targets,
     )
     current = tab.dataset_link(dataset.dataset_id)
     if current is None and not normalized:
@@ -527,7 +549,7 @@ def with_confirmed_observation_mapping(
     return revalidate_fit_inclusions(
         document=document,
         tab=candidate,
-        mechanism_species=model_species,
+        model_targets=model_targets,
     )
 
 
@@ -536,7 +558,7 @@ def _validate_current_fit_inclusion(
     document: ProjectDocument,
     tab: MechanismTabDocument,
     dataset_id: str,
-    mechanism_species: Sequence[str],
+    model_targets: Sequence[str],
 ) -> dataset_foundation.FitInclusionValidation:
     """Resolve mapping-owned context before calling the lower pure validator."""
     try:
@@ -562,7 +584,7 @@ def _validate_current_fit_inclusion(
             (series.raw_observation_id, series.column_name)
             for series in dataset.observations
         ),
-        model_species=mechanism_species,
+        model_targets=model_targets,
     )
     if normalized_mapping != current.observation_mapping:
         raise DatasetMappingError(
@@ -573,7 +595,8 @@ def _validate_current_fit_inclusion(
         set_id=initial_set.set_id,
         observation_mapping=normalized_mapping,
         initial_values=initial_set.values_dict(),
-        mechanism_species=mechanism_species,
+        mechanism_species=canonical_species_names(tab),
+        observation_targets=model_targets,
         resolved_t_start=resolve_fit_t_start(
             tab,
             initial_set.set_id,
@@ -586,7 +609,7 @@ def revalidate_fit_inclusions(
     *,
     document: ProjectDocument,
     tab: MechanismTabDocument,
-    mechanism_species: Sequence[str],
+    model_targets: Sequence[str],
 ) -> MechanismTabDocument:
     """Remove invalid included links after any dataset/set prerequisite change."""
     candidate = tab
@@ -598,7 +621,7 @@ def revalidate_fit_inclusions(
                 document=document,
                 tab=candidate,
                 dataset_id=dataset_id,
-                mechanism_species=mechanism_species,
+                model_targets=model_targets,
             )
         except (KeyError, TypeError, ValueError):
             current = candidate.dataset_link(dataset_id)
@@ -616,7 +639,7 @@ def with_validated_fit_inclusion(
     tab: MechanismTabDocument,
     dataset_id: str,
     include: bool,
-    mechanism_species: Sequence[str],
+    model_targets: Sequence[str],
 ) -> MechanismTabDocument:
     """Replace inclusion only after complete current-state validation."""
     current = tab.dataset_link(dataset_id)
@@ -628,7 +651,7 @@ def with_validated_fit_inclusion(
             document=document,
             tab=tab,
             dataset_id=dataset_id,
-            mechanism_species=mechanism_species,
+            model_targets=model_targets,
         )
     if current is None:
         raise DatasetMappingError(

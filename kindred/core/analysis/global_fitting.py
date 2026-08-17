@@ -4,45 +4,53 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field, replace
 from types import MappingProxyType
 from typing import Literal, Optional
 
 import numpy as np
 
 from kindred.core.analysis.dataset_parameter_overrides import (
+    FitCentredFixedEffectsParamSpec,
     FitCoupledVariableParamSpec,
     FitDatasetParameterOverrides,
     FitSharedVariableParamSpec,
 )
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.fit_uncertainty import (
+    bootstrap_de_seed,
     ProfileLikelihoodConfig,
     ResidualBootstrapConfig,
     profile_likelihood_extension,
     residual_bootstrap_extension,
 )
-from kindred.core.analysis.hierarchical_fit import (
-    HierarchicalFitConfig,
-    HierarchicalNuisanceParameter,
-    hierarchical_fit_extension,
-)
 from kindred.core.analysis.fit_evaluation_outcome import FitEvaluationOutcome
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.exceptions import (
+    FitSimulationError,
     FittingCancelled,
     SimulationCancelled,
 )
 from kindred.core.fitting_optimization import fit_parameters
-from kindred.core.fitting_completion import FitTerminalExtension
+from kindred.core.fitting_completion import (
+    FitExtensionProgress,
+    FitTerminalExtension,
+)
 from kindred.core.objective import ObjectiveContext
-from kindred.core.project_document import validate_fit_method
-from kindred.core.simulation_failure import build_simulation_failure
+from kindred.core.fitting_method_policy import validate_fit_method
+from kindred.core.species import validate_evaluation_count
+from kindred.core.simulation_failure import (
+    FactualCause,
+    factual_cause_from_exception,
+)
+from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "SharedRefitExecution",
+    "SharedRefitPromotionAdmission",
     "SharedRefitPromotion",
     "fit_global",
     "fit_global_shared_refit",
@@ -77,6 +85,297 @@ class SharedRefitPromotion:
         object.__setattr__(self, "log10", bool(self.log10))
 
 
+@dataclass(frozen=True, slots=True)
+class SharedRefitPromotionAdmission:
+    """One pre-dispatch promotion with its exact admitted seed and provenance."""
+
+    promotion: InitVar[SharedRefitPromotion]
+    source_values: InitVar[Sequence[tuple[str, float]]]
+    shared_variable: FitSharedVariableParamSpec = field(init=False)
+    provenance: Mapping[str, object] = field(init=False)
+
+    def __post_init__(
+        self,
+        promotion: SharedRefitPromotion,
+        source_values: Sequence[tuple[str, float]],
+    ) -> None:
+        if not isinstance(promotion, SharedRefitPromotion):
+            raise TypeError("Shared-refit admission requires a typed promotion.")
+        source_values = tuple(
+            (str(dataset_id or "").strip(), float(value))
+            for dataset_id, value in source_values
+        )
+        dataset_ids = tuple(dataset_id for dataset_id, _value in source_values)
+        values = np.asarray(
+            [value for _dataset_id, value in source_values],
+            dtype=float,
+        )
+        if (
+            not source_values
+            or any(not dataset_id for dataset_id in dataset_ids)
+            or len(dataset_ids) != len(set(dataset_ids))
+        ):
+            raise ValueError(
+                "Shared-refit admission requires distinct source dataset values."
+            )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("Shared-refit seeds require finite Per-dataset estimates.")
+        if promotion.seed_statistic == "geometric_mean":
+            if np.any(values <= 0.0):
+                raise ValueError(
+                    f"Geometric Shared-refit seed for {promotion.parameter_name!r} "
+                    "requires positive estimates."
+                )
+            seed_value = float(np.exp(np.mean(np.log(values))))
+        else:
+            seed_value = float(np.mean(values))
+        if not promotion.minimum <= seed_value <= promotion.maximum:
+            raise ValueError(
+                f"{promotion.parameter_name!r} central-tendency seed lies outside "
+                "the new Shared bounds."
+            )
+        shared_variable = FitSharedVariableParamSpec(
+            name=promotion.parameter_name,
+            initial=seed_value,
+            minimum=promotion.minimum,
+            maximum=promotion.maximum,
+            log10=promotion.log10,
+        )
+        provenance = MappingProxyType(
+            {
+                "seed_statistic": promotion.seed_statistic,
+                "seed_value": seed_value,
+                "source_values": tuple(float(value) for value in values),
+                "source_dataset_ids": dataset_ids,
+                "source_scope": "per_dataset",
+                "seed_authority": "pre-dispatch Shared-refit admission",
+            }
+        )
+        object.__setattr__(self, "shared_variable", shared_variable)
+        object.__setattr__(self, "provenance", provenance)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class SharedRefitExecution:
+    """One admitted, immutable Shared-refit parameter execution.
+
+    Promoted specifications are derived exclusively from their admissions and
+    the optimizer layout is built exclusively from the resulting final
+    parameter routes.  Callers therefore cannot supply either fact twice.
+    """
+
+    dataset_ids: tuple[str, ...]
+    promotion_admissions: tuple[SharedRefitPromotionAdmission, ...]
+    shared_variables: tuple[FitSharedVariableParamSpec, ...]
+    dataset_overrides: tuple[FitDatasetParameterOverrides, ...]
+    coupled_variables: tuple[FitCoupledVariableParamSpec, ...]
+    optimizer_layout: _fit_execution.FitParameterLayout
+
+    def __init__(
+        self,
+        *,
+        dataset_ids: Sequence[str],
+        promotion_admissions: Sequence[SharedRefitPromotionAdmission],
+        existing_shared_variables: Sequence[FitSharedVariableParamSpec] = (),
+        dataset_overrides: Sequence[FitDatasetParameterOverrides] = (),
+        coupled_variables: Sequence[FitCoupledVariableParamSpec] = (),
+    ) -> None:
+        roster = tuple(str(value or "").strip() for value in dataset_ids)
+        if (
+            not roster
+            or any(not value for value in roster)
+            or len(roster) != len(set(roster))
+        ):
+            raise ValueError(
+                "Shared-refit execution requires a distinct fitted dataset roster."
+            )
+        admitted = tuple(promotion_admissions)
+        if not admitted or any(
+            not isinstance(item, SharedRefitPromotionAdmission)
+            for item in admitted
+        ):
+            raise ValueError(
+                "Shared-refit execution requires typed promotion admissions."
+            )
+        promoted_names = tuple(item.shared_variable.name for item in admitted)
+        if len(promoted_names) != len(set(promoted_names)):
+            raise ValueError("Shared-refit execution repeats a promoted parameter.")
+        for item in admitted:
+            source_ids = tuple(item.provenance.get("source_dataset_ids", ()))
+            if source_ids != roster:
+                raise ValueError(
+                    "Shared-refit admission source datasets must exactly match "
+                    "the fitted dataset roster."
+                )
+
+        existing = tuple(existing_shared_variables)
+        if any(
+            not isinstance(item, FitSharedVariableParamSpec) for item in existing
+        ):
+            raise TypeError(
+                "Shared-refit existing Shared parameters must use typed specs."
+            )
+        existing_names = tuple(item.name for item in existing)
+        if (
+            len(existing_names) != len(set(existing_names))
+            or set(existing_names).intersection(promoted_names)
+        ):
+            raise ValueError(
+                "Shared-refit promoted and existing Shared parameter routes overlap."
+            )
+        shared = (*existing, *(item.shared_variable for item in admitted))
+        supplied_overrides = tuple(dataset_overrides)
+        if any(
+            not isinstance(item, FitDatasetParameterOverrides)
+            for item in supplied_overrides
+        ):
+            raise TypeError(
+                "Shared-refit dataset routes must use typed override records."
+            )
+        override_ids = tuple(item.dataset_id for item in supplied_overrides)
+        if (
+            len(override_ids) != len(set(override_ids))
+            or set(override_ids) - set(roster)
+        ):
+            raise ValueError(
+                "Shared-refit dataset routes must belong uniquely to its roster."
+            )
+        overrides_by_id = {
+            item.dataset_id: item for item in supplied_overrides
+        }
+        overrides = tuple(
+            overrides_by_id.get(
+                dataset_id,
+                FitDatasetParameterOverrides(dataset_id=dataset_id),
+            )
+            for dataset_id in roster
+        )
+        coupled = tuple(coupled_variables)
+        if any(
+            not isinstance(item, FitCoupledVariableParamSpec) for item in coupled
+        ):
+            raise TypeError(
+                "Shared-refit coupled routes must use typed specifications."
+            )
+        stale_dataset_routes = set(promoted_names).intersection(
+            name
+            for override in overrides
+            for name in (
+                *(item.name for item in override.variable_params),
+                *(item[0] for item in override.fixed_params),
+            )
+        )
+        stale_coupled_routes = set(promoted_names).intersection(
+            item.parameter_name for item in coupled
+        )
+        if stale_dataset_routes or stale_coupled_routes:
+            raise ValueError(
+                "Shared-refit execution retained an obsolete promoted parameter route."
+            )
+        shared_params = {item.name: item.initial for item in shared}
+        shared_bounds = {
+            item.name: (item.minimum, item.maximum) for item in shared
+        }
+        shared_log10 = {item.name: item.log10 for item in shared}
+        layout = _fit_execution.build_parameter_layout_for_dataset_ids(
+            dataset_ids=roster,
+            shared_params=shared_params,
+            dataset_overrides=overrides,
+            coupled_variables=coupled,
+            bounds=shared_bounds,
+            log10_params=shared_log10,
+        )
+        object.__setattr__(self, "dataset_ids", roster)
+        object.__setattr__(self, "promotion_admissions", admitted)
+        object.__setattr__(self, "shared_variables", tuple(shared))
+        object.__setattr__(self, "dataset_overrides", overrides)
+        object.__setattr__(self, "coupled_variables", coupled)
+        object.__setattr__(self, "optimizer_layout", layout)
+
+
+def _shared_refit_provenance(
+    execution: SharedRefitExecution,
+    *,
+    terminal_route: Literal[
+        "optimizer_terminal",
+        "user_stop_best_valid_bounded_replay",
+    ],
+) -> Mapping[str, object]:
+    """Return admitted Shared-refit provenance for sole result construction."""
+
+    if not isinstance(execution, SharedRefitExecution):
+        raise TypeError("Shared-refit terminal requires its admitted execution.")
+    admitted = execution.promotion_admissions
+    names = tuple(item.shared_variable.name for item in admitted)
+    if len(names) != len(set(names)):
+        raise ValueError("Shared-refit terminal admissions repeat a parameter.")
+    if terminal_route not in {
+        "optimizer_terminal",
+        "user_stop_best_valid_bounded_replay",
+    }:
+        raise ValueError("Shared-refit terminal route is invalid.")
+    return {
+        "execution": "Promote to Shared and Refit",
+        "terminal_route": terminal_route,
+        "promotions": {
+            item.shared_variable.name: item.provenance
+            for item in admitted
+        },
+        "starting_value_authority": "shared_refit_execution",
+        "terminal_value_authority": "result.shared_params",
+    }
+
+
+def _validate_shared_refit_replay(
+    *,
+    shared_params: Mapping[str, float],
+    dataset_params: Mapping[str, Mapping[str, float]],
+    terminal_replay_count: int,
+    completion: object,
+    execution: SharedRefitExecution,
+    terminal_route: Literal[
+        "optimizer_terminal",
+        "user_stop_best_valid_bounded_replay",
+    ],
+) -> None:
+    """Validate replay custody before the sole result construction."""
+
+    if tuple(dataset_params) != execution.dataset_ids:
+        raise ValueError("Shared-refit replay dataset roster differs from admission.")
+    expected_shared = set(execution.optimizer_layout.param_names)
+    if set(shared_params) != expected_shared:
+        raise ValueError("Shared-refit replay Shared routes differ from admission.")
+    expected_dataset = {
+        dataset_id: {
+            *(item.name for item in override.variable_params),
+            *(
+                item.parameter_name
+                for item in execution.coupled_variables
+                if dataset_id in item.dataset_ids
+            ),
+        }
+        for dataset_id, override in zip(
+            execution.dataset_ids,
+            execution.dataset_overrides,
+            strict=True,
+        )
+    }
+    if any(
+        set(dataset_params[dataset_id]) != expected_dataset[dataset_id]
+        for dataset_id in execution.dataset_ids
+    ):
+        raise ValueError("Shared-refit replay dataset routes differ from admission.")
+    if int(terminal_replay_count) != 1:
+        raise ValueError("A publishable Shared-refit replay requires one replay.")
+    if terminal_route == "user_stop_best_valid_bounded_replay" and (
+        getattr(completion, "status", None) != "warn"
+        or bool(getattr(completion, "optimizer_converged", False))
+    ):
+        raise ValueError("User-Stop Shared-refit replay semantics are invalid.")
+
+
+
+
 def _validate_run_inputs(
     *,
     fit_evaluators: Mapping[str, object],
@@ -89,7 +388,7 @@ def _validate_run_inputs(
     tuple[FitSharedVariableParamSpec, ...],
     tuple[FitDatasetParameterOverrides, ...],
 ]:
-    payloads = list(datasets)
+    payloads = sorted(datasets, key=lambda item: str(getattr(item, "dataset_id", "")))
     if not payloads:
         raise ValueError("At least one Fit dataset is required.")
     if any(not isinstance(item, FitDatasetSpec) for item in payloads):
@@ -113,12 +412,12 @@ def _validate_run_inputs(
             + "."
         )
 
-    shared = tuple(shared_variables)
+    shared = tuple(sorted(shared_variables, key=lambda item: item.name))
     shared_names = [item.name for item in shared]
     if len(shared_names) != len(set(shared_names)):
         raise ValueError("Shared Fit parameter names must be unique.")
 
-    overrides = tuple(dataset_overrides)
+    overrides = tuple(sorted(dataset_overrides, key=lambda item: item.dataset_id))
     override_ids = [item.dataset_id for item in overrides]
     if len(override_ids) != len(set(override_ids)):
         raise ValueError("Each Fit dataset may have only one override record.")
@@ -132,6 +431,9 @@ def _validate_run_inputs(
     return payloads, evaluators, shared, overrides
 
 
+
+
+
 def fit_global(
     *,
     fit_evaluators: Mapping[str, object],
@@ -139,6 +441,7 @@ def fit_global(
     shared_variables: Sequence[FitSharedVariableParamSpec],
     dataset_overrides: Sequence[FitDatasetParameterOverrides] = (),
     coupled_variables: Sequence[FitCoupledVariableParamSpec] = (),
+    centred_variables: Sequence[FitCentredFixedEffectsParamSpec] = (),
     weights: Optional[Mapping[str, float]] = None,
     method: str,
     max_nfev: int = 1000,
@@ -152,11 +455,21 @@ def fit_global(
     cancellation_control: SimulationCancellationControl | None = None,
     profile_likelihood: ProfileLikelihoodConfig | None = None,
     residual_bootstrap: ResidualBootstrapConfig | None = None,
-    hierarchical: Sequence[HierarchicalFitConfig] = (),
-) -> _fit_execution.GlobalFitResult:
+    extension_progress_callback: Optional[
+        Callable[[FitExtensionProgress], None]
+    ] = None,
+    shared_refit_provenance: Mapping[str, object] | None = None,
+    optimizer_layout: _fit_execution.FitParameterLayout,
+ ) -> tuple[_fit_execution.GlobalFitResult | None, FitEvaluationOutcome]:
     """Fit immutable dataset captures through one evaluator per dataset."""
 
     method = validate_fit_method(method)
+    max_nfev = validate_evaluation_count(
+        max_nfev,
+        field="Fit evaluation budget",
+    )
+    if max_nfev <= 0:
+        raise ValueError("Fit evaluation budget must be positive.")
     payloads, evaluators, shared, overrides = _validate_run_inputs(
         fit_evaluators=fit_evaluators,
         datasets=datasets,
@@ -164,6 +477,9 @@ def fit_global(
         dataset_overrides=dataset_overrides,
     )
     coupled = tuple(coupled_variables)
+    centred = tuple(centred_variables)
+    if any(not isinstance(item, FitCentredFixedEffectsParamSpec) for item in centred):
+        raise TypeError("Centred Fit requests must contain typed parameter specifications.")
     shared_params = {item.name: item.initial for item in shared}
     shared_bounds = {
         item.name: (item.minimum, item.maximum)
@@ -178,14 +494,24 @@ def fit_global(
         payloads,
         None if weights is None else dict(weights),
     )
-    layout = _fit_execution.build_parameter_layout(
-        payloads=payloads,
+    if not isinstance(optimizer_layout, _fit_execution.FitParameterLayout):
+        raise TypeError("Global Fit requires its pre-dispatch optimizer layout.")
+    layout = optimizer_layout
+    expected_layout = _fit_execution.build_parameter_layout_for_dataset_ids(
+        dataset_ids=tuple(item.dataset_id for item in payloads),
         shared_params=shared_params,
         dataset_overrides=overrides,
         coupled_variables=coupled,
         bounds=shared_bounds,
         log10_params=shared_log10,
+        centred_variables=centred,
     )
+    if (
+        layout.opt_param_keys() != expected_layout.opt_param_keys()
+        or layout.initial_params() != expected_layout.initial_params()
+        or layout.bounds_dict() != expected_layout.bounds_dict()
+    ):
+        raise ValueError("Pre-dispatch Fit optimizer layout no longer matches execution.")
 
     logger.info(
         "Global fitting: %d datasets, %d optimizer coordinates",
@@ -240,6 +566,13 @@ def fit_global(
             if isinstance(cause, BaseException):
                 raise cause
             raise RuntimeError("Fatal Fit evaluation omitted its typed cause.")
+        if optimizer_evaluation.status == "scientific_unavailable":
+            unavailability = optimizer_evaluation.unavailability
+            if unavailability is None:
+                raise RuntimeError(
+                    "Scientific-unavailability terminal replay omitted its result."
+                )
+            return None, optimizer_evaluation
         success = bool(
             optimizer_result.success
             and optimizer_evaluation.status == "converged"
@@ -251,8 +584,11 @@ def fit_global(
         ).strip()
         if identifiability:
             diagnostic = _fit_execution.build_fit_diagnostic_from_failure(
-                build_simulation_failure(
-                    kind="fitting_identifiability",
+                FactualCause(
+                    domain="fit",
+                    origin="identifiability",
+                    code=None,
+                    type="FittingIdentifiability",
                     message=identifiability,
                     details={"final_report_warning": True},
                 ),
@@ -275,54 +611,38 @@ def fit_global(
             [optimizer_result.parameters[key] for key in keys],
             dtype=float,
         )
-        fitted_shared = layout.shared_param_dict_from_vector(vector)
-        combined_dataset_params = {
-            item.dataset_id: {}
-            for item in payloads
-        }
-        for dataset_id, parameter_name in layout.dataset_var_order:
-            combined_dataset_params[dataset_id].update(
-                layout.dataset_var_params_for_dataset(dataset_id, vector)
+        layout.validate_optimizer_vector(vector)
+        try:
+            replay_state = _fit_execution._assemble_fit_replay_state(
+                fit_evaluators=evaluators,
+                payloads=payloads,
+                layout=layout,
+                candidate_vector=vector,
+                fixed_dataset_params=fixed_dataset_params,
+                weights=weights_norm,
+                cancellation_check=cancellation_check,
+                cancellation_control=cancellation_control,
+                success=success,
+                message=message,
+                scipy_nfev=int(optimizer_result.scipy_nfev),
+                terminal_replay_count=int(optimizer_result.terminal_replay_count),
+                objective_call_count=int(objective.objective_calls),
+                optimizer_diagnostic=diagnostic,
             )
-        for item in layout.coupled_var_order:
-            for dataset_id in item.dataset_ids:
-                combined_dataset_params[dataset_id].update(
-                    layout.coupled_params_for_dataset(dataset_id, vector)
-                )
-
-        result = _fit_execution.assemble_global_fit_result(
-            fit_evaluators=evaluators,
-            payloads=payloads,
-            layout=layout,
-            fitted_params=fitted_shared,
-            fixed_dataset_params=fixed_dataset_params,
-            combined_dataset_params=combined_dataset_params,
-            weights=weights_norm,
-            cancellation_check=cancellation_check,
-            cancellation_control=cancellation_control,
-            success=success,
-            message=message,
-            nfev=int(optimizer_result.nfev),
-            optimizer_diagnostic=diagnostic,
-        )
-        result.scipy_nfev = int(optimizer_result.scipy_nfev or optimizer_result.nfev)
-        result.terminal_replay_count = int(optimizer_result.terminal_replay_count)
-        result.objective_call_count = int(objective.objective_calls)
-        hierarchical_configs = tuple(hierarchical)
-        if any(
-            not isinstance(item, HierarchicalFitConfig)
-            for item in hierarchical_configs
-        ):
-            raise TypeError(
-                "Hierarchical Fit requests must contain HierarchicalFitConfig values."
+        except FitSimulationError as exc:
+            details = dict(getattr(exc, "details", None) or {})
+            if not details.get("scientific_unavailable"):
+                raise
+            outcome = FitEvaluationOutcome.scientific_unavailable(
+                ScientificUnavailable(
+                    producer=str(details.get("producer", "global_fit_replay")),
+                    stage=str(details.get("stage", "final_replay")),
+                    details=details,
+                    factual_cause=getattr(exc, "factual_cause", None),
+                ),
+                provenance={"stage": "optimizer_terminal_replay"},
             )
-        if (
-            profile_likelihood is None
-            and residual_bootstrap is None
-            and not hierarchical_configs
-        ):
-            return result
-
+            return None, outcome
         # Post-fit methods receive a fresh objective without progress emission.
         # It retains the same evaluators, candidate/fatal taxonomy, coordinates,
         # normalized weights, cancellation owner, and immutable captures.
@@ -340,219 +660,200 @@ def fit_global(
             cancellation_control=cancellation_control,
         )
         extensions: list[FitTerminalExtension] = []
+        extension_pipeline_stopped = False
         terminal_parameters = {
-            key: float(optimizer_result.parameters[key])
-            for key in keys
+            key: float(vector[index])
+            for index, key in enumerate(keys)
         }
         if profile_likelihood is not None:
-            extensions.append(
-                profile_likelihood_extension(
+            profile_config = replace(
+                profile_likelihood,
+                parameter_names=tuple(
+                    layout.coordinate_identity(name)
+                    for name in profile_likelihood.parameter_names
+                ),
+            )
+            try:
+                extension = profile_likelihood_extension(
                     objective=terminal_objective,
                     initial_parameters=terminal_parameters,
                     bounds=layout.bounds_dict(),
-                    config=profile_likelihood,
+                    config=profile_config,
                     decode_coordinate=layout.decode_coordinate,
                     cancellation_check=cancellation_check,
                     terminal_converged=(
                         optimizer_evaluation.status == "converged"
                     ),
+                    progress_callback=extension_progress_callback,
                 )
-            )
+            except (FittingCancelled, SimulationCancelled) as exc:
+                extension_pipeline_stopped = True
+                stop_cause = factual_cause_from_exception(
+                    exc,
+                    domain="fit",
+                    origin="profile_likelihood",
+                )
+                extension = FitTerminalExtension(
+                    kind="profile_likelihood",
+                    status="stopped",
+                    method="profile likelihood with nuisance reoptimization",
+                    provenance={
+                        "settlement": "stopped",
+                        "primary_fit_preserved": True,
+                    },
+                    details={"primary_fit_preserved": True},
+                    cause=stop_cause,
+                )
+            except Exception as exc:
+                extension = FitTerminalExtension(
+                    kind="profile_likelihood",
+                    status="failed",
+                    method="weighted-Gaussian profile likelihood",
+                    provenance={
+                        "settlement": "failed",
+                        "primary_fit_preserved": True,
+                    },
+                    details={"primary_fit_preserved": True},
+                    cause=factual_cause_from_exception(
+                        exc,
+                        domain="fit",
+                        origin="profile_likelihood",
+                    ),
+                )
+            extensions.append(extension)
 
         if residual_bootstrap is not None:
             def refit_bootstrap(
                 synthetic_payloads: Sequence[FitDatasetSpec],
-            ) -> _fit_execution.GlobalFitResult:
+                replicate_index: int,
+            ) -> tuple[_fit_execution.GlobalFitResult | None, FitEvaluationOutcome]:
+                replicate_seed = (
+                    bootstrap_de_seed(
+                        residual_bootstrap.seed,
+                        replicate_index,
+                    )
+                    if (
+                        residual_bootstrap.optimizer_method == "differential_evolution"
+                    )
+                    else None
+                )
                 return fit_global(
                     fit_evaluators=evaluators,
                     datasets=synthetic_payloads,
                     shared_variables=shared,
                     dataset_overrides=overrides,
                     coupled_variables=coupled,
+                    centred_variables=centred,
                     weights=weights_norm,
-                    method=method,
+                    method=residual_bootstrap.optimizer_method,
                     max_nfev=max_nfev,
                     ftol=ftol,
                     xtol=xtol,
-                    seed=seed,
+                    seed=replicate_seed,
                     progress_callback=None,
+                    extension_progress_callback=None,
                     cancellation_check=cancellation_check,
                     cancellation_control=cancellation_control,
+                    optimizer_layout=layout,
                 )
 
-            extensions.append(
-                residual_bootstrap_extension(
-                    terminal_result=result,
-                    payloads=payloads,
-                    config=residual_bootstrap,
-                    refit=refit_bootstrap,
-                    cancellation_check=cancellation_check,
-                )
-            )
-
-        payloads_by_id = {
-            payload.dataset_id: payload
-            for payload in payloads
-        }
-        base_vector = np.asarray(
-            [terminal_parameters[key] for key in keys],
-            dtype=float,
-        )
-        for hierarchy in hierarchical_configs:
-            coordinate_names = {
-                dataset_id: f"{dataset_id}::{hierarchy.parameter_name}"
-                for dataset_id in payloads_by_id
-            }
-            missing_coordinates = tuple(
-                coordinate
-                for coordinate in coordinate_names.values()
-                if coordinate not in terminal_parameters
-            )
-            hierarchy_provenance: dict[str, object] = {
-                "likelihood_model": "weighted Gaussian observation residuals",
-                "random_effects": "independent Gaussian dataset effects",
-                "marginalization": "first-order Laplace approximation at conditional modes",
-                "optimizer_scale": "log10" if hierarchy.log10 else "linear",
-                "optimizer_method": hierarchy.optimizer_method,
-                "max_nfev": hierarchy.max_nfev,
-                "inner_max_nfev": hierarchy.inner_max_nfev,
-                "joint_nuisance_reoptimization": True,
-                "dataset_specific_evaluation": True,
-                "fit_local_only": True,
-                "publication_requires_shared_refit": True,
-                "primary_evaluation_status": optimizer_evaluation.status,
-            }
-            if missing_coordinates:
-                extensions.append(
-                    FitTerminalExtension(
-                        kind="hierarchical",
-                        status="unavailable",
-                        method=(
-                            "nonlinear mixed-effects weighted-Gaussian likelihood "
-                            "with Gaussian random effects and Laplace marginalization"
-                        ),
-                        provenance=hierarchy_provenance,
-                        details={
-                            "parameter_name": hierarchy.parameter_name,
-                            "missing_optimizer_coordinates": missing_coordinates,
-                        },
-                        unavailable_reason=(
-                            "Hierarchical scope requires one active Per-dataset "
-                            "optimizer coordinate for every included dataset."
-                        ),
-                    )
-                )
-                continue
-            if any(
-                layout.coordinate_log10(coordinate) != hierarchy.log10
-                for coordinate in coordinate_names.values()
-            ):
-                raise ValueError(
-                    f"Hierarchical scale for {hierarchy.parameter_name!r} does not "
-                    "match its configured dataset coordinates."
-                )
-
-            random_coordinates = frozenset(coordinate_names.values())
-            nuisance_parameters = tuple(
-                HierarchicalNuisanceParameter(
-                    name=coordinate,
-                    initial=layout.decode_coordinate(
-                        coordinate,
-                        terminal_parameters[coordinate],
-                    ),
-                    minimum=layout.decode_coordinate(
-                        coordinate,
-                        layout.bounds_dict()[coordinate][0],
-                    ),
-                    maximum=layout.decode_coordinate(
-                        coordinate,
-                        layout.bounds_dict()[coordinate][1],
-                    ),
-                    log10=layout.coordinate_log10(coordinate),
-                )
-                for coordinate in keys
-                if coordinate not in random_coordinates
-            )
-            nuisance_names = frozenset(
-                item.name
-                for item in nuisance_parameters
-            )
-            dataset_objectives = {
-                dataset_id: _fit_execution.GlobalFitObjective(
-                    fit_evaluators={dataset_id: evaluators[dataset_id]},
-                    payloads=[payloads_by_id[dataset_id]],
-                    shared_params=shared_params,
-                    dataset_params=fixed_dataset_params,
-                    weights={dataset_id: weights_norm[dataset_id]},
-                    layout=layout,
-                    penalty_value=penalty_value,
-                    ctx=ObjectiveContext(),
-                    progress_callback=None,
-                    cancellation_check=cancellation_check,
-                    cancellation_control=cancellation_control,
-                )
-                for dataset_id in payloads_by_id
-            }
-
-            def hierarchical_dataset_evaluation(
-                dataset_id: str,
-                physical_parameters: Mapping[str, float],
-                *,
-                _coordinate_names: Mapping[str, str] = coordinate_names,
-                _nuisance_names: frozenset[str] = nuisance_names,
-                _dataset_objectives: Mapping[
-                    str,
-                    _fit_execution.GlobalFitObjective,
-                ] = dataset_objectives,
-            ) -> FitEvaluationOutcome:
-                if dataset_id not in _dataset_objectives:
-                    raise KeyError(dataset_id)
-                coordinate = _coordinate_names[dataset_id]
-                expected_coordinates = _nuisance_names | {coordinate}
-                if set(physical_parameters) != expected_coordinates:
-                    raise ValueError(
-                        "Hierarchical dataset evaluation received a mismatched "
-                        "optimizer coordinate roster."
-                    )
-                candidate = base_vector.copy()
-                for name, physical_value in physical_parameters.items():
-                    candidate[layout.coordinate_index(name)] = (
-                        layout.encode_coordinate(name, physical_value)
-                    )
-                return _dataset_objectives[dataset_id].evaluate_outcome(candidate)
-
-            extensions.append(
-                hierarchical_fit_extension(
-                    dataset_ids=tuple(payloads_by_id),
-                    config=hierarchy,
-                    dataset_evaluator=hierarchical_dataset_evaluation,
-                    primary_evaluation=optimizer_evaluation,
-                    nuisance_parameters=nuisance_parameters,
-                    initial_effects={
-                        dataset_id: result.dataset_params[dataset_id][
-                            hierarchy.parameter_name
-                        ]
-                        for dataset_id in payloads_by_id
+            if extension_pipeline_stopped:
+                extension = FitTerminalExtension(
+                    kind="bootstrap",
+                    status="stopped",
+                    method="stratified residual bootstrap with full refits",
+                    provenance={
+                        "settlement": "not_started_after_stop",
+                        "primary_fit_preserved": True,
                     },
-                    cancellation_check=cancellation_check,
+                    details={"primary_fit_preserved": True},
+                    cause=factual_cause_from_exception(
+                        FittingCancelled(
+                            "Bootstrap was not started after post-fit processing stopped."
+                        ),
+                        domain="fit",
+                        origin="bootstrap",
+                    ),
                 )
-            )
-        return _fit_execution.attach_terminal_extensions(result, extensions)
-    except FittingCancelled:
+            else:
+                try:
+                    extension = residual_bootstrap_extension(
+                        terminal_result=replay_state,
+                        terminal_outcome=optimizer_evaluation,
+                        payloads=payloads,
+                        config=residual_bootstrap,
+                        refit=refit_bootstrap,
+                        cancellation_check=cancellation_check,
+                        progress_callback=extension_progress_callback,
+                    )
+                except (FittingCancelled, SimulationCancelled) as exc:
+                    extension_pipeline_stopped = True
+                    extension = FitTerminalExtension(
+                        kind="bootstrap",
+                        status="stopped",
+                        method="stratified residual bootstrap with full refits",
+                        provenance={
+                            "settlement": "stopped",
+                            "primary_fit_preserved": True,
+                        },
+                        details={"primary_fit_preserved": True},
+                        cause=factual_cause_from_exception(
+                            exc, domain="fit", origin="bootstrap"
+                        ),
+                    )
+                except Exception as exc:
+                    extension = FitTerminalExtension(
+                        kind="bootstrap",
+                        status="failed",
+                        method="stratified residual bootstrap with full refits",
+                        provenance={
+                            "settlement": "failed",
+                            "primary_fit_preserved": True,
+                        },
+                        details={"primary_fit_preserved": True},
+                        cause=factual_cause_from_exception(
+                            exc,
+                            domain="fit",
+                            origin="bootstrap",
+                        ),
+                    )
+            extensions.append(extension)
+
+        result = _fit_execution._construct_global_fit_result(
+            replay_state,
+            terminal_extensions=extensions,
+            shared_refit_provenance=shared_refit_provenance,
+        )
+        return result, optimizer_evaluation
+
+    except FittingCancelled as exc:
+        if not hasattr(exc, "scipy_nfev"):
+            optimizer = locals().get("optimizer_result")
+            if optimizer is not None:
+                setattr(exc, "scipy_nfev", int(optimizer.scipy_nfev))
+        if not hasattr(exc, "objective_call_count"):
+            active_objective = locals().get("objective")
+            calls = getattr(active_objective, "objective_calls", None)
+            if calls is not None:
+                setattr(exc, "objective_call_count", int(calls))
         raise
     except SimulationCancelled as exc:
-        raise FittingCancelled() from exc
+        cancellation = FittingCancelled()
+        optimizer = locals().get("optimizer_result")
+        if optimizer is not None:
+            setattr(cancellation, "scipy_nfev", int(optimizer.scipy_nfev))
+        active_objective = locals().get("objective")
+        calls = getattr(active_objective, "objective_calls", None)
+        if calls is not None:
+            setattr(cancellation, "objective_call_count", int(calls))
+        raise cancellation from exc
 
 
 def fit_global_shared_refit(
     *,
-    previous_result: _fit_execution.GlobalFitResult,
-    promotions: Sequence[SharedRefitPromotion],
+    execution: SharedRefitExecution,
     fit_evaluators: Mapping[str, object],
     datasets: Sequence[FitDatasetSpec],
-    existing_shared_variables: Sequence[FitSharedVariableParamSpec] = (),
-    dataset_overrides: Sequence[FitDatasetParameterOverrides] = (),
-    coupled_variables: Sequence[FitCoupledVariableParamSpec] = (),
     weights: Optional[Mapping[str, float]] = None,
     method: str,
     max_nfev: int = 1000,
@@ -564,108 +865,30 @@ def fit_global_shared_refit(
     cancellation_control: SimulationCancellationControl | None = None,
     profile_likelihood: ProfileLikelihoodConfig | None = None,
     residual_bootstrap: ResidualBootstrapConfig | None = None,
-) -> _fit_execution.GlobalFitResult:
-    """Promote Per-dataset coordinates and execute a new exact Shared refit.
+    extension_progress_callback: Optional[
+        Callable[[FitExtensionProgress], None]
+    ] = None,
+) -> tuple[_fit_execution.GlobalFitResult | None, FitEvaluationOutcome]:
+    """Execute one pre-dispatch-admitted exact Shared refit.
 
-    The labelled central tendency is used only as the new optimizer starting
-    value.  This function never returns or publishes that seed: its canonical
-    parameter values come exclusively from the completed Shared refit.
+    Promotion seeds, source provenance, final parameter routes, and optimizer
+    layout have one owner in ``execution``.  Canonical terminal values still
+    come exclusively from the completed Shared refit.
     """
 
-    if not isinstance(previous_result, _fit_execution.GlobalFitResult):
-        raise TypeError("Shared refit requires a completed previous GlobalFitResult.")
-    requested = tuple(promotions)
-    if not requested or any(
-        not isinstance(item, SharedRefitPromotion) for item in requested
-    ):
-        raise ValueError("Shared refit requires typed promotion requests.")
-    names = tuple(item.parameter_name for item in requested)
-    if len(names) != len(set(names)):
-        raise ValueError("Shared refit repeats a promoted parameter.")
-    existing = tuple(existing_shared_variables)
-    overlap = set(names).intersection(item.name for item in existing)
-    if overlap:
+    if not isinstance(execution, SharedRefitExecution):
+        raise TypeError("Shared refit requires its admitted execution.")
+    dataset_ids = tuple(item.dataset_id for item in datasets)
+    if dataset_ids != execution.dataset_ids:
         raise ValueError(
-            "Shared refit promotions duplicate existing Shared coordinates: "
-            + ", ".join(sorted(overlap))
+            "Shared-refit fitted datasets must exactly match its admitted roster."
         )
-
-    payload_ids = tuple(item.dataset_id for item in datasets)
-    if set(payload_ids) != set(previous_result.dataset_params):
-        raise ValueError(
-            "Shared refit requires the same executed included dataset roster as "
-            "the Per-dataset terminal candidate."
-        )
-    configured_dataset_names = {
-        name
-        for override in dataset_overrides
-        for name in (
-            *(item.name for item in override.variable_params),
-            *(item[0] for item in override.fixed_params),
-        )
-    }
-    coupled_names = {item.parameter_name for item in coupled_variables}
-    stale_routes = set(names).intersection(configured_dataset_names | coupled_names)
-    if stale_routes:
-        raise ValueError(
-            "Promoted Shared parameters still have a Per-dataset/coupled route: "
-            + ", ".join(sorted(stale_routes))
-        )
-
-    promoted_variables: list[FitSharedVariableParamSpec] = []
-    seed_provenance: dict[str, object] = {}
-    for promotion in requested:
-        try:
-            values = np.asarray(
-                [
-                    float(previous_result.dataset_params[dataset_id][promotion.parameter_name])
-                    for dataset_id in payload_ids
-                ],
-                dtype=float,
-            )
-        except KeyError as exc:
-            raise ValueError(
-                f"Previous Fit omitted Per-dataset estimate {promotion.parameter_name!r}."
-            ) from exc
-        if not np.all(np.isfinite(values)):
-            raise ValueError("Shared-refit seeds require finite Per-dataset estimates.")
-        if promotion.seed_statistic == "geometric_mean":
-            if np.any(values <= 0.0):
-                raise ValueError(
-                    f"Geometric Shared-refit seed for {promotion.parameter_name!r} "
-                    "requires positive estimates."
-                )
-            seed_value = float(np.exp(np.mean(np.log(values))))
-        else:
-            seed_value = float(np.mean(values))
-        if not promotion.minimum <= seed_value <= promotion.maximum:
-            raise ValueError(
-                f"{promotion.parameter_name!r} central-tendency seed lies outside "
-                "the new Shared bounds."
-            )
-        promoted_variables.append(
-            FitSharedVariableParamSpec(
-                name=promotion.parameter_name,
-                initial=seed_value,
-                minimum=promotion.minimum,
-                maximum=promotion.maximum,
-                log10=promotion.log10,
-            )
-        )
-        seed_provenance[promotion.parameter_name] = {
-            "seed_statistic": promotion.seed_statistic,
-            "seed_value": seed_value,
-            "source_values": tuple(float(value) for value in values),
-            "source_scope": "per_dataset",
-            "terminal_authority": "completed Shared refit only",
-        }
-
     result = fit_global(
         fit_evaluators=fit_evaluators,
         datasets=datasets,
-        shared_variables=existing + tuple(promoted_variables),
-        dataset_overrides=dataset_overrides,
-        coupled_variables=coupled_variables,
+        shared_variables=execution.shared_variables,
+        dataset_overrides=execution.dataset_overrides,
+        coupled_variables=execution.coupled_variables,
         weights=weights,
         method=method,
         max_nfev=max_nfev,
@@ -677,13 +900,11 @@ def fit_global_shared_refit(
         cancellation_control=cancellation_control,
         profile_likelihood=profile_likelihood,
         residual_bootstrap=residual_bootstrap,
-    )
-    result.shared_refit_provenance = MappingProxyType(
-        {
-            "execution": "Promote to Shared and Refit",
-            "previous_candidate_invalidated": True,
-            "promotions": seed_provenance,
-            "publication_authority": "result.shared_params from this completed refit",
-        }
+        extension_progress_callback=extension_progress_callback,
+        shared_refit_provenance=_shared_refit_provenance(
+            execution,
+            terminal_route="optimizer_terminal",
+        ),
+        optimizer_layout=execution.optimizer_layout,
     )
     return result

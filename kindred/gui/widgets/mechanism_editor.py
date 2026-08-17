@@ -80,9 +80,10 @@ class _DetailedBalanceCorrectionDialog(QtWidgets.QDialog):
             )
         layout.addLayout(form)
         explanation = QtWidgets.QLabel(
-            "Kindred will add one symbolic dependency for each cycle. The "
-            "detached Reactions edit is accepted and reverified by the owning "
-            "Run or Fit workflow before execution continues.",
+            "Kindred will update one supported canonical source coordinate "
+            "for each cycle. The detached Reactions edit is accepted and "
+            "reverified by the owning Run or Fit workflow before execution "
+            "continues.",
             self,
         )
         explanation.setWordWrap(True)
@@ -489,12 +490,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "reaction: A -&gt; B ; dG_act=55 ; degeneracy=2\n"
             "Use k= or kf= for a positive constant rate; A= with Ea= selects Arrhenius; dG_act= selects Eyring. κ= is an optional positive local transmission coefficient on that Eyring step and defaults to 1.\n"
             "degeneracy= is the positive integer count of equivalent Eyring pathways and defaults to 1. It multiplies the effective forward Eyring rate, but it is distinct from κ, the transmission coefficient; it does not change the authored barrier. Do not encode the same pathway count in both a lowered barrier and degeneracy, or multiply the resulting rate again: that double counts.\n"
-            "For reversible steps, kr= is the explicit reverse rate when that is the selected authority; Keq= or dG_eq= can instead derive the reverse rate.\n"
+            "For reversible steps, kr= is the explicit concentration-form reverse rate when that is the selected authority; Keq= or dG_eq= can instead derive the reverse rate.\n"
             "\n"
             "<b>Equilibrium Lines</b>\n"
             "Meaning: an equilibrium line declares a reversible pair whose forward rate and thermodynamic relation determine the reverse rate.\n"
             "equilibrium: A &lt;=&gt; B ; kf=10.0 ; Keq=2.0\n"
-            "Use a reversible arrow and kf= plus exactly one of kr=, Keq=, or dG_eq=. Keq= must be positive; dG_eq= uses the selected global energy unit and nominal temperature. Supplying incompatible rate authorities, such as kr= with Keq=, is rejected.\n"
+            "Use a reversible arrow and kf= plus exactly one of kr=, Keq=, or dG_eq=. Keq= is concentration-form with units M^(nr-nf); dG_eq= uses Keq=exp(-dG_eq/(R*T))*C0^(nr-nf) in the selected global energy unit and nominal temperature. A thermodynamic kf=0 disables both directions; explicit kf+kr remains strictly positive. Supplying incompatible rate authorities, such as kr= with Keq=, is rejected.\n"
             "\n"
             "<b>Temperature Schedules</b>\n"
             "Meaning: a schedule makes the external temperature T(t) change during the run instead of staying at the nominal tab value.\n"
@@ -1223,6 +1224,11 @@ class MechanismEditorBinding(QtCore.QObject):
     @property
     def tab_id(self) -> str:
         return self._tab_id
+
+    def bind_registry(self, registry) -> None:
+        """Rebind this retained editor to the published registry."""
+
+        self._registry = registry
 
     def _detailed_balance_context(self) -> tuple[str, str, float, bool]:
         tab = self._registry.tab(self._tab_id)

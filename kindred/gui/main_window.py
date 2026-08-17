@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import stat
 import tempfile
 import time
 import webbrowser
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -35,6 +36,7 @@ from kindred.core.dataset_mapping import (
 )
 from kindred.core.datasets.observation_mapping import suggest_observation_mapping
 from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS
 from kindred.core.project_document import (
     FIT_MAX_NFEV_RANGE,
     FIT_SEED_RANGE,
@@ -45,22 +47,25 @@ from kindred.core.project_document import (
     ProjectDocument,
     SimulationExecutionSettings,
     canonical_species_names,
+    canonical_observation_target_names,
     canonical_initial_values,
-    SUPPORTED_FIT_METHODS,
-    fit_method_label,
     new_set_id,
     reconcile_tab_mechanism_source,
     retained_tab_mechanism_source,
     validate_fit_defaults,
 )
-from kindred.core.project_session import ProjectContentToken, ProjectSession
+from kindred.core.project_session import (
+    PreparedProjectInstall,
+    ProjectContentToken,
+    ProjectSession,
+)
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
     ExperimentalAxisSelection,
     SimulationSeriesAxisSelection,
 )
 from kindred.core.result_repository import (
-    ExplicitResultCurrentFacts,
+    ExplicitResultKey,
     ResultRepository,
 )
 from kindred.core.simulator.dsl_parse import (
@@ -101,11 +106,15 @@ from kindred.gui.dataset_payload_snapshot import (
     build_data_manager_snapshot,
     build_experimental_layer_inputs,
 )
-from kindred.gui.fit_session_owner import FitSessionOwner
+from kindred.gui.fit_session_owner import (
+    FitReplacementDispositionSummary,
+    FitSessionOwner,
+)
 from kindred.gui.fitting.constants import (
-    DE_POPULATION_TOLERANCE_LABEL,
+    DE_CONVERGENCE_TOLERANCE_LABEL,
     DIFFERENTIAL_EVOLUTION_METHOD,
     FUNCTION_TOLERANCE_LABEL,
+    fit_method_label,
 )
 from kindred.gui.main_window_variable_runtime import (
     ActiveSliderRenderProjection,
@@ -135,6 +144,9 @@ from kindred.gui.widgets.dataset_overlay_panel import (
     OverlaySelectionIntent,
 )
 from kindred.gui.widgets.editor_panel import EditorPanel
+from kindred.gui.widgets.interactive_plot_transition import (
+    InteractiveDisplayController,
+)
 from kindred.gui.widgets.mechanism_editor import (
     MechanismEditorBinding,
     MechanismEditorTabbed,
@@ -159,6 +171,7 @@ from kindred.gui.workflow_contracts import (
 )
 from kindred.gui.workspace_tab_registry import (
     CanonicalMutationResult,
+    PreparedWorkspaceInstall,
     ScientificDocumentDelta,
     WorkspaceTabRegistry,
 )
@@ -209,6 +222,88 @@ class _TabSurfaceBundle:
     slider_binding: TabSliderBinding
 
 
+class _PreparedPhysicalTabContext:
+    """Read-only prepared values used only during detached construction."""
+
+    def __init__(
+        self,
+        *,
+        prepared_session: PreparedProjectInstall,
+        prepared_workspace: PreparedWorkspaceInstall,
+        identity_generation: int,
+    ) -> None:
+        self._document = prepared_session.document
+        self._path = prepared_session.path
+        self._presentation = dict(prepared_workspace.presentation_by_tab_id)
+        self._runtime = dict(prepared_workspace.runtime_by_tab_id)
+        self._identity_generation = int(identity_generation)
+
+    def tab(self, tab_id: str) -> MechanismTabDocument:
+        return self._document.tab(str(tab_id))
+
+    def tab_runtime(self, tab_id: str):
+        target = str(tab_id)
+        self._document.tab(target)
+        try:
+            return self._runtime[target]
+        except KeyError as exc:
+            raise KeyError(f"Unknown prepared tab ID: {target!r}.") from exc
+
+    def presentation(self, tab_id: str):
+        target = str(tab_id)
+        self._document.tab(target)
+        try:
+            return self._presentation[target]
+        except KeyError as exc:
+            raise KeyError(f"Unknown prepared tab ID: {target!r}.") from exc
+
+    def document_identity(self, tab_id: str) -> tuple[int, str]:
+        target = str(tab_id)
+        self._document.tab(target)
+        return self._identity_generation, target
+
+    @property
+    def document(self) -> ProjectDocument:
+        return self._document
+
+    @property
+    def path(self) -> str | None:
+        """Return the incoming project path without consulting live session state."""
+
+        return self._path
+
+    def imported_source(self, source_id: str):
+        return self._document.imported_source(source_id)
+
+
+@dataclass(slots=True)
+class _PreparedProjectPhysicalInstall:
+    """Prepared Qt custody attached alongside the still-current project."""
+
+    tab_surfaces: dict[str, _TabSurfaceBundle]
+    plots_by_tab_id: dict[str, PyQtGraphPlotPanel]
+    active_tab_id: str
+    preparation_holder: QtWidgets.QWidget
+    prepared_context: _PreparedPhysicalTabContext
+    old_tab_surfaces: dict[str, _TabSurfaceBundle]
+    old_plots_by_tab_id: dict[str, PyQtGraphPlotPanel]
+    old_initial_plot: PyQtGraphPlotPanel | None
+    old_plot_current: QtWidgets.QWidget | None = None
+    old_analysis_current: QtWidgets.QWidget | None = None
+    old_surface_current: tuple[QtWidgets.QWidget | None, ...] = ()
+    old_workspace_active_tab_id: str | None = None
+    old_repositories: dict[str, ResultRepository] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _ProjectPhysicalRetirement:
+    """Old Qt custody held until the controller purges old result identities."""
+
+    tab_surfaces: dict[str, _TabSurfaceBundle]
+    plots_by_tab_id: dict[str, PyQtGraphPlotPanel]
+    initial_plot: PyQtGraphPlotPanel | None
+
+
 @dataclass(frozen=True, slots=True)
 class _XlsxExportSuccess:
     generation: int
@@ -247,7 +342,35 @@ class _XlsxExportWorker(QtCore.QThread):
         self._projection = projection
         self._path = os.path.abspath(os.fspath(path))
         self._commit_started = False
-        self._terminal_outcome: str | None = None
+        self._terminal_outcome: (
+            _XlsxExportSuccess | _XlsxExportFailure | None
+        ) = None
+        self._terminal_consumed = False
+
+    @property
+    def terminal_outcome(self) -> _XlsxExportSuccess | _XlsxExportFailure | None:
+        """Return the exact terminal object retained before signal delivery."""
+
+        return self._terminal_outcome
+
+    @property
+    def terminal_consumed(self) -> bool:
+        """Return whether the retained terminal has crossed a lifecycle fence."""
+
+        return self._terminal_consumed
+
+    def consume_terminal_outcome(
+        self,
+    ) -> _XlsxExportSuccess | _XlsxExportFailure | None:
+        """Consume this worker's one exact terminal object at a fence."""
+
+        if self._terminal_consumed:
+            return None
+        outcome = self._terminal_outcome
+        if outcome is None:
+            return None
+        self._terminal_consumed = True
+        return outcome
 
     def cancel(self) -> bool:
         """Request cancellation without waiting on destination finalization."""
@@ -302,50 +425,46 @@ class _XlsxExportWorker(QtCore.QThread):
             if existing_mode is not None:
                 os.chmod(temporary_path, existing_mode)
             self._check_cancelled()
-            # Enter the sole commit boundary before the final interruption
-            # check. Cancellation thereafter neither waits for nor interrupts
-            # a potentially blocking atomic replace; that commit may finish.
+            # Enter the sole commit boundary. Cancellation thereafter neither
+            # waits for nor interrupts a potentially blocking atomic replace;
+            # that commit may finish.
             self._commit_started = True
-            self._check_cancelled()
             os.replace(temporary_path, self._path)
             temporary_path = ""
-            self._terminal_outcome = "committed"
         except _XlsxExportCancelled:
-            self._terminal_outcome = "cancelled"
-            self.failed.emit(
-                _XlsxExportFailure(
-                    generation=self._generation,
-                    path=self._path,
-                    message="XLSX export was cancelled.",
-                    cancelled=True,
-                )
+            outcome = _XlsxExportFailure(
+                generation=self._generation,
+                path=self._path,
+                message="XLSX export was cancelled.",
+                cancelled=True,
             )
+            self._terminal_outcome = outcome
+            self.failed.emit(outcome)
         except Exception as exc:
             cancelled = bool(
                 not self._commit_started
                 and self.isInterruptionRequested()
             )
-            self._terminal_outcome = "cancelled" if cancelled else "failed"
-            self.failed.emit(
-                _XlsxExportFailure(
-                    generation=self._generation,
-                    path=self._path,
-                    message=(
-                        "XLSX export was cancelled."
-                        if cancelled
-                        else f"{type(exc).__name__}: {exc}"
-                    ),
-                    cancelled=cancelled,
-                )
+            outcome = _XlsxExportFailure(
+                generation=self._generation,
+                path=self._path,
+                message=(
+                    "XLSX export was cancelled."
+                    if cancelled
+                    else f"{type(exc).__name__}: {exc}"
+                ),
+                cancelled=cancelled,
             )
+            self._terminal_outcome = outcome
+            self.failed.emit(outcome)
         else:
-            self.succeeded.emit(
-                _XlsxExportSuccess(
-                    generation=self._generation,
-                    path=self._path,
-                    completion=completion,
-                )
+            outcome = _XlsxExportSuccess(
+                generation=self._generation,
+                path=self._path,
+                completion=completion,
             )
+            self._terminal_outcome = outcome
+            self.succeeded.emit(outcome)
         finally:
             if descriptor >= 0:
                 try:
@@ -482,20 +601,50 @@ class _XlsxExportOwner(QtCore.QObject):
         return True
 
     @QtCore.Slot(object)
-    def _publish_success(self, outcome: object) -> None:
-        if (
+    def _publish_success(
+        self,
+        outcome: object,
+        *,
+        allow_consumed: bool = False,
+    ) -> bool:
+        if not (
             isinstance(outcome, _XlsxExportSuccess)
             and outcome.generation == self._generation
         ):
-            self.succeeded.emit(outcome)
+            return False
+        worker = self._active_worker
+        if (
+            not allow_consumed
+            and worker is not None
+            and worker.terminal_outcome is outcome
+            and worker.terminal_consumed
+        ):
+            return False
+        self.succeeded.emit(outcome)
+        return True
 
     @QtCore.Slot(object)
-    def _publish_failure(self, outcome: object) -> None:
-        if (
+    def _publish_failure(
+        self,
+        outcome: object,
+        *,
+        allow_consumed: bool = False,
+    ) -> bool:
+        if not (
             isinstance(outcome, _XlsxExportFailure)
             and outcome.generation == self._generation
         ):
-            self.failed.emit(outcome)
+            return False
+        worker = self._active_worker
+        if (
+            not allow_consumed
+            and worker is not None
+            and worker.terminal_outcome is outcome
+            and worker.terminal_consumed
+        ):
+            return False
+        self.failed.emit(outcome)
+        return True
 
     @QtCore.Slot()
     def _worker_finished(self) -> None:
@@ -508,32 +657,57 @@ class _XlsxExportOwner(QtCore.QObject):
 
     def _cancel_active(self) -> _XlsxExportWorker | None:
         worker = self._active_worker
-        if worker is not None and worker.cancel():
-            self._generation += 1
+        if worker is not None:
+            worker.cancel()
         return worker
 
-    def cancel_and_wait_for_project_replacement(
-        self,
-        deadline: float,
-    ) -> bool:
-        generation_before_cancel = self._generation
-        worker = self._cancel_active()
+    def request_project_replacement_cancellation(self) -> None:
+        """Request cancellation without waiting on the XLSX worker."""
+
+        self._cancel_active()
+
+    def settle_project_replacement(self, deadline: float) -> bool:
+        """Settle a replacement-cancelled XLSX worker by one shared deadline."""
+
+        deadline_value = float(deadline)
+        if not math.isfinite(deadline_value):
+            raise ValueError("project replacement deadline must be finite.")
+        worker = self._active_worker
         if worker is None:
             return True
         if worker.isRunning():
             remaining_ms = max(
                 0,
-                int((float(deadline) - time.monotonic()) * 1000.0),
+                int((deadline_value - time.monotonic()) * 1000.0),
             )
             if not worker.wait(remaining_ms):
                 return False
-        if worker is self._active_worker:
+        if worker is not self._active_worker:
+            return True
+        outcome = worker.consume_terminal_outcome()
+        if outcome is None:
+            logger.error(
+                "XLSX worker stopped without a valid terminal outcome during "
+                "project replacement"
+            )
+            self._generation += 1
+            self._active_worker = None
+            worker.deleteLater()
+            self._publish_application_close_settlement()
+            return False
+        try:
+            if isinstance(outcome, _XlsxExportSuccess):
+                self._publish_success(outcome, allow_consumed=True)
+            elif not outcome.cancelled:
+                self._publish_failure(outcome, allow_consumed=True)
+            # Expected pre-commit cancellation is intentionally settled
+            # internally and produces no replacement-time user notification.
+        finally:
             # The native worker may already have committed and emitted queued
-            # success/finished callbacks that cannot settle while project
-            # replacement synchronously waits on the GUI thread. Retire that
-            # exact authority before the replacement turn can continue.
-            if self._generation == generation_before_cancel:
-                self._generation += 1
+            # callbacks that cannot settle while replacement synchronously
+            # waits on the GUI thread. Retire this exact authority only after
+            # its retained terminal has taken the normal publication route.
+            self._generation += 1
             self._active_worker = None
             worker.deleteLater()
             self._publish_application_close_settlement()
@@ -559,12 +733,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rendering_workspace = False
         self._recent_menu: QtWidgets.QMenu | None = None
         self._tab_surfaces: dict[str, _TabSurfaceBundle] = {}
+        # During the physical replacement window, old result repositories are
+        # deliberately kept as the cleanup target even when tab IDs are reused
+        # by the incoming project.  The override is populated before semantic
+        # publication and cleared only after old-resource retirement.
+        self._replacement_repository_override: dict[str, ResultRepository] | None = None
+        self._project_replacement_cleanup_active = False
+        # A replacement commits physical references before the semantic
+        # signal updates the tab strip and shell projection.  This flag is
+        # cleared by that one signal or by precommit discard.
+        self._replacement_structure_pending = False
         self._dark_mode_action: QtGui.QAction | None = None
         self._run_action: QtGui.QAction | None = None
         self._xlsx_export_action: QtGui.QAction | None = None
         self._last_export_directory: str | None = None
         self._slider_apply_refreshing: set[str] = set()
-        self._fit_shared_refit_signal_window: QtCore.QObject | None = None
         self._prepared_save_materialized: tuple[
             ProjectDocument,
             tuple[tuple[str, tuple[str, ...]], ...],
@@ -575,10 +758,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(self._startup_size())
         self.setDockNestingEnabled(True)
 
-        self._workspace = MechanismWorkspaceView(
-            self,
-            main_plot_embed_analysis_tabs=False,
-        )
+        self._workspace = MechanismWorkspaceView(self)
         self._workspace.setObjectName("mechanismWorkspace")
         self.setCentralWidget(self._workspace)
 
@@ -599,8 +779,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._simulation_jobs = SimulationJobOwner(
             gate=self._computation_gate,
             repository_for_tab=self._repository_for_tab,
-            current_explicit_result_facts=(
-                self._capture_current_explicit_result_facts
+            current_explicit_result_key=(
+                self._resolve_current_explicit_result_key
             ),
             propose_detailed_balance_source=self._propose_detailed_balance_source,
             commit_detailed_balance_source=self._commit_detailed_balance_source,
@@ -653,6 +833,7 @@ class MainWindow(QtWidgets.QMainWindow):
             dataset_imports=self._dataset_import_staging,
             fit_session=self._fit_session_owner,
             xlsx_exports=self._xlsx_export_owner,
+            physical_install=self,
             set_status_text=self.set_status_text,
             settle_execution_candidate=(
                 lambda token: self._settle_execution_candidate(
@@ -705,7 +886,6 @@ class MainWindow(QtWidgets.QMainWindow):
             schedule_restored_floating_dock_recovery=(
                 self.schedule_restored_floating_dock_recovery
             ),
-            splitter=self._workspace.main_plot_workspace_splitter,
             dark_mode_action=lambda: self._dark_mode_action,
             apply_theme=self._theme_manager.apply,
             actual_dark_mode=lambda: self._theme_manager.applied_dark_mode,
@@ -780,31 +960,65 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._symbolic_calculator_dock = symbolic
 
-    def _create_tab_surface(self, tab_id: str) -> _TabSurfaceBundle:
-        """Construct and retain one tab's complete non-plot physical surface."""
+    def _create_tab_surface(
+        self,
+        tab_id: str,
+        *,
+        registry=None,
+        surface_parent: QtWidgets.QWidget | None = None,
+        install: bool = True,
+        publish_initial_state: bool = True,
+        plot_resolver: Callable[[str], PyQtGraphPlotPanel] | None = None,
+    ) -> _TabSurfaceBundle:
+        """Construct one complete tab surface, optionally in detached custody."""
 
-        target = self._workspace_tab_registry.tab(tab_id).tab_id
-        if target in self._tab_surfaces:
+        surface_registry = self._workspace_tab_registry if registry is None else registry
+        target = surface_registry.tab(tab_id).tab_id
+        if install and target in self._tab_surfaces:
             raise ValueError(f"Tab surface already exists: {target!r}.")
+        if surface_parent is None:
+            editor_parent = self._mechanism_stack
+            simulation_parent = self._initial_conditions_stack
+            data_parent = self
+            overlay_parent = self
+            right_parent = self._data_stack
+            calculator_parent = self._calculator_stack
+        else:
+            editor_parent = surface_parent
+            simulation_parent = surface_parent
+            data_parent = surface_parent
+            overlay_parent = surface_parent
+            right_parent = surface_parent
+            calculator_parent = surface_parent
 
-        editor_panel = EditorPanel(parent=self._mechanism_stack)
+        editor_panel = EditorPanel(parent=editor_parent)
         editor = editor_panel.editor
         slider_panel = editor.detach_slider_pane_for_dock()
-        batch_model = BatchInitialConditionsTableModel(parent=self)
+        if surface_parent is not None:
+            slider_panel.setParent(surface_parent)
+        # During replacement preparation every acquired QObject must already
+        # belong to the disposable detached custody.  The normal live path
+        # retains the historical MainWindow parent until SimulationPanel takes
+        # ownership below; prepared construction uses its holder immediately,
+        # so a failing SimulationPanel constructor cannot orphan the model.
+        model_parent = self if surface_parent is None else surface_parent
+        batch_model = BatchInitialConditionsTableModel(parent=model_parent)
         simulation_panel = SimulationPanel(
             batch_model=batch_model,
-            parent=self._initial_conditions_stack,
+            parent=simulation_parent,
         )
         batch_model.setParent(simulation_panel)
         batch_table = simulation_panel.batch_table
         data_panel = DataManagerPanel(
             self._dataset_import_staging,
             origin_tab_id=target,
-            source_resolver=lambda source_id: self._project_session.document.imported_source(source_id),
-            parent=self,
+            source_resolver=lambda source_id, captured_registry=surface_registry: (
+                captured_registry.document.imported_source(source_id)
+            ),
+            parent=data_parent,
         )
         overlay_panel = DatasetOverlayPanel(
-            self,
+            overlay_parent,
             color_for_species=self.config_controller.species_color,
             experimental_point_size=self.config_controller.experimental_point_size,
             experimental_point_opacity=(
@@ -812,16 +1026,16 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
         )
         right_panel = RightPanelTabbed(
-            self._data_stack,
+            right_parent,
             data_panel=data_panel,
             overlay_panel=overlay_panel,
         )
         calculator_owner = SymbolicCalculatorOwner(
             canonical_prepared_dsl=lambda captured=target: (
-                self._workspace_tab_registry.tab(captured).prepared_dsl
+                surface_registry.tab(captured).prepared_dsl
             ),
             canonical_source=lambda captured=target: (
-                self._workspace_tab_registry.tab(captured).mechanism_source
+                surface_registry.tab(captured).mechanism_source
             ),
         )
         calculator_panel = SymbolicCalculatorPanel(
@@ -831,17 +1045,17 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
             on_copy_result=calculator_owner.copy_compact_text,
             on_copy_context=calculator_owner.copy_context_text,
-            parent=self._calculator_stack,
+            parent=calculator_parent,
         )
         editor_binding = MechanismEditorBinding(
             tab_id=target,
             editor=editor,
-            registry=self._workspace_tab_registry,
+            registry=surface_registry,
             parent=editor_panel,
         )
         initial_actions = InitialConditionsTableActions(
             tab_id=target,
-            registry=self._workspace_tab_registry,
+            registry=surface_registry,
             model=batch_model,
             table=batch_table,
             simulation_jobs=self._simulation_jobs,
@@ -849,12 +1063,32 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         slider_binding = TabSliderBinding(
             tab_id=target,
-            registry=self._workspace_tab_registry,
+            registry=surface_registry,
             table=batch_table,
             variable_sliders=editor.variable_sliders_widget(),
             species_sliders=editor.species_sliders_widget(),
             slider_workspace_owner=editor,
             simulation_jobs=self._simulation_jobs,
+            allocate_interactive_preview_batch=(
+                lambda tab_id, document_identity, target_set_ids, captured=target: (
+                    (
+                        self._workspace.plot_for_tab(captured)
+                        if plot_resolver is None
+                        else plot_resolver(captured)
+                    ).allocate_interactive_preview_batch(
+                        tab_id=tab_id,
+                        document_identity=document_identity,
+                        target_set_ids=target_set_ids,
+                    )
+                )
+            ),
+            interactive_exact_release_batch=(
+                lambda captured=target: (
+                    self._workspace.plot_for_tab(captured)
+                    if plot_resolver is None
+                    else plot_resolver(captured)
+                ).interactive_exact_release_batch()
+            ),
             preview_preflight=(
                 lambda targets, captured=target: self._preview_preflight(
                     captured,
@@ -886,16 +1120,25 @@ class MainWindow(QtWidgets.QMainWindow):
             initial_actions=initial_actions,
             slider_binding=slider_binding,
         )
-        self._tab_surfaces[target] = bundle
-        self._mechanism_stack.addWidget(editor_panel)
-        self._slider_stack.addWidget(slider_panel)
-        self._initial_conditions_stack.addWidget(simulation_panel)
-        self._data_stack.addWidget(right_panel)
-        self._calculator_stack.addWidget(calculator_panel)
-        self._connect_tab_surface(bundle)
+        if install:
+            self._tab_surfaces[target] = bundle
+            self._mechanism_stack.addWidget(editor_panel)
+            self._slider_stack.addWidget(slider_panel)
+            self._initial_conditions_stack.addWidget(simulation_panel)
+            self._data_stack.addWidget(right_panel)
+            self._calculator_stack.addWidget(calculator_panel)
+        self._connect_tab_surface(
+            bundle,
+            publish_initial_state=publish_initial_state,
+        )
         return bundle
 
-    def _connect_tab_surface(self, bundle: _TabSurfaceBundle) -> None:
+    def _connect_tab_surface(
+        self,
+        bundle: _TabSurfaceBundle,
+        *,
+        publish_initial_state: bool = True,
+    ) -> None:
         """Connect one page only to callbacks closed over its immutable tab ID."""
 
         tab_id = bundle.tab_id
@@ -1050,7 +1293,8 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle.overlay_panel.experimentalPointOpacityRequested.connect(
             self._set_experimental_point_opacity
         )
-        sliders.publish_slider_draft_state()
+        if publish_initial_state:
+            sliders.publish_slider_draft_state()
 
     def _drop_tab_surface(self, tab_id: str) -> None:
         target = str(tab_id)
@@ -1094,9 +1338,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._tab_surfaces[self._workspace_tab_registry.active_tab_id]
 
     def _connect_application_graph(self) -> None:
-        self.project_controller.documentReplaced.connect(self._on_document_replaced)
         self.project_controller.projectStateChanged.connect(
-            self._refresh_project_state
+            self._on_project_state_changed
         )
         self.project_controller.closePendingChanged.connect(
             self._on_close_pending_changed
@@ -1277,6 +1520,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         tab_id: str,
         plot: PyQtGraphPlotPanel,
+        *,
+        surface_ids: Iterable[str] | None = None,
     ) -> None:
         """Bind one retained plot only to intents from its owning tab."""
 
@@ -1289,13 +1534,19 @@ class MainWindow(QtWidgets.QMainWindow):
             "plotPresentationIntentRequested",
             "resultDiagnostic",
             "renderFailed",
+            "interactiveFrameDisposition",
         )
         if any(
             not callable(getattr(getattr(plot, name, None), "connect", None))
             for name in required_signals
         ):
             raise TypeError("Workspace plot must expose the plot intent signals.")
-        if target not in self._tab_surfaces:
+        valid_surface_ids = (
+            set(self._tab_surfaces)
+            if surface_ids is None
+            else {str(item) for item in surface_ids}
+        )
+        if target not in valid_surface_ids:
             raise RuntimeError(
                 f"Workspace plot {target!r} has no matching tab runtime bundle."
             )
@@ -1325,6 +1576,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 message,
             )
         )
+        plot.interactiveFrameDisposition.connect(
+            self._simulation_jobs.consume_interactive_frame_disposition
+        )
+
     def _refresh_workspace_document(self) -> None:
         """Refresh canonical/global projections without changing selected page state."""
 
@@ -1481,7 +1736,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda: bundle.overlay_panel.render_snapshot(
                     records=data_snapshot.datasets,
                     active_links=data_snapshot.active_links,
-                    known_species=tuple(canonical_species_names(tab)),
+                    known_species=tuple(canonical_observation_target_names(tab)),
                 ),
                 bundle.overlay_panel.clear_projection,
             )
@@ -1527,14 +1782,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             bundle.overlay_panel.refresh_application_style_controls()
             bundle.overlay_panel.refresh_color_swatches(
-                known_species=tuple(canonical_species_names(tab)),
+                known_species=tuple(canonical_observation_target_names(tab)),
             )
             try:
                 self._workspace.plot_for_tab(
                     tab.tab_id
                 ).apply_application_plot_preferences(
                     color_for_species=self.config_controller.species_color,
-                    known_species=tuple(canonical_species_names(tab)),
+                    known_species=tuple(canonical_observation_target_names(tab)),
                     experimental_point_size=point_size,
                     experimental_point_opacity=point_opacity,
                 )
@@ -1614,7 +1869,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     bundle.overlay_panel.render_snapshot(
                         records=snapshot.datasets,
                         active_links=snapshot.active_links,
-                        known_species=tuple(canonical_species_names(tab)),
+                        known_species=tuple(canonical_observation_target_names(tab)),
                     )
                 except Exception as exc:
                     logger.exception("Tab %s Overlay refresh failed", tab_id)
@@ -1654,9 +1909,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _compose_result_projection(
         self,
         tab_id: str,
+        *,
+        document: ProjectDocument | None = None,
+        presentation: object | None = None,
+        repository: ResultRepository | None = None,
     ) -> WorkspaceResultProjection:
-        tab = self._project_session.document.tab(tab_id)
-        presentation = self._workspace_tab_registry.presentation(tab_id)
+        current_document = (
+            self._project_session.document if document is None else document
+        )
+        tab = current_document.tab(tab_id)
+        if presentation is None:
+            presentation = self._workspace_tab_registry.presentation(tab_id)
+        if repository is None:
+            repository = self._repository_for_tab(tab_id)
         visible_sets = tuple(
             VisibleResultSet(
                 set_id=set_id,
@@ -1665,13 +1930,12 @@ class MainWindow(QtWidgets.QMainWindow):
             for set_id in presentation.plot_set_ids
         )
         experimental_layers = build_experimental_layer_inputs(
-            document=self._project_session.document,
+            document=current_document,
             active_tab=tab,
             presentation=presentation,
         )
-        repository = self._repository_for_tab(tab_id)
         analysis = tab.dsl_analysis
-        modeled_species = tuple(canonical_species_names(tab))
+        modeled_species = tuple(canonical_observation_target_names(tab))
         simulation_series_names = list(
             ()
             if analysis is None
@@ -1697,7 +1961,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for species in simulation_series
         }
         for layer in experimental_layers:
-            color_name = layer.model_species or layer.raw_column
+            color_name = layer.model_target or layer.raw_column
             color_by_axis_selection[
                 ExperimentalAxisSelection(
                     layer.dataset_id,
@@ -1716,6 +1980,7 @@ class MainWindow(QtWidgets.QMainWindow):
             intervention_annotations_visible=(
                 presentation.intervention_annotations_visible
             ),
+            mechanism_species=canonical_species_names(tab),
             active_overlay_layers=experimental_layers,
             color_by_axis_selection=color_by_axis_selection,
             experimental_point_size=(
@@ -1784,6 +2049,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_results_changed(self, tab_id: str) -> None:
         """Ignore late results from a replaced/closed semantic tab."""
 
+        if self._project_replacement_cleanup_active:
+            return
         target = str(tab_id)
         if target in self._slider_apply_refreshing:
             return
@@ -1798,14 +2065,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(frame, InteractivePreviewFrame):
             raise TypeError("Interactive Preview must publish a typed frame.")
         target = frame.tab_id
+        plot = None
         if (
-            target not in self._tab_surfaces
-            or target != self._workspace_tab_registry.active_tab_id
+            target in self._tab_surfaces
+            and target == self._workspace_tab_registry.active_tab_id
         ):
-            return
-        try:
-            plot = self._workspace.active_plot()
-        except RuntimeError:
+            try:
+                plot = self._workspace.plot_for_tab(target)
+            except (KeyError, RuntimeError):
+                pass
+        if plot is None:
+            disposition = InteractiveDisplayController.reject_unrenderable(
+                frame,
+                message="Interactive frame has no active plot surface.",
+            )
+            self._simulation_jobs.consume_interactive_frame_disposition(
+                disposition
+            )
             return
         plot.apply_interactive_preview_frame(frame)
 
@@ -1828,22 +2104,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         plot.apply_interactive_preview_terminal_outcome(outcome)
 
-    @QtCore.Slot(str, int)
-    def _on_interactive_preview_retired(
-        self,
-        tab_id: str,
-        generation: int,
-    ) -> None:
+    @QtCore.Slot(object)
+    def _on_interactive_preview_retired(self, retirement: object) -> None:
         """Retire physical cadence without reviving a removed tab surface."""
 
-        target = str(tab_id)
+        from kindred.gui.interactive_preview import InteractivePreviewRetirement
+
+        if not isinstance(retirement, InteractivePreviewRetirement):
+            raise TypeError(
+                "Interactive Preview retirement intent must be typed."
+            )
+        target = retirement.tab_id
         if target not in self._tab_surfaces:
             return
         try:
             plot = self._workspace.plot_for_tab(target)
-        except KeyError:
+        except (KeyError, RuntimeError):
             return
-        plot.retire_interactive_preview(target, int(generation))
+        plot.apply_interactive_preview_retirement(retirement)
 
     @QtCore.Slot(str, object)
     def _on_run_dispatched(self, tab_id: str, set_ids: object) -> None:
@@ -1879,6 +2157,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return panel.xlsx_export_projection()
 
     def _repository_for_tab(self, tab_id: str) -> ResultRepository:
+        override = self._replacement_repository_override
+        if override is not None:
+            repository = override.get(str(tab_id))
+            if repository is not None:
+                return repository
         repository = self._workspace_tab_registry.tab_runtime(tab_id).result_repository
         if not isinstance(repository, ResultRepository):
             raise LookupError(f"Tab {tab_id!r} has no ResultRepository.")
@@ -1909,35 +2192,36 @@ class MainWindow(QtWidgets.QMainWindow):
             if set_ids:
                 self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
 
-    def _capture_current_explicit_result_facts(
+    def _resolve_current_explicit_result_key(
         self,
         tab_id: str,
         set_id: str,
-    ) -> ExplicitResultCurrentFacts | None:
-        """Capture current typed facts for one exact result-key boundary."""
+    ) -> ExplicitResultKey | None:
+        """Build the sole Run target and return its request-projected key."""
 
-        tab = self._project_session.document.tab(str(tab_id))
+        tab = next(
+            (
+                item
+                for item in self._project_session.document.tabs
+                if item.tab_id == str(tab_id)
+            ),
+            None,
+        )
+        if tab is None or not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
+            return None
+        if not tab.mechanism_source.reactions_text.strip():
+            return None
+        if not any(
+            item.set_id == str(set_id)
+            for item in tab.initial_condition_sets
+        ):
+            return None
         target = self._build_explicit_target_for_tab(
             tab,
             str(set_id),
             publication_generation=0,
         )
-        key = target.key
-        executable_identity = target.execution_request.snapshot.target_executable_identity
-        if executable_identity is None:
-            raise RuntimeError(
-                f"Run target {target.set_name!r} has no bound executable identity."
-            )
-        return ExplicitResultCurrentFacts(
-            tab_id=key.tab_id,
-            set_id=key.set_id,
-            mechanism_source=key.mechanism_source,
-            analysis_identity=key.analysis_identity,
-            initial_values=key.initial_values,
-            execution_settings=key.execution_settings,
-            scientific_settings=key.scientific_settings,
-            executable_identity=executable_identity,
-        )
+        return target.key
 
     def _build_explicit_target_for_tab(
         self,
@@ -2189,7 +2473,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         if bundle.initial_actions.delete_selected():
-            bundle.slider_binding._evict_preview_targets(targets)
+            bundle.slider_binding.evict_preview_targets(targets)
             self._refresh_slider_target_summary(tab_id)
             self._refresh_dataset_views((tab_id,))
 
@@ -2637,16 +2921,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 or runtime.slider_parameter_draft
                 or runtime.slider_species_drafts_by_set_id
             )
+        fit_disposition = self._fit_session_owner.replacement_disposition
+        if not isinstance(
+            fit_disposition,
+            FitReplacementDispositionSummary,
+        ):
+            raise TypeError(
+                "Fit replacement disposition must be "
+                "FitReplacementDispositionSummary."
+            )
         return ProjectTransientState(
             reactions_draft=reactions_draft,
             notes_draft=notes_draft,
             invalid_initial_conditions=invalid_initials,
             slider_drafts=slider_drafts,
             active_run_or_preview=bool(
-                self._simulation_jobs.is_executing
-                or self._simulation_jobs.pending_preview_tab_id is not None
+                self._simulation_jobs.current_kind is not None
             ),
-            active_fit=self._fit_session_owner.fit_active,
+            active_fit=fit_disposition.active_worker,
+            fit_disposition=fit_disposition,
             active_import=bool(self._dataset_import_staging.busy),
             active_xlsx_export=self._xlsx_export_owner.is_exporting,
         )
@@ -2806,6 +3099,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if tab_id not in current_tab_ids:
             return
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
+        # Reactions drafts invalidate only the calculator's current snapshot;
+        # reverting the draft immediately rebuilds from accepted prepared DSL
+        # and lets the owner restore any matching fingerprint history.  Slider
+        # and notes drafts leave executable identity unchanged, but refreshing
+        # here keeps the projection synchronized for every draft signal.
+        self._refresh_symbolic_calculator(tab_id)
         self._workspace.set_tab_dirty(tab_id, runtime.has_dirty_drafts)
         if tab_id == self._workspace_tab_registry.active_tab_id:
             self._set_tab_run_enabled(tab_id, self._run_admitted(tab_id))
@@ -3414,15 +3713,15 @@ class MainWindow(QtWidgets.QMainWindow):
             previous_set_ids = tuple(
                 item.set_id for item in tab.initial_condition_sets
             )
-            species = canonical_species_names(tab)
-            if not species:
+            model_targets = canonical_observation_target_names(tab)
+            if not model_targets:
                 raise DatasetMappingError(
-                    "Optional mapping requires a valid mechanism with species."
+                    "Optional mapping requires a valid mechanism with observation targets."
                 )
             review = DatasetMappingBatchDialog(
                 records=batch_proposal.records,
                 tab=tab,
-                mechanism_species=species,
+                model_targets=model_targets,
                 parent=self,
             )
             if review.exec() != QtWidgets.QDialog.DialogCode.Accepted:
@@ -3435,7 +3734,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 document=self._project_session.document,
                 tab=tab,
                 batch=batch,
-                mechanism_species=species,
+                model_targets=model_targets,
             )
             result = self._workspace_tab_registry.replace_tab(
                 origin_tab_id,
@@ -3580,6 +3879,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not path:
             return
+        if self.project_controller.is_current_project_path(path):
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export Original Dataset",
+                "Cannot overwrite the currently open project archive.",
+            )
+            return
         self._remember_export_directory(path)
         try:
             exported = export_original_source(self._project_session.document, record, path)
@@ -3617,17 +3923,17 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             dataset = self._project_session.document.dataset(intent.dataset_id)
             if choice is DatasetMappingChoice.CREATE_SET:
-                species = canonical_species_names(tab)
-                if not species:
+                model_targets = canonical_observation_target_names(tab)
+                if not model_targets:
                     raise ValueError(
-                        "Apply a valid mechanism before creating a set from observations."
+                        "Apply a valid mechanism with observation targets before creating a set from observations."
                     )
                 mapping = self._prompt_observation_mapping(
                     dataset,
                     tab.dataset_link(dataset.dataset_id).observation_mapping
                     if tab.dataset_link(dataset.dataset_id) is not None
                     else (),
-                    species,
+                    model_targets,
                     title="Confirm Observation Mapping",
                 )
                 if mapping is None:
@@ -3643,7 +3949,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     dataset=dataset,
                     set_id=new_set_id(),
                     set_name=suggested_name,
-                    model_species=species,
+                    model_targets=model_targets,
                     confirmed_mapping=mapping,
                 )
             elif choice is DatasetMappingChoice.MAP_EXISTING:
@@ -3679,7 +3985,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     document=self._project_session.document,
                     tab=tab,
                     plan=plan,
-                    mechanism_species=canonical_species_names(tab),
+                    model_targets=canonical_observation_target_names(tab),
                 )
             else:
                 plan = plan_leave_unmapped(
@@ -3690,7 +3996,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     document=self._project_session.document,
                     tab=tab,
                     plan=plan,
-                    mechanism_species=canonical_species_names(tab),
+                    model_targets=canonical_observation_target_names(tab),
                 )
             result = self._workspace_tab_registry.replace_tab(
                 tab_id,
@@ -3732,12 +4038,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             tab = self._workspace_tab_registry.tab(tab_id)
             dataset = self._project_session.document.dataset(intent.dataset_id)
-            species = canonical_species_names(tab)
+            model_targets = canonical_observation_target_names(tab)
             current = tab.dataset_link(dataset.dataset_id)
             mapping = self._prompt_observation_mapping(
                 dataset,
                 current.observation_mapping if current is not None else (),
-                species,
+                model_targets,
                 title="Observation Mapping",
             )
             if mapping is None:
@@ -3746,7 +4052,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 document=self._project_session.document,
                 tab=tab,
                 dataset=dataset,
-                model_species=species,
+                model_targets=model_targets,
                 confirmed_mapping=mapping,
             )
             result = self._workspace_tab_registry.replace_tab(
@@ -3778,21 +4084,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         dataset,
         current_mapping: Iterable[tuple[str, str]],
-        model_species: Sequence[str],
+        model_targets: Sequence[str],
         *,
         title: str,
     ) -> tuple[tuple[str, str], ...] | None:
-        species = tuple(dict.fromkeys(str(name) for name in model_species))
+        targets = tuple(dict.fromkeys(str(name) for name in model_targets))
         observations = tuple(
             (series.raw_observation_id, series.column_name)
             for series in dataset.observations
         )
         current = dict(current_mapping)
         suggestions = {
-            item.raw_observation_id: item.model_species
+            item.raw_observation_id: item.model_target
             for item in suggest_observation_mapping(
                 raw_observations=observations,
-                model_species=species,
+                model_targets=targets,
             )
         }
         dialog = QtWidgets.QDialog(self)
@@ -3810,13 +4116,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for raw_observation_id, column in observations:
             combo = QtWidgets.QComboBox(dialog)
             combo.addItem("(unmapped)", None)
-            for species_name in species:
-                combo.addItem(species_name, species_name)
+            for target_name in targets:
+                combo.addItem(target_name, target_name)
             selected = current.get(
                 raw_observation_id,
                 suggestions.get(raw_observation_id),
             )
-            if selected in species:
+            if selected in targets:
                 combo.setCurrentIndex(combo.findData(selected))
             form.addRow(column, combo)
             editors[raw_observation_id] = combo
@@ -3840,7 +4146,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(
                 self,
                 title,
-                "Each mechanism species may be mapped from at most one column.",
+                "Each model target may be mapped from at most one column.",
             )
             return None
         return mapping
@@ -3867,7 +4173,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 tab=tab,
                 dataset_id=intent.dataset_id,
                 include=intent.include,
-                mechanism_species=canonical_species_names(tab),
+                model_targets=canonical_observation_target_names(tab),
             )
             result = self._workspace_tab_registry.replace_tab(
                 tab_id,
@@ -4374,6 +4680,8 @@ class MainWindow(QtWidgets.QMainWindow):
             except KeyError:
                 continue
             changed = plot.stop_interactive_display() or changed
+        for bundle in tuple(self._tab_surfaces.values()):
+            changed = bundle.slider_binding.settle_stop() or changed
         return bool(self._simulation_jobs.cancel_current() or changed)
 
     def _run_global_fit(self) -> bool:
@@ -4412,24 +4720,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return False
         bundle.slider_binding.cancel_pending_preview_intent()
-        window = self._fit_session_owner.open_or_focus(tab.tab_id)
-        if window is None:
-            return False
-        self._connect_fit_shared_refit_signal(window)
-        return True
-
-    def _connect_fit_shared_refit_signal(self, window: QtCore.QObject) -> None:
-        """Connect the Results Shared-refit intent to its sole Fit owner once."""
-
-        if not isinstance(window, QtCore.QObject):
-            raise TypeError("Fit window must be a QObject.")
-        if window is self._fit_shared_refit_signal_window:
-            return
-        signal = getattr(window, "sharedRefitRequested", None)
-        if signal is None:
-            raise TypeError("Fit window has no Shared-refit intent signal.")
-        signal.connect(self._fit_session_owner.accept_shared_refit_intent)
-        self._fit_shared_refit_signal_window = window
+        return self._fit_session_owner.open_or_focus(tab.tab_id) is not None
 
     def _configure_fitting(self) -> bool:
         if not self._mutation_input_admitted("Configure Fitting"):
@@ -4493,7 +4784,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def sync_method_controls(_index: int = -1) -> None:
             is_de = method.currentData() == DIFFERENTIAL_EVOLUTION_METHOD
             ftol_label.setText(
-                DE_POPULATION_TOLERANCE_LABEL
+                DE_CONVERGENCE_TOLERANCE_LABEL
                 if is_de
                 else FUNCTION_TOLERANCE_LABEL
             )
@@ -4659,7 +4950,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._workspace_tab_registry.tab_runtime(
             tab_id
         ).reactions_draft is not None:
-            state = bundle.calculator_owner.reset_project_session_state()
+            state = bundle.calculator_owner.invalidate_current_snapshot()
         else:
             state = bundle.calculator_owner.refresh()
         bundle.calculator_panel.render_state(state)
@@ -4672,6 +4963,10 @@ class MainWindow(QtWidgets.QMainWindow):
             tab_id,
             description="Open Symbolic Calculator"
         ):
+            bundle = self._tab_surfaces[tab_id]
+            state = bundle.calculator_owner.invalidate_current_snapshot()
+            bundle.calculator_panel.render_state(state)
+            bundle.editor.symbolic_calculator_btn.setEnabled(state.available)
             return
         self._refresh_symbolic_calculator(tab_id)
         if tab_id == self._workspace_tab_registry.active_tab_id:
@@ -4684,12 +4979,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _evaluate_symbolic(self, tab_id: str, query: str):
         bundle = self._tab_surfaces[str(tab_id)]
         if not self._mutation_input_admitted("Evaluate Symbolic Expression"):
-            return bundle.calculator_owner.reset_project_session_state()
+            return bundle.calculator_owner.view_state()
         if not self._accept_visible_source(
             tab_id,
             description="Evaluate Symbolic Expression"
         ):
-            return bundle.calculator_owner.reset_project_session_state()
+            return bundle.calculator_owner.invalidate_current_snapshot()
         return bundle.calculator_owner.evaluate(query)
 
     def _open_mechanism_inspector(self, tab_id: str) -> None:
@@ -4928,19 +5223,519 @@ class MainWindow(QtWidgets.QMainWindow):
     def set_status_text(self, text: str) -> None:
         self._status_label.setText(str(text))
 
-    def _on_document_replaced(self) -> None:
-        self._workspace.reset_plot_session_state()
-        for tab_id in tuple(self._tab_surfaces):
-            self._drop_tab_surface(tab_id)
-        for tab in self._project_session.document.tabs:
-            self._create_tab_surface(tab.tab_id)
-        self._refresh_workspace_document()
+    def _detach_surface_bundle(self, bundle: _TabSurfaceBundle) -> None:
+        """Remove one surface from live stacks without destroying its custody."""
+
+        for stack, widget in (
+            (self._mechanism_stack, bundle.editor_panel),
+            (self._slider_stack, bundle.slider_panel),
+            (self._initial_conditions_stack, bundle.simulation_panel),
+            (self._data_stack, bundle.right_panel),
+            (self._calculator_stack, bundle.calculator_panel),
+        ):
+            if stack.indexOf(widget) >= 0:
+                stack.removeWidget(widget)
+            widget.setParent(None)
+
+    def _attach_surface_bundle(self, bundle: _TabSurfaceBundle) -> None:
+        """Install one prepared surface into the retained dock stacks."""
+
+        self._mechanism_stack.addWidget(bundle.editor_panel)
+        self._slider_stack.addWidget(bundle.slider_panel)
+        self._initial_conditions_stack.addWidget(bundle.simulation_panel)
+        self._data_stack.addWidget(bundle.right_panel)
+        self._calculator_stack.addWidget(bundle.calculator_panel)
+
+    def _destroy_surface_bundle(
+        self,
+        bundle: _TabSurfaceBundle,
+    ) -> tuple[str, ...]:
+        """Destroy a detached surface and its binding-owned timer custody."""
+
+        failures: list[str] = []
+        try:
+            bundle.slider_binding.dispose()
+        except Exception as exc:
+            logger.exception(
+                "Prepared Slider binding could not be disposed for tab %s",
+                bundle.tab_id,
+            )
+            failures.append(f"slider disposal for tab {bundle.tab_id}: {exc}")
+        try:
+            self._detach_surface_bundle(bundle)
+        except Exception as exc:
+            logger.exception(
+                "Surface bundle could not be detached for tab %s",
+                bundle.tab_id,
+            )
+            failures.append(f"surface detach for tab {bundle.tab_id}: {exc}")
+        for widget in (
+            bundle.editor_panel,
+            bundle.slider_panel,
+            bundle.simulation_panel,
+            bundle.right_panel,
+            bundle.calculator_panel,
+        ):
+            try:
+                widget.deleteLater()
+            except Exception as exc:
+                logger.exception(
+                    "Surface widget could not be queued for deletion for tab %s",
+                    bundle.tab_id,
+                )
+                failures.append(
+                    f"widget deletion for tab {bundle.tab_id}: {exc}"
+                )
+        return tuple(failures)
+
+    def _detach_plot(self, plot: PyQtGraphPlotPanel) -> None:
+        self._workspace.detach_plot(plot)
+
+    def _destroy_plot(self, plot: PyQtGraphPlotPanel) -> tuple[str, ...]:
+        failures: list[str] = []
+        try:
+            plot.drop_tab_session_state()
+        except Exception as exc:
+            logger.exception("Plot session state could not be retired")
+            failures.append(f"plot state retirement: {exc}")
+        try:
+            self._detach_plot(plot)
+        except Exception as exc:
+            logger.exception("Plot custody could not be detached")
+            failures.append(f"plot detach: {exc}")
+        try:
+            analysis = plot.analysis_tabs()
+        except Exception as exc:
+            logger.exception("Plot analysis surface could not be resolved")
+            failures.append(f"plot analysis lookup: {exc}")
+            analysis = None
+        if analysis is not None:
+            try:
+                analysis.setParent(None)
+            except Exception as exc:
+                logger.exception("Plot analysis surface could not be detached")
+                failures.append(f"plot analysis detach: {exc}")
+            try:
+                analysis.deleteLater()
+            except Exception as exc:
+                logger.exception("Plot analysis surface could not be deleted")
+                failures.append(f"plot analysis deletion: {exc}")
+        try:
+            plot.deleteLater()
+        except Exception as exc:
+            logger.exception("Plot custody could not be deleted")
+            failures.append(f"plot deletion: {exc}")
+        return tuple(failures)
+
+    def _attach_plot(self, plot: PyQtGraphPlotPanel) -> None:
+        self._workspace.attach_plot(plot)
+
+    def _prepare_surface_projection(
+        self,
+        bundle: _TabSurfaceBundle,
+        registry: _PreparedPhysicalTabContext,
+        plot: PyQtGraphPlotPanel,
+    ) -> None:
+        """Render every staged page from prepared values before publication."""
+        previous_rendering = self._rendering_workspace
+        self._rendering_workspace = True
+        try:
+            tab = registry.tab(bundle.tab_id)
+            bundle.editor_binding.apply_render_projection(
+                bundle.editor_binding.prepare_render()
+            )
+            bundle.initial_actions.apply_render_projection(
+                bundle.initial_actions.prepare_render()
+            )
+            slider_projection = bundle.slider_binding.prepare_render()
+            bundle.slider_binding.apply_render_projection(slider_projection)
+            # Do not emit the live-shell draft signal while this bundle is
+            # prepared: its ordinary consumer resolves through the current
+            # tab map, which still belongs to the old project until
+            # publication.  Set the prepared control directly instead.
+            bundle.editor.set_slider_draft_actions_enabled(
+                bundle.slider_binding.has_slider_draft()
+            )
+            bundle.simulation_panel.render_run_defaults(
+                tab.run_defaults,
+                run_admitted=False,
+                simulation_job_kind=self._simulation_jobs.current_kind,
+            )
+            snapshot = build_data_manager_snapshot(
+                document=registry.document,
+                active_tab=tab,
+                presentation=registry.presentation(bundle.tab_id),
+            )
+            bundle.data_panel.render_snapshot(snapshot)
+            bundle.overlay_panel.render_snapshot(
+                records=snapshot.datasets,
+                active_links=snapshot.active_links,
+                known_species=tuple(canonical_observation_target_names(tab)),
+            )
+            target_names = tuple(
+                tab.initial_condition_set(set_id).name
+                for set_id in slider_projection.targets
+            )
+            bundle.editor.set_slider_edit_targets_summary(
+                "Slider edit targets: "
+                + (", ".join(target_names) if target_names else "none")
+            )
+            calculator_state = bundle.calculator_owner.refresh()
+            bundle.calculator_panel.render_state(calculator_state)
+            state = registry.presentation(bundle.tab_id)
+            plot.set_persisted_plot_state(
+                log_x=state.log_x,
+                log_y=state.log_y,
+                legend_visible=state.legend_visible,
+                x_inverted=state.x_inverted,
+                y_inverted=state.y_inverted,
+            )
+            repository = registry.tab_runtime(
+                bundle.tab_id
+            ).result_repository
+            if not isinstance(repository, ResultRepository):
+                raise LookupError(
+                    f"Prepared tab {bundle.tab_id!r} has no ResultRepository."
+                )
+            plot.apply_workspace_result_projection(
+                self._compose_result_projection(
+                    bundle.tab_id,
+                    document=registry.document,
+                    presentation=state,
+                    repository=repository,
+                )
+            )
+        finally:
+            self._rendering_workspace = previous_rendering
+
+    def prepare_project_install(
+        self,
+        *,
+        prepared_session: PreparedProjectInstall,
+        prepared_workspace: PreparedWorkspaceInstall,
+    ) -> object:
+        """Prepare every replacement Qt surface while the old project is live."""
+
+        if not isinstance(prepared_session, PreparedProjectInstall):
+            raise TypeError("prepared_session must be PreparedProjectInstall.")
+        if not isinstance(prepared_workspace, PreparedWorkspaceInstall):
+            raise TypeError("prepared_workspace must be PreparedWorkspaceInstall.")
+        document_ids = tuple(tab.tab_id for tab in prepared_session.document.tabs)
+        workspace_ids = tuple(
+            tab_id for tab_id, _runtime in prepared_workspace.runtime_by_tab_id
+        )
+        if document_ids != workspace_ids:
+            raise ValueError(
+                "Prepared project and workspace tab IDs must have identical order."
+            )
+        active_tab_id = str(prepared_workspace.active_tab_id)
+        if active_tab_id not in document_ids:
+            raise ValueError(
+                f"Prepared workspace active tab is unknown: {active_tab_id!r}."
+            )
+
+        holder = QtWidgets.QWidget(self)
+        holder.setObjectName("preparedProjectPhysicalInstall")
+        holder.hide()
+        prepared_context = _PreparedPhysicalTabContext(
+            prepared_session=prepared_session,
+            prepared_workspace=prepared_workspace,
+            identity_generation=self._project_session.identity_generation + 1,
+        )
+        surfaces: dict[str, _TabSurfaceBundle] = {}
+        plots: dict[str, PyQtGraphPlotPanel] = {}
+        staged_plot_by_tab_id: dict[str, PyQtGraphPlotPanel] = {}
+        prepared: _PreparedProjectPhysicalInstall | None = None
+        try:
+            for tab_id in document_ids:
+                bundle = self._create_tab_surface(
+                    tab_id,
+                    registry=prepared_context,
+                    surface_parent=holder,
+                    install=False,
+                    publish_initial_state=False,
+                    plot_resolver=lambda target, captured=staged_plot_by_tab_id: (
+                        captured[str(target)]
+                    ),
+                )
+                surfaces[tab_id] = bundle
+            for tab_id in document_ids:
+                plot = self._workspace.new_plot_panel()
+                # Workspace's factory intentionally returns an unparented
+                # panel for ordinary tab installation.  Prepared replacement
+                # custody must be established before any configuration or
+                # signal operation can fail; if the transfer itself raises,
+                # dispose this still-unregistered local immediately.
+                try:
+                    plot.setParent(holder)
+                except Exception:
+                    try:
+                        plot.deleteLater()
+                    except Exception:
+                        logger.exception(
+                            "Unparented prepared plot could not be discarded"
+                        )
+                    raise
+                plots[tab_id] = plot
+                staged_plot_by_tab_id[tab_id] = plot
+                plot.setObjectName("plotPanel")
+                self._connect_workspace_plot(
+                    tab_id,
+                    plot,
+                    surface_ids=surfaces,
+                )
+            for bundle in surfaces.values():
+                self._prepare_surface_projection(
+                    bundle,
+                    prepared_context,
+                    plots[bundle.tab_id],
+                )
+            old_surfaces = self._tab_surfaces
+            (
+                old_plots,
+                old_initial_plot,
+                old_workspace_active_tab_id,
+                old_plot_current,
+                old_analysis_current,
+            ) = self._workspace.capture_plot_state()
+            old_surface_current = tuple(
+                stack.currentWidget()
+                for stack in (
+                    self._mechanism_stack,
+                    self._slider_stack,
+                    self._initial_conditions_stack,
+                    self._data_stack,
+                    self._calculator_stack,
+                )
+            )
+            old_repositories = {
+                tab.tab_id: repository
+                for tab in self._project_session.document.tabs
+                for repository in (
+                    self._workspace_tab_registry.tab_runtime(
+                        tab.tab_id
+                    ).result_repository,
+                )
+                if isinstance(repository, ResultRepository)
+            }
+            prepared = _PreparedProjectPhysicalInstall(
+                tab_surfaces=surfaces,
+                plots_by_tab_id=plots,
+                active_tab_id=active_tab_id,
+                preparation_holder=holder,
+                prepared_context=prepared_context,
+                old_tab_surfaces=old_surfaces,
+                old_plots_by_tab_id=old_plots,
+                old_initial_plot=old_initial_plot,
+                old_plot_current=old_plot_current,
+                old_analysis_current=old_analysis_current,
+                old_surface_current=old_surface_current,
+                old_workspace_active_tab_id=old_workspace_active_tab_id,
+                old_repositories=old_repositories,
+            )
+            # Rendering used the call-local prepared context.  Rebind every
+            # retained consumer to the final registry before any host
+            # attachment; no forwarding context survives this call.
+            self._bind_prepared_surfaces_to_live_registry(prepared)
+            # Add incoming pages and plots beside the current project.  Qt
+            # keeps the existing current widgets selected while these are
+            # added, so old physical custody remains current until publish.
+            for bundle in surfaces.values():
+                self._attach_surface_bundle(bundle)
+            for plot in plots.values():
+                self._attach_plot(plot)
+            # All incoming children now belong to their real hosts; the
+            # temporary custody holder is empty and no longer participates in
+            # publication or discard decisions.
+            holder.deleteLater()
+            return prepared
+        except Exception:
+            logger.exception("Prepared project physical construction failed")
+            for plot in plots.values():
+                self._destroy_plot(plot)
+            for bundle in surfaces.values():
+                self._destroy_surface_bundle(bundle)
+            try:
+                holder.deleteLater()
+            except Exception:
+                logger.exception("Prepared project holder could not be retired")
+            raise
+
+    def _bind_prepared_surfaces_to_live_registry(
+        self,
+        prepared: _PreparedProjectPhysicalInstall,
+    ) -> None:
+        """Rebind rendered consumers directly to the final live registry."""
+
+        registry = self._workspace_tab_registry
+        for bundle in prepared.tab_surfaces.values():
+            captured = bundle.tab_id
+            bundle.editor_binding.bind_registry(registry)
+            bundle.initial_actions.bind_registry(registry)
+            bundle.slider_binding.bind_registry(registry)
+            bundle.data_panel.bind_source_resolver(
+                lambda source_id, captured_registry=registry: (
+                    captured_registry.document.imported_source(source_id)
+                )
+            )
+            bundle.calculator_owner.bind_canonical_source_resolvers(
+                canonical_prepared_dsl=lambda captured_tab=captured: registry.tab(
+                    captured_tab
+                ).prepared_dsl,
+                canonical_source=lambda captured_tab=captured: registry.tab(
+                    captured_tab
+                ).mechanism_source,
+            )
+
+    def publish_project_install(
+        self,
+        prepared: object,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> object:
+        """Fence and publish prepared references plus current selections only."""
+
+        if not isinstance(prepared, _PreparedProjectPhysicalInstall):
+            raise TypeError("prepared must be prepared physical custody.")
+        if not isinstance(expected_token, ProjectContentToken):
+            raise TypeError("expected_token must be ProjectContentToken.")
+        if not self._project_session.is_content_token_current(expected_token):
+            raise RuntimeError(
+                "Prepared physical project assignment rejected a stale token."
+            )
+        # Preparation already attached and bound every incoming surface while
+        # old custody remained current.  Publication is intentionally limited
+        # to the final container/reference assignments and current selections.
+        self._tab_surfaces = prepared.tab_surfaces
+        active_bundle = prepared.tab_surfaces[prepared.active_tab_id]
+        for stack, current in zip(
+            (
+                self._mechanism_stack,
+                self._slider_stack,
+                self._initial_conditions_stack,
+                self._data_stack,
+                self._calculator_stack,
+            ),
+            (
+                active_bundle.editor_panel,
+                active_bundle.slider_panel,
+                active_bundle.simulation_panel,
+                active_bundle.right_panel,
+                active_bundle.calculator_panel,
+            ),
+        ):
+            stack.setCurrentWidget(current)
+        active_plot = prepared.plots_by_tab_id[prepared.active_tab_id]
+        self._workspace.adopt_plot_state(
+            prepared.plots_by_tab_id,
+            None,
+            prepared.active_tab_id,
+            current_plot=active_plot,
+            current_analysis=active_plot.analysis_tabs(),
+        )
+        self._replacement_structure_pending = True
+        self._replacement_repository_override = dict(prepared.old_repositories)
+        self._project_replacement_cleanup_active = True
+        return _ProjectPhysicalRetirement(
+            tab_surfaces=prepared.old_tab_surfaces,
+            plots_by_tab_id=prepared.old_plots_by_tab_id,
+            initial_plot=prepared.old_initial_plot,
+        )
+
+    def discard_project_install(self, prepared: object) -> None:
+        """Restore old references/selections and destroy prepared custody."""
+
+        if not isinstance(prepared, _PreparedProjectPhysicalInstall):
+            raise TypeError("prepared must be prepared physical custody.")
+        # A stale token may reject the semantic commit immediately after
+        # publish.  Restore only physical references and selection; the
+        # ProjectSession and registry owners are deliberately not rolled back.
+        if self._tab_surfaces is prepared.tab_surfaces:
+            self._tab_surfaces = prepared.old_tab_surfaces
+        self._workspace.adopt_plot_state(
+            prepared.old_plots_by_tab_id,
+            prepared.old_initial_plot,
+            prepared.old_workspace_active_tab_id,
+            current_plot=prepared.old_plot_current,
+            current_analysis=prepared.old_analysis_current,
+        )
+        for stack, current in zip(
+            (
+                self._mechanism_stack,
+                self._slider_stack,
+                self._initial_conditions_stack,
+                self._data_stack,
+                self._calculator_stack,
+            ),
+            prepared.old_surface_current,
+        ):
+            if current is not None and stack.indexOf(current) >= 0:
+                stack.setCurrentWidget(current)
+        for plot in prepared.plots_by_tab_id.values():
+            self._destroy_plot(plot)
+        for bundle in prepared.tab_surfaces.values():
+            self._destroy_surface_bundle(bundle)
+        self._replacement_repository_override = None
+        self._project_replacement_cleanup_active = False
+        self._replacement_structure_pending = False
+        try:
+            prepared.preparation_holder.deleteLater()
+        except Exception:
+            logger.exception("Prepared project holder could not be retired")
+
+    def retire_project_install(
+        self,
+        retirement: object,
+    ) -> tuple[str, ...]:
+        """Retire old surfaces only after the controller purges old results."""
+
+        if not isinstance(retirement, _ProjectPhysicalRetirement):
+            raise TypeError("retirement must be old physical custody.")
+        failures: list[str] = []
+        try:
+            for bundle in retirement.tab_surfaces.values():
+                try:
+                    failures.extend(self._destroy_surface_bundle(bundle))
+                except Exception as exc:
+                    logger.exception(
+                        "Surface bundle retirement raised for %s",
+                        getattr(bundle, "tab_id", "<unknown>"),
+                    )
+                    failures.append(f"surface retirement: {exc}")
+            for plot in retirement.plots_by_tab_id.values():
+                try:
+                    failures.extend(self._destroy_plot(plot))
+                except Exception as exc:
+                    logger.exception("Plot retirement raised")
+                    failures.append(f"plot retirement: {exc}")
+            if retirement.initial_plot is not None:
+                try:
+                    failures.extend(self._destroy_plot(retirement.initial_plot))
+                except Exception as exc:
+                    logger.exception("Initial plot retirement raised")
+                    failures.append(f"initial plot retirement: {exc}")
+        finally:
+            # Retirement is best-effort cleanup.  It must never roll back or
+            # obscure the newly published semantic/physical state.  The
+            # project-state handler still owns the pending structure refresh.
+            self._replacement_repository_override = None
+            self._project_replacement_cleanup_active = False
+        return tuple(failures)
+
+    @QtCore.Slot()
+    def _on_project_state_changed(self) -> None:
+        """Refresh replacement structure after semantic publication."""
+
+        if self._replacement_structure_pending:
+            self._replacement_structure_pending = False
+            self._refresh_workspace_tab_structure()
+            return
+        self._refresh_project_state()
 
     def _refresh_project_state(self) -> None:
         self._render_tab_state()
         self._refresh_title()
         self._refresh_actions()
-        self.config_controller.update_recent_files_menu()
 
     @QtCore.Slot()
     def _on_simulation_state_changed(self) -> None:
@@ -4999,10 +5794,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._stop_action.setEnabled(
             mutation_admitted
-            and bool(
-                self._simulation_jobs.is_executing
-                or self._simulation_jobs.pending_preview_tab_id is not None
-            )
+            and self._simulation_jobs.current_kind is not None
         )
         self._global_fit_action.setEnabled(
             mutation_admitted and self._computation_gate.is_idle

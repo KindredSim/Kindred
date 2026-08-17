@@ -28,6 +28,11 @@ import math
 from dataclasses import dataclass
 from typing import Callable, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
+from kindred.core.species import (
+    validate_temperature,
+    validate_time_seconds,
+)
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -52,30 +57,18 @@ class TemperatureScheduleDictProtocol(TemperatureScheduleProtocol, Protocol):
     def to_dict(self) -> Mapping[str, object]: ...
 
 
-def _finite_float(value: object, *, field: str) -> float:
-    try:
-        out = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise TemperatureScheduleError(f"{field} must be finite.") from exc
-    if not math.isfinite(out):
-        raise TemperatureScheduleError(f"{field} must be finite.")
-    return float(out)
-
-
 def coerce_temperature_kelvin(value: object, *, field: str = "temperature") -> float:
-    temperature = _finite_float(value, field=field)
-    if not 0.1 <= temperature <= 10_000.0:
-        raise TemperatureScheduleError(
-            f"{field} must be within 0.1–10000 K, got {temperature} K"
-        )
-    return temperature
+    try:
+        return validate_temperature(value, field=field)
+    except (TypeError, ValueError) as exc:
+        raise TemperatureScheduleError(str(exc)) from exc
 
 
 def _coerce_nonnegative_time(value: object, *, field: str) -> float:
-    time_value = _finite_float(value, field=field)
-    if time_value < 0.0:
-        raise TemperatureScheduleError(f"{field} must be non-negative, got {time_value}")
-    return time_value
+    try:
+        return validate_time_seconds(value, field=field)
+    except (TypeError, ValueError) as exc:
+        raise TemperatureScheduleError(str(exc)) from exc
 
 
 class _ValidatedCallableTemperatureSchedule:
@@ -414,8 +407,10 @@ class TemperatureSchedule:
         The response begins from ``baseline_temperature`` at the first authored
         setpoint; it never extrapolates an authored setpoint backward in time.
         """
-        if not math.isfinite(float(tau)) or float(tau) <= 0.0:
-            raise TemperatureScheduleError(f"tau must be positive and finite, got {tau}")
+        try:
+            tau_f = validate_time_seconds(tau, field="tau", allow_zero=False)
+        except (TypeError, ValueError) as exc:
+            raise TemperatureScheduleError(str(exc)) from exc
 
         if len(times) < 2:
             raise TemperatureScheduleError(f"At least 2 time points required, got {len(times)}")
@@ -432,7 +427,6 @@ class TemperatureSchedule:
                 for i in range(len(setpoints))
             ]
         )
-        tau_f = float(tau)
         baseline = coerce_temperature_kelvin(
             baseline_temperature,
             field="baseline temperature",
@@ -633,8 +627,11 @@ def declared_temperature_step_boundaries(
 ) -> tuple[float, ...]:
     """Return only authored finite piecewise-temperature discontinuities."""
 
-    start = _finite_float(t_start, field="temperature boundary start")
-    end = _finite_float(t_end, field="temperature boundary end")
+    try:
+        start = validate_time_seconds(t_start, field="temperature boundary start")
+        end = validate_time_seconds(t_end, field="temperature boundary end")
+    except (TypeError, ValueError) as exc:
+        raise TemperatureScheduleError(str(exc)) from exc
     if end <= start:
         raise TemperatureScheduleError(
             "temperature boundary end must be greater than start."

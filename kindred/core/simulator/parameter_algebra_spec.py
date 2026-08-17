@@ -738,9 +738,9 @@ def _validate_retained_parameter_program(
                             f"Static mechanism parameter {name!r} has no scalar value."
                         )
                     value = float(values[0])
-                if not np.isfinite(value) or value <= 0.0:
+                if not np.isfinite(value):
                     raise ValueError(
-                        f"Mechanism parameter {name!r} must be a positive finite real."
+                        f"Mechanism parameter {name!r} must be a finite real."
                     )
         except Exception as exc:
             name = next(

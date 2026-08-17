@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import math
 from typing import Callable, Iterable, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -19,6 +18,7 @@ from kindred.core.project_document import (
 )
 from kindred.core.project_presentation_state import ProjectPresentationState
 from kindred.core.project_session import ProjectContentToken
+from kindred.core.species import validate_concentration
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
 from kindred.gui.workspace_tab_registry import CanonicalMutationResult
 
@@ -38,6 +38,25 @@ _SLIDER_COLUMN_WIDTH = 72
 _PLOT_COLUMN_WIDTH = 56
 _CUSTOM_COLUMN_WIDTH = 72
 _RUN_GEAR_COLUMN_WIDTH = 36
+
+
+def _admit_initial_condition_set_candidate(
+    candidate: InitialConditionSet,
+) -> InitialConditionSet:
+    """Validate one complete Batch candidate before canonical replacement."""
+
+    if not isinstance(candidate, InitialConditionSet):
+        raise TypeError("Initial-condition candidate must be typed.")
+    # ``values_dict`` is the core model's single materialization boundary. It
+    # rejects forged/malformed carriers and duplicate species before the GUI
+    # performs any projection or canonical replacement.
+    candidate.values_dict()
+    for species, value in candidate.values:
+        validate_concentration(
+            value,
+            field=f"initial concentration for {species}",
+        )
+    return candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +125,10 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             species = tuple(
                 dict.fromkeys(str(item) for item in species_names if str(item))
             )
+        admitted_sets = tuple(
+            _admit_initial_condition_set_candidate(initial_set)
+            for initial_set in tab.initial_condition_sets
+        )
         override_ids = {
             set_id for set_id, _settings in tab.run_overrides_by_set_id
         }
@@ -126,7 +149,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 plot_requested=initial_set.set_id in plot_ids,
                 slider_pinned=initial_set.set_id in pinned_ids,
             )
-            for initial_set in tab.initial_condition_sets
+            for initial_set in admitted_sets
         )
         if rows == self._rows and species == self._species:
             return
@@ -615,6 +638,11 @@ class InitialConditionsTableActions(QtCore.QObject):
     def tab_id(self) -> str:
         return self._tab_id
 
+    def bind_registry(self, registry) -> None:
+        """Rebind this retained table owner to the published registry."""
+
+        self._registry = registry
+
     def prepare_render(self) -> _InitialConditionsRenderProjection:
         """Prepare the complete table projection without touching widgets."""
 
@@ -760,14 +788,17 @@ class InitialConditionsTableActions(QtCore.QObject):
         tab = self._registry.tab(self._tab_id)
         initial_set = tab.initial_condition_set(set_id)
         try:
-            value = float(raw_text)
-        except (TypeError, ValueError):
-            value = math.nan
+            value = validate_concentration(
+                float(raw_text),
+                field=f"initial concentration for {species}",
+            )
+        except (TypeError, ValueError, OverflowError):
+            value = None
         invalid = self._registry.tab_runtime(
             self._tab_id
         ).invalid_initial_text_by_set_id
         was_invalid = species in invalid.get(set_id, {})
-        if not math.isfinite(value) or value < 0.0:
+        if value is None:
             raw = str(raw_text)
             if invalid.get(set_id, {}).get(species) == raw:
                 return False
@@ -782,9 +813,12 @@ class InitialConditionsTableActions(QtCore.QObject):
         result: CanonicalMutationResult | None = None
         if changed:
             values[str(species)] = value
+            candidate = _admit_initial_condition_set_candidate(
+                initial_set.with_values(values)
+            )
             result = self._registry.replace_initial_condition_set(
                 self._tab_id,
-                initial_set.with_values(values),
+                candidate,
                 expected_token=self._editor_mutation_token(),
             )
             if result is None:
@@ -820,16 +854,18 @@ class InitialConditionsTableActions(QtCore.QObject):
         parsed: list[list[float]] = []
         try:
             for row in cells:
-                values = [float(raw.strip()) for raw in row]
-                if any(
-                    not math.isfinite(value) or value < 0.0
-                    for value in values
-                ):
-                    raise ValueError
+                values = [
+                    validate_concentration(
+                        float(raw.strip()),
+                        field="pasted initial concentration",
+                    )
+                    for raw in row
+                ]
                 parsed.append(values)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return self._reject(
-                "Every pasted concentration must be finite and nonnegative."
+                "Every pasted concentration must be within the supported "
+                "concentration domain."
             )
 
         tab = self._registry.tab(self._tab_id)
@@ -856,7 +892,9 @@ class InitialConditionsTableActions(QtCore.QObject):
                     values[species] = value
                     row_changed = True
             if row_changed:
-                candidate_sets[row_index] = initial_set.with_values(values)
+                candidate_sets[row_index] = _admit_initial_condition_set_candidate(
+                    initial_set.with_values(values)
+                )
                 changed_ids.append(initial_set.set_id)
 
         result: CanonicalMutationResult | None = None

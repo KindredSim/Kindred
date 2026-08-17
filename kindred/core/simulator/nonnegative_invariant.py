@@ -6,7 +6,10 @@ from typing import Iterable
 
 import numpy as np
 
-from kindred.core.exceptions import SolverError
+from kindred.core.simulator.solver_types import (
+    SimulationScientificUnavailability,
+    _SimulationScientificUnavailabilitySignal,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +71,12 @@ def project_nonnegative_trajectory(
     if Y2.size == 0:
         return Y2, NonnegativeProjection()
     if not np.all(np.isfinite(Y2)):
-        raise SolverError(
-            f"{context} trajectory contains non-finite concentration values.",
-            details={"candidate_domain_eligible": True},
+        raise _SimulationScientificUnavailabilitySignal(
+            SimulationScientificUnavailability(
+                producer="nonnegative_invariant",
+                stage="trajectory_arithmetic",
+                details={"context": context},
+            )
         )
     negative_mask = Y2 < 0.0
     count = int(np.count_nonzero(negative_mask))

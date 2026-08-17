@@ -1,140 +1,118 @@
-"""Native-grid concentration-time integration used by result statistics."""
+"""Compact fixed-policy concentration-time statistics."""
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from dataclasses import dataclass
 
 import numpy as np
 
 from kindred.core.time_grid import is_uniform_time_grid
 
-__all__ = ["integrate_ctc"]
+__all__ = ["CtcResult", "integrate_ctc"]
 
 
-def _trapezoid_segment(h: float, y0: float, y1: float) -> float:
-    return 0.5 * h * (y0 + y1)
+@dataclass(frozen=True, slots=True)
+class CtcResult:
+    """Typed scalar CTC outcome.
+
+    ``value`` is present only for an available finite result.  Numerical input
+    or accumulation overflow is an ordinary unavailable projection, not an
+    exception that callers must classify heuristically.
+    """
+
+    value: float | None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.value is None:
+            if not self.reason:
+                raise ValueError("Unavailable CTC results require a reason.")
+            return
+        parsed = float(self.value)
+        if not np.isfinite(parsed):
+            raise ValueError("Available CTC results must be finite.")
+        if self.reason is not None:
+            raise ValueError("Available CTC results cannot carry an unavailable reason.")
+        object.__setattr__(self, "value", parsed)
+
+    @property
+    def available(self) -> bool:
+        return self.value is not None
+
+    @classmethod
+    def unavailable(cls, reason: str = "nonfinite") -> "CtcResult":
+        return cls(None, str(reason))
 
 
-def _composite_trapezoid(t: np.ndarray, y: np.ndarray) -> float:
-    return float(np.sum(np.diff(t) * 0.5 * (y[:-1] + y[1:])))
+def _composite_trapezoid(time: np.ndarray, values: np.ndarray) -> float:
+    with np.errstate(over="ignore", invalid="ignore"):
+        return float(np.sum(np.diff(time) * 0.5 * (values[:-1] + values[1:])))
 
 
-def _simpson13_uniform(t: np.ndarray, y: np.ndarray) -> float:
-    intervals = t.size - 1
+def _simpson13_uniform(time: np.ndarray, values: np.ndarray) -> float:
+    intervals = time.size - 1
     if intervals % 2:
         raise ValueError("Simpson 1/3 requires an even number of intervals.")
-    h = (t[-1] - t[0]) / intervals
-    weighted = (
-        y[0]
-        + y[-1]
-        + 4.0 * np.sum(y[1:-1:2])
-        + 2.0 * np.sum(y[2:-2:2])
-    )
-    return float(weighted * h / 3.0)
+    h = (time[-1] - time[0]) / intervals
+    with np.errstate(over="ignore", invalid="ignore"):
+        weighted = (
+            values[0]
+            + values[-1]
+            + 4.0 * np.sum(values[1:-1:2])
+            + 2.0 * np.sum(values[2:-2:2])
+        )
+        return float(weighted * h / 3.0)
 
 
-def _tail_strategy(value: str | None) -> str:
-    normalized = str(value or "").strip().casefold()
-    if (
-        not normalized
-        or normalized in {"38", "3/8", "three-eighths", "three_eighths"}
-        or normalized.startswith("38")
-    ):
-        return "38"
-    return "trapezoid"
+def integrate_ctc(t: np.ndarray, y: np.ndarray) -> CtcResult:
+    """Integrate one baseline-corrected curve using fixed internal policy.
 
-
-def integrate_ctc(
-    t: np.ndarray,
-    y: np.ndarray,
-    *,
-    eps_uniform: float | None = None,
-    uniformity_eps: float | None = None,
-    tail_strategy: str | None = None,
-    policy: Mapping[str, Any] | None = None,
-) -> tuple[float, str, bool, float, str]:
-    """Preserve clean-baseline Simpson/trapezoid selection and metadata."""
+    The policy is intentionally not caller-configurable: uniform grids use
+    Simpson 1/3 with a hard-coded relative tolerance of ``1e-6`` and a 3/8
+    tail for an odd interval count; nonuniform grids use composite trapezoid.
+    Finite-shape overflow and nonfinite numerical input produce a typed
+    unavailable result.
+    """
 
     time = np.asarray(t, dtype=float)
     values = np.asarray(y, dtype=float)
     if time.ndim != 1 or values.ndim != 1 or time.size != values.size:
         raise ValueError("t and y must be 1D arrays of equal length.")
+    if time.size == 0:
+        raise ValueError("t and y must contain at least one sample.")
     if np.any(~np.isfinite(time)) or np.any(~np.isfinite(values)):
-        raise ValueError("t and y must contain finite values.")
-
-    if policy:
-        uniformity_eps = policy.get("uniformity_eps", uniformity_eps)
-        tail_strategy = policy.get("tail_strategy", tail_strategy)
-    if eps_uniform is not None:
-        uniformity_eps = eps_uniform
-    used_eps = float(1e-6 if uniformity_eps is None else uniformity_eps)
-    used_tail = _tail_strategy(tail_strategy)
-
+        return CtcResult.unavailable("nonfinite input")
+    if time.size > 1 and np.any(np.diff(time) <= 0.0):
+        raise ValueError("t must be strictly increasing.")
     if time.size < 2:
-        return 0.0, "Trapezoidal", True, used_eps, used_tail
-
-    monotonic = bool(np.all(np.diff(time) > 0.0))
-    uniform = monotonic and is_uniform_time_grid(time, used_eps)
+        return CtcResult(0.0)
+    uniform = is_uniform_time_grid(time, 1e-6)
     if not uniform:
-        return (
-            _composite_trapezoid(time, values),
-            "Trapezoidal",
-            False,
-            used_eps,
-            used_tail,
-        )
-
-    intervals = time.size - 1
-    if intervals % 2 == 0:
-        return (
-            _simpson13_uniform(time, values),
-            "Simpson13",
-            True,
-            used_eps,
-            used_tail,
-        )
-
-    h = float(np.median(np.diff(time)))
-    if used_tail == "38" and time.size >= 4:
-        head_points = time.size - 3
-        head_value = (
-            _simpson13_uniform(time[:head_points], values[:head_points])
-            if head_points >= 3
-            else 0.0
-        )
-        tail_value = (
-            3.0
-            * h
-            * (
-                values[-4]
-                + 3.0 * values[-3]
-                + 3.0 * values[-2]
-                + values[-1]
+        value = _composite_trapezoid(time, values)
+    else:
+        intervals = time.size - 1
+        if intervals % 2 == 0:
+            value = _simpson13_uniform(time, values)
+        elif time.size >= 4:
+            head_points = time.size - 3
+            head_value = (
+                _simpson13_uniform(time[:head_points], values[:head_points])
+                if head_points >= 3
+                else 0.0
             )
-            / 8.0
-        )
-        return (
-            float(head_value + tail_value),
-            "Simpson13+38",
-            True,
-            used_eps,
-            used_tail,
-        )
-
-    head_value = (
-        _simpson13_uniform(time[:-1], values[:-1])
-        if time.size - 1 >= 3
-        else 0.0
-    )
-    tail_value = _trapezoid_segment(
-        time[-1] - time[-2],
-        values[-2],
-        values[-1],
-    )
-    return (
-        float(head_value + tail_value),
-        "Simpson13+TrapezoidTail",
-        True,
-        used_eps,
-        used_tail,
-    )
+            h = float(np.median(np.diff(time)))
+            with np.errstate(over="ignore", invalid="ignore"):
+                tail_value = (
+                    3.0 * h * (
+                        values[-4]
+                        + 3.0 * values[-3]
+                        + 3.0 * values[-2]
+                        + values[-1]
+                    ) / 8.0
+                )
+            value = float(head_value + tail_value)
+        else:
+            value = _composite_trapezoid(time, values)
+    if not np.isfinite(value):
+        return CtcResult.unavailable("nonfinite result")
+    return CtcResult(value)

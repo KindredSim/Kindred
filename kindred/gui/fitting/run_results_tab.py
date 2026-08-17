@@ -15,7 +15,8 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 from kindred.core.analysis.fit_statistics import FitMetric
-from kindred.core.analysis.global_fitting import SharedRefitPromotion
+from kindred.core.analysis.global_fit_execution import FitCoordinate
+from kindred.core.simulation_failure import FactualCause
 from kindred.gui.display_name_policy import (
     DIAGNOSTIC_LABEL_MAX_CHARS,
     PLOT_TITLE_LABEL_MAX_CHARS,
@@ -27,17 +28,22 @@ from kindred.gui.display_name_policy import (
     compact_text,
     dataset_alias,
 )
-from kindred.gui.fitting.contracts import FitRunIdentity, FitWorkerFailure
+from kindred.gui.fitting.contracts import (
+    FitPublicationBundle,
+    FitProjectionAvailability,
+    FitRunIdentity,
+)
 from kindred.gui.fitting.launch import (
     FitInitialApplyProposal,
     FitSharedRefitIntent,
 )
 from kindred.gui.fitting.reporting import (
     FitEstimateReportRow,
-    FitTerminalReportError,
+    FitProfileIntervalReportRow,
     FitTerminalReport,
     fit_bound_state,
     fit_metric_text,
+    fit_primary_model_lines,
     fit_terminal_extension_lines,
     fit_terminal_report_payload,
 )
@@ -62,6 +68,18 @@ _APPLY_SCOPE_LABELS = {
     "initial_concentrations": "Initial Conditions",
     "observable_definitions": "Observable Definitions",
 }
+_PROFILE_TABLE_HEADERS = (
+    "Coordinate",
+    "Estimate",
+    "Confidence",
+    "Lower",
+    "Upper",
+    "Status",
+    "Interval kind",
+    "Lower outcome",
+    "Upper outcome",
+    "Resolution",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,10 +139,15 @@ def _plain_json_data(value: object) -> object:
     if isinstance(value, np.ndarray):
         return _plain_json_data(value.tolist())
     if isinstance(value, Mapping):
-        return {
-            str(key): _plain_json_data(item)
-            for key, item in value.items()
-        }
+        normalized: dict[str, object] = {}
+        for raw_key, raw_item in value.items():
+            if isinstance(raw_key, FitCoordinate):
+                raise TypeError(
+                    "Fit run export does not accept typed FitCoordinate mapping keys."
+                )
+            key = str(raw_key)
+            normalized[key] = _plain_json_data(raw_item)
+        return normalized
     if isinstance(value, (tuple, list)):
         return [_plain_json_data(item) for item in value]
     raise TypeError(
@@ -152,11 +175,21 @@ def _fit_run_identity_export_payload(
     identity_payload = candidate.run_identity.payload
     if not isinstance(identity_payload, Mapping):
         raise TypeError("Fit run identity payload must be a JSON object.")
-    curves = project_fit_candidate_curves(candidate)
+    curve_failure: str | None = None
+    try:
+        curves = project_fit_candidate_curves(candidate)
+    except Exception as exc:
+        curves = ()
+        curve_failure = f"{type(exc).__name__}: {exc}"
     export = dict(identity_payload)
     export["schema_version"] = 2
     export["export_kind"] = "verbose_fit_run"
     export["fit_report"] = fit_terminal_report_payload(report)
+    export["curve_projection"] = (
+        {"status": "available"}
+        if curve_failure is None
+        else {"status": "unavailable", "reason": curve_failure}
+    )
     export["curves"] = [
         {
             "dataset_id": curve.dataset_id,
@@ -242,12 +275,47 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         identity: FitRunIdentity,
         candidate: FitCandidate | None = None,
         report: FitTerminalReport | None = None,
+        report_availability: FitProjectionAvailability | None = None,
+        semantic_copy_availability: FitProjectionAvailability | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         if not isinstance(identity, FitRunIdentity):
             raise TypeError("Results summary requires a FitRunIdentity.")
         if candidate is not None and not isinstance(candidate, FitCandidate):
             raise TypeError("candidate must be FitCandidate.")
+        if report is not None and not isinstance(report, FitTerminalReport):
+            raise TypeError("report must be FitTerminalReport or None.")
+        if report_availability is None:
+            report_availability = FitProjectionAvailability(
+                name="semantic_report",
+                state="available" if report is not None else "unavailable",
+                reason=None if report is not None else "Semantic report unavailable.",
+            )
+        if not isinstance(report_availability, FitProjectionAvailability):
+            raise TypeError(
+                "report_availability must be FitProjectionAvailability or None."
+            )
+        if report_availability.available != (report is not None):
+            raise ValueError(
+                "Summary report availability must exactly match its report value."
+            )
+        if semantic_copy_availability is None:
+            semantic_copy_availability = FitProjectionAvailability(
+                name="semantic_copy",
+                state="available" if report is not None else "unavailable",
+                reason=None if report is not None else "Semantic report unavailable.",
+            )
+        if not isinstance(
+            semantic_copy_availability,
+            FitProjectionAvailability,
+        ):
+            raise TypeError(
+                "semantic_copy_availability must be FitProjectionAvailability or None."
+            )
+        if semantic_copy_availability.available != report_availability.available:
+            raise ValueError(
+                "Summary semantic Copy availability must match report availability."
+            )
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("Results Summary")
@@ -256,6 +324,8 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         self._identity = identity
         self._candidate = candidate
         self._report = report
+        self._report_availability = report_availability
+        self._semantic_copy_availability = semantic_copy_availability
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -308,6 +378,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             "Parameters",
             "DF",
             "Completion",
+            "Primary model",
             "Joint optimizer convergence",
             "Joint optimizer diagnostic",
             "Weighted SSE",
@@ -373,6 +444,32 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         estimates_layout.addWidget(self._estimate_tables_label)
         body_layout.addWidget(estimates_group)
 
+        self._profile_group = QtWidgets.QGroupBox("Profile intervals", self)
+        self._profile_group.setObjectName("results_profile_group")
+        profile_layout = QtWidgets.QVBoxLayout(self._profile_group)
+        self._profile_table = QtWidgets.QTableWidget(
+            0,
+            len(_PROFILE_TABLE_HEADERS),
+            self._profile_group,
+        )
+        self._profile_table.setObjectName("results_profile_table")
+        self._profile_table.setHorizontalHeaderLabels(list(_PROFILE_TABLE_HEADERS))
+        self._profile_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._profile_table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._profile_table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self._profile_table.setSortingEnabled(False)
+        self._profile_table.setWordWrap(False)
+        self._profile_table.horizontalHeader().setStretchLastSection(True)
+        profile_layout.addWidget(self._profile_table)
+        self._profile_group.hide()
+        body_layout.addWidget(self._profile_group)
+
         aggregates_group = QtWidgets.QGroupBox("Per-dataset Aggregates")
         aggregates_layout = QtWidgets.QVBoxLayout(aggregates_group)
         self._aggregates_label = QtWidgets.QLabel(aggregates_group)
@@ -403,6 +500,8 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         self.refresh(
             identity,
             report=report,
+            report_availability=report_availability,
+            semantic_copy_availability=semantic_copy_availability,
         )
 
     def _update_fitted_params(self, report: FitTerminalReport | None) -> None:
@@ -486,11 +585,68 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
                 f"R² = {fit_metric_text(value)}"
                 for series, value in row.r_squared_by_series
             )
+            if row.x_point_count:
+                lines.append(
+                    f"  X: points = {row.x_point_count}; weighted SSE = "
+                    f"{fit_metric_text(row.x_weighted_residual_sse) if row.x_weighted_residual_sse is not None else 'unavailable'}; "
+                    f"deltaX = {tuple(round(value, 6) for value in row.x_delta_x)}; "
+                    f"match = {row.x_match_kinds}; sample = {row.x_sample_kinds}; "
+                    f"source rows = {row.x_source_rows}; segments = {row.x_segment_ids}; "
+                    f"discontinuities = {row.x_discontinuity_ids}"
+                )
             tooltip_lines.append(
                 f"{row.dataset_display_name}: Dataset ID {row.dataset_id}"
             )
         self._dataset_metrics_label.setText("\n".join(lines))
         self._dataset_metrics_label.setToolTip("\n".join(tooltip_lines))
+
+    @staticmethod
+    def _profile_cell(value: float | None) -> str:
+        return "unavailable" if value is None else f"{value:.6g}"
+
+    @staticmethod
+    def _profile_resolution_text(row: FitProfileIntervalReportRow) -> str:
+        if not row.resolution:
+            return "unavailable"
+        return json.dumps(
+            _plain_json_data(row.resolution),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _update_profile_table(self, report: FitTerminalReport | None) -> None:
+        profile_exists = bool(
+            report is not None
+            and any(
+                extension.kind == "profile_likelihood"
+                for extension in report.terminal_extensions
+            )
+        )
+        if not profile_exists:
+            self._profile_table.setRowCount(0)
+            self._profile_group.hide()
+            return
+        assert report is not None
+        self._profile_table.setRowCount(len(report.profile_intervals))
+        for row_index, row in enumerate(report.profile_intervals):
+            values = (
+                row.display_name,
+                self._profile_cell(row.estimate),
+                self._profile_cell(row.confidence),
+                self._profile_cell(row.lower),
+                self._profile_cell(row.upper),
+                row.status,
+                row.interval_kind,
+                row.lower_outcome or "unavailable",
+                row.upper_outcome or "unavailable",
+                self._profile_resolution_text(row),
+            )
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setToolTip(row.coordinate.to_machine_key())
+                self._profile_table.setItem(row_index, column, item)
+        self._profile_group.show()
 
     @staticmethod
     def _estimate_line(row: FitEstimateReportRow) -> str:
@@ -514,10 +670,13 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
 
     def _update_terminal_report(self, report: FitTerminalReport | None) -> None:
         if report is None:
-            self._estimate_tables_label.setText("No terminal estimate report available.")
+            reason = self._report_availability.reason or "Semantic report unavailable."
+            unavailable = f"No terminal estimate report available: {reason}"
+            self._estimate_tables_label.setText(unavailable)
             self._aggregates_label.setText("No per-dataset aggregates available.")
-            self._validity_label.setText("No terminal validity report available.")
-            self._validity_label.setToolTip("")
+            self._update_profile_table(None)
+            self._validity_label.setText(unavailable)
+            self._validity_label.setToolTip(reason)
             return
         estimate_rows = (
             *report.shared_estimates,
@@ -538,10 +697,10 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             geometric_mean = (
                 "—" if row.geometric_mean is None else f"{row.geometric_mean:.6g}"
             )
-            geometric_dispersion = (
+            geometric_spread = (
                 "—"
-                if row.geometric_dispersion is None
-                else f"{row.geometric_dispersion:.6g}"
+                if row.geometric_spread is None
+                else f"{row.geometric_spread:.6g}"
             )
             geometric_note = (
                 f" ({row.geometric_unavailable_reason})"
@@ -552,7 +711,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
                 f"{row.display_name} [{row.unit}]: n={row.n}; mean={row.arithmetic_mean:.6g}; "
                 f"sample SD={sample_sd}; SE={standard_error}; median={row.median:.6g}; "
                 f"IQR={row.iqr:.6g}; min={row.minimum:.6g}; max={row.maximum:.6g}; "
-                f"geometric mean={geometric_mean}; geometric dispersion={geometric_dispersion}"
+                f"geometric mean={geometric_mean}; geometric spread={geometric_spread}"
                 f"{geometric_note}"
             )
         self._aggregates_label.setText(
@@ -560,13 +719,51 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             if aggregate_lines
             else "No Per-dataset fitted scalar aggregates available."
         )
+        self._update_profile_table(report)
         method_lines = [
             f"Overall Fit status: {report.status}",
+            *fit_primary_model_lines(
+                report.primary_model,
+                report.primary_model_details,
+            ),
             "Joint optimizer convergence: "
             + ("converged" if report.joint_optimizer_converged else "did not converge"),
             f"Joint optimizer diagnostic: {report.joint_optimizer_diagnostic}",
             report.publication.message,
+            "Known input/condition context: "
+            + json.dumps(_plain_json_data(report.known_input_context), sort_keys=True),
+            "Weighting provenance: "
+            + json.dumps(
+                _plain_json_data(report.weighting_provenance),
+                sort_keys=True,
+            ),
         ]
+        for settlement in report.centred_fixed_effects_settlements:
+            method_lines.append(
+                f"Centred overall {settlement.parameter_name}: "
+                f"roster={', '.join(settlement.dataset_ids)}; "
+                f"reference={settlement.reference_dataset_id}; "
+                f"decoded overall={settlement.overall_decoded_value:.6g}; "
+                "optimizer deviations="
+                + ", ".join(
+                    f"{item.coordinate.dataset_id}={item.optimizer_value:.6g}"
+                    for item in settlement.deviations
+                )
+            )
+            method_lines.append(
+                "  decoded dataset values: "
+                + ", ".join(
+                    f"{dataset_id}={value:.6g}"
+                    for dataset_id, value in settlement.dataset_values.items()
+                )
+            )
+        if any(
+            item.requires_shared_refit
+            for item in report.publication.classifications
+        ):
+            method_lines.append(
+                "A completed Shared refit is required before parameter publication."
+            )
         method_lines.extend(report.validity_diagnostics or ("No validity warnings.",))
         if report.shared_refit_provenance:
             method_lines.append(
@@ -599,6 +796,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
                 "Parameters": report.parameter_count,
                 "DF": report.degrees_of_freedom,
                 "Completion": report.status,
+                "Primary model": report.primary_model,
                 "Joint optimizer convergence": (
                     "converged"
                     if report.joint_optimizer_converged
@@ -635,6 +833,8 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         *,
         candidate: FitCandidate | None = None,
         report: FitTerminalReport | None = None,
+        report_availability: FitProjectionAvailability | None = None,
+        semantic_copy_availability: FitProjectionAvailability | None = None,
     ) -> None:
         if not isinstance(identity, FitRunIdentity):
             raise TypeError("Results summary requires a FitRunIdentity.")
@@ -643,10 +843,40 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             if not isinstance(candidate, FitCandidate):
                 raise TypeError("candidate must be FitCandidate.")
             self._candidate = candidate
-        self._report = report
-        self._run_identity_label.setText(f"Run: {identity.short_hash}")
         if report is not None and not isinstance(report, FitTerminalReport):
             raise TypeError("Results summary report must be FitTerminalReport.")
+        if report_availability is None:
+            report_availability = FitProjectionAvailability(
+                name="semantic_report",
+                state="available" if report is not None else "unavailable",
+                reason=None if report is not None else "Semantic report unavailable.",
+            )
+        if semantic_copy_availability is None:
+            semantic_copy_availability = FitProjectionAvailability(
+                name="semantic_copy",
+                state="available" if report is not None else "unavailable",
+                reason=None if report is not None else "Semantic report unavailable.",
+            )
+        if not isinstance(report_availability, FitProjectionAvailability):
+            raise TypeError("Results summary report availability must be typed.")
+        if not isinstance(semantic_copy_availability, FitProjectionAvailability):
+            raise TypeError("Results summary semantic Copy availability must be typed.")
+        if report_availability.available != (report is not None):
+            raise ValueError(
+                "Summary report availability must exactly match its report value."
+            )
+        if semantic_copy_availability.available != report_availability.available:
+            raise ValueError(
+                "Summary semantic Copy availability must match report availability."
+            )
+        self._report = report
+        self._report_availability = report_availability
+        self._semantic_copy_availability = semantic_copy_availability
+        self._run_identity_label.setText(f"Run: {identity.short_hash}")
+        self._copy_identity_button.setEnabled(True)
+        self._copy_identity_json_button.setEnabled(
+            semantic_copy_availability.available
+        )
         self._update_stats(report)
         self._update_fitted_params(report)
         self._update_dataset_metrics(report)
@@ -670,6 +900,11 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             self.statusMessage.emit("Clipboard unavailable")
             return
         try:
+            if not self._semantic_copy_availability.available:
+                raise ValueError(
+                    "Semantic Fit Copy is unavailable: "
+                    f"{self._semantic_copy_availability.reason or 'semantic report unavailable.'}"
+                )
             if self._candidate is None:
                 clipboard.setText(self._identity.readable_json())
             else:
@@ -699,8 +934,8 @@ class FitTrackerPanel(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Fixed,
         )
-        self.setMinimumHeight(88)
-        self.setMaximumHeight(124)
+        self.setMinimumHeight(108)
+        self.setMaximumHeight(240)
         self._previous_cost: float | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -771,6 +1006,12 @@ class FitTrackerPanel(QtWidgets.QWidget):
         if cost.available:
             self._previous_cost = cost.value
         lines, tooltips = self._report_parameter_lines(report)
+        profile_lines, profile_tooltips = self._report_profile_lines(report)
+        if profile_lines:
+            if lines:
+                lines.append("")
+            lines.extend(profile_lines)
+            tooltips.extend(profile_tooltips)
         objective_calls = (
             "unavailable"
             if report.objective_call_count is None
@@ -832,6 +1073,72 @@ class FitTrackerPanel(QtWidgets.QWidget):
                 )
             )
             tooltips.append(f"{alias.full}: Set ID {set_id}")
+        return lines, tooltips
+
+    @staticmethod
+    def _report_profile_lines(
+        report: FitTerminalReport,
+    ) -> tuple[list[str], list[str]]:
+        """Render compact ordinary Profile status from the report DTO only."""
+
+        rows = tuple(report.profile_intervals)
+        if not rows:
+            return [], []
+        lines: list[str] = ["Profile intervals:"]
+        tooltips: list[str] = []
+        for row in rows:
+            coordinate = compact_text(
+                row.display_name,
+                max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
+            ).display
+            estimate = (
+                "unavailable" if row.estimate is None else f"{row.estimate:.6g}"
+            )
+            confidence = (
+                "confidence unavailable"
+                if row.confidence is None
+                else f"confidence={row.confidence:.6g}"
+            )
+            if row.status == "available" and row.lower is not None and row.upper is not None:
+                detail = (
+                    f"{coordinate} = {estimate} [{row.lower:.6g}, {row.upper:.6g}] "
+                    f"({confidence}; {row.interval_kind})"
+                )
+            elif row.status == "partial":
+                lower = "—" if row.lower is None else f"{row.lower:.6g}"
+                upper = "—" if row.upper is None else f"{row.upper:.6g}"
+                outcomes = ", ".join(
+                    item
+                    for item in (row.lower_outcome, row.upper_outcome)
+                    if item
+                ) or "endpoint unavailable"
+                detail = (
+                    f"{coordinate} = {estimate} [{lower}, {upper}] "
+                    f"({confidence}; partial, {outcomes})"
+                )
+            else:
+                endpoint_reason = ", ".join(
+                    item
+                    for item in (row.lower_outcome, row.upper_outcome)
+                    if item
+                )
+                resolution_reasons = []
+                for side in ("lower", "upper"):
+                    value = row.resolution.get(side)
+                    if isinstance(value, Mapping) and value.get("reason"):
+                        resolution_reasons.append(str(value["reason"]))
+                reason = "; ".join(
+                    item
+                    for item in (*resolution_reasons, endpoint_reason)
+                    if item
+                ) or row.interval_kind or row.status
+                detail = f"{coordinate} — {row.status}: {reason}"
+            lines.append(f"  {detail}")
+            tooltips.append(
+                f"{row.coordinate.to_machine_key()} · {row.interval_kind}; "
+                f"lower={row.lower_outcome or 'unavailable'}; "
+                f"upper={row.upper_outcome or 'unavailable'}"
+            )
         return lines, tooltips
 
     @staticmethod
@@ -912,27 +1219,39 @@ class RunResultsTab(QtWidgets.QWidget):
     statusMessage = Signal(str)
     copyAvailableChanged = Signal(bool)
     initialSelectionChanged = Signal()
-    sharedRefitRequested = Signal(object)
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
         *,
         color_resolver: ColorResolver | None = None,
+        shared_refit_handler: Callable[[object], object] | None = None,
     ) -> None:
         super().__init__(parent)
         if color_resolver is not None and not callable(color_resolver):
             raise TypeError("color_resolver must be callable.")
+        if shared_refit_handler is not None and not callable(shared_refit_handler):
+            raise TypeError("shared_refit_handler must be callable.")
         self._color_resolver = color_resolver
+        self._shared_refit_handler = shared_refit_handler
         self._run_identity: FitRunIdentity | None = None
         self._candidate: FitCandidate | None = None
         self._last_report: FitTerminalReport | None = None
+        self._report_availability = FitProjectionAvailability(
+            name="semantic_report",
+            state="unavailable",
+            reason="Semantic report unavailable.",
+        )
+        self._semantic_copy_availability = FitProjectionAvailability(
+            name="semantic_copy",
+            state="unavailable",
+            reason="Semantic report unavailable.",
+        )
         self._initial_apply_checkboxes: dict[
             tuple[str, str], QtWidgets.QCheckBox
         ] = {}
         self._shared_refit_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
         self._shared_refit_rows: dict[str, tuple[FitEstimateReportRow, ...]] = {}
         self._shared_refit_source_run_hash: str | None = None
-        self._shared_refit_source_origin: tuple[str, str] | None = None
         self._shared_refit_seed_data = "arithmetic_mean"
         self._available_apply_scopes: frozenset[str] = frozenset()
         self._unavailable_apply_reasons: Mapping[str, str] = MappingProxyType({})
@@ -1113,7 +1432,6 @@ class RunResultsTab(QtWidgets.QWidget):
         self._shared_refit_checkboxes = {}
         self._shared_refit_rows = {}
         self._shared_refit_source_run_hash = None
-        self._shared_refit_source_origin = None
         self._shared_refit_seed_combo.blockSignals(True)
         self._shared_refit_seed_combo.clear()
         self._shared_refit_seed_combo.blockSignals(False)
@@ -1135,7 +1453,7 @@ class RunResultsTab(QtWidgets.QWidget):
         }
         local_scalar_names = {
             scalar_name
-            for observable in getattr(candidate, "local_observables", ())
+            for observable in candidate.local_observables
             for scalar_name in observable.scalar_names
         }
         grouped: dict[str, list[FitEstimateReportRow]] = {}
@@ -1173,9 +1491,7 @@ class RunResultsTab(QtWidgets.QWidget):
                 )
             except (OverflowError, ValueError):
                 return False
-            minimum = max(row.minimum for row in rows)
-            maximum = min(row.maximum for row in rows)
-            if not math.isfinite(seed) or minimum >= maximum or not minimum <= seed <= maximum:
+            if not math.isfinite(seed):
                 return False
         return True
 
@@ -1219,7 +1535,6 @@ class RunResultsTab(QtWidgets.QWidget):
         self._shared_refit_button.setEnabled(
             bool(
                 self._shared_refit_source_run_hash
-                and self._shared_refit_source_origin
                 and self._last_report
                 and selected
             )
@@ -1240,10 +1555,6 @@ class RunResultsTab(QtWidgets.QWidget):
 
         self._clear_shared_refit_controls()
         self._shared_refit_source_run_hash = candidate.run_identity.short_hash
-        self._shared_refit_source_origin = (
-            candidate.origin.tab_id,
-            candidate.origin.capture_id,
-        )
         rows_by_name = self._shared_refit_source_rows(candidate, report)
         if not rows_by_name:
             return
@@ -1288,8 +1599,7 @@ class RunResultsTab(QtWidgets.QWidget):
     def _request_shared_refit(self) -> None:
         report = self._last_report
         source_run_hash = self._shared_refit_source_run_hash
-        source_origin = self._shared_refit_source_origin
-        if source_run_hash is None or source_origin is None or report is None:
+        if source_run_hash is None or report is None:
             self.statusMessage.emit("Shared refit requires a terminal Per-dataset Fit.")
             return
         selected_names = tuple(
@@ -1305,100 +1615,77 @@ class RunResultsTab(QtWidgets.QWidget):
                 "Select an eligible parameter and a scientifically valid starting estimate."
             )
             return
-        promotions: list[SharedRefitPromotion] = []
-        try:
-            for name in selected_names:
-                rows = self._shared_refit_rows[name]
-                minimum = max(row.minimum for row in rows)
-                maximum = min(row.maximum for row in rows)
-                if minimum >= maximum:
-                    raise ValueError(
-                        f"{rows[0].display_name} has no common finite bounds."
-                    )
-                log_scale = all(row.log_scale for row in rows)
-                if log_scale and minimum <= 0.0:
-                    raise ValueError(
-                        f"{rows[0].display_name} requires positive logarithmic bounds."
-                    )
-                promotions.append(
-                    SharedRefitPromotion(
-                        parameter_name=name,
-                        minimum=minimum,
-                        maximum=maximum,
-                        log10=log_scale,
-                        seed_statistic=statistic,
-                    )
-                )
-        except (TypeError, ValueError) as exc:
-            self.statusMessage.emit(f"Shared refit request rejected: {exc}")
-            return
         intent = FitSharedRefitIntent(
-            origin_tab_id=source_origin[0],
-            origin_capture_id=source_origin[1],
             source_run_hash=source_run_hash,
-            promotions=tuple(promotions),
+            parameter_names=selected_names,
+            seed_statistic=statistic,
         )
-        self.sharedRefitRequested.emit(intent)
+        if self._shared_refit_handler is None:
+            self.statusMessage.emit("Shared refit owner is unavailable.")
+            return
+        self._shared_refit_handler(intent)
 
-    def set_candidate(
-        self,
-        candidate: FitCandidate,
-        *,
-        report: FitTerminalReport,
-        available_scopes: frozenset[str] | None = None,
-        unavailable_reasons: Mapping[str, str] | None = None,
-    ) -> bool:
-        """Present a typed candidate; Apply feasibility remains owner-owned."""
+    def publish_publication_bundle(self, bundle: FitPublicationBundle) -> bool:
+        """Publish one owner-settled semantic/curve bundle atomically.
 
+        Report, Apply, semantic Copy, and curve projection are already
+        independently settled by the session owner.  This method only swaps
+        the visible state to that bundle; it never retries a failed sibling or
+        derives one projection's availability from another.
+        """
+
+        if not isinstance(bundle, FitPublicationBundle):
+            raise TypeError("Fit publication requires FitPublicationBundle.")
+        candidate = bundle.candidate
         if not isinstance(candidate, FitCandidate):
-            raise TypeError("candidate must be a FitCandidate.")
-        if not isinstance(report, FitTerminalReport):
-            raise TypeError("report must be a FitTerminalReport.")
-        self.restore_terminal_semantics(
-            candidate,
-            report=report,
-            available_scopes=available_scopes,
-            unavailable_reasons=unavailable_reasons,
-        )
-        self._clear_render_failures()
-        try:
-            curves = project_fit_candidate_curves(candidate)
-            presentation = self._candidate_plot_presentation(candidate, curves)
-            rendered = self._install_plot_projection(curves, presentation)
-        except Exception as exc:
-            self._reject_terminal_projection(exc)
-            return False
-        return bool(curves and rendered)
+            raise TypeError("Fit publication candidate must be FitCandidate.")
+        report = bundle.report
+        if report is not None and not isinstance(report, FitTerminalReport):
+            raise TypeError("Fit publication report must be FitTerminalReport or None.")
+        curves = tuple(bundle.curves)
+        if any(not isinstance(item, FitCurveDataset) for item in curves):
+            raise TypeError("Fit publication curves must be FitCurveDataset values.")
 
-    def restore_terminal_semantics(
-        self,
-        candidate: FitCandidate,
-        *,
-        report: FitTerminalReport,
-        available_scopes: frozenset[str] | None = None,
-        unavailable_reasons: Mapping[str, str] | None = None,
-    ) -> None:
-        """Restore Summary/Run/Apply truth without touching physical plots."""
-
-        if not isinstance(candidate, FitCandidate):
-            raise TypeError("candidate must be FitCandidate.")
-        if not isinstance(report, FitTerminalReport):
-            raise TypeError("report must be a FitTerminalReport.")
-        self.set_apply_availability(available_scopes, unavailable_reasons)
-        self.set_run_identity(candidate.run_identity)
+        # Custody and semantic projection are installed as one view update.
         self._candidate = candidate
+        self.set_run_identity(candidate.run_identity)
+        self._report_availability = bundle.report_availability
+        self._semantic_copy_availability = bundle.semantic_copy_availability
+        self.set_apply_availability(
+            bundle.apply_available_scopes,
+            bundle.apply_unavailable_reasons,
+        )
         self._terminal_failure_label.hide()
         self._last_report = report
         self._project_apply_availability()
-        self._tracker_panel.update_final(report)
-        self._project_shared_refit_context(candidate, report)
-        self._refresh_summary_dialog()
+        self._clear_render_failures()
+        if report is None:
+            self._tracker_panel.clear()
+            self._clear_shared_refit_controls()
+        else:
+            self._tracker_panel.update_final(report)
+            self._project_shared_refit_context(candidate, report)
 
-    def set_shared_refit_source_candidate(
+        self._curves = ()
+        self._dataset_presentation = MappingProxyType({})
+        if curves:
+            presentation = self._candidate_plot_presentation(candidate, curves)
+            rendered = self._install_plot_projection(curves, presentation)
+        else:
+            rendered = False
+            self._install_plot_projection((), {})
+            if not bundle.curve_availability.available:
+                self._record_render_failure(
+                    _FIT_AGGREGATE_VIEW,
+                    bundle.curve_availability.reason or "Fit curve projection unavailable.",
+                )
+        self._refresh_summary_dialog()
+        self.copyAvailableChanged.emit(self.copy_eligible())
+        return bool(rendered)
+
+    def set_shared_refit_source_publication(
         self,
-        candidate: FitCandidate,
-        *,
-        report: FitTerminalReport,
+        bundle: FitPublicationBundle,
     ) -> None:
         """Project retry controls from the retained Per-dataset source.
 
@@ -1407,55 +1694,72 @@ class RunResultsTab(QtWidgets.QWidget):
         retry after an unsuccessful Shared terminal.
         """
 
+        if not isinstance(bundle, FitPublicationBundle):
+            raise TypeError("Shared-refit source requires FitPublicationBundle.")
+        candidate = bundle.candidate
+        report = bundle.report
         if not isinstance(candidate, FitCandidate):
-            raise TypeError("Shared-refit source must be a FitCandidate.")
+            raise TypeError("Shared-refit source bundle requires FitCandidate.")
+        if report is None:
+            return
         if not isinstance(report, FitTerminalReport):
-            raise TypeError("Shared-refit source report must be a FitTerminalReport.")
+            raise TypeError("Shared-refit source report must be FitTerminalReport.")
         self._project_shared_refit_context(candidate, report)
 
-    def mark_terminal_projection_unavailable(self, error: BaseException) -> None:
-        """Disable physical plot/Copy authority while retaining terminal data."""
+    def set_terminal_failure(self, failure: FactualCause) -> None:
+        """Present the complete canonical factual-cause chain."""
 
-        self._reject_terminal_projection(error)
-
-    def set_terminal_report_failure(self, error: BaseException) -> None:
-        """Present semantic-report failure distinctly from physical plotting."""
-
-        if not isinstance(error, FitTerminalReportError):
-            raise TypeError("Semantic terminal failure must be FitTerminalReportError.")
-        self._last_report = None
-        self._tracker_panel.clear()
-        payload = {
-            "failure_type": type(error).__name__,
-            "message": str(error),
-        }
-        self._terminal_failure_label.setText(
-            "Fit terminal report failed — " + str(error)
-        )
-        self._terminal_failure_label.setToolTip(
-            json.dumps(payload, sort_keys=True, indent=2)
-        )
-        self._terminal_failure_label.show()
-        self.statusMessage.emit(str(error))
-        self.copyAvailableChanged.emit(False)
-
-    def set_terminal_failure(self, failure: FitWorkerFailure) -> None:
-        """Present a typed worker failure without flattening its provenance."""
-
-        if not isinstance(failure, FitWorkerFailure):
-            raise TypeError("Terminal Fit failure must be FitWorkerFailure.")
+        if not isinstance(failure, FactualCause):
+            raise TypeError("Terminal Fit failure must be FactualCause.")
         chain: list[str] = []
-        current: FitWorkerFailure | None = failure
+        current: FactualCause | None = failure
         while current is not None:
             code = f" [{current.code}]" if current.code else ""
+            context_values = current.context if isinstance(current.context, Mapping) else {}
+            detail_values = current.details if isinstance(current.details, Mapping) else {}
+            stage = context_values.get("preparation_stage", detail_values.get("preparation_stage"))
+            parameter_names = context_values.get("parameter_names", detail_values.get("parameter_names"))
+            context = ""
+            if stage:
+                context += f"; preparation stage={stage}"
+            if parameter_names:
+                context += f"; parameter_names={parameter_names}"
             chain.append(
-                f"{current.exception_type}{code}: {current.message}"
+                f"{current.type}{code}: {current.message}{context}"
             )
-            current = current.typed_cause
+            current = current.cause
         text = "Fit failed — " + " Caused by: ".join(chain)
         self._terminal_failure_label.setText(text)
         self._terminal_failure_label.setToolTip(
             json.dumps(failure.to_payload(), sort_keys=True, indent=2)
+        )
+        self._terminal_failure_label.show()
+
+    def set_terminal_unavailable(
+        self,
+        cause: FactualCause,
+        *,
+        older_retained_last_fit: bool = False,
+    ) -> None:
+        """Present typed scientific unavailability without a failure label."""
+
+        if not isinstance(cause, FactualCause):
+            raise TypeError("Scientific-unavailability cause must be FactualCause.")
+        chain: list[str] = []
+        current: FactualCause | None = cause
+        while current is not None:
+            code = f" [{current.code}]" if current.code else ""
+            chain.append(f"{current.type}{code}: {current.message}")
+            current = current.cause
+        text = "Fit result scientifically unavailable — " + " Caused by: ".join(chain)
+        if older_retained_last_fit:
+            text += (
+                "\nOlder retained Last Fit state is shown separately; it is not "
+                "the unavailable attempt."
+            )
+        self._terminal_failure_label.setText(text)
+        self._terminal_failure_label.setToolTip(
+            json.dumps(cause.to_payload(), sort_keys=True, indent=2)
         )
         self._terminal_failure_label.show()
 
@@ -1533,6 +1837,16 @@ class RunResultsTab(QtWidgets.QWidget):
         self._run_identity = None
         self._candidate = None
         self._last_report = None
+        self._report_availability = FitProjectionAvailability(
+            name="semantic_report",
+            state="unavailable",
+            reason="Semantic report unavailable.",
+        )
+        self._semantic_copy_availability = FitProjectionAvailability(
+            name="semantic_copy",
+            state="unavailable",
+            reason="Semantic report unavailable.",
+        )
         self._available_apply_scopes = frozenset()
         self._unavailable_apply_reasons = MappingProxyType({})
         self._apply_group.hide()
@@ -1567,6 +1881,13 @@ class RunResultsTab(QtWidgets.QWidget):
         if identity is None:
             return
         if self._summary_dialog is not None and self._summary_dialog.isVisible():
+            self._summary_dialog.refresh(
+                identity,
+                candidate=self._candidate,
+                report=self._last_report,
+                report_availability=self._report_availability,
+                semantic_copy_availability=self._semantic_copy_availability,
+            )
             self._summary_dialog.raise_()
             self._summary_dialog.activateWindow()
             return
@@ -1574,6 +1895,8 @@ class RunResultsTab(QtWidgets.QWidget):
             identity,
             candidate=self._candidate,
             report=self._last_report,
+            report_availability=self._report_availability,
+            semantic_copy_availability=self._semantic_copy_availability,
             parent=self,
         )
         dialog.statusMessage.connect(self.statusMessage)
@@ -1588,11 +1911,16 @@ class RunResultsTab(QtWidgets.QWidget):
         clipboard = _get_clipboard()
         if identity is None or clipboard is None:
             raise ValueError("Fit run JSON is unavailable.")
+        if not self._semantic_copy_availability.available:
+            raise ValueError(
+                "Semantic Fit Copy is unavailable because the terminal "
+                f"report projection failed: {self._semantic_copy_availability.reason}"
+            )
         if self._candidate is None:
             clipboard.setText(identity.readable_json())
         else:
             if self._last_report is None:
-                raise ValueError("Fit terminal report is unavailable.")
+                raise ValueError("Semantic Fit Copy is unavailable because no report exists.")
             clipboard.setText(
                 _fit_run_identity_export_json(self._candidate, self._last_report)
             )
@@ -1656,6 +1984,20 @@ class RunResultsTab(QtWidgets.QWidget):
                 continue
             reason = self._unavailable_apply_reasons.get(scope, "")
             if scope == "parameters" and self._last_report is not None:
+                requires_shared_refit = any(
+                    item.requires_shared_refit
+                    for item in self._last_report.publication.classifications
+                )
+                if requires_shared_refit:
+                    reason = " ".join(
+                        item
+                        for item in (
+                            reason,
+                            "A completed Shared refit is required before "
+                            "parameter publication.",
+                        )
+                        if item
+                    )
                 reason = " ".join(
                     item
                     for item in (
@@ -1683,8 +2025,7 @@ class RunResultsTab(QtWidgets.QWidget):
 
     def copy_all_to_clipboard(self) -> None:
         view = self._all_datasets_plot_view
-        candidate = self._candidate
-        if view is None or candidate is None:
+        if view is None or not self._curves:
             raise ValueError("No rendered Fit curves are available to copy.")
         if _FIT_AGGREGATE_VIEW in self._stale_plot_view_ids:
             if not self._refresh_plot_view(_FIT_AGGREGATE_VIEW):
@@ -1692,14 +2033,7 @@ class RunResultsTab(QtWidgets.QWidget):
         if not view.copy_eligible():
             self.copyAvailableChanged.emit(False)
             return
-        try:
-            curves = project_fit_candidate_curves(candidate)
-        except Exception as exc:
-            view.reject_projection(exc)
-            self._stale_plot_view_ids.discard(_FIT_AGGREGATE_VIEW)
-            self.copyAvailableChanged.emit(False)
-            return
-        view.copy_projection_to_clipboard(curves)
+        view.copy_projection_to_clipboard(self._curves)
 
     def set_view_autorange_locked(self, running: bool) -> None:
         """Retain the historical presentation state at this composition boundary."""
@@ -1888,20 +2222,6 @@ class RunResultsTab(QtWidgets.QWidget):
         self._refresh_active_plot_view()
         self.copyAvailableChanged.emit(self.copy_eligible())
 
-    def _reject_terminal_projection(self, error: BaseException) -> None:
-        """Clear physical/Copy authority while retaining terminal semantics."""
-
-        self._curves = ()
-        self._dataset_presentation = MappingProxyType({})
-        self._stale_plot_view_ids.clear()
-        for plot_view in (
-            *self._dataset_plot_views.values(),
-            *((self._all_datasets_plot_view,) if self._all_datasets_plot_view else ()),
-        ):
-            plot_view.reject_projection(error)
-        self._record_render_failure(_FIT_AGGREGATE_VIEW, str(error))
-        self.copyAvailableChanged.emit(False)
-
     def _record_render_failure(
         self,
         view_id: _FitResultViewIdentity,
@@ -2015,4 +2335,6 @@ class RunResultsTab(QtWidgets.QWidget):
             identity,
             candidate=self._candidate,
             report=self._last_report,
+            report_availability=self._report_availability,
+            semantic_copy_availability=self._semantic_copy_availability,
         )

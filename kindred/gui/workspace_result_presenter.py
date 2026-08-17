@@ -29,6 +29,7 @@ from kindred.core.result_repository import (
     ResultRepository,
     SimulationResultValue,
 )
+from kindred.core.simulation_failure import FactualCause
 from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 from kindred.gui.dataset_payload_snapshot import (
     ExperimentalLayerIdentity,
@@ -169,13 +170,13 @@ class InteractiveDisplayProjection:
     x_label: str
     y_label: str
     curves: tuple[InteractiveDisplayCurve, ...]
-    target_set_ids: tuple[str, ...] = ()
-    batch_id: str = ""
+    target_set_ids: tuple[str, ...]
+    batch_id: str
 
     def __post_init__(self) -> None:
-        generation = int(self.generation)
-        if generation < 0:
-            raise ValueError("interactive display generation must be nonnegative.")
+        generation = self.generation
+        if type(generation) is not int or generation <= 0:
+            raise ValueError("interactive display generation must be positive.")
         curves = tuple(self.curves)
         if any(not isinstance(curve, InteractiveDisplayCurve) for curve in curves):
             raise TypeError("curves must contain InteractiveDisplayCurve values.")
@@ -187,14 +188,12 @@ class InteractiveDisplayProjection:
             _required_id(value, "target_set_id") for value in self.target_set_ids
         )
         if not target_set_ids:
-            target_set_ids = (set_id,)
+            raise ValueError("interactive display target roster is required.")
         if len(set(target_set_ids)) != len(target_set_ids):
             raise ValueError("interactive display target roster must be unique.")
         if set_id not in target_set_ids:
             raise ValueError("set_id must belong to the interactive target roster.")
-        batch_id = str(self.batch_id or "").strip()
-        if not batch_id:
-            batch_id = f"{self.tab_id}:{generation}:{','.join(target_set_ids)}"
+        batch_id = _required_id(self.batch_id, "batch_id")
         object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
         object.__setattr__(self, "set_id", set_id)
         object.__setattr__(self, "generation", generation)
@@ -202,7 +201,7 @@ class InteractiveDisplayProjection:
         object.__setattr__(self, "y_label", _required_id(self.y_label, "y_label"))
         object.__setattr__(self, "curves", curves)
         object.__setattr__(self, "target_set_ids", target_set_ids)
-        object.__setattr__(self, "batch_id", _required_id(batch_id, "batch_id"))
+        object.__setattr__(self, "batch_id", batch_id)
 
 
 class _XlsxDestination:
@@ -507,6 +506,17 @@ def _result_warning_details(entry: ResultEntry | None) -> tuple[str, ...]:
         details.append(
             "Algebra failed: " + ", ".join(provenance.failed_algebra_outputs)
         )
+    for cause in provenance.algebra_errors:
+        if not isinstance(cause, FactualCause):
+            raise TypeError("algebra errors must contain FactualCause values.")
+        raw_name = cause.details.get("name")
+        observable_name = str(raw_name or "<unknown observable>")
+        code = cause.code if cause.code is not None else "<none>"
+        details.append(
+            "Algebra error for "
+            f"{observable_name}: type={cause.type}; code={code}; "
+            f"message={cause.message}"
+        )
     if provenance.omitted_algebra_outputs:
         details.append(
             "Algebra omitted: " + ", ".join(provenance.omitted_algebra_outputs)
@@ -536,7 +546,10 @@ def _result_entry_payload(entry: ResultEntry) -> Mapping[str, object]:
                             "succeeded": provenance.succeeded_algebra_outputs,
                             "failed": provenance.failed_algebra_outputs,
                             "omitted": provenance.omitted_algebra_outputs,
-                            "errors": provenance.algebra_errors,
+                            "errors": tuple(
+                                cause.to_payload()
+                                for cause in provenance.algebra_errors
+                            ),
                         }
                     ),
                 }
@@ -1285,11 +1298,10 @@ class WorkspaceResultProjection:
 
         seen: set[int] = set()
         warnings: list[WorkspacePlotLayer] = []
-        visible_layer_ids = {block.block_id for block in self.copy_all_blocks}
         for layer in self.plot_layers:
             entry = layer.result_entry
             if (
-                layer.layer_id not in visible_layer_ids
+                not layer.visible
                 or entry is None
                 or not entry.result.provenance.completed_with_warnings
                 or id(entry) in seen
@@ -1529,7 +1541,7 @@ def _export_column_header(
             "raw_observation_id",
             "dataset_name",
             "raw_column",
-            "model_species",
+            "model_target",
             "set_id",
         )
         if provenance.get(key) not in {None, ""}
@@ -1652,8 +1664,8 @@ def _observation_provenance(
         "dataset_name": source.dataset_name,
         "raw_column": source.raw_column,
     }
-    if source.model_species is not None:
-        payload["model_species"] = source.model_species
+    if source.model_target is not None:
+        payload["model_target"] = source.model_target
     if source.set_id is not None:
         payload["set_id"] = source.set_id
     return MappingProxyType(payload)
@@ -1990,6 +2002,7 @@ class WorkspaceResultPresenter:
         repository: ResultRepository,
         reference_lines_visible: bool,
         intervention_annotations_visible: bool,
+        mechanism_species: Sequence[str],
         active_overlay_layers: Sequence[ExperimentalLayerInput] = (),
         color_by_axis_selection: Mapping[
             AxisSeriesSelection,
@@ -2006,6 +2019,12 @@ class WorkspaceResultPresenter:
             raise TypeError("repository must be a ResultRepository.")
         if repository.tab_id != tab_id:
             raise ValueError("repository does not belong to the requested tab.")
+        mechanism_species_ordered = tuple(
+            _required_id(name, "mechanism species") for name in mechanism_species
+        )
+        if len(mechanism_species_ordered) != len(set(mechanism_species_ordered)):
+            raise ValueError("mechanism species roster must contain unique names.")
+        mechanism_species_set = set(mechanism_species_ordered)
         current_id = str(current_set_id or "")
         colors = {
             _axis_selection(
@@ -2056,9 +2075,9 @@ class WorkspaceResultPresenter:
         }
         derived_overlay_y_values: list[ExperimentalAxisSelection] = []
         for candidate in active_overlay_inputs:
-            if candidate.model_species is None or not (
+            if candidate.model_target is None or not (
                 bool(selected_y_uses_default_all)
-                or candidate.model_species in selected_model_y
+                or candidate.model_target in selected_model_y
             ):
                 continue
             selection = ExperimentalAxisSelection(
@@ -2087,26 +2106,26 @@ class WorkspaceResultPresenter:
                     candidate.raw_observation_id,
                 )
                 for candidate in active_overlay_inputs
-                if candidate.model_species == selected_x.series_name
+                if candidate.model_target == selected_x.series_name
             )
         elif isinstance(selected_x, ExperimentalAxisSelection):
             selected_x_source = experimental_by_axis.get(selected_x)
             excluded_experimental_y.add(selected_x)
-            if selected_x_source is not None and selected_x_source.model_species:
+            if selected_x_source is not None and selected_x_source.model_target:
                 excluded_simulation_y.add(
-                    SimulationSeriesAxisSelection(selected_x_source.model_species)
+                    SimulationSeriesAxisSelection(selected_x_source.model_target)
                 )
         simulation_x_axis: AxisSeriesSelection = selected_x
         if (
             isinstance(selected_x, ExperimentalAxisSelection)
             and selected_x_source is not None
-            and selected_x_source.model_species is not None
+            and selected_x_source.model_target is not None
         ):
             # Experimental X remains the selected/source-row identity for raw
             # observations, while simulated and Reference layers consume its
             # current mapped model-series identity.
             simulation_x_axis = SimulationSeriesAxisSelection(
-                selected_x_source.model_species
+                selected_x_source.model_target
             )
 
         layers: list[WorkspacePlotLayer] = []
@@ -2267,8 +2286,8 @@ class WorkspaceResultPresenter:
                 experimental.raw_observation_id,
             )
             candidate_label = f"{experimental.dataset_name}: {experimental.raw_column}"
-            if experimental.model_species:
-                candidate_label = f"{candidate_label} → {experimental.model_species}"
+            if experimental.model_target:
+                candidate_label = f"{candidate_label} → {experimental.model_target}"
             add_axis_candidate(y_axis, candidate_label)
             experimental_x = np.asarray(experimental.t, dtype=float)
             experimental_y = np.asarray(experimental.y, dtype=float)
@@ -2286,7 +2305,7 @@ class WorkspaceResultPresenter:
                             candidate
                             for candidate in active_overlay_inputs
                             if candidate.dataset_id == experimental.dataset_id
-                            and candidate.model_species == selected_x.series_name
+                            and candidate.model_target == selected_x.series_name
                         ),
                         None,
                     )
@@ -2406,21 +2425,18 @@ class WorkspaceResultPresenter:
         )
 
         def is_concentration(selection: AxisSeriesSelection) -> bool:
+            """Classify units from the canonical mechanism-species roster only."""
+
             if isinstance(selection, ExperimentalAxisSelection):
                 source = experimental_by_axis.get(selection)
-                return source is not None and source.model_species is not None
-            for layer in layers:
-                if layer.kind is ResultLayerKind.EXPERIMENTAL:
-                    continue
-                if selection not in dict(layer.series_axes).values():
-                    continue
-                if layer.result_entry is None:
-                    continue
                 return (
-                    selection.series_name
-                    not in layer.result_entry.result.provenance.requested_algebra_outputs
+                    source is not None
+                    and source.model_target in mechanism_species_set
                 )
-            return False
+            return (
+                isinstance(selection, SimulationSeriesAxisSelection)
+                and selection.series_name in mechanism_species_set
+            )
 
         y_label = (
             "Concentration (M)"
@@ -2750,7 +2766,7 @@ class WorkspaceResultPresenter:
                         "raw_observation_id",
                         "dataset_name",
                         "raw_column",
-                        "model_species",
+                        "model_target",
                         "set_id",
                     ),
                 )
@@ -2766,7 +2782,7 @@ class WorkspaceResultPresenter:
                             str(provenance.get("raw_observation_id") or ""),
                             str(provenance.get("dataset_name") or ""),
                             str(provenance.get("raw_column") or ""),
-                            str(provenance.get("model_species") or ""),
+                            str(provenance.get("model_target") or ""),
                             str(provenance.get("set_id") or ""),
                         ),
                     )

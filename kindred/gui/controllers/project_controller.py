@@ -7,8 +7,9 @@ import math
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import Protocol, runtime_checkable
 
 from PySide6 import QtCore, QtWidgets
 
@@ -22,7 +23,10 @@ from kindred.core.project_session import (
 from kindred.gui.controllers.config_controller import ConfigController
 from kindred.gui.controllers.simulation_job_owner import SimulationJobOwner
 from kindred.gui.dataset_import_staging import DatasetImportStaging
-from kindred.gui.fit_session_owner import FitSessionOwner
+from kindred.gui.fit_session_owner import (
+    FitReplacementDispositionSummary,
+    FitSessionOwner,
+)
 from kindred.gui.workspace_tab_registry import (
     PreparedWorkspaceInstall,
     WorkspaceTabRegistry,
@@ -33,9 +37,43 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "AuthoringDiscardMode",
+    "ProjectPhysicalInstallPort",
     "ProjectController",
     "ProjectTransientState",
 ]
+
+
+@runtime_checkable
+class ProjectPhysicalInstallPort(Protocol):
+    """Prepared physical-surface seam for atomic project replacement.
+
+    ``prepare_project_install`` owns all fallible widget, binding, signal,
+    attachment, and plot-resource construction while the old pages, shell,
+    and semantic owners remain current.  It returns opaque prepared custody
+    only after construction is complete; partial preparation must be cleaned
+    by the port itself.  ``publish_project_install`` performs only the fenced
+    physical reference/current-page assignment and then returns old-resource
+    custody for retirement after semantic publication and result-identity
+    purge.
+    """
+
+    def prepare_project_install(
+        self,
+        *,
+        prepared_session: PreparedProjectInstall,
+        prepared_workspace: PreparedWorkspaceInstall,
+    ) -> object: ...
+
+    def publish_project_install(
+        self,
+        prepared: object,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> object: ...
+
+    def discard_project_install(self, prepared: object) -> None: ...
+
+    def retire_project_install(self, retirement: object) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +88,9 @@ class ProjectTransientState:
     active_fit: bool = False
     active_import: bool = False
     active_xlsx_export: bool = False
+    fit_disposition: FitReplacementDispositionSummary = field(
+        default_factory=FitReplacementDispositionSummary
+    )
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -64,6 +105,13 @@ class ProjectTransientState:
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise TypeError(f"{field_name} must be bool.")
+        if not isinstance(
+            self.fit_disposition,
+            FitReplacementDispositionSummary,
+        ):
+            raise TypeError(
+                "fit_disposition must be FitReplacementDispositionSummary."
+            )
 
     @property
     def has_authoring_edits(self) -> bool:
@@ -82,6 +130,7 @@ class ProjectTransientState:
         return bool(
             self.active_run_or_preview
             or self.active_fit
+            or self.fit_disposition.active_worker
             or self.active_import
             or self.active_xlsx_export
         )
@@ -92,6 +141,7 @@ class ProjectTransientState:
             self.has_authoring_edits
             or self.slider_drafts
             or self.has_active_work
+            or self.fit_disposition.requires_disposition
         )
 
 
@@ -102,6 +152,7 @@ class _ProjectDispositionRequest:
     action: str
     archive_dirty: bool
     transient: ProjectTransientState
+    project_replacement: bool = False
     application_close: bool = False
 
 
@@ -122,7 +173,6 @@ class AuthoringDiscardMode(Enum):
 class _DispositionResult:
     content_token: ProjectContentToken
     clean_idle: bool = False
-    saved: bool = False
     discard_all_authoring: bool = False
     discard_slider_drafts: bool = False
 
@@ -130,7 +180,6 @@ class _DispositionResult:
 class ProjectController(QtCore.QObject):
     """The sole New/Open/Convert/Save/Save As/Close disposition owner."""
 
-    documentReplaced = QtCore.Signal()
     projectStateChanged = QtCore.Signal()
     closePendingChanged = QtCore.Signal(bool)
     nativeCloseAuthorized = QtCore.Signal()
@@ -150,6 +199,7 @@ class ProjectController(QtCore.QObject):
         dataset_imports: DatasetImportStaging,
         fit_session: FitSessionOwner,
         xlsx_exports: object,
+        physical_install: ProjectPhysicalInstallPort,
         set_status_text: Callable[[str], None],
         settle_execution_candidate: Callable[
             [ProjectContentToken],
@@ -182,8 +232,26 @@ class ProjectController(QtCore.QObject):
             raise TypeError("dataset_imports must be a DatasetImportStaging.")
         if not isinstance(fit_session, FitSessionOwner):
             raise TypeError("fit_session must be a FitSessionOwner.")
+        if not isinstance(physical_install, ProjectPhysicalInstallPort):
+            raise TypeError(
+                "physical_install must implement ProjectPhysicalInstallPort."
+            )
+        for owner_name, owner in (
+            ("simulation_jobs", simulation_jobs),
+            ("dataset_imports", dataset_imports),
+            ("fit_session", fit_session),
+        ):
+            for method_name in (
+                "request_project_replacement_cancellation",
+                "settle_project_replacement",
+            ):
+                if not callable(getattr(owner, method_name, None)):
+                    raise TypeError(
+                        f"{owner_name} must provide {method_name}()."
+                    )
         for method_name in (
-            "cancel_and_wait_for_project_replacement",
+            "request_project_replacement_cancellation",
+            "settle_project_replacement",
             "cancel_for_application_close",
         ):
             if not callable(getattr(xlsx_exports, method_name, None)):
@@ -226,6 +294,7 @@ class ProjectController(QtCore.QObject):
         self._dataset_imports = dataset_imports
         self._fit_session = fit_session
         self._xlsx_exports = xlsx_exports
+        self._physical_install = physical_install
         self._set_status_text = set_status_text
         self._settle_execution_candidate = settle_execution_candidate
         self._prepare_before_save = prepare_before_save
@@ -273,6 +342,21 @@ class ProjectController(QtCore.QObject):
     def _set_status(self, text: str) -> None:
         self._set_status_text(str(text))
 
+    def _set_replacement_success_status(
+        self,
+        success_text: str,
+        cleanup_failures: tuple[str, ...],
+    ) -> None:
+        """Publish exactly one terminal status for a committed replacement."""
+
+        if cleanup_failures:
+            self._set_status(
+                f"{success_text}, but cleanup reported: "
+                + "; ".join(cleanup_failures)
+            )
+            return
+        self._set_status(success_text)
+
     @property
     def mutation_admitted(self) -> bool:
         """Whether a new user mutation may enter the project lifecycle."""
@@ -318,6 +402,7 @@ class ProjectController(QtCore.QObject):
         action: str,
         *,
         expected_token: ProjectContentToken,
+        project_replacement: bool = False,
         application_close: bool = False,
     ) -> _DispositionResult | None:
         if not self._content_token_is_current(
@@ -331,6 +416,7 @@ class ProjectController(QtCore.QObject):
                 self._tabs.workspace_presentation()
             ),
             transient=self._transient_state(),
+            project_replacement=bool(project_replacement),
             application_close=bool(application_close),
         )
         if not request.archive_dirty and not request.transient.has_any:
@@ -360,7 +446,6 @@ class ProjectController(QtCore.QObject):
                 return None
             return _DispositionResult(
                 content_token=saved_token,
-                saved=True,
                 discard_slider_drafts=request.transient.slider_drafts,
             )
         if choice is _DispositionChoice.DISCARD:
@@ -392,12 +477,42 @@ class ProjectController(QtCore.QObject):
             details.append("Slider Preview drafts are not project content.")
         if transient.active_run_or_preview:
             details.append("Run or Preview work is still active.")
-        if transient.active_fit:
+        fit_disposition = transient.fit_disposition
+        if transient.active_fit or fit_disposition.active_worker:
             details.append("Fit work is still active.")
+        if fit_disposition.has_retained_work:
+            if fit_disposition.retained_completed_fit:
+                if fit_disposition.apply_ready:
+                    details.append(
+                        "Completed Fit results are retained and still have "
+                        "values available to Apply."
+                    )
+                else:
+                    details.append(
+                        "Completed Fit results are retained; no values remain "
+                        "available to Apply."
+                    )
+            elif fit_disposition.retained_diagnostic_only:
+                details.append("Diagnostic-only Fit results are retained.")
+            if fit_disposition.retained_nonconverged:
+                details.append("The retained Fit did not converge.")
+            if fit_disposition.retained_terminal and not (
+                fit_disposition.retained_completed_fit
+                or fit_disposition.retained_diagnostic_only
+            ):
+                details.append("A terminal Fit state is retained.")
+            if fit_disposition.setup_validation_blocked:
+                details.append("Fit setup edits still require correction.")
+            if fit_disposition.shared_refit_retry:
+                details.append("A Shared-refit retry remains staged.")
         if transient.active_import:
             details.append("A dataset import is still active.")
         if transient.active_xlsx_export:
             details.append("An XLSX export is still active.")
+        if request.project_replacement and transient.has_active_work:
+            details.append(
+                "Continuing with this project replacement will stop active work."
+            )
         details.append(f"Choose once how to proceed before {request.action}.")
 
         dialog = QtWidgets.QMessageBox(self._parent_widget)
@@ -447,6 +562,8 @@ class ProjectController(QtCore.QObject):
             discard_parts.append("Invalid Cell Edit(s)")
         if transient.slider_drafts:
             discard_parts.append("Slider Preview")
+        if fit_disposition.requires_disposition:
+            discard_parts.append("Retained Fit Work")
         if not discard_parts and not transient.has_active_work:
             raise RuntimeError("Disposition prompt has no discardable work.")
         if not discard_parts:
@@ -470,14 +587,18 @@ class ProjectController(QtCore.QObject):
                 )
             else:
                 discard_label = f"Discard {discard_subject} and Close"
-        elif transient.has_active_work:
+        elif request.project_replacement and transient.has_active_work:
             discard_label = (
                 f"Discard {discard_subject}, Stop Active Work, and Continue"
                 if discard_subject
                 else "Stop Active Work and Continue"
             )
         else:
-            discard_label = f"Discard {discard_subject} and Continue"
+            discard_label = (
+                f"Discard {discard_subject} and Continue"
+                if discard_subject
+                else "Continue"
+            )
         discard_button = dialog.addButton(
             discard_label,
             QtWidgets.QMessageBox.ButtonRole.DestructiveRole,
@@ -506,55 +627,43 @@ class ProjectController(QtCore.QObject):
 
     def _settle_replacement_workers(self) -> bool:
         deadline = time.monotonic() + self._replacement_timeout_seconds
-        try:
-            simulation_stopped = bool(
-                self._simulation_jobs.cancel_and_wait_for_project_replacement(
-                    deadline
+        owners = (
+            ("Simulation", self._simulation_jobs),
+            ("Dataset import", self._dataset_imports),
+            ("Fit", self._fit_session),
+            ("XLSX export", self._xlsx_exports),
+        )
+
+        # Admission fencing and cancellation are deliberately a complete
+        # broadcast phase.  No owner is allowed to consume the shared
+        # deadline before every other active owner has received its request.
+        request_failures: set[str] = set()
+        for label, owner in owners:
+            try:
+                owner.request_project_replacement_cancellation()
+            except Exception:
+                logger.exception(
+                    "%s cancellation request failed during project replacement",
+                    label,
                 )
-            )
-        except Exception:
-            logger.exception(
-                "Simulation settlement failed during project replacement"
-            )
-            simulation_stopped = False
-        try:
-            imports_stopped = bool(
-                self._dataset_imports.cancel_and_settle_for_project_replacement(
-                    deadline
+                request_failures.add(label)
+
+        settlement_failures: set[str] = set(request_failures)
+        for label, owner in owners:
+            try:
+                settled = bool(owner.settle_project_replacement(deadline))
+            except Exception:
+                logger.exception(
+                    "%s settlement failed during project replacement",
+                    label,
                 )
-            )
-        except Exception:
-            logger.exception(
-                "Dataset import settlement failed during project replacement"
-            )
-            imports_stopped = False
-        try:
-            fit_stopped = bool(
-                self._fit_session.close_for_project_replacement(deadline)
-            )
-        except Exception:
-            logger.exception("Fit settlement failed during project replacement")
-            fit_stopped = False
-        try:
-            xlsx_stopped = bool(
-                self._xlsx_exports.cancel_and_wait_for_project_replacement(
-                    deadline
-                )
-            )
-        except Exception:
-            logger.exception(
-                "XLSX export settlement failed during project replacement"
-            )
-            xlsx_stopped = False
+                settled = False
+            if not settled:
+                settlement_failures.add(label)
         failed = tuple(
             label
-            for label, succeeded in (
-                ("Simulation", simulation_stopped),
-                ("Dataset import", imports_stopped),
-                ("Fit", fit_stopped),
-                ("XLSX export", xlsx_stopped),
-            )
-            if not succeeded
+            for label, _owner in owners
+            if label in settlement_failures
         )
         if failed:
             logger.error(
@@ -593,41 +702,151 @@ class ProjectController(QtCore.QObject):
         prepared_session: PreparedProjectInstall,
         prepared_workspace: PreparedWorkspaceInstall,
         disposition: _DispositionResult,
-    ) -> bool:
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Publish a prepared replacement and return its cleanup outcome.
+
+        The first tuple item distinguishes a failure before publication from a
+        committed replacement.  The second item contains only deduplicated
+        best-effort cleanup failures observed after the new project became
+        authoritative.
+        """
+
         if not self._content_token_is_current(
             disposition.content_token,
             action="Project replacement",
         ):
-            return False
-        if not self._settle_replacement_workers():
-            return False
+            return False, ()
         previous_document = self._session.document
+        prepared_physical: object | None = None
         try:
-            self._apply_discard(disposition)
+            prepared_physical = self._physical_install.prepare_project_install(
+                prepared_session=prepared_session,
+                prepared_workspace=prepared_workspace,
+            )
+        except Exception as exc:
+            logger.exception("Project physical installation preparation failed")
+            self._set_status(
+                "Project replacement was not completed because its physical "
+                f"surfaces could not be prepared: {exc}"
+            )
+            return False, ()
+        if prepared_physical is None:
+            raise TypeError(
+                "physical_install.prepare_project_install() must return "
+                "prepared custody."
+            )
+        # Detached physical preparation is deliberately completed while the
+        # old semantic/runtime/page/active-work owners remain untouched. A
+        # stale token must also abort before cancellation admission is fenced.
+        if not self._content_token_is_current(
+            disposition.content_token,
+            action="Project replacement",
+        ):
+            self._physical_install.discard_project_install(prepared_physical)
+            return False, ()
+        if not self._settle_replacement_workers():
+            self._physical_install.discard_project_install(prepared_physical)
+            return False, ()
+        physical_published = False
+        session_published = False
+        try:
+            if not self._content_token_is_current(
+                disposition.content_token,
+                action="Project replacement",
+            ):
+                self._physical_install.discard_project_install(
+                    prepared_physical
+                )
+                return False, ()
+            # Physical publication is the last fallible phase.  Preparation
+            # already constructed, rendered, attached, and bound every
+            # incoming consumer; this call only fences and assigns the
+            # prepared physical references/selections.  Do not discard old
+            # authoring here: the old project remains semantically current
+            # until both assignment-only semantic commits succeed.
+            retirement = self._physical_install.publish_project_install(
+                prepared_physical,
+                expected_token=disposition.content_token,
+            )
+            physical_published = True
+            if not self._content_token_is_current(
+                disposition.content_token,
+                action="Project replacement",
+            ):
+                self._physical_install.discard_project_install(
+                    prepared_physical
+                )
+                return False, ()
             committed_token = self._session.commit_install(
                 prepared_session,
                 expected_token=disposition.content_token,
             )
             if committed_token is None:
+                self._physical_install.discard_project_install(
+                    prepared_physical
+                )
                 self._content_token_is_current(
                     disposition.content_token,
                     action="Project replacement",
                 )
-                return False
-            self._tabs.commit_install(prepared_workspace)
+                return False, ()
+            session_published = True
+            if not self._tabs.commit_install(
+                prepared_workspace,
+                expected_token=committed_token,
+            ):
+                raise RuntimeError(
+                    "Workspace replacement registry rejected its current token."
+                )
+        except Exception:
+            if physical_published and not session_published:
+                try:
+                    self._physical_install.discard_project_install(
+                        prepared_physical
+                    )
+                except Exception:
+                    logger.exception(
+                        "Prepared project physical custody could not be discarded"
+                    )
+            elif not physical_published:
+                try:
+                    self._physical_install.discard_project_install(
+                        prepared_physical
+                    )
+                except Exception:
+                    logger.exception(
+                        "Prepared project physical custody could not be discarded"
+                    )
+            raise
         finally:
             self._dataset_imports.resume_after_project_replacement()
-        self._purge_replaced_project_results(previous_document)
-        self.documentReplaced.emit()
+        cleanup_failures = list(
+            self._purge_replaced_project_results(previous_document)
+        )
+        try:
+            retirement_failures = self._physical_install.retire_project_install(
+                retirement
+            )
+            if retirement_failures is not None:
+                cleanup_failures.extend(
+                    str(item) for item in retirement_failures
+                )
+        except Exception as exc:
+            # Retirement is deliberately after publication and old-result
+            # purge.  A cleanup defect must be visible, but it cannot turn
+            # the newly published project back into the old one.
+            logger.exception("Old project physical retirement failed")
+            cleanup_failures.append(f"physical retirement: {exc}")
         self.projectStateChanged.emit()
-        return True
+        return True, tuple(dict.fromkeys(cleanup_failures))
 
     def _purge_replaced_project_results(
         self,
         previous_document: ProjectDocument,
-    ) -> None:
+    ) -> tuple[str, ...]:
         """Drop old result identities only after both prepared installs commit."""
 
+        failures: list[str] = []
         for tab in previous_document.tabs:
             set_ids = tuple(
                 initial_set.set_id
@@ -635,11 +854,15 @@ class ProjectController(QtCore.QObject):
             )
             try:
                 self._simulation_jobs.purge_tab(tab.tab_id, set_ids)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "Old Simulation result state could not be purged for tab %s",
                     tab.tab_id,
                 )
+                failures.append(
+                    f"result purge for tab {tab.tab_id}: {exc}"
+                )
+        return tuple(failures)
 
     def new_project(self) -> bool:
         if self._reject_mutation_during_close("New Project"):
@@ -664,16 +887,21 @@ class ProjectController(QtCore.QObject):
         disposition = self._resolve_disposition(
             "starting a new project",
             expected_token=operative_token,
+            project_replacement=True,
         )
         if disposition is None:
             return False
-        if not self._commit_project_install(
+        committed, cleanup_failures = self._commit_project_install(
             prepared_session,
             prepared_workspace,
             disposition,
-        ):
+        )
+        if not committed:
             return False
-        self._set_status("New project")
+        self._set_replacement_success_status(
+            "New project",
+            cleanup_failures,
+        )
         return True
 
     def load_project(self) -> bool:
@@ -733,6 +961,16 @@ class ProjectController(QtCore.QObject):
                 f"File no longer exists:\n{absolute_path}",
             )
             return False
+        if self._same_canonical_path(
+            absolute_path,
+            self._session.current_path,
+        ):
+            self._set_status(f"Project is already open: {absolute_path}")
+            try:
+                self._config.record_recent_project(absolute_path)
+            except Exception:
+                logger.warning("Recent-project promotion failed", exc_info=True)
+            return True
         try:
             decoded = self._archive_store.load(absolute_path)
         except Exception as exc:
@@ -767,30 +1005,21 @@ class ProjectController(QtCore.QObject):
         disposition = self._resolve_disposition(
             "opening another project",
             expected_token=operative_token,
+            project_replacement=True,
         )
         if disposition is None:
             return False
-        if (
-            disposition.saved
-            and self._same_canonical_path(
-                absolute_path,
-                self._session.current_path,
-            )
-        ):
-            self._apply_discard(disposition)
-            self._set_status(f"Project is already open: {absolute_path}")
-            try:
-                self._config.record_recent_project(absolute_path)
-            except Exception:
-                logger.warning("Recent-project promotion failed", exc_info=True)
-            return True
-        if not self._commit_project_install(
+        committed, cleanup_failures = self._commit_project_install(
             prepared_session,
             prepared_workspace,
             disposition,
-        ):
+        )
+        if not committed:
             return False
-        self._set_status(f"Opened project: {absolute_path}")
+        self._set_replacement_success_status(
+            f"Opened project: {absolute_path}",
+            cleanup_failures,
+        )
         try:
             self._config.record_recent_project(absolute_path)
         except Exception:
@@ -811,6 +1040,11 @@ class ProjectController(QtCore.QObject):
             os.path.realpath(os.path.abspath(os.fsdecode(os.fspath(second))))
         )
         return first_path == second_path
+
+    def is_current_project_path(self, path: str | os.PathLike[str]) -> bool:
+        """Return whether ``path`` resolves to the active project archive."""
+
+        return self._same_canonical_path(path, self._session.current_path)
 
     def save_project(self) -> bool:
         if self._reject_mutation_during_close("Save Project"):
@@ -934,7 +1168,7 @@ class ProjectController(QtCore.QObject):
         ):
             return None
         destination = self._save_as_path(path)
-        if os.path.exists(destination) and not self._confirm_overwrite(
+        if os.path.lexists(destination) and not self._confirm_overwrite(
             destination
         ):
             return None
@@ -1083,23 +1317,26 @@ class ProjectController(QtCore.QObject):
                     "Idle Fit cleanup failed during application Close"
                 )
                 fit_idle_closed = False
-            if not fit_idle_closed:
-                self._set_status(
-                    "Close was not completed because the idle Fit window "
-                    "could not be destroyed safely."
-                )
-                return False
-            if not self._session.is_content_token_current(
-                disposition.content_token
-            ):
-                self._set_status(
-                    "Close was not completed because the current project changed."
-                )
-                return False
-            self._close_started = True
-            self._close_authorization = "native"
-            self.nativeCloseAuthorized.emit()
-            return True
+            if fit_idle_closed:
+                if not self._session.is_content_token_current(
+                    disposition.content_token
+                ):
+                    self._set_status(
+                        "Close was not completed because the current project changed."
+                    )
+                    return False
+                self._close_started = True
+                self._close_authorization = "native"
+                self.nativeCloseAuthorized.emit()
+                return True
+            # A failed synchronous idle-window teardown is still an owner
+            # cleanup problem, not a second Close policy.  Fall through to
+            # the already-established single 60-second bounded state machine;
+            # its Fit owner cancellation/settlement path gets one chance to
+            # finish disposal before the hard-exit deadline.
+            self._set_status(
+                "Idle Fit cleanup did not finish; waiting for the bounded Close path."
+            )
         self._close_started = True
         self._close_pending = True
         self._close_deadline = (

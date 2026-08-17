@@ -66,7 +66,7 @@ class ExperimentalLayerInput:
     raw_observation_id: str
     dataset_name: str
     raw_column: str
-    model_species: str | None
+    model_target: str | None
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
@@ -99,13 +99,13 @@ class ExperimentalLayerInput:
             raise ValueError(
                 "Experimental layer identity must match its dataset/raw IDs."
             )
-        if self.model_species is not None and (
-            not isinstance(self.model_species, str)
-            or not self.model_species
-            or self.model_species != self.model_species.strip()
+        if self.model_target is not None and (
+            not isinstance(self.model_target, str)
+            or not self.model_target
+            or self.model_target != self.model_target.strip()
         ):
             raise ValueError(
-                "Experimental mapped-model identity must be None or a "
+                "Experimental mapped-target identity must be None or a "
                 "nonblank edge-normalized string."
             )
         if self.set_id is not None and (
@@ -235,7 +235,7 @@ def build_experimental_layer_inputs(
                     raw_observation_id=raw_observation_id,
                     dataset_name=record.display_name,
                     raw_column=raw_column,
-                    model_species=mapping.get(raw_observation_id),
+                    model_target=mapping.get(raw_observation_id),
                     set_id=(link.set_id if link is not None else None),
                     t=series.t,
                     y=series.y,

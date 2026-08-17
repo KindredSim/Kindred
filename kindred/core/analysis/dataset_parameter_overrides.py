@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Mapping
 
 __all__ = [
+    "FIT_SCOPE_CENTRED_FIXED_EFFECTS",
     "FitCoupledVariableParamSpec",
+    "FitCentredFixedEffectsParamSpec",
     "FitDatasetParameterOverrides",
     "FitDatasetVariableParamSpec",
     "FitSharedVariableParamSpec",
 ]
+
+
+FIT_SCOPE_CENTRED_FIXED_EFFECTS = "centred_fixed_effects"
 
 
 def _identifier(value: object, field: str) -> str:
@@ -107,6 +113,85 @@ class FitSharedVariableParamSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class FitCentredFixedEffectsParamSpec:
+    """One mechanism parameter with an overall and centred dataset effect.
+
+    ``initial_values`` is the admitted physical start for every included
+    dataset.  The layout encodes these values on one raw scale (physical for
+    linear parameters, log10 for log parameters), then centres the deviations
+    on that same scale.  Dataset IDs are canonicalized by the layout, not by
+    presentation order.
+    """
+
+    parameter_name: str
+    dataset_ids: tuple[str, ...]
+    initial_values: tuple[tuple[str, float], ...]
+    minimum: float
+    maximum: float
+    log10: bool = False
+
+    def __post_init__(self) -> None:
+        parameter_name = _identifier(self.parameter_name, "centred parameter name")
+        dataset_ids = tuple(
+            _identifier(value, "centred dataset ID") for value in self.dataset_ids
+        )
+        if (
+            not dataset_ids
+            or len(dataset_ids) != len(set(dataset_ids))
+        ):
+            raise ValueError(
+                f"Centred parameter {parameter_name!r} requires unique dataset IDs."
+            )
+        starts: dict[str, float] = {}
+        raw_starts = (
+            tuple(self.initial_values.items())
+            if isinstance(self.initial_values, Mapping)
+            else tuple(self.initial_values)
+        )
+        for raw_dataset_id, raw_value in raw_starts:
+            dataset_id = _identifier(raw_dataset_id, "centred start dataset ID")
+            if dataset_id in starts:
+                raise ValueError(
+                    f"Centred parameter {parameter_name!r} repeats dataset {dataset_id!r}."
+                )
+            starts[dataset_id] = _finite(
+                raw_value,
+                f"{parameter_name}:{dataset_id} initial",
+            )
+        if set(starts) != set(dataset_ids):
+            raise ValueError(
+                f"Centred parameter {parameter_name!r} starts must exactly match its dataset roster."
+            )
+        minimum = _finite(self.minimum, f"{parameter_name} minimum")
+        maximum = _finite(self.maximum, f"{parameter_name} maximum")
+        if minimum >= maximum:
+            raise ValueError(
+                f"Centred parameter {parameter_name!r} requires minimum < maximum."
+            )
+        if bool(self.log10) and minimum <= 0.0:
+            raise ValueError(
+                f"Centred parameter {parameter_name!r} log10 bounds must be positive."
+            )
+        if any(
+            value < minimum or value > maximum
+            for value in starts.values()
+        ):
+            raise ValueError(
+                f"Centred parameter {parameter_name!r} starts must lie inside its bounds."
+            )
+        object.__setattr__(self, "parameter_name", parameter_name)
+        dataset_ids = tuple(sorted(dataset_ids))
+        object.__setattr__(self, "dataset_ids", dataset_ids)
+        object.__setattr__(
+            self,
+            "initial_values",
+            tuple((dataset_id, starts[dataset_id]) for dataset_id in dataset_ids),
+        )
+        object.__setattr__(self, "minimum", minimum)
+        object.__setattr__(self, "maximum", maximum)
+        object.__setattr__(self, "log10", bool(self.log10))
+
+@dataclass(frozen=True, slots=True)
 class FitDatasetParameterOverrides:
     """Fixed and variable evaluator inputs for one stable dataset."""
 
@@ -126,7 +211,7 @@ class FitDatasetParameterOverrides:
                 )
             fixed_names.add(name)
             fixed.append((name, _finite(raw_value, f"{dataset_id}:{name}")))
-        variables = tuple(self.variable_params)
+        variables = tuple(sorted(self.variable_params, key=lambda item: item.name))
         variable_names = [item.name for item in variables]
         if len(variable_names) != len(set(variable_names)):
             raise ValueError(

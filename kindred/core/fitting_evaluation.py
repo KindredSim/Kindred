@@ -17,20 +17,22 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
 import numpy as np
 
 from kindred.core.exceptions import (
-    FitCandidateDomainError,
     FitSimulationError,
     FittingCancelled,
     KindredError,
+    KineticRuntimeDomainError,
     SimulationCancelled,
 )
-from kindred.core.algebra.errors import (
-    AlgebraDomainError,
-    AlgebraTypeError,
-    AlgebraZeroDivError,
+from kindred.core.analysis.fit_evaluation_outcome import (
+    ScientificUnavailable,
 )
-from kindred.core.runtime_defaults import (
-    USE_ANALYTIC_JACOBIAN_DEFAULT,
-    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+from kindred.core.analysis import fit_evaluation_outcome as _fit_outcome
+from kindred.core.algebra.errors import (
+    AlgebraError,
+)
+from kindred.core.algebra.observable_introspection import AdmittedAlgebraProgram
+from kindred.core.algebra.simulation_series import (
+    evaluate_compiled_algebra_series_for_simulation,
 )
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
@@ -46,7 +48,6 @@ from kindred.core.simulation_preparation import (
     bind_simulation_execution_request_interventions,
     build_simulation_request_from_prepared_run,
     canonicalize_request_parameter_names,
-    compose_simulation_target_identity,
     partition_simulation_parameter_values,
     metadata_view_for_mechanism,
     prepare_bound_mechanism,
@@ -54,16 +55,22 @@ from kindred.core.simulation_preparation import (
     resolve_prepared_run_intervention_execution,
     SimulationPreparationError,
 )
-from kindred.core.simulation_preparation_stages import build_solver_config
+from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
 from kindred.core.result_repository import SimulationResultValue
-from kindred.core.simulation_result_finalization import finalize_simulation_result
+from kindred.core.simulation_result_finalization import (
+    build_simulation_row_algebra_context,
+    finalize_simulation_result,
+)
 from kindred.core.simulator.solver_types import (
-    DEFAULT_SOLVER_NAME,
     SimulationCancellationControl,
+    SimulationExecutionOutcome,
+    SimulationScientificUnavailability,
 )
 from kindred.core.simulator.solvers import solve_ode
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulator.executable_identity import compose_target_executable_identity
+from kindred.core.time_grid import build_time_grid
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +81,11 @@ __all__ = [
     "FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED",
     "PreparedFittingExecutionContext",
     "SerialFittingEvaluator",
-    "is_candidate_domain_failure",
     "evaluate_fitting_series",
     "prepare_fitting_execution_context",
 ]
+
+_FittingSeriesOutcome = _fit_outcome.FittingSeriesOutcome
 
 FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED = "optimizer_shared"
 FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET = "optimizer_dataset"
@@ -115,92 +123,98 @@ def _coerce_consumed_parameter_value(
         failed_params=dict(failed_params or {}) or None,
         details={
             "fatal": True,
-            "candidate_domain": False,
             "parameter_origin": origin,
         },
     )
 
 
-def _raw_candidate_domain_eligible(exc: BaseException) -> bool:
-    """Consume only the A1 typed numerical-runtime marker."""
-
-    details = getattr(exc, "details", None)
-    return bool(
-        getattr(exc, "candidate_domain_eligible", False) is True
-        or (
-            isinstance(exc, KindredError)
-            and isinstance(details, Mapping)
-            and details.get("candidate_domain_eligible") is True
-        )
-    )
-
-
-def _candidate_preparation_domain_eligible(
-    exc: BaseException,
-    candidate_parameter_names: set[str],
-) -> bool:
-    """Require a typed marker and a candidate-owned referenced parameter."""
-
-    if not _raw_candidate_domain_eligible(exc):
-        return False
-    referenced = {
-        str(name)
-        for name in getattr(exc, "parameter_names", ())
-        if str(name).strip()
-    }
-    return bool(referenced and referenced.intersection(candidate_parameter_names))
-
-
-def is_candidate_domain_failure(exc: BaseException) -> bool:
-    """Return whether *exc* is an admitted, nonfatal candidate outcome.
-
-    Candidate-domain status is a semantic contract carried by the typed
-    ``FitSimulationError`` flags.  No parameter-name attribution is involved:
-    a valid fitted parameter can drive an otherwise independent expression or
-    trajectory outside its admitted numerical domain.
-    """
-
-    details = getattr(exc, "details", None)
-    return bool(
-        isinstance(exc, FitSimulationError)
-        and isinstance(details, Mapping)
-        and details.get("candidate_domain") is True
-        and details.get("fatal") is False
-    )
-
-
-def _candidate_domain_error(
-    exc: BaseException,
+def _scientific_unavailability_from_exception(
+    exc: object,
     *,
+    producer: str,
     stage: str,
     failed_params: Optional[Dict[str, float]],
+    value_dependencies: Sequence[str] = (),
     extra_details: Mapping[str, object] | None = None,
-) -> FitSimulationError:
+) -> ScientificUnavailable:
     details = dict(getattr(exc, "details", None) or {})
-    parameter_names = tuple(
+    normalized_dependencies = tuple(
         sorted(
             str(name)
-            for name in getattr(exc, "parameter_names", ())
+            for name in value_dependencies
             if str(name).strip()
         )
     )
-    if parameter_names:
-        details["parameter_names"] = parameter_names
+    if normalized_dependencies:
+        details["value_dependencies"] = normalized_dependencies
     details.update(dict(extra_details or {}))
-    details.update(
-        {
-            "fatal": False,
-            "candidate_domain": True,
-            "stage": str(stage),
+    return ScientificUnavailable(
+        producer=producer,
+        stage=stage,
+        details={
+            **details,
+            "failed_params": dict(failed_params or {}),
+        },
+        factual_cause=getattr(exc, "factual_cause", None),
+    )
+
+
+def _candidate_dependency_unavailability(
+    exc: object,
+    *,
+    origins: Optional[Mapping[str, str]],
+    producer: str,
+    stage: str,
+    failed_params: Optional[Dict[str, float]],
+) -> ScientificUnavailable | None:
+    details = getattr(exc, "details", None)
+    if not isinstance(details, Mapping):
+        details = {}
+    raw_dependencies = getattr(exc, "value_dependencies", ())
+    if not raw_dependencies:
+        raw_dependencies = details.get("value_dependencies", ())
+    if isinstance(raw_dependencies, str):
+        raw_dependencies = (raw_dependencies,)
+    dependencies = frozenset(
+        str(item).strip()
+        for item in raw_dependencies
+        if str(item).strip()
+    ) if isinstance(raw_dependencies, (list, tuple, set, frozenset)) else frozenset()
+    optimizer_names = frozenset(
+        str(name).strip()
+        for name, origin in (origins or {}).items()
+        if str(name).strip()
+        and str(origin).strip()
+        in {
+            FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+            FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
         }
     )
-    return FitCandidateDomainError(
-        str(getattr(exc, "message", None) or str(exc)),
+    optimizer_dependencies = dependencies.intersection(optimizer_names)
+    if not optimizer_dependencies and not (
+        isinstance(exc, SimulationScientificUnavailability) and not dependencies
+    ):
+        return None
+    return _scientific_unavailability_from_exception(
+        exc,
+        producer=producer,
         stage=stage,
         failed_params=failed_params,
-        details=details,
-        context=getattr(exc, "context", None),
+        extra_details={
+            "value_dependencies": tuple(sorted(dependencies)),
+            "optimizer_dependencies": tuple(sorted(optimizer_dependencies)),
+        },
+        value_dependencies=dependencies,
     )
+
+
+def _is_fit_local_algebra_failure(exc: BaseException) -> bool:
+    """Identify the admitted Algebra producer without settling dependency policy."""
+
+    if isinstance(exc, AlgebraError):
+        return True
+    details = getattr(exc, "details", None)
+    return isinstance(details, Mapping) and "algebra_statement" in details
 
 
 def _fatal_evaluation_error(
@@ -216,57 +230,106 @@ def _fatal_evaluation_error(
     details.update(
         {
             "fatal": True,
-            "candidate_domain": False,
             "stage": str(stage),
         }
     )
+    source_message = str(getattr(exc, "message", None) or str(exc)).strip()
+    rendered_message = str(message or "").strip()
+    if source_message and source_message in rendered_message:
+        prefix, separator, _ = rendered_message.partition(":")
+        rendered_message = (
+            prefix.strip()
+            if separator
+            else rendered_message.replace(source_message, "").rstrip(" :")
+        )
     return FitSimulationError(
-        message,
+        rendered_message or "Fitting evaluation failed.",
         failed_params=failed_params,
         details=details,
         context=getattr(exc, "context", None),
     )
 
 
-def _strict_algebra_failure_details(exc: BaseException) -> Mapping[str, object] | None:
-    """Retain typed Algebra location without using dependency provenance."""
+def _strict_algebra_failure_details(
+    exc: BaseException,
+    *,
+    admission: AdmittedAlgebraProgram | None = None,
+) -> Mapping[str, object] | None:
+    """Attach only the bounded dependency truth retained at Fit admission.
 
-    candidate_sensitive_type = isinstance(
-        exc,
-        (AlgebraZeroDivError, AlgebraDomainError),
-    ) or (
-        isinstance(exc, AlgebraTypeError)
-        and str(getattr(exc, "msg", "")).startswith("non-finite")
-    )
-    if not candidate_sensitive_type:
+    Algebra's exception type and message identify a producer failure, but they
+    do not decide whether the failure is candidate-dependent.  The admitted
+    AST does: an exact statement location is resolved to its transitive local
+    scalar plan.  Dynamic or incomplete mappings intentionally return no
+    dependency truth and therefore remain conservative at the Fit boundary.
+    """
+
+    if not isinstance(exc, AlgebraError) or admission is None:
         return None
     line = getattr(exc, "line", None)
     line_text = str(getattr(exc, "line_text", "") or "")
-    if line is None and not line_text:
-        return {"algebra_code": str(getattr(exc, "code", "") or "")}
+    statements = tuple(admission.compiled.block.lines)
+    matches = [
+        statement
+        for statement in statements
+        if (line is not None and int(statement.line) == int(line))
+        or (line_text and str(statement.line_text) == line_text)
+    ]
+    if len(matches) != 1:
+        return None
+    statement = matches[0]
+    plan = {
+        str(name): tuple(str(dep) for dep in dependencies)
+        for name, dependencies in admission.dependency_plan
+    }
+    local_scalars = set(admission.scalar_names)
+    local_observables = set(admission.observable_names)
+    dependencies: set[str] = set()
+    pending = list(plan.get(str(statement.name), ()))
+    seen: set[str] = set()
+    while pending:
+        name = str(pending.pop())
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in local_scalars:
+            dependencies.add(name)
+        elif name in local_observables:
+            pending.extend(plan.get(name, ()))
+        else:
+            # The admitted plan is incomplete for this statement.  Do not
+            # manufacture a candidate dependency from an unknown AST atom.
+            return None
+    # A dynamic expression (species/current row or a dynamic local observable)
+    # is not an exact local scalar arithmetic failure.
+    if statement.expr.has_species_ref() or any(
+        name in local_observables for name in seen
+    ):
+        return None
     return {
         "algebra_code": str(getattr(exc, "code", "") or ""),
         "algebra_location": {
-            "line": int(line) if line is not None else None,
-            "column": int(getattr(exc, "col", 1)),
+            "line": int(getattr(exc, "line", statement.line)),
+            "column": int(getattr(exc, "col", statement.col)),
         },
         "algebra_statement": {
-            "name": "",
-            "source": line_text,
+            "name": str(statement.name),
+            "source": str(statement.line_text),
         },
+        "value_dependencies": tuple(sorted(dependencies)),
     }
 
 
 class FittingSeriesEvaluator(Protocol):
     """Exact evaluator contract consumed by the Fit optimizer."""
 
-    def evaluate_series_with_parameter_origins(
+    def evaluate_series_outcome_with_parameter_origins(
         self,
         params: Mapping[str, float],
         origins: Optional[Mapping[str, str]] = None,
         *,
         failed_params: Optional[Dict[str, float]] = None,
-    ) -> SimulationResultValue: ...
+    ) -> _FittingSeriesOutcome: ...
 
 
 def evaluate_fitting_series(
@@ -275,22 +338,25 @@ def evaluate_fitting_series(
     *,
     origins: Optional[Mapping[str, str]] = None,
     failed_params: Optional[Dict[str, float]] = None,
-) -> SimulationResultValue:
-    if not callable(
-        getattr(evaluator, "evaluate_series_with_parameter_origins", None)
-    ):
+) -> _FittingSeriesOutcome:
+    outcome_evaluator = getattr(
+        evaluator,
+        "evaluate_series_outcome_with_parameter_origins",
+        None,
+    )
+    if not callable(outcome_evaluator):
         raise TypeError(
             "Fit evaluator must implement "
-            "evaluate_series_with_parameter_origins(...)."
+            "evaluate_series_outcome_with_parameter_origins(...)."
         )
-    value = evaluator.evaluate_series_with_parameter_origins(
+    outcome = outcome_evaluator(
         dict(params or {}),
         dict(origins or {}),
         failed_params=failed_params,
     )
-    if not isinstance(value, SimulationResultValue):
-        raise TypeError("Fit evaluator must return a SimulationResultValue.")
-    return value
+    if not isinstance(outcome, _FittingSeriesOutcome):
+        raise TypeError("Fit evaluator must return a FittingSeriesOutcome.")
+    return outcome
 
 
 @dataclass(frozen=True)
@@ -305,6 +371,7 @@ class PreparedFittingExecutionContext:
     requested_sample_times: tuple[float, ...]
     fit_sampling_policy: str = "fit_internal_regular_grid"
     fit_sampling_identity: Mapping[str, object] = field(default_factory=dict)
+    fit_local_admission: AdmittedAlgebraProgram | None = None
 
     def __post_init__(self) -> None:
         execution_request = self.execution_request
@@ -375,6 +442,9 @@ class PreparedFittingExecutionContext:
             "fit_sampling_identity",
             dict(self.fit_sampling_identity or {}),
         )
+        admission = self.fit_local_admission
+        if admission is not None and not isinstance(admission, AdmittedAlgebraProgram):
+            raise TypeError("Fit-local admission must be a typed value.")
 
 def prepare_fitting_execution_context(
     *,
@@ -384,14 +454,11 @@ def prepare_fitting_execution_context(
     t_end: float,
     num_points: int,
     objective_sample_times: Sequence[float],
-    solver: str = DEFAULT_SOLVER_NAME,
-    rtol: float = 1e-6,
-    atol: float = 1e-12,
-    use_analytic_jacobian: bool = USE_ANALYTIC_JACOBIAN_DEFAULT,
-    wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+    prepared_solver_config: PreparedSolverConfig,
     initial_prefix: str = "init:",
     fit_sampling_policy: str = "fit_internal_regular_grid",
     fit_sampling_identity: Mapping[str, object] | None = None,
+    fit_local_admission: AdmittedAlgebraProgram | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> PreparedFittingExecutionContext:
     """Prepare structured execution data for serial fitting evaluation."""
@@ -420,12 +487,37 @@ def prepare_fitting_execution_context(
         raise ValueError("Fitting num_points must be >= 2.")
     grid_n = num_points
     initial_prefix = str(initial_prefix or "init:")
+    if fit_local_admission is not None:
+        if not isinstance(fit_local_admission, AdmittedAlgebraProgram):
+            raise TypeError("fit_local_admission must be a typed value.")
+        # Re-entry is deliberate: namespace and domain drift must reject before
+        # Fit setup or solver mutation.  The returned admission is the only
+        # request-local Algebra authority used below.
+        fit_local_admission = fit_local_admission.reenter(prepared_dsl)
+    local_scalar_names = set(
+        ()
+        if fit_local_admission is None
+        else fit_local_admission.scalar_names
+    )
     mechanism_param_names = [
         str(name)
         for name in (param_names or ())
         if str(name).strip()
         and not str(name).startswith(initial_prefix)
+        and str(name) not in local_scalar_names
     ]
+    if not isinstance(prepared_solver_config, PreparedSolverConfig):
+        raise TypeError("Fit preparation requires a PreparedSolverConfig.")
+    if prepared_solver_config.grid != {"N": grid_n}:
+        raise ValueError(
+            "Fit prepared solver grid must exactly match requested sampling grid."
+        )
+    try:
+        # Validate and realize the regular N grid before any exact observation
+        # union/deduplication; an unrepresentable grid must fail prelaunch.
+        build_time_grid(t_start, t_end, prepared_solver_config.grid)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Fit regular grid cannot be realized on this time span.") from exc
     temperature_K = float(prepared_dsl.analysis.temperature_K)
     objective_times = np.asarray(tuple(objective_sample_times), dtype=float).reshape(-1)
     if (
@@ -448,14 +540,6 @@ def prepare_fitting_execution_context(
         )
     )
 
-    prepared_solver_config = build_solver_config(
-        solver_input=solver,
-        rtol=rtol,
-        atol=atol,
-        grid={"N": grid_n},
-        use_analytic_jacobian=use_analytic_jacobian,
-        wegscheider_cyclicity_enabled=wegscheider_cyclicity_enabled,
-    )
     if (
         cancellation_control is not None
         and cancellation_control.cancel_requested()
@@ -464,7 +548,9 @@ def prepare_fitting_execution_context(
     bound = prepare_bound_mechanism(
         prepared_dsl,
         mechanism_param_names,
-        wegscheider_cyclicity_enabled=wegscheider_cyclicity_enabled,
+        wegscheider_cyclicity_enabled=(
+            prepared_solver_config.wegscheider_cyclicity_enabled
+        ),
     )
     if (
         cancellation_control is not None
@@ -515,7 +601,12 @@ def prepare_fitting_execution_context(
             prepared_dsl.analysis.normalized_text.encode("utf-8")
         ).hexdigest(),
         mechanism_text_len=len(prepared_dsl.analysis.normalized_text),
-        param_names=sorted({str(x) for x in canonical_requested_param_names if str(x).strip()}),
+        param_names=sorted(
+            {
+                *(str(x) for x in canonical_requested_param_names if str(x).strip()),
+                *local_scalar_names,
+            }
+        ),
         t_end=float(t_end),
         num_points=grid_n,
         temperature_K=float(temperature_K),
@@ -540,7 +631,7 @@ def prepare_fitting_execution_context(
             target_executable_identity=(
                 None
                 if intervention_execution is None
-                else compose_simulation_target_identity(
+                else compose_target_executable_identity(
                     bound.base_executable_identity,
                     intervention_execution,
                 )
@@ -549,6 +640,7 @@ def prepare_fitting_execution_context(
             requested_parameter_names=tuple(
                 canonical_requested_param_names
             ),
+            wegscheider_admission_report=bound.wegscheider_admission_report,
         ),
         t_span=(float(t_start), float(t_end)),
         solver_config=prepared_solver_config,
@@ -580,9 +672,8 @@ def prepare_fitting_execution_context(
         requested_param_names=tuple(
             sorted(
                 {
-                    str(x)
-                    for x in canonical_requested_param_names
-                    if str(x).strip()
+                    *(str(x) for x in canonical_requested_param_names if str(x).strip()),
+                    *local_scalar_names,
                 }
             )
         ),
@@ -591,6 +682,7 @@ def prepare_fitting_execution_context(
         requested_sample_times=requested_sample_times,
         fit_sampling_policy=str(fit_sampling_policy or "fit_internal_regular_grid"),
         fit_sampling_identity=dict(fit_sampling_identity or {}),
+        fit_local_admission=fit_local_admission,
     )
 
 
@@ -600,22 +692,11 @@ class SerialFittingEvaluator:
     def __init__(
         self,
         context: PreparedFittingExecutionContext,
-        *,
-        fixed_params: Optional[Mapping[str, float]] = None,
-        fixed_param_origins: Optional[Mapping[str, str]] = None,
     ) -> None:
         self._context = replace(
             context,
             execution_request=context.execution_request.isolated_copy(),
         )
-        self._fixed_params = {
-            str(name): float(value) for name, value in dict(fixed_params or {}).items() if str(name).strip()
-        }
-        raw_fixed_origins = dict(fixed_param_origins or {})
-        self._fixed_param_origins = {
-            name: _parameter_origin_for(name, raw_fixed_origins)
-            for name in self._fixed_params
-        }
         self._cancellation_control: SimulationCancellationControl | None = None
 
     @property
@@ -693,34 +774,134 @@ class SerialFittingEvaluator:
                     details={"fatal": True, "stage": "parameter_binding"},
                 )
 
-    def evaluate_series_with_parameter_origins(
+    def evaluate_series_outcome_with_parameter_origins(
         self,
         params: Mapping[str, float],
         origins: Optional[Mapping[str, str]] = None,
         *,
         failed_params: Optional[Dict[str, float]] = None,
-    ) -> SimulationResultValue:
-        self._raise_if_cancel_requested()
-        param_map = {str(name): float(value) for name, value in self._fixed_params.items()}
-        origin_map = dict(self._fixed_param_origins)
-        runtime_origins = dict(origins or {})
-        for raw_name, raw_value in dict(params or {}).items():
-            name = str(raw_name)
-            if not name.strip():
-                continue
-            param_map[name] = raw_value
-            origin_map[name] = _parameter_origin_for(name, runtime_origins)
+    ) -> _FittingSeriesOutcome:
+        """Return the producer-owned per-dataset semantic status."""
 
+        try:
+            result = self._evaluate_series(
+                params,
+                origins,
+                failed_params=failed_params,
+            )
+        except (FittingCancelled, SimulationCancelled) as exc:
+            return _FittingSeriesOutcome.cancelled(exc)
+        except Exception as exc:
+            is_algebra_failure = _is_fit_local_algebra_failure(exc)
+            unavailable = _candidate_dependency_unavailability(
+                exc,
+                origins=origins,
+                producer=(
+                    "fitting_algebra"
+                    if is_algebra_failure
+                    else "serial_fitting_evaluator"
+                ),
+                stage=(
+                    "fit_algebra"
+                    if is_algebra_failure
+                    else "candidate_evaluation"
+                ),
+                failed_params=failed_params,
+            )
+            if unavailable is not None:
+                return _FittingSeriesOutcome.scientific_unavailable(
+                    unavailable,
+                    provenance={"stage": "serial_fitting_evaluator"},
+                )
+            return _FittingSeriesOutcome.fatal(
+                exc,
+                provenance={"stage": "serial_fitting_evaluator"},
+            )
+        if isinstance(result, SimulationExecutionOutcome):
+            if result.status != "scientific_unavailable":
+                raise RuntimeError("Unsupported simulation execution outcome status.")
+            unavailability = result.unavailability
+            if unavailability is None:
+                raise RuntimeError("Simulation outcome omitted its unavailability result.")
+            unavailable = _candidate_dependency_unavailability(
+                unavailability,
+                origins=origins,
+                producer=unavailability.producer,
+                stage=unavailability.stage,
+                failed_params=None,
+            )
+            if unavailable is None:
+                return _FittingSeriesOutcome.fatal(
+                    FitSimulationError(
+                        "Simulation scientific unavailability depends on fixed or unknown authority.",
+                        details=dict(unavailability.details),
+                    ),
+                    provenance={"stage": "solver"},
+                )
+            return _FittingSeriesOutcome.scientific_unavailable(
+                unavailable,
+                provenance={"stage": "solver"},
+            )
+        if not isinstance(result, SimulationResultValue):
+            raise TypeError("Fit evaluator must return a SimulationResultValue.")
+        return _FittingSeriesOutcome.available(result)
+
+    def _evaluate_series(
+        self,
+        params: Mapping[str, float],
+        origins: Optional[Mapping[str, str]] = None,
+        *,
+        failed_params: Optional[Dict[str, float]] = None,
+    ) -> SimulationResultValue | SimulationExecutionOutcome:
+        self._raise_if_cancel_requested()
+        param_map = {
+            str(name): raw_value
+            for raw_name, raw_value in dict(params or {}).items()
+            for name in (str(raw_name),)
+            if name.strip()
+        }
+        origin_map = dict(origins or {})
+
+        admission = self._context.fit_local_admission
+        local_scalar_names = set(
+            () if admission is None else admission.scalar_names
+        )
+        missing_local_scalars = sorted(local_scalar_names - set(param_map))
+        if missing_local_scalars:
+            raise FitSimulationError(
+                "Fit-local evaluation is missing request scalar value(s): "
+                + ", ".join(repr(name) for name in missing_local_scalars),
+                details={"fatal": True, "stage": "fit_local_evaluation"},
+            )
+        local_scalar_values = {
+            name: _coerce_consumed_parameter_value(
+                name=name,
+                raw_value=param_map[name],
+                origins=origin_map,
+                failed_params=failed_params,
+            )
+            for name in local_scalar_names
+        }
         initial_overrides: Dict[str, float] = {}
         candidate_parameter_names = {
             str(name)
             for name in dict(params or {})
-            if str(name).strip() and not str(name).startswith(self._context.initial_prefix)
+            if (
+                str(name).strip()
+                and not str(name).startswith(self._context.initial_prefix)
+                and str(name) not in local_scalar_names
+                and _parameter_origin_for(str(name), origin_map)
+                in {
+                    FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+                    FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
+                }
+            )
         }
         non_initial_parameters = {
             str(name): value
             for name, value in param_map.items()
             if not str(name).startswith(self._context.initial_prefix)
+            and str(name) not in local_scalar_names
         }
 
         non_initial_parameters = {
@@ -767,23 +948,9 @@ class SerialFittingEvaluator:
             )
         except SimulationPreparationError as exc:
             preparation_cause = exc.__cause__ or exc
-            if _candidate_preparation_domain_eligible(
-                exc,
-                candidate_parameter_names,
-            ) or _raw_candidate_domain_eligible(preparation_cause):
-                raise _candidate_domain_error(
-                    exc,
-                    stage=exc.stage,
-                    failed_params=failed_params,
-                ) from exc
             algebra_details = _strict_algebra_failure_details(preparation_cause)
             if algebra_details is not None:
-                raise _candidate_domain_error(
-                    exc,
-                    stage=exc.stage,
-                    failed_params=failed_params,
-                    extra_details=algebra_details,
-                ) from exc
+                raise preparation_cause from exc
             raise fit_simulation_error_from_preparation_error(
                 exc,
                 failed_params=failed_params,
@@ -791,20 +958,11 @@ class SerialFittingEvaluator:
         except SimulationCancelled as exc:
             raise FittingCancelled() from exc
         except Exception as exc:
-            if _raw_candidate_domain_eligible(exc):
-                raise _candidate_domain_error(
-                    exc,
-                    stage="candidate_preparation",
-                    failed_params=failed_params,
-                ) from exc
+            if isinstance(exc, KineticRuntimeDomainError):
+                raise
             algebra_details = _strict_algebra_failure_details(exc)
             if algebra_details is not None:
-                raise _candidate_domain_error(
-                    exc,
-                    stage="candidate_preparation",
-                    failed_params=failed_params,
-                    extra_details=algebra_details,
-                ) from exc
+                raise
             raise _fatal_evaluation_error(
                 exc,
                 message=f"Structured fitting candidate preparation failed: {exc}",
@@ -887,7 +1045,7 @@ class SerialFittingEvaluator:
                     origins=origin_map,
                     failed_params=failed_params,
                 )
-            else:
+            elif name not in local_scalar_names:
                 binding_name = parameter_partition.mechanism_parameter_name_by_raw.get(name, name)
                 if binding_name not in consumed_parameter_names:
                     if name in parameter_partition.schedule_only_parameter_names:
@@ -947,15 +1105,6 @@ class SerialFittingEvaluator:
                     ),
                 )
             except SimulationPreparationError as exc:
-                if _candidate_preparation_domain_eligible(
-                    exc,
-                    candidate_parameter_names,
-                ):
-                    raise _candidate_domain_error(
-                        exc,
-                        stage=exc.stage,
-                        failed_params=failed_params,
-                    ) from exc
                 raise fit_simulation_error_from_preparation_error(
                     exc,
                     failed_params=failed_params,
@@ -976,6 +1125,7 @@ class SerialFittingEvaluator:
                 self._context.requested_sample_times,
                 dtype=float,
             ),
+            candidate_evaluation=True,
         )
         try:
             result = solve_ode(request)
@@ -984,12 +1134,8 @@ class SerialFittingEvaluator:
         except SimulationCancelled as exc:
             raise FittingCancelled() from exc
         except KindredError as exc:
-            if _raw_candidate_domain_eligible(exc):
-                raise _candidate_domain_error(
-                    exc,
-                    stage="solver",
-                    failed_params=failed_params,
-                ) from exc
+            if isinstance(exc, KineticRuntimeDomainError):
+                raise
             raise _fatal_evaluation_error(
                 exc,
                 message=f"Fitting simulation failed: {exc}",
@@ -1003,6 +1149,8 @@ class SerialFittingEvaluator:
                 stage="solver",
                 failed_params=failed_params,
             ) from exc
+        if isinstance(result, SimulationExecutionOutcome):
+            return result
         self._raise_if_cancel_requested()
 
         initials_map = {
@@ -1024,12 +1172,7 @@ class SerialFittingEvaluator:
                 raise FittingCancelled() from exc
             algebra_details = _strict_algebra_failure_details(exc)
             if algebra_details is not None:
-                raise _candidate_domain_error(
-                    exc,
-                    stage="result_finalization",
-                    failed_params=failed_params,
-                    extra_details=algebra_details,
-                ) from exc
+                raise
             raise _fatal_evaluation_error(
                 exc,
                 message=f"Fitting result finalization failed: {exc}",
@@ -1056,6 +1199,86 @@ class SerialFittingEvaluator:
                 solver=final_solver_provenance,
             ),
         )
+        if admission is not None:
+            self._raise_if_cancel_requested()
+            try:
+                symbol_series, symbol_values = build_simulation_row_algebra_context(
+                    prepared_run.mechanism,
+                    np.asarray(admitted.t, dtype=float),
+                    parameter_algebra_spec=prepared_run.parameter_algebra_spec,
+                    temperature_schedule=prepared_run.temperature_schedule,
+                )
+                symbol_series.update(
+                    {
+                        str(name): np.asarray(values, dtype=float)
+                        for name, values in admitted.series.items()
+                    }
+                )
+                symbol_values.update(
+                    {str(name): float(value) for name, value in admitted.scalars.items()}
+                )
+                symbol_values.update(local_scalar_values)
+                species_series = {
+                    str(name): np.asarray(admitted.series[name], dtype=float)
+                    for name in prepared_run.species_names
+                }
+                local_series, local_scalars = (
+                    evaluate_compiled_algebra_series_for_simulation(
+                        prepared_run.mechanism,
+                        admission.compiled,
+                        t=np.asarray(admitted.t, dtype=float),
+                        species_series=species_series,
+                        initials=initials_map,
+                        temperature_K=float(
+                            metadata_view_for_mechanism(
+                                prepared_run.mechanism
+                            ).temperature_K
+                        ),
+                        symbol_series=symbol_series,
+                        symbol_values=symbol_values,
+                    )
+                )
+            except Exception as exc:
+                if isinstance(exc, (FittingCancelled, SimulationCancelled)):
+                    raise FittingCancelled() from exc
+                details = _strict_algebra_failure_details(
+                    exc,
+                    admission=admission,
+                )
+                if details is not None:
+                    raise _fatal_evaluation_error(
+                        exc,
+                        message=f"Fit-local observable evaluation failed: {exc}",
+                        stage="fit_local_evaluation",
+                        failed_params=failed_params,
+                        extra_details=details,
+                    ) from exc
+                raise _fatal_evaluation_error(
+                    exc,
+                    message=f"Fit-local observable evaluation failed: {exc}",
+                    stage="fit_local_evaluation",
+                    failed_params=failed_params,
+                ) from exc
+            local_names = tuple(admission.observable_names)
+            solver_provenance = dict(admitted.provenance.solver)
+            solver_provenance["fit_local_admission_identity"] = admission.identity
+            admitted = replace(
+                admitted,
+                series={**dict(admitted.series), **local_series},
+                scalars={**dict(admitted.scalars), **local_scalars},
+                provenance=replace(
+                    admitted.provenance,
+                    solver=solver_provenance,
+                    requested_algebra_outputs=(
+                        *admitted.provenance.requested_algebra_outputs,
+                        *local_names,
+                    ),
+                    succeeded_algebra_outputs=(
+                        *admitted.provenance.succeeded_algebra_outputs,
+                        *local_names,
+                    ),
+                ),
+            )
         segment_ids = np.asarray(admitted.segment_ids, dtype=np.int64)
         segment_keys = tuple(admitted.segment_keys)
         discontinuity_ids = np.asarray(

@@ -6,6 +6,8 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
+from kindred.core.species import validate_concentration
+
 __all__ = ["FitInitialTolerance", "FitInitialToleranceMode"]
 
 FitInitialToleranceMode = Literal[
@@ -44,35 +46,44 @@ class FitInitialTolerance:
             "asymmetric_percent",
             "absolute",
         }:
-            raise ValueError("Unknown initial-condition tolerance mode.")
+            raise ValueError("Unknown Vary IC mode.")
         object.__setattr__(self, "mode", mode)
         if mode == "disabled":
             if self.lower is not None or self.upper is not None:
-                raise ValueError("Disabled IC tolerance cannot retain bounds.")
+                raise ValueError("No Vary IC mode cannot retain bounds.")
             return
-        lower = _finite(self.lower, "IC tolerance lower value")
-        upper = _finite(self.upper, "IC tolerance upper value")
+        lower = _finite(self.lower, "Vary IC lower value")
+        upper = _finite(self.upper, "Vary IC upper value")
         if mode == "symmetric_percent":
             if lower < 0.0 or upper != lower or lower == 0.0:
                 raise ValueError(
-                    "Symmetric IC tolerance requires one positive percentage."
+                    "Symmetric Vary IC requires one positive percentage."
                 )
         elif mode == "asymmetric_percent":
             if lower < 0.0 or upper < 0.0 or (lower == 0.0 and upper == 0.0):
                 raise ValueError(
-                    "Asymmetric IC tolerance percentages must be nonnegative "
+                    "Asymmetric Vary IC percentages must be nonnegative "
                     "and not both zero."
                 )
         elif lower < 0.0 or lower >= upper:
             raise ValueError(
-                "Absolute IC tolerance requires nonnegative minimum < maximum."
+                "Absolute Vary IC requires nonnegative minimum < maximum."
+            )
+        if mode == "absolute":
+            lower = validate_concentration(
+                lower,
+                field="Vary IC absolute minimum",
+            )
+            upper = validate_concentration(
+                upper,
+                field="Vary IC absolute maximum",
             )
         object.__setattr__(self, "lower", lower)
         object.__setattr__(self, "upper", upper)
 
     @classmethod
     def symmetric_percent(cls, percent: object) -> "FitInitialTolerance":
-        value = _finite(percent, "IC tolerance percentage")
+        value = _finite(percent, "Vary IC percentage")
         return cls("symmetric_percent", value, value)
 
     @classmethod
@@ -98,29 +109,46 @@ class FitInitialTolerance:
     def bounds_for(self, initial: object) -> tuple[float, float]:
         """Resolve bounds from the current editable nominal value."""
 
-        nominal = _finite(initial, "IC initial value")
-        if nominal < 0.0:
-            raise ValueError("Initial concentration must be nonnegative.")
+        nominal = validate_concentration(
+            _finite(initial, "IC initial value"),
+            field="IC initial value",
+        )
         if not self.enabled:
             return nominal, nominal
         assert self.lower is not None and self.upper is not None
         if self.mode in {"symmetric_percent", "asymmetric_percent"}:
             if nominal == 0.0:
                 raise ValueError(
-                    "A zero IC initial guess cannot move through percentage "
+                    "A zero Starting IC cannot move through percentage "
                     "bounds; use meaningful absolute bounds."
                 )
-            minimum = max(0.0, nominal * (1.0 - self.lower / 100.0))
+            # Preserve the exact authored percentage formula.  Clamping a
+            # negative result to zero would silently change the displayed
+            # range and hide an invalid concentration bound.
+            minimum = nominal * (1.0 - self.lower / 100.0)
             maximum = nominal * (1.0 + self.upper / 100.0)
+            if minimum < 0.0:
+                raise ValueError(
+                    "Vary IC lower percentage would produce a negative "
+                    "concentration; reduce it or use absolute bounds."
+                )
         else:
             minimum, maximum = self.lower, self.upper
         if not math.isfinite(minimum) or not math.isfinite(maximum):
             raise ValueError(
-                "IC tolerance resolves to non-finite bounds; reduce the "
+                "Vary IC resolves to non-finite bounds; reduce the "
                 "percentage or use explicit finite absolute bounds."
             )
+        minimum = validate_concentration(
+            minimum,
+            field="Vary IC minimum",
+        )
+        maximum = validate_concentration(
+            maximum,
+            field="Vary IC maximum",
+        )
         if minimum >= maximum or not minimum <= nominal <= maximum:
             raise ValueError(
-                "IC tolerance must resolve to minimum <= initial <= maximum."
+                "Vary IC must resolve to minimum <= Starting IC <= maximum."
             )
         return float(minimum), float(maximum)

@@ -17,6 +17,12 @@ from kindred.core.datasets.source_rules import (
     identify_physical_columns,
     validate_tabular_source_bytes,
 )
+from kindred.core.species import (
+    validate_concentration,
+    validate_imported_time_seconds,
+    validate_observation,
+    validate_time_seconds,
+)
 
 __all__ = [
     "DatasetMappedTarget",
@@ -116,6 +122,13 @@ class ObservationSeries:
 
     def __post_init__(self) -> None:
         validate_raw_observation_id(self.raw_observation_id)
+        if type(self.t) is not tuple or type(self.y) is not tuple:
+            raise TypeError("ObservationSeries t/y must be immutable tuples.")
+        if len(self.t) != len(self.y) or not self.t:
+            raise ValueError("ObservationSeries t/y must be equal and nonempty.")
+        for index, (time, value) in enumerate(zip(self.t, self.y, strict=True)):
+            validate_imported_time_seconds(time, field=f"observation time[{index}]")
+            validate_observation(value, field=f"observation value[{index}]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,29 +431,55 @@ def validate_fit_inclusion(
     observation_mapping: Sequence[tuple[str, str]],
     initial_values: Mapping[str, object],
     mechanism_species: Sequence[str],
+    observation_targets: Sequence[str],
     resolved_t_start: object,
 ) -> FitInclusionValidation:
-    """Validate one Fit inclusion from already-resolved immutable values."""
+    """Validate one Fit inclusion from already-resolved immutable values.
+
+    Mechanism species admit the complete initial-condition state; observation
+    targets independently admit each raw-observation mapping.
+    """
     if not isinstance(dataset, RawDatasetRecord):
         raise TypeError("dataset must be a RawDatasetRecord.")
     if not isinstance(set_id, str) or not set_id or set_id != set_id.strip():
         raise RawDatasetValidationError("Fit inclusion requires an initial-condition set ID.")
-    roster = tuple(str(species).strip() for species in mechanism_species)
-    if not roster or any(not species for species in roster):
+    mechanism_roster = tuple(
+        str(species).strip() for species in mechanism_species
+    )
+    if not mechanism_roster or any(not species for species in mechanism_roster):
         raise RawDatasetValidationError("Fit inclusion requires a nonempty valid mechanism species roster.")
-    if len(set(roster)) != len(roster):
+    if len(set(mechanism_roster)) != len(mechanism_roster):
         raise RawDatasetValidationError("Mechanism species identities must be unique.")
+    target_roster = tuple(
+        str(target).strip() for target in observation_targets
+    )
+    if not target_roster or any(not target for target in target_roster):
+        raise RawDatasetValidationError(
+            "Fit inclusion requires a nonempty valid observation target roster."
+        )
+    if len(set(target_roster)) != len(target_roster):
+        raise RawDatasetValidationError("Observation target identities must be unique.")
     if not isinstance(initial_values, Mapping):
         raise TypeError("initial_values must be a mapping.")
     values = dict(initial_values)
-    if set(values) != set(roster):
-        missing = tuple(species for species in roster if species not in values)
-        extra = tuple(species for species in values if species not in set(roster))
-        raise RawDatasetValidationError(
-            f"Mapped initial-condition state is incomplete for the current mechanism (missing={missing!r}, extra={extra!r})."
+    if set(values) != set(mechanism_roster):
+        missing = tuple(
+            species for species in mechanism_roster if species not in values
         )
-    if any(type(value) is bool or not math.isfinite(float(value)) or float(value) < 0.0 for value in values.values()):
-        raise RawDatasetValidationError("Mapped initial-condition state must be finite and nonnegative.")
+        extra = tuple(
+            species for species in values if species not in set(mechanism_roster)
+        )
+        raise RawDatasetValidationError(
+            f"Mapped initial-condition state is incomplete for the current "
+            f"mechanism (missing={missing!r}, extra={extra!r})."
+        )
+    try:
+        for species, value in values.items():
+            validate_concentration(value, field=f"initial concentration for {species}")
+    except (TypeError, ValueError) as exc:
+        raise RawDatasetValidationError(
+            "Mapped initial-condition state is outside the supported concentration domain."
+        ) from exc
     raw_ids = tuple(series.raw_observation_id for series in dataset.observations)
     mapping = tuple(observation_mapping)
     if not mapping:
@@ -448,7 +487,7 @@ def validate_fit_inclusion(
             "Fit inclusion requires at least one valid mapped observation target."
         )
     seen_ids: set[str] = set()
-    seen_species: set[str] = set()
+    seen_targets: set[str] = set()
     for item in mapping:
         if (
             not isinstance(item, tuple)
@@ -461,23 +500,24 @@ def validate_fit_inclusion(
             or item[1] != item[1].strip()
         ):
             raise RawDatasetValidationError(
-                "Fit inclusion observation mapping must contain canonical ID/species pairs."
+                "Fit inclusion observation mapping must contain canonical "
+                "ID/target pairs."
             )
-        raw_id, species = item
+        raw_id, target = item
         if raw_id not in raw_ids:
             raise RawDatasetValidationError(
                 f"Fit inclusion mapping references unknown raw observation ID {raw_id!r}."
             )
-        if species not in roster:
+        if target not in target_roster:
             raise RawDatasetValidationError(
-                f"Fit inclusion mapping references unknown model species {species!r}."
+                f"Fit inclusion mapping references unknown model target {target!r}."
             )
-        if raw_id in seen_ids or species in seen_species:
+        if raw_id in seen_ids or target in seen_targets:
             raise RawDatasetValidationError(
                 "Fit inclusion observation mapping must be a partial bijection."
             )
         seen_ids.add(raw_id)
-        seen_species.add(species)
+        seen_targets.add(target)
     if tuple(raw_id for raw_id, _species in mapping) != tuple(
         raw_id for raw_id in raw_ids if raw_id in seen_ids
     ):
@@ -513,8 +553,12 @@ def validate_fit_inclusion(
         start = float(resolved_t_start)
     except (TypeError, ValueError, OverflowError) as exc:
         raise RawDatasetValidationError("Fit inclusion requires a numeric resolved start time.") from exc
-    if not math.isfinite(start) or start < 0.0:
-        raise RawDatasetValidationError("Fit inclusion requires a finite nonnegative resolved start time.")
+    try:
+        start = validate_time_seconds(start, field="Fit inclusion resolved start time")
+    except (TypeError, ValueError) as exc:
+        raise RawDatasetValidationError(
+            "Fit inclusion requires a bounded nonnegative resolved start time."
+        ) from exc
     return FitInclusionValidation(
         dataset_id=dataset.dataset_id,
         set_id=set_id,

@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
+from typing import Any, Callable, Iterable, Literal, Mapping, Optional, Protocol, Tuple
 
 import numpy as np
 
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.temperature import TemperatureScheduleProtocol
+from kindred.core.species import (
+    TIME_MAX_S,
+    validate_runtime_concentration,
+    validate_time_seconds,
+)
+from kindred.core.time_grid import build_time_grid, normalize_time_grid_policy
 
 DEFAULT_SOLVER_NAME = "BDF"
 
@@ -43,6 +49,36 @@ class SimulationCancellationControl:
         return bool(self.poll())
 
 
+@dataclass(frozen=True, slots=True)
+class SimulationScientificUnavailability:
+    """Immutable simulation-owned result for candidate-only unavailable science."""
+
+    producer: str
+    stage: str
+    details: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        producer = str(self.producer or "").strip()
+        stage = str(self.stage or "").strip()
+        if not producer or not stage:
+            raise ValueError("Simulation unavailability producer and stage are required.")
+        if not isinstance(self.details, Mapping):
+            raise TypeError("Simulation unavailability details must be a mapping.")
+        object.__setattr__(self, "producer", producer)
+        object.__setattr__(self, "stage", stage)
+        object.__setattr__(self, "details", _freeze_solver_value(dict(self.details)))
+
+
+class _SimulationScientificUnavailabilitySignal(RuntimeError):
+    """Private segment unwind normalized by ``solve_ode`` in fitting mode."""
+
+    def __init__(self, outcome: SimulationScientificUnavailability) -> None:
+        if not isinstance(outcome, SimulationScientificUnavailability):
+            raise TypeError("Simulation unavailability signal requires its typed result.")
+        self.outcome = outcome
+        super().__init__("scientific simulation unavailable")
+
+
 def _freeze_solver_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType(
@@ -73,9 +109,7 @@ class SimulationPresentationBoundary:
     post_state: tuple[tuple[str, float], ...]
 
     def __post_init__(self) -> None:
-        time = float(self.time)
-        if not np.isfinite(time):
-            raise ValueError("Presentation boundary time must be finite.")
+        time = validate_time_seconds(self.time, field="presentation boundary time")
         pre = _finite_state_pairs(self.pre_state, field="pre_state")
         post = _finite_state_pairs(self.post_state, field="post_state")
         if tuple(name for name, _value in pre) != tuple(
@@ -114,10 +148,7 @@ def _finite_state_pairs(
         if name in names:
             raise ValueError(f"{field} contains duplicate species {name!r}.")
         value = float(raw_value)
-        if not np.isfinite(value) or value < 0.0:
-            raise ValueError(
-                f"{field} values must be finite and nonnegative."
-            )
+        value = validate_runtime_concentration(value, field=f"{field} value")
         names.add(name)
         normalized.append((name, value))
     if not normalized:
@@ -145,6 +176,7 @@ class SimulationRequest:
     species_names: Optional[Tuple[str, ...]] = None
     symbolic_wegscheider_identity: Optional[Mapping[str, Any]] = None
     cancellation_control: SimulationCancellationControl | None = None
+    candidate_evaluation: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -164,22 +196,43 @@ class SimulationRequest:
             raise TypeError(
                 "cancellation_control must be a SimulationCancellationControl."
             )
-        object.__setattr__(
-            self,
-            "t_span",
-            (float(self.t_span[0]), float(self.t_span[1])),
-        )
+        object.__setattr__(self, "candidate_evaluation", bool(self.candidate_evaluation))
+        start = validate_time_seconds(self.t_span[0], field="t_span start")
+        end = validate_time_seconds(self.t_span[1], field="t_span end")
+        if end <= start:
+            raise ValueError("t_span end must be greater than start.")
+        object.__setattr__(self, "t_span", (start, end))
         y0 = np.asarray(self.y0, dtype=float).reshape(-1).copy()
+        if y0.size == 0 or np.any(~np.isfinite(y0)) or np.any(y0 < 0.0):
+            raise ValueError("y0 must contain finite nonnegative runtime states.")
         y0.setflags(write=False)
         object.__setattr__(self, "y0", y0)
         if self.t_eval is not None:
             t_eval = np.asarray(self.t_eval, dtype=float).copy()
+            if (
+                t_eval.ndim != 1
+                or np.any(~np.isfinite(t_eval))
+                or np.any(t_eval < start)
+                or np.any(t_eval > end)
+                or (t_eval.size > 1 and np.any(np.diff(t_eval) <= 0.0))
+            ):
+                raise ValueError("t_eval must be strictly increasing within t_span.")
             t_eval.setflags(write=False)
             object.__setattr__(self, "t_eval", t_eval)
         if self.grid is not None:
             if not isinstance(self.grid, Mapping):
                 raise TypeError("grid must be a mapping or None.")
-            object.__setattr__(self, "grid", _freeze_solver_value(self.grid))
+            normalized_grid = normalize_time_grid_policy(self.grid)
+            # Validate generated-grid representability at request construction,
+            # before any worker or solver invocation.  Explicit t_eval remains
+            # an exact output request and does not require realizing N.
+            if self.t_eval is None:
+                build_time_grid(start, end, normalized_grid)
+            object.__setattr__(
+                self,
+                "grid",
+                _freeze_solver_value(normalized_grid),
+            )
         if self.species_names is not None:
             object.__setattr__(
                 self,
@@ -210,6 +263,19 @@ class SimulationOutput:
             )
         t = np.asarray(self.t, dtype=float).copy()
         Y = np.asarray(self.Y, dtype=float).copy()
+        if (
+            t.ndim != 1
+            or t.size == 0
+            or np.any(~np.isfinite(t))
+            or np.any(t < 0.0)
+            or np.any(t > TIME_MAX_S)
+            or (t.size > 1 and np.any(np.diff(t) <= 0.0))
+        ):
+            raise ValueError("Simulation output times must be bounded and increasing.")
+        if Y.ndim != 2 or Y.shape[1] != t.size:
+            raise ValueError("Simulation output state rows must align with time.")
+        if np.any(~np.isfinite(Y)) or np.any(Y < 0.0):
+            raise ValueError("Simulation output states must be finite and nonnegative.")
         t.setflags(write=False)
         Y.setflags(write=False)
         object.__setattr__(self, "t", t)
@@ -245,3 +311,31 @@ class SimulationOutput:
             _freeze_solver_value(self.provenance),
         )
         object.__setattr__(self, "presentation_boundaries", boundaries)
+
+
+@dataclass(frozen=True, slots=True)
+class SimulationExecutionOutcome:
+    """Candidate-aware solver boundary transport.
+
+    Ordinary simulation callers still receive ``SimulationOutput``.  A fitting
+    request receives this envelope only when a producer-owned scientific
+    unavailability was normalized at the solver boundary.
+    """
+
+    status: Literal["available", "scientific_unavailable"]
+    output: SimulationOutput | None = None
+    unavailability: SimulationScientificUnavailability | None = None
+
+    def __post_init__(self) -> None:
+        status = str(self.status or "")
+        if status == "available":
+            if self.output is None or self.unavailability is not None:
+                raise ValueError("Available simulation outcomes require only output.")
+        elif status == "scientific_unavailable":
+            if self.output is not None or self.unavailability is None:
+                raise ValueError(
+                    "Unavailable simulation outcomes require only unavailability."
+                )
+        else:
+            raise ValueError(f"Unsupported simulation outcome status: {status!r}")
+        object.__setattr__(self, "status", status)

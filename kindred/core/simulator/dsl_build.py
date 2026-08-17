@@ -12,11 +12,10 @@ import math
 from typing import Dict, List, Optional
 
 from ..equilibrium_rate_authority import (
-    normalize_equilibrium_rate_authority,
+    equilibrium_constant_unit,
 )
 from ..mechanism import Mechanism
 from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
-from ..thermodynamics import K_from_deltaG_eq
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .dsl_build_input import DslMechanismBuildInput
 from .parameter_namespace import _namespace_policy_from_step
@@ -106,15 +105,7 @@ def build_mechanism_from_ir(
             user_kf_explicit = step.user_kf_explicit
             user_kr_explicit = step.user_kr_explicit
 
-            dG_eq_J = step.dG_eq_J_per_mol
-            if Keq_input is not None:
-                Keq_model_value = Keq_input
-            elif dG_eq_J is not None:
-                Keq_model_value = float(
-                    K_from_deltaG_eq(float(dG_eq_J), T)
-                )
-            else:
-                Keq_model_value = None
+            Keq_model_value = step.Keq
 
             forward_model: Optional[Dict[str, object]] = None
             if (
@@ -160,22 +151,15 @@ def build_mechanism_from_ir(
                 standard_conc_M=step.standard_conc_M
                 if step.standard_conc_M is not None
                 else None,
+                Keq_unit=equilibrium_constant_unit(
+                    math.fsum(float(value) for value in products.values())
+                    - math.fsum(float(value) for value in reactants.values())
+                ),
             ).to_metadata()
-            if Keq_input is not None or dG_eq_J is not None:
-                nf = math.fsum(float(value) for value in reactants.values())
-                nr = math.fsum(float(value) for value in products.values())
-                eq_metadata["std_ratio"] = float(C0) ** (nr - nf)
             authority_context = "normalized_public"
-            authority = normalize_equilibrium_rate_authority(
-                kf=kf_val,
-                kr=kr_val,
-                Keq=Keq_model_value,
-                metadata=eq_metadata,
-                context=authority_context,
-            )
 
             eq_index = len(mechanism.equilibria)
-            mechanism._add_equilibrium_with_authority_context(
+            _equilibrium, authority = mechanism._add_equilibrium_with_authority_context(
                 stoich_forward=reactants,
                 stoich_back=products,
                 Keq=Keq_model_value,

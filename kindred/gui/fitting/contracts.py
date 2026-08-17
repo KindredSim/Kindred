@@ -13,111 +13,12 @@ FitResolvedXMode = Literal["monotone", "time_guided"]
 
 __all__ = [
     "FitParametricSettings",
-    "FitWorkerFailure",
     "FitRunIdentity",
     "FitTargetSelection",
     "copy_target_selection",
+    "FitProjectionAvailability",
+    "FitPublicationBundle",
 ]
-
-
-def _freeze_failure_value(value: object) -> object:
-    """Retain structured failure details without carrying mutable objects."""
-
-    if value is None or isinstance(value, (bool, int, str)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else "non-finite numeric value"
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {
-                str(key): _freeze_failure_value(item)
-                for key, item in value.items()
-            }
-        )
-    if isinstance(value, (tuple, list)):
-        return tuple(_freeze_failure_value(item) for item in value)
-    return str(value)
-
-
-def _plain_failure_value(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {
-            str(key): _plain_failure_value(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, tuple):
-        return [_plain_failure_value(item) for item in value]
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class FitWorkerFailure:
-    """Immutable typed failure transported from the worker to presentation."""
-
-    exception_type: str
-    code: str
-    message: str
-    details: Mapping[str, object]
-    typed_cause: "FitWorkerFailure | None" = None
-
-    def __post_init__(self) -> None:
-        exception_type = _name(self.exception_type, "failure exception type")
-        message = _name(self.message, "failure message")
-        code = str(self.code or "").strip()
-        if self.typed_cause is not None and not isinstance(
-            self.typed_cause,
-            FitWorkerFailure,
-        ):
-            raise TypeError("Fit worker typed cause must be FitWorkerFailure.")
-        object.__setattr__(self, "exception_type", exception_type)
-        object.__setattr__(self, "code", code)
-        object.__setattr__(self, "message", message)
-        object.__setattr__(
-            self,
-            "details",
-            _freeze_failure_value(dict(self.details or {})),
-        )
-
-    @classmethod
-    def from_exception(cls, error: BaseException) -> "FitWorkerFailure":
-        if not isinstance(error, BaseException):
-            raise TypeError("Fit worker failure source must be an exception.")
-
-        def build(current: BaseException, seen: frozenset[int]) -> "FitWorkerFailure":
-            identity = id(current)
-            typed_cause = getattr(current, "typed_cause", None)
-            if not isinstance(typed_cause, BaseException):
-                typed_cause = current.__cause__
-            nested = (
-                build(typed_cause, seen | {identity})
-                if isinstance(typed_cause, BaseException)
-                and id(typed_cause) not in seen
-                and id(typed_cause) != identity
-                else None
-            )
-            message = str(getattr(current, "message", None) or current).strip()
-            return cls(
-                exception_type=type(current).__name__,
-                code=str(getattr(current, "code", "") or ""),
-                message=message or type(current).__name__,
-                details=dict(getattr(current, "details", {}) or {}),
-                typed_cause=nested,
-            )
-
-        return build(error, frozenset())
-
-    def to_payload(self) -> dict[str, object]:
-        return {
-            "exception_type": self.exception_type,
-            "code": self.code or None,
-            "message": self.message,
-            "details": _plain_failure_value(self.details),
-            "typed_cause": (
-                self.typed_cause.to_payload()
-                if self.typed_cause is not None
-                else None
-            ),
-        }
 
 
 def _name(value: object, field: str) -> str:
@@ -215,6 +116,94 @@ def copy_target_selection(
             copied.append(destination)
             unmatched += 1
     return tuple(copied), matched, unmatched
+
+
+FitProjectionState = Literal["available", "unavailable"]
+
+
+@dataclass(frozen=True, slots=True)
+class FitProjectionAvailability:
+    """Typed settlement for one independent terminal projection."""
+
+    name: str
+    state: FitProjectionState
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        name = _name(self.name, "Fit projection name")
+        state = str(self.state or "").strip().lower()
+        if state not in {"available", "unavailable"}:
+            raise ValueError("Fit projection state must be available or unavailable.")
+        reason = str(self.reason or "").strip() or None
+        if state == "unavailable" and reason is None:
+            raise ValueError("Unavailable Fit projection requires a reason.")
+        if state == "available" and reason is not None:
+            raise ValueError("Available Fit projection cannot carry a reason.")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "reason", reason)
+
+    @property
+    def available(self) -> bool:
+        return self.state == "available"
+
+
+@dataclass(frozen=True, slots=True)
+class FitPublicationBundle:
+    """One immutable owner-settled semantic/physical Fit publication.
+
+    Values are intentionally opaque at this contracts layer so the owner of
+    terminal science remains the only producer of reports, candidates, and
+    curves.  Presentation consumes the bundle atomically and never recreates
+    terminal truth from a partial projection.
+    """
+
+    candidate: object
+    report: object | None
+    curves: tuple[object, ...]
+    report_availability: FitProjectionAvailability
+    curve_availability: FitProjectionAvailability
+    semantic_copy_availability: FitProjectionAvailability
+    apply_available_scopes: frozenset[str]
+    apply_unavailable_reasons: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        if self.candidate is None:
+            raise ValueError("Fit publication bundle requires candidate custody.")
+        for field_name in (
+            "report_availability",
+            "curve_availability",
+            "semantic_copy_availability",
+        ):
+            if not isinstance(getattr(self, field_name), FitProjectionAvailability):
+                raise TypeError(f"{field_name} must be FitProjectionAvailability.")
+        curves = tuple(self.curves)
+        if self.curve_availability.available and not curves:
+            raise ValueError("Available curve projection requires curves.")
+        if not self.curve_availability.available and curves:
+            raise ValueError("Unavailable curve projection cannot carry curves.")
+        if self.report_availability.available and self.report is None:
+            raise ValueError("Available report projection requires a report.")
+        if not self.report_availability.available and self.report is not None:
+            raise ValueError("Unavailable report projection cannot carry a report.")
+        if self.semantic_copy_availability.available and not self.report_availability.available:
+            raise ValueError("Semantic Copy requires an available report projection.")
+        available = frozenset(str(scope).strip() for scope in self.apply_available_scopes)
+        if any(not scope for scope in available):
+            raise ValueError("Fit Apply scope identities must be nonblank.")
+        reasons = MappingProxyType(
+            {
+                str(scope): str(reason or "").strip()
+                for scope, reason in dict(self.apply_unavailable_reasons).items()
+            }
+        )
+        if any(not scope or not reason for scope, reason in reasons.items()):
+            raise ValueError("Fit Apply unavailable reasons must be nonblank.")
+        if available.intersection(reasons):
+            raise ValueError("Fit Apply scope cannot be available and unavailable.")
+        object.__setattr__(self, "curves", curves)
+        object.__setattr__(self, "apply_available_scopes", available)
+        object.__setattr__(self, "apply_unavailable_reasons", reasons)
 
 
 def _json_value(value: object) -> object:

@@ -9,6 +9,8 @@ from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
 
 __all__ = ["MechanismWorkspaceView"]
 
+_CREATE_TAB_TOOLTIP = "Create a fresh mechanism tab"
+
 
 class MechanismWorkspaceView(QtWidgets.QWidget):
     """Physical mechanism selector and tab-local plot host; owns no project truth."""
@@ -22,8 +24,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
-        *,
-        main_plot_embed_analysis_tabs: bool = True,
     ) -> None:
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
@@ -42,7 +42,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         self._tab_bar.tabCloseRequested.connect(self._on_close_requested)
         layout.addWidget(self._tab_bar)
 
-        self._embed_analysis_tabs = bool(main_plot_embed_analysis_tabs)
         self._dark_mode = False
         self._active_tab_id: str | None = None
         self._plot_by_tab_id: dict[str, PyQtGraphPlotPanel] = {}
@@ -58,8 +57,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
 
     def _new_plot_panel(self) -> PyQtGraphPlotPanel:
         plot = PyQtGraphPlotPanel(
-            embed_analysis_tabs=self._embed_analysis_tabs,
-            workspace_splitter_object_name="mainPlotWorkspaceSplitter",
             enable_axis_inversion_actions=True,
             enable_reference_layer_toggle_action=True,
             enable_copy_visible_data_action=True,
@@ -67,10 +64,69 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         plot.set_theme(dark_mode=self._dark_mode)
         return plot
 
-    def _install_analysis_widget(self, plot: PyQtGraphPlotPanel) -> None:
-        analysis = plot.analysis_tabs_for_workspace(
-            detached=not self._embed_analysis_tabs,
+    def new_plot_panel(self) -> PyQtGraphPlotPanel:
+        """Create one unparented plot panel for detached project custody."""
+
+        return self._new_plot_panel()
+
+    def capture_plot_state(
+        self,
+    ) -> tuple[
+        dict[str, PyQtGraphPlotPanel],
+        PyQtGraphPlotPanel | None,
+        str | None,
+        QtWidgets.QWidget | None,
+        QtWidgets.QWidget | None,
+    ]:
+        """Capture plot custody and current selection as plain values."""
+
+        return (
+            dict(self._plot_by_tab_id),
+            self._initial_plot,
+            self._active_tab_id,
+            self._plot_stack.currentWidget(),
+            self._analysis_stack.currentWidget(),
         )
+
+    def adopt_plot_state(
+        self,
+        plots_by_tab_id: dict[str, PyQtGraphPlotPanel],
+        initial_plot: PyQtGraphPlotPanel | None,
+        active_tab_id: str | None,
+        *,
+        current_plot: QtWidgets.QWidget | None = None,
+        current_analysis: QtWidgets.QWidget | None = None,
+    ) -> None:
+        """Adopt plot custody and optionally restore current selections."""
+
+        self._plot_by_tab_id = dict(plots_by_tab_id)
+        self._initial_plot = initial_plot
+        self._active_tab_id = (
+            None if active_tab_id is None else str(active_tab_id)
+        )
+        if current_plot is not None:
+            self._plot_stack.setCurrentWidget(current_plot)
+        if current_analysis is not None:
+            self._analysis_stack.setCurrentWidget(current_analysis)
+
+    def attach_plot(self, plot: PyQtGraphPlotPanel) -> None:
+        """Attach one plot and its analysis surface to the workspace hosts."""
+
+        self._plot_stack.addWidget(plot)
+        self._install_analysis_widget(plot)
+
+    def detach_plot(self, plot: PyQtGraphPlotPanel) -> None:
+        """Detach one plot and its analysis surface from the workspace hosts."""
+
+        analysis = plot.analysis_tabs()
+        if self._plot_stack.indexOf(plot) >= 0:
+            self._plot_stack.removeWidget(plot)
+        if self._analysis_stack.indexOf(analysis) >= 0:
+            self._analysis_stack.removeWidget(analysis)
+        plot.setParent(None)
+
+    def _install_analysis_widget(self, plot: PyQtGraphPlotPanel) -> None:
+        analysis = plot.analysis_tabs()
         if self._analysis_stack.indexOf(analysis) < 0:
             self._analysis_stack.addWidget(analysis)
 
@@ -110,19 +166,12 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
     def main_plot_analysis_widget(self) -> QtWidgets.QStackedWidget:
         return self._analysis_stack
 
-    def main_plot_workspace_splitter(self) -> QtWidgets.QSplitter:
-        return self.active_plot().workspace_splitter()
-
     def available_analysis_surfaces(self) -> list[str]:
-        widget = self.active_plot().analysis_tabs_for_workspace(
-            detached=False,
-        )
+        widget = self.active_plot().analysis_tabs()
         return [str(widget.tabText(index)) for index in range(widget.count())]
 
     def focus_analysis_surface(self, surface_name: str) -> bool:
-        widget = self.active_plot().analysis_tabs_for_workspace(
-            detached=False,
-        )
+        widget = self.active_plot().analysis_tabs()
         target = str(surface_name).strip()
         for index in range(widget.count()):
             if widget.tabText(index) != target:
@@ -193,7 +242,7 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
             plus_index = self._tab_bar.count() - 1
             self._tab_bar.setTabText(plus_index, "+")
             self._tab_bar.setTabData(plus_index, None)
-            self._tab_bar.setTabToolTip(plus_index, "Create a fresh mechanism tab")
+            self._tab_bar.setTabToolTip(plus_index, _CREATE_TAB_TOOLTIP)
             self._tab_bar.setTabButton(
                 plus_index,
                 QtWidgets.QTabBar.ButtonPosition.RightSide,
@@ -207,7 +256,7 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         active_plot = self._ensure_plot(active_tab_id)
         self._active_tab_id = str(active_tab_id)
         self._plot_stack.setCurrentWidget(active_plot)
-        analysis = active_plot.analysis_tabs_for_workspace(detached=False)
+        analysis = active_plot.analysis_tabs()
         self._analysis_stack.setCurrentWidget(analysis)
 
     def select_tab_surface(self, tab_id: str) -> None:
@@ -227,9 +276,7 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
             self._tab_bar.blockSignals(blocked)
         self._active_tab_id = target
         self._plot_stack.setCurrentWidget(plot)
-        self._analysis_stack.setCurrentWidget(
-            plot.analysis_tabs_for_workspace(detached=False)
-        )
+        self._analysis_stack.setCurrentWidget(plot.analysis_tabs())
 
     def drop_tab_session_state(self, tab_id: str) -> None:
         target = str(tab_id)
@@ -237,7 +284,7 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         if plot is None:
             return
         plot.drop_tab_session_state()
-        analysis = plot.analysis_tabs_for_workspace(detached=False)
+        analysis = plot.analysis_tabs()
         self._plot_stack.removeWidget(plot)
         self._analysis_stack.removeWidget(analysis)
         analysis.setParent(None)
@@ -255,7 +302,7 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         initial = self._initial_plot
         if initial is not None:
             initial.reset_plot_session_state()
-            analysis = initial.analysis_tabs_for_workspace(detached=False)
+            analysis = initial.analysis_tabs()
             self._analysis_stack.removeWidget(analysis)
             analysis.setParent(None)
             initial.setParent(None)

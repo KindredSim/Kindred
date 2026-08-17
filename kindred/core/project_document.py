@@ -14,6 +14,7 @@ from kindred.core.mechanism_source import (
     MechanismAuthoringSource,
     source_matches_analysis,
 )
+from kindred.core.fitting_method_policy import validate_fit_method
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.dsl_parse import (
     DslAnalysis,
@@ -23,10 +24,22 @@ from kindred.core.simulator.dsl_parse import (
 )
 from kindred.core.simulator.wegscheider_symbolic import (
     WegscheiderCyclicityReport,
-    analyze_wegscheider_cyclicity,
 )
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.units import UnitsModel
+from kindred.core.species import (
+    CONCENTRATION_MAX_M,
+    CONCENTRATION_MIN_M,
+    MAX_FIT_EVALUATIONS,
+    MAX_GENERATED_TIME_ROWS,
+    TIME_MAX_S,
+    TIME_MIN_S,
+    TEMPERATURE_MAX_K,
+    TEMPERATURE_MIN_K,
+    validate_concentration,
+    validate_temperature,
+    validate_time_seconds,
+)
 
 __all__ = [
     "DatasetLink",
@@ -47,10 +60,8 @@ __all__ = [
     "FIT_SEED_RANGE",
     "SIMULATION_POINT_RANGE",
     "TEMPERATURE_RANGE_K",
-    "SUPPORTED_FIT_METHODS",
-    "FIT_METHOD_LABELS",
-    "fit_method_label",
-    "validate_fit_method",
+    "CONCENTRATION_RANGE_M",
+    "TIME_RANGE_S",
     "SUPPORTED_SOLVERS",
     "validate_fit_solver",
     "fresh_mechanism_tab",
@@ -60,8 +71,8 @@ __all__ = [
     "new_tab_id",
     "next_mechanism_name",
     "next_set_name",
-    "canonical_analysis_identity",
     "canonical_initial_values",
+    "canonical_observation_target_names",
     "canonical_species_names",
     "retained_tab_mechanism_source",
     "reconcile_tab_mechanism_source",
@@ -72,27 +83,21 @@ __all__ = [
     "validate_tab_scientific_settings",
 ]
 
-_SIMULATION_POINT_RANGE = (10, 100_000)
-_TEMPERATURE_RANGE_K = (0.1, 10_000.0)
+_SIMULATION_POINT_RANGE = (10, MAX_GENERATED_TIME_ROWS)
+_TEMPERATURE_RANGE_K = (TEMPERATURE_MIN_K, TEMPERATURE_MAX_K)
 _SOLVERS = ("Radau", "BDF")
-_FITTING_METHODS = ("trf", "dogbox", "differential_evolution")
-_FITTING_METHOD_LABELS = {
-    "trf": "Trust Region Reflective",
-    "dogbox": "Dogbox",
-    "differential_evolution": "Differential Evolution",
-}
-_FITTING_MAX_NFEV_RANGE = (10, 10_000)
+_FITTING_MAX_NFEV_RANGE = (10, MAX_FIT_EVALUATIONS)
 _FITTING_SEED_RANGE = (0, 999_999)
 
 # Public option policy owned by the canonical project model.  GUI controls
 # project these immutable values; they must not restate or narrow them.
 SUPPORTED_SOLVERS = _SOLVERS
-SUPPORTED_FIT_METHODS = _FITTING_METHODS
-FIT_METHOD_LABELS = dict(_FITTING_METHOD_LABELS)
 FIT_MAX_NFEV_RANGE = _FITTING_MAX_NFEV_RANGE
 FIT_SEED_RANGE = _FITTING_SEED_RANGE
 SIMULATION_POINT_RANGE = _SIMULATION_POINT_RANGE
 TEMPERATURE_RANGE_K = _TEMPERATURE_RANGE_K
+CONCENTRATION_RANGE_M = (CONCENTRATION_MIN_M, CONCENTRATION_MAX_M)
+TIME_RANGE_S = (TIME_MIN_S, TIME_MAX_S)
 
 
 def _new_id(prefix: str) -> str:
@@ -113,6 +118,17 @@ def new_dataset_id() -> str:
 
 def new_project_id() -> str:
     return _new_id("project")
+
+
+def _values_dict_rejecting_duplicates(
+    values: object,
+    *,
+    context: str,
+) -> dict[str, float]:
+    """Materialize species values only after one structural preflight."""
+
+    validated = _validate_initial_condition_values(values, context=context)
+    return dict(validated)
 
 
 def _require_name(value: object, label: str) -> str:
@@ -168,6 +184,51 @@ def _require_finite(
     return parsed
 
 
+def _validate_initial_condition_values(
+    values: object,
+    *,
+    context: str,
+) -> tuple[tuple[str, float], ...]:
+    """Validate one carrier before any species map can be materialized.
+
+    The exact tuple/pair shape is part of the immutable project contract.  A
+    forged instance can bypass a dataclass ``__post_init__`` with
+    ``object.__new__``/``object.__setattr__``; callers that are about to build
+    a map therefore repeat this small, centralized preflight.
+    """
+
+    if type(values) is not tuple:
+        raise TypeError(f"{context} values must be an exact tuple.")
+    validated: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for index, pair in enumerate(values):
+        if type(pair) is not tuple or len(pair) != 2:
+            raise TypeError(
+                f"{context} values[{index}] must be an exact species/value "
+                "pair."
+            )
+        species, value = pair
+        if type(species) is not str:
+            raise TypeError(
+                f"{context} values[{index}][0] species name must be a str."
+            )
+        _require_name(
+            species,
+            f"{context} values[{index}][0] species name",
+        )
+        if species in seen:
+            raise ValueError(
+                f"Duplicate species {species!r} in {context}."
+            )
+        parsed = validate_concentration(
+            value,
+            field=f"{context} values[{index}][1] initial concentration",
+        )
+        seen.add(species)
+        validated.append((species, parsed))
+    return tuple(validated)
+
+
 def validate_fit_solver(value: object) -> str:
     """Validate and return one canonical solver name for Fit execution."""
 
@@ -182,30 +243,6 @@ def validate_fit_solver(value: object) -> str:
             f"Fit solver must be one of {SUPPORTED_SOLVERS!r}."
         )
     return normalized
-
-
-def validate_fit_method(value: object) -> str:
-    """Validate and return one canonical optimizer identifier.
-
-    Method IDs are deliberately separate from their ordinary-facing labels;
-    persisted/run identities use only this stable roster.
-    """
-
-    if not isinstance(value, str):
-        raise TypeError("Fit optimization method must be a string identifier.")
-    normalized = value.strip()
-    if normalized not in SUPPORTED_FIT_METHODS:
-        raise ValueError(
-            "Fit optimization method must be one of "
-            f"{SUPPORTED_FIT_METHODS!r}."
-        )
-    return normalized
-
-
-def fit_method_label(value: object) -> str:
-    """Return the readable label for a canonical optimizer identifier."""
-
-    return FIT_METHOD_LABELS[validate_fit_method(value)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,8 +286,24 @@ class InitialConditionSet:
     name: str
     values: tuple[tuple[str, float], ...] = ()
 
+    def __post_init__(self) -> None:
+        """Admit an immutable, duplicate-free carrier at construction."""
+
+        _require_id(self.set_id, "initial-condition set ID")
+        _require_name(self.name, "initial-condition set name")
+        validated = _validate_initial_condition_values(
+            self.values,
+            context=f"initial-condition set {self.set_id!r}",
+        )
+        # Numeric admission canonicalizes Real values to the model's float
+        # representation while retaining authored species order.
+        object.__setattr__(self, "values", validated)
+
     def values_dict(self) -> dict[str, float]:
-        return dict(self.values)
+        return _values_dict_rejecting_duplicates(
+            self.values,
+            context=f"initial-condition set {self.set_id!r}",
+        )
 
     def with_values(
         self,
@@ -262,15 +315,56 @@ class InitialConditionSet:
             values=tuple(
                 (
                     _require_name(species, "initial-condition species name"),
-                    _require_finite(
+                    validate_concentration(
                         value,
-                        f"initial value for {species}",
-                        minimum=0.0,
+                        field=f"initial value for {species}",
                     ),
                 )
                 for species, value in items
             ),
         )
+
+
+def _validate_initial_condition_set_carriers(
+    sets: object,
+    *,
+    context: str,
+) -> tuple[InitialConditionSet, ...]:
+    """Preflight all sets before any set-name/index map can be built."""
+
+    if type(sets) is not tuple:
+        raise TypeError(f"{context} must be an exact tuple.")
+    validated: list[InitialConditionSet] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for index, item in enumerate(sets):
+        if not isinstance(item, InitialConditionSet):
+            raise TypeError(
+                f"{context}[{index}] must be an InitialConditionSet."
+            )
+        set_id = _require_id(item.set_id, "initial-condition set ID")
+        set_name = _require_name(
+            item.name,
+            "initial-condition set name",
+        )
+        if set_id in seen_ids:
+            raise ValueError(
+                f"Duplicate initial-condition set ID {set_id!r} in {context}."
+            )
+        name_key = set_name.casefold()
+        if name_key in seen_names:
+            raise ValueError(
+                f"Duplicate initial-condition set name {item.name!r} "
+                f"in {context}."
+            )
+        _values_dict_rejecting_duplicates(
+            item.values,
+            context=f"initial-condition set {item.set_id!r}",
+        )
+        seen_ids.add(set_id)
+        seen_names.add(name_key)
+        validated.append(item)
+    return tuple(validated)
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,6 +477,10 @@ class MechanismTabDocument:
         sets: Sequence[InitialConditionSet],
     ) -> "MechanismTabDocument":
         candidate_sets = tuple(sets)
+        _validate_initial_condition_set_carriers(
+            candidate_sets,
+            context="initial-condition sets",
+        )
         retained_ids = {item.set_id for item in candidate_sets}
         run_overrides = tuple(
             (set_id, settings)
@@ -829,12 +927,8 @@ def validate_simulation_execution_settings(
         raise ValueError(
             f"{label}.solver must use canonical supported spelling."
         )
-    start = _require_finite(
-        settings.t_start,
-        f"{label}.t_start",
-        minimum=0.0,
-    )
-    end = _require_finite(settings.t_end, f"{label}.t_end")
+    start = validate_time_seconds(settings.t_start, field=f"{label}.t_start")
+    end = validate_time_seconds(settings.t_end, field=f"{label}.t_end")
     if end <= start:
         raise ValueError(f"{label}.t_end must be greater than t_start.")
     _require_int(
@@ -851,12 +945,7 @@ def validate_tab_scientific_settings(
 ) -> TabScientificSettings:
     if not isinstance(settings, TabScientificSettings):
         raise TypeError(f"{label} must be TabScientificSettings.")
-    _require_finite(
-        settings.temperature,
-        f"{label}.temperature",
-        minimum=_TEMPERATURE_RANGE_K[0],
-        maximum=_TEMPERATURE_RANGE_K[1],
-    )
+    validate_temperature(settings.temperature, field=f"{label}.temperature")
     _require_finite(
         settings.rtol,
         f"{label}.rtol",
@@ -963,22 +1052,23 @@ def canonical_species_names(tab: MechanismTabDocument) -> tuple[str, ...]:
     return tuple(str(name) for name in prepared_dsl.analysis.species_names)
 
 
-def canonical_analysis_identity(tab: MechanismTabDocument) -> str:
-    """Return the exact identity of the accepted retained DSL analysis."""
+def canonical_observation_target_names(
+    tab: MechanismTabDocument,
+) -> tuple[str, ...]:
+    """Return accepted species followed by accepted authored observables."""
 
     if not isinstance(tab, MechanismTabDocument):
         raise TypeError("tab must be a MechanismTabDocument.")
     prepared_dsl = tab.prepared_dsl
+    if prepared_dsl is None:
+        return ()
     if type(prepared_dsl) is not PreparedDslRequestSet:
-        raise ValueError(
-            f"Mechanism tab {tab.tab_id!r} has no accepted DSL analysis."
-        )
-    identity = prepared_dsl.analysis.identity
-    if type(identity) is not str or not identity or identity != identity.strip():
-        raise ValueError(
-            f"Mechanism tab {tab.tab_id!r} has an invalid analysis identity."
-        )
-    return identity
+        raise TypeError("tab prepared_dsl must be PreparedDslRequestSet.")
+    analysis = prepared_dsl.analysis
+    return (
+        tuple(str(name) for name in analysis.species_names)
+        + tuple(str(name) for name in analysis.observable_names)
+    )
 
 
 def canonical_initial_values(
@@ -1002,23 +1092,7 @@ def _detailed_balance_admission(
     if prepared_dsl is None:
         report = WegscheiderCyclicityReport(cycles=())
     else:
-        from kindred.core.simulator.parameter_algebra import (
-            apply_parameter_algebra_spec_to_mechanism,
-        )
-
-        mechanism = prepared_dsl.mechanism_for_execution()
-        parameter_algebra_spec = (
-            prepared_dsl.parameter_algebra_spec_for_execution()
-        )
-        apply_parameter_algebra_spec_to_mechanism(
-            parameter_algebra_spec,
-            mechanism=mechanism,
-            require_mutable=False,
-        )
-        report = analyze_wegscheider_cyclicity(
-            mechanism,
-            parameter_algebra_spec=parameter_algebra_spec,
-        )
+        report = prepared_dsl.wegscheider_admission_report()
     return DetailedBalanceAdmission(
         report=report,
         policy_enabled=bool(policy_enabled),
@@ -1105,23 +1179,40 @@ def reconcile_tab_mechanism_source(
         if admitted_dsl is None
         else admitted_dsl.analysis.species_names
     )
+    new_observation_targets = (
+        ()
+        if admitted_dsl is None
+        else (
+            *admitted_dsl.analysis.species_names,
+            *admitted_dsl.analysis.observable_names,
+        )
+    )
     old_species = (
         ()
         if tab.dsl_analysis is None
         else tab.dsl_analysis.species_names
     )
     new_species_set = set(new_species)
+    new_observation_targets_set = set(new_observation_targets)
     old_species_set = set(old_species)
     introduced = tuple(
         species
         for species in new_species
         if species not in old_species_set
     )
+    admitted_initial_sets = _validate_initial_condition_set_carriers(
+        tab.initial_condition_sets,
+        context=f"initial-condition sets in tab {tab.tab_id!r}",
+    )
     reconciled_sets: list[InitialConditionSet] = []
-    for initial_set in tab.initial_condition_sets:
+    for initial_set in admitted_initial_sets:
+        source_values = _values_dict_rejecting_duplicates(
+            initial_set.values,
+            context=f"initial-condition set {initial_set.set_id!r}",
+        )
         values = {
             species: value
-            for species, value in initial_set.values
+            for species, value in source_values.items()
             if species in new_species_set
         }
         for species in introduced:
@@ -1213,12 +1304,14 @@ def reconcile_tab_mechanism_source(
             target_name = str(declaration.source_name)
             target_index = index_by_name.get(target_name.casefold())
             values = {species: 0.0 for species in new_species}
-            values.update(
-                {
-                    assignment.species: assignment.value
+            declaration_values = _values_dict_rejecting_duplicates(
+                tuple(
+                    (assignment.species, assignment.value)
                     for assignment in declaration.assignments
-                }
+                ),
+                context=f"inline initial-condition set {target_name!r}",
             )
+            values.update(declaration_values)
             if target_index is None:
                 target = InitialConditionSet(
                     set_id=new_set_id(),
@@ -1261,14 +1354,22 @@ def reconcile_tab_mechanism_source(
                         "during admission."
                     )
             materialized_ids.append(anonymous_target.set_id)
+        anonymous_values = _values_dict_rejecting_duplicates(
+            anonymous_target.values,
+            context=f"initial-condition set {anonymous_target.set_id!r}",
+        )
         values = {
-            species: float(
-                anonymous_target.values_dict().get(species, 0.0)
-            )
+            species: float(anonymous_values.get(species, 0.0))
             for species in new_species
         }
-        for assignment in declaration.assignments:
-            values[assignment.species] = assignment.value
+        declaration_values = _values_dict_rejecting_duplicates(
+            tuple(
+                (assignment.species, assignment.value)
+                for assignment in declaration.assignments
+            ),
+            context="inline initial-condition declaration",
+        )
+        values.update(declaration_values)
         anonymous_target = replace(
             anonymous_target,
             values=tuple(values.items()),
@@ -1303,10 +1404,10 @@ def reconcile_tab_mechanism_source(
     reconciled_links: list[tuple[str, DatasetLink]] = []
     for dataset_id, link in tab.dataset_links:
         observation_mapping = tuple(
-            (raw_observation_id, model_species)
-            for raw_observation_id, model_species
+            (raw_observation_id, model_target)
+            for raw_observation_id, model_target
             in link.observation_mapping
-            if model_species in new_species_set
+            if model_target in new_observation_targets_set
         )
         reconciled_links.append(
             (
@@ -1526,10 +1627,17 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 f"accepted mechanism: {exc}"
             ) from exc
         mechanism_species_by_tab_id[tab.tab_id] = mechanism_species
+        observation_targets = canonical_observation_target_names(tab)
         mechanism_species_set = frozenset(mechanism_species)
+        admitted_initial_sets = _validate_initial_condition_set_carriers(
+            tab.initial_condition_sets,
+            context=(
+                f"initial-condition sets in tab {tab.tab_id!r}"
+            ),
+        )
         set_id_values = [
             _require_id(item.set_id, "initial-condition set ID")
-            for item in tab.initial_condition_sets
+            for item in admitted_initial_sets
         ]
         _validate_unique(
             set_id_values,
@@ -1540,17 +1648,12 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
         _validate_unique(
             (
                 _require_name(item.name, "initial-condition set name")
-                for item in tab.initial_condition_sets
+                for item in admitted_initial_sets
             ),
             f"set names in tab {tab.name!r}",
             key=lambda value: str(value).casefold(),
         )
-        for item in tab.initial_condition_sets:
-            if not isinstance(item, InitialConditionSet):
-                raise TypeError(
-                    "initial_condition_sets must contain "
-                    "InitialConditionSet values."
-                )
+        for item in admitted_initial_sets:
             _validate_unique(
                 (
                     _require_name(
@@ -1562,13 +1665,14 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 f"species in initial-condition set {item.set_id!r}",
             )
             for species, value in item.values:
-                _require_finite(
+                validate_concentration(
                     value,
-                    "initial concentration for "
-                    f"tab {tab.tab_id!r} ({tab.name!r}), "
-                    f"set {item.set_id!r} ({item.name!r}), "
-                    f"species {species!r}",
-                    minimum=0.0,
+                    field=(
+                        "initial concentration for "
+                        f"tab {tab.tab_id!r} ({tab.name!r}), "
+                        f"set {item.set_id!r} ({item.name!r}), "
+                        f"species {species!r}"
+                    ),
                 )
                 if species not in mechanism_species_set:
                     raise ValueError(
@@ -1636,7 +1740,7 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                     )
                     for series in dataset.observations
                 ),
-                model_species=mechanism_species,
+                model_targets=observation_targets,
             )
             if normalized_observation_mapping != link.observation_mapping:
                 raise ValueError(
@@ -1702,6 +1806,7 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                     observation_mapping=link.observation_mapping,
                     initial_values=initial_set.values_dict(),
                     mechanism_species=mechanism_species_by_tab_id[tab.tab_id],
+                    observation_targets=canonical_observation_target_names(tab),
                     resolved_t_start=resolved_settings.t_start,
                 )
             except (KeyError, TypeError, ValueError) as exc:

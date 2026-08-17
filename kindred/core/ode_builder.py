@@ -23,8 +23,14 @@ from .equilibrium_rate_authority import (
     json_safe_equilibrium_authority_payload,
     normalize_existing_equilibrium_rate_authority,
 )
+from .exceptions import KineticRuntimeDomainError
 from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
 from .rate_binding import ForwardRateBinding, RateBinding as _RateBinding
+from .species import validate_temperature
+from .simulator.solver_types import (
+    SimulationScientificUnavailability,
+    _SimulationScientificUnavailabilitySignal,
+)
 from .kinetics import (
     ArrheniusRateModel,
     ConstantRateModel,
@@ -35,7 +41,6 @@ from .kinetics import (
     forward_rate_model_for_equilibrium,
     forward_rate_model_for_reaction,
 )
-from .exceptions import SolverError
 
 logger = logging.getLogger(__name__)
 
@@ -133,10 +138,68 @@ class EffectiveRateCoefficientEvaluator:
         object.__setattr__(self, "_evaluators", tuple(self._evaluators))
 
     def __call__(self, temperature_K: float) -> EffectiveRateCoefficients:
-        temperature = float(temperature_K)
-        if not math.isfinite(temperature) or temperature <= 0.0:
-            raise ValueError("Runtime temperature must be positive and finite.")
-        pairs = tuple(evaluator(temperature) for evaluator in self._evaluators)
+        def failure_details(index: int | None = None) -> dict[str, object]:
+            details: dict[str, object] = {}
+            if index is not None:
+                details["step_index"] = int(index)
+                if index < len(self.step_kinds):
+                    details["step_kind"] = str(self.step_kinds[index])
+                snapshot = (
+                    self.authority_snapshot[index]
+                    if index < len(self.authority_snapshot)
+                    else {}
+                )
+                names = tuple(
+                    sorted(
+                        {
+                            str(snapshot.get(key)).strip()
+                            for key in (
+                                "binding_name",
+                                "forward_binding_name",
+                                "reverse_binding_name",
+                            )
+                            if snapshot.get(key) is not None
+                            and str(snapshot.get(key)).strip()
+                        }
+                    )
+                )
+                details["authority_names"] = names
+                details["parameter_names"] = names
+                details["value_dependencies"] = names
+            return details
+
+        try:
+            temperature = validate_temperature(
+                temperature_K,
+                field="Runtime temperature",
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise KineticRuntimeDomainError(
+                f"Runtime temperature is outside the admitted domain: {exc}",
+                stage="scheduled_temperature",
+                details=failure_details(),
+            ) from exc
+        pairs: list[tuple[float, float]] = []
+        for index, evaluator in enumerate(self._evaluators):
+            try:
+                pairs.append(evaluator(temperature))
+            except KineticRuntimeDomainError as exc:
+                details = dict(getattr(exc, "details", {}) or {})
+                details.update(failure_details(index))
+                raise KineticRuntimeDomainError(
+                    str(getattr(exc, "message", None) or exc),
+                    stage=str(details.get("stage") or "kinetic_lowering"),
+                    parameter_names=tuple(details.get("parameter_names", ())),
+                    details=details,
+                ) from exc
+            except (ArithmeticError, ValueError) as exc:
+                details = failure_details(index)
+                raise KineticRuntimeDomainError(
+                    f"Runtime kinetic lowering is outside the admitted domain: {exc}",
+                    stage="kinetic_lowering",
+                    parameter_names=tuple(details.get("parameter_names", ())),
+                    details=details,
+                ) from exc
         forward = tuple(float(pair[0]) for pair in pairs)
         reverse = tuple(float(pair[1]) for pair in pairs)
         if not (
@@ -147,20 +210,24 @@ class EffectiveRateCoefficientEvaluator:
             raise ValueError(
                 "Effective rate coefficient shape conflicts with mechanism steps."
             )
-        for kind, forward_value, reverse_value in zip(
+        for index, (kind, forward_value, reverse_value) in enumerate(zip(
             self.step_kinds,
             forward,
             reverse,
             strict=True,
-        ):
-            if not math.isfinite(forward_value) or forward_value <= 0.0:
-                raise ValueError(
-                    "Effective forward rate coefficients must be positive and finite."
+        )):
+            if not math.isfinite(forward_value) or forward_value < 0.0:
+                raise KineticRuntimeDomainError(
+                    "Effective forward rate coefficients must be finite and nonnegative.",
+                    parameter_names=tuple(failure_details(index).get("parameter_names", ())),
+                    details=failure_details(index),
                 )
             if kind == "equilibrium":
-                if not math.isfinite(reverse_value) or reverse_value <= 0.0:
-                    raise ValueError(
-                        "Effective reverse rate coefficients must be positive and finite."
+                if not math.isfinite(reverse_value) or reverse_value < 0.0:
+                    raise KineticRuntimeDomainError(
+                        "Effective reverse rate coefficients must be finite and nonnegative.",
+                        parameter_names=tuple(failure_details(index).get("parameter_names", ())),
+                        details=failure_details(index),
                     )
             elif kind == "reaction":
                 if reverse_value != 0.0:
@@ -458,6 +525,38 @@ def build_ode_rhs_from_mechanism(
     stoich_rate_buffer = np.empty_like(S)
     stoich_flux = np.empty(n_species, dtype=float)
 
+    def _runtime_dependency_details(indices: object = ()) -> dict[str, object]:
+        selected = np.asarray(indices, dtype=int).reshape(-1)
+        names: list[str] = []
+        step_names: list[str] = []
+        for index in selected:
+            idx = int(index)
+            if 0 <= idx < len(steps):
+                step_type, _step = steps[idx]
+                step_names.append(f"{step_type}{idx}")
+                if step_type == "reaction":
+                    binding = getattr(_step, "rate", None)
+                    binding_name = getattr(binding, "name", None)
+                    if binding_name is not None:
+                        names.append(str(binding_name))
+                else:
+                    equilibrium = _step
+                    for binding in (
+                        getattr(equilibrium, "kf", None),
+                        getattr(equilibrium, "kr", None),
+                    ):
+                        binding_name = getattr(binding, "name", None)
+                        if binding_name is not None:
+                            names.append(str(binding_name))
+        payload = {
+            "step_names": tuple(step_names),
+            "step_indices": tuple(int(index) for index in selected),
+            "authority_names": tuple(sorted(set(names))),
+            "parameter_names": tuple(sorted(set(names))),
+            "value_dependencies": tuple(sorted(set(names))),
+        }
+        return payload
+
     def _stable_diff_exp_logs(log_f: np.ndarray, log_r: np.ndarray, out: np.ndarray) -> None:
         """
         Compute exp(log_f) - exp(log_r) stably from logs.
@@ -468,18 +567,28 @@ def build_ode_rhs_from_mechanism(
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             out.fill(0.0)
             if np.any(np.isnan(log_f)) or np.any(np.isnan(log_r)):
-                raise SolverError(
-                    "Reversible rate logarithm is non-finite at the solver state.",
-                    details={"candidate_domain_eligible": True},
+                raise _SimulationScientificUnavailabilitySignal(
+                    SimulationScientificUnavailability(
+                        producer="ode_builder",
+                        stage="reversible_rate_logarithm",
+                        details=_runtime_dependency_details(
+                            np.flatnonzero(np.isnan(log_f) | np.isnan(log_r))
+                        ),
+                    )
                 )
             max_lr = np.maximum(log_f, log_r)
             min_lr = np.minimum(log_f, log_r)
             finite_max = np.isfinite(max_lr)
             unrepresentable = ~finite_max & (max_lr > 0.0)
             if np.any(unrepresentable):
-                raise SolverError(
-                    "Reversible rate difference is non-finite at the solver state.",
-                    details={"candidate_domain_eligible": True},
+                raise _SimulationScientificUnavailabilitySignal(
+                    SimulationScientificUnavailability(
+                        producer="ode_builder",
+                        stage="reversible_rate_difference",
+                        details=_runtime_dependency_details(
+                            np.flatnonzero(unrepresentable)
+                        ),
+                    )
                 )
             if not np.any(finite_max):
                 # Both rates are exactly zero in log space (-inf - -inf).
@@ -490,9 +599,14 @@ def build_ode_rhs_from_mechanism(
             log_mag = max_lr[indices] + np.log(small)
             mag = np.exp(log_mag)
             if np.any(~np.isfinite(mag)):
-                raise SolverError(
-                    "Reversible rate difference is non-finite at the solver state.",
-                    details={"candidate_domain_eligible": True},
+                raise _SimulationScientificUnavailabilitySignal(
+                    SimulationScientificUnavailability(
+                        producer="ode_builder",
+                        stage="reversible_rate_difference",
+                        details=_runtime_dependency_details(
+                            indices
+                        ),
+                    )
                 )
             sign = np.where(log_f[indices] >= log_r[indices], 1.0, -1.0)
             out[indices] = sign * mag

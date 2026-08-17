@@ -4,9 +4,15 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from numbers import Real
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence, TypeAlias
 
 from kindred.core.authored_source_errors import AuthoredSourceError
+from kindred.core.species import (
+    validate_concentration,
+    validate_time_seconds,
+)
 
 __all__ = [
     "InterventionFlux",
@@ -15,17 +21,126 @@ __all__ = [
     "InterventionProtocol",
     "InterventionProtocolOperation",
     "InterventionSchedule",
+    "InterventionScheduleDependencyMetadata",
     "InterventionScheduleError",
+    "InterventionScheduleFieldIdentity",
     "InterventionSet",
     "InterventionTrigger",
     "InterventionTriggerAction",
     "coerce_intervention_schedule",
+    "intervention_schedule_parameter_dependencies",
     "intervention_schedule_parameter_names",
+]
+
+
+# The declaration ordinal and (where applicable) the authored nested ordinal
+# are part of the key.  Keeping the location in the key is important: two
+# protocol records may use the same field name without overwriting one another.
+InterventionScheduleFieldIdentity: TypeAlias = tuple[int, int | None, str]
+InterventionScheduleDependencyMetadata: TypeAlias = Mapping[
+    InterventionScheduleFieldIdentity, tuple[str, ...]
 ]
 
 
 class InterventionScheduleError(AuthoredSourceError):
     """The authored intervention source is outside the final public schema."""
+
+    __slots__ = (
+        "operation",
+        "declaration_ordinal",
+        "field",
+        "nested_location",
+        "domain",
+        "field_identities",
+        "value_dependencies",
+        "details",
+        "_locked",
+    )
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: str | None = None,
+        declaration_ordinal: int | None = None,
+        field: str | None = None,
+        nested_location: Mapping[str, Any] | None = None,
+        domain: str | None = None,
+        field_identities: Sequence[InterventionScheduleFieldIdentity] = (),
+        value_dependencies: Sequence[str] = (),
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Retain producer-owned location/dependency facts immutably."""
+        normalized_dependencies = tuple(
+            sorted(
+                {
+                    str(name).strip()
+                    for name in value_dependencies
+                    if str(name).strip()
+                }
+            )
+        )
+        normalized_field_identities = tuple(
+            (int(declaration), None if nested is None else int(nested), str(path))
+            for declaration, nested, path in field_identities
+        )
+        payload = dict(details or {})
+        if operation is not None:
+            payload["operation"] = str(operation)
+        if declaration_ordinal is not None:
+            payload["declaration_ordinal"] = int(declaration_ordinal)
+        if field is not None:
+            payload["field"] = str(field)
+        if nested_location is not None:
+            payload["nested_location"] = nested_location
+        if domain is not None:
+            payload["domain"] = str(domain)
+        if normalized_field_identities:
+            payload["field_identities"] = normalized_field_identities
+        if normalized_dependencies:
+            payload["value_dependencies"] = normalized_dependencies
+        object.__setattr__(self, "operation", None if operation is None else str(operation))
+        object.__setattr__(
+            self,
+            "declaration_ordinal",
+            None if declaration_ordinal is None else int(declaration_ordinal),
+        )
+        object.__setattr__(self, "field", None if field is None else str(field))
+        object.__setattr__(self, "nested_location", _freeze_schedule_value(nested_location))
+        object.__setattr__(self, "domain", None if domain is None else str(domain))
+        object.__setattr__(self, "field_identities", normalized_field_identities)
+        object.__setattr__(self, "value_dependencies", normalized_dependencies)
+        object.__setattr__(
+            self,
+            "details",
+            MappingProxyType(
+                {
+                    str(key): _freeze_schedule_value(value)
+                    for key, value in payload.items()
+                }
+            ),
+        )
+        super().__init__(str(message))
+        object.__setattr__(self, "_locked", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_locked", False):
+            raise AttributeError("InterventionScheduleError is immutable")
+        object.__setattr__(self, name, value)
+
+
+def _freeze_schedule_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_schedule_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_schedule_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(
+            _freeze_schedule_value(item) for item in sorted(value, key=repr)
+        )
+    return value
 
 
 _PARAM_FIELDS = frozenset(
@@ -41,6 +156,21 @@ _PARAM_FIELDS = frozenset(
 )
 _DIRECTIONS = frozenset({"rising", "falling", "either"})
 _PHASES = frozenset({"before", "during", "after"})
+_AUTHORED_FLOAT_FIELDS = frozenset(
+    {
+        "time",
+        "start_time",
+        "end_time",
+        "value",
+        "delta",
+        "flux_rate",
+        "threshold",
+        "every",
+        "duration",
+        "min_interval",
+    }
+)
+_AUTHORED_INTEGER_FIELDS = frozenset({"count", "max_count"})
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -53,60 +183,66 @@ def _canonical_bytes(value: object) -> bytes:
 
 
 def _finite(value: object, *, field: str) -> float:
-    try:
-        number = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise InterventionScheduleError(f"{field} must be a finite number.") from exc
+    if type(value) is bool or not isinstance(value, Real):
+        raise InterventionScheduleError(f"{field} must be a finite number.")
+    number = float(value)
     if not math.isfinite(number):
         raise InterventionScheduleError(f"{field} must be a finite number.")
     return number
 
 
 def _nonnegative(value: object, *, field: str) -> float:
-    number = _finite(value, field=field)
-    if number < 0.0:
-        raise InterventionScheduleError(f"{field} must be non-negative.")
-    return number
+    try:
+        return validate_time_seconds(value, field=field)
+    except (TypeError, ValueError) as exc:
+        raise InterventionScheduleError(str(exc)) from exc
 
 
 def _positive(value: object, *, field: str) -> float:
-    number = _finite(value, field=field)
+    number = _nonnegative(value, field=field)
     if number <= 0.0:
         raise InterventionScheduleError(f"{field} must be greater than zero.")
     return number
 
 
+def _concentration(value: object, *, field: str) -> float:
+    try:
+        return validate_concentration(value, field=field)
+    except (TypeError, ValueError) as exc:
+        raise InterventionScheduleError(str(exc)) from exc
+
+
 def _positive_int(value: object, *, field: str) -> int:
-    if isinstance(value, bool):
+    if type(value) is not int:
         raise InterventionScheduleError(f"{field} must be a positive integer.")
-    if isinstance(value, int):
-        number = value
-    elif isinstance(value, str) and value.strip().isdecimal():
-        number = int(value.strip())
-    else:
-        raise InterventionScheduleError(f"{field} must be a positive integer.")
+    number = value
     if number <= 0:
         raise InterventionScheduleError(f"{field} must be a positive integer.")
     return number
 
 
 def _name(value: object, *, field: str) -> str:
-    name = str(value or "").strip()
+    if not isinstance(value, str):
+        raise InterventionScheduleError(f"{field} must be a string.")
+    name = value.strip()
     if not name:
         raise InterventionScheduleError(f"{field} must not be empty.")
     return name
 
 
+def _enum(value: object, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise InterventionScheduleError(f"{field} must be a string.")
+    text = value.strip().lower()
+    if not text:
+        raise InterventionScheduleError(f"{field} must not be empty.")
+    return text
+
+
 def _ordinal(value: object, *, field: str) -> int:
-    if isinstance(value, bool):
+    if type(value) is not int or value < 0:
         raise InterventionScheduleError(f"{field} must be a non-negative integer.")
-    try:
-        number = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise InterventionScheduleError(f"{field} must be a non-negative integer.") from exc
-    if number < 0 or number != value:
-        raise InterventionScheduleError(f"{field} must be a non-negative integer.")
-    return number
+    return value
 
 
 def _pair(
@@ -117,7 +253,7 @@ def _pair(
     domain: str,
 ) -> tuple[float | None, str | None]:
     has_value = value is not None
-    has_parameter = parameter is not None and bool(str(parameter).strip())
+    has_parameter = parameter is not None
     if has_value == has_parameter:
         raise InterventionScheduleError(
             f"Exactly one of {field} and {field}_param is required."
@@ -128,6 +264,7 @@ def _pair(
         "signed": _finite,
         "nonnegative": _nonnegative,
         "positive": _positive,
+        "concentration": _concentration,
     }[domain]
     return validator(value, field=field), None
 
@@ -144,7 +281,10 @@ def _resolved(
     if parameter is not None:
         if parameter not in parameter_values:
             raise InterventionScheduleError(
-                f"Missing intervention schedule parameter: {parameter}"
+                f"Missing intervention schedule parameter: {parameter}",
+                field=field,
+                domain=domain,
+                value_dependencies=(parameter,),
             )
         raw = parameter_values[parameter]
     else:
@@ -153,8 +293,19 @@ def _resolved(
         "signed": _finite,
         "nonnegative": _nonnegative,
         "positive": _positive,
+        "concentration": _concentration,
     }[domain]
-    return validator(raw, field=field)
+    try:
+        return validator(raw, field=field)
+    except InterventionScheduleError as exc:
+        if parameter is None:
+            raise
+        raise InterventionScheduleError(
+            str(exc),
+            field=field,
+            domain=domain,
+            value_dependencies=(parameter,),
+        ) from exc
 
 
 def _put_pair(
@@ -203,7 +354,7 @@ class InterventionSet:
             self.time, self.time_param, field="time", domain="nonnegative"
         )
         value, value_param = _pair(
-            self.value, self.value_param, field="value", domain="nonnegative"
+            self.value, self.value_param, field="value", domain="concentration"
         )
         object.__setattr__(self, "time", time)
         object.__setattr__(self, "time_param", time_param)
@@ -225,7 +376,7 @@ class InterventionSet:
                 self.time, self.time_param, values, field="time", domain="nonnegative"
             ),
             value=_resolved(
-                self.value, self.value_param, values, field="value", domain="nonnegative"
+                self.value, self.value_param, values, field="value", domain="concentration"
             ),
             declaration_ordinal=self.declaration_ordinal,
         )
@@ -355,22 +506,39 @@ class InterventionFlux:
         )
 
     def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionFlux":
+        start_time = _resolved(
+            self.start_time,
+            self.start_time_param,
+            values,
+            field="start_time",
+            domain="nonnegative",
+        )
+        end_time = _resolved(
+            self.end_time,
+            self.end_time_param,
+            values,
+            field="end_time",
+            domain="nonnegative",
+        )
+        if end_time <= start_time:
+            raise InterventionScheduleError(
+                "end_time must be greater than start_time.",
+                field="end_time",
+                domain="interval_order",
+                field_identities=(
+                    (self.declaration_ordinal, None, "start_time"),
+                    (self.declaration_ordinal, None, "end_time"),
+                ),
+                value_dependencies=tuple(
+                    name
+                    for name in (self.start_time_param, self.end_time_param)
+                    if name is not None
+                ),
+            )
         return InterventionFlux(
             species=self.species,
-            start_time=_resolved(
-                self.start_time,
-                self.start_time_param,
-                values,
-                field="start_time",
-                domain="nonnegative",
-            ),
-            end_time=_resolved(
-                self.end_time,
-                self.end_time_param,
-                values,
-                field="end_time",
-                domain="nonnegative",
-            ),
+            start_time=start_time,
+            end_time=end_time,
             flux_rate=_resolved(
                 self.flux_rate,
                 self.flux_rate_param,
@@ -420,7 +588,7 @@ class InterventionHold:
                 getattr(self, field),
                 getattr(self, f"{field}_param"),
                 field=field,
-                domain="nonnegative",
+                domain="concentration" if field == "value" else "nonnegative",
             )
             object.__setattr__(self, field, value)
             object.__setattr__(self, f"{field}_param", parameter)
@@ -449,28 +617,45 @@ class InterventionHold:
         )
 
     def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionHold":
+        start_time = _resolved(
+            self.start_time,
+            self.start_time_param,
+            values,
+            field="start_time",
+            domain="nonnegative",
+        )
+        end_time = _resolved(
+            self.end_time,
+            self.end_time_param,
+            values,
+            field="end_time",
+            domain="nonnegative",
+        )
+        if end_time <= start_time:
+            raise InterventionScheduleError(
+                "end_time must be greater than start_time.",
+                field="end_time",
+                domain="interval_order",
+                field_identities=(
+                    (self.declaration_ordinal, None, "start_time"),
+                    (self.declaration_ordinal, None, "end_time"),
+                ),
+                value_dependencies=tuple(
+                    name
+                    for name in (self.start_time_param, self.end_time_param)
+                    if name is not None
+                ),
+            )
         return InterventionHold(
             species=self.species,
-            start_time=_resolved(
-                self.start_time,
-                self.start_time_param,
-                values,
-                field="start_time",
-                domain="nonnegative",
-            ),
-            end_time=_resolved(
-                self.end_time,
-                self.end_time_param,
-                values,
-                field="end_time",
-                domain="nonnegative",
-            ),
+            start_time=start_time,
+            end_time=end_time,
             value=_resolved(
                 self.value,
                 self.value_param,
                 values,
                 field="value",
-                domain="nonnegative",
+                domain="concentration",
             ),
             declaration_ordinal=self.declaration_ordinal,
         )
@@ -505,8 +690,8 @@ class InterventionProtocolOperation:
     authored_ordinal: int = 0
 
     def __post_init__(self) -> None:
-        phase = str(self.phase).strip().lower()
-        op = str(self.op).strip().lower()
+        phase = _enum(self.phase, field="phase")
+        op = _enum(self.op, field="op")
         if phase not in _PHASES:
             raise InterventionScheduleError(f"Unsupported protocol phase: {phase!r}.")
         permitted = {"before": {"set", "jump"}, "during": {"flux", "hold"}, "after": {"set", "jump"}}
@@ -531,7 +716,7 @@ class InterventionProtocolOperation:
                     raw_value,
                     raw_parameter,
                     field=field,
-                    domain="nonnegative" if field == "value" else "signed",
+                    domain="concentration" if field == "value" else "signed",
                 )
             else:
                 if raw_value is not None or raw_parameter is not None:
@@ -564,7 +749,7 @@ class InterventionProtocolOperation:
             getattr(self, f"{selected}_param"),
             values,
             field=selected,
-            domain="nonnegative" if selected == "value" else "signed",
+            domain="concentration" if selected == "value" else "signed",
         )
         return InterventionProtocolOperation(**kwargs)
 
@@ -618,6 +803,11 @@ class InterventionProtocol:
                 raise InterventionScheduleError(
                     f"Protocol {phase} contains an operation from another phase."
                 )
+            authored_ordinals = [int(item.authored_ordinal) for item in operations]
+            if len(authored_ordinals) != len(set(authored_ordinals)):
+                raise InterventionScheduleError(
+                    f"Protocol {phase} nested authored ordinals must be unique."
+                )
             object.__setattr__(self, phase, operations)
         if not self.before and not self.during and not self.after:
             raise InterventionScheduleError(
@@ -649,6 +839,34 @@ class InterventionProtocol:
         )
 
     def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionProtocol":
+        resolved_phases: dict[str, tuple[InterventionProtocolOperation, ...]] = {}
+        for phase in ("before", "during", "after"):
+            resolved_items: list[InterventionProtocolOperation] = []
+            for nested in getattr(self, phase):
+                try:
+                    resolved_items.append(nested.resolve_parameters(values))
+                except InterventionScheduleError as exc:
+                    details = dict(getattr(exc, "details", {}) or {})
+                    details["nested_location"] = {
+                        "phase": phase,
+                        "authored_ordinal": nested.authored_ordinal,
+                    }
+                    dependencies = tuple(
+                        getattr(exc, "value_dependencies", ())
+                        or details.get("value_dependencies", ())
+                    )
+                    raise InterventionScheduleError(
+                        str(exc),
+                        operation=self.op,
+                        declaration_ordinal=self.declaration_ordinal,
+                        field=getattr(exc, "field", None),
+                        nested_location=details["nested_location"],
+                        domain=getattr(exc, "domain", None),
+                        field_identities=getattr(exc, "field_identities", ()),
+                        value_dependencies=dependencies,
+                        details=details,
+                    ) from exc
+            resolved_phases[phase] = tuple(resolved_items)
         return InterventionProtocol(
             start_time=_resolved(
                 self.start_time,
@@ -660,9 +878,9 @@ class InterventionProtocol:
             every=self.every,
             count=self.count,
             duration=self.duration,
-            before=tuple(item.resolve_parameters(values) for item in self.before),
-            during=tuple(item.resolve_parameters(values) for item in self.during),
-            after=tuple(item.resolve_parameters(values) for item in self.after),
+            before=resolved_phases["before"],
+            during=resolved_phases["during"],
+            after=resolved_phases["after"],
             declaration_ordinal=self.declaration_ordinal,
         )
 
@@ -699,7 +917,7 @@ class InterventionTriggerAction:
     delta_param: str | None = None
 
     def __post_init__(self) -> None:
-        op = str(self.op).strip().lower()
+        op = _enum(self.op, field="op")
         if op not in {"set", "jump"}:
             raise InterventionScheduleError(
                 "Trigger then permits exactly op=set or op=jump."
@@ -716,7 +934,7 @@ class InterventionTriggerAction:
             getattr(self, selected),
             getattr(self, f"{selected}_param"),
             field=selected,
-            domain="nonnegative" if selected == "value" else "signed",
+            domain="concentration" if selected == "value" else "signed",
         )
         object.__setattr__(self, selected, value)
         object.__setattr__(self, f"{selected}_param", parameter)
@@ -738,7 +956,7 @@ class InterventionTriggerAction:
                     getattr(self, f"{selected}_param"),
                     values,
                     field=selected,
-                    domain="nonnegative" if selected == "value" else "signed",
+                    domain="concentration" if selected == "value" else "signed",
                 )
             },
         )
@@ -774,11 +992,11 @@ class InterventionTrigger:
             self.threshold,
             self.threshold_param,
             field="threshold",
-            domain="nonnegative",
+            domain="concentration",
         )
         object.__setattr__(self, "threshold", threshold)
         object.__setattr__(self, "threshold_param", threshold_param)
-        direction = str(self.direction or "either").strip().lower()
+        direction = _enum(self.direction, field="direction")
         if direction not in _DIRECTIONS:
             raise InterventionScheduleError(
                 "direction must be rising, falling, or either."
@@ -811,6 +1029,26 @@ class InterventionTrigger:
         return self.threshold_param is not None or self.then.is_parameterized
 
     def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionTrigger":
+        try:
+            then = self.then.resolve_parameters(values)
+        except InterventionScheduleError as exc:
+            details = dict(getattr(exc, "details", {}) or {})
+            details["nested_location"] = {"path": "then"}
+            dependencies = tuple(
+                getattr(exc, "value_dependencies", ())
+                or details.get("value_dependencies", ())
+            )
+            raise InterventionScheduleError(
+                str(exc),
+                operation=self.op,
+                declaration_ordinal=self.declaration_ordinal,
+                field=getattr(exc, "field", None),
+                nested_location=details["nested_location"],
+                domain=getattr(exc, "domain", None),
+                field_identities=getattr(exc, "field_identities", ()),
+                value_dependencies=dependencies,
+                details=details,
+            ) from exc
         return InterventionTrigger(
             watch_species=self.watch_species,
             threshold=_resolved(
@@ -818,12 +1056,12 @@ class InterventionTrigger:
                 self.threshold_param,
                 values,
                 field="threshold",
-                domain="nonnegative",
+                domain="concentration",
             ),
             direction=self.direction,
             max_count=self.max_count,
             min_interval=self.min_interval,
-            then=self.then.resolve_parameters(values),
+            then=then,
             declaration_ordinal=self.declaration_ordinal,
         )
 
@@ -918,14 +1156,26 @@ class InterventionSchedule:
         return any(item.is_parameterized for item in self.operations)
 
     def resolve_parameters(
-        self, parameter_values: Mapping[str, Any] | None
+        self,
+        parameter_values: Mapping[str, Any] | None,
+        *,
+        dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
     ) -> "InterventionSchedule":
         if not self.is_parameterized:
             return self
         values = dict(parameter_values or {})
-        return InterventionSchedule(
-            tuple(item.resolve_parameters(values) for item in self.operations)
-        )
+        dependency_metadata = dependency_metadata or intervention_schedule_parameter_dependencies(self)
+        resolved: list[InterventionOperation] = []
+        for item in self.operations:
+            try:
+                resolved.append(item.resolve_parameters(values))
+            except InterventionScheduleError as exc:
+                raise _annotate_schedule_resolution_error(
+                    exc,
+                    operation=item,
+                    dependency_metadata=dependency_metadata,
+                ) from exc
+        return InterventionSchedule(tuple(resolved))
 
     def to_payload(self) -> dict[str, Any]:
         return {"operations": [item.to_payload() for item in self.operations]}
@@ -976,6 +1226,85 @@ class InterventionSchedule:
         return tuple(item for item in self.operations if isinstance(item, InterventionTrigger))
 
 
+def _schedule_field_identities(
+    operation: object,
+    fields: Sequence[str],
+    *,
+    nested_location: Mapping[str, Any] | None = None,
+) -> tuple[InterventionScheduleFieldIdentity, ...]:
+    declaration = int(getattr(operation, "declaration_ordinal", -1))
+    location = nested_location
+    if location is None:
+        nested_ordinal = getattr(operation, "authored_ordinal", None)
+        phase = str(getattr(operation, "phase", ""))
+        if nested_ordinal is not None and phase:
+            location = {"phase": phase, "authored_ordinal": int(nested_ordinal)}
+    nested_ordinal = None if location is None else location.get("authored_ordinal")
+    phase = "" if location is None else str(location.get("phase", ""))
+    path_prefix = ""
+    if nested_ordinal is not None and phase:
+        path_prefix = phase + "."
+    elif location is not None and location.get("path"):
+        path_prefix = str(location["path"]).rstrip(".") + "."
+    return tuple(
+        (
+            declaration,
+            None if nested_ordinal is None else int(nested_ordinal),
+            path_prefix + str(field),
+        )
+        for field in fields
+    )
+
+
+def _annotate_schedule_resolution_error(
+    exc: InterventionScheduleError,
+    *,
+    operation: object,
+    dependency_metadata: InterventionScheduleDependencyMetadata,
+) -> InterventionScheduleError:
+    details = dict(getattr(exc, "details", {}) or {})
+    nested_location = getattr(exc, "nested_location", None)
+    if nested_location is None:
+        raw_location = details.get("nested_location")
+        if isinstance(raw_location, Mapping):
+            nested_location = raw_location
+    existing_identities = tuple(getattr(exc, "field_identities", ()) or ())
+    fields = (getattr(exc, "field", None),) if getattr(exc, "field", None) else ()
+    identities = existing_identities or _schedule_field_identities(
+        operation,
+        tuple(str(field) for field in fields),
+        nested_location=nested_location,
+    )
+    dependencies = {
+        str(name).strip()
+        for name in getattr(exc, "value_dependencies", ())
+        if str(name).strip()
+    }
+    metadata_dependencies = {
+        str(name).strip()
+        for identity in identities
+        for name in dependency_metadata.get(identity, ())
+        if str(name).strip()
+    }
+    if metadata_dependencies:
+        dependencies = metadata_dependencies
+    if identities:
+        details["field_identities"] = identities
+    if dependencies:
+        details["value_dependencies"] = tuple(sorted(dependencies))
+    return InterventionScheduleError(
+        str(exc),
+        operation=str(getattr(operation, "op", type(operation).__name__)),
+        declaration_ordinal=int(getattr(operation, "declaration_ordinal", -1)),
+        field=getattr(exc, "field", None),
+        nested_location=nested_location,
+        domain=getattr(exc, "domain", None),
+        field_identities=identities,
+        value_dependencies=tuple(sorted(dependencies)),
+        details=details,
+    )
+
+
 def _literal_fields(fields: Mapping[str, Any], *, context: str) -> None:
     for key in fields:
         if str(key).endswith("_param") and str(key) not in _PARAM_FIELDS:
@@ -992,7 +1321,7 @@ def _operation_from_fields(
 ) -> InterventionOperation:
     data = dict(fields)
     _literal_fields(data, context="intervention")
-    op = str(data.get("op") or "").strip().lower()
+    op = _enum(data.get("op"), field="op")
     ordinal = _ordinal(declaration_ordinal, field="declaration_ordinal")
     if op == "set":
         allowed = frozenset(
@@ -1084,7 +1413,7 @@ def _operation_from_fields(
             }
         )
         _reject_keys(data, allowed, context="protocol")
-        if str(data.get("kind") or "").strip().lower() != "repeat":
+        if _enum(data.get("kind"), field="kind") != "repeat":
             raise InterventionScheduleError("Protocol kind must be repeat.")
         phases: dict[str, tuple[InterventionProtocolOperation, ...]] = {}
         for phase in ("before", "during", "after"):
@@ -1164,7 +1493,7 @@ def _protocol_operation_from_fields(
 ) -> InterventionProtocolOperation:
     data = dict(fields)
     _literal_fields(data, context=f"protocol {phase}")
-    op = str(data.get("op") or "").strip().lower()
+    op = _enum(data.get("op"), field="op")
     selected = {
         "set": "value",
         "hold": "value",
@@ -1192,7 +1521,7 @@ def _protocol_operation_from_fields(
 def _trigger_action_from_payload(raw: Mapping[str, Any]) -> InterventionTriggerAction:
     data = dict(raw)
     _literal_fields(data, context="trigger then")
-    op = str(data.get("op") or "").strip().lower()
+    op = _enum(data.get("op"), field="op")
     selected = {"set": "value", "jump": "delta"}.get(op)
     if selected is None:
         raise InterventionScheduleError(
@@ -1213,7 +1542,31 @@ def _trigger_action_from_payload(raw: Mapping[str, Any]) -> InterventionTriggerA
     )
 
 
-def _parse_record_fields(text: str, *, delimiter: str, context: str) -> dict[str, str]:
+def _lower_authored_fields(
+    fields: Mapping[str, str], *, context: str
+) -> dict[str, Any]:
+    lowered: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key in _AUTHORED_FLOAT_FIELDS:
+            try:
+                lowered[key] = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise InterventionScheduleError(
+                    f"{context} field {key!r} must be a numeric literal."
+                ) from exc
+        elif key in _AUTHORED_INTEGER_FIELDS:
+            try:
+                lowered[key] = int(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise InterventionScheduleError(
+                    f"{context} field {key!r} must be an integer literal."
+                ) from exc
+        else:
+            lowered[key] = value
+    return lowered
+
+
+def _parse_record_fields(text: str, *, delimiter: str, context: str) -> dict[str, Any]:
     if not text:
         raise InterventionScheduleError(f"{context} must not be empty.")
     parts = text.split(delimiter)
@@ -1235,7 +1588,7 @@ def _parse_record_fields(text: str, *, delimiter: str, context: str) -> dict[str
                 f"Duplicate {context} field: {key!r}."
             )
         fields[key] = value
-    return fields
+    return _lower_authored_fields(fields, context=context)
 
 
 def _unwrap_envelope(value: str, *, context: str) -> str:
@@ -1284,7 +1637,7 @@ def _parse_trigger_envelope(value: str) -> InterventionTriggerAction:
     )
 
 
-def _parse_directive(rest: str, *, line_no: int) -> dict[str, str]:
+def _parse_directive(rest: str, *, line_no: int) -> dict[str, Any]:
     text = str(rest).strip()
     if not text:
         raise InterventionScheduleError(
@@ -1342,7 +1695,7 @@ def _parse_directive(rest: str, *, line_no: int) -> dict[str, str]:
                 f"Line {line_no}: duplicate intervention field {key!r}."
             )
         fields[key] = value
-    return fields
+    return _lower_authored_fields(fields, context=f"Line {line_no}: intervention")
 
 
 def _admit_intervention_directives(
@@ -1375,23 +1728,75 @@ def _admit_intervention_directives(
 def intervention_schedule_parameter_names(
     schedule: InterventionSchedule | None,
 ) -> set[str]:
+    return {
+        str(name)
+        for values in intervention_schedule_parameter_dependencies(schedule).values()
+        for name in values
+        if str(name).strip()
+    }
+
+
+def intervention_schedule_parameter_dependencies(
+    schedule: InterventionSchedule | None,
+) -> InterventionScheduleDependencyMetadata:
+    """Return direct dependencies keyed by complete authored field identity."""
     if schedule is None:
-        return set()
-    names: set[str] = set()
+        return MappingProxyType({})
+    dependencies: dict[InterventionScheduleFieldIdentity, tuple[str, ...]] = {}
 
-    def walk(value: object) -> None:
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                if str(key) in _PARAM_FIELDS and str(item or "").strip():
-                    names.add(str(item))
-                else:
-                    walk(item)
-        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            for item in value:
-                walk(item)
+    def add(
+        declaration: int,
+        nested_ordinal: int | None,
+        field_path: str,
+        parameter: object,
+    ) -> None:
+        if not isinstance(parameter, str) or not parameter.strip():
+            return
+        identity = (int(declaration), nested_ordinal, str(field_path))
+        dependencies[identity] = (parameter.strip(),)
 
-    walk(schedule.to_payload())
-    return names
+    for operation in schedule.operations:
+        declaration = int(getattr(operation, "declaration_ordinal", 0))
+        if isinstance(operation, InterventionProtocol):
+            add(declaration, None, "start_time", operation.start_time_param)
+            for phase in ("before", "during", "after"):
+                for nested in getattr(operation, phase):
+                    selected = {
+                        "set": "value",
+                        "hold": "value",
+                        "jump": "delta",
+                        "flux": "flux_rate",
+                    }[nested.op]
+                    add(
+                        declaration,
+                        int(nested.authored_ordinal),
+                        f"{phase}.{selected}",
+                        getattr(nested, f"{selected}_param"),
+                    )
+            continue
+        if isinstance(operation, InterventionTrigger):
+            add(declaration, None, "threshold", operation.threshold_param)
+            selected = "value" if operation.then.op == "set" else "delta"
+            add(
+                declaration,
+                None,
+                f"then.{selected}",
+                getattr(operation.then, f"{selected}_param"),
+            )
+            continue
+        for field in {
+            "set": ("time", "value"),
+            "jump": ("time", "delta"),
+            "flux": ("start_time", "end_time", "flux_rate"),
+            "hold": ("start_time", "end_time", "value"),
+        }.get(getattr(operation, "op", ""), ()):
+            add(
+                declaration,
+                None,
+                field,
+                getattr(operation, f"{field}_param", None),
+            )
+    return MappingProxyType(dict(dependencies))
 
 
 def coerce_intervention_schedule(value: object) -> InterventionSchedule | None:

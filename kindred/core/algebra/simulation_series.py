@@ -28,6 +28,7 @@ from kindred.core.algebra.identifier_canonicalization import canonicalize_algebr
 from kindred.core.algebra.symbol_table import (
     build_algebra_symbol_table as _build_algebra_symbol_table,
 )
+from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.parameter_algebra_spec import (
     invalid_parameter_algebra_identifier_reference_message,
 )
@@ -62,14 +63,64 @@ def _iter_identifiers(expr: ExprNode):
         return
 
 
+def _iter_call_names(expr: ExprNode):
+    if isinstance(expr, CallNode):
+        yield str(expr.name)
+        for arg in expr.args:
+            yield from _iter_call_names(arg)
+        return
+    if isinstance(expr, UnaryNode):
+        yield from _iter_call_names(expr.rhs)
+        return
+
+
+def _iter_species_refs(expr: ExprNode):
+    if isinstance(expr, SpeciesRefNode):
+        yield str(expr.name)
+        return
+    if isinstance(expr, UnaryNode):
+        yield from _iter_species_refs(expr.rhs)
+        return
+    if isinstance(expr, BinaryNode):
+        yield from _iter_species_refs(expr.lhs)
+        yield from _iter_species_refs(expr.rhs)
+        return
+    if isinstance(expr, CallNode):
+        for arg in expr.args:
+            yield from _iter_species_refs(arg)
+        return
+    if isinstance(expr, BinaryNode):
+        yield from _iter_call_names(expr.lhs)
+        yield from _iter_call_names(expr.rhs)
+        return
+
+
 def _reject_invalid_identifier_references(
     block: AlgebraBlock,
     *,
     mechanism_namespace: MechanismParameterNamespace | None = None,
     allowed_names: set[str] | None = None,
+    species_names: set[str] | None = None,
 ) -> None:
     allowed = set(allowed_names or ())
     for stmt in block.lines:
+        unknown_functions = sorted(
+            set(_iter_call_names(stmt.expr))
+            - set(SymbolTable().functions())
+        )
+        if unknown_functions:
+            raise ValueError(
+                "Unknown Algebra function(s): "
+                + ", ".join(repr(name) for name in unknown_functions)
+            )
+        unknown_species = sorted(
+            set(_iter_species_refs(stmt.expr)) - set(species_names or ())
+        )
+        if unknown_species:
+            raise ValueError(
+                "Unknown species in Algebra expression: "
+                + ", ".join(repr(name) for name in unknown_species)
+            )
         for name in sorted(set(_iter_identifiers(stmt.expr))):
             if name in allowed:
                 continue
@@ -106,6 +157,7 @@ def compile_algebra_observables(
     *,
     mechanism_namespace: MechanismParameterNamespace | None = None,
     retained_spec: object,
+    species_names: set[str] | None = None,
 ) -> CompiledAlgebraSeries:
     """Compile the retained observable AST for repeated evaluation.
 
@@ -130,6 +182,7 @@ def compile_algebra_observables(
         algebra_block,
         mechanism_namespace=mechanism_namespace,
         allowed_names=allowed_names,
+        species_names=species_names,
     )
     observable_names = tuple(str(stmt.name) for stmt in (algebra_block.lines or []))
     return CompiledAlgebraSeries(

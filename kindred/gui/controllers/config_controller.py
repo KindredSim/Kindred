@@ -100,7 +100,6 @@ class ConfigControllerPort:
     restore_window_state: Callable[[object], object]
     save_window_state: Callable[[], object]
     schedule_restored_floating_dock_recovery: Callable[[], None]
-    splitter: Callable[[], object | None]
     dark_mode_action: Callable[[], object | None]
     apply_theme: Callable[[bool, Callable[[bool], None] | None], bool]
     actual_dark_mode: Callable[[], bool]
@@ -506,16 +505,6 @@ class ConfigController(QtCore.QObject):
             self._ui.restore_geometry,
             "window geometry",
         )
-        splitter = self._ui.splitter()
-        if splitter is not None:
-            restore_splitter = getattr(splitter, "restoreState", None)
-            if callable(restore_splitter):
-                self._restore_state(
-                    settings,
-                    "window/splitter_state",
-                    restore_splitter,
-                    "workspace splitter state",
-                )
         if self._restore_state(
             settings,
             "window/dock_state",
@@ -539,11 +528,6 @@ class ConfigController(QtCore.QObject):
             settings.setValue("window/is_maximized", self._ui.is_maximized())
             settings.setValue("window/geometry", self._ui.save_geometry())
             settings.setValue("window/dock_state", self._ui.save_window_state())
-            splitter = self._ui.splitter()
-            if splitter is not None:
-                save_splitter = getattr(splitter, "saveState", None)
-                if callable(save_splitter):
-                    settings.setValue("window/splitter_state", save_splitter())
             if not self._sync_or_report(settings, "layout preferences"):
                 return False
         except Exception as exc:

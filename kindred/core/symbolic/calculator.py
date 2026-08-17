@@ -34,10 +34,6 @@ from .jacobian import (
     classify_symbolic_jacobian_support,
 )
 from .namespaces import SymbolicParameterNamespaceContext
-from .parameter_expression import (
-    CALCULATOR_EXPANSION_POLICY,
-    translate_parameter_expression,
-)
 
 _NUMERIC_LITERAL_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:\d[\d_]*\.\d[\d_]*|\d[\d_]*\.|\.\d[\d_]*|\d[\d_]*)(?:[eE][+\-]?\d[\d_]*)?(?![A-Za-z0-9_])"
@@ -107,7 +103,10 @@ class SymbolicCalculatorResult:
             for name, expr in sorted(dict(self.let_definitions).items())
         )
         definitions = "\n".join(f"- {name} := {expr}" for name, expr in definitions_by_kind) or "- none"
-        mechanism_source = str(self.mechanism_source or "").strip() or "(not provided)"
+        # The source is an immutable historical snapshot.  Preserve it
+        # byte-for-byte so Copy Context remains truthful even when the
+        # project is later edited or reconstructed.
+        mechanism_source = str(self.mechanism_source or "") or "(not provided)"
         return "\n".join(
             [
                 f"Query: {self.query}",
@@ -729,6 +728,117 @@ def _validate_numeric_literal_text(literal: str) -> None:
         )
 
 
+def _translate_calculator_parameter_node(
+    node: object,
+    *,
+    namespace: SymbolicParameterNamespaceContext,
+    identifiers: list[str],
+    sympy: Any,
+) -> tuple[Any, tuple[str, ...]]:
+    """Lower one retained parameter AST directly for Calculator expansion.
+
+    Algebra admission owns the retained AST; Calculator owns this lowering.
+    Numeric literals are rationalized from their admitted binary64 value and
+    identifiers are resolved through the admitted namespace before SymPy
+    symbols are created.  The returned identifier order is the only metadata
+    needed by dependency expansion; no generic policy or symbolic identity is
+    minted here.
+    """
+
+    if isinstance(node, NumberNode):
+        value = float(node.value)
+        if not math.isfinite(value):
+            raise SymbolicCalculatorError(
+                "Only finite retained numeric literals are supported in Calculator parameter expansion."
+            )
+        numerator, denominator = value.as_integer_ratio()
+        return sympy.Rational(numerator, denominator), tuple(identifiers)
+
+    if isinstance(node, IdentNode):
+        raw_name = str(node.name)
+        if raw_name in ALGEBRA_PROTECTED_NAMES:
+            if raw_name == "T":
+                raise SymbolicCalculatorError(
+                    "Protected runtime symbol 'T' is not supported in Calculator parameter expansion."
+                )
+            canonical_name = raw_name
+        else:
+            try:
+                canonical_name = namespace.resolve_identifier(raw_name)
+            except UnsupportedSymbolicExpressionError as exc:
+                raise SymbolicCalculatorError(str(exc)) from exc
+        if canonical_name not in identifiers:
+            identifiers.append(canonical_name)
+        return sympy.Symbol(canonical_name), tuple(identifiers)
+
+    if isinstance(node, UnaryNode):
+        if node.op not in {"+", "-"}:
+            raise SymbolicCalculatorError(
+                "Only unary plus/minus are supported in Calculator parameter expansion."
+            )
+        rhs, _ = _translate_calculator_parameter_node(
+            node.rhs,
+            namespace=namespace,
+            identifiers=identifiers,
+            sympy=sympy,
+        )
+        return (rhs if node.op == "+" else -rhs), tuple(identifiers)
+
+    if isinstance(node, BinaryNode):
+        operator = str(node.op)
+        if operator not in {"+", "-", "*", "/", "**", "^"}:
+            raise SymbolicCalculatorError(
+                f"Retained Algebra operator {operator!r} is unsupported in Calculator parameter expansion."
+            )
+        lhs, _ = _translate_calculator_parameter_node(
+            node.lhs,
+            namespace=namespace,
+            identifiers=identifiers,
+            sympy=sympy,
+        )
+        rhs, _ = _translate_calculator_parameter_node(
+            node.rhs,
+            namespace=namespace,
+            identifiers=identifiers,
+            sympy=sympy,
+        )
+        if operator == "+":
+            expression = lhs + rhs
+        elif operator == "-":
+            expression = lhs - rhs
+        elif operator == "*":
+            expression = lhs * rhs
+        elif operator == "/":
+            expression = lhs / rhs
+        elif operator in {"**", "^"}:
+            expression = lhs ** rhs
+        _reject_nonfinite_symbolic_result(sympy, expression)
+        return expression, tuple(identifiers)
+
+    raise SymbolicCalculatorError(
+        "Calculator parameter expansion requires supported nodes from the retained admitted Algebra AST; "
+        f"got {type(node).__name__}."
+    )
+
+
+def _translate_calculator_parameter_expression(
+    assignment: Any,
+    *,
+    namespace: SymbolicParameterNamespaceContext,
+) -> tuple[Any, tuple[str, ...]]:
+    retained_node = getattr(assignment, "expr_ast", None)
+    if retained_node is None:
+        raise SymbolicCalculatorError(
+            "Calculator parameter expansion requires the retained admitted Algebra AST."
+        )
+    return _translate_calculator_parameter_node(
+        retained_node,
+        namespace=namespace,
+        identifiers=[],
+        sympy=require_sympy(),
+    )
+
+
 # Algebra admission retains the validated program on the mechanism.  The
 # calculator consumes that retained AST without reconstructing or reparsing
 # accepted source text or metadata.
@@ -771,19 +881,18 @@ def _translated_parameter_definitions(
             raise SymbolicCalculatorError(f"Cyclic symbolic parameter dependency for {name!r}.")
         assignment = assignments_by_name[name]
         try:
-            translated = translate_parameter_expression(
+            translated_expression, translated_identifiers = _translate_calculator_parameter_expression(
                 assignment,
-                policy=CALCULATOR_EXPANSION_POLICY,
                 namespace=parameter_namespace,
             )
         except UnsupportedSymbolicExpressionError as exc:
             raise SymbolicCalculatorError(str(exc)) from exc
         substitutions = {
             dep_name: expand_assignment(dep_name, stack + (name,))
-            for dep_name in translated.canonical_identifiers
+            for dep_name in translated_identifiers
             if dep_name in assignments_by_name
         }
-        expr = translated.expression
+        expr = translated_expression
         if substitutions:
             expr = expr.xreplace(
                 {

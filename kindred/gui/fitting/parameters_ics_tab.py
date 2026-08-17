@@ -9,26 +9,29 @@ outside it.
 from __future__ import annotations
 
 import math
+import secrets
+import sys
+from dataclasses import dataclass, replace
 from collections.abc import Mapping, Sequence
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.analysis.fit_uncertainty import (
+    BOOTSTRAP_SEED_RANGE,
     ProfileLikelihoodConfig,
     ResidualBootstrapConfig,
 )
-from kindred.core.analysis.hierarchical_fit import HierarchicalFitConfig
+from kindred.core.analysis.global_fit_execution import FitCoordinate
 
+from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS
+from kindred.gui.fitting.constants import FIT_METHOD_LABELS
 from kindred.core.project_document import (
     FIT_MAX_NFEV_RANGE,
-    FIT_METHOD_LABELS,
     FIT_SEED_RANGE,
     FitDefaults,
-    SUPPORTED_FIT_METHODS,
     SUPPORTED_SOLVERS,
     default_fit_defaults,
     validate_fit_defaults,
 )
-from kindred.gui.fitting.constants import DIFFERENTIAL_EVOLUTION_METHOD
 from kindred.gui.fitting.launch import (
     FitAdvancedAnalysisSetupEdit,
     FitDefaultsSetupEdit,
@@ -40,14 +43,26 @@ from kindred.gui.fitting.launch import (
     FitParameterScopeSetupEdit,
     FitParameterConfiguration,
     FitParameterSetupEdit,
+    FitParameterVarySetupEdit,
     FitParameterVariable,
     FitSetupSnapshot,
     FitSolverSetupEdit,
-    fit_uncertainty_coordinate_names,
+    fit_uncertainty_coordinates,
 )
+from kindred.gui.fitting.constants import (
+    CENTRED_FIXED_EFFECTS_SCOPE_LABEL,
+    DIFFERENTIAL_EVOLUTION_METHOD,
+)
+from kindred.gui.parameter_enumeration import admit_gui_parameter_value
 from kindred.gui.ui_helpers import setup_scientific_validator
 
 __all__ = ["ParametersIcsTab"]
+
+
+@dataclass(frozen=True, slots=True)
+class _InvalidNumericDraft:
+    raw_fields: tuple[tuple[str, str], ...]
+    message: str
 
 
 def _format_number(value: object) -> str:
@@ -71,8 +86,36 @@ def _format_scientific(value: object) -> str:
     return f"{base}e{sign}{digits.lstrip('0') or '0'}"
 
 
+def _resolve_coordinate_selection(
+    values: Sequence[object],
+    available: Sequence[FitCoordinate],
+) -> set[FitCoordinate]:
+    """Resolve stored coordinate identities without guessing display aliases."""
+
+    roster = tuple(available)
+    resolved: set[FitCoordinate] = set()
+    for value in values:
+        if isinstance(value, FitCoordinate):
+            if value not in roster:
+                raise ValueError(f"Unavailable Fit coordinate: {value.display_name!r}.")
+            resolved.add(value)
+            continue
+        display = str(value or "").strip()
+        matches = tuple(
+            coordinate for coordinate in roster if coordinate.display_name == display
+        )
+        if len(matches) != 1:
+            if len(matches) > 1:
+                raise ValueError(
+                    f"Ambiguous Fit coordinate display name: {display!r}."
+                )
+            raise ValueError(f"Unavailable Fit coordinate: {display!r}.")
+        resolved.add(matches[0])
+    return resolved
+
+
 class _FitLocalObservableDialog(QtWidgets.QDialog):
-    """Algebraic-observable page used for one Fit-local intent."""
+    """Author a Fit-local observable against one column per selected dataset."""
 
     def __init__(
         self,
@@ -86,20 +129,26 @@ class _FitLocalObservableDialog(QtWidgets.QDialog):
         self.setModal(True)
         self.resize(520, 340)
 
-        self._dataset_ids = [str(x) for x in (dataset_ids or []) if str(x)]
+        self._dataset_ids = tuple(
+            dict.fromkeys(str(x).strip() for x in (dataset_ids or []) if str(x).strip())
+        )
         self._available_observations = {
             mapped.dataset_id: mapped
             for mapped in self._normalize_available_observations(
                 available_observations
             )
         }
-        self._selection: dict[str, str] | None = None
+        self._selection: tuple[
+            str,
+            str,
+            tuple[FitObservationSnapshot, ...],
+            str,
+        ] | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         self._observable_tab = QtWidgets.QWidget(self)
         layout.addWidget(self._observable_tab, stretch=1)
         self._init_observable_tab()
-        self._connect_observable_signals()
         self._add_button_box(layout)
 
     @staticmethod
@@ -111,6 +160,10 @@ class _FitLocalObservableDialog(QtWidgets.QDialog):
             if not isinstance(mapped, FitMappedDatasetSnapshot):
                 raise TypeError(
                     "Observable choices must be typed mapped dataset snapshots."
+                )
+            if any(item.dataset_id == mapped.dataset_id for item in normalized):
+                raise ValueError(
+                    "Observable choices repeat a mapped dataset snapshot."
                 )
             if any(
                 not isinstance(observation, FitObservationSnapshot)
@@ -130,18 +183,24 @@ class _FitLocalObservableDialog(QtWidgets.QDialog):
         observable_layout.addWidget(header)
 
         target_form = QtWidgets.QFormLayout()
-        self._observable_dataset_combo = QtWidgets.QComboBox(self._observable_tab)
-        self._observable_column_combo = QtWidgets.QComboBox(self._observable_tab)
-        for dataset_id, entry in self._available_observations.items():
-            self._observable_dataset_combo.addItem(
-                entry.display_name,
-                dataset_id,
-            )
-        target_form.addRow("Dataset:", self._observable_dataset_combo)
-        target_form.addRow(
-            "Observed column:",
-            self._observable_column_combo,
-        )
+        self._observable_column_combos: dict[str, QtWidgets.QComboBox] = {}
+        for dataset_id in self._dataset_ids:
+            entry = self._available_observations.get(dataset_id)
+            combo = QtWidgets.QComboBox(self._observable_tab)
+            combo.setObjectName(f"fit_local_observable_column_{dataset_id}")
+            if entry is None:
+                combo.addItem("No captured observations available")
+                combo.setEnabled(False)
+                label = f"{dataset_id} observed column:"
+            else:
+                for observation in entry.observations:
+                    # Store the existing immutable snapshot itself.  The
+                    # accepted selection must not reconstruct an observation
+                    # from raw IDs.
+                    combo.addItem(observation.raw_column, observation)
+                label = f"{entry.display_name} observed column:"
+            self._observable_column_combos[dataset_id] = combo
+            target_form.addRow(label, combo)
         observable_layout.addLayout(target_form)
 
         scope_form = QtWidgets.QFormLayout()
@@ -182,12 +241,6 @@ class _FitLocalObservableDialog(QtWidgets.QDialog):
         observable_layout.addWidget(observable_help)
         observable_layout.addStretch(1)
 
-    def _connect_observable_signals(self) -> None:
-        self._observable_dataset_combo.currentIndexChanged.connect(
-            self._refresh_observable_columns
-        )
-        self._refresh_observable_columns()
-
     def _add_button_box(self, layout: QtWidgets.QVBoxLayout) -> None:
         button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
@@ -197,51 +250,35 @@ class _FitLocalObservableDialog(QtWidgets.QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
-    def selection(self) -> dict[str, str] | None:
-        return dict(self._selection or {}) if self._selection else None
+    def selection(
+        self,
+    ) -> tuple[str, str, tuple[FitObservationSnapshot, ...], str] | None:
+        return self._selection
 
-    def _refresh_observable_columns(self) -> None:
-        self._observable_column_combo.clear()
-        dataset_id = str(self._observable_dataset_combo.currentData() or "")
-        entry = self._available_observations.get(dataset_id)
-        if entry is None:
-            return
-        for observation in entry.observations:
-            self._observable_column_combo.addItem(
-                observation.raw_column,
-                observation.raw_observation_id,
-            )
-
-    def _observable_target_selection(self) -> dict[str, str] | None:
-        dataset_id = str(self._observable_dataset_combo.currentData() or "").strip()
-        raw_observation_id = str(
-            self._observable_column_combo.currentData() or ""
-        ).strip()
-        raw_column = str(self._observable_column_combo.currentText() or "").strip()
-        if not dataset_id or not raw_observation_id or not raw_column:
+    def _selected_observations(self) -> tuple[FitObservationSnapshot, ...] | None:
+        selected: list[FitObservationSnapshot] = []
+        for dataset_id in self._dataset_ids:
+            combo = self._observable_column_combos.get(dataset_id)
+            if combo is None:
+                return None
+            observation = combo.currentData()
+            if not isinstance(observation, FitObservationSnapshot):
+                return None
+            selected.append(observation)
+        if len(selected) != len(self._dataset_ids):
             return None
-        return {
-            "dataset_id": dataset_id,
-            "raw_observation_id": raw_observation_id,
-            "raw_column": raw_column,
-        }
+        return tuple(selected)
 
     def accept(self) -> None:  # noqa: D401 - Qt override
         mode = "per_dataset"
-        target = self._observable_target_selection()
-        if target is None:
+        observations = self._selected_observations()
+        if observations is None:
             return
         name = str(self._new_observable_name_edit.text()).strip()
         expression = str(self._new_observable_expr_edit.text()).strip()
         if not name or not expression:
             return
-        self._selection = {
-            "type": "observable_new",
-            "name": name,
-            "expr": expression,
-            "scalar_scope": mode,
-            **target,
-        }
+        self._selection = (name, expression, observations, mode)
         super().accept()
 
 
@@ -381,114 +418,30 @@ class _InitialConcentrationsDialog(QtWidgets.QDialog):
             return None
 
 
-class _HierarchicalConfigDialog(QtWidgets.QDialog):
-    """Author one complete F-owned Hierarchical configuration."""
+class _ConvergenceDialog(QtWidgets.QDialog):
+    """Transactional Fit convergence settings editor."""
 
-    def __init__(
-        self,
-        parameter: FitParameterVariable,
-        configuration: HierarchicalFitConfig | None = None,
-        parent: QtWidgets.QWidget | None = None,
-    ) -> None:
+    def __init__(self, defaults: FitDefaults, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Hierarchical Fit — {parameter.display_name}")
-        self._parameter = parameter
-        if configuration is not None and configuration.parameter_name != parameter.name:
-            raise ValueError("Hierarchical configuration changed parameter identity.")
-        parameter_config = parameter.per_dataset_config
-        self._log10 = (
-            parameter_config.log10 if configuration is None else configuration.log10
-        )
+        self.setWindowTitle("Advanced Fit settings")
+        self.setModal(True)
         form = QtWidgets.QFormLayout(self)
-        self._population = QtWidgets.QLineEdit(
-            _format_scientific(
-                parameter_config.value
-                if configuration is None
-                else configuration.initial_population
-            ),
+        self._ftol = QtWidgets.QLineEdit(_format_scientific(defaults.ftol), self)
+        self._xtol = QtWidgets.QLineEdit(_format_scientific(defaults.xtol), self)
+        setup_scientific_validator(self._ftol)
+        setup_scientific_validator(self._xtol)
+        form.addRow("Objective-improvement tolerance:", self._ftol)
+        xtol_label = QtWidgets.QLabel("Parameter-step tolerance:", self)
+        form.addRow(xtol_label, self._xtol)
+        if defaults.method == DIFFERENTIAL_EVOLUTION_METHOD:
+            xtol_label.hide()
+            self._xtol.hide()
+        note = QtWidgets.QLabel(
+            "These values are applied together only after the Fit owner accepts the edit.",
             self,
         )
-        self._minimum = QtWidgets.QLineEdit(
-            _format_scientific(
-                parameter_config.minimum
-                if configuration is None
-                else configuration.minimum
-            ),
-            self,
-        )
-        self._maximum = QtWidgets.QLineEdit(
-            _format_scientific(
-                parameter_config.maximum
-                if configuration is None
-                else configuration.maximum
-            ),
-            self,
-        )
-        self._dispersion = QtWidgets.QLineEdit(
-            _format_scientific(
-                0.1
-                if configuration is None
-                else configuration.initial_dispersion
-            ),
-            self,
-        )
-        self._dispersion_minimum = QtWidgets.QLineEdit(
-            _format_scientific(
-                1e-8
-                if configuration is None
-                else configuration.minimum_dispersion
-            ),
-            self,
-        )
-        self._dispersion_maximum = QtWidgets.QLineEdit(
-            _format_scientific(
-                10.0
-                if configuration is None
-                else configuration.maximum_dispersion
-            ),
-            self,
-        )
-        self._max_nfev = QtWidgets.QSpinBox(self)
-        self._max_nfev.setRange(1, 2_000_000_000)
-        self._max_nfev.setValue(
-            500 if configuration is None else configuration.max_nfev
-        )
-        self._inner_max_nfev = QtWidgets.QSpinBox(self)
-        self._inner_max_nfev.setRange(1, 2_000_000_000)
-        self._inner_max_nfev.setValue(
-            200 if configuration is None else configuration.inner_max_nfev
-        )
-        self._method = QtWidgets.QComboBox(self)
-        for method in SUPPORTED_FIT_METHODS:
-            self._method.addItem(FIT_METHOD_LABELS.get(method, method), method)
-        method_id = (
-            "trf" if configuration is None else configuration.optimizer_method
-        )
-        self._method.setCurrentIndex(max(0, self._method.findData(method_id)))
-        for edit in (
-            self._population,
-            self._minimum,
-            self._maximum,
-            self._dispersion,
-            self._dispersion_minimum,
-            self._dispersion_maximum,
-        ):
-            setup_scientific_validator(edit)
-        for label, widget in (
-            ("Population starting value:", self._population),
-            ("Population allowed minimum:", self._minimum),
-            ("Population allowed maximum:", self._maximum),
-            ("Expected between-dataset variation:", self._dispersion),
-            ("Variation allowed minimum:", self._dispersion_minimum),
-            ("Variation allowed maximum:", self._dispersion_maximum),
-        ):
-            form.addRow(label, widget)
-        advanced = QtWidgets.QGroupBox("Advanced", self)
-        advanced_form = QtWidgets.QFormLayout(advanced)
-        advanced_form.addRow("Optimizer method:", self._method)
-        advanced_form.addRow("Outer evaluations:", self._max_nfev)
-        advanced_form.addRow("Inner evaluations:", self._inner_max_nfev)
-        form.addRow(advanced)
+        note.setWordWrap(True)
+        form.addRow("", note)
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
             self,
@@ -497,28 +450,254 @@ class _HierarchicalConfigDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
 
-    def configuration(self) -> HierarchicalFitConfig:
-        parameter = self._parameter
-        return HierarchicalFitConfig(
-            parameter_name=parameter.name,
-            initial_population=float(self._population.text()),
-            minimum=float(self._minimum.text()),
-            maximum=float(self._maximum.text()),
-            log10=self._log10,
-            initial_dispersion=float(self._dispersion.text()),
-            minimum_dispersion=float(self._dispersion_minimum.text()),
-            maximum_dispersion=float(self._dispersion_maximum.text()),
-            optimizer_method=str(self._method.currentData() or "trf"),
-            max_nfev=self._max_nfev.value(),
-            inner_max_nfev=self._inner_max_nfev.value(),
+    def values(self) -> tuple[float, float] | None:
+        try:
+            values = (float(self._ftol.text()), float(self._xtol.text()))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not all(math.isfinite(value) and value > 0.0 for value in values):
+            return None
+        return values
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        if self.values() is None:
+            return
+        super().accept()
+
+
+class _ProfileLikelihoodDialog(QtWidgets.QDialog):
+    """Transactional Profile likelihood configuration."""
+
+    def __init__(
+        self,
+        *,
+        available: Sequence[FitCoordinate],
+        display_names: Mapping[FitCoordinate, str] | None = None,
+        configuration: ProfileLikelihoodConfig | None,
+        default_selection: Sequence[FitCoordinate] | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Profile likelihood")
+        self.setModal(True)
+        self.resize(520, 420)
+        form = QtWidgets.QFormLayout(self)
+        self._coordinates = QtWidgets.QListWidget(self)
+        self._coordinates.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
         )
+        display_names = dict(display_names or {})
+        self._typed_identity_mode = any(
+            coordinate.scope in {"centred_overall", "centred_deviation"}
+            for coordinate in available
+        )
+        selected = (
+            (
+                set(default_selection)
+                if configuration is not None
+                and not configuration.parameter_names
+                and default_selection is not None
+                else _resolve_coordinate_selection(
+                    configuration.parameter_names,
+                    available,
+                )
+            )
+            if configuration
+            else set(
+                default_selection if default_selection is not None else available
+            )
+        )
+        for coordinate in available:
+            if not isinstance(coordinate, FitCoordinate):
+                raise TypeError("Uncertainty rosters require typed FitCoordinate values.")
+            label = display_names.get(coordinate, coordinate.display_name)
+            item = QtWidgets.QListWidgetItem(label, self._coordinates)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, coordinate)
+            item.setToolTip(coordinate.display_name)
+            item.setSelected(coordinate in selected)
+        self._confidence = QtWidgets.QLineEdit(
+            _format_scientific(configuration.confidence_level if configuration else 0.95),
+            self,
+        )
+        self._points = QtWidgets.QSpinBox(self)
+        self._points.setRange(2, 10_000)
+        self._points.setValue(
+            configuration.max_bracketing_steps_per_side if configuration else 8
+        )
+        self._budget = QtWidgets.QSpinBox(self)
+        self._budget.setRange(1, 100_000)
+        self._budget.setValue(configuration.max_nfev_per_point if configuration else 300)
+        self._method = QtWidgets.QComboBox(self)
+        ParametersIcsTab._add_method_items(self._method)
+        method = configuration.optimizer_method if configuration else "trf"
+        self._method.setCurrentIndex(max(0, self._method.findData(method)))
+        setup_scientific_validator(self._confidence)
+        form.addRow("Coordinates:", self._coordinates)
+        form.addRow("Confidence level:", self._confidence)
+        form.addRow("Maximum outward search steps per side", self._points)
+        form.addRow("Maximum evaluations per refit:", self._budget)
+        form.addRow("Optimization method:", self._method)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def configuration(self) -> ProfileLikelihoodConfig:
+        names = tuple(
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for item in self._coordinates.selectedItems()
+        )
+        if not self._typed_identity_mode:
+            self._reject_ambiguous_display_names(names)
+        return ProfileLikelihoodConfig(
+            parameter_names=names,
+            confidence_level=float(self._confidence.text()),
+            max_bracketing_steps_per_side=self._points.value(),
+            max_nfev_per_point=self._budget.value(),
+            optimizer_method=str(self._method.currentData() or "trf"),
+        )
+
+    @staticmethod
+    def _reject_ambiguous_display_names(
+        coordinates: Sequence[FitCoordinate],
+    ) -> None:
+        labels = [coordinate.display_name for coordinate in coordinates]
+        if len(labels) != len(set(labels)):
+            raise ValueError(
+                "Selected uncertainty coordinates have ambiguous display names; "
+                "select only one coordinate with each displayed identity."
+            )
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        try:
+            self.configuration()
+        except (TypeError, ValueError, OverflowError):
+            return
+        super().accept()
+
+
+class _ResidualBootstrapDialog(QtWidgets.QDialog):
+    """Transactional residual Bootstrap configuration."""
+
+    def __init__(
+        self,
+        *,
+        available: Sequence[FitCoordinate],
+        display_names: Mapping[FitCoordinate, str] | None = None,
+        configuration: ResidualBootstrapConfig | None,
+        default_selection: Sequence[FitCoordinate] | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Residual bootstrap")
+        self.setModal(True)
+        self.resize(520, 440)
+        form = QtWidgets.QFormLayout(self)
+        self._coordinates = QtWidgets.QListWidget(self)
+        self._coordinates.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        display_names = dict(display_names or {})
+        self._typed_identity_mode = any(
+            coordinate.scope in {"centred_overall", "centred_deviation"}
+            for coordinate in available
+        )
+        selected = (
+            _resolve_coordinate_selection(
+                configuration.parameter_names,
+                available,
+            )
+            if configuration
+            else set(
+                default_selection if default_selection is not None else available
+            )
+        )
+        for coordinate in available:
+            if not isinstance(coordinate, FitCoordinate):
+                raise TypeError("Uncertainty rosters require typed FitCoordinate values.")
+            label = display_names.get(coordinate, coordinate.display_name)
+            item = QtWidgets.QListWidgetItem(label, self._coordinates)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, coordinate)
+            item.setToolTip(coordinate.display_name)
+            item.setSelected(coordinate in selected)
+        self._replicates = QtWidgets.QSpinBox(self)
+        self._replicates.setRange(1, 1_000_000)
+        self._replicates.setValue(configuration.replicates if configuration else 200)
+        self._minimum = QtWidgets.QSpinBox(self)
+        self._minimum.setRange(1, 1_000_000)
+        self._minimum.setValue(
+            configuration.minimum_successful_replicates if configuration else 50
+        )
+        self._fraction = QtWidgets.QLineEdit(
+            _format_scientific(configuration.minimum_success_fraction if configuration else 0.8),
+            self,
+        )
+        self._confidence = QtWidgets.QLineEdit(
+            _format_scientific(configuration.confidence_level if configuration else 0.95),
+            self,
+        )
+        self._seed = QtWidgets.QSpinBox(self)
+        self._seed.setRange(*BOOTSTRAP_SEED_RANGE)
+        bootstrap_seed = (
+            configuration.seed
+            if configuration is not None
+            else secrets.randbelow(2_000_000_001)
+        )
+        self._seed.setValue(bootstrap_seed)
+        self._method = QtWidgets.QComboBox(self)
+        ParametersIcsTab._add_method_items(self._method)
+        method = configuration.optimizer_method if configuration else "trf"
+        self._method.setCurrentIndex(max(0, self._method.findData(method)))
+        setup_scientific_validator(self._fraction)
+        setup_scientific_validator(self._confidence)
+        form.addRow("Coordinates:", self._coordinates)
+        form.addRow("Number of refits:", self._replicates)
+        form.addRow("Minimum successful refits:", self._minimum)
+        form.addRow("Required success rate:", self._fraction)
+        form.addRow("Confidence level:", self._confidence)
+        form.addRow("Random seed:", self._seed)
+        form.addRow("Optimization method:", self._method)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def configuration(self) -> ResidualBootstrapConfig:
+        names = tuple(
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for item in self._coordinates.selectedItems()
+        )
+        if not self._typed_identity_mode:
+            _ProfileLikelihoodDialog._reject_ambiguous_display_names(names)
+        return ResidualBootstrapConfig(
+            parameter_names=names,
+            seed=self._seed.value(),
+            replicates=self._replicates.value(),
+            confidence_level=float(self._confidence.text()),
+            minimum_successful_replicates=self._minimum.value(),
+            minimum_success_fraction=float(self._fraction.text()),
+            optimizer_method=str(self._method.currentData() or "trf"),
+        )
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        try:
+            self.configuration()
+        except (TypeError, ValueError, OverflowError):
+            return
+        super().accept()
 
 
 class ParametersIcsTab(QtWidgets.QWidget):
     """Presentation-only parameter, IC-scope, and optimizer panel."""
 
     setupEditsRequested = QtCore.Signal(object)
-    addObservableRequested = QtCore.Signal(object)
+    addObservableRequested = QtCore.Signal(str, str, object, str)
     resetRequested = QtCore.Signal(str)
     viewStepsRequested = QtCore.Signal()
     statusMessage = QtCore.Signal(str)
@@ -537,12 +716,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._origin = origin
         self._projected_setup: FitSetupSnapshot | None = None
         self._last_fit_parameters: dict[str, FitParameterVariable] = {}
+        self._last_fit_is_older_retained_state = False
         self._can_reset_initial = False
         self._can_reset_last_fit = False
         self._selected_dataset_ids: tuple[str, ...] = ()
         self._parameter_choices: dict[str, object] = {}
-        self._invalid_numeric_text: dict[tuple[str, ...], str] = {}
-        self._invalid_numeric_messages: dict[tuple[str, ...], str] = {}
+        self._invalid_numeric_drafts: dict[
+            tuple[str, ...], _InvalidNumericDraft
+        ] = {}
         self._projecting = False
         self._defaults_backing: FitDefaults | None = None
         self._default_changed_fields: set[str] = set()
@@ -560,7 +741,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if not isinstance(origin, FitOriginSnapshot):
             raise TypeError("origin must be FitOriginSnapshot.")
         if self._origin is not None and self._origin.capture_id != origin.capture_id:
-            self._clear_invalid_numeric_state()
+            self._retire_numeric_drafts()
         self._origin = origin
 
 
@@ -614,15 +795,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
         selection = dialog.selection()
         if not selection:
             return
+        # Window/owner handoff: name, expression, exact selected snapshot
+        # roster (in selected-dataset order), and scalar scope.  No intent DTO
+        # or raw-observation reconstruction crosses this boundary.
+        name, expression, observations, scalar_scope = selection
         self.addObservableRequested.emit(
-            {
-                "name": selection["name"],
-                "expr": selection["expr"],
-                "scalar_scope": selection["scalar_scope"],
-                "dataset_id": selection["dataset_id"],
-                "raw_observation_id": selection["raw_observation_id"],
-                "raw_column": selection["raw_column"],
-            }
+            name,
+            expression,
+            observations,
+            scalar_scope,
         )
 
     def _add_initial_concentrations(self) -> None:
@@ -688,14 +869,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if not self._can_reset_initial:
             self.statusMessage.emit("Initial Fit setup is not available.")
             return
-        self._clear_invalid_numeric_state()
         self.resetRequested.emit("initial")
 
     def _reset_to_last_fit(self) -> None:
         if not self._can_reset_last_fit:
             self.statusMessage.emit("No completed Fit is available to restore.")
             return
-        self._clear_invalid_numeric_state()
         self.resetRequested.emit("last_fit")
 
 
@@ -715,7 +894,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
     _SCOPE_LABELS = {
         "shared": "One shared value",
         "per_dataset": "Independent value for each dataset",
-        "hierarchical": "Related values across datasets (hierarchical / partial pooling)",
+        "centred_fixed_effects": CENTRED_FIXED_EFFECTS_SCOPE_LABEL,
     }
 
     def _build_parameters_panel(self) -> QtWidgets.QWidget:  # noqa: C901
@@ -802,6 +981,18 @@ class ParametersIcsTab(QtWidgets.QWidget):
         form.addRow("Across datasets:", self._scope_combo)
         editor_layout.addLayout(form)
 
+        self._revert_parameter_draft_button = QtWidgets.QPushButton(
+            "Revert invalid values", self._selected_editor
+        )
+        self._revert_parameter_draft_button.setObjectName(
+            "fit_parameter_revert_invalid_values"
+        )
+        self._revert_parameter_draft_button.setEnabled(False)
+        self._revert_parameter_draft_button.clicked.connect(
+            self._revert_selected_parameter_draft
+        )
+        editor_layout.addWidget(self._revert_parameter_draft_button)
+
         self._dataset_values_group = QtWidgets.QGroupBox("Values by dataset", self._selected_editor)
         self._dataset_values_group.setObjectName("fit_parameter_values_by_dataset")
         dataset_layout = QtWidgets.QVBoxLayout(self._dataset_values_group)
@@ -818,27 +1009,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
         dataset_layout.addWidget(self._dataset_values_table)
         editor_layout.addWidget(self._dataset_values_group)
 
-        self._related_group = QtWidgets.QGroupBox("Related-values configuration", self._selected_editor)
-        related_layout = QtWidgets.QFormLayout(self._related_group)
-        self._related_population_label = QtWidgets.QLabel("—", self._related_group)
-        self._related_range_label = QtWidgets.QLabel("—", self._related_group)
-        self._related_variation_label = QtWidgets.QLabel("—", self._related_group)
-        self._related_variation_range_label = QtWidgets.QLabel("—", self._related_group)
-        self._related_scale_label = QtWidgets.QLabel("—", self._related_group)
-        related_layout.addRow("Population starting value:", self._related_population_label)
-        related_layout.addRow("Population allowed range:", self._related_range_label)
-        related_layout.addRow("Expected between-dataset variation:", self._related_variation_label)
-        related_layout.addRow("Variation allowed range:", self._related_variation_range_label)
-        related_layout.addRow("Inherited scale:", self._related_scale_label)
-        self._configure_related_button = QtWidgets.QPushButton(
-            "Configure related-values model", self._related_group
-        )
-        self._configure_related_button.clicked.connect(self._configure_related_values)
-        related_layout.addRow(self._configure_related_button)
-        editor_layout.addWidget(self._related_group)
         right_layout.addWidget(self._selected_editor)
 
-        last_group = QtWidgets.QGroupBox("Last Fit", right)
+        self._last_fit_group = QtWidgets.QGroupBox("Last Fit", right)
+        last_group = self._last_fit_group
         last_layout = QtWidgets.QFormLayout(last_group)
         self._last_result_label = QtWidgets.QLabel("—", last_group)
         self._last_result_label.setWordWrap(True)
@@ -883,8 +1057,18 @@ class ParametersIcsTab(QtWidgets.QWidget):
         params_layout.addLayout(actions)
         layout.addWidget(params_group, stretch=1)
 
-        settings_group = QtWidgets.QGroupBox("Fit settings", container)
+        self._analysis_cards_host = QtWidgets.QWidget(container)
+        self._analysis_cards_layout = QtWidgets.QGridLayout(self._analysis_cards_host)
+        self._analysis_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._analysis_cards_layout.setHorizontalSpacing(8)
+        self._analysis_cards_layout.setVerticalSpacing(8)
+
+        settings_group = QtWidgets.QGroupBox("Fit settings", self._analysis_cards_host)
         settings_group.setObjectName("fit_settings_group")
+        settings_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
         settings_form = QtWidgets.QFormLayout(settings_group)
         self._solver_combo = QtWidgets.QComboBox(settings_group)
         self._solver_combo.setObjectName("global_fit_solver")
@@ -915,89 +1099,43 @@ class ParametersIcsTab(QtWidgets.QWidget):
         settings_form.addRow("Optimization method:", self._method_combo)
         settings_form.addRow("Maximum evaluations:", self._max_eval_spin)
         settings_form.addRow(seed_widget)
-        convergence = QtWidgets.QGroupBox(
-            "Advanced convergence settings", settings_group
-        )
-        convergence.setCheckable(True)
-        convergence.setChecked(False)
-        convergence_form = QtWidgets.QFormLayout(convergence)
-        self._ftol_label = QtWidgets.QLabel("Objective-improvement tolerance:", convergence)
-        self._ftol_edit = QtWidgets.QLineEdit(_format_scientific(defaults.ftol), convergence)
-        self._xtol_label = QtWidgets.QLabel("Parameter-step tolerance:", convergence)
-        self._xtol_edit = QtWidgets.QLineEdit(_format_scientific(defaults.xtol), convergence)
-        setup_scientific_validator(self._ftol_edit)
-        setup_scientific_validator(self._xtol_edit)
-        convergence_form.addRow(self._ftol_label, self._ftol_edit)
-        convergence_form.addRow(self._xtol_label, self._xtol_edit)
-        settings_form.addRow(convergence)
-        layout.addWidget(settings_group)
+        self._settings_summary = QtWidgets.QLabel(settings_group)
+        self._settings_summary.setObjectName("fit_settings_summary")
+        self._settings_summary.setWordWrap(True)
+        self._advanced_button = QtWidgets.QPushButton("Advanced…", settings_group)
+        self._advanced_button.clicked.connect(self._open_convergence_dialog)
+        settings_form.addRow("Accepted:", self._settings_summary)
+        settings_form.addRow("Convergence:", self._advanced_button)
 
-        uncertainty_group = QtWidgets.QGroupBox(
-            "Estimate uncertainty — optional", container
-        )
-        uncertainty_group.setObjectName("fit_uncertainty_group")
-        uncertainty_layout = QtWidgets.QVBoxLayout(uncertainty_group)
-        self._profile_enabled = QtWidgets.QCheckBox("Profile likelihood", uncertainty_group)
-        uncertainty_layout.addWidget(self._profile_enabled)
-        profile_form = QtWidgets.QFormLayout()
-        self._profile_coordinates = QtWidgets.QListWidget(uncertainty_group)
-        self._profile_coordinates.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
-        )
-        self._profile_confidence = QtWidgets.QLineEdit("0.95", uncertainty_group)
-        self._profile_points = QtWidgets.QSpinBox(uncertainty_group)
-        self._profile_points.setRange(2, 10000)
-        self._profile_points.setValue(8)
-        self._profile_budget = QtWidgets.QSpinBox(uncertainty_group)
-        self._profile_budget.setRange(1, 2_000_000_000)
-        self._profile_budget.setValue(300)
-        self._profile_method = QtWidgets.QComboBox(uncertainty_group)
-        self._add_method_items(self._profile_method)
-        setup_scientific_validator(self._profile_confidence)
-        profile_form.addRow("Selected parameters:", self._profile_coordinates)
-        profile_form.addRow("Confidence level:", self._profile_confidence)
-        profile_form.addRow("Search points on each side:", self._profile_points)
-        profile_form.addRow("Maximum evaluations per refit:", self._profile_budget)
-        profile_advanced = QtWidgets.QGroupBox("Advanced", uncertainty_group)
-        profile_advanced_form = QtWidgets.QFormLayout(profile_advanced)
-        profile_advanced_form.addRow("Optimization method:", self._profile_method)
-        profile_form.addRow(profile_advanced)
-        uncertainty_layout.addLayout(profile_form)
+        profile_card = QtWidgets.QGroupBox("Profile likelihood", self._analysis_cards_host)
+        profile_card.setObjectName("fit_profile_card")
+        profile_layout = QtWidgets.QVBoxLayout(profile_card)
+        self._profile_enabled = QtWidgets.QCheckBox("Enabled", profile_card)
+        self._profile_summary = QtWidgets.QLabel("Not configured", profile_card)
+        self._profile_summary.setWordWrap(True)
+        self._profile_configure = QtWidgets.QPushButton("Configure…", profile_card)
+        profile_layout.addWidget(self._profile_enabled)
+        profile_layout.addWidget(self._profile_summary)
+        profile_layout.addStretch(1)
+        profile_layout.addWidget(self._profile_configure)
 
-        self._bootstrap_enabled = QtWidgets.QCheckBox(
-            "Residual bootstrap", uncertainty_group
-        )
-        uncertainty_layout.addWidget(self._bootstrap_enabled)
-        bootstrap_form = QtWidgets.QFormLayout()
-        self._bootstrap_coordinates = QtWidgets.QListWidget(uncertainty_group)
-        self._bootstrap_coordinates.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
-        )
-        self._bootstrap_seed = QtWidgets.QSpinBox(uncertainty_group)
-        self._bootstrap_seed.setRange(-2_000_000_000, 2_000_000_000)
-        self._bootstrap_replicates = QtWidgets.QSpinBox(uncertainty_group)
-        self._bootstrap_replicates.setRange(1, 1_000_000)
-        self._bootstrap_replicates.setValue(200)
-        self._bootstrap_minimum = QtWidgets.QSpinBox(uncertainty_group)
-        self._bootstrap_minimum.setRange(1, 1_000_000)
-        self._bootstrap_minimum.setValue(50)
-        self._bootstrap_confidence = QtWidgets.QLineEdit("0.95", uncertainty_group)
-        self._bootstrap_fraction = QtWidgets.QLineEdit("0.8", uncertainty_group)
-        setup_scientific_validator(self._bootstrap_confidence)
-        setup_scientific_validator(self._bootstrap_fraction)
-        bootstrap_form.addRow("Selected parameters:", self._bootstrap_coordinates)
-        bootstrap_form.addRow("Number of refits:", self._bootstrap_replicates)
-        bootstrap_form.addRow("Minimum successful refits:", self._bootstrap_minimum)
-        bootstrap_form.addRow("Required success rate:", self._bootstrap_fraction)
-        bootstrap_form.addRow("Confidence level:", self._bootstrap_confidence)
-        bootstrap_form.addRow("Random seed:", self._bootstrap_seed)
-        uncertainty_layout.addLayout(bootstrap_form)
-        self._advanced_apply = QtWidgets.QPushButton(
-            "Apply these settings", uncertainty_group
-        )
-        self._advanced_apply.clicked.connect(self._emit_advanced_analysis_edit)
-        uncertainty_layout.addWidget(self._advanced_apply)
-        layout.addWidget(uncertainty_group)
+        bootstrap_card = QtWidgets.QGroupBox("Residual bootstrap", self._analysis_cards_host)
+        bootstrap_card.setObjectName("fit_bootstrap_card")
+        bootstrap_layout = QtWidgets.QVBoxLayout(bootstrap_card)
+        self._bootstrap_enabled = QtWidgets.QCheckBox("Enabled", bootstrap_card)
+        self._bootstrap_summary = QtWidgets.QLabel("Not configured", bootstrap_card)
+        self._bootstrap_summary.setWordWrap(True)
+        self._bootstrap_configure = QtWidgets.QPushButton("Configure…", bootstrap_card)
+        bootstrap_layout.addWidget(self._bootstrap_enabled)
+        bootstrap_layout.addWidget(self._bootstrap_summary)
+        bootstrap_layout.addStretch(1)
+        bootstrap_layout.addWidget(self._bootstrap_configure)
+
+        self._analysis_cards = (settings_group, profile_card, bootstrap_card)
+        for column, card in enumerate(self._analysis_cards):
+            self._analysis_cards_layout.addWidget(card, 0, column)
+            self._analysis_cards_layout.setColumnStretch(column, 1)
+        layout.addWidget(self._analysis_cards_host)
 
         # Signals are attached after construction so projection can use one
         # coherent blocker set and cannot author half a typed intent.
@@ -1005,7 +1143,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._method_combo.currentIndexChanged.connect(
             lambda *_args: self._emit_defaults_edit(changed_field="method")
         )
-        self._method_combo.currentIndexChanged.connect(self._sync_method_controls)
         self._max_eval_spin.valueChanged.connect(
             lambda *_args: self._emit_defaults_edit(changed_field="max_nfev")
         )
@@ -1016,27 +1153,19 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._seed_spin.valueChanged.connect(
             lambda *_args: self._emit_defaults_edit(changed_field="seed")
         )
-        self._ftol_edit.editingFinished.connect(
-            lambda: self._emit_defaults_edit(changed_field="ftol")
-        )
-        self._xtol_edit.editingFinished.connect(
-            lambda: self._emit_defaults_edit(changed_field="xtol")
-        )
-        self._ftol_edit.textChanged.connect(
-            lambda text: self._on_default_text_changed("ftol", text)
-        )
-        self._xtol_edit.textChanged.connect(
-            lambda text: self._on_default_text_changed("xtol", text)
-        )
-        self._vary_check.toggled.connect(self._emit_selected_parameter_edit)
+        self._profile_enabled.toggled.connect(self._on_profile_toggled)
+        self._bootstrap_enabled.toggled.connect(self._on_bootstrap_toggled)
+        self._profile_configure.clicked.connect(self._open_profile_dialog)
+        self._bootstrap_configure.clicked.connect(self._open_bootstrap_dialog)
+        self._vary_check.toggled.connect(self._emit_selected_parameter_vary_edit)
         self._scale_combo.currentIndexChanged.connect(self._emit_selected_parameter_edit)
         self._scope_combo.currentIndexChanged.connect(self._on_scope_changed)
         for edit in (self._starting_edit, self._minimum_edit, self._maximum_edit):
+            edit.textChanged.connect(self._on_parameter_numeric_text_changed)
             edit.editingFinished.connect(self._emit_selected_parameter_edit)
-        self._sync_method_controls()
         self._dataset_values_group.setVisible(False)
-        self._related_group.setVisible(False)
         self._selected_editor.setEnabled(False)
+        self._project_defaults(defaults)
         return widget
 
     @staticmethod
@@ -1089,36 +1218,22 @@ class ParametersIcsTab(QtWidgets.QWidget):
         parameter = self._parameter_by_name(name)
         return parameter.display_name if parameter is not None else name
 
-    def _coordinate_display_name(self, coordinate: str) -> str:
-        raw = str(coordinate)
-        if "::" not in raw:
-            return self._display_parameter_name(raw)
-        dataset_id, name = raw.split("::", 1)
-        return f"{self._display_parameter_name(name)} — {self._dataset_display_name(dataset_id)}"
+    def _coordinate_display_name(self, coordinate: FitCoordinate) -> str:
+        if not isinstance(coordinate, FitCoordinate):
+            raise TypeError("Uncertainty roster entries require FitCoordinate values.")
+        if coordinate.scope == "shared":
+            return self._display_parameter_name(coordinate.name)
+        if coordinate.scope == "centred_overall":
+            return f"{self._display_parameter_name(coordinate.name)} — overall"
+        if coordinate.scope == "dataset":
+            return (
+                f"{self._display_parameter_name(coordinate.name)} — "
+                f"{self._dataset_display_name(str(coordinate.dataset_id))}"
+            )
+        return coordinate.display_name
 
-    def _selected_coordinate_names(self, widget: QtWidgets.QListWidget) -> tuple[str, ...]:
-        return tuple(
-            str(item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text())
-            for item in widget.selectedItems()
-        )
-
-    def _project_coordinate_list(
-        self,
-        widget: QtWidgets.QListWidget,
-        available: Sequence[str],
-        selected: Sequence[str],
-    ) -> None:
-        blocker = QtCore.QSignalBlocker(widget)
-        widget.clear()
-        selected_names = set(str(item) for item in selected)
-        for coordinate in available:
-            raw = str(coordinate)
-            item = QtWidgets.QListWidgetItem(self._coordinate_display_name(raw), widget)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, raw)
-            item.setToolTip(raw)
-            item.setSelected(raw in selected_names)
-        del blocker
-        widget.setVisible(bool(available))
+    def _available_bootstrap_coordinates(self) -> tuple[FitCoordinate, ...]:
+        return self._available_analysis_coordinates()
 
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         self._check_snapshot(snapshot)
@@ -1154,6 +1269,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._check_snapshot(snapshot)
         if not isinstance(intents, tuple):
             raise TypeError("Fit setup delta must carry a tuple of intents.")
+        accepted_parameter_names = {
+            intent.parameter.name
+            for intent in intents
+            if isinstance(intent, FitParameterSetupEdit)
+        }
+        self._retire_numeric_drafts(accepted_parameter_names)
         # Owner acknowledgement is the accepted truth.  Reprojecting that
         # truth is atomic for this view and never changes retained Last Fit.
         self.project_setup_snapshot(snapshot)
@@ -1170,6 +1291,36 @@ class ParametersIcsTab(QtWidgets.QWidget):
         )
         self._project_last_fit_columns()
         self._render_selected_parameter()
+
+    def set_last_fit_presentation(self, *, older_retained_state: bool) -> None:
+        """Label retained Last Fit values without changing their ownership.
+
+        A new scientifically unavailable attempt must not make the retained
+        values look like evidence from that attempt.  This is presentation
+        state only: the owner still controls the retained setup snapshot and
+        values.
+        """
+
+        self._last_fit_is_older_retained_state = bool(older_retained_state)
+        title = (
+            "Last Fit (older retained state)"
+            if self._last_fit_is_older_retained_state
+            else "Last Fit"
+        )
+        self._last_fit_group.setTitle(title)
+        header = (
+            "Last result (older retained)"
+            if self._last_fit_is_older_retained_state
+            else "Last result"
+        )
+        self._param_table.setHorizontalHeaderItem(
+            2,
+            QtWidgets.QTableWidgetItem(header),
+        )
+        self._dataset_values_table.setHorizontalHeaderItem(
+            2,
+            QtWidgets.QTableWidgetItem(header),
+        )
 
     def set_initial_reset_available(self, snapshot: FitSetupSnapshot) -> None:
         self._check_snapshot(snapshot)
@@ -1209,7 +1360,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return "—"
         if last.scope == "shared":
             return f"{_format_number(last.selected_config.value)} (Shared)"
-        return "Related values" if last.scope == "hierarchical" else "Per dataset"
+        return (
+            CENTRED_FIXED_EFFECTS_SCOPE_LABEL
+            if last.scope == "centred_fixed_effects"
+            else "Per dataset"
+        )
 
     def _project_last_fit_columns(self) -> None:
         blocker = QtCore.QSignalBlocker(self._param_table)
@@ -1223,19 +1378,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
             del blocker
         self._render_selected_parameter()
 
-    def _parameter_row(self, name: str) -> int:
-        for row in range(self._param_table.rowCount()):
-            item = self._param_table.item(row, 1)
-            if item is not None and str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") == name:
-                return row
-        return -1
-
     def _on_roster_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         if self._projecting or item.column() != 0:
             return
         name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
         if name:
-            self._emit_selected_parameter_edit(name=name)
+            self._emit_vary_edit(
+                name,
+                item.checkState() == QtCore.Qt.CheckState.Checked,
+            )
 
     def _on_parameter_selection_changed(self) -> None:
         if not self._projecting:
@@ -1250,8 +1401,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _clear_selected_editor(self) -> None:
         self._selected_editor.setEnabled(False)
         self._dataset_values_group.setVisible(False)
-        self._related_group.setVisible(False)
         self._last_result_label.setText("—")
+        self._revert_parameter_draft_button.setEnabled(False)
 
     def _render_selected_parameter(self) -> None:  # noqa: C901
         parameter = self._selected_parameter()
@@ -1260,6 +1411,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return
         self._selected_editor.setEnabled(True)
         config = parameter.selected_config
+        validator_minimum = (
+            -sys.float_info.max
+            if parameter.scientific_category == "finite_scalar"
+            else 0.0
+        )
+        for edit in (self._starting_edit, self._minimum_edit, self._maximum_edit):
+            setup_scientific_validator(edit, minimum=validator_minimum)
+        draft = self._invalid_numeric_drafts.get(("parameter", parameter.name))
+        raw_fields = dict(draft.raw_fields) if draft is not None else {}
         blockers = [
             QtCore.QSignalBlocker(control)
             for control in (
@@ -1273,6 +1433,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             )
         ]
         try:
+            self._project_scope_choices(parameter)
             self._vary_check.setChecked(config.fit)
             self._minimum_edit.setText(_format_number(config.minimum))
             self._maximum_edit.setText(_format_number(config.maximum))
@@ -1284,8 +1445,24 @@ class ParametersIcsTab(QtWidgets.QWidget):
             else:
                 self._starting_edit.setReadOnly(True)
                 self._starting_edit.setText("Values by dataset")
+            controls = {
+                "starting": self._starting_edit,
+                "minimum": self._minimum_edit,
+                "maximum": self._maximum_edit,
+            }
+            for field, edit in controls.items():
+                edit.setStyleSheet("")
+                edit.setToolTip("")
+                if field not in raw_fields:
+                    continue
+                if field == "starting" and parameter.scope != "shared":
+                    continue
+                edit.setText(raw_fields[field])
+                edit.setStyleSheet(
+                    "background: rgb(255, 200, 200); color: rgb(80, 0, 0);"
+                )
+                edit.setToolTip(draft.message)
             self._render_dataset_values(parameter)
-            self._render_related_summary(parameter)
             last = self._last_fit_parameters.get(parameter.name)
             if last is None:
                 self._last_result_label.setText("—")
@@ -1293,14 +1470,21 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 self._last_result_label.setText(f"{_format_number(last.selected_config.value)} (Shared)")
             else:
                 self._last_result_label.setText(
-                    "Related values" if last.scope == "hierarchical" else "Per dataset"
+                    CENTRED_FIXED_EFFECTS_SCOPE_LABEL
+                    if last.scope == "centred_fixed_effects"
+                    else "Per dataset"
                 )
         finally:
             del blockers
-        self._clear_parameter_editor_invalid(parameter.name)
+        self._revert_parameter_draft_button.setEnabled(
+            any(
+                len(key) > 1 and key[1] == parameter.name
+                for key in self._invalid_numeric_drafts
+            )
+        )
 
     def _render_dataset_values(self, parameter: FitParameterVariable) -> None:
-        visible = parameter.scope in {"per_dataset", "hierarchical"}
+        visible = parameter.scope in {"per_dataset", "centred_fixed_effects"}
         self._dataset_values_group.setVisible(visible)
         if not visible:
             self._dataset_values_table.setRowCount(0)
@@ -1327,6 +1511,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
             )
             value_item.setData(QtCore.Qt.ItemDataRole.UserRole, dataset_id)
             value_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            key = ("parameter_dataset", parameter.name, dataset_id, "initial")
+            draft = self._invalid_numeric_drafts.get(key)
+            if draft is not None:
+                value_item.setText(dict(draft.raw_fields)["initial"])
+                value_item.setBackground(QtGui.QColor(255, 200, 200))
+                value_item.setForeground(QtGui.QColor(80, 0, 0))
+                value_item.setToolTip(draft.message)
             self._dataset_values_table.setItem(row, 1, value_item)
             last_item = QtWidgets.QTableWidgetItem(
                 _format_number(last_values[dataset_id]) if dataset_id in last_values else "—"
@@ -1336,34 +1527,23 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._dataset_values_table.setItem(row, 2, last_item)
         del blocker
 
-    def _render_related_summary(self, parameter: FitParameterVariable) -> None:
-        visible = parameter.scope == "hierarchical"
-        self._related_group.setVisible(visible)
-        if not visible:
+    def _project_scope_choices(self, parameter: FitParameterVariable) -> None:
+        """Offer only scopes supported by the accepted parameter authority."""
+
+        allowed = (
+            ("shared", "per_dataset")
+            if parameter.fit_local_provenance is not None
+            else tuple(self._SCOPE_LABELS)
+        )
+        current = tuple(
+            str(self._scope_combo.itemData(index) or "")
+            for index in range(self._scope_combo.count())
+        )
+        if current == allowed:
             return
-        configuration = next(
-            (item for item in (self._projected_setup.hierarchical if self._projected_setup else ())
-             if item.parameter_name == parameter.name),
-            None,
-        )
-        if configuration is None:
-            self._related_population_label.setText(_format_number(parameter.per_dataset_config.value))
-            self._related_range_label.setText(
-                f"{_format_number(parameter.per_dataset_config.minimum)} to {_format_number(parameter.per_dataset_config.maximum)}"
-            )
-            self._related_variation_label.setText("—")
-            self._related_variation_range_label.setText("—")
-            self._related_scale_label.setText("Logarithmic" if parameter.per_dataset_config.log10 else "Linear")
-            return
-        self._related_population_label.setText(_format_number(configuration.initial_population))
-        self._related_range_label.setText(
-            f"{_format_number(configuration.minimum)} to {_format_number(configuration.maximum)}"
-        )
-        self._related_variation_label.setText(_format_number(configuration.initial_dispersion))
-        self._related_variation_range_label.setText(
-            f"{_format_number(configuration.minimum_dispersion)} to {_format_number(configuration.maximum_dispersion)}"
-        )
-        self._related_scale_label.setText("Logarithmic" if configuration.log10 else "Linear")
+        self._scope_combo.clear()
+        for scope in allowed:
+            self._scope_combo.addItem(self._SCOPE_LABELS[scope], scope)
 
     def _on_dataset_value_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         if self._projecting or item.column() != 1:
@@ -1374,14 +1554,88 @@ class ParametersIcsTab(QtWidgets.QWidget):
         dataset_id = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
         key = ("parameter_dataset", parameter.name, dataset_id, "initial")
         try:
-            value = self._parse_number(item.text(), f"{parameter.name} value for dataset {dataset_id}")
-            if not math.isfinite(value):
-                raise ValueError("value must be finite.")
-            self._clear_invalid_numeric(key, edit=None)
+            parsed = self._parse_number(
+                item.text(), f"{parameter.name} value for dataset {dataset_id}"
+            )
+            admit_gui_parameter_value(
+                parsed,
+                scientific_category=parameter.scientific_category,
+                allow_exact_zero=parameter.allow_exact_zero,
+                field=f"{parameter.name} value for dataset {dataset_id}",
+            )
+            if key in self._invalid_numeric_drafts:
+                self._store_invalid_numeric_draft(
+                    key,
+                    {"initial": item.text()},
+                    "Apply the corrected parameter values or revert this draft.",
+                )
+                item.setBackground(QtGui.QColor(255, 200, 200))
+                item.setForeground(QtGui.QColor(80, 0, 0))
+                item.setToolTip(
+                    "Apply the corrected parameter values or revert this draft."
+                )
             self._emit_selected_parameter_edit()
         except (TypeError, ValueError, OverflowError) as exc:
-            self._set_invalid_numeric(key, item.text(), str(exc))
+            self._store_invalid_numeric_draft(
+                key,
+                {"initial": item.text()},
+                str(exc),
+            )
+            item.setBackground(QtGui.QColor(255, 200, 200))
+            item.setForeground(QtGui.QColor(80, 0, 0))
+            item.setToolTip(str(exc))
             self.statusMessage.emit(str(exc))
+
+    def _on_parameter_numeric_text_changed(self, _raw_text: str) -> None:
+        if self._projecting or self._projected_setup is None:
+            return
+        parameter = self._selected_parameter()
+        if parameter is None:
+            return
+        try:
+            self._parameter_projection_for_change(parameter)
+        except (TypeError, ValueError, OverflowError) as exc:
+            self._store_parameter_editor_draft(parameter, str(exc))
+            return
+        if ("parameter", parameter.name) in self._invalid_numeric_drafts:
+            self._store_parameter_editor_draft(
+                parameter,
+                "Apply the corrected parameter values or revert this draft.",
+            )
+
+    def _store_parameter_editor_draft(
+        self,
+        parameter: FitParameterVariable,
+        message: str,
+    ) -> None:
+        fields = {
+            "minimum": self._minimum_edit,
+            "maximum": self._maximum_edit,
+        }
+        if parameter.scope == "shared":
+            fields = {"starting": self._starting_edit, **fields}
+        self._store_invalid_numeric_draft(
+            ("parameter", parameter.name),
+            {field: edit.text() for field, edit in fields.items()},
+            message,
+        )
+        for edit in fields.values():
+            edit.setStyleSheet(
+                "background: rgb(255, 200, 200); color: rgb(80, 0, 0);"
+            )
+            edit.setToolTip(str(message))
+        self._revert_parameter_draft_button.setEnabled(True)
+
+    def _revert_selected_parameter_draft(self) -> None:
+        parameter = self._selected_parameter()
+        if parameter is None:
+            return
+        if not self._retire_numeric_drafts({parameter.name}):
+            return
+        self._render_selected_parameter()
+        self.statusMessage.emit(
+            f"Invalid values for {parameter.display_name} reverted."
+        )
 
     def _parameter_projection_for_change(self, parameter: FitParameterVariable) -> FitParameterVariable:
         if self._projected_setup is None:
@@ -1423,9 +1677,125 @@ class ParametersIcsTab(QtWidgets.QWidget):
             per_dataset_config=active if scope != "shared" else parameter.per_dataset_config,
             family=parameter.family,
             role=parameter.role,
+            scientific_category=parameter.scientific_category,
+            allow_exact_zero=parameter.allow_exact_zero,
             unit=parameter.unit,
             fit_local_provenance=parameter.fit_local_provenance,
         )
+
+    def _uncertainty_effects_for_parameter(
+        self,
+        parameter: FitParameterVariable,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return accepted typed uncertainty coordinates affected by Vary off."""
+
+        setup = self._projected_setup
+        if setup is None:
+            return {}
+        available = set(fit_uncertainty_coordinates(setup.parameters, setup.datasets))
+        effects: dict[str, tuple[str, ...]] = {}
+        for label, configuration in (
+            ("Profile", setup.profile_likelihood),
+            ("Bootstrap", setup.residual_bootstrap),
+        ):
+            if configuration is None:
+                continue
+            coordinates = tuple(
+                coordinate
+                for coordinate in configuration.parameter_names
+                if isinstance(coordinate, FitCoordinate)
+                and coordinate in available
+                and coordinate.name == parameter.name
+            )
+            if coordinates:
+                effects[label] = tuple(
+                    self._coordinate_display_name(coordinate)
+                    for coordinate in coordinates
+                )
+        return effects
+
+    def _confirm_vary_analysis_update(
+        self,
+        parameter: FitParameterVariable,
+    ) -> bool:
+        effects = self._uncertainty_effects_for_parameter(parameter)
+        if not effects:
+            return True
+        details = [
+            f"Stopping Vary for {parameter.display_name} will update these analyses:"
+        ]
+        details.extend(
+            f"{label}: {', '.join(coordinates)}"
+            for label, coordinates in effects.items()
+        )
+        message = QtWidgets.QMessageBox(self)
+        message.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        message.setWindowTitle("Update uncertainty analyses?")
+        message.setText("\n".join(details))
+        stop_button = message.addButton(
+            "Stop varying and update analyses",
+            QtWidgets.QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_button = message.addButton(
+            "Cancel",
+            QtWidgets.QMessageBox.ButtonRole.RejectRole,
+        )
+        message.setDefaultButton(cancel_button)
+        message.exec()
+        return message.clickedButton() is stop_button
+
+    def _reproject_vary_truth(self, parameter_name: str) -> None:
+        """Restore the visible Vary controls from the accepted setup only."""
+
+        setup = self._projected_setup
+        parameter = self._parameter_by_name(parameter_name)
+        if setup is None or parameter is None:
+            return
+        blockers = (
+            QtCore.QSignalBlocker(self._vary_check),
+            QtCore.QSignalBlocker(self._param_table),
+        )
+        self._vary_check.setChecked(parameter.selected_config.fit)
+        for row in range(self._param_table.rowCount()):
+            item = self._param_table.item(row, 0)
+            if item is not None and str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") == parameter_name:
+                item.setCheckState(
+                    QtCore.Qt.CheckState.Checked
+                    if parameter.selected_config.fit
+                    else QtCore.Qt.CheckState.Unchecked
+                )
+                break
+        del blockers
+
+    def _emit_vary_edit(self, name: str, desired_fit: bool) -> bool:
+        if self._projecting or self._running or self._projected_setup is None:
+            return False
+        parameter = self._parameter_by_name(str(name or ""))
+        if parameter is None:
+            return False
+        desired = bool(desired_fit)
+        if desired == parameter.selected_config.fit:
+            self._reproject_vary_truth(parameter.name)
+            return False
+        if not desired and not self._confirm_vary_analysis_update(parameter):
+            self._reproject_vary_truth(parameter.name)
+            return False
+        setup = self._projected_setup
+        self._reproject_vary_truth(parameter.name)
+        intent = FitParameterVarySetupEdit(
+            origin_tab_id=setup.origin_tab_id,
+            origin_capture_id=setup.origin_capture_id,
+            parameter_name=parameter.name,
+            desired_fit=desired,
+        )
+        self.setupEditsRequested.emit((intent,))
+        return True
+
+    def _emit_selected_parameter_vary_edit(self, desired_fit: bool) -> bool:
+        parameter = self._selected_parameter()
+        if parameter is None:
+            return False
+        return self._emit_vary_edit(parameter.name, desired_fit)
 
     def _emit_selected_parameter_edit(self, *_args: object, name: str | None = None) -> bool:
         if self._projecting or self._running or self._projected_setup is None:
@@ -1442,7 +1812,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             )
         except (TypeError, ValueError, OverflowError) as exc:
             self.statusMessage.emit(f"Fit parameter edit is invalid: {exc}")
-            self.validityChanged.emit()
+            self._store_parameter_editor_draft(parameter, str(exc))
             return False
         self.setupEditsRequested.emit((intent,))
         return True
@@ -1454,22 +1824,17 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if parameter is None:
             return
         desired = str(self._scope_combo.currentData() or "")
-        if desired == parameter.scope:
-            if desired == "hierarchical":
-                self._configure_related_values()
+        if (
+            parameter.fit_local_provenance is not None
+            and desired == "centred_fixed_effects"
+        ):
+            self._restore_scope(parameter.scope)
+            self.statusMessage.emit(
+                "Fit-local observable scalars cannot use centred dataset deviations."
+            )
             return
-        config = None
-        if desired == "hierarchical":
-            dialog = _HierarchicalConfigDialog(parameter, parent=self)
-            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-                self._restore_scope(parameter.scope)
-                return
-            try:
-                config = dialog.configuration()
-            except (TypeError, ValueError, OverflowError) as exc:
-                self.statusMessage.emit(f"Related-values setup is invalid: {exc}")
-                self._restore_scope(parameter.scope)
-                return
+        if desired == parameter.scope:
+            return
         self.setupEditsRequested.emit(
             (
                 FitParameterScopeSetupEdit(
@@ -1477,7 +1842,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     origin_capture_id=self._projected_setup.origin_capture_id,
                     parameter_name=parameter.name,
                     scope=desired,
-                    hierarchical_config=config,
                 ),
             )
         )
@@ -1487,88 +1851,39 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._scope_combo.setCurrentIndex(self._scope_combo.findData(scope))
         del blocker
 
-    def _configure_related_values(self) -> None:
-        if self._projecting or self._projected_setup is None:
-            return
-        parameter = self._selected_parameter()
-        if parameter is None:
-            return
-        existing = next(
-            (item for item in self._projected_setup.hierarchical if item.parameter_name == parameter.name),
-            None,
-        )
-        dialog = _HierarchicalConfigDialog(parameter, configuration=existing, parent=self)
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-        try:
-            configuration = dialog.configuration()
-            intent = FitParameterScopeSetupEdit(
-                origin_tab_id=self._projected_setup.origin_tab_id,
-                origin_capture_id=self._projected_setup.origin_capture_id,
-                parameter_name=parameter.name,
-                scope="hierarchical",
-                hierarchical_config=configuration,
-            )
-        except (TypeError, ValueError, OverflowError) as exc:
-            self.statusMessage.emit(f"Related-values setup is invalid: {exc}")
-            return
-        self.setupEditsRequested.emit((intent,))
-
     @property
     def has_invalid_edits(self) -> bool:
-        return bool(self._invalid_numeric_text)
+        return bool(self._invalid_numeric_drafts)
 
-    def _set_invalid_numeric(
+    def _store_invalid_numeric_draft(
         self,
         key: tuple[str, ...],
-        raw_text: str,
+        raw_fields: Mapping[str, str],
         message: str,
-        *,
-        item: QtWidgets.QTableWidgetItem | None = None,
-        edit: QtWidgets.QLineEdit | None = None,
     ) -> None:
-        self._invalid_numeric_text[key] = str(raw_text)
-        self._invalid_numeric_messages[key] = str(message)
-        target = edit
-        if target is not None:
-            target.setStyleSheet("background: rgb(255, 200, 200); color: rgb(80, 0, 0);")
-            target.setToolTip(str(message))
-        if item is not None:
-            item.setBackground(QtGui.QColor(255, 200, 200))
-            item.setForeground(QtGui.QColor(80, 0, 0))
-            item.setToolTip(str(message))
-        self.validityChanged.emit()
+        draft = _InvalidNumericDraft(
+            tuple((str(field), str(raw)) for field, raw in raw_fields.items()),
+            str(message),
+        )
+        if self._invalid_numeric_drafts.get(key) != draft:
+            self._invalid_numeric_drafts[key] = draft
+            self.validityChanged.emit()
 
-    def _clear_invalid_numeric(
+    def _retire_numeric_drafts(
         self,
-        key: tuple[str, ...],
-        *,
-        item: QtWidgets.QTableWidgetItem | None = None,
-        edit: QtWidgets.QLineEdit | None = None,
-    ) -> None:
-        changed = key in self._invalid_numeric_text
-        self._invalid_numeric_text.pop(key, None)
-        self._invalid_numeric_messages.pop(key, None)
-        if edit is not None:
-            edit.setStyleSheet("")
-            edit.setToolTip("")
-        if item is not None:
-            item.setBackground(QtGui.QBrush())
-            item.setForeground(QtGui.QBrush())
-        if changed:
+        parameter_names: set[str] | None = None,
+    ) -> bool:
+        keys = tuple(
+            key
+            for key in self._invalid_numeric_drafts
+            if parameter_names is None
+            or (len(key) > 1 and key[1] in parameter_names)
+        )
+        for key in keys:
+            self._invalid_numeric_drafts.pop(key)
+        if keys:
             self.validityChanged.emit()
-
-    def _clear_parameter_editor_invalid(self, name: str) -> None:
-        for key in tuple(self._invalid_numeric_text):
-            if len(key) > 1 and key[0] in {"parameter", "parameter_dataset"} and key[1] == name:
-                self._invalid_numeric_text.pop(key, None)
-                self._invalid_numeric_messages.pop(key, None)
-
-    def _clear_invalid_numeric_state(self) -> None:
-        if self._invalid_numeric_text:
-            self._invalid_numeric_text.clear()
-            self._invalid_numeric_messages.clear()
-            self.validityChanged.emit()
+        return bool(keys)
 
     @staticmethod
     def _parse_number(raw_text: str, field: str) -> float:
@@ -1588,72 +1903,42 @@ class ParametersIcsTab(QtWidgets.QWidget):
             for control in (
                 self._method_combo,
                 self._max_eval_spin,
-                self._ftol_edit,
-                self._xtol_edit,
                 self._seed_check,
                 self._seed_spin,
             )
         ]
         self._method_combo.setCurrentIndex(self._method_combo.findData(defaults.method))
         self._max_eval_spin.setValue(defaults.max_nfev)
-        self._ftol_edit.setText(_format_scientific(defaults.ftol))
-        self._xtol_edit.setText(_format_scientific(defaults.xtol))
         self._seed_check.setChecked(defaults.use_seed)
         self._seed_spin.setValue(defaults.seed)
         self._seed_spin.setEnabled(defaults.use_seed)
         del blocker
-        self._sync_method_controls()
-
-    def _sync_method_controls(self, *_args: object) -> None:
-        is_de = str(self._method_combo.currentData() or "") == DIFFERENTIAL_EVOLUTION_METHOD
-        self._ftol_label.setText(
-            "Population-improvement tolerance:" if is_de else "Objective-improvement tolerance:"
-        )
-        self._xtol_edit.setEnabled(not is_de)
-        self._xtol_label.setEnabled(not is_de)
-        self._xtol_edit.setToolTip(
-            "Differential Evolution does not use a parameter-step tolerance."
-            if is_de
-            else ""
+        self._settings_summary.setText(
+            f"{self._solver_combo.currentText()} · "
+            f"{FIT_METHOD_LABELS.get(defaults.method, defaults.method)} · "
+            f"max {defaults.max_nfev:,} · "
+            f"{'seed ' + str(defaults.seed) if defaults.use_seed else 'no seed'}"
         )
 
-    def _defaults_projection(self) -> FitDefaults:
+    def _defaults_projection(
+        self,
+        *,
+        ftol: float | None = None,
+        xtol: float | None = None,
+    ) -> FitDefaults:
         if self._defaults_backing is None:
             raise ValueError("Fit defaults are not available.")
-        ftol = self._positive_finite_default("ftol", self._ftol_edit.text())
-        xtol = self._positive_finite_default("xtol", self._xtol_edit.text())
         return validate_fit_defaults(
-            FitDefaults(
+            replace(
+                self._defaults_backing,
                 method=str(self._method_combo.currentData() or "trf"),
                 max_nfev=self._max_eval_spin.value(),
-                ftol=ftol,
-                xtol=xtol,
+                ftol=self._defaults_backing.ftol if ftol is None else ftol,
+                xtol=self._defaults_backing.xtol if xtol is None else xtol,
                 use_seed=self._seed_check.isChecked(),
                 seed=self._seed_spin.value(),
             )
         )
-
-    @staticmethod
-    def _positive_finite_default(field: str, raw_text: str) -> float:
-        try:
-            value = float(raw_text)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"{field} must be a number.") from exc
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError(f"{field} must be finite and positive.")
-        return value
-
-    def _on_default_text_changed(self, field: str, raw_text: str) -> None:
-        if self._projecting:
-            return
-        self._default_changed_fields.add(field)
-        edit = self._ftol_edit if field == "ftol" else self._xtol_edit
-        try:
-            self._positive_finite_default(field, raw_text)
-        except ValueError as exc:
-            self._set_invalid_numeric(("defaults", field), raw_text, str(exc), edit=edit)
-            return
-        self._clear_invalid_numeric(("defaults", field), edit=edit)
 
     def _emit_defaults_edit(self, *_args: object, changed_field: str | None = None) -> None:
         if self._projecting or self._running or self._projected_setup is None:
@@ -1686,93 +1971,222 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self.setupEditsRequested.emit((edit,))
 
     def _project_advanced_analysis(self, snapshot: FitSetupSnapshot) -> None:
-        available = fit_uncertainty_coordinate_names(snapshot.parameters, snapshot.datasets)
         profile = snapshot.profile_likelihood
         bootstrap = snapshot.residual_bootstrap
-        controls = (
-            self._profile_enabled,
-            self._profile_confidence,
-            self._profile_points,
-            self._profile_budget,
-            self._profile_method,
-            self._bootstrap_enabled,
-            self._bootstrap_seed,
-            self._bootstrap_replicates,
-            self._bootstrap_minimum,
-            self._bootstrap_confidence,
-            self._bootstrap_fraction,
-        )
-        blockers = [QtCore.QSignalBlocker(control) for control in controls]
+        blockers = [
+            QtCore.QSignalBlocker(control)
+            for control in (self._profile_enabled, self._bootstrap_enabled)
+        ]
         try:
             self._profile_enabled.setChecked(profile is not None)
             self._bootstrap_enabled.setChecked(bootstrap is not None)
-            self._profile_confidence.setText(_format_scientific(profile.confidence_level if profile else 0.95))
-            self._profile_points.setValue(profile.points_per_side if profile else 8)
-            self._profile_budget.setValue(profile.max_nfev_per_point if profile else 300)
-            self._profile_method.setCurrentIndex(
-                self._profile_method.findData(profile.optimizer_method if profile else "trf")
-            )
-            self._bootstrap_seed.setValue(bootstrap.seed if bootstrap else 0)
-            self._bootstrap_replicates.setValue(bootstrap.replicates if bootstrap else 200)
-            self._bootstrap_minimum.setValue(bootstrap.minimum_successful_replicates if bootstrap else 50)
-            self._bootstrap_confidence.setText(_format_scientific(bootstrap.confidence_level if bootstrap else 0.95))
-            self._bootstrap_fraction.setText(_format_scientific(bootstrap.minimum_success_fraction if bootstrap else 0.8))
-            self._project_coordinate_list(
-                self._profile_coordinates,
-                available,
-                profile.parameter_names if profile else (),
-            )
-            self._project_coordinate_list(
-                self._bootstrap_coordinates,
-                available,
-                bootstrap.parameter_names if bootstrap else (),
+            self._profile_summary.setText(self._analysis_summary(profile, "Profile"))
+            self._bootstrap_summary.setText(
+                self._analysis_summary(bootstrap, "Bootstrap")
             )
         finally:
             del blockers
 
-    def _advanced_analysis_intent(self, *, clear_uncertainty: bool = False) -> FitAdvancedAnalysisSetupEdit:
+    @staticmethod
+    def _analysis_summary(configuration: object | None, label: str) -> str:
+        if configuration is None:
+            return "Not configured"
+        names = tuple(getattr(configuration, "parameter_names", ()))
+        method = str(getattr(configuration, "optimizer_method", "trf"))
+        if label == "Profile":
+            detail = (
+                f"{len(names)} coordinate{'s' if len(names) != 1 else ''} · "
+                f"{getattr(configuration, 'confidence_level', 0.95):.0%} · "
+                f"{getattr(configuration, 'max_bracketing_steps_per_side', 0)} "
+                "maximum outward search steps/side"
+            )
+        else:
+            detail = (
+                f"{len(names)} coordinate{'s' if len(names) != 1 else ''} · "
+                f"{getattr(configuration, 'replicates', 0)} refits · "
+                f"{getattr(configuration, 'minimum_success_fraction', 0.0):.0%} minimum"
+            )
+        return f"Enabled · {detail} · {FIT_METHOD_LABELS.get(method, method)}"
+
+    def _analysis_intent(
+        self,
+        *,
+        profile: ProfileLikelihoodConfig | None,
+        bootstrap: ResidualBootstrapConfig | None,
+    ) -> FitAdvancedAnalysisSetupEdit:
         setup = self._projected_setup
         if setup is None:
             raise ValueError("Fit setup is unavailable.")
-        profile = None
-        if self._profile_enabled.isChecked() and not clear_uncertainty:
-            profile = ProfileLikelihoodConfig(
-                parameter_names=self._selected_coordinate_names(self._profile_coordinates),
-                confidence_level=float(self._profile_confidence.text()),
-                points_per_side=self._profile_points.value(),
-                max_nfev_per_point=self._profile_budget.value(),
-                optimizer_method=str(self._profile_method.currentData() or "trf"),
-            )
-        bootstrap = None
-        if self._bootstrap_enabled.isChecked() and not clear_uncertainty:
-            bootstrap = ResidualBootstrapConfig(
-                parameter_names=self._selected_coordinate_names(self._bootstrap_coordinates),
-                seed=self._bootstrap_seed.value(),
-                replicates=self._bootstrap_replicates.value(),
-                confidence_level=float(self._bootstrap_confidence.text()),
-                minimum_successful_replicates=self._bootstrap_minimum.value(),
-                minimum_success_fraction=float(self._bootstrap_fraction.text()),
-            )
         return FitAdvancedAnalysisSetupEdit(
             origin_tab_id=setup.origin_tab_id,
             origin_capture_id=setup.origin_capture_id,
             profile_likelihood=profile,
             residual_bootstrap=bootstrap,
-            hierarchical=setup.hierarchical,
-            # Results owns Shared-refit authoring.  Parameters only preserves
-            # any already accepted owner state while editing uncertainty.
             shared_refit_promotions=setup.shared_refit_promotions,
         )
 
-    def _emit_advanced_analysis_edit(self) -> None:
-        if self._projecting or self._running:
+    def _open_convergence_dialog(self) -> None:
+        if self._projecting or self._running or self._defaults_backing is None:
+            return
+        dialog = _ConvergenceDialog(self._defaults_backing, parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        if values is None:
             return
         try:
-            intent = self._advanced_analysis_intent()
+            setup = self._projected_setup
+            if setup is None:
+                return
+            intent = FitDefaultsSetupEdit(
+                origin_tab_id=setup.origin_tab_id,
+                origin_capture_id=setup.origin_capture_id,
+                defaults=self._defaults_projection(ftol=values[0], xtol=values[1]),
+            )
         except (TypeError, ValueError, OverflowError) as exc:
-            self.statusMessage.emit(f"Uncertainty settings are invalid: {exc}")
+            self.statusMessage.emit(f"Advanced Fit settings are invalid: {exc}")
             return
         self.setupEditsRequested.emit((intent,))
+
+    def _available_analysis_coordinates(self) -> tuple[FitCoordinate, ...]:
+        setup = self._projected_setup
+        if setup is None:
+            return ()
+        return fit_uncertainty_coordinates(setup.parameters, setup.datasets)
+
+    def _analysis_coordinate_display_names(self) -> dict[FitCoordinate, str]:
+        return {
+            raw: self._coordinate_display_name(raw)
+            for raw in self._available_analysis_coordinates()
+        }
+
+    def _open_profile_dialog(self) -> None:
+        if self._projecting or self._running:
+            return
+        setup = self._projected_setup
+        if setup is None:
+            return
+        dialog = _ProfileLikelihoodDialog(
+            available=self._available_analysis_coordinates(),
+            display_names=self._analysis_coordinate_display_names(),
+            configuration=setup.profile_likelihood,
+            default_selection=None,
+            parent=self,
+        )
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            if setup.profile_likelihood is None:
+                blocker = QtCore.QSignalBlocker(self._profile_enabled)
+                self._profile_enabled.setChecked(False)
+                del blocker
+            return
+        try:
+            self.setupEditsRequested.emit(
+                (
+                    self._analysis_intent(
+                        profile=dialog.configuration(),
+                        bootstrap=setup.residual_bootstrap,
+                    ),
+                )
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            self.statusMessage.emit(f"Profile likelihood settings are invalid: {exc}")
+
+    def _open_bootstrap_dialog(self) -> None:
+        if self._projecting or self._running:
+            return
+        setup = self._projected_setup
+        if setup is None:
+            return
+        dialog = _ResidualBootstrapDialog(
+            available=self._available_bootstrap_coordinates(),
+            display_names=self._analysis_coordinate_display_names(),
+            configuration=setup.residual_bootstrap,
+            default_selection=None,
+            parent=self,
+        )
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            if setup.residual_bootstrap is None:
+                blocker = QtCore.QSignalBlocker(self._bootstrap_enabled)
+                self._bootstrap_enabled.setChecked(False)
+                del blocker
+            return
+        try:
+            self.setupEditsRequested.emit(
+                (
+                    self._analysis_intent(
+                        profile=setup.profile_likelihood,
+                        bootstrap=dialog.configuration(),
+                    ),
+                )
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            self.statusMessage.emit(f"Residual bootstrap settings are invalid: {exc}")
+
+    def _on_profile_toggled(self, enabled: bool) -> None:
+        if self._projecting or self._running:
+            return
+        setup = self._projected_setup
+        if setup is None:
+            return
+        # The checkbox is a projection of the accepted owner snapshot.  Keep
+        # it there while a dialog/intent is pending; acknowledgements reproject
+        # the new value atomically.
+        blocker = QtCore.QSignalBlocker(self._profile_enabled)
+        self._profile_enabled.setChecked(setup.profile_likelihood is not None)
+        del blocker
+        if enabled:
+            self._open_profile_dialog()
+            return
+        try:
+            self.setupEditsRequested.emit(
+                (
+                    self._analysis_intent(
+                        profile=None,
+                        bootstrap=setup.residual_bootstrap,
+                    ),
+                )
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            self.statusMessage.emit(f"Profile likelihood settings are invalid: {exc}")
+
+    def _on_bootstrap_toggled(self, enabled: bool) -> None:
+        if self._projecting or self._running:
+            return
+        setup = self._projected_setup
+        if setup is None:
+            return
+        blocker = QtCore.QSignalBlocker(self._bootstrap_enabled)
+        self._bootstrap_enabled.setChecked(setup.residual_bootstrap is not None)
+        del blocker
+        if enabled:
+            self._open_bootstrap_dialog()
+            return
+        try:
+            self.setupEditsRequested.emit(
+                (
+                    self._analysis_intent(
+                        profile=setup.profile_likelihood,
+                        bootstrap=None,
+                    ),
+                )
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            self.statusMessage.emit(f"Residual bootstrap settings are invalid: {exc}")
+
+    def _relayout_analysis_cards(self) -> None:
+        if not hasattr(self, "_analysis_cards"):
+            return
+        narrow = self.width() < 900
+        columns = 1 if narrow else 3
+        for index, card in enumerate(self._analysis_cards):
+            row, column = divmod(index, columns)
+            self._analysis_cards_layout.addWidget(card, row, column)
+        for column in range(3):
+            self._analysis_cards_layout.setColumnStretch(column, 1 if column < columns else 0)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._relayout_analysis_cards()
 
     def set_running_state(self, running: bool) -> None:
         self._running = bool(running)
@@ -1781,6 +2195,37 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     def clear_pending_setup_edits(self) -> None:
         self._default_changed_fields.clear()
-        self._clear_invalid_numeric_state()
+        self._retire_numeric_drafts()
         if self._projected_setup is not None:
             self.project_setup_snapshot(self._projected_setup)
+
+    def reject_setup_edits(
+        self,
+        intents: Sequence[object],
+        message: str = "Fit setup edit was rejected.",
+    ) -> None:
+        """Keep rejected parameter text as a local draft over accepted truth.
+
+        The Fit window calls this with the same typed intent tuple it received
+        from the owner.  No accepted setup is retained by this widget.
+        """
+
+        if not isinstance(intents, tuple):
+            raise TypeError("Fit setup rejection must carry a tuple.")
+        rejected_names = {
+            intent.parameter.name
+            for intent in intents
+            if isinstance(intent, FitParameterSetupEdit)
+        }
+        rejected_vary_names = {
+            intent.parameter_name
+            for intent in intents
+            if isinstance(intent, FitParameterVarySetupEdit)
+        }
+        if rejected_vary_names and self._projected_setup is not None:
+            # A semantic Vary rejection is not numeric authoring.  Restore
+            # accepted checkbox/roster truth without creating a draft.
+            self.project_setup_snapshot(self._projected_setup)
+        selected = self._selected_parameter()
+        if selected is not None and selected.name in rejected_names:
+            self._store_parameter_editor_draft(selected, str(message))

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterable, Mapping
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from kindred.gui.display_name_policy import (
     DATASET_LIST_LABEL_MAX_CHARS,
@@ -89,6 +89,16 @@ class DataTab(QtWidgets.QWidget):
                 errors.append(error)
         return tuple(errors)
 
+    def has_pending_edits(self, included_dataset_ids: Iterable[str]) -> bool:
+        """Return whether an included dataset has an unapplied Data draft."""
+
+        included = {
+            dataset_id
+            for item in included_dataset_ids
+            if (dataset_id := str(item or "").strip())
+        }
+        return bool(included.intersection(self._pending))
+
     def _build_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget(self)
         panel.setObjectName("global_fit_data_range_panel")
@@ -117,10 +127,10 @@ class DataTab(QtWidgets.QWidget):
         self._min_edit = self._number_edit("global_fit_data_range_min")
         self._max_edit = self._number_edit("global_fit_data_range_max")
         self._start_edit = self._number_edit("global_fit_t_start")
-        self._maximum_edit = QtWidgets.QLineEdit(self._footer)
+        self._maximum_edit = QtWidgets.QSpinBox(self._footer)
         self._maximum_edit.setObjectName("global_fit_maximum_observations")
-        self._maximum_edit.setPlaceholderText("All")
-        self._maximum_edit.setValidator(QtGui.QIntValidator(0, 2_000_000_000, self))
+        self._maximum_edit.setRange(0, 0)
+        self._maximum_edit.setSpecialValueText("All")
         range_widget = QtWidgets.QWidget(self._footer)
         range_layout = QtWidgets.QHBoxLayout(range_widget)
         range_layout.setContentsMargins(0, 0, 0, 0)
@@ -132,7 +142,7 @@ class DataTab(QtWidgets.QWidget):
         controls.addWidget(QtWidgets.QLabel("Data Range", self._footer), 1, 0)
         controls.addWidget(range_widget, 1, 1)
         controls.addWidget(
-            QtWidgets.QLabel("Maximum observations per target", self._footer),
+            QtWidgets.QLabel("N:", self._footer),
             2,
             0,
         )
@@ -167,7 +177,7 @@ class DataTab(QtWidgets.QWidget):
         self._max_edit.textChanged.connect(
             lambda *_args: self._controls_changed("data_range_max")
         )
-        self._maximum_edit.textChanged.connect(
+        self._maximum_edit.valueChanged.connect(
             lambda *_args: self._controls_changed("maximum_observations_per_target")
         )
         self._x_combo.currentIndexChanged.connect(
@@ -242,13 +252,7 @@ class DataTab(QtWidgets.QWidget):
                     self._format(config.get("data_range_max", 0.0)),
                 )
             )
-            maximum = config.get("maximum_observations_per_target")
-            self._maximum_edit.setText(
-                self._invalid_raw.get(
-                    (self._current_dataset_id, "maximum_observations_per_target"),
-                    "All" if maximum in (None, 0, "") else str(maximum),
-                )
-            )
+            self._set_maximum_range(config)
             selected_x = str(config.get("parametric_x", "t") or "t")
             options = tuple(
                 str(item)
@@ -293,6 +297,39 @@ class DataTab(QtWidgets.QWidget):
     def _format(value: object) -> str:
         return repr(float(value))
 
+    def _available_observation_limit(
+        self,
+        dataset_id: str,
+        config: Mapping[str, object],
+    ) -> int:
+        """Return the largest actually available per-target observation count."""
+
+        unlimited = dict(config)
+        unlimited["maximum_observations_per_target"] = None
+        try:
+            retained = self._retained_observations_getter(dataset_id, unlimited)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(
+            (len(getattr(item, "t", ())) for item in retained),
+            default=0,
+        )
+
+    def _set_maximum_range(self, config: Mapping[str, object]) -> None:
+        maximum = config.get("maximum_observations_per_target")
+        maximum_limit = self._available_observation_limit(
+            self._current_dataset_id,
+            config,
+        )
+        previous_block = self._maximum_edit.blockSignals(True)
+        try:
+            self._maximum_edit.setRange(0, maximum_limit)
+            self._maximum_edit.setValue(
+                0 if maximum in (None, 0) else min(int(maximum), maximum_limit)
+            )
+        finally:
+            self._maximum_edit.blockSignals(previous_block)
+
     @classmethod
     def _owned_settings(
         cls,
@@ -330,19 +367,10 @@ class DataTab(QtWidgets.QWidget):
                 self._invalid_raw.pop((dataset_id, field), None)
                 config[field] = value
         if "maximum_observations_per_target" in changed:
-            raw_maximum = self._maximum_edit.text().strip()
-            try:
-                if not raw_maximum or raw_maximum.casefold() == "all":
-                    maximum = None
-                else:
-                    maximum = int(raw_maximum)
-                    if maximum < 2:
-                        raise ValueError
-            except (TypeError, ValueError, OverflowError):
-                self._invalid_raw[(dataset_id, "maximum_observations_per_target")] = raw_maximum
-            else:
-                self._invalid_raw.pop((dataset_id, "maximum_observations_per_target"), None)
-                config["maximum_observations_per_target"] = maximum
+            maximum = int(self._maximum_edit.value())
+            config["maximum_observations_per_target"] = (
+                None if maximum == 0 else maximum
+            )
         if "parametric_x" in changed:
             config["parametric_x"] = str(self._x_combo.currentData() or "t")
         if "parametric_mode" in changed:
@@ -363,9 +391,9 @@ class DataTab(QtWidgets.QWidget):
 
     def _validation_error(self, dataset_id: str, config: Mapping[str, object]) -> str | None:
         accepted = self._settings_getter(dataset_id)
-        for field in ("t_start", "data_range_min", "data_range_max", "maximum_observations_per_target"):
+        for field in ("t_start", "data_range_min", "data_range_max"):
             if (dataset_id, field) in self._invalid_raw:
-                return "Fit data values must be finite; Maximum observations must be All or an integer ≥ 2."
+                return "Fit data values must be finite."
         try:
             if float(config["t_start"]) < 0.0:
                 return "Simulation start must be finite and nonnegative."
@@ -373,6 +401,13 @@ class DataTab(QtWidgets.QWidget):
                 return "Data Range minimum must be ≤ maximum."
         except (KeyError, TypeError, ValueError):
             return "Complete the Fit data values before applying."
+        maximum = config.get("maximum_observations_per_target")
+        if maximum not in (None, 0):
+            try:
+                if int(maximum) < 2:
+                    return "Maximum observations must be All or an integer ≥ 2."
+            except (TypeError, ValueError, OverflowError):
+                return "Maximum observations must be All or an integer ≥ 2."
         try:
             retained = self._retained_observations_getter(dataset_id, config)
         except ValueError as exc:
@@ -402,6 +437,17 @@ class DataTab(QtWidgets.QWidget):
                 changed_field
             )
         config = self._capture(changed_field)
+        self._set_maximum_range(config)
+        if changed_field in {
+            "t_start",
+            "data_range_min",
+            "data_range_max",
+            "parametric_x",
+        }:
+            maximum = int(self._maximum_edit.value())
+            config["maximum_observations_per_target"] = (
+                None if maximum == 0 else maximum
+            )
         self._refresh_parametric_presentation()
         error = self._validation_error(self._current_dataset_id, config)
         try:
@@ -421,6 +467,7 @@ class DataTab(QtWidgets.QWidget):
             self._pending[self._current_dataset_id] = config
         else:
             self._pending.pop(self._current_dataset_id, None)
+            self._changed_fields.pop(self._current_dataset_id, None)
         self._footer.set_dirty(dirty)
         self.validityChanged.emit()
 

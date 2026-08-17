@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -11,6 +10,7 @@ from kindred.core.equilibrium_rate_authority import effective_equilibrium_keq
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
 from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
+from kindred.core.simulation_failure import FactualCause
 from kindred.core.result_repository import (
     SimulationResultProvenance,
     SimulationResultValue,
@@ -55,7 +55,7 @@ class FinalizedSimulationResult:
     species_names: list[str]
     base_species_count: int
     algebra_scalars: dict[str, float]
-    algebra_errors: list[dict[str, Any]]
+    algebra_errors: tuple[FactualCause, ...]
 
     def __post_init__(self) -> None:
         y = _immutable_exact_float_matrix(self.y)
@@ -63,8 +63,15 @@ class FinalizedSimulationResult:
             raise ValueError("finalized simulation matrix must be two-dimensional.")
         object.__setattr__(self, "y", y)
         object.__setattr__(self, "species_names", list(self.species_names))
-        object.__setattr__(self, "algebra_scalars", deepcopy(dict(self.algebra_scalars)))
-        object.__setattr__(self, "algebra_errors", [deepcopy(dict(error)) for error in self.algebra_errors])
+        object.__setattr__(
+            self,
+            "algebra_scalars",
+            {str(name): float(value) for name, value in self.algebra_scalars.items()},
+        )
+        errors = tuple(self.algebra_errors or ())
+        if any(not isinstance(error, FactualCause) for error in errors):
+            raise TypeError("finalized algebra errors must be FactualCause values.")
+        object.__setattr__(self, "algebra_errors", errors)
 
 
 def _initials_for_algebra(
@@ -271,7 +278,7 @@ def evaluate_simulation_result_algebra(
             "solver result matrix must align with base species and row time."
         )
     algebra_scalars: dict[str, float] = {}
-    algebra_errors: list[dict[str, Any]] = []
+    algebra_errors: tuple[FactualCause, ...] = ()
 
     if compiled_algebra_for_mechanism(mechanism) is None:
         return FinalizedSimulationResult(
@@ -379,7 +386,7 @@ def evaluate_simulation_result_algebra(
             gui_evaluator=_best_effort_evaluator,
         )
     algebra_scalars = dict(evaluation.scalars)
-    algebra_errors = list(evaluation.errors)
+    algebra_errors = tuple(evaluation.errors)
     if not evaluation.series:
         return FinalizedSimulationResult(
             y=result_y,
@@ -409,6 +416,13 @@ def evaluate_simulation_result_algebra(
     )
 
 
+_DIRECT_RESULT_IDENTITY_FIELDS = (
+    "result_segment_ids",
+    "result_segment_keys",
+    "result_discontinuity_ids",
+)
+
+
 def _required_direct_row_identity(
     result: object,
 ) -> tuple[
@@ -416,15 +430,14 @@ def _required_direct_row_identity(
     tuple[str, ...],
     np.ndarray,
 ]:
+    """Validate and promote the executor's one-time row identity payload."""
+
     provenance = getattr(result, "provenance", None)
     if not isinstance(provenance, Mapping):
         raise TypeError("solver result provenance must be a mapping.")
-    fields = (
-        "result_segment_ids",
-        "result_segment_keys",
-        "result_discontinuity_ids",
+    missing = tuple(
+        field for field in _DIRECT_RESULT_IDENTITY_FIELDS if field not in provenance
     )
-    missing = tuple(field for field in fields if field not in provenance)
     if missing:
         raise ValueError(
             "solver result is missing direct row identity: "
@@ -443,11 +456,37 @@ def _required_direct_row_identity(
             "solver result contains retired boundary identity: "
             + ", ".join(sorted(retired))
         )
-    return (
-        np.asarray(provenance["result_segment_ids"]),
-        tuple(str(value) for value in provenance["result_segment_keys"]),
-        np.asarray(provenance["result_discontinuity_ids"]),
-    )
+
+    def identity_vector(field: str) -> np.ndarray:
+        raw = np.asarray(provenance[field])
+        if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
+            raise ValueError(
+                f"solver result {field!r} must be a one-dimensional integer array."
+            )
+        if raw.dtype.kind == "u" and raw.size:
+            if int(np.max(raw)) > np.iinfo(np.int64).max:
+                raise ValueError(f"solver result {field!r} exceeds int64 range.")
+        values = raw.astype(np.int64, copy=False)
+        if np.any(values < 0) or np.any(np.diff(values) < 0):
+            raise ValueError(
+                f"solver result {field!r} must be ordered and nonnegative."
+            )
+        return values
+
+    segment_ids = identity_vector("result_segment_ids")
+    discontinuity_ids = identity_vector("result_discontinuity_ids")
+    raw_keys = provenance["result_segment_keys"]
+    if isinstance(raw_keys, (str, bytes)):
+        raise ValueError("solver result segment keys must be a sequence.")
+    try:
+        segment_keys = tuple(
+            str(value).strip() for value in raw_keys  # type: ignore[union-attr]
+        )
+    except TypeError as exc:
+        raise ValueError("solver result segment keys must be a sequence.") from exc
+    if any(not value for value in segment_keys):
+        raise ValueError("solver result segment keys must be nonblank.")
+    return segment_ids, segment_keys, discontinuity_ids
 
 
 def finalize_simulation_result(
@@ -503,6 +542,11 @@ def finalize_simulation_result(
     solver_provenance = getattr(result, "provenance", None)
     if not isinstance(solver_provenance, Mapping):
         raise TypeError("solver result provenance must be a mapping.")
+    retained_solver_provenance = {
+        str(name): value
+        for name, value in solver_provenance.items()
+        if name not in _DIRECT_RESULT_IDENTITY_FIELDS
+    }
     compiled_algebra = compiled_algebra_for_mechanism(mechanism)
     requested_algebra_outputs = (
         ()
@@ -514,9 +558,9 @@ def finalize_simulation_result(
         finalized.species_names[finalized.base_species_count :]
     )
     failed_names = {
-        str(error.get("name") or "")
+        str(error.details.get("name") or "")
         for error in finalized.algebra_errors
-        if str(error.get("name") or "") in requested_algebra_outputs
+        if str(error.details.get("name") or "") in requested_algebra_outputs
     }
     succeeded_algebra_outputs = tuple(
         name
@@ -545,7 +589,7 @@ def finalize_simulation_result(
         scalars=finalized.algebra_scalars,
         parameters=parameters,
         provenance=SimulationResultProvenance(
-            solver=dict(solver_provenance),
+            solver=retained_solver_provenance,
             preparation_warnings=tuple(preparation_warnings),
             requested_algebra_outputs=requested_algebra_outputs,
             succeeded_algebra_outputs=succeeded_algebra_outputs,

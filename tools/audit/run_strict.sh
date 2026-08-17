@@ -69,23 +69,23 @@ if [[ ! -f "${summary}" ]]; then
   exit 2
 fi
 
-offending_lines="$(grep -nE '^Audit .*: (WARN|FAIL|TIMEOUT)($|[ (])' "${summary}" || true)"
+offending_lines="$(grep -nE '^Audit .*: (SKIP|WARN|FAIL|TIMEOUT)($|[ (])' "${summary}" || true)"
 if [[ -n "${offending_lines}" ]]; then
-  echo "STRICT GATE FAILED: SUMMARY contains WARN/FAIL/TIMEOUT."
+  echo "STRICT GATE FAILED: SUMMARY contains SKIP/WARN/FAIL/TIMEOUT."
   echo "Report dir: ${report_dir}"
   echo "Offending lines:"
   printf '%s\n' "${offending_lines}" | head -n 50 | sed 's/^/  /'
   exit 2
 fi
 
-severity_pattern='(\|[[:space:]]*(WARN|FAIL|TIMEOUT)[[:space:]]*\|)|(\((WARN|FAIL|TIMEOUT)\)(:|[[:space:]]|$))|((^|\|)status=(WARN|FAIL|TIMEOUT)($|\|))|(^((WARN|FAIL|TIMEOUT))($|[[:space:]:|]))'
+severity_pattern='(\|[[:space:]]*(SKIP|WARN|FAIL|TIMEOUT)[[:space:]]*\|)|(\((SKIP|WARN|FAIL|TIMEOUT)\)(:|[[:space:]]|$))|((^|\|)status=(SKIP|WARN|FAIL|TIMEOUT)($|\|))|(^((SKIP|WARN|FAIL|TIMEOUT))($|[[:space:]:|]))'
 report_offending_lines="$(
   find "${report_dir}" -maxdepth 1 -type f ! -name 'SUMMARY.txt' -print0 \
     | xargs -0 -r grep -nHE "${severity_pattern}" \
     || true
 )"
 if [[ -n "${report_offending_lines}" ]]; then
-  echo "STRICT GATE FAILED: stage report contains WARN/FAIL/TIMEOUT."
+  echo "STRICT GATE FAILED: stage report contains SKIP/WARN/FAIL/TIMEOUT."
   echo "Report dir: ${report_dir}"
   echo "Offending report lines:"
   printf '%s\n' "${report_offending_lines}" | head -n 50 | sed 's/^/  /'
@@ -98,5 +98,5 @@ if [[ "${run_all_rc}" != "0" ]]; then
   exit "${run_all_rc}"
 fi
 
-echo "STRICT GATE PASS: no WARN/FAIL/TIMEOUT in SUMMARY.txt or stage reports."
+echo "STRICT GATE PASS: no SKIP/WARN/FAIL/TIMEOUT in SUMMARY.txt or stage reports."
 echo "Report dir: ${report_dir}"

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from numbers import Real
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, TypeAlias
 
@@ -12,30 +11,19 @@ import numpy as np
 
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
 from kindred.core.simulator.solver_types import SimulationPresentationBoundary
-from kindred.core.simulator.executable_identity import (
-    TargetExecutableScienceIdentity,
-)
-
-from kindred.core.mechanism_source import MechanismAuthoringSource
-from kindred.core.project_document import (
-    MechanismTabDocument,
-    SimulationExecutionSettings,
-    TabScientificSettings,
-    canonical_analysis_identity,
-    canonical_initial_values,
-    validate_simulation_execution_settings,
-    validate_tab_scientific_settings,
+from kindred.core.simulation_failure import FactualCause
+from kindred.core.simulation_preparation import (
+    SimulationExecutionRequest,
+    simulation_execution_request_fingerprint,
 )
 
 __all__ = [
     "ExplicitResultEntry",
     "ExplicitResultKey",
-    "ExplicitResultCurrentFacts",
-    "explicit_result_key_from_values",
-    "explicit_result_key_from_current_facts",
+    "explicit_result_key_for_request",
     "explicit_result_key_is_current",
     "PreviewResultIdentity",
-    "preview_result_identity_for_tab",
+    "preview_result_identity_for_request",
     "PreviewResultEntry",
     "PreviewResultKey",
     "ResultEntry",
@@ -52,86 +40,38 @@ def _required_id(value: object, field: str) -> str:
     return normalized
 
 
-def explicit_result_key_from_values(
+def explicit_result_key_for_request(
     *,
     tab_id: str,
     set_id: str,
-    mechanism_source: MechanismAuthoringSource,
-    analysis_identity: str,
-    initial_values: Iterable[tuple[str, float]],
-    execution_settings: SimulationExecutionSettings,
-    scientific_settings: TabScientificSettings,
-    executable_identity: TargetExecutableScienceIdentity,
+    execution_request: SimulationExecutionRequest,
 ) -> "ExplicitResultKey":
-    """Construct one explicit key from one retained typed source identity."""
+    """Project one admitted request plus Run target coordinates into its key."""
 
     return ExplicitResultKey(
         tab_id=tab_id,
         set_id=set_id,
-        mechanism_source=mechanism_source,
-        analysis_identity=analysis_identity,
-        executable_identity=executable_identity,
-        initial_values=tuple(initial_values),
-        execution_settings=execution_settings,
-        scientific_settings=scientific_settings,
-    )
-
-
-def preview_result_identity_for_tab(
-    tab: MechanismTabDocument,
-    set_id: str,
-    *,
-    parameter_values: Iterable[tuple[str, float]],
-    initial_values: Iterable[tuple[str, float]] | None = None,
-    executable_identity: TargetExecutableScienceIdentity,
-) -> "PreviewResultIdentity":
-    """Construct Preview identity from the same accepted tab projection."""
-
-    if not isinstance(tab, MechanismTabDocument):
-        raise TypeError("tab must be a MechanismTabDocument.")
-    if not isinstance(executable_identity, TargetExecutableScienceIdentity):
-        raise TypeError("Preview identity requires typed target executable science.")
-    return PreviewResultIdentity(
-        tab_id=tab.tab_id,
-        set_id=set_id,
-        mechanism_source=tab.mechanism_source,
-        analysis_identity=canonical_analysis_identity(tab),
-        executable_identity=executable_identity,
-        parameter_values=tuple(parameter_values),
-        initial_values=(
-            canonical_initial_values(tab, set_id)
-            if initial_values is None
-            else tuple(initial_values)
+        request_fingerprint=simulation_execution_request_fingerprint(
+            execution_request
         ),
-        execution_settings=tab.resolved_execution_settings(set_id),
-        scientific_settings=tab.scientific_settings,
     )
 
 
-def _finite_pairs(
-    values: Iterable[tuple[str, object]],
+def preview_result_identity_for_request(
     *,
-    field: str,
-    nonnegative: bool = False,
-) -> tuple[tuple[str, float], ...]:
-    normalized: list[tuple[str, float]] = []
-    names: set[str] = set()
-    for raw_name, raw_value in values:
-        name = _required_id(raw_name, f"{field} name")
-        if name in names:
-            raise ValueError(f"{field} contains duplicate name {name!r}.")
-        if type(raw_value) is bool or not isinstance(raw_value, Real):
-            raise TypeError(f"{field} value for {name!r} must be numeric.")
-        value = float(raw_value)
-        if not np.isfinite(value):
-            raise ValueError(f"{field} value for {name!r} must be finite.")
-        if nonnegative and value < 0.0:
-            raise ValueError(
-                f"{field} value for {name!r} must be nonnegative."
-            )
-        names.add(name)
-        normalized.append((name, value))
-    return tuple(normalized)
+    tab_id: str,
+    set_id: str,
+    execution_request: SimulationExecutionRequest,
+) -> "PreviewResultIdentity":
+    """Project one admitted request plus Preview target coordinates."""
+
+    return PreviewResultIdentity(
+        tab_id=tab_id,
+        set_id=set_id,
+        request_fingerprint=simulation_execution_request_fingerprint(
+            execution_request
+        ),
+    )
 
 
 def _frozen_vector(value: object, *, field: str) -> np.ndarray:
@@ -369,46 +309,6 @@ def _validate_rows_against_executed_segments(
             )
 
 
-def _validate_direct_solver_row_identity(
-    *,
-    provenance: SimulationResultProvenance,
-    segment_ids: np.ndarray,
-    segment_keys: tuple[str, ...],
-    discontinuity_ids: np.ndarray,
-) -> None:
-    direct = provenance.solver
-    retired = frozenset(
-        {
-            "boundary_sides",
-            "boundary_phases",
-            "result_boundary_sides",
-            "result_boundary_phases",
-        }
-    ).intersection(direct)
-    if retired:
-        raise ValueError(
-            "solver result contains retired boundary identity: "
-            + ", ".join(sorted(retired))
-        )
-    expected = {
-        "result_segment_ids": tuple(int(value) for value in segment_ids),
-        "result_segment_keys": segment_keys,
-        "result_discontinuity_ids": tuple(
-            int(value) for value in discontinuity_ids
-        ),
-    }
-    for field, value in expected.items():
-        raw = direct.get(field)
-        if raw is None or isinstance(raw, (str, bytes)):
-            raise ValueError(
-                f"solver result is missing direct row identity field {field!r}."
-            )
-        if tuple(raw) != value:  # type: ignore[arg-type]
-            raise ValueError(
-                f"explicit result identity conflicts with solver field {field!r}."
-            )
-
-
 def _freeze_provenance_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType(
@@ -444,130 +344,24 @@ def _frozen_provenance_mapping(
 
 @dataclass(frozen=True, slots=True)
 class ExplicitResultKey:
-    """Exact reusable scientific identity for one explicit Run target."""
+    """Lightweight exact projection of one admitted Run request."""
 
     tab_id: str
     set_id: str
-    mechanism_source: MechanismAuthoringSource
-    analysis_identity: str
-    executable_identity: TargetExecutableScienceIdentity
-    initial_values: tuple[tuple[str, float], ...]
-    execution_settings: SimulationExecutionSettings
-    scientific_settings: TabScientificSettings
+    request_fingerprint: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
         object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-        if not isinstance(self.mechanism_source, MechanismAuthoringSource):
-            raise TypeError("mechanism_source must be a MechanismAuthoringSource.")
         object.__setattr__(
             self,
-            "analysis_identity",
-            _required_id(self.analysis_identity, "analysis_identity"),
+            "request_fingerprint",
+            _required_id(self.request_fingerprint, "request_fingerprint"),
         )
-        if not isinstance(
-            self.executable_identity,
-            TargetExecutableScienceIdentity,
-        ):
-            raise TypeError(
-                "Explicit result key requires typed target executable identity."
-            )
-        if self.executable_identity.base.analysis_identity != self.analysis_identity:
+        if not self.request_fingerprint.startswith("simulation-request:"):
             raise ValueError(
-                "Explicit result analysis and executable identities conflict."
+                "Explicit result key requires a simulation-request fingerprint."
             )
-        object.__setattr__(
-            self,
-            "initial_values",
-            _finite_pairs(
-                self.initial_values,
-                field="initial_values",
-                nonnegative=True,
-            ),
-        )
-        if not isinstance(self.execution_settings, SimulationExecutionSettings):
-            raise TypeError(
-                "execution_settings must be a SimulationExecutionSettings value."
-            )
-        validate_simulation_execution_settings(self.execution_settings)
-        validate_tab_scientific_settings(self.scientific_settings)
-
-@dataclass(frozen=True, slots=True)
-class ExplicitResultCurrentFacts:
-    """Typed live facts captured for one current explicit-result target.
-
-    The GUI captures these values from its current immutable document and
-    passes them across this boundary.  Identity construction and exact-key
-    comparison remain pure operations here, alongside :class:`ExplicitResultKey`.
-    """
-
-    tab_id: str
-    set_id: str
-    mechanism_source: MechanismAuthoringSource
-    analysis_identity: str
-    initial_values: tuple[tuple[str, float], ...]
-    execution_settings: SimulationExecutionSettings
-    scientific_settings: TabScientificSettings
-    executable_identity: TargetExecutableScienceIdentity
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
-        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-        if not isinstance(self.mechanism_source, MechanismAuthoringSource):
-            raise TypeError(
-                "mechanism_source must be a MechanismAuthoringSource."
-            )
-        object.__setattr__(
-            self,
-            "analysis_identity",
-            _required_id(self.analysis_identity, "analysis_identity"),
-        )
-        object.__setattr__(
-            self,
-            "initial_values",
-            _finite_pairs(
-                self.initial_values,
-                field="initial_values",
-                nonnegative=True,
-            ),
-        )
-        if not isinstance(
-            self.execution_settings,
-            SimulationExecutionSettings,
-        ):
-            raise TypeError(
-                "execution_settings must be a SimulationExecutionSettings value."
-            )
-        validate_simulation_execution_settings(self.execution_settings)
-        validate_tab_scientific_settings(self.scientific_settings)
-        if not isinstance(
-            self.executable_identity,
-            TargetExecutableScienceIdentity,
-        ):
-            raise TypeError(
-                "current facts require typed target executable identity."
-            )
-
-
-def explicit_result_key_from_current_facts(
-    facts: ExplicitResultCurrentFacts,
-) -> ExplicitResultKey:
-    """Construct the one exact key for captured current typed facts."""
-
-    if not isinstance(facts, ExplicitResultCurrentFacts):
-        raise TypeError(
-            "facts must be an ExplicitResultCurrentFacts value."
-        )
-    return explicit_result_key_from_values(
-        tab_id=facts.tab_id,
-        set_id=facts.set_id,
-        mechanism_source=facts.mechanism_source,
-        analysis_identity=facts.analysis_identity,
-        initial_values=facts.initial_values,
-        execution_settings=facts.execution_settings,
-        scientific_settings=facts.scientific_settings,
-        executable_identity=facts.executable_identity,
-    )
 
 
 def explicit_result_key_is_current(
@@ -585,59 +379,24 @@ def explicit_result_key_is_current(
 
 @dataclass(frozen=True, slots=True)
 class PreviewResultIdentity:
-    """Generation-free scientific identity captured by the Slider owner."""
+    """Generation-free lightweight projection of one admitted Preview request."""
 
     tab_id: str
     set_id: str
-    mechanism_source: MechanismAuthoringSource
-    analysis_identity: str
-    executable_identity: TargetExecutableScienceIdentity
-    parameter_values: tuple[tuple[str, float], ...]
-    initial_values: tuple[tuple[str, float], ...]
-    execution_settings: SimulationExecutionSettings
-    scientific_settings: TabScientificSettings
+    request_fingerprint: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
         object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-        if not isinstance(self.mechanism_source, MechanismAuthoringSource):
-            raise TypeError("mechanism_source must be a MechanismAuthoringSource.")
         object.__setattr__(
             self,
-            "analysis_identity",
-            _required_id(self.analysis_identity, "analysis_identity"),
+            "request_fingerprint",
+            _required_id(self.request_fingerprint, "request_fingerprint"),
         )
-        if not isinstance(
-            self.executable_identity,
-            TargetExecutableScienceIdentity,
-        ):
-            raise TypeError(
-                "Preview identity requires typed target executable identity."
-            )
-        if self.executable_identity.base.analysis_identity != self.analysis_identity:
+        if not self.request_fingerprint.startswith("simulation-request:"):
             raise ValueError(
-                "Preview analysis and executable identities conflict."
+                "Preview identity requires a simulation-request fingerprint."
             )
-        object.__setattr__(
-            self,
-            "parameter_values",
-            _finite_pairs(self.parameter_values, field="parameter_values"),
-        )
-        object.__setattr__(
-            self,
-            "initial_values",
-            _finite_pairs(
-                self.initial_values,
-                field="initial_values",
-                nonnegative=True,
-            ),
-        )
-        if not isinstance(self.execution_settings, SimulationExecutionSettings):
-            raise TypeError(
-                "execution_settings must be a SimulationExecutionSettings value."
-            )
-        validate_simulation_execution_settings(self.execution_settings)
-        validate_tab_scientific_settings(self.scientific_settings)
 
 
 @dataclass(frozen=True, slots=True)
@@ -646,13 +405,7 @@ class PreviewResultKey:
 
     tab_id: str
     set_id: str
-    mechanism_source: MechanismAuthoringSource
-    analysis_identity: str
-    executable_identity: TargetExecutableScienceIdentity
-    parameter_values: tuple[tuple[str, float], ...]
-    initial_values: tuple[tuple[str, float], ...]
-    execution_settings: SimulationExecutionSettings
-    scientific_settings: TabScientificSettings
+    request_fingerprint: str
     generation: int
     kind: str = "preview"
 
@@ -660,35 +413,11 @@ class PreviewResultKey:
         identity = PreviewResultIdentity(
             tab_id=self.tab_id,
             set_id=self.set_id,
-            mechanism_source=self.mechanism_source,
-            analysis_identity=self.analysis_identity,
-            executable_identity=self.executable_identity,
-            parameter_values=self.parameter_values,
-            initial_values=self.initial_values,
-            execution_settings=self.execution_settings,
-            scientific_settings=self.scientific_settings,
+            request_fingerprint=self.request_fingerprint,
         )
         object.__setattr__(self, "tab_id", identity.tab_id)
         object.__setattr__(self, "set_id", identity.set_id)
-        object.__setattr__(self, "mechanism_source", identity.mechanism_source)
-        object.__setattr__(self, "analysis_identity", identity.analysis_identity)
-        object.__setattr__(
-            self,
-            "executable_identity",
-            identity.executable_identity,
-        )
-        object.__setattr__(self, "parameter_values", identity.parameter_values)
-        object.__setattr__(self, "initial_values", identity.initial_values)
-        object.__setattr__(
-            self,
-            "execution_settings",
-            identity.execution_settings,
-        )
-        object.__setattr__(
-            self,
-            "scientific_settings",
-            identity.scientific_settings,
-        )
+        object.__setattr__(self, "request_fingerprint", identity.request_fingerprint)
         if self.kind != "preview":
             raise ValueError("PreviewResultKey kind must be exactly 'preview'.")
         if type(self.generation) is not int:
@@ -710,13 +439,7 @@ class PreviewResultKey:
         return cls(
             tab_id=identity.tab_id,
             set_id=identity.set_id,
-            mechanism_source=identity.mechanism_source,
-            analysis_identity=identity.analysis_identity,
-            executable_identity=identity.executable_identity,
-            parameter_values=identity.parameter_values,
-            initial_values=identity.initial_values,
-            execution_settings=identity.execution_settings,
-            scientific_settings=identity.scientific_settings,
+            request_fingerprint=identity.request_fingerprint,
             generation=generation,
         )
 
@@ -725,13 +448,7 @@ class PreviewResultKey:
         return PreviewResultIdentity(
             tab_id=self.tab_id,
             set_id=self.set_id,
-            mechanism_source=self.mechanism_source,
-            analysis_identity=self.analysis_identity,
-            executable_identity=self.executable_identity,
-            parameter_values=self.parameter_values,
-            initial_values=self.initial_values,
-            execution_settings=self.execution_settings,
-            scientific_settings=self.scientific_settings,
+            request_fingerprint=self.request_fingerprint,
         )
 
 
@@ -745,7 +462,7 @@ class SimulationResultProvenance:
     succeeded_algebra_outputs: tuple[str, ...] = ()
     failed_algebra_outputs: tuple[str, ...] = ()
     omitted_algebra_outputs: tuple[str, ...] = ()
-    algebra_errors: tuple[Mapping[str, Any], ...] = ()
+    algebra_errors: tuple[FactualCause, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.solver, Mapping):
@@ -804,13 +521,14 @@ class SimulationResultProvenance:
                 "requested algebra outputs lack a terminal outcome: "
                 + ", ".join(sorted(missing))
             )
-        errors: list[Mapping[str, Any]] = []
-        for value in self.algebra_errors:
-            if not isinstance(value, Mapping):
-                raise TypeError(
-                    "algebra_errors must contain only mapping values."
-                )
-            errors.append(_frozen_provenance_mapping(value))
+        if isinstance(self.algebra_errors, Mapping):
+            raise TypeError(
+                "algebra_errors must be a tuple of FactualCause values, "
+                "not a mapping."
+            )
+        errors = tuple(self.algebra_errors)
+        if any(not isinstance(value, FactualCause) for value in errors):
+            raise TypeError("algebra_errors must contain only FactualCause values.")
         object.__setattr__(
             self,
             "solver",
@@ -825,7 +543,7 @@ class SimulationResultProvenance:
         object.__setattr__(self, "succeeded_algebra_outputs", succeeded)
         object.__setattr__(self, "failed_algebra_outputs", failed)
         object.__setattr__(self, "omitted_algebra_outputs", omitted)
-        object.__setattr__(self, "algebra_errors", tuple(errors))
+        object.__setattr__(self, "algebra_errors", errors)
 
     @staticmethod
     def _normalized_algebra_names(
@@ -846,6 +564,7 @@ class SimulationResultProvenance:
             self.preparation_warnings
             or self.failed_algebra_outputs
             or self.omitted_algebra_outputs
+            or self.algebra_errors
         )
 
 
@@ -927,12 +646,6 @@ class SimulationResultValue:
         )
         if len(segment_keys) != time.size:
             raise ValueError("result segment keys must align with result time.")
-        _validate_direct_solver_row_identity(
-            provenance=self.provenance,
-            segment_ids=segment_ids,
-            segment_keys=segment_keys,
-            discontinuity_ids=discontinuity_ids,
-        )
         catalog = _executed_segment_catalog(self.provenance)
         _validate_rows_against_executed_segments(
             time=time,

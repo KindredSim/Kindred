@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import math
 from typing import Iterable, Mapping, Sequence
 
+from kindred.core.species import validate_imported_time_seconds, validate_observation
+
 
 class ObservationMappingError(ValueError):
     """Raised when an explicit observation mapping cannot be honored."""
@@ -14,12 +16,12 @@ class ObservationMappingError(ValueError):
 @dataclass(frozen=True)
 class ObservationMappingSuggestion:
     raw_observation_id: str
-    model_species: str
+    model_target: str
 
     def __post_init__(self) -> None:
         for value, label in (
             (self.raw_observation_id, "raw observation ID"),
-            (self.model_species, "model species"),
+            (self.model_target, "model target"),
         ):
             if (
                 type(value) is not str
@@ -44,7 +46,7 @@ def normalize_observation_mapping(
     mapping: Iterable[tuple[str, str]],
     *,
     raw_observations: Sequence[tuple[str, str]],
-    model_species: Sequence[str],
+    model_targets: Sequence[str],
 ) -> tuple[tuple[str, str], ...]:
     """Validate and deterministically order an explicit partial bijection."""
     normalized_observations = tuple(
@@ -55,53 +57,54 @@ def normalize_observation_mapping(
         for raw_id, raw_column in raw_observations
     )
     normalized_ids = tuple(raw_id for raw_id, _ in normalized_observations)
-    normalized_species = tuple(
-        _canonical_text(value, "Model species name")
-        for value in model_species
+    normalized_targets = tuple(
+        _canonical_text(value, "Model target name")
+        for value in model_targets
     )
     if len(set(normalized_ids)) != len(normalized_ids):
         raise ObservationMappingError("Raw observation IDs must be unique.")
-    if len(set(normalized_species)) != len(normalized_species):
-        raise ObservationMappingError("Model species names must be unique.")
+    if len(set(normalized_targets)) != len(normalized_targets):
+        raise ObservationMappingError("Model target names must be unique.")
     available_ids = set(normalized_ids)
     column_by_id = dict(normalized_observations)
-    available_species = set(normalized_species)
+    available_targets = set(normalized_targets)
     by_raw_id: dict[str, str] = {}
-    raw_id_by_species: dict[str, str] = {}
-    for raw_observation_id, raw_species in mapping:
+    raw_id_by_target: dict[str, str] = {}
+    for raw_observation_id, raw_target in mapping:
         raw_id = _canonical_text(
             raw_observation_id,
             "Mapped raw observation ID",
         )
-        species = _canonical_text(raw_species, "Mapped model species")
+        target = _canonical_text(raw_target, "Mapped model target")
         if raw_id not in available_ids:
             raise ObservationMappingError(
                 f"Explicit raw observation ID {raw_id!r} is no longer present "
                 "in the dataset."
             )
-        if species not in available_species:
+        if target not in available_targets:
             raise ObservationMappingError(
-                f"Explicit observation target '{species}' is not present in the active mechanism."
+                f"Explicit observation target '{target}' is not present in the "
+                "accepted model target roster."
             )
-        previous_species = by_raw_id.get(raw_id)
-        if previous_species is not None:
-            if previous_species == species:
+        previous_target = by_raw_id.get(raw_id)
+        if previous_target is not None:
+            if previous_target == target:
                 raise ObservationMappingError(
                     f"Observation mapping for raw ID {raw_id!r} "
-                    f"({column_by_id[raw_id]!r}) to {species!r} is duplicated."
+                    f"({column_by_id[raw_id]!r}) to {target!r} is duplicated."
                 )
             raise ObservationMappingError(
                 f"Raw observation ID {raw_id!r} ({column_by_id[raw_id]!r}) "
-                "is mapped to more than one mechanism species."
+                "is mapped to more than one model target."
             )
-        previous_raw_id = raw_id_by_species.get(species)
+        previous_raw_id = raw_id_by_target.get(target)
         if previous_raw_id is not None:
             raise ObservationMappingError(
-                f"Mechanism species {species!r} is mapped from more than one "
+                f"Model target {target!r} is mapped from more than one "
                 "raw observation."
             )
-        by_raw_id[raw_id] = species
-        raw_id_by_species[species] = raw_id
+        by_raw_id[raw_id] = target
+        raw_id_by_target[target] = raw_id
     return tuple(
         (raw_id, by_raw_id[raw_id])
         for raw_id in normalized_ids
@@ -112,7 +115,7 @@ def normalize_observation_mapping(
 def suggest_observation_mapping(
     *,
     raw_observations: Sequence[tuple[str, str]],
-    model_species: Sequence[str],
+    model_targets: Sequence[str],
 ) -> tuple[ObservationMappingSuggestion, ...]:
     """Suggest only unambiguous exact-name matches.
 
@@ -128,26 +131,26 @@ def suggest_observation_mapping(
     )
     suggestions: list[ObservationMappingSuggestion] = []
     claimed_ids: set[str] = set()
-    claimed_species: set[str] = set()
+    claimed_targets: set[str] = set()
     candidates: list[tuple[str, str]] = []
-    for species_value in model_species:
-        species = _canonical_text(species_value, "Model species name")
+    for target_value in model_targets:
+        target = _canonical_text(target_value, "Model target name")
         exact = [
             (raw_id, raw_column)
             for raw_id, raw_column in observations
-            if raw_column == species
+            if raw_column == target
         ]
         if len(exact) == 1:
-            candidates.append((exact[0][0], species))
-    for raw_id, species in candidates:
-        if raw_id in claimed_ids or species in claimed_species:
+            candidates.append((exact[0][0], target))
+    for raw_id, target in candidates:
+        if raw_id in claimed_ids or target in claimed_targets:
             continue
         claimed_ids.add(raw_id)
-        claimed_species.add(species)
+        claimed_targets.add(target)
         suggestions.append(
             ObservationMappingSuggestion(
                 raw_observation_id=raw_id,
-                model_species=species,
+                model_target=target,
             )
         )
     return tuple(suggestions)
@@ -156,10 +159,15 @@ def suggest_observation_mapping(
 def seed_species_values_at_exact_zero(
     *,
     observations: Mapping[str, object],
-    model_species: Sequence[str],
+    mechanism_species: Sequence[str],
+    model_targets: Sequence[str],
     confirmed_mapping: Iterable[tuple[str, str]],
 ) -> tuple[tuple[str, float], ...]:
-    """Build a complete species vector using only confirmed samples at t == 0.0."""
+    """Seed mechanism species from confirmed samples at exact t == 0.0.
+
+    The model-target roster validates every confirmed mapping, including
+    authored observables, while only mechanism species receive IC values.
+    """
     raw_observations: list[tuple[str, str]] = []
     for raw_id_value, raw_spec in observations.items():
         raw_id = _canonical_text(raw_id_value, "Raw observation ID")
@@ -179,22 +187,40 @@ def seed_species_values_at_exact_zero(
     mapping = normalize_observation_mapping(
         confirmed_mapping,
         raw_observations=tuple(raw_observations),
-        model_species=model_species,
+        model_targets=model_targets,
     )
-    raw_id_by_species = {species: raw_id for raw_id, species in mapping}
+    raw_id_by_target = {target: raw_id for raw_id, target in mapping}
+    normalized_mechanism_species = tuple(
+        _canonical_text(value, "Mechanism species name")
+        for value in mechanism_species
+    )
+    if len(set(normalized_mechanism_species)) != len(
+        normalized_mechanism_species
+    ):
+        raise ObservationMappingError(
+            "Mechanism species names must be unique."
+        )
     seeded: list[tuple[str, float]] = []
-    for species_value in model_species:
-        species = _canonical_text(species_value, "Model species name")
+    for species in normalized_mechanism_species:
         value = 0.0
-        raw_id = raw_id_by_species.get(species)
+        raw_id = raw_id_by_target.get(species)
         if raw_id is not None:
             spec = observations[raw_id]
             raw_column = _canonical_text(
                 spec.get("raw_column"),
                 "Raw observation label",
             )
-            t_values = tuple(float(item) for item in spec.get("t", ()))
-            y_values = tuple(float(item) for item in spec.get("y", ()))
+            try:
+                t_values = tuple(
+                    validate_imported_time_seconds(item, field="observation time")
+                    for item in spec.get("t", ())
+                )
+                y_values = tuple(
+                    validate_observation(item, field="observation value")
+                    for item in spec.get("y", ())
+                )
+            except (TypeError, ValueError) as exc:
+                raise ObservationMappingError(str(exc)) from exc
             if len(t_values) != len(y_values):
                 raise ObservationMappingError(
                     f"Observation {raw_column!r} (raw ID {raw_id!r}) has "

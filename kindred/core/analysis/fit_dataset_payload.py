@@ -112,7 +112,10 @@ class FitDatasetSpec:
     target_weights: Mapping[str, float] = field(default_factory=dict)
     x_name: str = "t"
     x_mode: str = "monotone"
-    x_obs_by_species: Mapping[str, np.ndarray] = field(default_factory=dict)
+    # One immutable X capture. Its `y` member stores captured X values; using
+    # the same row-aligned DTO keeps raw identity and physical source-row
+    # custody identical for Y and X.
+    x_observations: FitObservationSeries | None = None
 
     def __post_init__(self) -> None:
         dataset_id = str(self.dataset_id or "").strip()
@@ -145,11 +148,11 @@ class FitDatasetSpec:
             )
         x_name = str(self.x_name or "t").strip() or "t"
         x_mode = str(self.x_mode or "").strip().lower()
-        axes: dict[str, np.ndarray] = {}
+        x_series: FitObservationSeries | None = None
         if x_name == "t":
             x_mode = "monotone"
-            if self.x_obs_by_species:
-                raise ValueError("Time-X Fit captures must not contain parametric axes.")
+            if self.x_observations is not None:
+                raise ValueError("Time-X Fit captures must not contain an X block.")
         else:
             if x_name in species:
                 raise ValueError(
@@ -161,25 +164,29 @@ class FitDatasetSpec:
                     f"Dataset {dataset_id!r} requires a resolved parametric-X "
                     "mode of 'monotone' or 'time_guided'."
                 )
-            raw_axes = dict(self.x_obs_by_species)
-            if set(raw_axes) != set(species):
+            x_series = self.x_observations
+            if not isinstance(x_series, FitObservationSeries):
                 raise ValueError(
-                    f"Dataset {dataset_id!r} parametric-X axes must exactly match targets."
+                    f"Dataset {dataset_id!r} parametric-X captures require one X block."
                 )
-            for name in species:
-                axis = _readonly_float_vector(
-                    raw_axes[name],
-                    f"{dataset_id}:{name} observed X",
+            if x_series.raw_observation_id in raw_observation_ids:
+                raise ValueError(
+                    f"Dataset {dataset_id!r} X raw observation ID must be unique from Y."
                 )
-                if axis.size != observation_map[name].y.size:
+            x_rows = set(x_series.source_rows)
+            for name, series in observation_map.items():
+                if not set(series.source_rows).issubset(x_rows):
                     raise ValueError(
-                        f"Dataset {dataset_id!r} target {name!r} has misaligned X/Y rows."
+                        f"Dataset {dataset_id!r} target {name!r} references an X source row "
+                        "that is absent from the captured X block."
                     )
-                axes[name] = axis
+            if not x_rows:
+                raise ValueError(f"Dataset {dataset_id!r} X block must not be empty.")
 
+        weight_roster = species if x_name == "t" else (*species, x_name)
         weights = normalize_dataset_target_weights(
             dataset_id=dataset_id,
-            selected_targets=species,
+            selected_targets=weight_roster,
             target_weights=self.target_weights,
         )
         object.__setattr__(self, "dataset_id", dataset_id)
@@ -192,11 +199,52 @@ class FitDatasetSpec:
         object.__setattr__(self, "target_weights", MappingProxyType(weights))
         object.__setattr__(self, "x_name", x_name)
         object.__setattr__(self, "x_mode", x_mode)
-        object.__setattr__(self, "x_obs_by_species", MappingProxyType(axes))
+        object.__setattr__(self, "x_observations", x_series)
 
     @property
     def point_count(self) -> int:
-        return sum(
+        y_count = sum(
             int(series.y.size)
             for series in self.observations.values()
         )
+        if self.x_name == "t" or self.x_observations is None:
+            return y_count
+        retained_x_rows = {
+            int(row)
+            for series in self.observations.values()
+            for row in series.source_rows
+        }
+        return y_count + len(retained_x_rows)
+
+    @property
+    def target_roster(self) -> tuple[str, ...]:
+        """Exact weighted objective roster, including canonical X."""
+
+        return self.species_list if self.x_name == "t" else (*self.species_list, self.x_name)
+
+    @property
+    def x_source_rows(self) -> tuple[int, ...]:
+        """Ordered union of physical X rows referenced by retained Y rows."""
+
+        if self.x_name == "t" or self.x_observations is None:
+            return ()
+        retained = {
+            int(row)
+            for series in self.observations.values()
+            for row in series.source_rows
+        }
+        return tuple(row for row in self.x_observations.source_rows if row in retained)
+
+    def x_values_for_rows(self, rows: Sequence[int] | None = None) -> np.ndarray:
+        """Resolve captured X values by physical source-row identity."""
+
+        if self.x_name == "t" or self.x_observations is None:
+            return np.asarray([], dtype=float)
+        requested = self.x_source_rows if rows is None else tuple(int(row) for row in rows)
+        by_row = dict(zip(self.x_observations.source_rows, self.x_observations.y, strict=True))
+        try:
+            values = np.asarray([by_row[row] for row in requested], dtype=float)
+        except KeyError as exc:
+            raise ValueError(f"Dataset {self.dataset_id!r} has an unknown X source row.") from exc
+        values.setflags(write=False)
+        return values

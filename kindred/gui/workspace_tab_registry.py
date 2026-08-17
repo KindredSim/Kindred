@@ -150,6 +150,12 @@ class WorkspaceTabRegistry:
     def active_tab_id(self) -> str:
         return self._installed.active_tab_id
 
+    @property
+    def document(self) -> ProjectDocument:
+        """Expose current canonical truth to staged physical consumers."""
+
+        return self._session.document
+
     def tab(self, tab_id: str) -> MechanismTabDocument:
         """Return canonical truth for exactly one caller-supplied tab ID."""
 
@@ -232,12 +238,28 @@ class WorkspaceTabRegistry:
             runtime_by_tab_id=tuple(next_runtime),
         )
 
-    def commit_install(self, prepared: PreparedWorkspaceInstall) -> None:
-        """Commit one prepared registry replacement using assignments only."""
+    def commit_install(
+        self,
+        prepared: PreparedWorkspaceInstall,
+        *,
+        expected_token: ProjectContentToken | None = None,
+    ) -> bool:
+        """Commit one prepared registry replacement using assignments only.
+
+        The optional token fence lets a replacement caller make the final
+        registry assignment conditional on the exact session revision without
+        reopening any validation, construction, or Qt work in this owner.
+        """
 
         if not isinstance(prepared, PreparedWorkspaceInstall):
             raise TypeError("prepared must be PreparedWorkspaceInstall.")
+        if expected_token is not None:
+            if not isinstance(expected_token, ProjectContentToken):
+                raise TypeError("expected_token must be ProjectContentToken.")
+            if not self._session.is_content_token_current(expected_token):
+                return False
         self._installed = prepared
+        return True
 
     @staticmethod
     def _clone_runtime(runtime: TabRuntimeState) -> TabRuntimeState:
@@ -351,6 +373,15 @@ class WorkspaceTabRegistry:
                 # Runtime replacement establishes the Draft/canonical invariant
                 # before callers perform any later persistence or view work.
                 runtime.reactions_draft = None
+            if (
+                runtime.notes_draft is not None
+                and runtime.notes_draft == tab.notes
+            ):
+                # Notes has the same accepted-draft invariant as Reactions:
+                # once the exact text is represented by canonical document
+                # truth, retaining the draft would create a second dirty
+                # authority if archive output later fails.
+                runtime.notes_draft = None
             set_ids = {item.set_id for item in tab.initial_condition_sets}
             current_species = set(
                 ()
@@ -492,7 +523,23 @@ class WorkspaceTabRegistry:
         prepared_document = self._session.prepare_document_mutation(document)
         candidate = prepared_document.document
         changed = candidate != previous
-        if changed:
+        installed_runtime_by_tab_id = dict(self._installed.runtime_by_tab_id)
+        reconciles_equal_draft = any(
+            (
+                (runtime := installed_runtime_by_tab_id.get(tab.tab_id))
+                is not None
+                and runtime.reactions_draft is not None
+                and runtime.reactions_draft.reactions_text
+                == tab.mechanism_source.reactions_text
+            )
+            or (
+                runtime is not None
+                and runtime.notes_draft is not None
+                and runtime.notes_draft == tab.notes
+            )
+            for tab in candidate.tabs
+        )
+        if changed or reconciles_equal_draft:
             prepared_workspace, delta = self._prepare_reconciled_install(
                 previous_document=previous,
                 document=candidate,
@@ -515,7 +562,7 @@ class WorkspaceTabRegistry:
         )
         if token is None:
             return None
-        if changed:
+        if changed or reconciles_equal_draft:
             self._installed = prepared_workspace
         return CanonicalMutationResult(token=token, changed=changed)
 

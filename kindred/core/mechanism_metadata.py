@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Any, Mapping, MutableMapping, Optional
 
 from kindred.core.simulator.common import normalize_energy_unit
+from kindred.core.species import validate_c0
 from kindred.core.temperature import (
     TemperatureScheduleProtocol,
     coerce_temperature_kelvin,
@@ -35,6 +35,7 @@ class EquilibriumMetadataKeys:
     KEQ_INPUT = "Keq_input"
     FORWARD_MODEL = "forward_model"
     STANDARD_CONC_M = "standard_conc_M"
+    KEQ_UNIT = "Keq_unit"
 
 
 @dataclass(frozen=True)
@@ -50,20 +51,10 @@ class MechanismMetadataView:
             "temperature_K",
             coerce_temperature_kelvin(self.temperature_K, field=MechanismMetadataKeys.TEMPERATURE_K),
         )
-        if type(self.standard_conc_M) is bool:
-            raise ValueError(
-                f"{MechanismMetadataKeys.STANDARD_CONC_M} must be positive and finite."
-            )
-        try:
-            standard = float(self.standard_conc_M)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"{MechanismMetadataKeys.STANDARD_CONC_M} must be positive and finite."
-            ) from exc
-        if not math.isfinite(standard) or standard <= 0.0:
-            raise ValueError(
-                f"{MechanismMetadataKeys.STANDARD_CONC_M} must be positive and finite."
-            )
+        standard = validate_c0(
+            self.standard_conc_M,
+            field=MechanismMetadataKeys.STANDARD_CONC_M,
+        )
         object.__setattr__(self, "standard_conc_M", standard)
 
     @classmethod
@@ -102,6 +93,18 @@ class EquilibriumMetadataView:
     Keq_input: Optional[object] = None
     forward_model: Optional[dict[str, object]] = None
     standard_conc_M: Optional[float] = None
+    Keq_unit: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.standard_conc_M is not None:
+            object.__setattr__(
+                self,
+                "standard_conc_M",
+                validate_c0(
+                    self.standard_conc_M,
+                    field=EquilibriumMetadataKeys.STANDARD_CONC_M,
+                ),
+            )
 
     def to_metadata(self) -> dict[str, object]:
         out: dict[str, object] = {
@@ -117,4 +120,6 @@ class EquilibriumMetadataView:
             out[EquilibriumMetadataKeys.FORWARD_MODEL] = dict(self.forward_model)
         if self.standard_conc_M is not None:
             out[EquilibriumMetadataKeys.STANDARD_CONC_M] = float(self.standard_conc_M)
+        if self.Keq_unit is not None:
+            out[EquilibriumMetadataKeys.KEQ_UNIT] = str(self.Keq_unit)
         return out

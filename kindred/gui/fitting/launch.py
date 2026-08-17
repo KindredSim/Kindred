@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import InitVar, dataclass, field, replace
 from typing import Iterable, Literal
 
 import numpy as np
@@ -12,12 +12,32 @@ from kindred.core.analysis.fit_uncertainty import (
     ProfileLikelihoodConfig,
     ResidualBootstrapConfig,
 )
-from kindred.core.analysis.global_fitting import SharedRefitPromotion
-from kindred.core.analysis.hierarchical_fit import HierarchicalFitConfig
+from kindred.core.analysis.global_fitting import (
+    SharedRefitExecution,
+    SharedRefitPromotion,
+    SharedRefitPromotionAdmission,
+)
+from kindred.core.analysis.global_fit_execution import FitCoordinate
+from kindred.core.analysis.global_fit_execution import (
+    FitParameterLayout,
+    GlobalFitResult,
+    build_parameter_layout_for_dataset_ids,
+)
+from kindred.core.analysis.dataset_parameter_overrides import (
+    FIT_SCOPE_CENTRED_FIXED_EFFECTS,
+    FitCoupledVariableParamSpec,
+    FitCentredFixedEffectsParamSpec,
+    FitDatasetParameterOverrides,
+    FitDatasetVariableParamSpec,
+    FitSharedVariableParamSpec,
+)
 from kindred.core.algebra.observable_introspection import (
+    AdmittedAlgebraProgram,
     FitLocalObservable,
+    admit_fit_local_algebra,
     fit_observable_names,
 )
+from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices
 from kindred.core.dataset_mapping import (
     resolve_fit_t_start,
@@ -33,16 +53,23 @@ from kindred.core.project_document import (
     ProjectDocument,
     TabScientificSettings,
     canonical_initial_values,
+    canonical_observation_target_names,
     canonical_species_names,
     validate_fit_defaults,
     validate_fit_solver,
 )
-from kindred.core.simulator.dsl_parse import (
-    DslDerivedObservableDefinition,
-    DslDerivedScalarDefinition,
-    PreparedDslRequestSet,
+from kindred.core.species import TIME_MAX_S, validate_concentration
+from kindred.core.time_grid import build_time_grid
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulation_preparation_stages import (
+    PreparedSolverConfig,
+    build_solver_config,
 )
-from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
+from kindred.gui.parameter_enumeration import (
+    GuiParameterScientificCategory,
+    admit_gui_parameter_value,
+    enumerate_parameter_coordinates,
+)
 from kindred.gui.fitting.contracts import FitParametricSettings, FitRunIdentity
 from kindred.gui.fitting.ic_tolerance import FitInitialTolerance
 
@@ -55,6 +82,8 @@ __all__ = [
     "FitDatasetWeightModeSetupEdit",
     "FitDefaultsSetupEdit",
     "FitExecutionRequest",
+    "FitPreparedDatasetConfig",
+    "FitPhysicalCoordinatePolicy",
     "FitSharedRefitIntent",
     "FitApplySelection",
     "FitAdvancedAnalysisSetupEdit",
@@ -69,6 +98,7 @@ __all__ = [
     "FitOriginSnapshot",
     "FitParameterVariable",
     "FitParameterSetupEdit",
+    "FitParameterVarySetupEdit",
     "FitParameterScopeSetupEdit",
     "FitSolverSetupEdit",
     "FitSelectedObservation",
@@ -79,11 +109,14 @@ __all__ = [
     "fit_origin_science_matches",
     "revalidate_fit_request_inclusions",
     "selected_observations",
-    "fit_local_observable_definitions",
-    "fit_uncertainty_coordinate_names",
+    "fit_execution_span",
+    "build_fit_local_admission",
+    "fit_uncertainty_coordinates",
     "FitLocalScalarProvenance",
     "FitPublicationClassification",
     "build_fit_publication_classifications",
+    "rebind_fit_request",
+    "fit_setup_readiness",
 ]
 
 FitDatasetWeightMode = Literal["implicit", "user"]
@@ -95,40 +128,43 @@ FitPublicationRoute = Literal[
 ]
 
 
-def fit_local_observable_definitions(
+def build_fit_local_admission(
+    prepared_dsl: PreparedDslRequestSet,
     observables: Iterable[FitLocalObservable],
     parameters: Iterable[FitParameterVariable],
-) -> tuple[DslDerivedObservableDefinition, ...]:
-    """Join observable scalar names to the canonical selected Fit configs."""
+) -> AdmittedAlgebraProgram | None:
+    """Admit the sole Fit-local Algebra program from selected rows."""
 
+    observable_items = tuple(observables)
     parameter_by_name = {parameter.name: parameter for parameter in parameters}
-    definitions: list[DslDerivedObservableDefinition] = []
-    for observable in observables:
-        scalar_definitions: list[DslDerivedScalarDefinition] = []
-        for scalar_name in observable.scalar_names:
-            parameter = parameter_by_name.get(scalar_name)
-            if parameter is None:
-                raise ValueError(
-                    f"Observable scalar {scalar_name!r} has no Fit parameter row."
-                )
-            config = parameter.selected_config
-            scalar_definitions.append(
-                DslDerivedScalarDefinition(
-                    name=scalar_name,
-                    value=config.value,
-                    minimum=config.minimum,
-                    maximum=config.maximum,
-                    scope=parameter.scope,
-                )
-            )
-        definitions.append(
-            DslDerivedObservableDefinition(
-                name=observable.name,
-                expression=observable.expression,
-                scalar_parameters=tuple(scalar_definitions),
-            )
+    scalar_names = tuple(
+        dict.fromkeys(
+            scalar_name
+            for observable in observable_items
+            for scalar_name in observable.scalar_names
         )
-    return tuple(definitions)
+    )
+    for scalar_name in scalar_names:
+        parameter = parameter_by_name.get(scalar_name)
+        if parameter is None:
+            raise ValueError(
+                f"Observable scalar {scalar_name!r} has no Fit parameter row."
+            )
+        if (
+            parameter.scientific_category != "finite_scalar"
+            or not parameter.allow_exact_zero
+            or parameter.scope == FIT_SCOPE_CENTRED_FIXED_EFFECTS
+        ):
+            raise ValueError(
+                f"Fit-local scalar {scalar_name!r} lost finite-scalar authority."
+            )
+    if not observable_items:
+        return None
+    return admit_fit_local_algebra(
+        base=prepared_dsl,
+        observables=observable_items,
+        scalar_names=scalar_names,
+    )
 
 
 def _required(value: object, field: str) -> str:
@@ -143,6 +179,34 @@ def _finite(value: object, field: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError(f"{field} must be finite.")
     return parsed
+
+
+def fit_execution_span(t_start: object, t_end: object) -> tuple[float, float]:
+    """Return the canonical positive solver span for one Fit selection.
+
+    A selected inclusive window may retain exactly one observation at its
+    boundary (``t_start == t_end``).  That is valid data, but the simulation
+    preparation contract requires a strictly positive span.  Widen only the
+    execution span by one representable float; the selected observations and
+    user-facing Data Range remain unchanged.  At the admitted upper endpoint,
+    move the execution start back by one representable float instead.
+    """
+
+    start = _finite(t_start, "Fit execution start")
+    end = _finite(t_end, "Fit execution end")
+    if start < 0.0 or end < 0.0 or end > TIME_MAX_S or start > TIME_MAX_S:
+        raise ValueError("Fit execution span must use admitted nonnegative seconds.")
+    if end > start:
+        return start, end
+    if end < start:
+        raise ValueError("Fit execution end must not precede its start.")
+    widened_end = math.nextafter(start, math.inf)
+    if widened_end <= TIME_MAX_S:
+        return start, widened_end
+    widened_start = math.nextafter(start, -math.inf)
+    if widened_start < 0.0 or not widened_start < end:
+        raise ValueError("Fit boundary has no representable positive execution span.")
+    return widened_start, end
 
 
 def _validated_dataset_weight_mode(
@@ -167,8 +231,6 @@ class FitLocalScalarProvenance:
     origin_tab_id: str
     origin_capture_id: str
     observable_name: str
-    dataset_id: str
-    raw_observation_id: str
     admission_scope: Literal["shared", "per_dataset"]
     admitted_value: float
 
@@ -176,13 +238,20 @@ class FitLocalScalarProvenance:
         object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "Fit-local origin tab ID"))
         object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "Fit-local origin capture ID"))
         object.__setattr__(self, "observable_name", _required(self.observable_name, "Fit-local observable name"))
-        object.__setattr__(self, "dataset_id", _required(self.dataset_id, "Fit-local dataset ID"))
-        object.__setattr__(self, "raw_observation_id", _required(self.raw_observation_id, "Fit-local raw observation ID"))
         scope = str(self.admission_scope or "").strip().lower()
         if scope not in {"shared", "per_dataset"}:
             raise ValueError("Fit-local scalar admission scope must be Shared or Per-dataset.")
         object.__setattr__(self, "admission_scope", scope)
-        object.__setattr__(self, "admitted_value", _finite(self.admitted_value, "Fit-local admitted value"))
+        object.__setattr__(
+            self,
+            "admitted_value",
+            admit_gui_parameter_value(
+                self.admitted_value,
+                scientific_category="finite_scalar",
+                allow_exact_zero=True,
+                field="Fit-local admitted value",
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,7 +259,7 @@ class FitPublicationClassification:
     """Owner-provided publication route for one terminal Fit scalar."""
 
     parameter_name: str
-    scope: Literal["shared", "per_dataset", "hierarchical"]
+    scope: Literal["shared", "per_dataset", "centred_fixed_effects"]
     route: FitPublicationRoute
     eligible: bool
     requires_shared_refit: bool
@@ -200,7 +269,7 @@ class FitPublicationClassification:
     def __post_init__(self) -> None:
         object.__setattr__(self, "parameter_name", _required(self.parameter_name, "publication parameter name"))
         scope = str(self.scope or "").strip().lower()
-        if scope not in {"shared", "per_dataset", "hierarchical"}:
+        if scope not in {"shared", "per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
             raise ValueError("Publication classification scope is invalid.")
         object.__setattr__(self, "scope", scope)
         route = str(self.route or "").strip().lower()
@@ -253,14 +322,14 @@ def build_fit_publication_classifications(
                 route = "fit_local_only"
                 eligible = False
                 requires_refit = parameter.scope == "per_dataset"
-        elif parameter.scope == "shared":
+        elif parameter.scope in {"shared", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
             route = "parameters"
             eligible = True
             requires_refit = False
         else:
             route = "fit_local_only"
             eligible = False
-            requires_refit = parameter.scope in {"per_dataset", "hierarchical"}
+            requires_refit = parameter.scope == "per_dataset"
         classifications.append(
             FitPublicationClassification(
                 parameter_name=parameter.name,
@@ -284,29 +353,27 @@ class FitSharedRefitIntent:
     custody, promotion bounds, and dispatch admission before accepting it.
     """
 
-    origin_tab_id: str
-    origin_capture_id: str
     source_run_hash: str
-    promotions: tuple[SharedRefitPromotion, ...]
+    parameter_names: tuple[str, ...]
+    seed_statistic: Literal["arithmetic_mean", "geometric_mean"]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "Shared-refit origin tab ID"))
-        object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "Shared-refit origin capture ID"))
         object.__setattr__(self, "source_run_hash", _required(self.source_run_hash, "Shared-refit source run hash"))
-        promotions = tuple(self.promotions)
-        if not promotions or any(not isinstance(item, SharedRefitPromotion) for item in promotions):
-            raise ValueError("Shared-refit intent requires typed promotions.")
-        names = tuple(item.parameter_name for item in promotions)
+        names = tuple(_required(item, "Shared-refit parameter name") for item in self.parameter_names)
+        if not names:
+            raise ValueError("Shared-refit intent requires a parameter selection.")
         if len(names) != len(set(names)):
             raise ValueError("Shared-refit intent repeats a parameter.")
-        object.__setattr__(self, "promotions", promotions)
+        if self.seed_statistic not in {"arithmetic_mean", "geometric_mean"}:
+            raise ValueError("Shared-refit intent has an invalid seed statistic.")
+        object.__setattr__(self, "parameter_names", names)
 
 
 @dataclass(frozen=True, slots=True)
 class FitObservationSnapshot:
     raw_observation_id: str
     raw_column: str
-    model_species: str
+    model_target: str
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
@@ -320,8 +387,8 @@ class FitObservationSnapshot:
         object.__setattr__(self, "raw_column", _required(self.raw_column, "raw column"))
         object.__setattr__(
             self,
-            "model_species",
-            _required(self.model_species, "mapped model series"),
+            "model_target",
+            _required(self.model_target, "mapped model target"),
         )
         times = tuple(_finite(value, "observation time") for value in self.t)
         values = tuple(_finite(value, "observation value") for value in self.y)
@@ -365,11 +432,10 @@ class FitMappedDatasetSnapshot:
             if name in names:
                 raise ValueError(f"Duplicate initial species {name!r}.")
             names.add(name)
-            value = _finite(raw_value, f"initial value {name}")
-            if value < 0.0:
-                raise ValueError(
-                    f"Initial value {name!r} must be nonnegative."
-                )
+            value = validate_concentration(
+                _finite(raw_value, f"initial value {name}"),
+                field=f"initial value {name}",
+            )
             values.append((name, value))
         object.__setattr__(self, "initial_values", tuple(values))
         observations = tuple(self.observations)
@@ -436,6 +502,42 @@ class FitParameterConfiguration:
         object.__setattr__(self, "dataset_values", values)
 
 
+def _admit_fit_parameter_configuration(
+    configuration: FitParameterConfiguration,
+    *,
+    parameter_name: str,
+    scientific_category: GuiParameterScientificCategory,
+    allow_exact_zero: bool,
+) -> FitParameterConfiguration:
+    """Admit one complete scope candidate using its retained category."""
+
+    if not isinstance(configuration, FitParameterConfiguration):
+        raise TypeError("Fit parameter configuration must be typed.")
+
+    def admit(value: object, field: str) -> float:
+        return admit_gui_parameter_value(
+            value,
+            scientific_category=scientific_category,
+            allow_exact_zero=allow_exact_zero,
+            field=f"{parameter_name} {field}",
+        )
+
+    value = admit(configuration.value, "value")
+    minimum = admit(configuration.minimum, "minimum")
+    maximum = admit(configuration.maximum, "maximum")
+    dataset_values = tuple(
+        (dataset_id, admit(item, f"value for dataset {dataset_id}"))
+        for dataset_id, item in configuration.dataset_values
+    )
+    return replace(
+        configuration,
+        value=value,
+        minimum=minimum,
+        maximum=maximum,
+        dataset_values=dataset_values,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class FitParameterVariable:
     name: str
@@ -443,6 +545,8 @@ class FitParameterVariable:
     scope: str
     shared_config: FitParameterConfiguration
     per_dataset_config: FitParameterConfiguration
+    scientific_category: GuiParameterScientificCategory
+    allow_exact_zero: bool
     family: str = ""
     role: str = ""
     unit: str = "1"
@@ -456,22 +560,49 @@ class FitParameterVariable:
             _required(self.display_name, "parameter display name"),
         )
         scope = str(self.scope or "").strip().lower()
-        if scope not in {"shared", "per_dataset", "hierarchical"}:
+        if scope not in {"shared", "per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
             raise ValueError(
-                "Scalar Fit scope must be Shared, Per-dataset, or Hierarchical."
+                "Scalar Fit scope must be Shared, Per-dataset, or centred fixed effects."
             )
-        if not isinstance(self.shared_config, FitParameterConfiguration):
-            raise TypeError("Shared scalar configuration must be typed.")
-        if not isinstance(self.per_dataset_config, FitParameterConfiguration):
-            raise TypeError("Per-dataset scalar configuration must be typed.")
+        scientific_category = str(self.scientific_category or "").strip()
+        if scientific_category not in {
+            "rate",
+            "equilibrium_constant",
+            "finite_scalar",
+        }:
+            raise ValueError("Fit parameter scientific category is invalid.")
+        if type(self.allow_exact_zero) is not bool:
+            raise TypeError("Fit parameter exact-zero authority must be a bool.")
+        shared_config = _admit_fit_parameter_configuration(
+            self.shared_config,
+            parameter_name=self.name,
+            scientific_category=scientific_category,
+            allow_exact_zero=self.allow_exact_zero,
+        )
+        per_dataset_config = _admit_fit_parameter_configuration(
+            self.per_dataset_config,
+            parameter_name=self.name,
+            scientific_category=scientific_category,
+            allow_exact_zero=self.allow_exact_zero,
+        )
         if self.fit_local_provenance is not None and not isinstance(
             self.fit_local_provenance,
             FitLocalScalarProvenance,
         ):
             raise TypeError("Fit-local scalar provenance must be typed.")
+        if self.fit_local_provenance is not None and (
+            scientific_category != "finite_scalar"
+            or not self.allow_exact_zero
+        ):
+            raise ValueError(
+                "Fit-local scalars require arbitrary finite-scalar admission."
+            )
         object.__setattr__(self, "scope", scope)
+        object.__setattr__(self, "shared_config", shared_config)
+        object.__setattr__(self, "per_dataset_config", per_dataset_config)
         object.__setattr__(self, "family", str(self.family or "").strip())
         object.__setattr__(self, "role", str(self.role or "").strip())
+        object.__setattr__(self, "scientific_category", scientific_category)
         object.__setattr__(self, "unit", str(self.unit or "1").strip() or "1")
 
     @property
@@ -517,9 +648,9 @@ def _replace_fit_parameter(
     if unknown:
         raise TypeError("Unsupported Fit parameter replacement fields: " + ", ".join(sorted(unknown)))
     target_scope = str(changes.get("scope", parameter.scope)).strip().lower()
-    if target_scope not in {"shared", "per_dataset", "hierarchical"}:
+    if target_scope not in {"shared", "per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
         raise ValueError(
-            "Scalar Fit scope must be Shared, Per-dataset, or Hierarchical."
+            "Scalar Fit scope must be Shared, Per-dataset, or centred fixed effects."
         )
     selected = (
         parameter.shared_config
@@ -599,9 +730,10 @@ class FitInitialVariable:
     def __post_init__(self) -> None:
         object.__setattr__(self, "set_id", _required(self.set_id, "set ID"))
         object.__setattr__(self, "species", _required(self.species, "species"))
-        initial = _finite(self.initial, f"{self.species} initial")
-        if initial < 0.0:
-            raise ValueError("Initial concentration must be nonnegative.")
+        initial = validate_concentration(
+            _finite(self.initial, f"{self.species} initial"),
+            field=f"{self.species} initial",
+        )
         if not isinstance(self.tolerance, FitInitialTolerance):
             raise TypeError("Initial tolerance must be FitInitialTolerance.")
         minimum, _maximum = self.tolerance.bounds_for(initial)
@@ -647,20 +779,23 @@ class FitInitialApplyCellProposal:
         if len(dataset_ids) != len(set(dataset_ids)):
             raise ValueError("IC Apply proposal repeats a dataset ID.")
         object.__setattr__(self, "dataset_ids", dataset_ids)
-        for field in (
+        for field_name in (
             "captured_value",
             "nominal_value",
             "fitted_value",
             "minimum",
             "maximum",
         ):
-            object.__setattr__(self, field, _finite(getattr(self, field), field))
+            object.__setattr__(
+                self,
+                field_name,
+                validate_concentration(
+                    _finite(getattr(self, field_name), field_name),
+                    field=field_name,
+                ),
+            )
         if (
-            self.captured_value < 0.0
-            or self.nominal_value < 0.0
-            or self.fitted_value < 0.0
-            or self.minimum < 0.0
-            or self.minimum >= self.maximum
+            self.minimum >= self.maximum
             or not self.minimum <= self.nominal_value <= self.maximum
         ):
             raise ValueError("IC Apply proposal values or bounds are invalid.")
@@ -738,10 +873,19 @@ class FitInitialGlobalVariable:
 
     def __post_init__(self) -> None:
         species = _required(self.species, "initial species")
-        initial = _finite(self.initial, f"{species} initial")
-        minimum = _finite(self.minimum, f"{species} minimum")
-        maximum = _finite(self.maximum, f"{species} maximum")
-        if minimum < 0.0 or minimum >= maximum or not minimum <= initial <= maximum:
+        initial = validate_concentration(
+            _finite(self.initial, f"{species} initial"),
+            field=f"{species} initial",
+        )
+        minimum = validate_concentration(
+            _finite(self.minimum, f"{species} minimum"),
+            field=f"{species} minimum",
+        )
+        maximum = validate_concentration(
+            _finite(self.maximum, f"{species} maximum"),
+            field=f"{species} maximum",
+        )
+        if minimum >= maximum or not minimum <= initial <= maximum:
             raise ValueError(
                 f"{species} requires nonnegative minimum <= initial <= maximum."
             )
@@ -797,10 +941,13 @@ class FitDatasetLocalSettings:
             (_required(name, "target series"), _finite(value, "target weight"))
             for name, value in self.target_weights
         )
+        weight_roster = targets
+        if self.parametric is not None:
+            weight_roster = (*targets, self.parametric.x_name)
         weight_names = [name for name, _value in target_weights]
         if (
             len(weight_names) != len(set(weight_names))
-            or set(weight_names) != set(targets)
+            or set(weight_names) != set(weight_roster)
         ):
             raise ValueError(
                 "Fit target weights must exactly match selected targets."
@@ -931,7 +1078,7 @@ class FitOriginSnapshot:
                         "observations": [
                             {
                                 "raw_observation_id": obs.raw_observation_id,
-                                "model_species": obs.model_species,
+                                "model_target": obs.model_target,
                                 "t": obs.t,
                                 "y": obs.y,
                                 "source_rows": obs.source_rows,
@@ -955,6 +1102,8 @@ class FitOriginSnapshot:
                         "initial": item.selected_config.value,
                         "family": item.family,
                         "role": item.role,
+                        "scientific_category": item.scientific_category,
+                        "allow_exact_zero": item.allow_exact_zero,
                         "unit": item.unit,
                     }
                     for item in self.parameter_defaults
@@ -970,7 +1119,6 @@ def _validate_advanced_analysis_setup(
     parameters: tuple[FitParameterVariable, ...],
     profile_likelihood: ProfileLikelihoodConfig | None,
     residual_bootstrap: ResidualBootstrapConfig | None,
-    hierarchical: Iterable[HierarchicalFitConfig],
     shared_refit_promotions: Iterable[SharedRefitPromotion],
 ) -> None:
     if profile_likelihood is not None and not isinstance(
@@ -983,39 +1131,58 @@ def _validate_advanced_analysis_setup(
         ResidualBootstrapConfig,
     ):
         raise TypeError("Residual bootstrap configuration must be typed.")
-    hierarchy = tuple(hierarchical)
     promotions = tuple(shared_refit_promotions)
-    if any(not isinstance(item, HierarchicalFitConfig) for item in hierarchy):
-        raise TypeError("Hierarchical Fit configuration must be typed.")
     if any(not isinstance(item, SharedRefitPromotion) for item in promotions):
         raise TypeError("Shared-refit promotions must be typed.")
-    if promotions and (
-        profile_likelihood is not None
-        or residual_bootstrap is not None
-        or hierarchy
+    by_name = {item.name: item for item in parameters}
+    if promotions and (profile_likelihood is not None or residual_bootstrap is not None):
+        raise ValueError("Shared refit must complete before uncertainty setup.")
+    if promotions and any(
+        item.scope == FIT_SCOPE_CENTRED_FIXED_EFFECTS for item in parameters
     ):
         raise ValueError(
-            "Shared refit must complete before uncertainty or Hierarchical setup."
+            "Shared refit is unavailable while centred fixed-effects parameters "
+            "are selected."
         )
-    by_name = {item.name: item for item in parameters}
-    fitted_names = set(fit_uncertainty_coordinate_names(parameters, datasets))
+    allowed_coordinates = fit_uncertainty_coordinates(parameters, datasets)
+    allowed_set = set(allowed_coordinates)
+    allowed_display = {item.display_name for item in allowed_coordinates}
     for config in (profile_likelihood, residual_bootstrap):
-        if config is not None and not set(config.parameter_names) <= fitted_names:
+        if config is None:
+            continue
+        if not config.parameter_names:
             raise ValueError(
-                "Uncertainty configuration references an unavailable fitted parameter."
+                "Enabled uncertainty analysis requires at least one coordinate."
             )
-    hierarchical_names = [item.parameter_name for item in hierarchy]
-    if len(hierarchical_names) != len(set(hierarchical_names)):
-        raise ValueError("Hierarchical configuration repeats a parameter.")
-    declared_hierarchical = {
-        item.name for item in parameters if item.scope == "hierarchical"
-    }
-    if set(hierarchical_names) != declared_hierarchical:
-        raise ValueError(
-            "Hierarchical configuration must exactly match declared parameters."
-        )
-    if any(not by_name[name].selected_config.fit for name in declared_hierarchical):
-        raise ValueError("Hierarchical parameters must be selected for fitting.")
+        requested = tuple(config.parameter_names)
+        resolved: list[FitCoordinate] = []
+        for item in requested:
+            if isinstance(item, FitCoordinate):
+                coordinate = item
+            else:
+                display = str(item or "").strip()
+                if display not in allowed_display:
+                    raise ValueError(
+                        "Uncertainty configuration references an unavailable "
+                        "fitted coordinate."
+                    )
+                coordinate = next(
+                    value for value in allowed_coordinates
+                    if value.display_name == display
+                )
+            if coordinate not in allowed_set:
+                raise ValueError(
+                    "Uncertainty configuration references an unavailable fitted "
+                    "coordinate."
+                )
+            if coordinate.scope in {"coupled", "centred_deviation"}:
+                raise ValueError(
+                    "Coupled and centred dataset-deviation coordinates cannot "
+                    "be selected as uncertainty targets."
+                )
+            resolved.append(coordinate)
+        if len(resolved) != len(set(resolved)):
+            raise ValueError("Uncertainty coordinates repeat a typed identity.")
     promotion_names = [item.parameter_name for item in promotions]
     if len(promotion_names) != len(set(promotion_names)):
         raise ValueError("Shared-refit setup repeats a promotion.")
@@ -1030,29 +1197,254 @@ def _validate_advanced_analysis_setup(
         )
 
 
-def fit_uncertainty_coordinate_names(
+def fit_uncertainty_coordinates(
     parameters: Iterable[FitParameterVariable],
     datasets: Iterable[FitDatasetLocalSettings],
-) -> tuple[str, ...]:
-    """Return exact optimizer keys selectable by uncertainty methods."""
+) -> tuple[FitCoordinate, ...]:
+    """Return the exact ordinary typed uncertainty roster.
 
-    included_ids = tuple(
-        sorted(item.dataset_id for item in datasets if item.included)
-    )
-    names: list[str] = []
-    for parameter in parameters:
-        if not parameter.selected_config.fit:
+    A centred parameter exposes only its overall coordinate. Its dataset
+    deviations are fitted nuisances and are never public uncertainty targets.
+    """
+    parameter_items = tuple(parameters)
+    included_ids = tuple(sorted(item.dataset_id for item in datasets if item.included))
+    coordinates: list[FitCoordinate] = []
+    for parameter in sorted(parameter_items, key=lambda item: item.name):
+        if not parameter.selected_config.fit or parameter.fit_local_provenance is not None:
             continue
         if parameter.scope == "shared":
-            names.append(parameter.name)
+            coordinates.append(FitCoordinate("shared", parameter.name))
+        elif parameter.scope == FIT_SCOPE_CENTRED_FIXED_EFFECTS:
+            coordinates.append(FitCoordinate("centred_overall", parameter.name))
         else:
             values = dict(parameter.selected_config.dataset_values)
-            names.extend(
-                f"{dataset_id}::{parameter.name}"
+            coordinates.extend(
+                FitCoordinate("dataset", parameter.name, dataset_id)
                 for dataset_id in included_ids
                 if dataset_id in values
             )
-    return tuple(names)
+    return tuple(coordinates)
+
+
+@dataclass(frozen=True, slots=True)
+class FitPreparedDatasetConfig:
+    """One admitted dataset/grid solver policy completed before dispatch."""
+
+    dataset_id: str
+    retained_times: tuple[float, ...]
+    execution_t_start: float
+    execution_t_end: float
+    fit_sampling_policy: str
+    fit_sampling_identity: tuple[tuple[str, object], ...]
+    solver_config: PreparedSolverConfig
+
+    def __post_init__(self) -> None:
+        dataset_id = _required(self.dataset_id, "prepared Fit dataset ID")
+        retained_times = tuple(float(value) for value in self.retained_times)
+        if (
+            not retained_times
+            or any(not math.isfinite(value) for value in retained_times)
+            or any(right <= left for left, right in zip(retained_times, retained_times[1:]))
+        ):
+            raise ValueError("Prepared Fit dataset times must be finite and ordered.")
+        if not isinstance(self.solver_config, PreparedSolverConfig):
+            raise TypeError("Prepared Fit dataset requires PreparedSolverConfig.")
+        object.__setattr__(self, "dataset_id", dataset_id)
+        object.__setattr__(self, "retained_times", retained_times)
+
+
+@dataclass(frozen=True, slots=True)
+class FitPhysicalCoordinatePolicy:
+    """Retained physical admission policy for one Fit scalar coordinate."""
+
+    parameter_name: str
+    dataset_id: str | None
+    scientific_category: GuiParameterScientificCategory
+    allow_exact_zero: bool
+    minimum: float
+    maximum: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameter_name", _required(self.parameter_name, "physical Fit coordinate"))
+        if self.dataset_id is not None:
+            object.__setattr__(self, "dataset_id", _required(self.dataset_id, "physical Fit dataset ID"))
+        if self.scientific_category not in {"rate", "equilibrium_constant", "finite_scalar"}:
+            raise ValueError("Physical Fit coordinate category is invalid.")
+        admit_gui_parameter_value(
+            self.minimum,
+            scientific_category=self.scientific_category,
+            allow_exact_zero=self.allow_exact_zero,
+            field=f"{self.parameter_name} retained minimum",
+        )
+        admit_gui_parameter_value(
+            self.maximum,
+            scientific_category=self.scientific_category,
+            allow_exact_zero=self.allow_exact_zero,
+            field=f"{self.parameter_name} retained maximum",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _FitDispatchCompilation:
+    """Private immutable lowering retained only by an admitted Fit request."""
+
+    included_dataset_ids: tuple[str, ...]
+    prepared_datasets: tuple[FitPreparedDatasetConfig, ...]
+    ordinary_shared_variables: tuple[FitSharedVariableParamSpec, ...]
+    shared_refit_execution: SharedRefitExecution | None
+    ordinary_coupled_variables: tuple[FitCoupledVariableParamSpec, ...]
+    fixed_by_dataset: tuple[tuple[str, tuple[tuple[str, float], ...]], ...]
+    ordinary_dataset_overrides: tuple[FitDatasetParameterOverrides, ...]
+    candidate_names: tuple[str, ...]
+    physical_coordinate_policies: tuple[FitPhysicalCoordinatePolicy, ...]
+    ordinary_optimizer_layout: FitParameterLayout | None
+    ordinary_centred_variables: tuple[FitCentredFixedEffectsParamSpec, ...]
+
+    def __post_init__(self) -> None:
+        ids = tuple(_required(value, "included Fit dataset ID") for value in self.included_dataset_ids)
+        prepared = tuple(self.prepared_datasets)
+        prepared_ids = tuple(item.dataset_id for item in prepared)
+        fixed_ids = tuple(dataset_id for dataset_id, _values in self.fixed_by_dataset)
+        execution = self.shared_refit_execution
+        if execution is not None and not isinstance(
+            execution, SharedRefitExecution
+        ):
+            raise TypeError("Fit dispatch Shared-refit execution must be typed.")
+        if execution is None:
+            shared = tuple(self.ordinary_shared_variables)
+            coupled = tuple(self.ordinary_coupled_variables)
+            overrides = tuple(self.ordinary_dataset_overrides)
+            layout = self.ordinary_optimizer_layout
+            if not isinstance(layout, FitParameterLayout):
+                raise TypeError("Ordinary Fit dispatch requires its optimizer layout.")
+            admissions: tuple[SharedRefitPromotionAdmission, ...] = ()
+        else:
+            if (
+                self.ordinary_shared_variables
+                or self.ordinary_coupled_variables
+                or self.ordinary_dataset_overrides
+                or self.ordinary_centred_variables
+                or self.ordinary_optimizer_layout is not None
+            ):
+                raise ValueError(
+                    "Shared-refit dispatch cannot retain parallel ordinary "
+                    "parameter execution facts."
+                )
+            if execution.dataset_ids != ids:
+                raise ValueError(
+                    "Shared-refit dispatch roster differs from its execution."
+                )
+            shared = execution.shared_variables
+            coupled = execution.coupled_variables
+            overrides = execution.dataset_overrides
+            layout = execution.optimizer_layout
+            admissions = execution.promotion_admissions
+        override_ids = tuple(item.dataset_id for item in overrides)
+        if (
+            len(ids) != len(set(ids))
+            or len(prepared_ids) != len(ids)
+            or len(fixed_ids) != len(ids)
+            or len(override_ids) != len(ids)
+            or set(prepared_ids) != set(ids)
+            or set(fixed_ids) != set(ids)
+            or set(override_ids) != set(ids)
+        ):
+            raise ValueError("Fit dispatch prepared solver roster is incomplete.")
+        fixed_by_id = dict(self.fixed_by_dataset)
+        if any(
+            tuple(fixed_by_id[item.dataset_id]) != tuple(item.fixed_params)
+            for item in overrides
+        ):
+            raise ValueError(
+                "Fit dispatch fixed execution values disagree with its retired routes."
+            )
+        if set(layout.dataset_var_index) - set(ids):
+            raise ValueError("Fit dispatch optimizer layout references an excluded dataset.")
+        shared_by_name = {item.name: item for item in shared}
+        admission_names = tuple(
+            item.shared_variable.name for item in admissions
+        )
+        if (
+            len(shared_by_name) != len(shared)
+            or len(admission_names) != len(set(admission_names))
+            or any(
+                shared_by_name.get(item.shared_variable.name)
+                != item.shared_variable
+                for item in admissions
+            )
+        ):
+            raise ValueError(
+                "Fit dispatch Shared-refit admissions disagree with Shared execution specs."
+            )
+        admitted_names = set(admission_names)
+        stale_dataset_routes = admitted_names.intersection(
+            {
+                name
+                for override in overrides
+                for name in (
+                    *(item.name for item in override.variable_params),
+                    *(item[0] for item in override.fixed_params),
+                )
+            }
+        )
+        stale_coupled_routes = admitted_names.intersection(
+            item.parameter_name for item in coupled
+        )
+        if stale_dataset_routes or stale_coupled_routes:
+            raise ValueError(
+                "Fit dispatch retained an obsolete route for an admitted "
+                "Shared-refit parameter."
+            )
+        if not admitted_names.issubset(set(layout.param_names)):
+            raise ValueError(
+                "Fit dispatch optimizer layout omitted an admitted Shared-refit parameter."
+            )
+        policies_by_name = {
+            name: tuple(
+                item
+                for item in self.physical_coordinate_policies
+                if item.parameter_name == name
+            )
+            for name in admitted_names
+        }
+        for admission in admissions:
+            variable = admission.shared_variable
+            policies = policies_by_name[variable.name]
+            if (
+                tuple(admission.provenance.get("source_dataset_ids", ())) != ids
+                or float(
+                    admission.provenance.get("seed_value", math.nan)
+                ) != variable.initial
+                or len(policies) != 1
+                or policies[0].dataset_id is not None
+                or policies[0].minimum != variable.minimum
+                or policies[0].maximum != variable.maximum
+            ):
+                raise ValueError(
+                    "Fit dispatch Shared-refit source, seed, or physical policy "
+                    "is incomplete."
+                )
+        object.__setattr__(self, "included_dataset_ids", ids)
+        object.__setattr__(
+            self,
+            "ordinary_shared_variables",
+            tuple(self.ordinary_shared_variables),
+        )
+        object.__setattr__(
+            self,
+            "ordinary_coupled_variables",
+            tuple(self.ordinary_coupled_variables),
+        )
+        object.__setattr__(
+            self,
+            "ordinary_dataset_overrides",
+            tuple(self.ordinary_dataset_overrides),
+        )
+        centred = tuple(self.ordinary_centred_variables)
+        if any(not isinstance(item, FitCentredFixedEffectsParamSpec) for item in centred):
+            raise TypeError("Centred Fit dispatch variables must be typed.")
+        object.__setattr__(self, "ordinary_centred_variables", centred)
+        object.__setattr__(self, "shared_refit_execution", execution)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1061,7 +1453,7 @@ class FitExecutionRequest:
     mechanism_source: MechanismAuthoringSource
     prepared_dsl: PreparedDslRequestSet
     solver: FitSolver
-    local_observables: tuple[FitLocalObservable, ...]
+    fit_local_admission: AdmittedAlgebraProgram | None
     datasets: tuple[FitDatasetLocalSettings, ...]
     parameters: tuple[FitParameterVariable, ...]
     initials: tuple[FitInitialVariable, ...]
@@ -1071,10 +1463,14 @@ class FitExecutionRequest:
     dataset_weight_mode: FitDatasetWeightMode
     profile_likelihood: ProfileLikelihoodConfig | None = None
     residual_bootstrap: ResidualBootstrapConfig | None = None
-    hierarchical: tuple[HierarchicalFitConfig, ...] = ()
     shared_refit_promotions: tuple[SharedRefitPromotion, ...] = ()
+    shared_refit_source_result: InitVar[GlobalFitResult | None] = None
+    dispatch: _FitDispatchCompilation = field(init=False, repr=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(
+        self,
+        shared_refit_source_result: GlobalFitResult | None,
+    ) -> None:
         if not isinstance(self.origin, FitOriginSnapshot):
             raise TypeError("origin must be FitOriginSnapshot.")
         if not isinstance(self.mechanism_source, MechanismAuthoringSource):
@@ -1086,7 +1482,18 @@ class FitExecutionRequest:
             self.prepared_dsl.analysis,
         ):
             raise ValueError(
-                "Fit request prepared DSL must exactly match its effective source."
+                "Fit request prepared DSL must exactly match its captured source."
+            )
+        if (
+            self.mechanism_source != self.origin.mechanism_source
+            or self.prepared_dsl is not self.origin.prepared_dsl
+            or self.prepared_dsl.analysis.identity
+            != self.origin.prepared_dsl.analysis.identity
+            or self.prepared_dsl.base_executable_identity().fingerprint
+            != self.origin.prepared_dsl.base_executable_identity().fingerprint
+        ):
+            raise ValueError(
+                "Fit request must retain the captured project source and base science."
             )
         if not isinstance(self.defaults, FitDefaults):
             raise TypeError("defaults must be FitDefaults.")
@@ -1097,18 +1504,25 @@ class FitExecutionRequest:
             "dataset_weight_mode",
             _validated_dataset_weight_mode(self.dataset_weight_mode),
         )
-        local_observables = tuple(self.local_observables)
+        admission = self.fit_local_admission
+        if admission is not None:
+            if not isinstance(admission, AdmittedAlgebraProgram):
+                raise TypeError(
+                    "Fit request local admission must be AdmittedAlgebraProgram."
+                )
+            if (
+                admission.base_analysis_identity
+                != self.prepared_dsl.analysis.identity
+                or admission.base_executable_fingerprint
+                != self.prepared_dsl.base_executable_identity().fingerprint
+            ):
+                raise ValueError(
+                    "Fit request local admission no longer matches base science."
+                )
         raw_datasets = tuple(self.datasets)
         raw_parameters = tuple(self.parameters)
         raw_initials = tuple(self.initials)
         raw_global_initials = tuple(self.global_initials)
-        if any(
-            not isinstance(item, FitLocalObservable)
-            for item in local_observables
-        ):
-            raise TypeError(
-                "Fit request observables must be FitLocalObservable values."
-            )
         if any(
             not isinstance(item, FitDatasetLocalSettings)
             for item in raw_datasets
@@ -1179,37 +1593,54 @@ class FitExecutionRequest:
             raise ValueError(
                 "Fit request Global configurations must match active Global scopes."
             )
-        object.__setattr__(self, "local_observables", local_observables)
         object.__setattr__(self, "datasets", datasets)
         object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "initials", initials)
         object.__setattr__(self, "global_initials", global_initials)
         object.__setattr__(self, "initial_scopes", initial_scopes)
-        local_scalar_names = {
-            scalar_name
-            for observable in local_observables
-            for scalar_name in observable.scalar_names
-        }
-        if any(
-            item.name in local_scalar_names and item.scope == "hierarchical"
+        local_scalar_names = set(() if admission is None else admission.scalar_names)
+        parameter_by_name = {item.name: item for item in parameters}
+        for scalar_name in local_scalar_names:
+            parameter = parameter_by_name.get(scalar_name)
+            if (
+                parameter is None
+                or parameter.fit_local_provenance is None
+                or parameter.scientific_category != "finite_scalar"
+                or not parameter.allow_exact_zero
+            ):
+                raise ValueError(
+                    f"Fit-local scalar {scalar_name!r} lost its admitted row authority."
+                )
+        unexpected_local_rows = sorted(
+            item.name
             for item in parameters
-        ):
+            if item.fit_local_provenance is not None
+            and item.name not in local_scalar_names
+        )
+        if unexpected_local_rows:
             raise ValueError(
-                "Fit-local observable scalars are not eligible for Hierarchical scope."
+                "Fit request retained unowned Fit-local scalar row(s): "
+                + ", ".join(unexpected_local_rows)
             )
         _validate_advanced_analysis_setup(
             datasets=datasets,
             parameters=parameters,
             profile_likelihood=self.profile_likelihood,
             residual_bootstrap=self.residual_bootstrap,
-            hierarchical=self.hierarchical,
             shared_refit_promotions=self.shared_refit_promotions,
         )
-        object.__setattr__(self, "hierarchical", tuple(self.hierarchical))
         object.__setattr__(
             self,
             "shared_refit_promotions",
             tuple(self.shared_refit_promotions),
+        )
+        object.__setattr__(
+            self,
+            "dispatch",
+            _compile_fit_dispatch(
+                self,
+                shared_refit_source_result=shared_refit_source_result,
+            ),
         )
 
 
@@ -1232,7 +1663,6 @@ class FitSetupSnapshot:
     dataset_weight_mode: FitDatasetWeightMode
     profile_likelihood: ProfileLikelihoodConfig | None = None
     residual_bootstrap: ResidualBootstrapConfig | None = None
-    hierarchical: tuple[HierarchicalFitConfig, ...] = ()
     shared_refit_promotions: tuple[SharedRefitPromotion, ...] = ()
     publication_classifications: tuple[FitPublicationClassification, ...] = ()
 
@@ -1352,7 +1782,7 @@ class FitSetupSnapshot:
         incomplete_parameter_maps = sorted(
             item.name
             for item in parameters
-            if item.scope in {"per_dataset", "hierarchical"}
+            if item.scope in {"per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}
             and {
                 dataset_id
                 for dataset_id, _value in item.selected_config.dataset_values
@@ -1372,18 +1802,6 @@ class FitSetupSnapshot:
         object.__setattr__(self, "global_initials", global_initials)
         object.__setattr__(self, "initial_scopes", initial_scopes)
         object.__setattr__(self, "local_observables", local_observables)
-        local_scalar_names = {
-            scalar_name
-            for observable in local_observables
-            for scalar_name in observable.scalar_names
-        }
-        if any(
-            item.name in local_scalar_names and item.scope == "hierarchical"
-            for item in parameters
-        ):
-            raise ValueError(
-                "Fit-local observable scalars are not eligible for Hierarchical scope."
-            )
         classifications = build_fit_publication_classifications(
             parameters,
             local_observables,
@@ -1394,10 +1812,8 @@ class FitSetupSnapshot:
             parameters=parameters,
             profile_likelihood=self.profile_likelihood,
             residual_bootstrap=self.residual_bootstrap,
-            hierarchical=self.hierarchical,
             shared_refit_promotions=self.shared_refit_promotions,
         )
-        object.__setattr__(self, "hierarchical", tuple(self.hierarchical))
         object.__setattr__(
             self,
             "shared_refit_promotions",
@@ -1423,11 +1839,14 @@ class FitSetupSnapshot:
             global_initials=request.global_initials,
             initial_scopes=request.initial_scopes,
             defaults=request.defaults,
-            local_observables=request.local_observables,
+            local_observables=(
+                ()
+                if request.fit_local_admission is None
+                else request.fit_local_admission.observables
+            ),
             dataset_weight_mode=request.dataset_weight_mode,
             profile_likelihood=request.profile_likelihood,
             residual_bootstrap=request.residual_bootstrap,
-            hierarchical=request.hierarchical,
             shared_refit_promotions=request.shared_refit_promotions,
         )
 
@@ -1436,7 +1855,7 @@ class FitSetupSnapshot:
 class FitSelectedObservation:
     raw_observation_id: str
     raw_column: str
-    model_species: str
+    model_target: str
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
@@ -1506,48 +1925,67 @@ class FitParameterSetupEdit:
 
 
 @dataclass(frozen=True, slots=True)
-class FitParameterScopeSetupEdit:
-    """Atomic owner intent for a scalar scope change or Hierarchical edit."""
+class FitParameterVarySetupEdit:
+    """Typed intent for changing only one parameter's Vary state.
+
+    Unlike :class:`FitParameterSetupEdit`, this action carries no projected
+    numeric fields.  Roster and selected-editor controls therefore converge
+    on one canonical-identity action without allowing one row's editor to
+    author another row's values.
+    """
 
     origin_tab_id: str
     origin_capture_id: str
     parameter_name: str
-    scope: Literal["shared", "per_dataset", "hierarchical"]
-    hierarchical_config: HierarchicalFitConfig | None = None
+    desired_fit: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "origin_tab_id",
+            _required(self.origin_tab_id, "origin tab ID"),
+        )
+        object.__setattr__(
+            self,
+            "origin_capture_id",
+            _required(self.origin_capture_id, "origin capture ID"),
+        )
+        object.__setattr__(
+            self,
+            "parameter_name",
+            _required(self.parameter_name, "parameter name"),
+        )
+        if type(self.desired_fit) is not bool:
+            raise TypeError("desired Vary state must be a bool.")
+
+@dataclass(frozen=True, slots=True)
+class FitParameterScopeSetupEdit:
+    """Atomic owner intent for one scalar scope change."""
+
+    origin_tab_id: str
+    origin_capture_id: str
+    parameter_name: str
+    scope: Literal["shared", "per_dataset", "centred_fixed_effects"]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "origin_tab_id", _required(self.origin_tab_id, "origin tab ID"))
         object.__setattr__(self, "origin_capture_id", _required(self.origin_capture_id, "origin capture ID"))
         object.__setattr__(self, "parameter_name", _required(self.parameter_name, "parameter name"))
-        if self.scope not in {"shared", "per_dataset", "hierarchical"}:
+        if self.scope not in {"shared", "per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
             raise ValueError(
                 "Scalar scope transition must target Shared, Per-dataset, or "
-                "Hierarchical."
-            )
-        if self.scope == "hierarchical":
-            if not isinstance(self.hierarchical_config, HierarchicalFitConfig):
-                raise ValueError(
-                    "Hierarchical scope requires an explicit typed configuration."
-                )
-            if self.hierarchical_config.parameter_name != self.parameter_name:
-                raise ValueError(
-                    "Hierarchical scope configuration changed parameter identity."
-                )
-        elif self.hierarchical_config is not None:
-            raise ValueError(
-                "Non-Hierarchical scope cannot carry Hierarchical configuration."
+                "centred fixed effects."
             )
 
 
 @dataclass(frozen=True, slots=True)
 class FitAdvancedAnalysisSetupEdit:
-    """Atomic owner intent for uncertainty, hierarchy, and Shared refit."""
+    """Atomic owner intent for uncertainty and Shared refit."""
 
     origin_tab_id: str
     origin_capture_id: str
     profile_likelihood: ProfileLikelihoodConfig | None
     residual_bootstrap: ResidualBootstrapConfig | None
-    hierarchical: tuple[HierarchicalFitConfig, ...]
     shared_refit_promotions: tuple[SharedRefitPromotion, ...]
 
     def __post_init__(self) -> None:
@@ -1561,13 +1999,9 @@ class FitAdvancedAnalysisSetupEdit:
             self.residual_bootstrap, ResidualBootstrapConfig
         ):
             raise TypeError("Residual bootstrap configuration must be typed.")
-        hierarchy = tuple(self.hierarchical)
         promotions = tuple(self.shared_refit_promotions)
-        if any(not isinstance(item, HierarchicalFitConfig) for item in hierarchy):
-            raise TypeError("Hierarchical configuration must be typed.")
         if any(not isinstance(item, SharedRefitPromotion) for item in promotions):
             raise TypeError("Shared-refit promotions must be typed.")
-        object.__setattr__(self, "hierarchical", hierarchy)
         object.__setattr__(self, "shared_refit_promotions", promotions)
 
 
@@ -1651,16 +2085,6 @@ class FitDefaultsSetupEdit:
             raise TypeError("defaults edit must carry FitDefaults.")
 
 
-def _parameter_bounds(value: float) -> tuple[float, float]:
-    if value > 0.0:
-        low = max(value * 0.01, 1e-12)
-        high = value * 100.0
-        if high > low:
-            return low, high
-    span = max(1.0, abs(value) * 10.0)
-    return value - span, value + span
-
-
 def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, ...]:
     if not tab.mechanism_source.reactions_text.strip():
         return ()
@@ -1679,7 +2103,9 @@ def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, .
         low = float(coordinate.minimum)
         high = float(coordinate.maximum)
         if not math.isfinite(low) or not math.isfinite(high) or low >= high:
-            low, high = _parameter_bounds(value)
+            raise ValueError(
+                f"Accepted parameter {name!r} has invalid Fit bounds."
+            )
         variables.append(
             FitParameterVariable(
                 name=name,
@@ -1701,6 +2127,8 @@ def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, .
                 ),
                 family=str(coordinate.family),
                 role=str(coordinate.role),
+                scientific_category=coordinate.scientific_category,
+                allow_exact_zero=coordinate.allow_exact_zero,
                 unit=str(coordinate.unit),
             )
         )
@@ -1736,17 +2164,17 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
             maximum_observations_per_target=None,
             weight=1.0,
             target_species=tuple(
-                observation.model_species
+                observation.model_target
                 for observation in mapped.observations
             ),
             target_weights=tuple(
-                (observation.model_species, 1.0)
+                (observation.model_target, 1.0)
                 for observation in mapped.observations
             ),
             observation_targets=tuple(
                 (
                     observation.raw_observation_id,
-                    observation.model_species,
+                    observation.model_target,
                 )
                 for observation in mapped.observations
             ),
@@ -1843,7 +2271,7 @@ def fit_origin_science_matches(
             tuple(
                 (
                     observation.raw_observation_id,
-                    observation.model_species,
+                    observation.model_target,
                     observation.t,
                     observation.y,
                     observation.source_rows,
@@ -1896,6 +2324,7 @@ def capture_fit_origin(
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
         raise ValueError("Fit requires an accepted visible mechanism.")
     mechanism_species = canonical_species_names(tab)
+    observation_targets = canonical_observation_target_names(tab)
     selected_dataset_ids = (
         None
         if dataset_ids is None
@@ -1925,6 +2354,7 @@ def capture_fit_origin(
                 observation_mapping=link.observation_mapping,
                 initial_values=initial_set.values_dict(),
                 mechanism_species=mechanism_species,
+                observation_targets=observation_targets,
                 resolved_t_start=resolve_fit_t_start(
                     tab,
                     initial_set.set_id,
@@ -1947,7 +2377,7 @@ def capture_fit_origin(
             if validated is not None
             else link.observation_mapping
         )
-        for raw_observation_id, model_species in mapping:
+        for raw_observation_id, model_target in mapping:
             observation = by_raw_id.get(raw_observation_id)
             if observation is None:
                 raise ValueError(
@@ -1958,7 +2388,7 @@ def capture_fit_origin(
                 FitObservationSnapshot(
                     raw_observation_id=observation.raw_observation_id,
                     raw_column=observation.column_name,
-                    model_species=model_species,
+                    model_target=model_target,
                     t=observation.t,
                     y=observation.y,
                     source_rows=observation.source_rows,
@@ -2106,7 +2536,7 @@ def selected_observations(
             FitSelectedObservation(
                 raw_observation_id=observation.raw_observation_id,
                 raw_column=observation.raw_column,
-                model_species=target,
+                model_target=target,
                 t=tuple(float(observation.t[index]) for index in indices),
                 y=tuple(float(observation.y[index]) for index in indices),
                 source_rows=tuple(
@@ -2115,6 +2545,74 @@ def selected_observations(
             )
         )
     return tuple(selected)
+
+
+def fit_setup_readiness(
+    *,
+    origin: FitOriginSnapshot,
+    datasets: Iterable[FitDatasetLocalSettings],
+    parameters: Iterable[FitParameterVariable],
+    initials: Iterable[FitInitialVariable],
+    global_initials: Iterable[FitInitialGlobalVariable],
+    initial_scopes: Iterable[tuple[str, str]],
+) -> str | None:
+    """Return the shared cheap structural Run Fit readiness truth.
+
+    This deliberately admits no science and does not replace the request
+    builder's strict validation.  It only answers whether the captured setup
+    has every included dataset producing observations and at least one eligible
+    varying parameter or initial condition.
+    """
+
+    if not isinstance(origin, FitOriginSnapshot):
+        raise TypeError("Fit readiness requires FitOriginSnapshot.")
+    dataset_items = tuple(datasets)
+    parameter_items = tuple(parameters)
+    initial_items = tuple(initials)
+    global_initial_items = tuple(global_initials)
+    mapped_by_id = {item.dataset_id: item for item in origin.mapped_datasets}
+    included = tuple(item for item in dataset_items if item.included)
+    if not included:
+        return "Select at least one mapped dataset for fitting."
+    for local in included:
+        mapped = mapped_by_id.get(local.dataset_id)
+        if mapped is None:
+            return f"Included dataset {local.dataset_id!r} is not captured."
+        if not local.target_species:
+            return f"Dataset {mapped.display_name!r} must select at least one target."
+        try:
+            observations = selected_observations(mapped, local)
+        except (KeyError, TypeError, ValueError) as exc:
+            return str(exc)
+        if not observations:
+            return f"Dataset {mapped.display_name!r} has no selected observations."
+
+    scopes = dict(initial_scopes)
+    included_ids = {item.dataset_id for item in included}
+    has_fitted_initial = any(
+        item.fit
+        and scopes.get(item.species) == "local"
+        and any(
+            mapped.set_id == item.set_id and mapped.dataset_id in included_ids
+            for mapped in origin.mapped_datasets
+        )
+        for item in initial_items
+    ) or any(
+        item.fit
+        and scopes.get(item.species) == "global"
+        and any(
+            mapped.dataset_id in included_ids
+            and any(
+                species == item.species
+                for species, _value in mapped.initial_values
+            )
+            for mapped in origin.mapped_datasets
+        )
+        for item in global_initial_items
+    )
+    if not any(item.selected_config.fit for item in parameter_items) and not has_fitted_initial:
+        return "Select at least one parameter or initial concentration to fit."
+    return None
 
 
 def revalidate_fit_request_inclusions(
@@ -2129,12 +2627,18 @@ def revalidate_fit_request_inclusions(
     if not isinstance(request, FitExecutionRequest):
         raise TypeError("request must be FitExecutionRequest.")
     tab = document.tab(request.origin.tab_id)
-    species = canonical_species_names(tab)
+    mechanism_species = canonical_species_names(tab)
+    observation_targets = canonical_observation_target_names(tab)
     mapped_by_id = {
         item.dataset_id: item for item in request.origin.mapped_datasets
     }
     allowed_observable_names = {
-        item.name for item in request.local_observables
+        item.name
+        for item in (
+            ()
+            if request.fit_local_admission is None
+            else request.fit_local_admission.observables
+        )
     } | set(fit_observable_names(request.prepared_dsl))
     for local in request.datasets:
         if not local.included:
@@ -2153,7 +2657,8 @@ def revalidate_fit_request_inclusions(
             set_id=link.set_id,
             observation_mapping=link.observation_mapping,
             initial_values=initial_set.values_dict(),
-            mechanism_species=species,
+            mechanism_species=mechanism_species,
+            observation_targets=observation_targets,
             resolved_t_start=resolve_fit_t_start(
                 tab,
                 initial_set.set_id,
@@ -2200,6 +2705,488 @@ def revalidate_fit_request_inclusions(
                 )
 
 
+def rebind_fit_request(
+    *,
+    request: FitExecutionRequest,
+    origin: FitOriginSnapshot,
+    mechanism_source: MechanismAuthoringSource,
+    prepared_dsl: PreparedDslRequestSet,
+    document: ProjectDocument | None = None,
+    shared_refit_source_result: GlobalFitResult | None = None,
+) -> FitExecutionRequest:
+    """Re-admit one request against changed canonical science, losslessly.
+
+    This is the sole Fit re-entry boundary used after canonical source
+    replacement (for example detailed-balance correction) and by owner-side
+    retry routes.  Canonical rows are refreshed from the new prepared
+    namespace; the exact admitted Fit-local observable plan and its typed
+    scalar rows are retained call-locally.  The captured base prepared object
+    is never mutated or replaced in-place by this function.
+    """
+
+    if not isinstance(request, FitExecutionRequest):
+        raise TypeError("request must be FitExecutionRequest.")
+    if not isinstance(origin, FitOriginSnapshot):
+        raise TypeError("origin must be FitOriginSnapshot.")
+    if not isinstance(mechanism_source, MechanismAuthoringSource):
+        raise TypeError("mechanism_source must be MechanismAuthoringSource.")
+    if not isinstance(prepared_dsl, PreparedDslRequestSet):
+        raise TypeError("prepared_dsl must be PreparedDslRequestSet.")
+    if mechanism_source != origin.mechanism_source:
+        raise ValueError("Rebound request source must match its new Fit origin.")
+    if not source_matches_analysis(mechanism_source, prepared_dsl.analysis):
+        raise ValueError("Rebound prepared DSL does not match its source.")
+    if origin.prepared_dsl is not prepared_dsl:
+        raise ValueError("Rebound Fit origin must retain the prepared DSL instance.")
+    if (
+        request.origin.tab_id != origin.tab_id
+        or request.origin.mapped_datasets != origin.mapped_datasets
+        or request.origin.scientific_settings != origin.scientific_settings
+        or request.origin.fit_defaults != origin.fit_defaults
+    ):
+        raise ValueError("Rebound request changed captured Fit context beyond source science.")
+
+    admission = request.fit_local_admission
+    local_observables = () if admission is None else admission.observables
+    local_scalar_names = set(() if admission is None else admission.scalar_names)
+    if admission is not None:
+        # Re-admit exact source before replacing any canonical rows.  Collision
+        # and domain drift therefore fail closed at this request boundary.
+        admission = admission.reenter(prepared_dsl)
+
+    writable_coordinates = {
+        coordinate.name: coordinate
+        for coordinate in enumerate_parameter_coordinates(
+            prepared_dsl,
+            wegscheider_cyclicity_enabled=bool(
+                origin.scientific_settings.wegscheider_policy
+            ),
+        )
+    }
+    prior_parameters = {item.name: item for item in request.parameters}
+    canonical_parameters: list[FitParameterVariable] = []
+    canonical_names: set[str] = set()
+    dataset_ids = tuple(item.dataset_id for item in request.datasets)
+    for canonical_default in origin.parameter_defaults:
+        canonical_names.add(canonical_default.name)
+        coordinate = writable_coordinates.get(canonical_default.name)
+        if coordinate is None:
+            # A removed derived coordinate is harmless when it was fixed, but
+            # a selected optimizer coordinate would change the admitted model.
+            prior = prior_parameters.get(canonical_default.name)
+            if prior is not None and prior.selected_config.fit:
+                raise ValueError(
+                    f"Fitted coordinate {canonical_default.name!r} lost canonical write ownership."
+                )
+            continue
+        prior = prior_parameters.get(canonical_default.name)
+        if prior is None:
+            canonical_parameters.append(
+                _complete_fit_parameter_scopes(canonical_default, dataset_ids)
+            )
+            continue
+        if prior.selected_config.fit:
+            initial = prior.selected_config.value
+            dataset_values = tuple(prior.selected_config.dataset_values)
+        else:
+            initial = canonical_default.selected_config.value
+            dataset_values = tuple(
+                (dataset_id, canonical_default.selected_config.value)
+                for dataset_id in dataset_ids
+            )
+        if prior.selected_config.fit and (
+            coordinate.scientific_category != prior.scientific_category
+            or coordinate.allow_exact_zero != prior.allow_exact_zero
+            or not coordinate.writable
+            or coordinate.derived
+        ):
+            raise ValueError(
+                f"Fitted coordinate {canonical_default.name!r} changed scientific ownership."
+            )
+        refreshed = replace(
+            _replace_fit_parameter(
+                prior,
+                initial=initial,
+                dataset_values=dataset_values,
+                display_name=coordinate.display_name,
+                family=coordinate.family,
+                role=coordinate.role,
+                unit=coordinate.unit,
+            ),
+            scientific_category=coordinate.scientific_category,
+            allow_exact_zero=coordinate.allow_exact_zero,
+        )
+        canonical_parameters.append(refreshed)
+
+    # Fit-local rows are not part of canonical parameter defaults or coordinate
+    # enumeration.  Retain them exactly, including provenance, scope, bounds,
+    # selected value, and per-dataset values.
+    local_parameters = [
+        item for item in request.parameters if item.name in local_scalar_names
+    ]
+    if len({item.name for item in local_parameters}) != len(local_parameters):
+        raise ValueError("Rebound Fit-local scalar rows repeat an identity.")
+    if set(item.name for item in local_parameters) != local_scalar_names:
+        raise ValueError("Rebound Fit-local scalar plan lost one or more scalar rows.")
+    rebound_parameters = tuple((*canonical_parameters, *local_parameters))
+    rebound = build_fit_execution_request(
+        origin=origin,
+        mechanism_source=mechanism_source,
+        prepared_dsl=prepared_dsl,
+        solver=request.solver,
+        local_observables=local_observables,
+        fit_local_admission=admission,
+        datasets=request.datasets,
+        parameters=rebound_parameters,
+        initials=request.initials,
+        global_initials=request.global_initials,
+        initial_scopes=request.initial_scopes,
+        dataset_weight_mode=request.dataset_weight_mode,
+        defaults=request.defaults,
+        profile_likelihood=request.profile_likelihood,
+        residual_bootstrap=request.residual_bootstrap,
+        shared_refit_promotions=request.shared_refit_promotions,
+        shared_refit_source_result=shared_refit_source_result,
+    )
+    if document is not None:
+        revalidate_fit_request_inclusions(document=document, request=rebound)
+    return rebound
+
+
+def _compile_fit_dispatch(
+    request: FitExecutionRequest,
+    *,
+    shared_refit_source_result: GlobalFitResult | None,
+) -> _FitDispatchCompilation:
+    """Complete all static Fit facts before a worker can be constructed."""
+
+    mapped_by_id = {item.dataset_id: item for item in request.origin.mapped_datasets}
+    request_ids = tuple(item.dataset_id for item in request.datasets)
+    if len(request_ids) != len(set(request_ids)) or set(request_ids) != set(mapped_by_id):
+        raise ValueError("Fit dispatch dataset roster does not match its capture.")
+    included = tuple(item for item in request.datasets if item.included)
+    included_ids = tuple(item.dataset_id for item in included)
+    if not included_ids:
+        raise ValueError("Fit dispatch requires at least one included dataset.")
+
+    shared_variables: list[FitSharedVariableParamSpec] = []
+    centred_variables: list[FitCentredFixedEffectsParamSpec] = []
+    coupled_variables: list[FitCoupledVariableParamSpec] = []
+    variable_by_dataset: dict[str, list[FitDatasetVariableParamSpec]] = {
+        dataset_id: [] for dataset_id in included_ids
+    }
+    fixed_by_dataset: dict[str, dict[str, float]] = {
+        dataset_id: {} for dataset_id in included_ids
+    }
+    physical_policies: list[FitPhysicalCoordinatePolicy] = []
+    for parameter in request.parameters:
+        config = parameter.selected_config
+        dataset_values = dict(config.dataset_values)
+        target_ids = (None,) if parameter.scope == "shared" else included_ids
+        for dataset_id in target_ids:
+            physical_policies.append(
+                FitPhysicalCoordinatePolicy(
+                    parameter_name=parameter.name,
+                    dataset_id=dataset_id,
+                    scientific_category=parameter.scientific_category,
+                    allow_exact_zero=parameter.allow_exact_zero,
+                    minimum=config.minimum,
+                    maximum=config.maximum,
+                )
+            )
+        if config.fit and parameter.scope == "shared":
+            shared_variables.append(
+                FitSharedVariableParamSpec(
+                    name=parameter.name,
+                    initial=config.value,
+                    minimum=config.minimum,
+                    maximum=config.maximum,
+                    log10=config.log10,
+                )
+            )
+        elif config.fit and parameter.scope == FIT_SCOPE_CENTRED_FIXED_EFFECTS:
+            if parameter.fit_local_provenance is not None:
+                raise ValueError(
+                    "Fit-local observable scalars cannot use centred fixed effects."
+                )
+            centred_variables.append(
+                FitCentredFixedEffectsParamSpec(
+                    parameter_name=parameter.name,
+                    dataset_ids=tuple(included_ids),
+                    initial_values=tuple(
+                        (dataset_id, dataset_values[dataset_id])
+                        for dataset_id in included_ids
+                    ),
+                    minimum=config.minimum,
+                    maximum=config.maximum,
+                    log10=config.log10,
+                )
+            )
+        elif config.fit:
+            for dataset_id in included_ids:
+                if dataset_id not in dataset_values:
+                    raise ValueError(
+                        f"Fit dispatch parameter {parameter.name!r} omitted "
+                        f"included dataset {dataset_id!r}."
+                    )
+                variable_by_dataset[dataset_id].append(
+                    FitDatasetVariableParamSpec(
+                        name=parameter.name,
+                        initial=dataset_values[dataset_id],
+                        minimum=config.minimum,
+                        maximum=config.maximum,
+                        log10=config.log10,
+                    )
+                )
+        elif parameter.scope in {"per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
+            for dataset_id in included_ids:
+                if dataset_id not in dataset_values:
+                    raise ValueError(
+                        f"Fit dispatch fixed parameter {parameter.name!r} omitted "
+                        f"included dataset {dataset_id!r}."
+                    )
+                fixed_by_dataset[dataset_id][parameter.name] = dataset_values[dataset_id]
+        else:
+            for dataset_id in included_ids:
+                fixed_by_dataset[dataset_id][parameter.name] = config.value
+
+    datasets_for_set: dict[str, tuple[str, ...]] = {}
+    applicable_dataset_ids: dict[str, set[str]] = {}
+    for mapped in request.origin.mapped_datasets:
+        if mapped.dataset_id not in included_ids:
+            continue
+        datasets_for_set[mapped.set_id] = (
+            *datasets_for_set.get(mapped.set_id, ()),
+            mapped.dataset_id,
+        )
+        for species, _value in mapped.initial_values:
+            applicable_dataset_ids.setdefault(species, set()).add(mapped.dataset_id)
+    scopes = dict(request.initial_scopes)
+    for initial in request.global_initials:
+        if scopes.get(initial.species) != "global":
+            continue
+        applicable_ids = tuple(sorted(applicable_dataset_ids.get(initial.species, ())))
+        if initial.fit and applicable_ids:
+            coupled_variables.append(
+                FitCoupledVariableParamSpec(
+                    variable_id=f"initial:global:{initial.species}",
+                    parameter_name=f"init:{initial.species}",
+                    dataset_ids=applicable_ids,
+                    initial=initial.initial,
+                    minimum=initial.minimum,
+                    maximum=initial.maximum,
+                    log10=initial.log10,
+                )
+            )
+        else:
+            for dataset_id in applicable_ids:
+                fixed_by_dataset[dataset_id][f"init:{initial.species}"] = initial.initial
+    for initial in request.initials:
+        if scopes.get(initial.species) != "local":
+            continue
+        target_ids = datasets_for_set.get(initial.set_id, ())
+        if initial.fit and target_ids:
+            coupled_variables.append(
+                FitCoupledVariableParamSpec(
+                    variable_id=f"initial:{initial.set_id}:{initial.species}",
+                    parameter_name=f"init:{initial.species}",
+                    dataset_ids=target_ids,
+                    initial=initial.initial,
+                    minimum=initial.minimum,
+                    maximum=initial.maximum,
+                    log10=initial.log10,
+                )
+            )
+        else:
+            for dataset_id in target_ids:
+                fixed_by_dataset[dataset_id][f"init:{initial.species}"] = initial.initial
+
+    overrides = tuple(
+        FitDatasetParameterOverrides(
+            dataset_id=dataset_id,
+            fixed_params=tuple(sorted(fixed_by_dataset[dataset_id].items())),
+            variable_params=tuple(variable_by_dataset[dataset_id]),
+        )
+        for dataset_id in included_ids
+    )
+    promotion_admissions: list[SharedRefitPromotionAdmission] = []
+    shared_refit_execution: SharedRefitExecution | None = None
+    promotions = tuple(request.shared_refit_promotions)
+    if promotions:
+        if not isinstance(shared_refit_source_result, GlobalFitResult):
+            raise ValueError(
+                "Shared refit dispatch requires its canonical source result."
+            )
+        if set(shared_refit_source_result.dataset_params) != set(included_ids):
+            raise ValueError(
+                "Shared refit source result roster does not match included datasets."
+            )
+        promoted_names = {item.parameter_name for item in promotions}
+        for promotion in promotions:
+            try:
+                source_values = tuple(
+                    (
+                        dataset_id,
+                        shared_refit_source_result.dataset_params[dataset_id][
+                            promotion.parameter_name
+                        ],
+                    )
+                    for dataset_id in included_ids
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    "Previous Fit omitted Per-dataset estimate "
+                    f"{promotion.parameter_name!r}."
+                ) from exc
+            admission = SharedRefitPromotionAdmission(
+                promotion=promotion,
+                source_values=source_values,
+            )
+            promotion_admissions.append(admission)
+        overrides = tuple(
+            replace(
+                item,
+                variable_params=tuple(
+                    value for value in item.variable_params
+                    if value.name not in promoted_names
+                ),
+                fixed_params=tuple(
+                    value for value in item.fixed_params
+                    if value[0] not in promoted_names
+                ),
+            )
+            for item in overrides
+        )
+        coupled_variables = [
+            item for item in coupled_variables
+            if item.parameter_name not in promoted_names
+        ]
+        physical_policies = [
+            item for item in physical_policies
+            if item.parameter_name not in promoted_names
+        ]
+        parameter_by_name = {item.name: item for item in request.parameters}
+        for promotion in promotions:
+            parameter = parameter_by_name[promotion.parameter_name]
+            physical_policies.append(
+                FitPhysicalCoordinatePolicy(
+                    parameter_name=promotion.parameter_name,
+                    dataset_id=None,
+                    scientific_category=parameter.scientific_category,
+                    allow_exact_zero=parameter.allow_exact_zero,
+                    minimum=promotion.minimum,
+                    maximum=promotion.maximum,
+                )
+            )
+        shared_refit_execution = SharedRefitExecution(
+            dataset_ids=included_ids,
+            promotion_admissions=promotion_admissions,
+            existing_shared_variables=shared_variables,
+            dataset_overrides=overrides,
+            coupled_variables=coupled_variables,
+        )
+        shared_variables = list(shared_refit_execution.shared_variables)
+        overrides = shared_refit_execution.dataset_overrides
+        coupled_variables = list(shared_refit_execution.coupled_variables)
+        layout = shared_refit_execution.optimizer_layout
+    else:
+        layout = build_parameter_layout_for_dataset_ids(
+            dataset_ids=included_ids,
+            shared_params={item.name: item.initial for item in shared_variables},
+            dataset_overrides=overrides,
+            coupled_variables=tuple(coupled_variables),
+            centred_variables=tuple(centred_variables),
+            bounds={
+                item.name: (item.minimum, item.maximum)
+                for item in shared_variables
+            },
+            log10_params={item.name: item.log10 for item in shared_variables},
+        )
+    science = request.origin.scientific_settings
+    prepared_datasets: list[FitPreparedDatasetConfig] = []
+    for local in included:
+        selected = selected_observations(mapped_by_id[local.dataset_id], local)
+        retained_times = tuple(
+            sorted({float(value) for item in selected for value in item.t})
+        )
+        execution_t_start, execution_t_end = fit_execution_span(
+            local.t_start, local.data_range_max
+        )
+        grid_points = max(100, len(retained_times)) if local.parametric is not None else 100
+        policy = (
+            "parametric_regular_grid_union_retained_endpoints"
+            if local.parametric is not None
+            else "fit_internal_regular_grid_union_retained_endpoints"
+        )
+        identity = (
+            ("solver", request.solver),
+            ("t_start", execution_t_start),
+            ("t_end", execution_t_end),
+            ("regular_grid_count", grid_points),
+            ("retained_observation_times", retained_times),
+            ("union_endpoints", (execution_t_start, execution_t_end)),
+        )
+        try:
+            # Complete the regular-grid admission before Fit worker creation;
+            # exact retained observations are unioned later without a row cap.
+            build_time_grid(execution_t_start, execution_t_end, {"N": grid_points})
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Fit regular grid for dataset {local.dataset_id!r} "
+                "cannot be realized on this time span."
+            ) from exc
+        prepared_datasets.append(
+            FitPreparedDatasetConfig(
+                dataset_id=local.dataset_id,
+                retained_times=retained_times,
+                execution_t_start=execution_t_start,
+                execution_t_end=execution_t_end,
+                fit_sampling_policy=policy,
+                fit_sampling_identity=identity,
+                solver_config=build_solver_config(
+                    solver_input=request.solver,
+                    rtol=science.rtol,
+                    atol=science.atol,
+                    grid={"N": grid_points},
+                    use_analytic_jacobian=science.analytic_jacobian_policy,
+                    wegscheider_cyclicity_enabled=science.wegscheider_policy,
+                ),
+            )
+        )
+    return _FitDispatchCompilation(
+        included_dataset_ids=included_ids,
+        prepared_datasets=tuple(prepared_datasets),
+        ordinary_shared_variables=(
+            tuple(shared_variables) if shared_refit_execution is None else ()
+        ),
+        shared_refit_execution=shared_refit_execution,
+        ordinary_coupled_variables=(
+            tuple(coupled_variables) if shared_refit_execution is None else ()
+        ),
+        fixed_by_dataset=tuple(
+            (item.dataset_id, item.fixed_params)
+            for item in overrides
+        ),
+        ordinary_dataset_overrides=(
+            overrides if shared_refit_execution is None else ()
+        ),
+        ordinary_centred_variables=(
+            tuple(centred_variables) if shared_refit_execution is None else ()
+        ),
+        candidate_names=tuple(
+            sorted(
+                parameter.name
+                for parameter in request.parameters
+                if not parameter.name.startswith(INITIAL_PREFIX)
+            )
+        ),
+        physical_coordinate_policies=tuple(physical_policies),
+        ordinary_optimizer_layout=(
+            layout if shared_refit_execution is None else None
+        ),
+    )
+
+
 def build_fit_execution_request(
     *,
     origin: FitOriginSnapshot,
@@ -2207,6 +3194,7 @@ def build_fit_execution_request(
     prepared_dsl: PreparedDslRequestSet,
     solver: FitSolver = "BDF",
     local_observables: Iterable[FitLocalObservable],
+    fit_local_admission: AdmittedAlgebraProgram | None = None,
     datasets: Iterable[FitDatasetLocalSettings],
     parameters: Iterable[FitParameterVariable],
     initials: Iterable[FitInitialVariable],
@@ -2216,27 +3204,54 @@ def build_fit_execution_request(
     defaults: FitDefaults | None = None,
     profile_likelihood: ProfileLikelihoodConfig | None = None,
     residual_bootstrap: ResidualBootstrapConfig | None = None,
-    hierarchical: Iterable[HierarchicalFitConfig] = (),
     shared_refit_promotions: Iterable[SharedRefitPromotion] = (),
+    shared_refit_source_result: GlobalFitResult | None = None,
 ) -> FitExecutionRequest:
     """Validate a complete owner-built Fit request at the execution boundary."""
+    observable_items = tuple(local_observables)
+    dataset_items = tuple(datasets)
+    parameter_items = tuple(parameters)
+    initial_items = tuple(initials)
+    global_initial_items = tuple(global_initials)
+    initial_scope_items = tuple(initial_scopes)
+    readiness = fit_setup_readiness(
+        origin=origin,
+        datasets=dataset_items,
+        parameters=parameter_items,
+        initials=initial_items,
+        global_initials=global_initial_items,
+        initial_scopes=initial_scope_items,
+    )
+    if readiness is not None:
+        raise ValueError(readiness)
+    admission = fit_local_admission
+    if admission is None:
+        admission = build_fit_local_admission(
+            prepared_dsl,
+            observable_items,
+            parameter_items,
+        )
+    elif not isinstance(admission, AdmittedAlgebraProgram):
+        raise TypeError("fit_local_admission must be AdmittedAlgebraProgram or None.")
+    if admission is not None and tuple(admission.observables) != observable_items:
+        raise ValueError("Fit-local admission declarations do not match request.")
     request = FitExecutionRequest(
         origin=origin,
         mechanism_source=mechanism_source,
         prepared_dsl=prepared_dsl,
         solver=solver,
-        local_observables=tuple(local_observables),
-        datasets=tuple(datasets),
-        parameters=tuple(parameters),
-        initials=tuple(initials),
-        global_initials=tuple(global_initials),
-        initial_scopes=tuple(initial_scopes),
+        fit_local_admission=admission,
+        datasets=dataset_items,
+        parameters=parameter_items,
+        initials=initial_items,
+        global_initials=global_initial_items,
+        initial_scopes=initial_scope_items,
         defaults=defaults or origin.fit_defaults,
         dataset_weight_mode=dataset_weight_mode,
         profile_likelihood=profile_likelihood,
         residual_bootstrap=residual_bootstrap,
-        hierarchical=tuple(hierarchical),
         shared_refit_promotions=tuple(shared_refit_promotions),
+        shared_refit_source_result=shared_refit_source_result,
     )
     mapped_by_id = {item.dataset_id: item for item in origin.mapped_datasets}
     requested_ids = [item.dataset_id for item in request.datasets]
@@ -2250,15 +3265,16 @@ def build_fit_execution_request(
         for item in request.datasets
         if item.included
     }
-    if not included:
-        raise ValueError("Select at least one mapped dataset for fitting.")
     retained_dataset_ids = set(mapped_by_id)
     parameter_names = [item.name for item in request.parameters]
     expected_names = [item.name for item in origin.parameter_defaults]
     local_scalar_names = {
         scalar_name
-        for observable in request.local_observables
-        for scalar_name in observable.scalar_names
+        for scalar_name in (
+            ()
+            if request.fit_local_admission is None
+            else request.fit_local_admission.scalar_names
+        )
     }
     if (
         len(parameter_names) != len(set(parameter_names))
@@ -2267,11 +3283,34 @@ def build_fit_execution_request(
         raise ValueError(
             "Fit request must contain each captured and Fit-local scalar exactly once."
         )
+    captured_by_name = {
+        item.name: item for item in request.origin.parameter_defaults
+    }
     for parameter in request.parameters:
+        captured = captured_by_name.get(parameter.name)
+        if captured is not None and (
+            parameter.family != captured.family
+            or parameter.role != captured.role
+            or parameter.scientific_category != captured.scientific_category
+            or parameter.allow_exact_zero != captured.allow_exact_zero
+        ):
+            raise ValueError(
+                f"Parameter {parameter.name!r} changed its accepted scientific "
+                "authority."
+            )
+        if captured is None and (
+            parameter.name not in local_scalar_names
+            or parameter.fit_local_provenance is None
+            or parameter.scientific_category != "finite_scalar"
+            or not parameter.allow_exact_zero
+        ):
+            raise ValueError(
+                f"Fit-local scalar {parameter.name!r} lost finite-scalar authority."
+            )
         local_ids = {
         dataset_id for dataset_id, _value in parameter.selected_config.dataset_values
         }
-        if parameter.scope in {"per_dataset", "hierarchical"} and local_ids != retained_dataset_ids:
+        if parameter.scope in {"per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS} and local_ids != retained_dataset_ids:
             raise ValueError(
                 f"Parameter {parameter.name!r} requires one retained value "
                 "for every captured dataset."
@@ -2318,50 +3357,10 @@ def build_fit_execution_request(
                 continue
             global_by_species[species]  # accessed to enforce identity above
     for local in request.datasets:
-        if local.included:
-            if not local.target_species:
-                raise ValueError(
-                    f"Dataset {mapped_by_id[local.dataset_id].display_name!r} "
-                    "must select at least one target or be excluded."
-                )
-            observations = selected_observations(
-                mapped_by_id[local.dataset_id],
-                local,
+        if local.included and local.data_range_max <= local.t_start:
+            raise ValueError(
+                f"Dataset {mapped_by_id[local.dataset_id].display_name!r} "
+                "Fit interval requires Data Range maximum to be greater "
+                "than Simulation start."
             )
-            if not observations:
-                raise ValueError(
-                    f"Dataset {mapped_by_id[local.dataset_id].display_name!r} "
-                    "has no selected observations."
-                )
-            if local.data_range_max <= local.t_start:
-                raise ValueError(
-                    f"Dataset {mapped_by_id[local.dataset_id].display_name!r} "
-                    "Fit interval requires Data Range maximum to be greater "
-                    "than Simulation start."
-                )
-    has_fitted_initial = any(
-        item.fit
-        and scopes.get(item.species) == "local"
-        and any(
-            mapped.set_id == item.set_id and mapped.dataset_id in included
-            for mapped in origin.mapped_datasets
-        )
-        for item in request.initials
-    ) or any(
-        item.fit
-        and scopes.get(item.species) == "global"
-        and any(
-            mapped.dataset_id in included
-            and any(
-                species == item.species
-                for species, _value in mapped.initial_values
-            )
-            for mapped in origin.mapped_datasets
-        )
-        for item in request.global_initials
-    )
-    if not any(item.selected_config.fit for item in request.parameters) and not has_fitted_initial:
-        raise ValueError(
-            "Select at least one parameter or initial concentration to fit."
-        )
     return request

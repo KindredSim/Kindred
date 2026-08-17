@@ -24,6 +24,7 @@ from kindred.core.mechanism_metadata import (
 )
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
+    admit_explicit_directional_rate_pair,
     equilibrium_rate_symbolic_relations,
     effective_reverse_rate_from_keq,
     normalize_existing_equilibrium_rate_authority,
@@ -255,7 +256,6 @@ class _EquilibriumRateSource:
     kf_name: str | None
     kr_name: str | None
     keq_name: str | None
-    reverse_std_ratio: float = 1.0
 
 
 def _canonical_step_parameter_name(
@@ -389,16 +389,6 @@ def _equilibrium_rate_source(
         keq = None
     elif authority.kind == EquilibriumRateAuthorityKind.KEQ:
         keq = authority.Keq
-    try:
-        reverse_std_ratio = float(authority.reverse_std_ratio)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise UnsupportedSymbolicExpressionError(
-            "equilibrium reverse standard ratio must be positive and finite."
-        ) from exc
-    if not math.isfinite(reverse_std_ratio) or reverse_std_ratio <= 0.0:
-        raise UnsupportedSymbolicExpressionError(
-            "equilibrium reverse standard ratio must be positive and finite."
-        )
     return _EquilibriumRateSource(
         kf=kf,
         kr=kr,
@@ -406,7 +396,6 @@ def _equilibrium_rate_source(
         kf_name=kf_name,
         kr_name=kr_name,
         keq_name=keq_name,
-        reverse_std_ratio=reverse_std_ratio,
     )
 
 
@@ -431,13 +420,6 @@ def _symbolic_snapshot_scalar_value(value: object) -> float | None:
     return float(scalar)
 
 
-def _positive_reverse_std_ratio(value: object) -> float:
-    ratio = _finite_scalar(value, label="equilibrium reverse standard ratio")
-    if ratio <= 0.0:
-        raise UnsupportedSymbolicExpressionError("equilibrium reverse standard ratio must be positive.")
-    return float(ratio)
-
-
 def _validate_equilibrium_parameter_values(
     source: _EquilibriumRateSource,
 ) -> None:
@@ -445,11 +427,10 @@ def _validate_equilibrium_parameter_values(
     kr_label = source.kr_name or "equilibrium kr"
     keq_label = source.keq_name or "equilibrium Keq"
     kf_value = _finite_scalar(source.kf, label=f"symbolic parameter {kf_label}")
-    if kf_value <= 0.0:
+    if kf_value < 0.0:
         raise UnsupportedSymbolicExpressionError(
-            "equilibrium kf must be positive."
+            "equilibrium kf must be finite and nonnegative."
         )
-    reverse_std_ratio = _positive_reverse_std_ratio(source.reverse_std_ratio)
     kr_value = _symbolic_snapshot_scalar_value(source.kr) if source.kr is not None else None
     keq_value = _symbolic_snapshot_scalar_value(source.keq) if source.keq is not None else None
 
@@ -464,7 +445,6 @@ def _validate_equilibrium_parameter_values(
             effective_reverse_rate_from_keq(
                 kf_value,
                 keq_value,
-                reverse_std_ratio,
             )
         )
         return
@@ -477,13 +457,13 @@ def _validate_equilibrium_parameter_values(
         raise UnsupportedSymbolicExpressionError(
             "Symbolic Jacobian requires finite equilibrium kf plus finite kr or Keq."
         )
-    if kr_value <= 0.0:
+    try:
+        admit_explicit_directional_rate_pair(kf_value, kr_value)
+    except ValueError as exc:
         raise UnsupportedSymbolicExpressionError(
-            "equilibrium kr must be positive."
-        )
-    # Explicit kf+kr support needs only the two authored finite coefficients.
-    # Do not reject a valid positive kr because a derived display-only Keq
-    # would be outside binary64 range.
+            "explicit equilibrium kf and kr must each be an admitted "
+            "strictly positive rate."
+        ) from exc
 
 
 def _authored_equilibrium_forward_rate_family(

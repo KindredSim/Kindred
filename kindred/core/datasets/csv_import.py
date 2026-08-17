@@ -19,6 +19,7 @@ from kindred.core.datasets.source_rules import (
     validate_tabular_source_bytes,
     identify_physical_columns,
 )
+from kindred.core.species import validate_imported_time_seconds, validate_observation
 
 __all__ = [
     "CsvImportInterrupted",
@@ -270,11 +271,16 @@ def parse_physical_rows(
                 f"{resolved_time.assigned_name!r}: invalid numeric value "
                 f"{raw_time!r}."
             ) from exc
-        if not math.isfinite(parsed_time):
-            raise ValueError(
-                f"{_source_prefix()}row {row_index}, time column "
-                f"{resolved_time.assigned_name!r}: value must be finite."
+        try:
+            parsed_time = validate_imported_time_seconds(
+                parsed_time,
+                field=(
+                    f"{_source_prefix()}row {row_index}, time column "
+                    f"{resolved_time.assigned_name!r}"
+                ),
             )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
 
         for column in resolved_species:
             _raise_if_interrupted()
@@ -292,11 +298,16 @@ def parse_physical_rows(
                     f"{column.assigned_name!r}: invalid numeric observation "
                     f"{raw_value!r}."
                 ) from exc
-            if not math.isfinite(parsed_value):
-                raise ValueError(
-                    f"{_source_prefix()}row {row_index}, column "
-                    f"{column.assigned_name!r}: observation must be finite."
+            try:
+                parsed_value = validate_observation(
+                    parsed_value,
+                    field=(
+                        f"{_source_prefix()}row {row_index}, column "
+                        f"{column.assigned_name!r} observation"
+                    ),
                 )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from exc
             spec = observations_by_column[column]
             spec["t"].append(parsed_time)
             spec["y"].append(parsed_value)

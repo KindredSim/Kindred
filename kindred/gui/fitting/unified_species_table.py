@@ -521,7 +521,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         observation: FitObservationSnapshot,
     ) -> str:
         mapping = dict(dataset.observation_targets)
-        return str(mapping.get(observation.raw_observation_id, observation.model_species))
+        return str(mapping.get(observation.raw_observation_id, observation.model_target))
 
     def _row_species(self, dataset: FitDatasetLocalSettings) -> list[str]:
         mapped = self._mapped_dataset(dataset.dataset_id)
@@ -684,11 +684,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     )
                 )
             )
+            weight_eligible = has_data and (species != x_name or x_name is not None)
             weight_item = QtWidgets.QTableWidgetItem(
-                weight_text if eligible else ""
+                weight_text if weight_eligible else ""
             )
             weight_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._set_editable(weight_item, eligible)
+            self._set_editable(weight_item, weight_eligible)
             weight_item.setData(_DATASET_ROLE, dataset.dataset_id)
             weight_item.setData(
                 _RAW_ID_ROLE,
@@ -825,11 +826,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             if not math.isfinite(initial) or initial < 0.0:
                 raise ValueError
         except (TypeError, ValueError, OverflowError):
-            # The ordinary initial-value editor owns its own error.  Keep the
-            # mode selection visible and let the row validator explain the
-            # incomplete Starting IC when it runs.
-            self._stage_initial_row_at(row)
-            return
+            # A mode transition still authors a fresh range when Starting IC
+            # is incomplete.  The row validator retains the invalid Starting
+            # IC and Run remains blocked until the user repairs it.
+            initial = None
 
         if mode in {"symmetric_percent", "asymmetric_percent"} and initial == 0.0:
             # A percentage range around zero is undefined.  Reject the
@@ -868,7 +868,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             lower, upper, disable_log = "5", "5", False
         else:
             lower = "0"
-            upper = self._float_text(10.0 * initial) if initial > 0.0 else ""
+            upper = (
+                self._float_text(10.0 * initial)
+                if initial is not None and initial > 0.0
+                else ""
+            )
             disable_log = True
 
         # Signals from the two cleared cells must not create half-written
@@ -927,7 +931,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self,
         dataset: FitDatasetLocalSettings,
     ) -> None:
-        """Drop target drafts that are invalid for this dataset's current X."""
+        """Drop Y-selection drafts that are invalid for this dataset's current X."""
 
         parametric = dataset.parametric
         if parametric is None:
@@ -941,8 +945,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 self._pending_target_selections.pop(dataset_id, None)
             else:
                 self._pending_target_selections[dataset_id] = filtered
-        self._pending_target_weights.pop((dataset_id, x_name), None)
-        self._invalid_raw.pop(("target_weight", dataset_id, x_name), None)
 
     # ------------------------------------------------------------------
     # Presentation edits
@@ -1199,8 +1201,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._pending_target_selections[dataset_id] = selected
         # A weight has meaning only for a selected target.  Drop drafts for
         # rows just deselected so this surface never retains dormant weights.
+        x_name = (
+            projected.parametric.x_name
+            if projected.parametric is not None
+            else None
+        )
         for key in tuple(self._pending_target_weights):
-            if key[0] == dataset_id and key[1] not in selected:
+            if key[0] == dataset_id and key[1] not in selected and key[1] != x_name:
                 self._pending_target_weights.pop(key, None)
         self._refresh_footer_dirty()
         self._refresh_footer_validity()
@@ -1279,14 +1286,24 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             for target in self._selected_targets(current)
             if target != x_name
         )
+        weight_targets = (
+            (*selected, x_name)
+            if x_name is not None
+            else selected
+        )
         invalid_selected = [
             target
-            for target in selected
+            for target in weight_targets
             if ("target_weight", dataset_id, target) in self._invalid_raw
         ]
         if invalid_selected or ("dataset_weight", dataset_id) in self._invalid_raw:
             return None
         current_weights = dict(current.target_weights)
+        weight_roster = (
+            (*selected, current.parametric.x_name)
+            if current.parametric is not None
+            else selected
+        )
         target_weights = tuple(
             (
                 target,
@@ -1295,7 +1312,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     current_weights.get(target, 1.0),
                 ),
             )
-            for target in selected
+            for target in weight_roster
         )
         try:
             return replace(

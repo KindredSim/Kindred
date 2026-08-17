@@ -15,6 +15,7 @@ from kindred.core.datasets.foundation import (
     freeze_json_value,
     validate_raw_observation_id,
 )
+from kindred.core.species import validate_imported_time_seconds, validate_observation
 
 @dataclass(frozen=True, slots=True)
 class DatasetObservationPayload:
@@ -69,12 +70,23 @@ def _as_finite_float_tuple(
             raise ValueError(f"{label} must be a one-dimensional sequence.")
         source = tuple(values)
     converted: list[float] = []
-    for value in source:
+    for index, value in enumerate(source):
         if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
             raise ValueError(f"{label} must contain only finite numeric values.")
         parsed = float(value)
-        if not math.isfinite(parsed):
-            raise ValueError(f"{label} must contain only finite numeric values.")
+        if label.endswith(" times"):
+            try:
+                parsed = validate_imported_time_seconds(
+                    parsed,
+                    field=f"{label}[{index}]",
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from exc
+        else:
+            try:
+                parsed = validate_observation(parsed, field=f"{label}[{index}]")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from exc
         converted.append(parsed)
     return tuple(converted)
 

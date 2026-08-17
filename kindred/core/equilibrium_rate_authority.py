@@ -7,26 +7,95 @@ from typing import Any, Callable, Iterable, Mapping
 
 from kindred.core.constants import R
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
-from kindred.core.thermodynamics import K_from_deltaG_eq
+from kindred.core.species import validate_c0, validate_temperature
+from kindred.core.thermodynamics import (
+    concentration_Keq_from_deltaG_eq,
+)
+from kindred.core.units import (
+    admit_keq,
+    admit_rate,
+    equilibrium_constant_unit,
+    rate_constant_unit,
+)
 from kindred.core.simulator.errors import DSLError
 
 AUTHORITY_ERROR = "equilibrium requires kf and exactly one of kr or Keq/dG_eq"
 
 
-def _positive_finite(value: object, *, label: str) -> float:
+@dataclass(frozen=True, slots=True)
+class EquilibriumRateContract:
+    """Published concentration-form values and directional units."""
+
+    kf: float | None
+    kr: float | None
+    Keq: float | None
+    delta_n: float
+    kf_unit: str
+    kr_unit: str
+    Keq_unit: str
+
+
+def equilibrium_delta_n(equilibrium: object) -> float:
+    forward = math.fsum(
+        float(value)
+        for value in dict(getattr(equilibrium, "stoich_forward", {}) or {}).values()
+    )
+    reverse = math.fsum(
+        float(value)
+        for value in dict(getattr(equilibrium, "stoich_back", {}) or {}).values()
+    )
+    delta_n = float(reverse - forward)
+    if not math.isfinite(delta_n):
+        raise ValueError("equilibrium delta_n must be finite")
+    return delta_n
+
+
+def equilibrium_rate_contract(
+    equilibrium: object,
+    *,
+    temperature_K: float = 298.15,
+) -> EquilibriumRateContract:
+    """Return one public ``Keq``/directional-rate DTO for an accepted step."""
+    delta_n = equilibrium_delta_n(equilibrium)
+    forward_order = math.fsum(
+        float(value)
+        for value in dict(getattr(equilibrium, "stoich_forward", {}) or {}).values()
+    )
+    reverse_order = math.fsum(
+        float(value)
+        for value in dict(getattr(equilibrium, "stoich_back", {}) or {}).values()
+    )
+    kf = effective_equilibrium_forward_rate(equilibrium, temperature_K=temperature_K)
+    kr = effective_equilibrium_reverse_rate(equilibrium, temperature_K=temperature_K)
+    keq = effective_equilibrium_keq(equilibrium, temperature_K=temperature_K)
+    return EquilibriumRateContract(
+        kf=kf,
+        kr=kr,
+        Keq=keq,
+        delta_n=delta_n,
+        kf_unit=rate_constant_unit(forward_order),
+        kr_unit=rate_constant_unit(reverse_order),
+        Keq_unit=equilibrium_constant_unit(delta_n),
+    )
+
+
+def _positive_finite(value: object, *, label: str, allow_zero: bool = False) -> float:
     if type(value) is bool:
         raise DSLError(f"{label} must be positive and finite")
     try:
         number = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError) as exc:
         raise DSLError(f"{label} must be positive and finite") from exc
-    if not number > 0.0 or not math.isfinite(number):
-        raise DSLError(f"{label} must be positive and finite")
-    return number
+    try:
+        return admit_rate(number, field=label, allow_zero=allow_zero)
+    except ValueError as exc:
+        raise DSLError(str(exc)) from exc
 
 
 def choose_fast_equilibrium_rate(
     explicit_rates: Iterable[float] | None = None,
+    *,
+    allow_zero: bool = False,
 ) -> float:
     """Return the authored forward coefficient without inventing rate meaning.
 
@@ -38,7 +107,45 @@ def choose_fast_equilibrium_rate(
     rates = tuple(explicit_rates or ())
     if not rates:
         raise DSLError("equilibrium requires an explicit positive finite kf")
-    return _positive_finite(rates[0], label="kf")
+    return _positive_finite(rates[0], label="kf", allow_zero=allow_zero)
+
+
+def admit_explicit_directional_rate_pair(
+    kf: object,
+    kr: object,
+) -> tuple[float, float]:
+    """Admit the two independent coefficients of an authored reversible pair."""
+
+    try:
+        forward = admit_rate(kf, field="kf")
+        reverse = admit_rate(kr, field="kr")
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    return float(forward), float(reverse)
+
+
+def derived_equilibrium_ratio_from_directional_rates(
+    kf: object,
+    kr: object,
+) -> float:
+    """Return the finite positive readout derived from an admitted ``kf+kr`` pair.
+
+    This ratio is not authored concentration-form ``Keq`` authority.  In
+    particular, it is not constrained by the authored-``Keq`` envelope.
+    """
+
+    forward, reverse = admit_explicit_directional_rate_pair(kf, kr)
+    try:
+        ratio = forward / reverse
+    except (OverflowError, ZeroDivisionError) as exc:
+        raise ValueError(
+            "explicit kf+kr must derive a finite positive equilibrium ratio"
+        ) from exc
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        raise ValueError(
+            "explicit kf+kr must derive a finite positive equilibrium ratio"
+        )
+    return float(ratio)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +162,8 @@ def derive_fast_equilibrium_rates(
     dG_eq_J_per_mol: float | None = None,
     temperature_K: float = 298.15,
     explicit_rates: Iterable[float] | None = None,
+    standard_conc_M: float = 1.0,
+    delta_n: float = 0.0,
 ) -> FastEquilibriumRates:
     """Derive one fast-equilibrium rate pair."""
 
@@ -70,15 +179,23 @@ def derive_fast_equilibrium_rates(
             raise DSLError("dG_eq_J_per_mol must be finite") from exc
         if not math.isfinite(delta_g):
             raise DSLError("dG_eq_J_per_mol must be finite")
-        equilibrium_constant = K_from_deltaG_eq(
+        equilibrium_constant = concentration_Keq_from_deltaG_eq(
             delta_g,
-            _positive_finite(temperature_K, label="temperature_K"),
+            validate_temperature(temperature_K, field="temperature_K"),
+            standard_conc_M,
+            delta_n,
         )
         source = "derived(ΔG°)"
     else:
-        equilibrium_constant = _positive_finite(Keq, label="Keq")
+        try:
+            equilibrium_constant = admit_keq(Keq, field="Keq")
+        except ValueError as exc:
+            raise DSLError(str(exc)) from exc
         source = "derived(Keq)"
-    forward = choose_fast_equilibrium_rate(explicit_rates)
+    forward = choose_fast_equilibrium_rate(
+        explicit_rates,
+        allow_zero=bool(Keq is not None or dG_eq_J_per_mol is not None),
+    )
     reverse = float(
         effective_reverse_rate_from_keq(
             forward,
@@ -112,15 +229,10 @@ class EquilibriumRateAuthority:
     derived_role: str
     source: str = ""
     dG_eq_J_per_mol: object | None = None
-    reverse_std_ratio: object = 1.0
     has_explicit_keq_param: bool = False
     has_thermo_param: bool = False
     kf_editable: bool = True
     kr_editable: bool = True
-
-    @property
-    def consumes_keq(self) -> bool:
-        return self.kind == EquilibriumRateAuthorityKind.KEQ
 
     def effective_reverse_rate(self, Keq: object | None = None, kf: object | None = None) -> object:
         if self.kind == EquilibriumRateAuthorityKind.KR:
@@ -130,7 +242,7 @@ class EquilibriumRateAuthority:
         keq_value = self.Keq if Keq is None else Keq
         if keq_value is None:
             raise ValueError(AUTHORITY_ERROR)
-        return effective_reverse_rate_from_keq(self.kf if kf is None else kf, keq_value, self.reverse_std_ratio)
+        return effective_reverse_rate_from_keq(self.kf if kf is None else kf, keq_value)
 
     def authored_role_is_editable(self, role: str) -> bool:
         role = str(role)
@@ -158,7 +270,6 @@ class EquilibriumRateAuthority:
                 "kind": self.kind,
                 "source": self.source,
                 "derived_role": self.derived_role,
-                "reverse_std_ratio": self.reverse_std_ratio,
                 "has_explicit_keq_param": bool(self.has_explicit_keq_param),
                 "has_thermo_param": bool(self.has_thermo_param),
                 "editable": {
@@ -181,7 +292,6 @@ class EquilibriumRateAuthority:
             ("kind", self.kind),
             ("source", self.source),
             ("kf", self.kf),
-            ("reverse_std_ratio", self.reverse_std_ratio if self.consumes_keq else None),
         ]
         if self.kind == EquilibriumRateAuthorityKind.KR:
             items.append(("kr", self.kr))
@@ -251,6 +361,31 @@ def equilibrium_rate_symbolic_relations(
             Keq=forward_relation / reverse_relation,  # type: ignore[operator]
         )
 
+    try:
+        standard = validate_c0(
+            standard_conc_M,
+            field="equilibrium standard_conc_M",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "equilibrium standard_conc_M must be strictly positive and admitted"
+        ) from exc
+    forward_order = math.fsum(
+        float(value)
+        for value in dict(
+            getattr(equilibrium, "stoich_forward", {}) or {}
+        ).values()
+    )
+    reverse_order = math.fsum(
+        float(value)
+        for value in dict(
+            getattr(equilibrium, "stoich_back", {}) or {}
+        ).values()
+    )
+    delta_n = float(reverse_order - forward_order)
+    if not math.isfinite(delta_n):
+        raise ValueError("equilibrium standard-state exponent must be finite.")
+
     if authority.has_explicit_keq_param:
         keq_relation = literal(
             finite_scalar(
@@ -269,6 +404,8 @@ def equilibrium_rate_symbolic_relations(
             -literal(delta_g)
             / (literal(float(R)) * temperature)  # type: ignore[operator]
         )
+        if delta_n != 0.0:
+            keq_relation *= literal(standard) ** literal(delta_n)  # type: ignore[operator]
     else:
         keq_relation = literal(
             finite_scalar(
@@ -278,33 +415,7 @@ def equilibrium_rate_symbolic_relations(
             )
         )
 
-    standard = finite_scalar(
-        standard_conc_M,
-        label="equilibrium standard_conc_M",
-        positive=True,
-    )
-    forward_order = math.fsum(
-        float(value)
-        for value in dict(
-            getattr(equilibrium, "stoich_forward", {}) or {}
-        ).values()
-    )
-    reverse_order = math.fsum(
-        float(value)
-        for value in dict(
-            getattr(equilibrium, "stoich_back", {}) or {}
-        ).values()
-    )
-    standard_exponent = float(forward_order - reverse_order)
-    if not math.isfinite(standard_exponent):
-        raise ValueError(
-            "equilibrium standard-state exponent must be finite."
-        )
     reverse_relation = forward_relation / keq_relation  # type: ignore[operator]
-    if standard_exponent != 0.0:
-        reverse_relation *= literal(standard) ** literal(  # type: ignore[operator]
-            standard_exponent
-        )
     return EquilibriumRateSymbolicRelations(
         kf=forward_relation,
         kr=reverse_relation,
@@ -312,7 +423,7 @@ def equilibrium_rate_symbolic_relations(
     )
 
 
-def effective_reverse_rate_from_keq(kf: object, Keq: object, reverse_std_ratio: object = 1.0) -> object:
+def effective_reverse_rate_from_keq(kf: object, Keq: object) -> object:
     """Return the missing reverse coefficient from thermodynamic authority.
 
     Concrete coefficient inputs are required to be positive finite reals. The
@@ -329,32 +440,55 @@ def effective_reverse_rate_from_keq(kf: object, Keq: object, reverse_std_ratio: 
             number = float(value)
         except (TypeError, ValueError, OverflowError):
             return None
-        if not math.isfinite(number) or number <= 0.0:
-            raise ValueError(f"{label} must be a positive finite real")
+        if not math.isfinite(number) or number < 0.0:
+            raise ValueError(f"{label} must be a finite real")
+        if label == "Keq" and number == 0.0:
+            raise ValueError(f"{label} must be positive and finite")
+        if label == "kf":
+            try:
+                admit_rate(number, field=label, allow_zero=True)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+        elif label == "Keq":
+            try:
+                admit_keq(number, field=label)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+        elif number == 0.0:
+            raise ValueError(f"{label} must be positive and finite")
+        else:
+            try:
+                admit_rate(number, field=label)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
         return float(number)
 
     kf_value = concrete(kf, label="kf")
     keq_value = concrete(Keq, label="Keq")
-    standard_ratio = concrete(reverse_std_ratio, label="reverse_std_ratio")
-    if kf_value is None or keq_value is None or standard_ratio is None:
-        return kf / (Keq * reverse_std_ratio)  # type: ignore[operator]
+    if kf_value is None or keq_value is None:
+        return kf / Keq  # type: ignore[operator]
+    if kf_value == 0.0:
+        return 0.0
     try:
-        # Combine binary exponents separately so a representable reverse rate
-        # is not lost to overflow/underflow in the intermediate Keq*C0 term.
         kf_mantissa, kf_exponent = math.frexp(kf_value)
         keq_mantissa, keq_exponent = math.frexp(keq_value)
-        ratio_mantissa, ratio_exponent = math.frexp(standard_ratio)
-        scaled_mantissa = (
-            kf_mantissa / keq_mantissa / ratio_mantissa
-        )
+        scaled_mantissa = kf_mantissa / keq_mantissa
         reverse = math.ldexp(
             scaled_mantissa,
-            kf_exponent - keq_exponent - ratio_exponent,
+            kf_exponent - keq_exponent,
         )
     except OverflowError as exc:
         raise ValueError("thermodynamic reverse coefficient overflows the finite real domain") from exc
-    if not math.isfinite(reverse) or reverse <= 0.0:
-        raise ValueError("thermodynamic reverse coefficient must be a positive finite real")
+    if not math.isfinite(reverse) or reverse < 0.0:
+        raise ValueError("thermodynamic reverse coefficient must be finite")
+    if reverse == 0.0:
+        raise ValueError(
+            "thermodynamic reverse coefficient underflows the finite real domain"
+        )
+    try:
+        admit_rate(reverse, field="thermodynamic reverse rate")
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
     return float(reverse)
 
 
@@ -421,16 +555,39 @@ def plain_finite_float_or_none(value: object) -> float | None:
 
 
 def effective_equilibrium_forward_rate(eq: object, *, temperature_K: float = 298.15) -> float | None:
-    return _finite_float_or_none(
+    value = _finite_float_or_none(
         getattr(eq, "kf", None),
         temperature_K=float(temperature_K),
     )
+    if value is None:
+        return None
+    try:
+        return admit_rate(value, field="equilibrium kf", allow_zero=True)
+    except ValueError:
+        return None
 
 
 def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> float | None:
     authority = normalize_existing_equilibrium_rate_authority(eq)
-    temperature = float(temperature_K)
+    temperature = validate_temperature(temperature_K, field="temperature_K")
     meta = getattr(eq, "metadata", {}) or {}
+    forward_order = math.fsum(
+        float(value) for value in dict(getattr(eq, "stoich_forward", {}) or {}).values()
+    )
+    reverse_order = math.fsum(
+        float(value) for value in dict(getattr(eq, "stoich_back", {}) or {}).values()
+    )
+    delta_n = float(reverse_order - forward_order)
+    standard_conc = 1.0
+    if isinstance(meta, Mapping):
+        standard_conc = meta.get(
+            EquilibriumMetadataKeys.STANDARD_CONC_M,
+            1.0,
+        )
+    try:
+        standard_conc = float(standard_conc)
+    except (TypeError, ValueError, OverflowError):
+        return None
     if authority.kind == EquilibriumRateAuthorityKind.KR:
         # Explicit kf+kr has no writable Keq authority, but its ratio remains
         # a useful derived readout.  It is deliberately independent of C0:
@@ -440,12 +597,9 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
         if kf is None or kr is None or kf <= 0.0 or kr <= 0.0:
             return None
         try:
-            derived = float(kf) / float(kr)
-        except (OverflowError, ZeroDivisionError):
+            return derived_equilibrium_ratio_from_directional_rates(kf, kr)
+        except ValueError:
             return None
-        if not math.isfinite(derived) or derived <= 0.0:
-            return None
-        return derived
 
     if isinstance(meta, Mapping):
         if (
@@ -455,21 +609,38 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
         ):
             dg_value = _finite_float_or_none(authority.dG_eq_J_per_mol, temperature_K=temperature)
             if dg_value is not None:
-                return float(K_from_deltaG_eq(dg_value, temperature))
+                return float(
+                    concentration_Keq_from_deltaG_eq(
+                        dg_value, temperature, standard_conc, delta_n
+                    )
+                )
         metadata_keq_source = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
         if callable(metadata_keq_source):
             metadata_keq = _finite_float_or_none(metadata_keq_source, temperature_K=temperature)
             if metadata_keq is not None:
-                return float(metadata_keq)
+                try:
+                    return admit_keq(metadata_keq, field="Keq_input")
+                except ValueError:
+                    return None
         dg_value = _finite_float_or_none(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL), temperature_K=temperature)
         if dg_value is not None:
-            return float(K_from_deltaG_eq(dg_value, temperature))
+            return float(
+                concentration_Keq_from_deltaG_eq(
+                    dg_value, temperature, standard_conc, delta_n
+                )
+            )
         metadata_keq = _finite_float_or_none(metadata_keq_source, temperature_K=temperature)
         if metadata_keq is not None:
-            return float(metadata_keq)
+            try:
+                return admit_keq(metadata_keq, field="Keq_input")
+            except ValueError:
+                return None
     direct_keq = _finite_float_or_none(getattr(eq, "Keq", None), temperature_K=temperature)
     if direct_keq is not None:
-        return float(direct_keq)
+        try:
+            return admit_keq(direct_keq, field="Keq")
+        except ValueError:
+            return None
     kf = effective_equilibrium_forward_rate(eq, temperature_K=temperature)
     kr = _finite_float_or_none(getattr(eq, "kr", None), temperature_K=temperature)
     if kf is not None and kr is not None and kf > 0.0 and kr > 0.0:
@@ -478,20 +649,39 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
         except (OverflowError, ZeroDivisionError):
             return None
         if math.isfinite(derived) and derived > 0.0:
-            return derived
+            try:
+                return admit_keq(derived, field="derived Keq")
+            except ValueError:
+                return None
     return None
 
 def effective_equilibrium_reverse_rate(eq: object, *, temperature_K: float = 298.15) -> float | None:
     authority = normalize_existing_equilibrium_rate_authority(eq)
     temperature = float(temperature_K)
     if authority.kind == EquilibriumRateAuthorityKind.KR:
-        return _finite_float_or_none(authority.kr, temperature_K=temperature)
+        explicit = _finite_float_or_none(authority.kr, temperature_K=temperature)
+        if explicit is None:
+            return None
+        try:
+            return admit_rate(explicit, field="equilibrium kr")
+        except ValueError:
+            return None
     kf = effective_equilibrium_forward_rate(eq, temperature_K=temperature)
     keq = effective_equilibrium_keq(eq, temperature_K=temperature)
-    if kf is None or keq is None or kf <= 0.0 or keq <= 0.0:
+    if kf is None or keq is None or kf < 0.0 or keq <= 0.0:
         return None
     value = authority.effective_reverse_rate(Keq=keq, kf=kf)
-    return _finite_float_or_none(value, temperature_K=temperature)
+    resolved = _finite_float_or_none(value, temperature_K=temperature)
+    if resolved is None:
+        return None
+    try:
+        return admit_rate(
+            resolved,
+            field="equilibrium kr",
+            allow_zero=True,
+        )
+    except ValueError:
+        return None
 
 
 def _metadata_has_thermo_authority(metadata: Mapping[str, Any] | None) -> bool:
@@ -520,14 +710,6 @@ def _metadata_keq_input(metadata: Mapping[str, Any] | None) -> object | None:
     return meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
 
 
-def _metadata_reverse_std_ratio(metadata: Mapping[str, Any] | None) -> object:
-    meta = metadata or {}
-    value = meta.get("std_ratio")
-    if value is None:
-        return 1.0
-    return value
-
-
 def _metadata_user_flags(metadata: Mapping[str, Any] | None) -> tuple[bool, bool]:
     meta = metadata or {}
     return (
@@ -548,7 +730,12 @@ def validate_equilibrium_rate_authority_flags(
         raise ValueError(AUTHORITY_ERROR)
 
 
-def _validate_concrete_positive_coefficient(value: object | None, *, label: str) -> None:
+def _validate_concrete_positive_coefficient(
+    value: object | None,
+    *,
+    label: str,
+    allow_zero: bool = False,
+) -> None:
     """Reject invalid concrete coefficients while preserving symbolic authority."""
     if value is None or callable(value):
         return
@@ -557,6 +744,12 @@ def _validate_concrete_positive_coefficient(value: object | None, *, label: str)
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
+        return
+    if label in {"kf", "kr"}:
+        admit_rate(number, field=label, allow_zero=(label == "kf" or allow_zero))
+        return
+    if label in {"Keq", "Keq_input"}:
+        admit_keq(number, field=label)
         return
     if not math.isfinite(number) or number <= 0.0:
         raise ValueError(f"{label} must be a positive finite real")
@@ -575,7 +768,15 @@ def normalize_equilibrium_rate_authority(
     metadata_keq = _metadata_keq_input(meta)
     metadata_dg = _metadata_dg_eq(meta)
     _validate_concrete_positive_coefficient(kf, label="kf")
-    _validate_concrete_positive_coefficient(kr, label="kr")
+    _validate_concrete_positive_coefficient(
+        kr,
+        label="kr",
+        allow_zero=(
+            not bool(_metadata_user_flags(meta)[1])
+            and plain_finite_float_or_none(kf) == 0.0
+            and bool(Keq is not None or metadata_keq is not None or metadata_dg is not None)
+        ),
+    )
     _validate_concrete_positive_coefficient(Keq, label="Keq")
     _validate_concrete_positive_coefficient(metadata_keq, label="Keq_input")
     user_kf, user_kr = _metadata_user_flags(meta)
@@ -607,6 +808,13 @@ def normalize_equilibrium_rate_authority(
         raise ValueError(AUTHORITY_ERROR)
 
     if has_kr and not has_thermo:
+        kf_numeric = plain_finite_float_or_none(kf)
+        kr_numeric = plain_finite_float_or_none(kr)
+        if kf_numeric is not None and kr_numeric is not None:
+            derived_equilibrium_ratio_from_directional_rates(
+                kf_numeric,
+                kr_numeric,
+            )
         return EquilibriumRateAuthority(
             kind=EquilibriumRateAuthorityKind.KR,
             kf=kf,
@@ -614,10 +822,6 @@ def normalize_equilibrium_rate_authority(
             Keq=None,
             derived_role="Keq",
             source=ctx.value,
-            # Explicit concentration-form kf+kr is independent of C0.  Keep
-            # the retained ratio at the multiplicative identity even if an
-            # internal caller supplied stale derived metadata.
-            reverse_std_ratio=1.0,
         )
 
     if has_kr and has_thermo and ctx == EquilibriumRateInputContext.PUBLIC:
@@ -630,10 +834,6 @@ def normalize_equilibrium_rate_authority(
         keq_source = Keq
     if keq_source is None and metadata_dg is None:
         raise ValueError(AUTHORITY_ERROR)
-    _validate_concrete_positive_coefficient(
-        _metadata_reverse_std_ratio(meta),
-        label="reverse_std_ratio",
-    )
     return EquilibriumRateAuthority(
         kind=EquilibriumRateAuthorityKind.KEQ,
         kf=kf,
@@ -642,7 +842,6 @@ def normalize_equilibrium_rate_authority(
         derived_role="kr",
         source=ctx.value,
         dG_eq_J_per_mol=metadata_dg,
-        reverse_std_ratio=_metadata_reverse_std_ratio(meta),
         has_explicit_keq_param=bool(metadata_keq is not None or (Keq is not None and metadata_dg is None)),
         has_thermo_param=bool(has_thermo),
         kf_editable=True,

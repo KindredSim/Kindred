@@ -410,8 +410,8 @@ def _encode_document(
                         "dataset_id": dataset_id,
                         "set_id": link.set_id,
                         "observation_mapping": [
-                            [raw_observation_id, model_species]
-                            for raw_observation_id, model_species
+                            [raw_observation_id, model_target]
+                            for raw_observation_id, model_target
                             in link.observation_mapping
                         ],
                         "include_in_fit": link.include_in_fit,
@@ -1492,12 +1492,20 @@ class KinArchiveStore:
                             member_bytes,
                         )
                 handle.flush()
+            # Inspect the destination entry itself.  In particular, a
+            # dangling or live symlink is replaced as an entry by os.replace;
+            # following it here would either mutate the target or make a
+            # missing target appear to be a missing destination.
             try:
-                existing_mode = stat.S_IMODE(os.stat(archive_path).st_mode)
+                existing_stat = os.lstat(archive_path)
             except FileNotFoundError:
                 pass
             else:
-                os.chmod(temporary_path, existing_mode)
+                if stat.S_ISREG(existing_stat.st_mode):
+                    os.chmod(
+                        temporary_path,
+                        stat.S_IMODE(existing_stat.st_mode),
+                    )
             os.replace(temporary_path, archive_path)
         except BaseException:
             try:

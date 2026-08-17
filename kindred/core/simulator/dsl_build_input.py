@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import math
 
 from ..temperature import TemperatureSchedule
+from ..species import validate_c0, validate_temperature
+from ..units import admit_keq
 
 __all__ = [
     "DslBuildStep",
@@ -34,6 +36,7 @@ class DslBuildStep:
     kappa: float = 1.0
     standard_conc_M: float | None = None
     dG_eq_J_per_mol: float | None = None
+    Keq: float | None = None
     Keq_input: float | None = None
     user_kf_explicit: bool = False
     user_kr_explicit: bool = False
@@ -52,8 +55,8 @@ class DslBuildStep:
                     raise TypeError(
                         f"{field} must contain exact (str, float) tuples."
                     )
-        if type(self.kf) is not float or not math.isfinite(self.kf) or self.kf <= 0.0:
-            raise ValueError("kf must be positive and finite.")
+        if type(self.kf) is not float or not math.isfinite(self.kf) or self.kf < 0.0:
+            raise ValueError("kf must be finite and nonnegative.")
         for field in (
             "kr",
             "arrhenius_A",
@@ -61,6 +64,7 @@ class DslBuildStep:
             "eyring_dG_act_J_per_mol",
             "standard_conc_M",
             "dG_eq_J_per_mol",
+            "Keq",
             "Keq_input",
         ):
             value = getattr(self, field)
@@ -68,6 +72,10 @@ class DslBuildStep:
                 type(value) is not float or not math.isfinite(value)
             ):
                 raise TypeError(f"{field} must be an exact finite float or None.")
+        if self.standard_conc_M is not None:
+            validate_c0(self.standard_conc_M, field="standard_conc_M")
+        if self.Keq is not None:
+            admit_keq(self.Keq, field="Keq")
         if type(self.model) is not str or self.model not in {
             "Constant",
             "Arrhenius",
@@ -121,12 +129,13 @@ class DslMechanismBuildInput:
             not math.isfinite(self.temperature_K)
             or self.temperature_K <= 0.0
             or not math.isfinite(self.standard_conc_M)
-            or self.standard_conc_M <= 0.0
         ):
             raise ValueError(
                 "DSL mechanism build temperature and standard concentration "
                 "must be positive and finite."
             )
+        validate_temperature(self.temperature_K, field="temperature_K")
+        validate_c0(self.standard_conc_M, field="standard_conc_M")
         if self.temperature_schedule is not None and type(self.temperature_schedule) is not TemperatureSchedule:
             raise TypeError(
                 "DSL mechanism build temperature schedule must be exact TemperatureSchedule or None."

@@ -15,8 +15,12 @@ from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 
 __all__ = [
     "InteractivePreviewFrame",
+    "InteractivePreviewFrameDisposition",
+    "InteractivePreviewFrameDispositionKind",
     "InteractivePreviewBatchIdentity",
+    "InteractivePreviewPresentedReceipt",
     "InteractivePreviewRequest",
+    "InteractivePreviewRetirement",
     "InteractivePreviewSampling",
     "InteractivePreviewSeries",
     "InteractivePreviewTarget",
@@ -65,6 +69,17 @@ class InteractivePreviewTerminalState(str, Enum):
     OBSOLETE = "obsolete"
 
 
+class InteractivePreviewFrameDispositionKind(str, Enum):
+    """The exhaustive physical outcome for one emitted transient frame."""
+
+    ACCEPTED = "accepted"
+    ACCEPTED_EMPTY = "accepted-empty"
+    REJECTED_STALE = "rejected-stale"
+    REJECTED_UNRENDERABLE = "rejected-unrenderable"
+    RETIRED = "retired"
+    REPLACED = "replaced"
+
+
 @dataclass(frozen=True, slots=True)
 class InteractivePreviewBatchIdentity:
     """Stable identity shared by approximate frames and exact settlement."""
@@ -101,6 +116,96 @@ class InteractivePreviewBatchIdentity:
             self.batch_id,
             self.target_set_ids,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class InteractivePreviewPresentedReceipt:
+    """Immutable proof that one batch reached the physical plot.
+
+    Allocation of :class:`InteractivePreviewBatchIdentity` is computational
+    custody only.  This receipt is created by the display controller after a
+    nonempty display state has returned successfully from its physical
+    renderer.  Slider exact release consumes this value, never an allocated
+    batch by itself.
+    """
+
+    batch: InteractivePreviewBatchIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.batch, InteractivePreviewBatchIdentity):
+            raise TypeError("batch must be InteractivePreviewBatchIdentity.")
+
+    @classmethod
+    def issue(
+        cls,
+        batch: InteractivePreviewBatchIdentity,
+    ) -> "InteractivePreviewPresentedReceipt":
+        """Issue a receipt after physical render success."""
+
+        if not isinstance(batch, InteractivePreviewBatchIdentity):
+            raise TypeError("batch must be InteractivePreviewBatchIdentity.")
+        return cls(batch=batch)
+
+
+@dataclass(frozen=True, slots=True)
+class InteractivePreviewFrameDisposition:
+    """Exactly one physical settlement fact for one emitted frame.
+
+    The batch and target identity deliberately avoid any Qt or repository
+    representation.  The display controller creates these facts and the
+    lifecycle owner consumes them; neither side infers acceptance from a
+    render callback, repository entry, or terminal worker signal.
+    """
+
+    batch: InteractivePreviewBatchIdentity
+    target_set_id: str
+    kind: InteractivePreviewFrameDispositionKind
+    message: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.batch, InteractivePreviewBatchIdentity):
+            raise TypeError("batch must be InteractivePreviewBatchIdentity.")
+        target = _required_text(self.target_set_id, "target_set_id")
+        if target not in self.batch.target_set_ids:
+            raise ValueError("disposition target must belong to its Preview batch.")
+        kind = self.kind
+        if not isinstance(kind, InteractivePreviewFrameDispositionKind):
+            try:
+                kind = InteractivePreviewFrameDispositionKind(str(kind))
+            except ValueError as exc:
+                raise ValueError(
+                    "invalid Interactive Preview frame disposition."
+                ) from exc
+        object.__setattr__(self, "target_set_id", target)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "message", str(self.message or ""))
+
+    @property
+    def key(self) -> tuple[str, int, str, tuple[str, ...], str]:
+        """Return the unique lifecycle token for the emitted target frame."""
+
+        return (*self.batch.key, self.target_set_id)
+
+
+@dataclass(frozen=True, slots=True)
+class InteractivePreviewRetirement:
+    """Lifecycle intent asking the controller to retire physical custody."""
+
+    tab_id: str
+    target_set_ids: tuple[str, ...] = ()
+    message: str = ""
+
+    def __post_init__(self) -> None:
+        tab = _required_text(self.tab_id, "retirement tab_id")
+        targets = tuple(
+            _required_text(value, "retirement target_set_id")
+            for value in self.target_set_ids
+        )
+        if len(set(targets)) != len(targets):
+            raise ValueError("retirement targets must be unique.")
+        object.__setattr__(self, "tab_id", tab)
+        object.__setattr__(self, "target_set_ids", targets)
+        object.__setattr__(self, "message", str(self.message or ""))
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,14 +333,12 @@ class InteractivePreviewTarget:
 
 @dataclass(frozen=True, slots=True)
 class InteractivePreviewRequest:
-    """Newest-only transient request with exact document and Draft identity."""
+    """Newest-only transient request with exact document identity."""
 
     tab_id: str
     generation: int
     batch_id: str
     document_identity: tuple[int, str]
-    science_identity: str
-    draft_identity: str
     targets: tuple[InteractivePreviewTarget, ...]
     sampling: InteractivePreviewSampling
 
@@ -269,16 +372,6 @@ class InteractivePreviewRequest:
         object.__setattr__(self, "tab_id", tab_id)
         object.__setattr__(self, "batch_id", batch_id)
         object.__setattr__(self, "document_identity", (identity[0], tab_id))
-        object.__setattr__(
-            self,
-            "science_identity",
-            _required_text(self.science_identity, "science_identity"),
-        )
-        object.__setattr__(
-            self,
-            "draft_identity",
-            _required_text(self.draft_identity, "draft_identity"),
-        )
         object.__setattr__(self, "targets", targets)
 
     @property
@@ -331,8 +424,6 @@ class InteractivePreviewFrame:
     set_id: str
     generation: int
     batch_id: str
-    document_identity: tuple[int, str]
-    draft_identity: str
     target_set_ids: tuple[str, ...]
     x_values: tuple[float, ...]
     segment_ids: tuple[int, ...]
@@ -347,14 +438,6 @@ class InteractivePreviewFrame:
         if type(self.generation) is not int or self.generation <= 0:
             raise ValueError("generation must be a positive int.")
         batch_id = _required_text(self.batch_id, "batch_id")
-        identity = tuple(self.document_identity)
-        if (
-            len(identity) != 2
-            or type(identity[0]) is not int
-            or identity[0] < 0
-            or _required_text(identity[1], "document identity tab") != tab_id
-        ):
-            raise ValueError("document_identity must exactly identify the frame tab.")
         target_set_ids = tuple(
             _required_text(value, "target_set_id") for value in self.target_set_ids
         )
@@ -419,12 +502,6 @@ class InteractivePreviewFrame:
         object.__setattr__(self, "tab_id", tab_id)
         object.__setattr__(self, "set_id", set_id)
         object.__setattr__(self, "batch_id", batch_id)
-        object.__setattr__(self, "document_identity", (identity[0], tab_id))
-        object.__setattr__(
-            self,
-            "draft_identity",
-            _required_text(self.draft_identity, "draft_identity"),
-        )
         object.__setattr__(self, "target_set_ids", target_set_ids)
         object.__setattr__(self, "x_values", x_values)
         object.__setattr__(self, "segment_ids", segment_ids)
@@ -432,14 +509,3 @@ class InteractivePreviewFrame:
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
         object.__setattr__(self, "presentation_boundaries", boundaries)
         object.__setattr__(self, "series", series)
-
-    @property
-    def batch_identity(self) -> InteractivePreviewBatchIdentity:
-        """Return the physically displayable frame's batch identity."""
-
-        return InteractivePreviewBatchIdentity(
-            tab_id=self.tab_id,
-            generation=self.generation,
-            batch_id=self.batch_id,
-            target_set_ids=self.target_set_ids,
-        )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from math import gcd, isclose, isfinite, log
+from math import exp, gcd, isclose, isfinite, log
 from functools import reduce
 import re
 from typing import Any, Mapping, Sequence
@@ -10,6 +10,9 @@ from typing import Any, Mapping, Sequence
 from kindred.core.constants import R
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
+    effective_equilibrium_forward_rate,
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
 )
 from kindred.core.kinetics import (
@@ -27,29 +30,30 @@ from kindred.core.ode_builder import (
     build_effective_rate_coefficient_evaluator,
 )
 from kindred.core.rate_binding import ForwardRateBinding, RateBinding
-from kindred.core.simulator.algebra_section import upsert_lines_into_algebra_section
 from kindred.core.simulator.errors import DSLError
-from kindred.core.simulator.parameter_algebra_spec import (
-    ParameterAlgebraSpec,
-    ParameterAssignment,
-    strip_inline_comment,
-)
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.symbolic.backend import get_symbolic_backend_metadata
 from kindred.core.symbolic.identity import symbolic_fingerprint
-from kindred.core.symbolic.proof import prove_product_identity
 from kindred.core.temperature import TemperatureScheduleDictProtocol
 from kindred.core.units import UnitsModel
 
 __all__ = [
     "UnresolvedWegscheiderCyclicityError",
+    "UnsupportedWegscheiderCorrectionError",
+    "WegscheiderExecutableCycleSatisfaction",
+    "WegscheiderExecutableSatisfactionError",
+    "WegscheiderExecutableSatisfactionReport",
     "WegscheiderCycle",
     "WegscheiderCyclicityReport",
     "WegscheiderResolutionUpdate",
+    "WegscheiderTopologyReport",
+    "analyze_bound_wegscheider_satisfaction",
     "analyze_wegscheider_cyclicity",
+    "analyze_wegscheider_topology",
     "apply_wegscheider_resolution_to_reactions_text",
     "build_wegscheider_resolution_updates",
-    "validate_wegscheider_cyclicity_resolved",
+    "require_wegscheider_admission_satisfied",
+    "validate_bound_wegscheider_satisfaction",
 ]
 
 
@@ -61,17 +65,49 @@ class WegscheiderCycle:
     coefficients: tuple[int, ...]
     parameter_names: tuple[str, ...]
     # The cycle coefficients above remain aligned with the selected
-    # equilibrium steps for runtime temperature proofs.  Correction targets
+    # equilibrium steps for runtime temperature checks.  Correction targets
     # may expose more than one writable coordinate per step (kf+kr), so their
     # exponents are carried separately and aligned with parameter_names.
     correction_exponents: tuple[int, ...] = ()
+    authority_parameter_names: tuple[str, ...] = ()
+    authority_exponents: tuple[int, ...] = ()
     resolved_by: str | None = None
-    resolved_proof_fingerprint: str | None = None
+    structural_fingerprint: str | None = None
+    admission_status: str = "unavailable"
+    admission_reason: str | None = None
+    admission_log_product: float | None = None
+    admission_parameter_values: tuple[float | None, ...] = ()
+
+
+@dataclass(frozen=True)
+class WegscheiderTopologyReport:
+    """Cycle identity derived only from canonical reversible stoichiometry."""
+
+    cycles: tuple[WegscheiderCycle, ...]
+
+    @property
+    def topology_fingerprint(self) -> str:
+        return symbolic_fingerprint(
+            {
+                "kind": "wegscheider-topology",
+                "cycles": [
+                    {
+                        "cycle_id": cycle.cycle_id,
+                        "step_indices": cycle.step_indices,
+                        "equilibrium_indices": cycle.equilibrium_indices,
+                        "coefficients": cycle.coefficients,
+                        "structural_fingerprint": cycle.structural_fingerprint,
+                    }
+                    for cycle in self.cycles
+                ],
+            }
+        )
 
 
 @dataclass(frozen=True)
 class WegscheiderCyclicityReport:
     cycles: tuple[WegscheiderCycle, ...]
+    topology_fingerprint: str = ""
 
     @property
     def unresolved_cycles(self) -> tuple[WegscheiderCycle, ...]:
@@ -92,8 +128,18 @@ class WegscheiderCyclicityReport:
                 "coefficients": list(cycle.coefficients),
                 "parameter_names": list(cycle.parameter_names),
                 "correction_exponents": list(cycle.correction_exponents),
+                "authority_parameter_names": list(
+                    cycle.authority_parameter_names
+                ),
+                "authority_exponents": list(cycle.authority_exponents),
                 "resolved_by": cycle.resolved_by,
-                "proof_fingerprint": cycle.resolved_proof_fingerprint,
+                "structural_fingerprint": cycle.structural_fingerprint,
+                "admission_status": cycle.admission_status,
+                "admission_reason": cycle.admission_reason,
+                "admission_log_product": cycle.admission_log_product,
+                "admission_parameter_values": list(
+                    cycle.admission_parameter_values
+                ),
             }
             for cycle in self.cycles
         ]
@@ -105,16 +151,25 @@ class WegscheiderCyclicityReport:
                 "coefficients": list(cycle.coefficients),
                 "parameter_names": list(cycle.parameter_names),
                 "correction_exponents": list(cycle.correction_exponents),
+                "authority_parameter_names": list(
+                    cycle.authority_parameter_names
+                ),
+                "authority_exponents": list(cycle.authority_exponents),
             }
             for cycle in self.cycles
         ]
         payload: dict[str, Any] = {
             "kind": "wegscheider_cyclicity",
+            "stage": "admission",
             "backend_name": metadata.backend_name,
             "backend_version": metadata.backend_version,
             "profile_version": metadata.profile_version,
             "cycles": cycles_payload,
             "resolved": bool(self.is_resolved),
+            "topology_fingerprint": (
+                self.topology_fingerprint
+                or WegscheiderTopologyReport(self.cycles).topology_fingerprint
+            ),
         }
         source_payload = {
             "kind": "wegscheider_cyclicity_source",
@@ -123,10 +178,10 @@ class WegscheiderCyclicityReport:
         payload["source_fingerprint"] = symbolic_fingerprint(source_payload)
         payload["artifact_fingerprint"] = symbolic_fingerprint(
             {
-                "kind": "wegscheider_cyclicity_proof",
+                "kind": "wegscheider_cyclicity_admission",
                 "resolved": bool(self.is_resolved),
-                "proof_fingerprints": [
-                    item.get("proof_fingerprint")
+                "structural_fingerprints": [
+                    item.get("structural_fingerprint")
                     for item in cycles_payload
                 ],
             }
@@ -134,25 +189,116 @@ class WegscheiderCyclicityReport:
         payload["fingerprint"] = symbolic_fingerprint(payload)
         return payload
 
+@dataclass(frozen=True)
+class WegscheiderExecutableCycleSatisfaction:
+    cycle_id: str
+    status: str
+    temperatures_K: tuple[float, ...] = ()
+    log_products: tuple[float, ...] = ()
+    reason: str | None = None
+    parameter_names: tuple[str, ...] = ()
+    authority_parameter_names: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cycle_id", str(self.cycle_id))
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(
+            self,
+            "parameter_names",
+            tuple(str(name) for name in self.parameter_names if str(name).strip()),
+        )
+        object.__setattr__(
+            self,
+            "authority_parameter_names",
+            tuple(
+                str(name)
+                for name in self.authority_parameter_names
+                if str(name).strip()
+            ),
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "cycle_id": self.cycle_id,
+            "status": self.status,
+            "temperatures_K": tuple(float(value) for value in self.temperatures_K),
+            "log_products": tuple(float(value) for value in self.log_products),
+            "reason": self.reason,
+            "parameter_names": self.parameter_names,
+            "authority_parameter_names": self.authority_parameter_names,
+        }
+
+
+@dataclass(frozen=True)
+class WegscheiderExecutableSatisfactionReport:
+    """Later satisfaction against one bound executable request/candidate."""
+
+    admission_report: WegscheiderCyclicityReport
+    cycles: tuple[WegscheiderExecutableCycleSatisfaction, ...]
+
+    @property
+    def failed_cycles(self) -> tuple[WegscheiderExecutableCycleSatisfaction, ...]:
+        return tuple(cycle for cycle in self.cycles if cycle.status != "satisfied")
+
+    @property
+    def is_satisfied(self) -> bool:
+        return not self.failed_cycles
+
+    @property
+    def symbolic_identity(self) -> dict[str, Any]:
+        admission_identity = self.admission_report.symbolic_identity
+        executable_payload = {
+            "kind": "wegscheider-bound-executable",
+            "admission_fingerprint": admission_identity["fingerprint"],
+            "cycles": [
+                {
+                    "cycle_id": cycle.cycle_id,
+                    "status": cycle.status,
+                    "temperatures_K": cycle.temperatures_K,
+                    "log_products": cycle.log_products,
+                    "reason": cycle.reason,
+                    "parameter_names": cycle.parameter_names,
+                    "authority_parameter_names": cycle.authority_parameter_names,
+                }
+                for cycle in self.cycles
+            ],
+        }
+        executable_fingerprint = symbolic_fingerprint(executable_payload)
+        return {
+            "kind": "wegscheider-staged-satisfaction",
+            "topology": admission_identity["topology_fingerprint"],
+            "admission": admission_identity["fingerprint"],
+            "executable": executable_fingerprint,
+            "admission_report": admission_identity,
+            "executable_report": executable_payload,
+            "resolved": bool(self.is_satisfied),
+            "fingerprint": symbolic_fingerprint(
+                {
+                    "topology": admission_identity["topology_fingerprint"],
+                    "admission": admission_identity["fingerprint"],
+                    "executable": executable_fingerprint,
+                }
+            ),
+        }
 
 @dataclass(frozen=True)
 class WegscheiderResolutionUpdate:
     cycle_id: str
     parameter_name: str
-    expr_src: str
+    source_value: float | None = None
     # Source-owned dG_eq corrections are materialized by the native Reactions
     # writer.  Keep the exact linear source-coordinate relation alongside the
     # display expression so the writer never has to reparse accepted source or
     # reconstruct the detailed-balance report.
     source_terms: tuple[tuple[str, Fraction], ...] = ()
 
-    @property
-    def line(self) -> str:
-        return f"param {self.parameter_name} = {self.expr_src}"
-
-
 class UnresolvedWegscheiderCyclicityError(DSLError):
-    def __init__(self, cycles: Sequence[WegscheiderCycle]) -> None:
+    def __init__(
+        self,
+        cycles: Sequence[WegscheiderCycle],
+        *,
+        report: WegscheiderCyclicityReport | None = None,
+    ) -> None:
         unresolved = tuple(cycles)
         names = ", ".join(
             f"{cycle.cycle_id} ({', '.join(cycle.parameter_names)})"
@@ -161,12 +307,37 @@ class UnresolvedWegscheiderCyclicityError(DSLError):
         super().__init__(
             f"unresolved Wegscheider cyclicity: {names}",
             suggestion=(
-                "Add a symbolic parameter-algebra dependency such as "
-                "'param Keq3 = 1 / (Keq1 * Keq2)' for each independent thermodynamic cycle."
+                "Adjust one admitted directional-rate or thermodynamic "
+                "coordinate per independent cycle so the effective "
+                "coefficients satisfy the structural cycle identity."
             ),
         )
-        self.stage = "wegscheider_cyclicity"
+        self.stage = "wegscheider_admission"
         self.cycles = unresolved
+        self.report = report
+
+
+class WegscheiderExecutableSatisfactionError(DSLError):
+    def __init__(self, report: WegscheiderExecutableSatisfactionReport) -> None:
+        failed = report.failed_cycles
+        details = ", ".join(
+            f"{cycle.cycle_id}:{cycle.status}"
+            for cycle in failed
+        )
+        super().__init__(
+            f"bound executable Wegscheider satisfaction failed: {details}",
+            suggestion=(
+                "Use a source-admitted detailed-balance correction or change the "
+                "request/candidate temperature and writable canonical coordinates."
+            ),
+        )
+        self.stage = "wegscheider_executable"
+        self.report = report
+        self.cycles = failed
+
+
+class UnsupportedWegscheiderCorrectionError(ValueError):
+    """The selected correction has no canonical source coordinate to rewrite."""
 
 
 @dataclass(frozen=True)
@@ -246,20 +417,29 @@ def _correction_coordinates(
     mechanism: object,
     selected_steps: Sequence[_ReversibleStep],
     cycle_coefficients: Sequence[int],
-) -> tuple[tuple[str, ...], tuple[int, ...]]:
+) -> tuple[
+    tuple[str, ...],
+    tuple[int, ...],
+    tuple[str, ...],
+    tuple[int, ...],
+]:
     """Return the writable authority coordinates for one cycle.
 
     Wegscheider's scientific identity is expressed in equilibrium ratios, but
     the correction UI must write the accepted authority basis.  Explicit
-    ``kf+kr`` therefore contributes two coordinates (``kfN`` and ``krN``)
-    with opposite exponents.  Thermodynamic ``Keq`` contributes ``KeqN``;
-    a source-owned ``dG_eq`` contributes its indexed source coordinate so the
-    caller cannot accidentally write a derived Keq readout.
+    ``kf+kr`` contributes both coordinates to the identity, but only a literal
+    constant ``kf`` is offered as a source correction.  ``kr`` remains the
+    canonical correction for a typed Arrhenius/Eyring forward model.
     """
 
     equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
-    names: list[str] = []
-    exponents: list[int] = []
+    selectable_names: list[str] = []
+    selectable_exponents: list[int] = []
+    authority_names: list[str] = []
+    authority_exponents: list[int] = []
+    metadata = MechanismMetadataView.from_metadata(
+        getattr(mechanism, "metadata", {}) or {}
+    )
     for step, coefficient in zip(selected_steps, cycle_coefficients, strict=True):
         if not (0 <= int(step.equilibrium_index) < len(equilibria)):
             raise ValueError("Wegscheider cycle references an invalid equilibrium index.")
@@ -267,30 +447,55 @@ def _correction_coordinates(
         authority = normalize_existing_equilibrium_rate_authority(equilibrium)
         c = int(coefficient)
         if authority.kind == EquilibriumRateAuthorityKind.KR:
-            names.extend((f"kf{step.step_index}", f"kr{step.step_index}"))
-            exponents.extend((c, -c))
+            kf_name = f"kf{step.step_index}"
+            kr_name = f"kr{step.step_index}"
+            authority_names.extend((kf_name, kr_name))
+            authority_exponents.extend((c, -c))
+            try:
+                model = forward_rate_model_for_equilibrium(
+                    equilibrium,
+                    temperature_K=float(metadata.temperature_K),
+                    default_standard_conc_M=float(metadata.standard_conc_M),
+                )
+            except (TypeError, ValueError, OverflowError):
+                model = None
+            if isinstance(model, ConstantRateModel):
+                selectable_names.append(kf_name)
+                selectable_exponents.append(c)
+            selectable_names.append(kr_name)
+            selectable_exponents.append(-c)
         elif authority.dG_eq_J_per_mol is not None and not authority.has_explicit_keq_param:
-            names.append(f"dG_eq{step.step_index}")
-            exponents.append(c)
+            name = f"dG_eq{step.step_index}"
+            selectable_names.append(name)
+            selectable_exponents.append(c)
+            authority_names.append(name)
+            authority_exponents.append(c)
         else:
-            names.append(f"Keq{step.step_index}")
-            exponents.append(c)
-    return tuple(names), tuple(exponents)
+            name = f"Keq{step.step_index}"
+            selectable_names.append(name)
+            selectable_exponents.append(c)
+            authority_names.append(name)
+            authority_exponents.append(c)
+    return (
+        tuple(selectable_names),
+        tuple(selectable_exponents),
+        tuple(authority_names),
+        tuple(authority_exponents),
+    )
 
 
 def _cycle_correction_terms(
     cycle: WegscheiderCycle,
 ) -> tuple[tuple[str, int], ...]:
-    exponents = cycle.correction_exponents
-    if len(exponents) != len(cycle.parameter_names):
-        exponents = cycle.coefficients
-    if len(exponents) != len(cycle.parameter_names):
+    names = cycle.authority_parameter_names or cycle.parameter_names
+    exponents = cycle.authority_exponents or cycle.correction_exponents
+    if len(exponents) != len(names):
         raise ValueError(
-            f"{cycle.cycle_id} correction-coordinate metadata is not aligned."
+            f"{cycle.cycle_id} authority-coordinate metadata is not aligned."
         )
     return tuple(
         (str(name), int(exponent))
-        for name, exponent in zip(cycle.parameter_names, exponents, strict=True)
+        for name, exponent in zip(names, exponents, strict=True)
         if int(exponent) != 0
     )
 
@@ -359,58 +564,6 @@ def _nullspace_integer_basis(matrix: Sequence[Sequence[Fraction]]) -> tuple[tupl
     return tuple(basis)
 
 
-def _cycle_expression(cycle: WegscheiderCycle, dependent_parameter: str) -> str:
-    terms = _cycle_correction_terms(cycle)
-    names = tuple(name for name, _coefficient in terms)
-    if dependent_parameter not in names:
-        raise ValueError(f"{dependent_parameter!r} is not part of {cycle.cycle_id}.")
-    idx = names.index(dependent_parameter)
-    dependent_coeff = int(terms[idx][1])
-    if dependent_coeff == 0:
-        raise ValueError(f"{dependent_parameter!r} has zero coefficient in {cycle.cycle_id}.")
-
-    # A detailed-balance cycle may be represented entirely in authored
-    # dG_eq coordinates.  Since log Keq = -dG_eq/(R*T), the dependent energy
-    # is the signed linear combination of the remaining source coordinates.
-    if all(name.startswith("dG_eq") for name, _coefficient in terms):
-        source_terms = _dG_source_terms(terms, dependent_parameter)
-        numerator_terms: list[str] = []
-        for name, factor in source_terms:
-            if factor == 1:
-                numerator_terms.append(name)
-            elif factor == -1:
-                numerator_terms.append(f"-({name})")
-            else:
-                numerator_terms.append(f"({factor}) * {name}")
-        return " + ".join(numerator_terms) if numerator_terms else "0"
-
-    if any(name.startswith("dG_eq") for name, _coefficient in terms):
-        raise ValueError(
-            f"{cycle.cycle_id} mixes dG_eq and dimensionless equilibrium coordinates; "
-            "choose a single source authority basis before correction."
-        )
-    numerator_terms: list[str] = []
-    denominator_terms: list[str] = []
-    for name, coeff in terms:
-        if name == dependent_parameter or coeff == 0:
-            continue
-        exponent = Fraction(-int(coeff), dependent_coeff)
-        target_terms = numerator_terms if exponent > 0 else denominator_terms
-        magnitude = abs(exponent)
-        if magnitude.denominator == 1:
-            power = magnitude.numerator
-            term = str(name) if power == 1 else f"{name}**{power}"
-        else:
-            term = f"{name}**({magnitude.numerator}/{magnitude.denominator})"
-        target_terms.append(term)
-
-    numerator = " * ".join(numerator_terms) if numerator_terms else "1"
-    if not denominator_terms:
-        return numerator
-    denominator = " * ".join(denominator_terms)
-    return f"{numerator} / ({denominator})"
-
-
 def _dG_source_terms(
     terms: Sequence[tuple[str, int]],
     dependent_parameter: str,
@@ -434,6 +587,53 @@ def _dG_source_terms(
     )
 
 
+def _dependent_correction_value(
+    cycle: WegscheiderCycle,
+    dependent_parameter: str,
+) -> float:
+    terms = _cycle_correction_terms(cycle)
+    names = tuple(name for name, _coefficient in terms)
+    if dependent_parameter not in names:
+        raise ValueError(f"{dependent_parameter!r} is not part of {cycle.cycle_id}.")
+    if dependent_parameter not in cycle.parameter_names:
+        raise UnsupportedWegscheiderCorrectionError(
+            f"{dependent_parameter!r} is not a supported canonical source correction."
+        )
+    if len(cycle.admission_parameter_values) != len(names):
+        raise UnsupportedWegscheiderCorrectionError(
+            f"{cycle.cycle_id} has no complete admitted source-coordinate values."
+        )
+    dependent_index = names.index(dependent_parameter)
+    dependent_exponent = int(terms[dependent_index][1])
+    if dependent_exponent == 0:
+        raise UnsupportedWegscheiderCorrectionError(
+            f"{dependent_parameter!r} has no correction exponent."
+        )
+
+    log_other_product = 0.0
+    for index, (_name, exponent) in enumerate(terms):
+        if index == dependent_index:
+            continue
+        value = cycle.admission_parameter_values[index]
+        if value is None or not isfinite(value) or value <= 0.0:
+            raise UnsupportedWegscheiderCorrectionError(
+                f"{cycle.cycle_id} cannot correct {dependent_parameter!r}: "
+                "another canonical source coordinate is not positive and finite."
+            )
+        log_other_product += int(exponent) * log(float(value))
+    try:
+        value = exp(-log_other_product / dependent_exponent)
+    except (OverflowError, ZeroDivisionError) as exc:
+        raise UnsupportedWegscheiderCorrectionError(
+            f"{cycle.cycle_id} correction for {dependent_parameter!r} is not finite."
+        ) from exc
+    if not isfinite(value) or value <= 0.0:
+        raise UnsupportedWegscheiderCorrectionError(
+            f"{cycle.cycle_id} correction for {dependent_parameter!r} is not positive and finite."
+        )
+    return float(value)
+
+
 def build_wegscheider_resolution_updates(
     report: WegscheiderCyclicityReport,
     dependent_parameters: Mapping[str, str],
@@ -453,17 +653,39 @@ def build_wegscheider_resolution_updates(
                 f"{previous_cycle!r} and {cycle_id!r}; choose one dependent parameter per cycle."
             )
         requested_parameters[parameter_key] = str(cycle_id)
+        terms = _cycle_correction_terms(cycle)
+        is_dg = str(parameter_name).casefold().startswith("dg_eq")
+        dg_terms = tuple(
+            name.casefold().startswith("dg_eq")
+            for name, _coefficient in terms
+        )
+        if any(dg_terms) and not all(dg_terms):
+            raise UnsupportedWegscheiderCorrectionError(
+                f"{cycle.cycle_id} mixes energy and concentration/rate source authorities; "
+                "no one-way canonical correction is available."
+            )
+        if is_dg != bool(dg_terms and all(dg_terms)):
+            raise UnsupportedWegscheiderCorrectionError(
+                f"{parameter_name!r} does not belong to a supported canonical correction basis."
+            )
         updates.append(
             WegscheiderResolutionUpdate(
                 cycle_id=str(cycle_id),
                 parameter_name=str(parameter_name),
-                expr_src=_cycle_expression(cycle, str(parameter_name)),
-                source_terms=(
-                    _dG_source_terms(
-                        _cycle_correction_terms(cycle),
+                source_value=(
+                    None
+                    if is_dg
+                    else _dependent_correction_value(
+                        cycle,
                         str(parameter_name),
                     )
-                    if str(parameter_name).casefold().startswith("dg_eq")
+                ),
+                source_terms=(
+                    _dG_source_terms(
+                        terms,
+                        str(parameter_name),
+                    )
+                    if is_dg
                     else ()
                 ),
             )
@@ -478,110 +700,33 @@ def apply_wegscheider_resolution_to_reactions_text(
     units: UnitsModel,
     admitted_analysis: object,
 ) -> str:
-    from kindred.core.simulator.dsl_derivation import rewrite_scalar_source_line
-
     if type(units) is not UnitsModel:
         raise TypeError("Detailed-balance correction units must be UnitsModel.")
-    pending = {str(update.parameter_name).lower(): update for update in updates}
-    if not pending:
+    normalized_updates = tuple(updates)
+    names = tuple(str(update.parameter_name).casefold() for update in normalized_updates)
+    if len(names) != len(set(names)):
+        raise ValueError("Detailed-balance source updates must have unique targets.")
+    if not normalized_updates:
         return str(dsl_text or "")
-
-    raw_lines = str(dsl_text or "").splitlines(keepends=True)
-    line_contents = [line.rstrip("\r\n") for line in raw_lines]
-    line_endings = [
-        line[len(content):]
-        for line, content in zip(raw_lines, line_contents)
-    ]
-    if not raw_lines and dsl_text:
-        line_contents = [str(dsl_text)]
-        line_endings = [""]
-
-    # dG_eq is a source-owned equilibrium coordinate, not an Algebra
-    # parameter.  Materialize all selected dG corrections in this one
-    # detached Reactions edit, retaining the source's numeric energy unit and
-    # directive context.  The canonical admission/recheck performed by the
-    # owning Run/Fit workflow remains the only source validation authority.
-    dg_updates = {
-        key: update
-        for key, update in pending.items()
-        if re.fullmatch(r"dg_eq\d+", key, flags=re.IGNORECASE)
-    }
-    if dg_updates:
-        materialized_lines = _materialize_admitted_dG_source_updates(
-            str(dsl_text or ""),
-            dg_updates,
-            units=units,
-            admitted_analysis=admitted_analysis,
-        )
-        line_contents = [line.rstrip("\r\n") for line in materialized_lines]
-        line_endings = [
-            line[len(content):]
-            for line, content in zip(materialized_lines, line_contents)
-        ]
-        pending = {
-            key: update
-            for key, update in pending.items()
-            if key not in dg_updates
-        }
-        if not pending:
-            return "".join(
-                line + ending
-                for line, ending in zip(line_contents, line_endings)
-            )
-
-    rewritten: list[str] = []
-    rewritten_endings: list[str] = []
-    replaced: set[str] = set()
-    param_re = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
-    for raw, line_ending in zip(line_contents, line_endings):
-        code = strip_inline_comment(raw).strip()
-        match = param_re.match(code)
-        if match is None:
-            rewritten.append(raw)
-            rewritten_endings.append(line_ending)
-            continue
-        key = str(match.group(1)).lower()
-        update = pending.get(key)
-        if update is None:
-            rewritten.append(raw)
-            rewritten_endings.append(line_ending)
-            continue
-        if key in replaced:
-            continue
-        rewritten.append(
-            rewrite_scalar_source_line(
-                raw,
-                name=match.group(1),
-                expression=update.expr_src,
-            )
-        )
-        rewritten_endings.append(line_ending)
-        replaced.add(key)
-
-    missing = [
-        update.line
-        for key, update in pending.items()
-        if key not in replaced
-    ]
-    rewritten_text = "".join(
-        line + ending
-        for line, ending in zip(rewritten, rewritten_endings)
+    return _materialize_admitted_canonical_source_updates(
+        str(dsl_text or ""),
+        normalized_updates,
+        units=units,
+        admitted_analysis=admitted_analysis,
     )
-    if not missing:
-        return rewritten_text
-    return upsert_lines_into_algebra_section(rewritten_text, missing)
 
 
-def _materialize_admitted_dG_source_updates(
+def _materialize_admitted_canonical_source_updates(
     dsl_text: str,
-    updates: Mapping[str, WegscheiderResolutionUpdate],
+    updates: Sequence[WegscheiderResolutionUpdate],
     *,
     units: UnitsModel,
     admitted_analysis: object,
-) -> list[str]:
-    """Rewrite admitted dG coordinates without reparsing or normalizing."""
+) -> str:
+    """Rewrite only native source coordinates; never manufacture Algebra proof."""
 
     from kindred.core.simulator.dsl_derivation import (
+        authored_step_origin,
         coordinate_source_parts,
         coordinate_token_matches,
         origin_line_positions,
@@ -614,60 +759,62 @@ def _materialize_admitted_dG_source_updates(
         line_contents = [dsl_text]
         line_endings = [""]
     origin_positions = origin_line_positions(analysis, dsl_text)
-    authored_steps = tuple(
-        origin
-        for origin in analysis.origins
-        if any(
-            arrow in origin.source_text.split("#", 1)[0]
-            for arrow in ("->", "=>", "<=>")
-        )
-    )
-
-    def source_coordinate_location(name: str) -> tuple[int, float]:
-        match = re.fullmatch(r"dg_eq(\d+)", str(name).casefold())
+    def source_coordinate_location(name: str) -> tuple[int, str, float]:
+        match = re.fullmatch(r"(kf|kr|keq|dg_eq)(\d+)", str(name).casefold())
         if match is None:
-            raise ValueError(
+            raise UnsupportedWegscheiderCorrectionError(
                 f"Unsupported native detailed-balance coordinate {name!r}."
             )
-        step_index = int(match.group(1))
-        if not 1 <= step_index <= len(authored_steps):
-            raise ValueError(f"Source has no authored coordinate {name!r}.")
-        origin = authored_steps[step_index - 1]
+        role = str(match.group(1))
+        step_index = int(match.group(2))
+        try:
+            origin = authored_step_origin(analysis, step_index=step_index)
+        except LookupError as exc:
+            raise UnsupportedWegscheiderCorrectionError(
+                f"Source has no authored coordinate {name!r}."
+            ) from exc
         try:
             line_index = origin_positions[origin.authored_ordinal]
         except KeyError as exc:
-            raise ValueError(
+            raise UnsupportedWegscheiderCorrectionError(
                 f"Source has no exact origin for {name!r}."
             ) from exc
         if not 0 <= line_index < len(line_contents):
-            raise ValueError(f"Source origin for {name!r} is outside the exact source.")
+            raise UnsupportedWegscheiderCorrectionError(
+                f"Source origin for {name!r} is outside the exact source."
+            )
+        source_token = "Keq" if role == "keq" else "dG_eq" if role == "dg_eq" else role
         _prefix, tokens, _comment = coordinate_source_parts(line_contents[line_index])
         matches = [
-            pair for pair in tokens if coordinate_token_matches(pair[0], "dG_eq")
+            pair for pair in tokens if coordinate_token_matches(pair[0], source_token)
         ]
         if len(matches) != 1:
-            raise ValueError(
-                f"Source does not contain exactly one authored coordinate {name!r}."
+            raise UnsupportedWegscheiderCorrectionError(
+                f"Source does not contain one supported literal coordinate {name!r}."
             )
         try:
             value = float(matches[0][1])
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"Source {name} value is not numeric.") from exc
+            raise UnsupportedWegscheiderCorrectionError(
+                f"Source {name} value is not numeric."
+            ) from exc
         if not isfinite(value):
-            raise ValueError(f"Source {name} value is not finite.")
-        return line_index, value
+            raise UnsupportedWegscheiderCorrectionError(
+                f"Source {name} value is not finite."
+            )
+        return line_index, source_token, value
 
     coordinate_names: set[str] = {
-        str(key).casefold()
-        for key in updates
+        str(update.parameter_name).casefold()
+        for update in updates
     }
-    for update in updates.values():
+    for update in updates:
         coordinate_names.update(
             str(name).casefold()
             for name, _factor in update.source_terms
         )
 
-    admitted_coordinates: dict[str, tuple[int, float]] = {}
+    admitted_coordinates: dict[str, tuple[int, str, float]] = {}
     for coordinate_name in sorted(coordinate_names):
         admitted_coordinates[coordinate_name] = source_coordinate_location(
             coordinate_name
@@ -679,90 +826,48 @@ def _materialize_admitted_dG_source_updates(
     _source_energy_unit = analysis.energy_unit
     if not _source_energy_unit:
         raise ValueError("Admitted DSL source has no energy render unit.")
-    for key, update in updates.items():
-        target = str(key).casefold()
+    materialized_values: dict[str, float] = {}
+    for update in updates:
+        target = str(update.parameter_name).casefold()
         coordinate = admitted_coordinates.get(target)
         if coordinate is None:
             raise ValueError(
                 f"Source does not contain authored coordinate {update.parameter_name!r}."
             )
-        if not update.source_terms:
-            raise ValueError(
-                f"Detailed-balance update {update.parameter_name!r} is missing its "
-                "retained source-coordinate relation."
+        if update.source_terms:
+            materialized = 0.0
+            for source_name, factor in update.source_terms:
+                source_key = str(source_name).casefold()
+                source = admitted_coordinates.get(source_key)
+                if source is None:
+                    raise UnsupportedWegscheiderCorrectionError(
+                        f"Source does not contain authored coordinate {source_name!r}."
+                    )
+                materialized += float(factor) * source[2]
+        elif update.source_value is not None:
+            materialized = float(update.source_value)
+        else:
+            raise UnsupportedWegscheiderCorrectionError(
+                f"Detailed-balance update {update.parameter_name!r} has no canonical source value."
             )
-        materialized = 0.0
-        for source_name, factor in update.source_terms:
-            source_key = str(source_name).casefold()
-            source = admitted_coordinates.get(source_key)
-            if source is None:
-                raise ValueError(
-                    f"Source does not contain authored coordinate {source_name!r}."
-                )
-            materialized += float(factor) * source[1]
         if not isfinite(materialized):
-            raise ValueError(
+            raise UnsupportedWegscheiderCorrectionError(
                 f"Detailed-balance correction for {update.parameter_name!r} is not finite."
             )
-        line_index, _value = coordinate
+        materialized_values[target] = float(materialized)
+
+    for update in updates:
+        target = str(update.parameter_name).casefold()
+        line_index, source_token, _value = admitted_coordinates[target]
         line_contents[line_index] = rewrite_coordinate_source_line(
             line_contents[line_index],
-            token="dG_eq",
-            value=float(materialized),
+            token=source_token,
+            value=materialized_values[target],
         )
-    return [content + ending for content, ending in zip(line_contents, line_endings)]
-
-
-def _assignment_by_name(spec: ParameterAlgebraSpec | None) -> dict[str, ParameterAssignment]:
-    if spec is None:
-        return {}
-    return {str(stmt.name): stmt for stmt in spec.param_statements or []}
-
-
-def _cycle_candidate_proof_fingerprint(
-    *,
-    cycle: WegscheiderCycle,
-    assignment: ParameterAssignment,
-    spec: ParameterAlgebraSpec,
-) -> str | None:
-    candidate = str(assignment.name)
-    terms = _cycle_correction_terms(cycle)
-    if candidate not in {name for name, _coefficient in terms}:
-        return None
-    if any(name.startswith("dG_eq") for name, _coefficient in terms):
-        # The symbolic product proof works in dimensionless Keq coordinates;
-        # source-owned dG correction is handled by the native source writer.
-        return None
-    proof = prove_product_identity(
-        target_factors={
-            str(name): int(coeff)
-            for name, coeff in terms
-            if int(coeff) != 0
-        },
-        candidate=assignment,
-        spec=spec,
+    return "".join(
+        content + ending
+        for content, ending in zip(line_contents, line_endings, strict=True)
     )
-    return str(proof.fingerprint or "") if bool(proof.proven) else None
-
-
-def _parameter_algebra_resolution(
-    cycle: WegscheiderCycle,
-    *,
-    parameter_algebra_spec: ParameterAlgebraSpec | None,
-) -> tuple[str | None, str | None]:
-    assignments = _assignment_by_name(parameter_algebra_spec)
-    for name, _coefficient in _cycle_correction_terms(cycle):
-        assignment = assignments.get(name)
-        if assignment is None or parameter_algebra_spec is None:
-            continue
-        proof_fingerprint = _cycle_candidate_proof_fingerprint(
-            cycle=cycle,
-            assignment=assignment,
-            spec=parameter_algebra_spec,
-        )
-        if proof_fingerprint:
-            return name, proof_fingerprint
-    return None, None
 
 
 def _forward_model_temperature_exponents(
@@ -857,17 +962,6 @@ def _step_log_temperature_relation(
 
     authority = normalize_existing_equilibrium_rate_authority(equilibrium)
     if authority.kind == EquilibriumRateAuthorityKind.KEQ:
-        if (
-            callable(authority.reverse_std_ratio)
-            and bool(
-                getattr(
-                    authority.reverse_std_ratio,
-                    "accepts_runtime_temperature",
-                    False,
-                )
-            )
-        ):
-            return None
         if (
             authority.dG_eq_J_per_mol is not None
             and not authority.has_explicit_keq_param
@@ -1021,180 +1115,15 @@ def _combined_cycle_relation(
     return combined, tuple(relations)
 
 
-def _runtime_domain_resolution(
-    mechanism: object,
-    cycle: WegscheiderCycle,
-    selected_steps: Sequence[_ReversibleStep],
-    *,
-    evaluator: EffectiveRateCoefficientEvaluator,
-    nominal_temperature_K: float,
-    nominal_ratios: Mapping[int, float],
-    parameter_algebra_spec: ParameterAlgebraSpec | None,
-) -> tuple[str | None, str | None]:
-    domain_kind, temperatures, schedule_payload = (
-        _runtime_temperature_domain(mechanism)
-    )
-    reaction_count = len(tuple(getattr(mechanism, "reactions", ()) or ()))
-    if domain_kind == "finite" and temperatures:
-        log_products: list[float] = []
-        ratios_by_temperature: list[tuple[float, ...]] = []
-        for temperature in temperatures:
-            ratios: list[float] = []
-            for step in selected_steps:
-                ratio = _effective_equilibrium_ratio(
-                    evaluator,
-                    reaction_count=reaction_count,
-                    equilibrium_index=step.equilibrium_index,
-                    temperature_K=temperature,
-                )
-                if ratio is None:
-                    return None, None
-                ratios.append(ratio)
-            log_product = sum(
-                int(coefficient) * log(float(ratio))
-                for coefficient, ratio in zip(
-                    cycle.coefficients,
-                    ratios,
-                    strict=True,
-                )
-            )
-            if not isfinite(log_product) or not isclose(
-                log_product,
-                0.0,
-                rel_tol=0.0,
-                abs_tol=1e-10,
-            ):
-                break
-            log_products.append(float(log_product))
-            ratios_by_temperature.append(tuple(ratios))
-        else:
-            fingerprint = symbolic_fingerprint(
-                {
-                    "kind": "exhaustive-runtime-temperature-domain",
-                    "cycle_id": cycle.cycle_id,
-                    "schedule": schedule_payload,
-                    "temperatures_K": temperatures,
-                    "ratios": ratios_by_temperature,
-                    "log_products": log_products,
-                    "coefficients": cycle.coefficients,
-                }
-            )
-            return "runtime-temperature-domain", fingerprint
+def analyze_wegscheider_topology(mechanism: object) -> WegscheiderTopologyReport:
+    """Find structural cycles before evaluating any rate or equilibrium value."""
 
-    relation_result = _combined_cycle_relation(
-        mechanism,
-        cycle,
-        selected_steps,
-        evaluator=evaluator,
-        nominal_temperature_K=nominal_temperature_K,
-        nominal_ratios=nominal_ratios,
-    )
-    if relation_result is None:
-        return None, None
-    combined, relations = relation_result
-    temperature_invariant = (
-        isclose(
-            combined.log_temperature_power,
-            0.0,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and isclose(
-            combined.inverse_temperature,
-            0.0,
-            rel_tol=0.0,
-            abs_tol=1e-10,
-        )
-    )
-    if not temperature_invariant:
-        return None, None
-    algebra_name, algebra_fingerprint = _parameter_algebra_resolution(
-        cycle,
-        parameter_algebra_spec=parameter_algebra_spec,
-    )
-    constant_identity = isclose(
-        combined.log_constant,
-        0.0,
-        rel_tol=0.0,
-        abs_tol=1e-10,
-    )
-    if not constant_identity and algebra_fingerprint is None:
-        return None, None
-    fingerprint = symbolic_fingerprint(
-        {
-            "kind": "structural-runtime-temperature-identity",
-            "cycle_id": cycle.cycle_id,
-            "schedule": schedule_payload,
-            "combined_relation": {
-                "log_constant": combined.log_constant,
-                "log_temperature_power": (
-                    combined.log_temperature_power
-                ),
-                "inverse_temperature": combined.inverse_temperature,
-            },
-            "step_relations": [
-                {
-                    "log_constant": relation.log_constant,
-                    "log_temperature_power": (
-                        relation.log_temperature_power
-                    ),
-                    "inverse_temperature": relation.inverse_temperature,
-                    "source": relation.source,
-                }
-                for relation in relations
-            ],
-            "algebra_proof": algebra_fingerprint,
-        }
-    )
-    return (
-        algebra_name or "structural-temperature-identity",
-        fingerprint,
-    )
-
-
-def analyze_wegscheider_cyclicity(
-    mechanism: object,
-    *,
-    parameter_algebra_spec: ParameterAlgebraSpec | None = None,
-) -> WegscheiderCyclicityReport:
     steps = _reversible_steps(mechanism)
     if len(steps) < 2:
-        return WegscheiderCyclicityReport(cycles=())
-    try:
-        evaluator = build_effective_rate_coefficient_evaluator(mechanism)
-        nominal_temperature_K = float(
-            evaluator.nominal_temperature_K
-        )
-        reaction_count = len(
-            tuple(getattr(mechanism, "reactions", ()) or ())
-        )
-        nominal_ratios = {
-            step.equilibrium_index: _effective_equilibrium_ratio(
-                evaluator,
-                reaction_count=reaction_count,
-                equilibrium_index=step.equilibrium_index,
-                temperature_K=nominal_temperature_K,
-            )
-            for step in steps
-        }
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise DSLError(
-            "Wegscheider analysis could not evaluate the canonical "
-            "effective rate coefficients."
-        ) from exc
-    if any(value is None for value in nominal_ratios.values()):
-        raise DSLError(
-            "Wegscheider analysis requires finite positive effective "
-            "forward and reverse coefficients."
-        )
-    resolved_nominal_ratios = {
-        equilibrium_index: float(value)
-        for equilibrium_index, value in nominal_ratios.items()
-        if value is not None
-    }
+        return WegscheiderTopologyReport(cycles=())
     species = sorted({species_name for step in steps for species_name in step.vector.keys()})
     if not species:
-        return WegscheiderCyclicityReport(cycles=())
+        return WegscheiderTopologyReport(cycles=())
     matrix = [
         [step.vector.get(species_name, Fraction(0)) for step in steps]
         for species_name in species
@@ -1213,47 +1142,489 @@ def analyze_wegscheider_cyclicity(
         selected_coefficients = tuple(
             int(coefficient) for _step, coefficient in selected
         )
-        correction_names, correction_exponents = _correction_coordinates(
-            mechanism,
-            selected_steps,
-            selected_coefficients,
+        structural_fingerprint = symbolic_fingerprint(
+            {
+                "kind": "wegscheider-structural-cycle",
+                "step_indices": tuple(step.step_index for step in selected_steps),
+                "equilibrium_indices": tuple(
+                    step.equilibrium_index for step in selected_steps
+                ),
+                "coefficients": selected_coefficients,
+                "vectors": tuple(
+                    tuple(sorted((name, str(value)) for name, value in step.vector.items()))
+                    for step in selected_steps
+                ),
+            }
         )
         cycle = WegscheiderCycle(
             cycle_id=f"cycle_{idx}",
             step_indices=tuple(step.step_index for step, _coeff in selected),
             equilibrium_indices=tuple(step.equilibrium_index for step, _coeff in selected),
             coefficients=selected_coefficients,
-            parameter_names=correction_names,
-            correction_exponents=correction_exponents,
+            parameter_names=(),
+            structural_fingerprint=structural_fingerprint,
         )
-        resolved_by, proof_fingerprint = _runtime_domain_resolution(
+        cycles.append(cycle)
+    return WegscheiderTopologyReport(cycles=tuple(cycles))
+
+
+def _steps_for_cycle(
+    steps: Sequence[_ReversibleStep],
+    cycle: WegscheiderCycle,
+) -> tuple[_ReversibleStep, ...]:
+    by_equilibrium_index = {step.equilibrium_index: step for step in steps}
+    try:
+        return tuple(
+            by_equilibrium_index[index]
+            for index in cycle.equilibrium_indices
+        )
+    except KeyError as exc:
+        raise ValueError(
+            f"{cycle.cycle_id} is not present in the canonical reversible topology."
+        ) from exc
+
+
+def _canonical_admitted_ratio(
+    mechanism: object,
+    step: _ReversibleStep,
+    *,
+    temperature_K: float,
+) -> float | None:
+    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+    equilibrium = equilibria[step.equilibrium_index]
+    value = effective_equilibrium_keq(
+        equilibrium,
+        temperature_K=temperature_K,
+    )
+    if value is None or not isfinite(value) or value <= 0.0:
+        return None
+    return float(value)
+
+
+def _admission_correction_values(
+    mechanism: object,
+    selected_steps: Sequence[_ReversibleStep],
+    *,
+    temperature_K: float,
+) -> tuple[float | None, ...]:
+    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+    values: list[float | None] = []
+    for step in selected_steps:
+        equilibrium = equilibria[step.equilibrium_index]
+        authority = normalize_existing_equilibrium_rate_authority(equilibrium)
+        if authority.kind == EquilibriumRateAuthorityKind.KR:
+            values.extend(
+                (
+                    effective_equilibrium_forward_rate(
+                        equilibrium,
+                        temperature_K=temperature_K,
+                    ),
+                    effective_equilibrium_reverse_rate(
+                        equilibrium,
+                        temperature_K=temperature_K,
+                    ),
+                )
+            )
+        elif (
+            authority.dG_eq_J_per_mol is not None
+            and not authority.has_explicit_keq_param
+        ):
+            value = authority.dG_eq_J_per_mol
+            try:
+                values.append(
+                    float(value(temperature_K)) if callable(value) else float(value)
+                )
+            except (TypeError, ValueError, OverflowError):
+                values.append(None)
+        else:
+            values.append(
+                effective_equilibrium_keq(
+                    equilibrium,
+                    temperature_K=temperature_K,
+                )
+            )
+    return tuple(
+        float(value) if value is not None and isfinite(value) else None
+        for value in values
+    )
+
+
+def analyze_wegscheider_cyclicity(
+    mechanism: object,
+) -> WegscheiderCyclicityReport:
+    """Evaluate source admission after topology and before downstream mutation."""
+
+    topology = analyze_wegscheider_topology(mechanism)
+    if not topology.cycles:
+        return WegscheiderCyclicityReport(
+            cycles=(),
+            topology_fingerprint=topology.topology_fingerprint,
+        )
+    steps = _reversible_steps(mechanism)
+    nominal_temperature_K = float(
+        MechanismMetadataView.from_metadata(
+            getattr(mechanism, "metadata", {}) or {}
+        ).temperature_K
+    )
+    cycles: list[WegscheiderCycle] = []
+    for structural_cycle in topology.cycles:
+        selected_steps = _steps_for_cycle(steps, structural_cycle)
+        (
+            correction_names,
+            correction_exponents,
+            authority_names,
+            authority_exponents,
+        ) = _correction_coordinates(
             mechanism,
-            cycle,
             selected_steps,
-            evaluator=evaluator,
-            nominal_temperature_K=nominal_temperature_K,
-            nominal_ratios=resolved_nominal_ratios,
-            parameter_algebra_spec=parameter_algebra_spec,
+            structural_cycle.coefficients,
+        )
+        ratios = tuple(
+            _canonical_admitted_ratio(
+                mechanism,
+                step,
+                temperature_K=nominal_temperature_K,
+            )
+            for step in selected_steps
+        )
+        correction_values = _admission_correction_values(
+            mechanism,
+            selected_steps,
+            temperature_K=nominal_temperature_K,
+        )
+        if any(value is None for value in ratios):
+            cycles.append(
+                replace(
+                    structural_cycle,
+                    parameter_names=correction_names,
+                    correction_exponents=correction_exponents,
+                    authority_parameter_names=authority_names,
+                    authority_exponents=authority_exponents,
+                    admission_status="unavailable",
+                    admission_reason=(
+                        "canonical admitted equilibrium authority is not positive and finite"
+                    ),
+                    admission_parameter_values=correction_values,
+                )
+            )
+            continue
+        log_product = sum(
+            coefficient * log(float(ratio))
+            for coefficient, ratio in zip(
+                structural_cycle.coefficients,
+                ratios,
+                strict=True,
+            )
+        )
+        satisfied = isfinite(log_product) and isclose(
+            log_product,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-10,
         )
         cycles.append(
             replace(
-                cycle,
-                resolved_by=resolved_by,
-                resolved_proof_fingerprint=proof_fingerprint,
+                structural_cycle,
+                parameter_names=correction_names,
+                correction_exponents=correction_exponents,
+                authority_parameter_names=authority_names,
+                authority_exponents=authority_exponents,
+                resolved_by=(
+                    "canonical-admitted-equilibrium-authority"
+                    if satisfied
+                    else None
+                ),
+                admission_status="satisfied" if satisfied else "unsatisfied",
+                admission_reason=(
+                    None
+                    if satisfied
+                    else "canonical admitted cycle product is not unity"
+                ),
+                admission_log_product=float(log_product),
+                admission_parameter_values=correction_values,
             )
         )
-    return WegscheiderCyclicityReport(cycles=tuple(cycles))
-
-
-def validate_wegscheider_cyclicity_resolved(
-    mechanism: object,
-    *,
-    parameter_algebra_spec: ParameterAlgebraSpec | None = None,
-) -> WegscheiderCyclicityReport:
-    report = analyze_wegscheider_cyclicity(
-        mechanism,
-        parameter_algebra_spec=parameter_algebra_spec,
+    return WegscheiderCyclicityReport(
+        cycles=tuple(cycles),
+        topology_fingerprint=topology.topology_fingerprint,
     )
+
+
+def require_wegscheider_admission_satisfied(
+    report: WegscheiderCyclicityReport,
+) -> WegscheiderCyclicityReport:
+    if not isinstance(report, WegscheiderCyclicityReport):
+        raise TypeError("Wegscheider admission requires its typed staged report.")
     if report.unresolved_cycles:
-        raise UnresolvedWegscheiderCyclicityError(report.unresolved_cycles)
+        raise UnresolvedWegscheiderCyclicityError(
+            report.unresolved_cycles,
+            report=report,
+        )
+    return report
+
+
+def _finite_executable_cycle_satisfaction(
+    cycle: WegscheiderCycle,
+    selected_steps: Sequence[_ReversibleStep],
+    *,
+    evaluator: EffectiveRateCoefficientEvaluator,
+    reaction_count: int,
+    temperatures_K: Sequence[float],
+) -> WegscheiderExecutableCycleSatisfaction:
+    log_products: list[float] = []
+    for temperature in temperatures_K:
+        ratios = tuple(
+            _effective_equilibrium_ratio(
+                evaluator,
+                reaction_count=reaction_count,
+                equilibrium_index=step.equilibrium_index,
+                temperature_K=temperature,
+            )
+            for step in selected_steps
+        )
+        if any(ratio is None for ratio in ratios):
+            return WegscheiderExecutableCycleSatisfaction(
+                cycle_id=cycle.cycle_id,
+                status="unavailable",
+                temperatures_K=tuple(float(value) for value in temperatures_K),
+                log_products=tuple(log_products),
+                reason=(
+                    "bound forward/reverse coefficients are not positive and finite"
+                ),
+                parameter_names=cycle.parameter_names,
+                authority_parameter_names=cycle.authority_parameter_names,
+            )
+        log_product = sum(
+            coefficient * log(float(ratio))
+            for coefficient, ratio in zip(
+                cycle.coefficients,
+                ratios,
+                strict=True,
+            )
+        )
+        log_products.append(float(log_product))
+        if not isfinite(log_product) or not isclose(
+            log_product,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-10,
+        ):
+            return WegscheiderExecutableCycleSatisfaction(
+                cycle_id=cycle.cycle_id,
+                status="unsatisfied",
+                temperatures_K=tuple(float(value) for value in temperatures_K),
+                log_products=tuple(log_products),
+                reason="bound cycle product is not unity",
+                parameter_names=cycle.parameter_names,
+                authority_parameter_names=cycle.authority_parameter_names,
+            )
+    return WegscheiderExecutableCycleSatisfaction(
+        cycle_id=cycle.cycle_id,
+        status="satisfied",
+        temperatures_K=tuple(float(value) for value in temperatures_K),
+        log_products=tuple(log_products),
+        parameter_names=cycle.parameter_names,
+        authority_parameter_names=cycle.authority_parameter_names,
+    )
+
+
+def _continuum_executable_cycle_satisfaction(
+    mechanism: object,
+    cycle: WegscheiderCycle,
+    selected_steps: Sequence[_ReversibleStep],
+    *,
+    evaluator: EffectiveRateCoefficientEvaluator,
+) -> WegscheiderExecutableCycleSatisfaction:
+    nominal_temperature_K = float(evaluator.nominal_temperature_K)
+    reaction_count = len(tuple(getattr(mechanism, "reactions", ()) or ()))
+    nominal_ratios = {
+        step.equilibrium_index: _effective_equilibrium_ratio(
+            evaluator,
+            reaction_count=reaction_count,
+            equilibrium_index=step.equilibrium_index,
+            temperature_K=nominal_temperature_K,
+        )
+        for step in selected_steps
+    }
+    if any(value is None for value in nominal_ratios.values()):
+        return WegscheiderExecutableCycleSatisfaction(
+            cycle_id=cycle.cycle_id,
+            status="unavailable",
+            temperatures_K=(nominal_temperature_K,),
+            reason="bound coefficients cannot establish a continuum identity",
+            parameter_names=cycle.parameter_names,
+            authority_parameter_names=cycle.authority_parameter_names,
+        )
+    relations = _combined_cycle_relation(
+        mechanism,
+        cycle,
+        selected_steps,
+        evaluator=evaluator,
+        nominal_temperature_K=nominal_temperature_K,
+        nominal_ratios={key: float(value) for key, value in nominal_ratios.items() if value is not None},
+    )
+    if relations is None:
+        return WegscheiderExecutableCycleSatisfaction(
+            cycle_id=cycle.cycle_id,
+            status="unavailable",
+            temperatures_K=(nominal_temperature_K,),
+            reason="bound temperature dependence has no exhaustive typed relation",
+            parameter_names=cycle.parameter_names,
+            authority_parameter_names=cycle.authority_parameter_names,
+        )
+    combined, _step_relations = relations
+    identity_holds = (
+        isclose(combined.log_constant, 0.0, rel_tol=0.0, abs_tol=1e-10)
+        and isclose(
+            combined.log_temperature_power,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and isclose(
+            combined.inverse_temperature,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-10,
+        )
+    )
+    return WegscheiderExecutableCycleSatisfaction(
+        cycle_id=cycle.cycle_id,
+        status="satisfied" if identity_holds else "unsatisfied",
+        temperatures_K=(nominal_temperature_K,),
+        log_products=(
+            float(
+                combined.log_constant
+                + combined.log_temperature_power * log(nominal_temperature_K)
+                + combined.inverse_temperature / nominal_temperature_K
+            ),
+        ),
+        reason=(None if identity_holds else "bound cycle identity varies over temperature"),
+        parameter_names=cycle.parameter_names,
+        authority_parameter_names=cycle.authority_parameter_names,
+    )
+
+
+def analyze_bound_wegscheider_satisfaction(
+    mechanism: object,
+    admission_report: WegscheiderCyclicityReport,
+    *,
+    temperatures_K: Sequence[float] | None = None,
+) -> WegscheiderExecutableSatisfactionReport:
+    """Evaluate actual-cycle satisfaction without changing admission truth."""
+
+    if not isinstance(admission_report, WegscheiderCyclicityReport):
+        raise TypeError("bound Wegscheider analysis requires its admission report.")
+    current_topology = analyze_wegscheider_topology(mechanism)
+    expected_topology = (
+        admission_report.topology_fingerprint
+        or WegscheiderTopologyReport(admission_report.cycles).topology_fingerprint
+    )
+    if current_topology.topology_fingerprint != expected_topology:
+        raise ValueError(
+            "bound mechanism topology does not match its admitted Wegscheider topology."
+        )
+    if not admission_report.cycles:
+        return WegscheiderExecutableSatisfactionReport(
+            admission_report=admission_report,
+            cycles=(),
+        )
+
+    blocked = tuple(
+        WegscheiderExecutableCycleSatisfaction(
+            cycle_id=cycle.cycle_id,
+            status="blocked-by-admission",
+            reason=(
+                "downstream mutation cannot rescue an unsatisfied or unavailable admission"
+            ),
+            parameter_names=cycle.parameter_names,
+            authority_parameter_names=cycle.authority_parameter_names,
+        )
+        for cycle in admission_report.cycles
+        if cycle.resolved_by is None
+    )
+    if blocked:
+        satisfied_ids = {
+            cycle.cycle_id
+            for cycle in admission_report.cycles
+            if cycle.resolved_by is not None
+        }
+    else:
+        satisfied_ids = {cycle.cycle_id for cycle in admission_report.cycles}
+
+    try:
+        evaluator = build_effective_rate_coefficient_evaluator(mechanism)
+    except (TypeError, ValueError, OverflowError) as exc:
+        unavailable = tuple(
+            WegscheiderExecutableCycleSatisfaction(
+                cycle_id=cycle.cycle_id,
+                status="unavailable",
+                reason=f"bound coefficient authority is unavailable: {exc}",
+                parameter_names=cycle.parameter_names,
+                authority_parameter_names=cycle.authority_parameter_names,
+            )
+            for cycle in admission_report.cycles
+            if cycle.cycle_id in satisfied_ids
+        )
+        return WegscheiderExecutableSatisfactionReport(
+            admission_report=admission_report,
+            cycles=blocked + unavailable,
+        )
+
+    if temperatures_K is None:
+        domain_kind, domain_temperatures, _payload = _runtime_temperature_domain(mechanism)
+        explicit_temperatures = domain_temperatures if domain_kind == "finite" else ()
+    else:
+        domain_kind = "finite"
+        explicit_temperatures = tuple(float(value) for value in temperatures_K)
+        if not explicit_temperatures or any(
+            not isfinite(value) or value <= 0.0 for value in explicit_temperatures
+        ):
+            raise ValueError(
+                "bound Wegscheider temperatures must be a nonempty positive finite sequence."
+            )
+    reaction_count = len(tuple(getattr(mechanism, "reactions", ()) or ()))
+    steps = _reversible_steps(mechanism)
+    results: list[WegscheiderExecutableCycleSatisfaction] = list(blocked)
+    for cycle in admission_report.cycles:
+        if cycle.cycle_id not in satisfied_ids:
+            continue
+        selected_steps = _steps_for_cycle(steps, cycle)
+        if domain_kind == "finite" and explicit_temperatures:
+            result = _finite_executable_cycle_satisfaction(
+                cycle,
+                selected_steps,
+                evaluator=evaluator,
+                reaction_count=reaction_count,
+                temperatures_K=explicit_temperatures,
+            )
+        else:
+            result = _continuum_executable_cycle_satisfaction(
+                mechanism,
+                cycle,
+                selected_steps,
+                evaluator=evaluator,
+            )
+        results.append(result)
+    by_id = {result.cycle_id: result for result in results}
+    ordered = tuple(by_id[cycle.cycle_id] for cycle in admission_report.cycles)
+    return WegscheiderExecutableSatisfactionReport(
+        admission_report=admission_report,
+        cycles=ordered,
+    )
+
+
+def validate_bound_wegscheider_satisfaction(
+    mechanism: object,
+    admission_report: WegscheiderCyclicityReport,
+    *,
+    temperatures_K: Sequence[float] | None = None,
+) -> WegscheiderExecutableSatisfactionReport:
+    report = analyze_bound_wegscheider_satisfaction(
+        mechanism,
+        admission_report,
+        temperatures_K=temperatures_K,
+    )
+    if report.failed_cycles:
+        raise WegscheiderExecutableSatisfactionError(report)
     return report

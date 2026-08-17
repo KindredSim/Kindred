@@ -57,7 +57,10 @@ from .solver_types import (
     ODERhsWithTemp as _ODERhsWithTemp,
     Rhs2 as _Rhs2,
     SimulationCancellationControl as _SimulationCancellationControl,
+    SimulationExecutionOutcome as _SimulationExecutionOutcome,
     SimulationOutput as _SimulationOutput,
+    SimulationScientificUnavailability as _SimulationScientificUnavailability,
+    _SimulationScientificUnavailabilitySignal,
     SimulationRequest as _SimulationRequest,
 )
 
@@ -267,7 +270,7 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
         "atol": float(req.atol),
         "max_step": (None if req.max_step is None else float(req.max_step)),
         "first_step": (None if req.first_step is None else float(req.first_step)),
-        "grid_type": ("explicit" if req.t_eval is not None else ("dt" if "dt" in (req.grid or {}) else "N")),
+        "grid_type": ("explicit" if req.t_eval is not None else "N"),
         "grid_params": ({"t_eval": list(t_eval)} if req.t_eval is not None else dict(req.grid or {})),
         "has_temperature_schedule": req.temperature_schedule is not None,
     }
@@ -497,11 +500,22 @@ def _execute_scipy(
     if not sol.success:
         prov["solver_failure"] = str(sol.message)
         t_fail = float(sol.t[-1]) if getattr(sol, "t", None) is not None and len(sol.t) > 0 else float(t0)
+        if req.candidate_evaluation:
+            raise _SimulationScientificUnavailabilitySignal(
+                _SimulationScientificUnavailability(
+                    producer="scipy",
+                    stage="solve_ivp_unsuccessful",
+                    details={
+                        "solver": req.solver,
+                        "time": t_fail,
+                        "message": str(sol.message),
+                    },
+                )
+            )
         raise create_solver_error(
             req.solver,
             t_fail,
             str(sol.message),
-            candidate_domain_eligible=True,
         )
 
     prov["solver_used"] = method
@@ -619,7 +633,7 @@ def _normal_event_provenance(
             continue
     return out
 
-def solve_ode(req: _SimulationRequest) -> _SimulationOutput:
+def solve_ode(req: _SimulationRequest) -> _SimulationOutput | _SimulationExecutionOutcome:
     if not isinstance(req, _SimulationRequest):
         raise TypeError(f"solve_ode expects SimulationRequest, got {type(req)!r}")
     if (
@@ -649,16 +663,34 @@ def solve_ode(req: _SimulationRequest) -> _SimulationOutput:
 
     method = normalize_solver_name(req.solver)
     _scrub_unused_jacobian_provenance(prov, method=method)
-    return InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
-        ScheduleExecutionRequest(
-            request=req,
-            rhs=rhs,
-            t0=t0,
-            t1=t1,
-            y0=y0,
-            t_eval=t_eval,
-            provenance=prov,
-            method=method,
-            schedule=req.intervention_execution,
+    try:
+        output = InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
+            ScheduleExecutionRequest(
+                request=req,
+                rhs=rhs,
+                t0=t0,
+                t1=t1,
+                y0=y0,
+                t_eval=t_eval,
+                provenance=prov,
+                method=method,
+                schedule=req.intervention_execution,
+            )
         )
-    )
+    except _SimulationScientificUnavailabilitySignal as exc:
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
+            raise SimulationCancelled() from exc
+        if req.candidate_evaluation:
+            return _SimulationExecutionOutcome(
+                status="scientific_unavailable",
+                unavailability=exc.outcome,
+            )
+        raise create_solver_error(
+            req.solver,
+            t0,
+            "Simulation produced non-finite values.",
+        ) from exc
+    return output

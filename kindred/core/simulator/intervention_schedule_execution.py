@@ -25,6 +25,8 @@ from .nonnegative_invariant import (
 )
 from .solver_types import (
     Rhs2,
+    SimulationScientificUnavailability,
+    _SimulationScientificUnavailabilitySignal,
     SimulationOutput,
     SimulationPresentationBoundary,
     SimulationRequest,
@@ -1937,11 +1939,16 @@ def _ensure_finite_nonnegative(
 ) -> None:
     array = np.asarray(values, dtype=float)
     if not np.all(np.isfinite(array)):
-        raise create_solver_error(
-            solver,
-            time,
-            f"{context} contains non-finite concentration values.",
-            candidate_domain_eligible=True,
+        raise _SimulationScientificUnavailabilitySignal(
+            SimulationScientificUnavailability(
+                producer="intervention_schedule_execution",
+                stage="segment_arithmetic",
+                details={
+                    "solver": solver,
+                    "time": float(time),
+                    "context": context,
+                },
+            )
         )
     if np.any(array < 0.0):
         raise create_solver_error(

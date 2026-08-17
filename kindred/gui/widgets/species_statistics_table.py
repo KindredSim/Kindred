@@ -25,13 +25,10 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
     - Final concentration at t_end
     - Maximum concentration reached
     - Time at which maximum occurs
-    - CTC (Concentration-Time Curve) - baseline-corrected integral
+    - CTC (Concentration-Time Curve) - fixed-policy scalar integral
 
-    The CTC calculation uses smart logic:
-    - For species converging to ~0: CTC = ∫C dt (area under curve)
-    - For species converging to C_final: CTC = ∫|C - C_final| dt (deviation from equilibrium)
-
-    This prevents infinite growth for species with non-zero equilibrium values.
+    CTC uses one deterministic native-grid trapezoid policy. A nonfinite
+    numerical result is rendered as unavailable by the typed result owner.
     """
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
@@ -66,9 +63,10 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         self.horizontalHeaderItem(2).setToolTip("Maximum concentration reached")
         self.horizontalHeaderItem(3).setToolTip("Time at which maximum concentration occurs")
         self.horizontalHeaderItem(4).setToolTip(
-            "Concentration-Time Curve (baseline-corrected):\n"
-            "• Species → 0: ∫C dt (area under curve)\n"
-            "• Species → C_final: ∫|C - C_final| dt (deviation from equilibrium)"
+            "Concentration-Time Curve (fixed-policy scalar):\n"
+            "• Species → 0: ∫C dt\n"
+            "• Species → C_final: ∫|C - C_final| dt\n"
+            "Nonfinite numerical results are unavailable."
         )
 
         header.setStretchLastSection(False)
@@ -186,22 +184,17 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                             max_time = boundary.time
                 ctc_text = "—"
                 if ctc_applicable:
-                    threshold = max(
-                        1e-10,
-                        0.01 * float(np.max(np.abs(concentrations))),
-                    )
                     integrand = (
                         concentrations
-                        if abs(float(final_conc)) < threshold
+                        if final_conc == 0.0
                         else np.abs(concentrations - final_conc)
                     )
-                    ctc, _method, _uniform, _eps, _tail = integrate_ctc(
-                        time,
-                        integrand,
-                        uniformity_eps=1e-6,
-                        tail_strategy="38",
+                    ctc = integrate_ctc(time, integrand)
+                    ctc_text = (
+                        f"{ctc.value:.6g}"
+                        if ctc.available
+                        else "Unavailable"
                     )
-                    ctc_text = f"{ctc:.6g}"
                 calculated.append(
                     (
                         species_name,

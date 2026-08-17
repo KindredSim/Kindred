@@ -11,7 +11,8 @@ Current contract
 - Packaged preset sources use this same public syntax and remain admitted by
   the same parser.
 - Source-level `T=` is rejected; set nominal temperature in the mechanism tab.
-- If dG_eq/ΔG° is provided and Keq is omitted, compute Keq = exp(-ΔG°/(R*T)).
+- If dG_eq/ΔG° is provided and Keq is omitted, compute concentration-form
+  Keq = exp(-ΔG°/(R*T)) * C0**delta_n with reaction-dependent units.
 - Default per step is Eyring; Arrhenius override via A/Ea.
 - Units inferred from molecularity (1/(M^(n−1)*s)); bimolecular Eyring divides by C°.
 
@@ -40,7 +41,8 @@ from typing import Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 import re
 
 from ..equilibrium_rate_authority import (
-    effective_reverse_rate_from_keq,
+    admit_explicit_directional_rate_pair,
+    derived_equilibrium_ratio_from_directional_rates,
     validate_equilibrium_rate_authority_flags,
 )
 from ..mechanism_source import (
@@ -49,6 +51,13 @@ from ..mechanism_source import (
     source_matches_analysis,
 )
 from ..units import UnitsModel
+from ..units import (
+    admit_arrhenius_prefactor,
+    admit_energy_j_per_mol,
+    admit_keq,
+    admit_rate,
+)
+from ..species import validate_c0, validate_concentration, validate_temperature
 from .errors import (
     DSLError as _DSLError,
     invalid_number_error,
@@ -78,21 +87,19 @@ if TYPE_CHECKING:
     from ..intervention_schedule import InterventionSchedule
     from ..intervention_schedule_compiler import InterventionExecutionContract
     from ..temperature import TemperatureScheduleProtocol
+    from .wegscheider_symbolic import WegscheiderCyclicityReport
 
 logger = logging.getLogger(__name__)
 
 
 __all__ = [
     "DslAnalysis",
-    "DslDerivedObservableDefinition",
-    "DslDerivedScalarDefinition",
     "DslInitialConditionAdmission",
     "DslInitialConditionAssignment",
     "DslInitialConditionDeclaration",
     "DslParameterCoordinateUpdate",
     "DslSourceOrigin",
     "PreparedDslRequestSet",
-    "derive_source_with_observables",
     "derive_source_with_parameter_updates",
     "prepare_dsl_request_set",
 ]
@@ -241,11 +248,10 @@ class DslInitialConditionAssignment:
                 "Inline initial-condition values must be exact numbers."
             )
         value = float(self.value)
-        if not math.isfinite(value) or value < 0.0:
-            raise ValueError(
-                "Inline initial-condition values must be finite and "
-                "nonnegative."
-            )
+        try:
+            value = validate_concentration(value, field="initial concentration")
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         object.__setattr__(self, "value", value)
 
 
@@ -311,6 +317,29 @@ class DslInitialConditionAdmission:
             raise ValueError(
                 "Inline initial-condition set names must be unique."
             )
+        named_species: dict[str, set[str]] = {}
+        anonymous_species: set[str] = set()
+        for declaration in self.declarations:
+            seen = (
+                named_species.setdefault(
+                    str(declaration.source_name).casefold(),
+                    set(),
+                )
+                if declaration.source_kind == "named"
+                else anonymous_species
+            )
+            for assignment in declaration.assignments:
+                if assignment.species in seen:
+                    scope = (
+                        f"set {declaration.source_name!r}"
+                        if declaration.source_kind == "named"
+                        else "the anonymous initial-condition set"
+                    )
+                    raise ValueError(
+                        "Duplicate inline initial-condition assignment for "
+                        f"species {assignment.species!r} in {scope}."
+                    )
+                seen.add(assignment.species)
 
     @property
     def has_declarations(self) -> bool:
@@ -323,82 +352,6 @@ class DslInitialConditionAdmission:
         return tuple(
             item for item in self.declarations if item.source_kind == "named"
         )
-
-@dataclass(frozen=True, slots=True)
-class DslDerivedScalarDefinition:
-    name: str
-    value: float
-    minimum: float = -1.0e12
-    maximum: float = 1.0e12
-    scope: str = "shared"
-
-    def __post_init__(self) -> None:
-        name = str(self.name or "").strip()
-        value = float(self.value)
-        minimum = float(self.minimum)
-        maximum = float(self.maximum)
-        scope = str(self.scope or "").strip().lower()
-        if not _DSL_IDENTIFIER_RE.fullmatch(name):
-            raise ValueError(
-                "Derived DSL scalar name must be an identifier."
-            )
-        if (
-            not math.isfinite(value)
-            or not math.isfinite(minimum)
-            or not math.isfinite(maximum)
-            or minimum >= maximum
-            or not minimum <= value <= maximum
-        ):
-            raise ValueError(
-                f"Derived DSL scalar {name!r} requires a finite value "
-                "inside ordered non-NaN bounds."
-            )
-        if scope not in {"shared", "per_dataset"}:
-            raise ValueError(
-                "Derived DSL scalar scope must be shared or per_dataset."
-            )
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "value", value)
-        object.__setattr__(self, "minimum", minimum)
-        object.__setattr__(self, "maximum", maximum)
-        object.__setattr__(self, "scope", scope)
-
-
-@dataclass(frozen=True, slots=True)
-class DslDerivedObservableDefinition:
-    name: str
-    expression: str
-    scalar_parameters: tuple[DslDerivedScalarDefinition, ...] = ()
-
-    def __post_init__(self) -> None:
-        name = str(self.name or "").strip()
-        expression = str(self.expression or "").strip()
-        scalars = tuple(self.scalar_parameters)
-        if not _DSL_IDENTIFIER_RE.fullmatch(name):
-            raise ValueError(
-                "Derived DSL observable name must be an identifier."
-            )
-        if not expression:
-            raise ValueError(
-                "Derived DSL observable expression must be nonblank."
-            )
-        if any(
-            type(item) is not DslDerivedScalarDefinition
-            for item in scalars
-        ):
-            raise TypeError(
-                "Derived DSL observable scalars must be exact "
-                "DslDerivedScalarDefinition values."
-            )
-        scalar_names = tuple(item.name for item in scalars)
-        if len(scalar_names) != len(set(scalar_names)):
-            raise ValueError(
-                "Derived DSL observable scalar names must be unique."
-            )
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "expression", expression)
-        object.__setattr__(self, "scalar_parameters", scalars)
-
 
 @dataclass(frozen=True, slots=True)
 class DslAnalysis:
@@ -474,10 +427,13 @@ class DslAnalysis:
         ):
             raise TypeError("DSL analysis temperature_K must be numeric.")
         temperature_K = float(self.temperature_K)
-        if not math.isfinite(temperature_K) or temperature_K <= 0.0:
-            raise ValueError(
-                "DSL analysis temperature_K must be positive and finite."
+        try:
+            temperature_K = validate_temperature(
+                temperature_K,
+                field="DSL analysis temperature_K",
             )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         object.__setattr__(self, "temperature_K", temperature_K)
         if type(self.energy_unit) is not str:
             raise TypeError("DSL analysis energy_unit must be an exact string.")
@@ -552,6 +508,8 @@ def _mint_base_executable_science_identity(
             )
             if (
                 authority.kind == EquilibriumRateAuthorityKind.KEQ
+                and authority.dG_eq_J_per_mol is not None
+                and not authority.has_explicit_keq_param
                 and math.fsum((forward_order, -reverse_order)) != 0.0
             ):
                 consumes_c0 = True
@@ -633,7 +591,7 @@ def _mint_base_executable_science_identity(
                     key: strip_c0(item)
                     for key, item in value.items()
                     if str(key).lower()
-                    not in {"standard_conc_m", "std_ratio", "c0"}
+                    not in {"standard_conc_m", "c0"}
                 }
             if isinstance(value, (tuple, list)):
                 return [strip_c0(item) for item in value]
@@ -660,6 +618,7 @@ class PreparedDslRequestSet:
         "__intervention_execution",
         "__parameter_algebra_spec",
         "__base_executable_identity",
+        "__wegscheider_admission_report",
     )
 
     def __init__(
@@ -671,6 +630,7 @@ class PreparedDslRequestSet:
         intervention_execution: InterventionExecutionContract | None,
         parameter_algebra_spec: object,
         base_executable_identity: BaseExecutableScienceIdentity,
+        wegscheider_admission_report: WegscheiderCyclicityReport,
     ) -> None:
         from kindred.core.intervention_schedule import InterventionSchedule
         from kindred.core.intervention_schedule_compiler import (
@@ -717,12 +677,24 @@ class PreparedDslRequestSet:
             raise TypeError(
                 "prepared DSL requires parser-minted base executable identity."
             )
+        from kindred.core.simulator.wegscheider_symbolic import (
+            WegscheiderCyclicityReport,
+        )
+
+        if not isinstance(
+            wegscheider_admission_report,
+            WegscheiderCyclicityReport,
+        ):
+            raise TypeError(
+                "prepared DSL requires its typed Wegscheider admission report."
+            )
         self.analysis = analysis
         self.__mechanism = mechanism
         self.__intervention_schedule = intervention_schedule
         self.__intervention_execution = intervention_execution
         self.__parameter_algebra_spec = parameter_algebra_spec
         self.__base_executable_identity = base_executable_identity
+        self.__wegscheider_admission_report = wegscheider_admission_report
 
     def mechanism_for_execution(self) -> object:
         return copy.deepcopy(self.__mechanism)
@@ -742,6 +714,11 @@ class PreparedDslRequestSet:
 
     def base_executable_identity(self) -> BaseExecutableScienceIdentity:
         return self.__base_executable_identity
+
+    def wegscheider_admission_report(self) -> WegscheiderCyclicityReport:
+        """Return immutable source-admission truth captured before Algebra."""
+
+        return self.__wegscheider_admission_report
 
 # ------------------------------ helpers --------------------------------------
 
@@ -903,72 +880,29 @@ def _validate_rate_or_K(
 ) -> None:
     if value is None:
         return
-    if math.isnan(value) or math.isinf(value) or value <= 0:
+    if value is None or math.isnan(value) or math.isinf(value):
         raise _DSLError(
-            f"'{name}' must be a positive finite number, got {value}",
+            f"'{name}' must be finite, got {value}",
             line_number=line_number,
             line_content=line_content,
         )
-
-
-def _reverse_standard_state_ratio(
-    reactants: Mapping[str, float],
-    products: Mapping[str, float],
-    standard_conc_M: float,
-) -> float:
-    """Return C0**(n_reverse - n_forward) for thermodynamic reverse rates."""
     try:
-        standard = float(standard_conc_M)
-        exponent = math.fsum(float(value) for value in products.values()) - math.fsum(
-            float(value) for value in reactants.values()
-        )
-        ratio = math.pow(standard, exponent)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise _DSLError("standard concentration ratio must be finite") from exc
-    if not math.isfinite(standard) or standard <= 0.0 or not math.isfinite(ratio) or ratio <= 0.0:
-        raise _DSLError("standard concentration ratio must be positive and finite")
-    return float(ratio)
+        if str(name) == "Keq":
+            admit_keq(value, field=name)
+        else:
+            admit_rate(value, field=name, allow_zero=str(name) in {"k", "kf"})
+    except ValueError as exc:
+        raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
 
 
-def _reverse_rate_for_dsl(
-    kf: float,
-    Keq: float,
-    reverse_std_ratio: float,
-    *,
-    line_number: int | None,
-    line_content: str | None,
-) -> float:
-    """Lower thermodynamic reverse authority with source-aware failures."""
-    try:
-        value = effective_reverse_rate_from_keq(
-            kf,
-            Keq,
-            reverse_std_ratio,
-        )
-        result = float(value)
-    except (TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
-        raise _DSLError(
-            "Thermodynamic reverse rate is not representable as a positive finite real",
-            line_number=line_number,
-            line_content=line_content,
-        ) from exc
-    if not math.isfinite(result) or result <= 0.0:
-        raise _DSLError(
-            "Thermodynamic reverse rate is not representable as a positive finite real",
-            line_number=line_number,
-            line_content=line_content,
-        )
-    return result
-
-
-def _derive_fast_equilibrium_rates_with_context(
+def _derive_equilibrium_rates_with_context(
     *,
     line_number: Optional[int],
     line_content: Optional[str],
     **kwargs,
 ):
     """
-    Translate fast-equilibrium authority errors into source-aware DSL errors.
+    Translate equilibrium authority errors into source-aware DSL errors.
     """
     try:
         from ..equilibrium_rate_authority import (
@@ -1092,7 +1026,14 @@ def _inline_initial_number(
             line_number=line_number,
             line_content=line_content,
         )
-    return value
+    try:
+        return validate_concentration(value, field=f"Initial condition value for {context}")
+    except ValueError as exc:
+        raise _DSLError(
+            str(exc),
+            line_number=line_number,
+            line_content=line_content,
+        ) from exc
 
 
 def _inline_initial_assignments(
@@ -1188,6 +1129,27 @@ def _commented_initial_source(
     return "\n".join(rendered).strip()
 
 
+def _admit_unique_initial_assignments(
+    assignments: tuple[DslInitialConditionAssignment, ...],
+    seen: set[str],
+    *,
+    scope: str,
+    line_number: int,
+    line_content: str,
+) -> None:
+    """Reject duplicate species before constructing the typed admission."""
+
+    for assignment in assignments:
+        if assignment.species in seen:
+            raise _DSLError(
+                "Duplicate inline initial-condition assignment for "
+                f"species {assignment.species!r} in {scope}.",
+                line_number=line_number,
+                line_content=line_content,
+            )
+        seen.add(assignment.species)
+
+
 def _admit_inline_initial_conditions(
     text: str,
 ) -> tuple[DslInitialConditionAdmission, frozenset[int]]:
@@ -1199,6 +1161,7 @@ def _admit_inline_initial_conditions(
     declarations: list[DslInitialConditionDeclaration] = []
     claimed_indexes: set[int] = set()
     named_keys: set[str] = set()
+    anonymous_species: set[str] = set()
     index = 0
     while index < len(lines):
         raw = lines[index]
@@ -1225,6 +1188,7 @@ def _admit_inline_initial_conditions(
             named_keys.add(key)
             start = index
             assignments: list[DslInitialConditionAssignment] = []
+            named_species: set[str] = set()
             one_line_closed = False
             if "}" in body:
                 before_close, close, after_close = body.partition("}")
@@ -1242,12 +1206,26 @@ def _admit_inline_initial_conditions(
                         line_number=index + 1,
                         line_content=raw,
                     )
+                    _admit_unique_initial_assignments(
+                        parsed,
+                        named_species,
+                        scope=f"set {set_name!r}",
+                        line_number=index + 1,
+                        line_content=raw,
+                    )
                     assignments.extend(parsed)
                 one_line_closed = True
             elif body.strip():
                 parsed = _inline_initial_assignments(
                     body,
                     set_name=set_name,
+                    line_number=index + 1,
+                    line_content=raw,
+                )
+                _admit_unique_initial_assignments(
+                    parsed,
+                    named_species,
+                    scope=f"set {set_name!r}",
                     line_number=index + 1,
                     line_content=raw,
                 )
@@ -1282,11 +1260,25 @@ def _admit_inline_initial_conditions(
                                 line_number=cursor + 1,
                                 line_content=block_raw,
                             )
+                            _admit_unique_initial_assignments(
+                                parsed,
+                                named_species,
+                                scope=f"set {set_name!r}",
+                                line_number=cursor + 1,
+                                line_content=block_raw,
+                            )
                             assignments.extend(parsed)
                         break
                     parsed = _inline_initial_assignments(
                         block_code,
                         set_name=set_name,
+                        line_number=cursor + 1,
+                        line_content=block_raw,
+                    )
+                    _admit_unique_initial_assignments(
+                        parsed,
+                        named_species,
+                        scope=f"set {set_name!r}",
                         line_number=cursor + 1,
                         line_content=block_raw,
                     )
@@ -1315,6 +1307,13 @@ def _admit_inline_initial_conditions(
             parsed = _inline_initial_assignments(
                 code,
                 set_name=None,
+                line_number=index + 1,
+                line_content=raw,
+            )
+            _admit_unique_initial_assignments(
+                parsed,
+                anonymous_species,
+                scope="the anonymous initial-condition set",
                 line_number=index + 1,
                 line_content=raw,
             )
@@ -1606,9 +1605,12 @@ def _parse_standard_conc_directive(line: str) -> float:
     if not raw:
         raise _DSLError("C0= directive requires a numeric value")
     C0 = _float_or_none(raw)
-    if C0 is None or C0 <= 0:
-        raise _DSLError("C0 must be positive")
-    return float(C0)
+    if C0 is None:
+        raise _DSLError("C0 must be numeric")
+    try:
+        return validate_c0(C0, field="C0")
+    except ValueError as exc:
+        raise _DSLError(str(exc)) from exc
 
 
 def _split_stoich_and_params(
@@ -1669,45 +1671,6 @@ def _reject_unknown_params(
             f"Unknown {step_label} parameter(s): {', '.join(sorted(unknown))}",
             line_number=line_number, line_content=line_content,
         )
-
-
-def _resolve_Keq_from_params(
-    params: Dict[str, str],
-    *,
-    energy_unit: str,
-    T: float,
-    line_number: Optional[int],
-    line_content: Optional[str],
-) -> Tuple[float, Optional[float]]:
-    """Resolve equilibrium constant Keq from explicit Keq input or dG_eq=.
-
-    Precondition: at least one of "Keq" or "dG_eq" must be present in params.
-    Returns (Keq, dG_eqJ_or_None). Raises DSLError on numeric/overflow/underflow issues.
-    """
-    from ..thermodynamics import K_from_deltaG_eq
-    from .kinetics import normalize_energy_to_J_per_mol
-
-    Keq = _float_or_none(params.get("Keq"))
-    dG_eqJ: Optional[float] = None
-    if Keq is None:
-        dG_eq_val = _float_or_none(params["dG_eq"])
-        if dG_eq_val is None:
-            raise _DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
-        dG = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
-        dG_eqJ = dG
-        try:
-            Keq = K_from_deltaG_eq(dG, T)
-        except (ValueError, OverflowError) as exc:
-            raise _DSLError(
-                "Equilibrium constant overflow (dG_eq too large for given T)",
-                line_number=line_number, line_content=line_content,
-            ) from exc
-        if Keq <= 0:
-            raise _DSLError(
-                "Equilibrium constant underflowed to zero (dG_eq too large for given T)",
-                line_number=line_number, line_content=line_content,
-            )
-    return Keq, dG_eqJ
 
 
 def _parse_reaction_like_step(
@@ -1781,11 +1744,23 @@ def _parse_reaction_like_step(
     if "kf" in params or "k" in params:
         _validate_rate_or_K(kf, "kf" if "kf" in params else "k",
                             line_number=line_number, line_content=line_content)
-    if params.get("kr"):
+    if "kr" in params:
         _validate_rate_or_K(kr, "kr", line_number=line_number, line_content=line_content)
+        if kf is not None and kf == 0.0:
+            raise _DSLError(
+                "Explicit kf+kr reversible steps require both directional rates to be positive.",
+                line_number=line_number,
+                line_content=line_content,
+            )
     if "Keq" in params:
         _Keq_early = _float_or_none(params["Keq"])
-        if _Keq_early is not None and _Keq_early <= 0:
+        if _Keq_early is None:
+            raise _DSLError(
+                "Keq must be numeric",
+                line_number=line_number,
+                line_content=line_content,
+            )
+        if _Keq_early <= 0:
             raise _DSLError(
                 f"Keq must be positive, got {_Keq_early}",
                 line_number=line_number, line_content=line_content,
@@ -1794,6 +1769,7 @@ def _parse_reaction_like_step(
     arrhenius_EaJ = None
     eyring_dGJ = None
     dG_eqJ_for_step = None
+    Keq = None
     Keq_input = None
 
     if model == "Arrhenius":
@@ -1805,15 +1781,18 @@ def _parse_reaction_like_step(
                 examples=["A -> B ; A=1e13 ; Ea=50"],
                 line_number=line_number, line_content=line_content,
             )
-        if A <= 0:
-            raise _DSLError(
-                f"Arrhenius pre-exponential factor A must be positive, got {A}",
-                line_number=line_number, line_content=line_content,
-            )
+        try:
+            A = admit_arrhenius_prefactor(A, field="Arrhenius A")
+        except ValueError as exc:
+            raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
         Ea_val = _float_or_none(Ea)
         if Ea_val is None:
             raise _DSLError("Ea must be numeric", line_number=line_number, line_content=line_content)
         EaJ = normalize_energy_to_J_per_mol(Ea_val, energy_unit)
+        try:
+            EaJ = admit_energy_j_per_mol(EaJ, field="Ea")
+        except ValueError as exc:
+            raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
         arrhenius_A = A
         arrhenius_EaJ = EaJ
         try:
@@ -1823,26 +1802,6 @@ def _parse_reaction_like_step(
                 "Arrhenius rate computation overflowed (A and Ea produce an unrepresentable rate)",
                 line_number=line_number, line_content=line_content,
             ) from exc
-        if reversible and kr is None:
-            if "Keq" in params or "dG_eq" in params:
-                Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
-                    params, energy_unit=energy_unit, T=T,
-                    line_number=line_number, line_content=line_content,
-                )
-                kr = _reverse_rate_for_dsl(
-                    float(kf),
-                    float(Keq),
-                    _reverse_standard_state_ratio(react, prod, C0),
-                    line_number=line_number,
-                    line_content=line_content,
-                )
-                Keq_input = Keq if "Keq" in params else None
-            else:
-                raise _DSLError(
-                    "reversible Arrhenius step needs exactly one of kr or Keq/dG_eq",
-                    examples=["A <-> B ; A=1e10 ; Ea=50 ; Keq=2.0"],
-                    line_number=line_number, line_content=line_content,
-                )
     elif model == "Eyring":
         if kf is None:
             if "dG_act" not in params:
@@ -1855,6 +1814,10 @@ def _parse_reaction_like_step(
             if dG_act_val is None:
                 raise _DSLError("dG_act must be numeric", line_number=line_number, line_content=line_content)
             dGJ = normalize_energy_to_J_per_mol(dG_act_val, energy_unit)
+            try:
+                dGJ = admit_energy_j_per_mol(dGJ, field="dG_act")
+            except ValueError as exc:
+                raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
             eyring_dGJ = dGJ
             if kappa <= 0:
                 raise _DSLError(
@@ -1875,20 +1838,6 @@ def _parse_reaction_like_step(
                     "Eyring rate computation overflowed (dG_act too large for given T)",
                     line_number=line_number, line_content=line_content,
                 ) from exc
-        if reversible and kr is None:
-            if "Keq" in params or "dG_eq" in params:
-                Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
-                    params, energy_unit=energy_unit, T=T,
-                    line_number=line_number, line_content=line_content,
-                )
-                kr = _reverse_rate_for_dsl(
-                    float(kf),
-                    float(Keq),
-                    _reverse_standard_state_ratio(react, prod, C0),
-                    line_number=line_number,
-                    line_content=line_content,
-                )
-                Keq_input = Keq if "Keq" in params else None
     else:
         if kf is None:
             raise _DSLError(
@@ -1896,22 +1845,46 @@ def _parse_reaction_like_step(
                 line_number=line_number,
                 line_content=line_content,
             )
-        if reversible and kr is None:
-            Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
-                params,
-                energy_unit=energy_unit,
-                T=T,
-                line_number=line_number,
-                line_content=line_content,
+
+    if reversible and kr is None:
+        explicit_keq = _float_or_none(params.get("Keq"))
+        if "dG_eq" in params:
+            dG_eq_value = _float_or_none(params["dG_eq"])
+            if dG_eq_value is None:
+                raise _DSLError(
+                    "dG_eq must be numeric",
+                    line_number=line_number,
+                    line_content=line_content,
+                )
+            dG_eqJ_for_step = normalize_energy_to_J_per_mol(
+                dG_eq_value,
+                energy_unit,
             )
-            kr = _reverse_rate_for_dsl(
-                float(kf),
-                float(Keq),
-                _reverse_standard_state_ratio(react, prod, C0),
-                line_number=line_number,
-                line_content=line_content,
-            )
-            Keq_input = Keq if "Keq" in params else None
+            try:
+                dG_eqJ_for_step = admit_energy_j_per_mol(
+                    dG_eqJ_for_step,
+                    field="dG_eq",
+                )
+            except ValueError as exc:
+                raise _DSLError(
+                    str(exc),
+                    line_number=line_number,
+                    line_content=line_content,
+                ) from exc
+        rates = _derive_equilibrium_rates_with_context(
+            Keq=explicit_keq,
+            dG_eq_J_per_mol=dG_eqJ_for_step,
+            T=T,
+            standard_conc_M=C0,
+            delta_n=math.fsum(prod.values()) - math.fsum(react.values()),
+            explicit_rates=(float(kf),),
+            line_number=line_number,
+            line_content=line_content,
+        )
+        kf = rates.kf
+        kr = rates.kr
+        Keq = rates.Keq
+        Keq_input = explicit_keq
 
     return DslBuildStep(
         reactants=tuple(
@@ -1931,6 +1904,7 @@ def _parse_reaction_like_step(
         kappa=kappa,
         standard_conc_M=C0,
         dG_eq_J_per_mol=dG_eqJ_for_step,
+        Keq=float(Keq) if Keq is not None else None,
         Keq_input=Keq_input,
         user_kf_explicit=any(
             key in params for key in ("kf", "k", "A", "Ea", "dG_act")
@@ -2044,7 +2018,6 @@ def _parse_equilibrium_step(
         _validate_rate_or_K(Keq, "Keq", line_number=line_number, line_content=line_content)
     dG_eqJ = None
 
-    exp_rates: List[float] = []
     kf_explicit = None
     kr_explicit = None
     if "kf" in params:
@@ -2053,14 +2026,12 @@ def _parse_equilibrium_step(
             raise _DSLError("kf must be numeric", line_number=line_number, line_content=line_content)
         _validate_rate_or_K(kfv, "kf", line_number=line_number, line_content=line_content)
         kf_explicit = kfv
-        exp_rates.append(kfv)
     if "kr" in params:
         krv = _float_or_none(params["kr"])
         if krv is None:
             raise _DSLError("kr must be numeric", line_number=line_number, line_content=line_content)
         _validate_rate_or_K(krv, "kr", line_number=line_number, line_content=line_content)
         kr_explicit = krv
-        exp_rates.append(krv)
 
     _validate_equilibrium_rate_authority_for_dsl(
         has_kf=kf_explicit is not None,
@@ -2071,14 +2042,28 @@ def _parse_equilibrium_step(
         line_content=line_content,
     )
 
-    if (
-        Keq is None
+    explicit_directional_pair = (
+        not has_explicit_Keq
         and not has_explicit_dG_eq
         and kf_explicit is not None
         and kr_explicit is not None
-        and kr_explicit != 0
-    ):
-        Keq = kf_explicit / kr_explicit
+    )
+    if explicit_directional_pair:
+        try:
+            kf_explicit, kr_explicit = admit_explicit_directional_rate_pair(
+                kf_explicit,
+                kr_explicit,
+            )
+            _ = derived_equilibrium_ratio_from_directional_rates(
+                kf_explicit,
+                kr_explicit,
+            )
+        except ValueError as exc:
+            raise _DSLError(
+                str(exc),
+                line_number=line_number,
+                line_content=line_content,
+            ) from exc
 
     if Keq is None and has_explicit_dG_eq:
         dG_eq = (
@@ -2090,25 +2075,30 @@ def _parse_equilibrium_step(
         if dG_eq_val is None:
             raise _DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
         dG_eqJ = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
-    fe = _derive_fast_equilibrium_rates_with_context(
-        Keq=Keq,
-        dG_eq_J_per_mol=dG_eqJ,
-        T=T,
-        explicit_rates=exp_rates or None,
-        line_number=line_number,
-        line_content=line_content,
-    )
-    kf = fe.kf if kf_explicit is None else kf_explicit
-    kr = fe.kr if kr_explicit is None else kr_explicit
-    if kr_explicit is None and (has_explicit_Keq or dG_eqJ is not None):
-        reverse_std_ratio = _reverse_standard_state_ratio(react, prod, C0)
-        kr = _reverse_rate_for_dsl(
-            float(kf),
-            float(fe.Keq),
-            reverse_std_ratio,
+        try:
+            dG_eqJ = admit_energy_j_per_mol(dG_eqJ, field="dG_eq")
+        except ValueError as exc:
+            raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
+    if explicit_directional_pair:
+        if kf_explicit is None or kr_explicit is None:
+            raise AssertionError("explicit directional admission lost its pair")
+        kf = kf_explicit
+        kr = kr_explicit
+        derived_Keq = None
+    else:
+        fe = _derive_equilibrium_rates_with_context(
+            Keq=Keq,
+            dG_eq_J_per_mol=dG_eqJ,
+            T=T,
+            standard_conc_M=C0,
+            delta_n=math.fsum(prod.values()) - math.fsum(react.values()),
+            explicit_rates=(kf_explicit,),
             line_number=line_number,
             line_content=line_content,
         )
+        kf = fe.kf if kf_explicit is None else kf_explicit
+        kr = fe.kr if kr_explicit is None else kr_explicit
+        derived_Keq = float(fe.Keq)
 
     return DslBuildStep(
         reactants=tuple(
@@ -2126,6 +2116,7 @@ def _parse_equilibrium_step(
         kappa=1.0,
         standard_conc_M=C0,
         dG_eq_J_per_mol=dG_eqJ,
+        Keq=derived_Keq,
         Keq_input=(Keq if has_explicit_Keq else None),
         user_kf_explicit=("kf" in params),
         user_kr_explicit=("kr" in params),
@@ -2183,62 +2174,6 @@ def _mechanism_build_input(
     )
 
 
-def _validate_static_parameter_algebra(parameter_algebra_spec: object) -> None:
-    """Keep detached ``param`` extensions static; dynamics belong to ``let``."""
-    from kindred.core.algebra.parser import (
-        BinaryNode,
-        CallNode,
-        IdentNode,
-        SpeciesRefNode,
-        UnaryNode,
-    )
-
-    spec = parameter_algebra_spec
-    statements = tuple(getattr(spec, "param_statements", ()) or ())
-    retained = getattr(spec, "parameter_block", None)
-    retained_by_name = {
-        str(statement.name): statement
-        for statement in tuple(getattr(retained, "lines", ()) or ())
-    }
-    dynamic_names = set(getattr(spec, "observable_names", ()) or ())
-    dynamic_names.update(str(name) for name in getattr(spec, "scalar_input_names", ()) or ())
-
-    def identifiers(expr: object) -> set[str]:
-        if isinstance(expr, IdentNode):
-            return {str(expr.name)}
-        if isinstance(expr, SpeciesRefNode):
-            return set()
-        if isinstance(expr, UnaryNode):
-            return identifiers(expr.rhs)
-        if isinstance(expr, BinaryNode):
-            return identifiers(expr.lhs) | identifiers(expr.rhs)
-        if isinstance(expr, CallNode):
-            names: set[str] = set()
-            for argument in expr.args:
-                names.update(identifiers(argument))
-            return names
-        return set()
-
-    for assignment in statements:
-        statement = retained_by_name.get(str(assignment.name))
-        expr = getattr(statement, "expr", None) if statement is not None else getattr(assignment, "expr_ast", None)
-        if expr is None:
-            continue
-        runtime = bool(
-            isinstance(expr, SpeciesRefNode)
-            or expr.has_species_ref()
-            or ({"T", "t"} & identifiers(expr))
-            or (dynamic_names & identifiers(expr))
-        )
-        if runtime:
-            raise _DSLError(
-                "Parameter expressions may only reference static solver parameters and constants; "
-                "runtime temperature, time, concentration, scalar, and observable references belong in let expressions.",
-                line_number=int(getattr(assignment, "line_number", 0) or 0),
-                line_content=str(getattr(assignment, "line_content", "")),
-            )
-
-
 def prepare_dsl_request_set(
     text: str,
     *,
@@ -2276,6 +2211,14 @@ def prepare_dsl_request_set(
             initials=initials,
         )
     )
+    from kindred.core.simulator.wegscheider_symbolic import (
+        analyze_wegscheider_cyclicity,
+    )
+
+    # Capture admission from canonical parsed coefficient/equilibrium authority
+    # before Algebra compilation, request overrides, bindings, or runtime state
+    # can mutate the executable mechanism.
+    wegscheider_admission_report = analyze_wegscheider_cyclicity(mechanism)
     mechanism_namespace = build_namespace_from_mechanism(mechanism)
     parameter_algebra_spec = parse_parameter_algebra_spec_from_dsl_text(
         text,
@@ -2289,6 +2232,7 @@ def prepare_dsl_request_set(
         compiled_algebra_series = compile_algebra_observables(
             mechanism_namespace=mechanism_namespace,
             retained_spec=parameter_algebra_spec,
+            species_names={str(item) for item in mechanism.species_names()},
         )
     except ValueError as exc:
         raise _DSLError(str(exc)) from exc
@@ -2348,6 +2292,7 @@ def prepare_dsl_request_set(
             parameter_algebra_spec,
             analysis_identity=analysis.identity,
         ),
+        wegscheider_admission_report=wegscheider_admission_report,
     )
 
 
@@ -2683,7 +2628,6 @@ def derive_source_with_parameter_updates(
                     kr = effective_reverse_rate_from_keq(
                         kf,
                         keq,
-                        authority.reverse_std_ratio,
                     )
                 mechanism.equilibria[index] = replace(
                     equilibrium,
@@ -2744,7 +2688,6 @@ def derive_source_with_parameter_updates(
                     kr=effective_reverse_rate_from_keq(
                         kf,
                         update.value,
-                        authority.reverse_std_ratio,
                     ),
                     metadata=equilibrium_metadata,
                 )
@@ -2798,239 +2741,6 @@ def derive_source_with_parameter_updates(
         intervention_execution=prepared.intervention_execution_contract(),
         parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
         base_executable_identity=prepared.base_executable_identity(),
+        wegscheider_admission_report=prepared.wegscheider_admission_report(),
     )
     return updated_text, result
-
-
-def derive_source_with_observables(
-    source_text: str,
-    base: PreparedDslRequestSet,
-    definitions: tuple[DslDerivedObservableDefinition, ...],
-) -> tuple[str, PreparedDslRequestSet]:
-    """Derive Fit-local observables from exact source and return both authorities."""
-
-    if not isinstance(base, PreparedDslRequestSet):
-        raise TypeError("base must be a PreparedDslRequestSet.")
-    if type(source_text) is not str:
-        raise TypeError("source_text must be an exact str.")
-    source = MechanismAuthoringSource.from_parts(reactions_text=source_text)
-    if not source_matches_analysis(source, base.analysis):
-        raise ValueError(
-            "Observable derivation source does not match its retained analysis."
-        )
-    if base.analysis.inline_initial_conditions.has_declarations:
-        raise ValueError(
-            "Derived observables require canonical materialized initial "
-            "conditions."
-        )
-    if type(definitions) is not tuple or any(
-        type(item) is not DslDerivedObservableDefinition
-        for item in definitions
-    ):
-        raise TypeError(
-            "definitions must be an exact tuple of "
-            "DslDerivedObservableDefinition values."
-        )
-    if not definitions:
-        raise ValueError(
-            "Derived observable authority requires at least one definition."
-        )
-    observable_names = tuple(item.name for item in definitions)
-    if len(observable_names) != len(set(observable_names)):
-        raise ValueError("Derived observable names must be unique.")
-    scalars = tuple(
-        scalar
-        for definition in definitions
-        for scalar in definition.scalar_parameters
-    )
-    scalar_names = tuple(item.name for item in scalars)
-    if len(scalar_names) != len(set(scalar_names)):
-        raise ValueError(
-            "Derived observable scalar identities must be globally unique."
-        )
-    occupied = {
-        *base.analysis.species_names,
-        *base.analysis.observable_names,
-        *(item.name for item in base.analysis.parameters),
-    }
-    collisions = sorted(
-        (set(observable_names) | set(scalar_names)) & occupied
-    )
-    if collisions:
-        raise ValueError(
-            "Derived observable science conflicts with retained base name(s): "
-            + ", ".join(repr(name) for name in collisions)
-        )
-    if set(observable_names) & set(scalar_names):
-        raise ValueError(
-            "Derived observable names and scalar names must be disjoint."
-        )
-    if any(
-        "\n" in item.expression or "\r" in item.expression
-        for item in definitions
-    ):
-        raise ValueError(
-            "Derived observable expressions must be single-line Algebra "
-            "expressions."
-        )
-
-    scalar_lines = tuple(
-        f"param {item.name} = {item.value:.17g}"
-        for item in scalars
-    )
-    observable_lines = tuple(
-        f"let {item.name} = {item.expression}"
-        for item in definitions
-    )
-    derived_lines = scalar_lines + observable_lines
-
-    # Fit-local observables are admitted as a detached extension.  Parse only
-    # the new declarations against the already retained mechanism namespace;
-    # never concatenate and re-admit the base normalized source.
-    from kindred.core.algebra.parser import AlgebraBlock
-    from kindred.core.algebra.simulation_series import (
-        compile_algebra_observables,
-    )
-    from kindred.core.simulator.parameter_algebra_spec import (
-        parse_parameter_algebra_spec_from_dsl_text,
-    )
-
-    mechanism = base.mechanism_for_execution()
-    mechanism_namespace = build_namespace_from_mechanism(mechanism)
-    base_spec = base.parameter_algebra_spec_for_execution()
-    derived_spec = parse_parameter_algebra_spec_from_dsl_text(
-        "\n".join(derived_lines),
-        mechanism_namespace=mechanism_namespace,
-        # Retained base lets are runtime symbols for this detached extension.
-        # Expose their names to the new-only admission without reparsing their
-        # source expressions; the merged retained block supplies their ASTs.
-        scalar_input_names=set(
-            getattr(base_spec, "scalar_input_names", ())
-        )
-        | set(base_spec.param_assignment_names())
-        | set(base.analysis.observable_names),
-    )
-
-    def _merge_algebra_blocks(
-        left: AlgebraBlock | None,
-        right: AlgebraBlock | None,
-    ) -> AlgebraBlock:
-        left_lines = tuple(getattr(left, "lines", ()) or ())
-        right_lines = tuple(getattr(right, "lines", ()) or ())
-        return AlgebraBlock(
-            lines=left_lines + right_lines,
-            ast=tuple(statement.expr for statement in left_lines + right_lines),
-            static_values={
-                **dict(getattr(left, "static_values", {}) or {}),
-                **dict(getattr(right, "static_values", {}) or {}),
-            },
-        )
-
-    retained_spec = replace(
-        base_spec,
-        param_statements=list(base_spec.param_statements)
-        + list(derived_spec.param_statements),
-        observable_names=set(base_spec.observable_names)
-        | set(derived_spec.observable_names),
-        parameter_block=_merge_algebra_blocks(
-            getattr(base_spec, "parameter_block", None),
-            getattr(derived_spec, "parameter_block", None),
-        ),
-        observable_block=_merge_algebra_blocks(
-            getattr(base_spec, "observable_block", None),
-            getattr(derived_spec, "observable_block", None),
-        ),
-        raw_to_canonical_identifiers_by_assignment={
-            **dict(
-                getattr(base_spec, "raw_to_canonical_identifiers_by_assignment", {})
-                or {}
-            ),
-            **dict(
-                getattr(
-                    derived_spec,
-                    "raw_to_canonical_identifiers_by_assignment",
-                    {},
-                )
-                or {}
-            ),
-        },
-    )
-    _validate_static_parameter_algebra(retained_spec)
-    try:
-        compiled_algebra_series = compile_algebra_observables(
-            mechanism_namespace=mechanism_namespace,
-            retained_spec=retained_spec,
-        )
-    except ValueError as exc:
-        raise _DSLError(str(exc)) from exc
-    setattr(mechanism, "_compiled_algebra_series", compiled_algebra_series)
-
-    base_text = source_text
-
-    definition_payload = tuple(
-        {
-            "name": item.name,
-            "expression": item.expression,
-            "scalar_parameters": tuple(
-                {
-                    "name": scalar.name,
-                    "value": scalar.value,
-                }
-                for scalar in item.scalar_parameters
-            ),
-        }
-        for item in definitions
-    )
-    identity = hashlib.sha256(
-        json.dumps(
-            {
-                "base_analysis_identity": base.analysis.identity,
-                "definitions": definition_payload,
-            },
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    derived_identity = f"dsl-analysis-derived:{identity}"
-    derived_origins = tuple(
-        DslSourceOrigin(
-            authored_ordinal=len(base.analysis.origins) + index,
-            source_text=line,
-        )
-        for index, line in enumerate(derived_lines)
-    )
-    derived_source = base_text + (
-        ""
-        if base_text.endswith(("\n", "\r"))
-        else ("\r\n" if "\r\n" in base_text else "\n")
-    ) + ("\r\n" if "\r\n" in base_text else "\n").join(derived_lines)
-    analysis = DslAnalysis(
-        identity=derived_identity,
-        normalized_text=normalize_source_for_analysis(derived_source),
-        origins=base.analysis.origins + derived_origins,
-        species_names=base.analysis.species_names,
-        observable_names=tuple(
-            sorted(str(name) for name in retained_spec.observable_names)
-        ),
-        parameters=base.analysis.parameters,
-        inline_initial_conditions=base.analysis.inline_initial_conditions,
-        temperature_K=base.analysis.temperature_K,
-        energy_unit=base.analysis.energy_unit,
-    )
-    result = PreparedDslRequestSet(
-        analysis=analysis,
-        mechanism=mechanism,
-        intervention_schedule=(
-            base.parameterized_intervention_schedule_for_binding()
-        ),
-        intervention_execution=base.intervention_execution_contract(),
-        parameter_algebra_spec=retained_spec,
-        base_executable_identity=_mint_base_executable_science_identity(
-            mechanism,
-            retained_spec,
-            analysis_identity=analysis.identity,
-        ),
-    )
-    return derived_source, result
